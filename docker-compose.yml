@@ -1,0 +1,12 @@
+services:
+  vms:
+    build: .
+    container_name: anyaicam-vms
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app
+            - ./app/recordings:/app/recordings
+    restart: unless-stopped
