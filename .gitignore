@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 app/static/hls/
+
+recordings/
+logs.txt
+__pycache__/
+*.pyc
