@@ -8,5 +8,5 @@ services:
       - .env
     volumes:
       - ./app:/app
-            - ./app/recordings:/app/recordings
+      - ./recordings:/app/recordings
     restart: unless-stopped

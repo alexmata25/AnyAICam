@@ -1,0 +1,33 @@
+services:
+  portal:
+    build: ..
+    env_file: .env.production
+    expose:
+      - "8000"
+    volumes:
+      - portal_recordings:/app/recordings
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      portal:
+        condition: service_started
+    environment:
+      PUBLIC_DOMAIN: anyaicam.com
+      PORTAL_DOMAIN: portal.anyaicam.com
+      APP_UPSTREAM: portal:8000
+      TLS_EMAIL: replace@example.com
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  portal_recordings:
+  caddy_data:
+  caddy_config:
