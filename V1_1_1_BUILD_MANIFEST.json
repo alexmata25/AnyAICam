@@ -1,0 +1,18 @@
+{
+  "product": "AnyAiCam VMS",
+  "version": "1.1.1",
+  "release_name": "Camera Verification and Explicit Authentication",
+  "artifact": "main_v1_1_1_camera_verification_override.py",
+  "sha256": "ce32c3d39551b04939ec502c002810ddcaf244ebf25b8b1146a54144ad9f8f0f",
+  "syntax_validation": "passed",
+  "single_device_only": true,
+  "private_network_only": true,
+  "explicit_consent_required": true,
+  "credential_values_persisted": false,
+  "rate_limit_seconds": 15,
+  "protocols": [
+    "HTTP/HTTPS Basic",
+    "RTSP OPTIONS Basic",
+    "ONVIF device service"
+  ]
+}

@@ -16,9 +16,16 @@ from redirect_security import safe_redirect
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self,request: Request,call_next):
         origin=request.headers.get('origin','').rstrip('/')
-        if origin and origin not in settings.allowed_origins:
+        method=request.method.upper()
+        unsafe_method=method in {'POST','PUT','PATCH','DELETE'}
+        preflight=method=='OPTIONS'
+
+        # Allow ordinary browser page navigation. Enforce the origin allowlist
+        # only for CORS preflight and requests that can change server state.
+        if origin and (unsafe_method or preflight) and origin not in settings.allowed_origins:
             return JSONResponse({'detail':'Origin is not allowed.'},status_code=403)
-        if request.method=='OPTIONS':
+
+        if preflight:
             response=JSONResponse({},status_code=204)
         else:
             response=None

@@ -1,4 +1,3 @@
-from cloud_config import settings as cloud_settings
 import json
 import logging
 import secrets
