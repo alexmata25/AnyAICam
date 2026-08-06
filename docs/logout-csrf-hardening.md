@@ -4,7 +4,7 @@
 
 The active sidebar rendered logout as a normal HTML `POST /logout` form and separately installed a JavaScript submit interceptor. Under the normal path the interceptor called `window.fetch`, allowing the shared fetch wrapper to add `X-CSRF-Token`. If the interceptor was missing, stale, not yet installed, or interrupted by another script error, the browser retained a second path: direct form submission. Native form submission includes cookies but cannot add the custom CSRF header, so the unchanged middleware correctly returned HTTP 403.
 
-The first hardening pass then passed a JavaScript `URL` object to `window.fetch`. The shared wrapper distinguishes string inputs from Request-like inputs and tried to read `.url` from that `URL` object. Because a `URL` object has no `.url` property, it called `new URL(undefined)` and the browser displayed `Failed to construct 'URL': Invalid URL` before sending `/logout`. Logout now passes the relative string `'/logout'`, which is the wrapper's established and regression-tested input contract.
+The first hardening pass then passed a JavaScript `URL` object to `window.fetch`. The shared wrapper distinguished only string inputs from Request-like inputs and tried to read `.url` from that `URL` object. Because a `URL` object has no `.url` property, it called `new URL(undefined)` and the browser displayed `Failed to construct 'URL': Invalid URL` before sending `/logout`. Logout now passes the relative string `'/logout'`. The wrapper is also hardened to accept relative or absolute strings, `URL` objects, and Request-like objects.
 
 ## Hardened flow
 

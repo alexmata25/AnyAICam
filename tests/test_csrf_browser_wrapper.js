@@ -19,9 +19,11 @@ const window = {
 
 window.fetch = (input, options = {}) => {
   const method = (options.method || "GET").toUpperCase();
-  const requestUrl = typeof input === "string"
-    ? new URL(input, window.location.href)
-    : new URL(input.url);
+  const requestUrl = input instanceof URL
+    ? input
+    : typeof input === "string"
+      ? new URL(input, window.location.href)
+      : new URL(input.url, window.location.href);
   const sameOrigin = requestUrl.origin === window.location.origin;
   if (sameOrigin && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
     const csrf = document.cookie
@@ -49,6 +51,12 @@ window.fetch = (input, options = {}) => {
     assert(!capturedHeader.startsWith('"'), input);
     assert(!capturedHeader.endsWith('"'), input);
   }
+  capturedHeader = null;
+  await window.fetch(new URL("/logout", window.location.href), { method: "POST" });
+  assert.equal(capturedHeader, "signed-token", "same-origin URL object");
+  capturedHeader = null;
+  await window.fetch({ url: "/logout" }, { method: "POST" });
+  assert.equal(capturedHeader, "signed-token", "relative Request-like input");
   capturedHeader = null;
   await window.fetch("https://example.invalid/login", { method: "POST" });
   assert.equal(capturedHeader, null, "cross-origin request");

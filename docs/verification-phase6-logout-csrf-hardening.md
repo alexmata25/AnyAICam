@@ -19,6 +19,7 @@ Covered cases:
 - Login form behavior and quote normalization are unchanged
 - No active native HTML form can submit directly to `/logout`
 - Logout passes a relative string—not an unsupported JavaScript `URL` object—to the shared wrapper
+- Shared fetch normalization accepts strings, JavaScript `URL` objects, and Request-like inputs
 - Redacted diagnostic logging does not contain token values
 
 ## Local limitation

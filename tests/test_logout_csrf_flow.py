@@ -58,6 +58,8 @@ class LogoutCsrfFlowTests(unittest.TestCase):
     def test_logout_frontend_uses_protected_fetch_and_follows_redirect(self):
         self.assertIn("document.getElementById('sidebar-logout')?.addEventListener('click'", self.main)
         self.assertIn("window.fetch('/logout',{method:'POST'})", self.main)
+        self.assertEqual(self.main.count("requestUrl=input instanceof URL?input:"), 2)
+        self.assertNotIn("new URL(input.url),sameOrigin", self.main)
         self.assertIn("if(response.redirected){window.location.assign(response.url);return}", self.main)
         self.assertIn("'X-CSRF-Token':token", self.main)
         self.assertIn('id="sidebar-logout"', self.main)
