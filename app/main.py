@@ -8430,6 +8430,22 @@ def sales_training_resource_file(item_id: str, request: Request) -> Response:
     )
 
 
+ANALYTICS_FEATURES = [
+    ("Smart alerts", "Prioritize events that need attention."),
+    ("Smart motion", "Search motion events by camera and time."),
+    ("Line crossing", "Detect movement across a defined boundary."),
+    ("Intrusion", "Monitor activity inside protected zones."),
+    ("License plate recognition", "Capture and search vehicle plates."),
+    ("People counting", "Measure entries, exits, and foot traffic."),
+    ("Occupancy", "Track how many people are within a space."),
+    ("Vehicle search", "Find vehicles across recorded footage."),
+]
+
+
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
 @app.get("/analytics", response_class=HTMLResponse)
 def analytics() -> str:
     camera_options = "".join(
