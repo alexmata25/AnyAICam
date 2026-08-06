@@ -47,8 +47,11 @@ class CloudInventoryReporter:
                 "id": str(camera.get("id", ""))[:100],
                 "name": str(camera.get("name") or "Camera")[:160],
                 "online": camera.get("status") == "online",
-                "recording": False,
+                "recording": bool(camera.get("recording")),
                 "analytics": False,
+                "health_state": str(camera.get("health_state") or "unknown")[:32],
+                "fps": max(0, float(camera.get("fps") or 0)),
+                "bitrate_bps": max(0, int(camera.get("bitrate_bps") or 0)),
                 "manufacturer": str(camera.get("manufacturer") or "Unknown")[:120],
                 "model": str(camera.get("model") or "Unknown")[:120],
                 "protocols": [
