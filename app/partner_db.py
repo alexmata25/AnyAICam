@@ -20,6 +20,16 @@ ROLE_PERMISSIONS = {
     'technician': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action'},
     'customer_owner': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure'},
     'customer_viewer': {'customer.self.view'},
+    'owner': {'*'},
+    'sales': {'partner.view','customer.create','customer.view','customer.edit','quote.create','pricing.view'},
+    'support': {'partner.view','customer.view','audit.view'},
+    'installer': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action'},
+    'billing': {'partner.view','customer.view','pricing.view'},
+    'operations': {'partner.view','customer.view','appliance.assign','appliance.action','audit.view'},
+    'customer_admin': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure'},
+    'manager': {'customer.self.view','camera.self.configure'},
+    'viewer': {'customer.self.view'},
+    'guard': {'customer.self.view'},
 }
 
 
@@ -63,6 +73,8 @@ def initialize_database() -> None:
     bootstrap_admin()
     from db_migrations import apply_migrations
     apply_migrations()
+    from tenancy.migrations import apply_tenant_migration
+    apply_tenant_migration()
 
 
 def password_hash(password: str) -> str:
@@ -103,7 +115,7 @@ def authenticate_detailed(email: str,password: str):
     if user.get('must_change_password') and user.get('invitation_expires_at') and user['invitation_expires_at']<datetime.now().isoformat(): return None,'invitation_expired'
     if status in {'suspended','revoked'}: return None,status
     if status=='pending' or not user.get('approved'): return None,'pending'
-    if user.get('role') in {'administrator','partner_owner','salesperson','technician'}:
+    if user.get('role') in {'administrator','partner_owner','salesperson','technician','owner','sales','support','installer','billing','operations'}:
         approval=str(user.get('partner_approval_status') or 'pending').lower()
         if approval in {'rejected','revoked','suspended'}: return None,'revoked' if approval=='rejected' else approval
         if approval!='approved': return None,'pending'

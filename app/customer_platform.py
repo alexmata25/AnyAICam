@@ -72,7 +72,8 @@ def _camera_key(user_id: str, camera_id: int) -> str:
 
 
 def _is_customer(user: dict) -> bool:
-    return str(user.get("role") or "").lower() in {"customer_owner", "customer_viewer"}
+    from tenancy.policy import identity_domain
+    return identity_domain(user) == "customer" and bool(user.get("tenant_id") or user.get("customer_id"))
 
 
 def register_customer_platform_routes(
@@ -314,7 +315,8 @@ def register_customer_platform_routes(
     @app.put("/api/customer/cameras/{camera_id}/features")
     def update_customer_camera_features(camera_id: int, payload: CameraFeatureUpdate, request: Request):
         user = current_user(request)
-        if str(user.get("role") or "").lower() != "customer_owner":
+        from tenancy.policy import normalize_role
+        if normalize_role(user) != ("customer", "customer_admin"):
             raise HTTPException(status_code=403, detail="Customer owner permission required.")
         if camera_id not in user_camera_ids(user):
             raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")
@@ -337,7 +339,8 @@ def register_customer_platform_routes(
     @app.put("/api/customer/cameras/{camera_id}/alerts")
     def update_customer_camera_alerts(camera_id: int, payload: CameraAlertUpdate, request: Request):
         user = current_user(request)
-        if str(user.get("role") or "").lower() != "customer_owner":
+        from tenancy.policy import normalize_role
+        if normalize_role(user) != ("customer", "customer_admin"):
             raise HTTPException(status_code=403, detail="Customer owner permission required.")
         if camera_id not in user_camera_ids(user):
             raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")

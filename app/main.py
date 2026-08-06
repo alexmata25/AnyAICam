@@ -362,6 +362,10 @@ class UserModel(BaseModel):
     display_name: str = Field(min_length=2, max_length=120)
     email: str = Field(default="", max_length=200)
     role: str = "view-only"
+    identity_domain: str = "customer"
+    tenant_id: str | None = None
+    platform_role: str | None = None
+    customer_role: str | None = None
     enabled: bool = True
     super_admin: bool = False
     site_ids: list[str] = Field(default_factory=lambda: ["home"])
@@ -378,10 +382,26 @@ class UserUpdateModel(BaseModel):
     display_name: str | None = Field(default=None, min_length=2, max_length=120)
     email: str | None = Field(default=None, max_length=200)
     role: str | None = None
+    identity_domain: str | None = None
+    tenant_id: str | None = None
+    platform_role: str | None = None
+    customer_role: str | None = None
     enabled: bool | None = None
     super_admin: bool | None = None
     site_ids: list[str] | None = None
     camera_ids: list[int] | None = None
+
+
+def identity_fields_for_role(role: str) -> dict:
+    """Give legacy local accounts the same explicit identity contract."""
+    from tenancy.policy import normalize_role
+    domain, canonical_role = normalize_role({"role": role})
+    return {
+        "identity_domain": domain,
+        "tenant_id": None if domain == "platform" else os.environ.get("ANYAICAM_LOCAL_TENANT_ID", "00000000-0000-4000-8000-000000000002"),
+        "platform_role": canonical_role if domain == "platform" else None,
+        "customer_role": canonical_role if domain == "customer" else None,
+    }
 
 
 class UserCreateModel(BaseModel):
@@ -965,6 +985,24 @@ ROLE_PERMISSIONS = {
         "export_media", "acknowledge_alerts",
     },
     "viewer": {"view_live", "view_events", "view_sites"},
+    "owner": {
+        "view_live", "view_events", "view_analytics", "view_sites",
+        "manage_users", "manage_settings", "view_audit", "export_media",
+        "acknowledge_alerts",
+    },
+    "sales": {"view_sites"},
+    "support": {"view_sites", "view_audit"},
+    "billing": {"view_sites"},
+    "operations": {"view_sites", "view_audit"},
+    "customer_admin": {
+        "view_live", "view_events", "view_analytics", "view_sites",
+        "manage_users", "manage_settings", "export_media", "acknowledge_alerts",
+    },
+    "manager": {
+        "view_live", "view_events", "view_analytics", "view_sites",
+        "manage_settings", "export_media", "acknowledge_alerts",
+    },
+    "guard": {"view_live", "view_events", "view_sites", "acknowledge_alerts"},
 }
 VALID_ROLES = set(ROLE_PERMISSIONS)
 
@@ -998,6 +1036,8 @@ def default_users() -> list[dict]:
             display_name="Local Administrator",
             email=admin_email,
             role="administrator",
+            identity_domain="platform",
+            platform_role="owner",
             enabled=True,
             super_admin=True,
             site_ids=["home"],
@@ -1012,6 +1052,18 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
     admin_email = os.environ.get("ANYAICAM_ADMIN_EMAIL", "admin@local").strip().lower()
     admin_password = os.environ.get("ANYAICAM_ADMIN_PASSWORD", "")
     for user in users:
+        from tenancy.policy import normalize_role
+        domain, canonical_role = normalize_role(user)
+        identity_defaults = {
+            "identity_domain": domain,
+            "tenant_id": None if domain == "platform" else os.environ.get("ANYAICAM_LOCAL_TENANT_ID", "00000000-0000-4000-8000-000000000002"),
+            "platform_role": canonical_role if domain == "platform" else None,
+            "customer_role": canonical_role if domain == "customer" else None,
+        }
+        for field, value in identity_defaults.items():
+            if field not in user:
+                user[field] = value
+                changed = True
         user.setdefault("password_hash", "")
         user.setdefault("failed_login_attempts", 0)
         user.setdefault("locked_until", None)
@@ -1131,12 +1183,13 @@ def save_sessions(sessions: dict) -> None:
     temporary.replace(SESSIONS_FILE)
 
 
-def create_session(user_id: str, remember_me: bool = False) -> str:
+def create_session(user_id: str, remember_me: bool = False, identity_source: str = "local") -> str:
     session_id = secrets.token_urlsafe(32)
     sessions = load_sessions()
     max_age = 30 * 24 * 3600 if remember_me else SESSION_MAX_AGE_SECONDS
     sessions[session_id] = {
         "user_id": user_id,
+        "identity_source": identity_source,
         "created_at": datetime.now().isoformat(),
         "expires_at": (datetime.now() + timedelta(seconds=max_age)).isoformat(),
     }
@@ -1176,14 +1229,54 @@ def authenticated_user(request: Request) -> dict | None:
             return None
     except (KeyError, TypeError, ValueError):
         return None
-    user = next(
-        (
-            item for item in load_users()
-            if item.get("id") == session.get("user_id") and item.get("enabled", True)
-        ),
-        None,
-    )
+    if session.get("identity_source") == "database":
+        from partner_db import row
+        record = row("SELECT * FROM partner_users WHERE id=?", (session.get("user_id"),))
+        user = database_identity(record) if record else None
+    else:
+        user = next(
+            (
+                item for item in load_users()
+                if item.get("id") == session.get("user_id") and item.get("enabled", True)
+            ),
+            None,
+        )
     return user
+
+
+def database_identity(record: dict | None) -> dict | None:
+    """Map a database account into the unified application identity contract."""
+    if not record:
+        return None
+    from tenancy.policy import normalize_role
+    domain, canonical_role = normalize_role(record)
+    status = str(record.get("account_status") or "active").lower()
+    camera_ids = []
+    site_ids = []
+    if domain == "customer" and canonical_role != "customer_admin":
+        from partner_db import rows
+        camera_ids = [item["camera_id"] for item in rows(
+            "SELECT camera_id FROM camera_user_access WHERE tenant_id=? AND user_id=? AND can_view_live=1",
+            (record.get("tenant_id") or record.get("customer_id"), record.get("id")),
+        )]
+        site_ids = [item["site_id"] for item in rows(
+            "SELECT site_id FROM customer_site_permissions WHERE user_id=?",
+            (record.get("id"),),
+        )]
+    return {
+        **record,
+        "display_name": record.get("name") or record.get("email") or "User",
+        "role": canonical_role,
+        "identity_domain": domain,
+        "platform_role": canonical_role if domain == "platform" else None,
+        "customer_role": canonical_role if domain == "customer" else None,
+        "tenant_id": record.get("tenant_id") or record.get("customer_id"),
+        "enabled": bool(record.get("approved")) and status == "active",
+        "super_admin": domain == "platform" and canonical_role == "owner",
+        "site_ids": site_ids,
+        "camera_ids": camera_ids,
+        "identity_source": "database",
+    }
 
 
 def current_user(request: Request) -> dict:
@@ -1192,6 +1285,8 @@ def current_user(request: Request) -> dict:
         "display_name": "Unauthenticated",
         "email": "",
         "role": "viewer",
+        "identity_domain": "customer",
+        "tenant_id": None,
         "enabled": False,
         "site_ids": [],
         "camera_ids": [],
@@ -1199,6 +1294,12 @@ def current_user(request: Request) -> dict:
 
 
 def has_permission(user: dict, permission: str) -> bool:
+    from tenancy.policy import normalize_role
+    domain, role = normalize_role(user)
+    if domain == "platform" and role != "owner" and permission in {
+        "view_live", "view_events", "view_analytics", "export_media",
+    }:
+        return False
     return permission in ROLE_PERMISSIONS.get(user.get("role", "viewer"), set())
 
 
@@ -1207,7 +1308,9 @@ def user_camera_ids(user: dict) -> list[int]:
     raw_camera_ids = user.get("camera_ids") or []
 
     # Existing user records use an empty camera list to mean all cameras.
-    if user.get("super_admin") or user.get("role") == "admin" or not raw_camera_ids:
+    if user.get("super_admin") or user.get("role") in {"admin", "administrator", "owner", "customer_owner", "customer_admin"}:
+        return list(range(1, CAMERA_COUNT + 1))
+    if not raw_camera_ids and not user.get("identity_domain"):
         return list(range(1, CAMERA_COUNT + 1))
 
     allowed = []
@@ -4609,11 +4712,24 @@ PUBLIC_PATH_PREFIXES = (
 @app.middleware("http")
 async def authentication_middleware(request: Request, call_next):
     path = request.url.path
-    if path in {"/favicon.ico"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
+    public_path = path in {"/favicon.ico"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES)
+    # HLS is media, not a public static asset. Browser playback continues to
+    # use the normal signed session cookie.
+    if path.startswith(f"{HLS_URL_PREFIX}/"):
+        public_path = False
+    if public_path:
         return await call_next(request)
 
     user = authenticated_user(request)
     if user:
+        allowed, reason = identity_route_allowed(user, path)
+        if not allowed:
+            if path.startswith("/api/"):
+                return JSONResponse({"status": "error", "message": reason}, status_code=403)
+            return HTMLResponse(
+                "<h1>Access denied</h1><p>This page is outside your identity domain.</p>",
+                status_code=403,
+            )
         request.state.user = user
         return await call_next(request)
 
@@ -4627,9 +4743,39 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
-PARTNER_PORTAL_ROLES = {"partner_admin", "partner_sales", "installer"}
-CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer"}
-ADMIN_PORTAL_ROLES = {"administrator", "support_admin", "admin"}
+PARTNER_PORTAL_ROLES = {"partner_admin", "partner_sales", "installer", "sales", "operations"}
+CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer", "customer_admin", "manager", "viewer", "guard"}
+ADMIN_PORTAL_ROLES = {"administrator", "support_admin", "admin", "owner", "support", "billing", "operations"}
+
+PLATFORM_ONLY_PATH_PREFIXES = (
+    "/admin", "/partner", "/pricing", "/billing-operations", "/subscription-admin",
+    "/license-management", "/license-enforcement", "/onboarding-admin", "/audit-logs",
+    "/release-readiness", "/backup-restore", "/production-config", "/go-live",
+    "/operations", "/camera-health", "/edge/camera-provisioning", "/sites-management",
+    "/enterprise-", "/launch-readiness", "/subscription-admin", "/payment-setup",
+    "/users", "/business-users",
+)
+CUSTOMER_CAMERA_PATH_PREFIXES = (
+    "/events", "/alerts", "/playback", "/media", "/camera/", "/recordings/",
+    "/static/hls/", "/investigate", "/investigation-cases", "/incident-reports",
+    "/api/events", "/api/recordings", "/api/snapshots", "/api/clips", "/api/live",
+)
+
+
+def identity_route_allowed(user: dict, path: str) -> tuple[bool, str]:
+    """Enforce the identity-domain boundary independently from page navigation."""
+    from tenancy.policy import authorize, identity_domain
+    domain = identity_domain(user)
+    if domain == "customer" and path.startswith(PLATFORM_ONLY_PATH_PREFIXES):
+        return False, "Platform administration is not available to customer identities."
+    hls_match = re.fullmatch(r"/static/hls/camera(\d+)\.m3u8", path)
+    if domain == "customer" and hls_match and int(hls_match.group(1)) not in user_camera_ids(user):
+        return False, "Camera has not been shared with this customer identity."
+    camera_data_path = path == "/" or path.startswith(CUSTOMER_CAMERA_PATH_PREFIXES)
+    if domain == "platform" and camera_data_path:
+        decision = authorize(user, "camera.view", user.get("tenant_id"))
+        return decision.allowed, decision.reason
+    return True, "allowed"
 
 
 PUBLIC_BUSINESS_REGISTRATION_ROLES = {
@@ -4652,6 +4798,14 @@ def is_master_admin(user: dict | None) -> bool:
 def portal_destination_for_user(user: dict | None) -> str:
     """Return the existing portal destination for the authenticated role."""
     role = str((user or {}).get("role") or "").strip().lower()
+    if role == "sales":
+        return "/admin/customers/new"
+    if role == "support":
+        return "/admin-support"
+    if role == "billing":
+        return "/billing-operations"
+    if role == "operations":
+        return "/operations"
     if role == "installer":
         return "/partner-installations"
     if role in PARTNER_PORTAL_ROLES:
@@ -4821,6 +4975,7 @@ def customer_register_submit(
         display_name=normalized_name,
         email=normalized_email,
         role="customer_owner",
+        **identity_fields_for_role("customer_owner"),
         enabled=False,
         super_admin=False,
         site_ids=["home"],
@@ -4910,6 +5065,7 @@ def register_submit(
         display_name=normalized_name,
         email=normalized_email,
         role=normalized_role,
+        **identity_fields_for_role(normalized_role),
         enabled=False,
         super_admin=False,
         site_ids=["home"],
@@ -4953,6 +5109,19 @@ def login_submit(
     normalized_email = email.strip().lower()
     users = load_users()
     user = next((item for item in users if item.get("email", "").strip().lower() == normalized_email), None)
+    identity_source = "local"
+    password_is_valid = False
+    if user:
+        password_is_valid = verify_password(password, user.get("password_hash", ""))
+    else:
+        # Database-backed platform and tenant users share the normal login page
+        # and application session; authorization remains domain-specific.
+        from partner_db import authenticate_detailed
+        database_user, _reason = authenticate_detailed(normalized_email, password)
+        if database_user:
+            user = database_identity(database_user)
+            identity_source = "database"
+            password_is_valid = True
 
     if user and not user.get("enabled", True) and user.get("invitation_status") == "pending":
         return HTMLResponse(
@@ -4993,14 +5162,15 @@ def login_submit(
         except (TypeError, ValueError):
             user["locked_until"] = None
 
-    if not verify_password(password, user.get("password_hash", "")):
+    if not password_is_valid:
         user["failed_login_attempts"] = int(user.get("failed_login_attempts", 0)) + 1
         if user["failed_login_attempts"] >= MAX_LOGIN_ATTEMPTS:
             user["locked_until"] = (
                 datetime.now() + timedelta(minutes=LOCKOUT_MINUTES)
             ).isoformat()
             user["failed_login_attempts"] = 0
-        save_users(users)
+        if identity_source == "local":
+            save_users(users)
         append_audit_entry(
             AuditEntryModel(
                 user_id=user.get("id", "unknown"),
@@ -5018,9 +5188,10 @@ def login_submit(
     user["failed_login_attempts"] = 0
     user["locked_until"] = None
     user["last_login"] = datetime.now().isoformat()
-    save_users(users)
+    if identity_source == "local":
+        save_users(users)
 
-    token = create_session(user["id"], remember_me == "true")
+    token = create_session(user["id"], remember_me == "true", identity_source)
     append_audit_entry(
         AuditEntryModel(
             user_id=user["id"],
@@ -5033,7 +5204,7 @@ def login_submit(
             outcome="success",
         ).model_dump(mode="json")
     )
-    destination = safe_login_destination(user, next_url)
+    destination = "/account/change-password" if user.get("must_change_password") else safe_login_destination(user, next_url)
     response = RedirectResponse(destination, status_code=303)
     response.set_cookie(
         SESSION_COOKIE_NAME,
@@ -5163,6 +5334,7 @@ NAV_ITEMS = [
     ("dashboard", "/dashboard", "◉", "Dashboard"),
     ("admin-portal", "/admin-portal", "★", "Administrator portal"),
     ("admin-customers", "/admin-customers", "♙", "Customer accounts"),
+    ("new-customer", "/admin/customers/new", "+", "New customer"),
     ("admin-activation", "/admin-activation", "⇢", "Activation operations"),
     ("admin-support", "/admin-support", "?", "Support & compliance"),
     ("settings", "/settings", "⚒", "Settings"),
@@ -5195,6 +5367,7 @@ NAV_ITEMS = [
     ("subscription", "/subscription", "≡", "Subscription"),
     ("business-users", "/business-users", "♛", "Business users"),
     ("users", "/users", "♙", "Camera sharing users"),
+    ("tenant-camera-sharing", "/tenant/camera-sharing", "♙", "Camera sharing"),
     ("pricing", "/pricing", "$", "Pricing"),
     ("appliances", "/partner/appliance-dashboard", "▤", "Appliances"),
     ("partner-sales", "/partner-sales", "↗", "Partner sales"),
@@ -5266,7 +5439,8 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
     request = REQUEST_CONTEXT.get()
     shell_user = current_user(request) if request is not None else None
     shell_role = str((shell_user or {}).get("role") or "").strip().lower()
-    allowed_keys = navigation_keys_for_role(shell_role)
+    from tenancy.navigation import navigation_keys as tenant_navigation_keys
+    allowed_keys = tenant_navigation_keys(shell_user) if shell_user else {"help"}
 
     visible_nav_items = [
         item for item in NAV_ITEMS
@@ -5277,38 +5451,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         for key, url, icon, label in visible_nav_items
     )
 
-    if shell_role == "installer":
-        mobile_items = [
-            ("partner-install", "/partner-installations", "Installations"),
-            ("media", "/media", "Install guides"),
-            ("help", "/help", "Help"),
-        ]
-    elif shell_role in PARTNER_PORTAL_ROLES:
-        mobile_items = [
-            ("partner-sales", "/partner-sales", "Sales"),
-            ("partner-quotes", "/partner-quotes", "Quotes"),
-            ("partner-performance", "/partner-performance", "Performance"),
-            ("media", "/media", "Training"),
-            ("help", "/help", "Help"),
-        ]
-    elif shell_role in CUSTOMER_PORTAL_ROLES:
-        mobile_items = [
-            ("live", "/", "Cameras"),
-            ("alerts", "/alerts", "Alerts"),
-            ("playback", "/playback", "Playback"),
-            ("dashboard", "/dashboard", "Dashboard"),
-            ("settings", "/settings", "Account"),
-        ]
-    else:
-        mobile_items = [
-            ("live", "/", "Cameras"),
-            ("alerts", "/alerts", "Alerts"),
-            ("investigate", "/investigate", "Investigate"),
-            ("dashboard", "/dashboard", "Dashboard"),
-            ("sites", "/sites-management", "Sites"),
-            ("phone", "/phone-connect", "Phone"),
-            ("business-users", "/business-users", "Business users"),
-        ]
+    mobile_items = [(key, url, label) for key, url, _icon, label in visible_nav_items[:5]]
     mobile = "".join(
         f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
         for key, url, label in mobile_items
@@ -5352,6 +5495,7 @@ from customer_platform import register_customer_platform_routes
 from pwa_routes import register_pwa_routes
 from mobile_notifications import register_mobile_notification_routes
 from edge.routes import register_edge_discovery_routes
+from tenancy.routes import register_tenant_routes
 
 register_business_routes(app, page_shell)
 register_pricing_routes(app, page_shell)
@@ -5376,6 +5520,12 @@ register_pwa_routes(
 )
 register_mobile_notification_routes(
     app,
+    current_user=current_user,
+    record_audit=record_audit,
+)
+tenant_onboarding = register_tenant_routes(
+    app,
+    page_shell=page_shell,
     current_user=current_user,
     record_audit=record_audit,
 )
@@ -13837,6 +13987,7 @@ def accept_user_invite(payload: UserInviteAcceptModel) -> dict:
             display_name=payload.display_name,
             email=invite["email"],
             role=invite["role"],
+            **identity_fields_for_role(invite["role"]),
             enabled=True,
             super_admin=invite.get("super_admin", False),
             site_ids=["home"],
@@ -14040,6 +14191,7 @@ def create_user(request: Request, new_user: UserCreateModel) -> dict:
         display_name=new_user.display_name,
         email=new_user.email.strip().lower(),
         role=new_user.role,
+        **identity_fields_for_role(new_user.role),
         enabled=new_user.enabled,
         super_admin=new_user.super_admin,
         site_ids=new_user.site_ids,
