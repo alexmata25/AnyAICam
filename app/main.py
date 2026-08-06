@@ -5313,6 +5313,27 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
         for key, url, label in mobile_items
     )
+    scripts += """<script>
+document.addEventListener('submit',async event=>{
+  const form=event.target;
+  if(!(form instanceof HTMLFormElement)||!form.matches('.sidebar-auth[action="/logout"]'))return;
+  event.preventDefault();
+  const submitter=event.submitter||form.querySelector('button[type="submit"]');
+  if(submitter)submitter.disabled=true;
+  try{
+    const response=await window.fetch(form.action,{method:'POST'});
+    if(response.redirected){window.location.assign(response.url);return}
+    if(!response.ok){
+      const payload=await response.json().catch(()=>({}));
+      throw new Error(payload.detail||'Logout failed.');
+    }
+    window.location.assign('/login');
+  }catch(error){
+    if(submitter)submitter.disabled=false;
+    showToast(error.message||'Logout failed.');
+  }
+});
+</script>"""
     if cloud_settings.staging:
         content='<div class="mock-banner" role="status"><strong>STAGING ENVIRONMENT</strong> · Test data and services only</div>'+content
     content = license_warning_banner() + content
