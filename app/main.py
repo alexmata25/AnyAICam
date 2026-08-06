@@ -4461,6 +4461,32 @@ async def request_context_middleware(request: Request, call_next):
 
 
 @app.middleware("http")
+async def hls_freshness_middleware(request: Request, call_next):
+    """Never deliver an HLS manifest that is no longer advancing."""
+    match = re.fullmatch(r"/static/hls/camera(\d+)\.m3u8", request.url.path)
+    if match:
+        camera_number = int(match.group(1))
+        if 1 <= camera_number <= CAMERA_COUNT:
+            playlist = playlist_snapshot(
+                HLS_FOLDER,
+                camera_number,
+                HLS_FRESHNESS_SECONDS,
+            )
+            if not playlist["fresh"]:
+                return Response(
+                    content="HLS playlist is not fresh.",
+                    status_code=503,
+                    media_type="text/plain",
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                        "CDN-Cache-Control": "no-store",
+                        "Retry-After": "5",
+                    },
+                )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def maintenance_mode_middleware(request: Request, call_next):
     state = load_maintenance_state()
     exempt_paths = {

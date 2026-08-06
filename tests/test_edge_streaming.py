@@ -108,6 +108,8 @@ class EdgeStreamingIntegrationSourceTests(unittest.TestCase):
     def test_live_ui_uses_server_status_and_canonical_hls_url(self):
         self.assertIn("camera.status==='live'", self.source)
         self.assertIn("connectCamera(n,camera.hls_url)", self.source)
+        self.assertIn("async def hls_freshness_middleware", self.source)
+        self.assertIn('content="HLS playlist is not fresh."', self.source)
         self.assertNotIn("source='/hls/camera", self.source)
         self.assertNotIn("source=`/hls/camera", self.source)
 
