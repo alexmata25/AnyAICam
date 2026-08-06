@@ -9,6 +9,7 @@ services:
     volumes:
     - ./app:/app
     - ./recordings:/app/recordings
+    - ./data/config:/opt/anyaicam/data/config
     restart: unless-stopped
     healthcheck:
       test:
