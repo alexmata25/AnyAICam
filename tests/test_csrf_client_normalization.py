@@ -25,6 +25,9 @@ class CsrfClientNormalizationTests(unittest.TestCase):
         source = MAIN_SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("def auth_form_script()", source)
+        self.assertIn("new URL(input,window.location.href)", source)
+        self.assertIn("requestUrl.origin===window.location.origin", source)
+        self.assertNotIn("!input.startsWith('http://')", source)
         self.assertIn("new FormData(form)", source)
         self.assertIn("new URLSearchParams()", source)
         self.assertIn("if(response.redirected){location.assign(response.url);return}", source)

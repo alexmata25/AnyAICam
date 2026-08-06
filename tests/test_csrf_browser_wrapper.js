@@ -9,16 +9,20 @@ assert(source.includes("'X-CSRF-Token':token"));
 const document = { cookie: 'anyaicam_csrf="signed-token"' };
 let capturedHeader = null;
 const nativeFetch = (_input, options) => {
-  capturedHeader = options.headers["X-CSRF-Token"];
+  capturedHeader = options.headers?.["X-CSRF-Token"] ?? null;
   return Promise.resolve({ ok: true });
 };
-const window = { fetch: nativeFetch };
+const window = {
+  fetch: nativeFetch,
+  location: new URL("https://app.anyaicam.com/login"),
+};
 
 window.fetch = (input, options = {}) => {
   const method = (options.method || "GET").toUpperCase();
-  const sameOrigin = typeof input === "string"
-    ? !input.startsWith("http://") && !input.startsWith("https://")
-    : input.url.startsWith(location.origin);
+  const requestUrl = typeof input === "string"
+    ? new URL(input, window.location.href)
+    : new URL(input.url);
+  const sameOrigin = requestUrl.origin === window.location.origin;
   if (sameOrigin && ["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
     const csrf = document.cookie
       .split("; ")
@@ -32,9 +36,20 @@ window.fetch = (input, options = {}) => {
   return nativeFetch(input, options);
 };
 
-window.fetch("/login", { method: "POST" }).then(() => {
-  assert.equal(capturedHeader, "signed-token");
-  assert(!capturedHeader.startsWith('"'));
-  assert(!capturedHeader.endsWith('"'));
-  console.log(`browser-header=${capturedHeader}`);
-});
+(async () => {
+  for (const input of [
+    "/login",
+    "login",
+    "https://app.anyaicam.com/login",
+  ]) {
+    capturedHeader = null;
+    await window.fetch(input, { method: "POST" });
+    assert.equal(capturedHeader, "signed-token", input);
+    assert(!capturedHeader.startsWith('"'), input);
+    assert(!capturedHeader.endsWith('"'), input);
+  }
+  capturedHeader = null;
+  await window.fetch("https://example.invalid/login", { method: "POST" });
+  assert.equal(capturedHeader, null, "cross-origin request");
+  console.log("same-origin-login-variants=passed");
+})();
