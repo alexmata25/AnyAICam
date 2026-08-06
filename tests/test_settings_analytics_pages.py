@@ -1,8 +1,12 @@
 import ast
 from html import escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import inspect
 from pathlib import Path
 import re
+import threading
 import unittest
+from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,8 +14,14 @@ MAIN_SOURCE = ROOT / "app" / "main.py"
 
 
 class RouteStub:
-    def get(self, *_args, **_kwargs):
-        return lambda function: function
+    def __init__(self):
+        self.routes = {}
+
+    def get(self, path, **_kwargs):
+        def register(function):
+            self.routes[path] = function
+            return function
+        return register
 
 
 class SettingsAnalyticsPageTests(unittest.TestCase):
@@ -36,8 +46,9 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
         )
 
     def execute(self, *nodes, **values):
+        app = RouteStub()
         namespace = {
-            "app": RouteStub(),
+            "app": app,
             "HTMLResponse": object,
             "Request": object,
             **values,
@@ -45,6 +56,39 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
         module = ast.fix_missing_locations(ast.Module(body=list(nodes), type_ignores=[]))
         exec(compile(module, str(MAIN_SOURCE), "exec"), namespace)
         return namespace
+
+    def http_get(self, namespace, path):
+        routes = namespace["app"].routes
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    route = routes[self.path]
+                    result = route(object()) if inspect.signature(route).parameters else route()
+                    payload = str(result).encode("utf-8")
+                    self.send_response(200)
+                except Exception as error:
+                    payload = str(error).encode("utf-8")
+                    self.send_response(500)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{server.server_port}{path}", timeout=3
+            ) as response:
+                return response.status, response.read().decode("utf-8")
+        finally:
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_settings_page_renders_category_links(self):
         namespace = self.execute(
@@ -59,7 +103,8 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
             page_shell=lambda _title, _active, content, _scripts="": content,
         )
 
-        html = namespace["settings"](object())
+        status, html = self.http_get(namespace, "/settings")
+        self.assertEqual(status, 200)
         self.assertIn('href="/settings/cameras"', html)
         self.assertIn('href="/settings/events-alerts"', html)
 
@@ -74,7 +119,8 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
             page_shell=lambda _title, _active, content, _scripts="": content,
         )
 
-        html = namespace["analytics"]()
+        status, html = self.http_get(namespace, "/analytics")
+        self.assertEqual(status, 200)
         self.assertIn('href="/analytics/license-plate-recognition"', html)
         self.assertIn('href="/analytics/vehicle-search"', html)
 
