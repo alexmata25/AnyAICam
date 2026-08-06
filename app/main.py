@@ -5292,6 +5292,7 @@ from website_partner import register_website_partner_routes
 from customer_platform import register_customer_platform_routes
 from pwa_routes import register_pwa_routes
 from mobile_notifications import register_mobile_notification_routes
+from edge.routes import register_edge_discovery_routes
 
 register_business_routes(app, page_shell)
 register_pricing_routes(app, page_shell)
@@ -5318,6 +5319,13 @@ register_mobile_notification_routes(
     app,
     current_user=current_user,
     record_audit=record_audit,
+)
+register_edge_discovery_routes(
+    app,
+    current_user=current_user,
+    has_permission=has_permission,
+    runtime_role=RUNTIME_ROLE,
+    structured_log=structured_log,
 )
 
 
