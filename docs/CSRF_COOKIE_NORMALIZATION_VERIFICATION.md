@@ -34,4 +34,12 @@ The existing v0.9.0 test suite has pre-existing failures unrelated to this patch
 
 ## Deployment verification
 
-Pending access to the production Docker host. The current development machine has no Docker CLI, AWS CLI credentials, configured AWS region, or SSH host/key configuration. No rebuild, restart, or production mutation has been claimed in this report.
+- Transferred the Git commit to EC2 using a verified Git bundle; no ZIP package or GitHub push was used.
+- Checked out `feature/csrf-cookie-normalization` on the production host without moving `aws-production-20260806` or tag `v0.9.0`.
+- Rebuilt and recreated only the `vms` Compose service.
+- Deployed image: `sha256:f4b6a2a8f6277d9f14a5710ef91fe2d6d8f79bd6264a3afbbd56325dab16f56d`.
+- Container status: running and healthy; `/health` returned HTTP 200.
+- Live browser verification at `https://app.anyaicam.com/login` confirmed the fetch submit handler, quote normalization, normalized header assignment, and redirect handling are present; the old direct header expression is absent.
+- The JavaScript functional test captured `browser-header=signed-token`, proving a quoted cookie produces an unquoted header value.
+
+No real login credentials were submitted during automated verification, so no account lockout or customer database record was created.
