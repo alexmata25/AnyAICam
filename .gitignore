@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 app/static/hls/
+data/
 
 recordings/
 logs.txt
