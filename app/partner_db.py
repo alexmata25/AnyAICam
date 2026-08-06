@@ -14,6 +14,7 @@ REAL_SOURCE = 'real'
 DEMO_SOURCE = 'demo'
 
 ROLE_PERMISSIONS = {
+    'super_admin': {'*'},
     'administrator': {'*'},
     'partner_owner': {'partner.view','customer.create','customer.view','customer.edit','quote.create','user.invite','appliance.assign','appliance.action','pricing.view','pricing.edit','audit.view'},
     'salesperson': {'partner.view','customer.create','customer.view','customer.edit','quote.create','pricing.view'},
@@ -115,7 +116,7 @@ def authenticate_detailed(email: str,password: str):
     if user.get('must_change_password') and user.get('invitation_expires_at') and user['invitation_expires_at']<datetime.now().isoformat(): return None,'invitation_expired'
     if status in {'suspended','revoked'}: return None,status
     if status=='pending' or not user.get('approved'): return None,'pending'
-    if user.get('role') in {'administrator','partner_owner','salesperson','technician','owner','sales','support','installer','billing','operations'}:
+    if user.get('role') in {'super_admin','administrator','partner_owner','salesperson','technician','owner','sales','support','installer','billing','operations'}:
         approval=str(user.get('partner_approval_status') or 'pending').lower()
         if approval in {'rejected','revoked','suspended'}: return None,'revoked' if approval=='rejected' else approval
         if approval!='approved': return None,'pending'

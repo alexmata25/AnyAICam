@@ -13,6 +13,7 @@ from tenancy.policy import authorize, authorize_camera, normalize_role
 
 class TenancyPolicyTests(unittest.TestCase):
     def test_legacy_roles_map_to_independent_identity_domains(self):
+        self.assertEqual(normalize_role({"role": "super_admin"}), ("platform", "owner"))
         self.assertEqual(normalize_role({"role": "administrator"}), ("platform", "owner"))
         self.assertEqual(normalize_role({"role": "customer_owner"}), ("customer", "customer_admin"))
 

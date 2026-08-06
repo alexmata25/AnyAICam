@@ -28,7 +28,7 @@ try:
 except json.JSONDecodeError:
     PORTAL_ACCOUNTS = {}
 QUOTES_FILE = Path('/app/recordings/partner_quotes.json')
-LEGACY_PLATFORM_ROLES = {'administrator', 'partner_owner', 'salesperson', 'technician'}
+LEGACY_PLATFORM_ROLES = {'super_admin', 'administrator', 'partner_owner', 'salesperson', 'technician'}
 LEGACY_CUSTOMER_ROLES = {'customer_owner', 'customer_viewer'}
 PARTNER_ROLES = LEGACY_PLATFORM_ROLES | PLATFORM_ROLES
 AUTH_ROLES = PARTNER_ROLES | LEGACY_CUSTOMER_ROLES | CUSTOMER_ROLES

@@ -43,6 +43,8 @@ flowchart TD
 | Customer | Viewer | Live/playback/event access subject to camera grants |
 | Customer | Guard | Live/event access subject to camera grants |
 
+`Super Admin` and the earlier `administrator` role remain supported compatibility names for Platform Owner. Likewise, `Salesperson` maps to Platform Sales. New records use the canonical two-domain role names.
+
 ## Modules
 
 - `app/tenancy/policy.py`: domain normalization and tenant-first authorization.

@@ -10,6 +10,7 @@ PLATFORM_ROLES = {"owner", "sales", "support", "installer", "billing", "operatio
 CUSTOMER_ROLES = {"customer_admin", "manager", "viewer", "guard"}
 
 ROLE_ALIASES = {
+    "super_admin": ("platform", "owner"),
     "administrator": ("platform", "owner"),
     "admin": ("platform", "owner"),
     "support_admin": ("platform", "support"),

@@ -935,6 +935,11 @@ clip_tasks: set[asyncio.Task] = set()
 motion_event_lock = asyncio.Lock()
 
 ROLE_PERMISSIONS = {
+    "super_admin": {
+        "view_live", "view_events", "view_analytics", "view_sites",
+        "manage_users", "manage_settings", "view_audit", "export_media",
+        "acknowledge_alerts",
+    },
     # ANY AI CAM business portal roles.
     "administrator": {
         "view_live", "view_events", "view_analytics", "view_sites",
@@ -1069,7 +1074,7 @@ def migrate_users(users: list[dict]) -> tuple[list[dict], bool]:
         user.setdefault("locked_until", None)
         user.setdefault("site_ids", ["home"])
         user.setdefault("camera_ids", [])
-        user.setdefault("super_admin", user.get("role") in {"admin", "administrator", "support_admin"})
+        user.setdefault("super_admin", user.get("role") in {"super_admin", "admin", "administrator", "support_admin"})
         user.setdefault("invitation_status", "active")
         if user.get("id") == "local-admin":
             if not user.get("email"):
@@ -1308,7 +1313,7 @@ def user_camera_ids(user: dict) -> list[int]:
     raw_camera_ids = user.get("camera_ids") or []
 
     # Existing user records use an empty camera list to mean all cameras.
-    if user.get("super_admin") or user.get("role") in {"admin", "administrator", "owner", "customer_owner", "customer_admin"}:
+    if user.get("super_admin") or user.get("role") in {"super_admin", "admin", "administrator", "owner", "customer_owner", "customer_admin"}:
         return list(range(1, CAMERA_COUNT + 1))
     if not raw_camera_ids and not user.get("identity_domain"):
         return list(range(1, CAMERA_COUNT + 1))
@@ -4745,7 +4750,7 @@ async def authentication_middleware(request: Request, call_next):
 
 PARTNER_PORTAL_ROLES = {"partner_admin", "partner_sales", "installer", "sales", "operations"}
 CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer", "customer_admin", "manager", "viewer", "guard"}
-ADMIN_PORTAL_ROLES = {"administrator", "support_admin", "admin", "owner", "support", "billing", "operations"}
+ADMIN_PORTAL_ROLES = {"super_admin", "administrator", "support_admin", "admin", "owner", "support", "billing", "operations"}
 
 PLATFORM_ONLY_PATH_PREFIXES = (
     "/admin", "/partner", "/pricing", "/billing-operations", "/subscription-admin",
@@ -4789,9 +4794,12 @@ PUBLIC_BUSINESS_REGISTRATION_ROLES = {
 def is_master_admin(user: dict | None) -> bool:
     if not user:
         return False
+    from tenancy.policy import normalize_role
+    domain, role = normalize_role(user)
     return bool(
         user.get("id") == "local-admin"
         or user.get("super_admin") is True
+        or (domain == "platform" and role == "owner")
     )
 
 
