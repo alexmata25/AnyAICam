@@ -63,6 +63,15 @@ class CameraInventoryStore:
                 camera_id = str(safe["id"])
                 seen.add(camera_id)
                 previous = existing.get(camera_id, {})
+                if previous.get("provisioning_status") == "provisioned":
+                    safe["discovered_name"] = safe.get("name")
+                    for key in (
+                        "name", "provisioning_status", "camera_number",
+                        "rtsp_valid", "onvif_valid", "health_state",
+                        "recording", "fps", "bitrate_bps",
+                    ):
+                        if key in previous:
+                            safe[key] = previous[key]
                 safe["first_seen"] = previous.get("first_seen") or now
                 safe["last_seen"] = now
                 safe["last_scan"] = now
@@ -94,6 +103,29 @@ class CameraInventoryStore:
             }
             self._save(inventory)
             return inventory
+
+    def update(self, camera_id: str, values: dict) -> dict:
+        """Update only public inventory fields; credentials are always discarded."""
+        allowed = {
+            "name", "status", "provisioning_status", "camera_number",
+            "rtsp_valid", "onvif_valid", "health_state", "recording",
+            "fps", "bitrate_bps",
+        }
+        with self._lock:
+            inventory = self.load()
+            camera = next(
+                (item for item in inventory["cameras"] if item.get("id") == camera_id),
+                None,
+            )
+            if camera is None:
+                raise KeyError(camera_id)
+            camera.update(
+                _without_credentials({key: value for key, value in values.items() if key in allowed})
+            )
+            camera["updated_at"] = utc_now()
+            inventory["updated_at"] = camera["updated_at"]
+            self._save(inventory)
+            return dict(camera)
 
     def _save(self, inventory: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

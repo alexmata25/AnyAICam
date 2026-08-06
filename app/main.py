@@ -20,7 +20,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 from email.message import EmailMessage
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
@@ -49,6 +49,7 @@ from edge_streaming import (
     remove_startup_manifests,
     rtsp_endpoint_ready,
 )
+from edge.camera_provisioning import CameraConfigurationStore, credentialed_rtsp_url
 
 try:
     from pywebpush import webpush, WebPushException
@@ -1798,7 +1799,26 @@ def diagnostics_snapshot() -> dict:
     }
 
 
+def camera_configuration_store() -> CameraConfigurationStore:
+    return CameraConfigurationStore(
+        Path(os.environ.get("ANYAICAM_CONFIG_ROOT", "/opt/anyaicam/data/config"))
+        / "provisioned_cameras.json"
+    )
+
+
+def camera_display_name(camera_number: int) -> str:
+    provisioned = camera_configuration_store().by_number(camera_number)
+    return str(provisioned.get("name") or f"Camera {camera_number}") if provisioned else f"Camera {camera_number}"
+
+
 def camera_url(camera_number: int) -> str:
+    provisioned = camera_configuration_store().by_number(camera_number)
+    if provisioned:
+        return credentialed_rtsp_url(
+            str(provisioned.get("rtsp_url") or ""),
+            str(provisioned.get("username") or ""),
+            str(provisioned.get("password") or ""),
+        )
     host = os.environ[f"CAMERA{camera_number}_HOST"]
     port = int(os.environ.get(f"CAMERA{camera_number}_PORT", "554"))
     username = quote(os.environ[f"CAMERA{camera_number}_USERNAME"], safe="")
@@ -1813,6 +1833,14 @@ def camera_rtsp_readiness(camera_number: int) -> tuple[bool, str]:
     """Probe a camera only from an edge/combined runtime before launching FFmpeg."""
     if RUNTIME_ROLE not in {"edge", "combined"}:
         return False, "rtsp ingestion is disabled outside the edge runtime"
+    provisioned = camera_configuration_store().by_number(camera_number)
+    if provisioned:
+        parsed = urlparse(str(provisioned.get("rtsp_url") or ""))
+        return rtsp_endpoint_ready(
+            parsed.hostname or "",
+            parsed.port or 554,
+            RTSP_READINESS_TIMEOUT_SECONDS,
+        )
     host = os.environ.get(f"CAMERA{camera_number}_HOST", "").strip()
     try:
         port = int(os.environ.get(f"CAMERA{camera_number}_PORT", "554"))
@@ -4320,6 +4348,14 @@ async def health_monitor() -> None:
                     "message": f"Camera {camera_number} has repeatedly failed to reconnect.", "severity": "warning",
                 }
         metrics = system_metrics()
+        if RUNTIME_ROLE in {"edge", "combined"}:
+            try:
+                await asyncio.to_thread(edge_camera_provisioning.refresh_health)
+            except Exception as error:
+                structured_log(
+                    "edge.camera_health.failed",
+                    error=str(error)[:240],
+                )
         if metrics["cpu_percent"] >= 85:
             detected["system-high-cpu"] = {
                 "type": "high_cpu", "camera": None,
@@ -5130,6 +5166,7 @@ NAV_ITEMS = [
     ("admin-activation", "/admin-activation", "⇢", "Activation operations"),
     ("admin-support", "/admin-support", "?", "Support & compliance"),
     ("settings", "/settings", "⚒", "Settings"),
+    ("camera-provisioning", "/edge/camera-provisioning", "+", "Camera provisioning"),
     ("operations", "/operations", "⚙", "Operations"),
     ("camera-health", "/camera-health", "♡", "Camera health"),
     ("audit", "/audit-logs", "▤", "Audit logs"),
@@ -5211,6 +5248,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
         "media": "export_media",
         "dashboard": "view_sites",
         "camera-health": "view_sites",
+        "camera-provisioning": "manage_settings",
         "analytics": "view_analytics",
         "settings": "manage_settings",
         "users": "manage_users",
@@ -5320,12 +5358,20 @@ register_mobile_notification_routes(
     current_user=current_user,
     record_audit=record_audit,
 )
-register_edge_discovery_routes(
+edge_camera_provisioning = register_edge_discovery_routes(
     app,
     current_user=current_user,
     has_permission=has_permission,
     runtime_role=RUNTIME_ROLE,
     structured_log=structured_log,
+    page_shell=page_shell,
+    hls_folder=HLS_FOLDER,
+    recordings_folder=RECORDINGS_FOLDER,
+    hls_freshness_seconds=HLS_FRESHNESS_SECONDS,
+    process_state=lambda camera_number: dict(
+        camera_process_state.get(camera_number, {})
+    ),
+    camera_capacity=CAMERA_COUNT,
 )
 
 
@@ -5333,9 +5379,11 @@ register_edge_discovery_routes(
 def camera_detail(camera_number: int) -> str:
     if camera_number < 1 or camera_number > CAMERA_COUNT:
         raise HTTPException(status_code=404, detail="Camera not found")
+    display_name = escape(camera_display_name(camera_number))
     content = f"""<header class="topbar"><div><p class="eyebrow">Camera detail</p><h1>Camera {camera_number}</h1></div><a class="ghost-button" href="/">Back to cameras</a></header><section class="panel"><div class="camera-view" style="border-radius:10px"><video id="detail-video" controls muted playsinline></video><div class="camera-placeholder" id="detail-placeholder"><span class="signal">◉</span><strong>Waiting for live hardware</strong><small>The controls remain available while this camera is offline.</small></div></div><div class="camera-tools" style="justify-content:center"><button class="camera-tool" onclick="comingSoon('Microphone requires compatible camera hardware')" title="Microphone">◖</button><button class="camera-tool" id="detail-mute" title="Mute">♩</button><button class="camera-tool" onclick="comingSoon('Snapshot uses the live camera frame')" title="Snapshot">◉</button><button class="camera-tool" onclick="document.getElementById('detail-video').requestFullscreen()" title="Full screen">⛶</button><a class="camera-tool" href="/playback" title="Playback">◴</a></div></section><div class="workspace-tabs" style="margin-top:18px"><button class="workspace-tab active">Live</button><a class="workspace-tab" href="/playback" style="text-decoration:none">Playback</a><a class="workspace-tab" href="/analytics" style="text-decoration:none">Analytics · Demo</a></div>"""
     scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';if(Hls.isSupported()){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
-    return page_shell(f"Camera {camera_number}", "live", content, scripts)
+    content = content.replace(f"<h1>Camera {camera_number}</h1>", f"<h1>{display_name}</h1>", 1)
+    return page_shell(camera_display_name(camera_number), "live", content, scripts)
 
 
 
@@ -5628,6 +5676,10 @@ def operations_page(request: Request) -> str:
 def camera_status() -> dict:
     now = time.time()
     cameras = []
+    configured_names = {
+        int(camera.get("camera_number") or 0): str(camera.get("name") or "")
+        for camera in camera_configuration_store().safe_view()["cameras"]
+    }
     for camera_number in range(1, CAMERA_COUNT + 1):
         playlist = playlist_snapshot(
             HLS_FOLDER,
@@ -5642,6 +5694,7 @@ def camera_status() -> dict:
         cameras.append(
             {
                 "camera": camera_number,
+                "name": configured_names.get(camera_number) or f"Camera {camera_number}",
                 "online": status is StreamStatus.LIVE,
                 "status": status.value,
                 "status_label": status.value.title(),
@@ -7825,6 +7878,10 @@ def go_live_page(request: Request) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
+    camera_names = {
+        number: escape(camera_display_name(number))
+        for number in range(1, CAMERA_COUNT + 1)
+    }
     camera_cards = "".join(
         f"""<article class="camera-card">
         <div class="camera-view">
@@ -7834,11 +7891,11 @@ def home() -> str:
                 <span>The camera will reconnect automatically.</span>
             </div>
             <span class="live-badge">LIVE</span>
-            <video id="camera{n}" autoplay muted controls playsinline aria-label="Camera {n} live stream"></video>
+            <video id="camera{n}" autoplay muted controls playsinline aria-label="{camera_names[n]} live stream"></video>
             <div class="analytics-overlay" id="overlay{n}">Analytics overlay</div>
         </div>
         <div class="camera-meta">
-            <span class="camera-name">Camera {n}</span>
+            <span class="camera-name" id="camera-name{n}">{camera_names[n]}</span>
             <span class="camera-state" id="state{n}">Connecting…</span>
         </div>
         <div class="camera-tools polished" aria-label="Camera {n} controls">
@@ -7860,7 +7917,7 @@ def home() -> str:
             <button class="camera-action" id="audio{n}" type="button" title="Mute or unmute browser audio" onclick="toggleCameraAudio({n})">
                 <span class="camera-action-icon">◖</span><span id="audio-label{n}">Unmute</span>
             </button>
-            <a class="camera-action" title="Open camera and recording settings" href="/settings">
+            <a class="camera-action" title="Open camera provisioning and settings" href="/edge/camera-provisioning">
                 <span class="camera-action-icon">⚙</span><span>Settings</span>
             </a>
             <button class="camera-action" id="analytics{n}" type="button" title="Show or hide the analytics overlay" onclick="toggleAnalytics({n})">
@@ -7944,6 +8001,7 @@ async function refreshCameraStates(){
         const data=await response.json();
         (data.cameras||[]).forEach(camera=>{
             const n=Number(camera.camera),isLive=camera.status==='live';
+            const name=document.getElementById(`camera-name${n}`);if(name)name.textContent=camera.name||`Camera ${n}`;
             setState(n,camera.status_label||'Error',isLive);
             if(isLive)connectCamera(n,camera.hls_url);else disconnectCamera(n);
         });
@@ -8191,6 +8249,10 @@ def camera_health_page() -> str:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard() -> str:
+    camera_names = {
+        number: escape(camera_display_name(number))
+        for number in range(1, CAMERA_COUNT + 1)
+    }
     clips = sorted(
         RECORDINGS_FOLDER.rglob("*.mkv"),
         key=lambda clip: clip.stat().st_mtime,
@@ -8218,7 +8280,7 @@ def dashboard() -> str:
         </div>
         <div class="dashboard-camera-info">
             <div>
-                <div class="dashboard-camera-name">Camera {camera_number}</div>
+                <div class="dashboard-camera-name" id="dashboard-name-{camera_number}">{camera_names[camera_number]}</div>
                 <div class="dashboard-camera-detail" id="dashboard-detail-{camera_number}">Checking stream and recording status…</div>
             </div>
             <span class="dashboard-open-icon" aria-hidden="true">↗</span>
@@ -8368,6 +8430,7 @@ async function updateDashboard(){
             const rec=document.getElementById(`dashboard-rec-${camera.camera}`);
             const detail=document.getElementById(`dashboard-detail-${camera.camera}`);
             const card=document.getElementById(`dashboard-camera-${camera.camera}`);
+            const name=document.getElementById(`dashboard-name-${camera.camera}`);if(name)name.textContent=camera.name||`Camera ${camera.camera}`;
             if(camera.online)onlineCount++;
             live.textContent=camera.status_label.toUpperCase();live.classList.toggle('wait',!camera.online);
             rec.classList.toggle('inactive',camera.recording!=='running');
