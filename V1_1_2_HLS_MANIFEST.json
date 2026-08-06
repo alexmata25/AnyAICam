@@ -1,0 +1,14 @@
+{
+  "product": "AnyAiCam VMS",
+  "version": "1.1.2-hls",
+  "artifact": "v1_1_2_hls_latency_patch.py",
+  "sha256": "3c3b9d7fed596ecba6312f4323cd869c2cc2f7690e69ec7d8582ce28241566b7",
+  "changes": {
+    "hls_time_seconds": 1,
+    "hls_list_size": 3,
+    "gop_frames": 56,
+    "keyint_min_frames": 28,
+    "scene_change_threshold": 0
+  },
+  "syntax_validation": "passed"
+}

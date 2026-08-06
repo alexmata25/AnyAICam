@@ -1,0 +1,10 @@
+{
+  "product": "AnyAiCam VMS",
+  "version": "1.0.1",
+  "release_name": "Cloud ID Management",
+  "artifact": "main_v1_0_1_cloud_id_override.py",
+  "sha256": "75c7f77e7c76cdc9afc7674ea83e10e37a76d07b9c84a508c986aa0946ecb062",
+  "syntax_validation": "passed",
+  "external_provider_calls": false,
+  "credential_storage": false
+}

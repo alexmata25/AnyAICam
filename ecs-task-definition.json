@@ -1,0 +1,83 @@
+{
+  "family": "anyaicam-vms-staging",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/anyaicamVmsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "anyaicam-vms",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com/anyaicam-vms:<IMAGE_TAG>",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "ANYAICAM_ENV",
+          "value": "staging"
+        },
+        {
+          "name": "ANYAICAM_RUNTIME_ROLE",
+          "value": "cloud"
+        },
+        {
+          "name": "ANYAICAM_FORCE_HTTPS",
+          "value": "true"
+        },
+        {
+          "name": "ANYAICAM_SECURE_COOKIES",
+          "value": "true"
+        },
+        {
+          "name": "ANYAICAM_CLOUD_UPLOAD_ENABLED",
+          "value": "false"
+        },
+        {
+          "name": "WEB_CONCURRENCY",
+          "value": "2"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "ANYAICAM_DATABASE_URL",
+          "valueFrom": "<DATABASE_URL_SECRET_ARN>"
+        },
+        {
+          "name": "ANYAICAM_PORTAL_SECRET",
+          "valueFrom": "<PORTAL_SECRET_ARN>"
+        },
+        {
+          "name": "ANYAICAM_SMTP_PASSWORD",
+          "valueFrom": "<SMTP_PASSWORD_SECRET_ARN>"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8000/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/anyaicam-vms",
+          "awslogs-region": "<AWS_REGION>",
+          "awslogs-stream-prefix": "app",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

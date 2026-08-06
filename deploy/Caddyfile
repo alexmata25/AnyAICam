@@ -1,0 +1,27 @@
+{
+    email {$TLS_EMAIL}
+    servers {
+        trusted_proxies static private_ranges
+    }
+}
+
+{$PUBLIC_DOMAIN:anyaicam.com}, {$PORTAL_DOMAIN:portal.anyaicam.com} {
+    encode zstd gzip
+    request_body {
+        max_size 250MB
+    }
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy same-origin
+    }
+    reverse_proxy {$APP_UPSTREAM:vms:8000} {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+        header_up X-Real-IP {remote_host}
+        # Caddy forwards WebSocket upgrade headers automatically.
+        health_uri /health/live
+        health_interval 30s
+    }
+}

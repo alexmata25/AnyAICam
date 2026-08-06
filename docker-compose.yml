@@ -1,0 +1,23 @@
+services:
+  vms:
+    build: .
+    container_name: anyaicam-vms
+    ports:
+    - 8000:8000
+    env_file:
+    - .env
+    volumes:
+    - ./app:/app
+    - ./recordings:/app/recordings
+    restart: unless-stopped
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; r=urllib.request.Request('http://localhost:8000/health',
+        headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(r, timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s

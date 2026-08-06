@@ -1,0 +1,8 @@
+ANYAICAM_PUBLIC_URL=https://app.anyaicam.com
+ANYAICAM_PHONE_URL=https://app.anyaicam.com
+ANYAICAM_ALLOWED_ORIGINS=https://app.anyaicam.com,https://anyaicam.com
+
+# Keep blank until real VAPID values are generated privately:
+ANYAICAM_VAPID_PUBLIC_KEY=
+ANYAICAM_VAPID_PRIVATE_KEY=
+ANYAICAM_VAPID_SUBJECT=mailto:amata@anyaicam.com

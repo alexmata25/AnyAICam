@@ -1,0 +1,303 @@
+
+# ============================================================================
+# Phase 6E — Post-Launch Stabilization and Operational Assurance
+# Safe, local-first operational controls. No external network calls are made.
+# ============================================================================
+
+PHASE6E_STATE_FILE = RECORDINGS_FOLDER / "phase6e_operational_state.json"
+PHASE6E_DRILLS_FILE = RECORDINGS_FOLDER / "phase6e_incident_drills.json"
+PHASE6E_SLO_FILE = RECORDINGS_FOLDER / "phase6e_slo_history.json"
+PHASE6E_DEPLOYMENTS_FILE = RECORDINGS_FOLDER / "phase6e_deployments.json"
+
+PHASE6E_DEFAULT_SLOS = {
+    "availability_target": 99.9,
+    "api_p95_ms_target": 750,
+    "camera_online_target": 95.0,
+    "recording_success_target": 99.0,
+    "upload_success_target": 98.0,
+    "max_open_incidents": 3,
+}
+
+
+class Phase6EDeploymentCheckModel(BaseModel):
+    release_id: str = Field(min_length=2, max_length=120)
+    version: str = Field(min_length=1, max_length=60)
+    environment: str = Field(default="production", max_length=40)
+    notes: str = Field(default="", max_length=2000)
+
+
+class Phase6EIncidentDrillModel(BaseModel):
+    scenario: str = Field(min_length=3, max_length=160)
+    owner: str = Field(min_length=2, max_length=120)
+    result: str = Field(default="passed", pattern="^(passed|failed|partial)$")
+    recovery_minutes: int = Field(default=0, ge=0, le=10080)
+    notes: str = Field(default="", max_length=3000)
+
+
+def _phase6e_load(path: Path, default):
+    value = load_json_file(path, default)
+    return value if isinstance(value, type(default)) else default
+
+
+def phase6e_operational_snapshot() -> dict:
+    now = datetime.now()
+    total_cameras = max(1, CAMERA_COUNT)
+    online_cameras = sum(
+        1 for camera in camera_process_state.values()
+        if camera.get("live") in {"online", "running", "healthy"}
+    )
+    recording_cameras = sum(
+        1 for camera in camera_process_state.values()
+        if camera.get("recording") in {"online", "running", "healthy"}
+    )
+
+    queue = globals().get("cloud_upload_queue", [])
+    uploaded = sum(item.get("status") == "uploaded" for item in queue)
+    failed = sum(item.get("status") == "failed" for item in queue)
+    completed_uploads = uploaded + failed
+    upload_success = round((uploaded / completed_uploads) * 100, 2) if completed_uploads else 100.0
+
+    incidents = _phase6e_load(INCIDENTS_FILE, [])
+    open_incidents = sum(
+        str(item.get("status", "open")).lower() not in {"resolved", "closed"}
+        for item in incidents
+    )
+
+    uptime_seconds = max(0, int((now - STARTED_AT).total_seconds()))
+    camera_online_percent = round((online_cameras / total_cameras) * 100, 2)
+    recording_success_percent = round((recording_cameras / total_cameras) * 100, 2)
+
+    checks = {
+        "application_running": True,
+        "release_candidate": bool(RELEASE_CANDIDATE),
+        "secure_cookies": bool(SECURE_COOKIES),
+        "https_enforced": bool(FORCE_HTTPS),
+        "public_url_configured": bool(PUBLIC_BASE_URL),
+        "backup_directory_available": BACKUPS_FOLDER.exists(),
+        "recordings_directory_writable": os.access(RECORDINGS_FOLDER, os.W_OK),
+        "camera_online_percent": camera_online_percent,
+        "recording_success_percent": recording_success_percent,
+        "upload_success_percent": upload_success,
+        "open_incidents": open_incidents,
+    }
+
+    targets = dict(PHASE6E_DEFAULT_SLOS)
+    evaluations = {
+        "camera_online": camera_online_percent >= targets["camera_online_target"],
+        "recording_success": recording_success_percent >= targets["recording_success_target"],
+        "upload_success": upload_success >= targets["upload_success_target"],
+        "incident_load": open_incidents <= targets["max_open_incidents"],
+    }
+    healthy = all(evaluations.values())
+
+    return {
+        "phase": "6E",
+        "name": "Post-Launch Stabilization and Operational Assurance",
+        "checked_at": now.isoformat(),
+        "uptime_seconds": uptime_seconds,
+        "healthy": healthy,
+        "checks": checks,
+        "targets": targets,
+        "evaluations": evaluations,
+        "recommended_action": (
+            "Continue normal operations and review the dashboard daily."
+            if healthy
+            else "Review failed SLO checks, open incidents, and rollback readiness."
+        ),
+    }
+
+
+def phase6e_release_readiness(release_id: str, version: str, environment: str, notes: str) -> dict:
+    snapshot = phase6e_operational_snapshot()
+    cloud_snapshot_fn = globals().get("cloud_configuration_snapshot")
+    cloud = cloud_snapshot_fn() if callable(cloud_snapshot_fn) else {}
+
+    blockers = []
+    if environment.lower() == "production":
+        if not SECURE_COOKIES:
+            blockers.append("Secure cookies are disabled.")
+        if not FORCE_HTTPS:
+            blockers.append("HTTPS enforcement is disabled.")
+        if not PUBLIC_BASE_URL:
+            blockers.append("Public base URL is not configured.")
+    if not snapshot["checks"]["recordings_directory_writable"]:
+        blockers.append("Recordings directory is not writable.")
+    if not snapshot["checks"]["backup_directory_available"]:
+        blockers.append("Backup directory is unavailable.")
+    if snapshot["checks"]["open_incidents"] > PHASE6E_DEFAULT_SLOS["max_open_incidents"]:
+        blockers.append("Open incident count exceeds the Phase 6E limit.")
+
+    warnings = []
+    if not RELEASE_CANDIDATE:
+        warnings.append("Build is not marked as a release candidate.")
+    if cloud and not cloud.get("cloud_foundation_ready", False):
+        warnings.append("Cloud foundation configuration is incomplete.")
+    if snapshot["checks"]["camera_online_percent"] < PHASE6E_DEFAULT_SLOS["camera_online_target"]:
+        warnings.append("Camera online percentage is below target.")
+
+    record = {
+        "id": uuid.uuid4().hex[:16],
+        "release_id": release_id.strip(),
+        "version": version.strip(),
+        "environment": environment.strip().lower(),
+        "notes": notes.strip(),
+        "created_at": datetime.now().isoformat(),
+        "status": "blocked" if blockers else ("warning" if warnings else "ready"),
+        "blockers": blockers,
+        "warnings": warnings,
+        "rollback_ready": bool(BACKUPS_FOLDER.exists() and os.access(BACKUPS_FOLDER, os.W_OK)),
+        "snapshot": snapshot,
+    }
+    records = _phase6e_load(PHASE6E_DEPLOYMENTS_FILE, [])
+    records.append(record)
+    save_json_file(PHASE6E_DEPLOYMENTS_FILE, records[-500:])
+    structured_log(
+        "phase6e.release_readiness",
+        release_id=record["release_id"],
+        status=record["status"],
+        blocker_count=len(blockers),
+        warning_count=len(warnings),
+    )
+    return record
+
+
+@app.get("/api/operations/stability")
+def phase6e_stability_api(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    snapshot = phase6e_operational_snapshot()
+    history = _phase6e_load(PHASE6E_SLO_FILE, [])
+    history.append({
+        "checked_at": snapshot["checked_at"],
+        "healthy": snapshot["healthy"],
+        "checks": snapshot["checks"],
+        "evaluations": snapshot["evaluations"],
+    })
+    save_json_file(PHASE6E_SLO_FILE, history[-2016:])
+    return snapshot
+
+
+@app.get("/api/operations/deployments")
+def phase6e_deployments_api(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    records = _phase6e_load(PHASE6E_DEPLOYMENTS_FILE, [])
+    return {"deployments": list(reversed(records[-100:]))}
+
+
+@app.post("/api/operations/deployments/check")
+def phase6e_deployment_check(payload: Phase6EDeploymentCheckModel, request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    return phase6e_release_readiness(
+        payload.release_id, payload.version, payload.environment, payload.notes
+    )
+
+
+@app.get("/api/operations/drills")
+def phase6e_drills_api(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    return {"drills": list(reversed(_phase6e_load(PHASE6E_DRILLS_FILE, [])[-100:]))}
+
+
+@app.post("/api/operations/drills")
+def phase6e_create_drill(payload: Phase6EIncidentDrillModel, request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    drill = {
+        "id": uuid.uuid4().hex[:16],
+        "scenario": payload.scenario.strip(),
+        "owner": payload.owner.strip(),
+        "result": payload.result,
+        "recovery_minutes": payload.recovery_minutes,
+        "notes": payload.notes.strip(),
+        "created_at": datetime.now().isoformat(),
+        "created_by": user.get("id", "unknown"),
+    }
+    drills = _phase6e_load(PHASE6E_DRILLS_FILE, [])
+    drills.append(drill)
+    save_json_file(PHASE6E_DRILLS_FILE, drills[-500:])
+    structured_log(
+        "phase6e.incident_drill",
+        drill_id=drill["id"],
+        result=drill["result"],
+        recovery_minutes=drill["recovery_minutes"],
+    )
+    return {"status": "complete", "message": "Incident drill recorded.", "drill": drill}
+
+
+@app.get("/operations/stability", response_class=HTMLResponse)
+def phase6e_stability_page(request: Request):
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    content = """
+    <header class="topbar">
+      <div><p class="eyebrow">Phase 6E operations</p><h1>Stability and release assurance</h1></div>
+      <button class="action-button" id="refresh-phase6e">Refresh checks</button>
+    </header>
+    <section class="site-summary-grid" id="phase6e-summary"></section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>Release readiness</h2><div class="health-detail">Local validation only. This does not deploy or contact an external service.</div></div></div>
+      <form id="phase6e-release-form" class="settings-grid">
+        <label>Release ID<input id="phase6e-release-id" required placeholder="release-2026-08-04"></label>
+        <label>Version<input id="phase6e-version" required placeholder="1.0.0"></label>
+        <label>Environment<select id="phase6e-environment"><option value="production">Production</option><option value="staging">Staging</option></select></label>
+        <label>Notes<textarea id="phase6e-notes" rows="3"></textarea></label>
+        <div><button class="action-button" type="submit">Run readiness check</button></div>
+      </form>
+      <div id="phase6e-release-result" class="health-detail" style="margin-top:14px"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Incident drill log</h2></div>
+      <form id="phase6e-drill-form" class="settings-grid">
+        <label>Scenario<input id="phase6e-scenario" required placeholder="S3 upload queue unavailable"></label>
+        <label>Owner<input id="phase6e-owner" required placeholder="Operations"></label>
+        <label>Result<select id="phase6e-result"><option>passed</option><option>partial</option><option>failed</option></select></label>
+        <label>Recovery minutes<input id="phase6e-recovery" type="number" min="0" value="0"></label>
+        <label>Notes<textarea id="phase6e-drill-notes" rows="3"></textarea></label>
+        <div><button class="action-button" type="submit">Record drill</button></div>
+      </form>
+      <div id="phase6e-drills" style="margin-top:18px"></div>
+    </section>
+    """
+    scripts = """
+    <script>
+    const p6eEsc=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    async function phase6eLoad(){
+      const response=await fetch('/api/operations/stability'), data=await response.json();
+      if(!response.ok){showToast(data.detail||'Could not load stability checks.');return;}
+      const checks=data.checks||{};
+      document.getElementById('phase6e-summary').innerHTML=[
+        ['Overall',data.healthy?'Healthy':'Needs attention'],
+        ['Camera online',`${checks.camera_online_percent??0}%`],
+        ['Recording',`${checks.recording_success_percent??0}%`],
+        ['Upload success',`${checks.upload_success_percent??0}%`],
+        ['Open incidents',checks.open_incidents??0]
+      ].map(([label,value])=>`<article class="site-summary-card"><span class="site-summary-label">${p6eEsc(label)}</span><strong class="site-summary-value">${p6eEsc(value)}</strong></article>`).join('');
+      const drillsResponse=await fetch('/api/operations/drills'), drillsData=await drillsResponse.json();
+      document.getElementById('phase6e-drills').innerHTML=(drillsData.drills||[]).map(item=>`<article class="feature-card"><h3>${p6eEsc(item.scenario)}</h3><p>${p6eEsc(item.result)} · ${p6eEsc(item.recovery_minutes)} minutes · ${p6eEsc(item.owner)}</p><small>${p6eEsc(item.created_at)}</small></article>`).join('')||'<div class="empty">No incident drills recorded.</div>';
+    }
+    document.getElementById('refresh-phase6e').onclick=phase6eLoad;
+    document.getElementById('phase6e-release-form').onsubmit=async event=>{
+      event.preventDefault();
+      const payload={release_id:document.getElementById('phase6e-release-id').value,version:document.getElementById('phase6e-version').value,environment:document.getElementById('phase6e-environment').value,notes:document.getElementById('phase6e-notes').value};
+      const response=await fetch('/api/operations/deployments/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();
+      document.getElementById('phase6e-release-result').textContent=response.ok?`Status: ${data.status}. Blockers: ${(data.blockers||[]).join(' ')||'None'}`:(data.detail||'Check failed.');
+    };
+    document.getElementById('phase6e-drill-form').onsubmit=async event=>{
+      event.preventDefault();
+      const payload={scenario:document.getElementById('phase6e-scenario').value,owner:document.getElementById('phase6e-owner').value,result:document.getElementById('phase6e-result').value,recovery_minutes:Number(document.getElementById('phase6e-recovery').value||0),notes:document.getElementById('phase6e-drill-notes').value};
+      const response=await fetch('/api/operations/drills',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();
+      showToast(data.message||data.detail||'Drill saved.'); if(response.ok){event.currentTarget.reset();phase6eLoad();}
+    };
+    phase6eLoad();
+    </script>
+    """
+    return page_shell("Stability operations", "settings", content, scripts)

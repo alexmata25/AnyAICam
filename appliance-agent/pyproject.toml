@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anyaicam-appliance-agent"
+version = "0.1.0"
+description = "AnyAiCam Linux appliance agent"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+anyaicam-agent = "anyaicam_agent.service:main"
+anyaicam-setup = "anyaicam_agent.setup_wizard:main"
+anyaicam-status = "anyaicam_agent.cli:status_main"
+anyaicam-diagnostics = "anyaicam_agent.cli:diagnostics_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["anyaicam_agent*"]

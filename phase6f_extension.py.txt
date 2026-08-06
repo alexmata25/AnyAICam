@@ -1,0 +1,455 @@
+
+# ============================================================================
+# Phase 6F — Controlled Production Validation and Customer Pilot
+# Explicit approvals, bounded pilot cohorts, validation windows, and rollback
+# checkpoints. This phase does not deploy, activate cloud services, or contact
+# external providers.
+# ============================================================================
+
+PHASE6F_MARKER = "Phase 6F — Controlled Production Validation and Customer Pilot"
+PHASE6F_PILOTS_FILE = RECORDINGS_FOLDER / "phase6f_pilots.json"
+PHASE6F_APPROVALS_FILE = RECORDINGS_FOLDER / "phase6f_approvals.json"
+PHASE6F_VALIDATIONS_FILE = RECORDINGS_FOLDER / "phase6f_validations.json"
+PHASE6F_EVENTS_FILE = RECORDINGS_FOLDER / "phase6f_pilot_events.json"
+
+PHASE6F_MAX_PILOT_CUSTOMERS = int(os.environ.get("PHASE6F_MAX_PILOT_CUSTOMERS", "10"))
+PHASE6F_DEFAULT_WINDOW_HOURS = int(os.environ.get("PHASE6F_DEFAULT_WINDOW_HOURS", "72"))
+
+PHASE6F_REQUIRED_CHECKS = (
+    "customer_consent",
+    "support_contact_confirmed",
+    "rollback_plan_confirmed",
+    "backup_verified",
+    "release_readiness_passed",
+    "monitoring_owner_assigned",
+)
+
+
+class Phase6FPilotCreateModel(BaseModel):
+    name: str = Field(min_length=3, max_length=160)
+    owner: str = Field(min_length=2, max_length=120)
+    customer_ids: list[str] = Field(default_factory=list, max_length=50)
+    window_hours: int = Field(default=PHASE6F_DEFAULT_WINDOW_HOURS, ge=1, le=720)
+    success_criteria: list[str] = Field(default_factory=list, max_length=30)
+    rollback_trigger: str = Field(min_length=3, max_length=1000)
+    notes: str = Field(default="", max_length=4000)
+
+
+class Phase6FApprovalModel(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected|revoked)$")
+    approver: str = Field(min_length=2, max_length=120)
+    role: str = Field(min_length=2, max_length=120)
+    notes: str = Field(default="", max_length=2000)
+
+
+class Phase6FValidationModel(BaseModel):
+    check_key: str = Field(min_length=2, max_length=120)
+    passed: bool
+    evidence: str = Field(default="", max_length=3000)
+
+
+class Phase6FPilotStatusModel(BaseModel):
+    status: str = Field(pattern="^(draft|ready|active|paused|completed|rolled_back|cancelled)$")
+    reason: str = Field(default="", max_length=2000)
+
+
+def _phase6f_load(path: Path, default):
+    value = load_json_file(path, default)
+    return value if isinstance(value, type(default)) else default
+
+
+def _phase6f_save(path: Path, value) -> None:
+    save_json_file(path, value)
+
+
+def phase6f_pilot_by_id(pilot_id: str) -> dict | None:
+    return next(
+        (item for item in _phase6f_load(PHASE6F_PILOTS_FILE, []) if item.get("id") == pilot_id),
+        None,
+    )
+
+
+def phase6f_append_event(pilot_id: str, event: str, actor: str, details: str = "") -> dict:
+    item = {
+        "id": uuid.uuid4().hex[:16],
+        "pilot_id": pilot_id,
+        "event": event,
+        "actor": actor,
+        "details": details[:2000],
+        "created_at": datetime.now().isoformat(),
+    }
+    events = _phase6f_load(PHASE6F_EVENTS_FILE, [])
+    events.append(item)
+    _phase6f_save(PHASE6F_EVENTS_FILE, events[-5000:])
+    structured_log(
+        "phase6f.pilot_event",
+        pilot_id=pilot_id,
+        event=event,
+        actor=actor,
+    )
+    return item
+
+
+def phase6f_pilot_readiness(pilot: dict) -> dict:
+    validations = [
+        item for item in _phase6f_load(PHASE6F_VALIDATIONS_FILE, [])
+        if item.get("pilot_id") == pilot.get("id")
+    ]
+    latest = {}
+    for item in validations:
+        latest[item.get("check_key")] = item
+
+    approvals = [
+        item for item in _phase6f_load(PHASE6F_APPROVALS_FILE, [])
+        if item.get("pilot_id") == pilot.get("id")
+    ]
+    active_approvals = {}
+    for item in approvals:
+        key = (item.get("approver", "").lower(), item.get("role", "").lower())
+        if item.get("decision") == "approved":
+            active_approvals[key] = item
+        elif item.get("decision") in {"rejected", "revoked"}:
+            active_approvals.pop(key, None)
+
+    checks = {
+        key: bool(latest.get(key, {}).get("passed"))
+        for key in PHASE6F_REQUIRED_CHECKS
+    }
+    customer_count = len(pilot.get("customer_ids") or [])
+    bounded_cohort = 1 <= customer_count <= PHASE6F_MAX_PILOT_CUSTOMERS
+    two_person_approval = len(active_approvals) >= 2
+    release_snapshot = phase6e_operational_snapshot() if "phase6e_operational_snapshot" in globals() else {}
+    operationally_healthy = bool(release_snapshot.get("healthy", False))
+
+    blockers = []
+    if not bounded_cohort:
+        blockers.append(
+            f"Pilot must contain between 1 and {PHASE6F_MAX_PILOT_CUSTOMERS} customers."
+        )
+    for key, passed in checks.items():
+        if not passed:
+            blockers.append(f"Required validation is incomplete: {key}.")
+    if not two_person_approval:
+        blockers.append("Two distinct active approvals are required.")
+    if not operationally_healthy:
+        blockers.append("Phase 6E operational snapshot is not healthy.")
+
+    return {
+        "pilot_id": pilot.get("id"),
+        "ready": not blockers,
+        "customer_count": customer_count,
+        "max_customer_count": PHASE6F_MAX_PILOT_CUSTOMERS,
+        "bounded_cohort": bounded_cohort,
+        "required_checks": checks,
+        "active_approval_count": len(active_approvals),
+        "two_person_approval": two_person_approval,
+        "operationally_healthy": operationally_healthy,
+        "blockers": blockers,
+        "safe_action": (
+            "Pilot may be marked ready. Activation still requires a separate explicit status change."
+            if not blockers
+            else "Resolve blockers before changing the pilot to ready or active."
+        ),
+    }
+
+
+@app.get("/api/pilots")
+def phase6f_list_pilots(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    pilots = _phase6f_load(PHASE6F_PILOTS_FILE, [])
+    enriched = []
+    for pilot in reversed(pilots[-250:]):
+        item = dict(pilot)
+        item["readiness"] = phase6f_pilot_readiness(pilot)
+        enriched.append(item)
+    return {"pilots": enriched}
+
+
+@app.post("/api/pilots")
+def phase6f_create_pilot(payload: Phase6FPilotCreateModel, request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+
+    customer_ids = list(dict.fromkeys(
+        item.strip() for item in payload.customer_ids if item.strip()
+    ))
+    if len(customer_ids) > PHASE6F_MAX_PILOT_CUSTOMERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pilot cohorts are limited to {PHASE6F_MAX_PILOT_CUSTOMERS} customers.",
+        )
+
+    now = datetime.now()
+    pilot = {
+        "id": uuid.uuid4().hex[:16],
+        "name": payload.name.strip(),
+        "owner": payload.owner.strip(),
+        "customer_ids": customer_ids,
+        "window_hours": payload.window_hours,
+        "success_criteria": [
+            item.strip() for item in payload.success_criteria if item.strip()
+        ],
+        "rollback_trigger": payload.rollback_trigger.strip(),
+        "notes": payload.notes.strip(),
+        "status": "draft",
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "created_by": user.get("id", "unknown"),
+        "activated_at": None,
+        "completed_at": None,
+        "rolled_back_at": None,
+    }
+    pilots = _phase6f_load(PHASE6F_PILOTS_FILE, [])
+    pilots.append(pilot)
+    _phase6f_save(PHASE6F_PILOTS_FILE, pilots[-1000:])
+    phase6f_append_event(
+        pilot["id"], "pilot_created", user.get("id", "unknown"),
+        f"Cohort size: {len(customer_ids)}"
+    )
+    return {
+        "status": "complete",
+        "message": "Controlled pilot created in draft status.",
+        "pilot": pilot,
+        "readiness": phase6f_pilot_readiness(pilot),
+    }
+
+
+@app.get("/api/pilots/{pilot_id}")
+def phase6f_get_pilot(pilot_id: str, request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    pilot = phase6f_pilot_by_id(pilot_id)
+    if not pilot:
+        raise HTTPException(status_code=404, detail="Pilot not found.")
+    approvals = [
+        item for item in _phase6f_load(PHASE6F_APPROVALS_FILE, [])
+        if item.get("pilot_id") == pilot_id
+    ]
+    validations = [
+        item for item in _phase6f_load(PHASE6F_VALIDATIONS_FILE, [])
+        if item.get("pilot_id") == pilot_id
+    ]
+    events = [
+        item for item in _phase6f_load(PHASE6F_EVENTS_FILE, [])
+        if item.get("pilot_id") == pilot_id
+    ]
+    return {
+        "pilot": pilot,
+        "readiness": phase6f_pilot_readiness(pilot),
+        "approvals": approvals,
+        "validations": validations,
+        "events": events[-500:],
+    }
+
+
+@app.post("/api/pilots/{pilot_id}/approvals")
+def phase6f_record_approval(
+    pilot_id: str, payload: Phase6FApprovalModel, request: Request
+) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    pilot = phase6f_pilot_by_id(pilot_id)
+    if not pilot:
+        raise HTTPException(status_code=404, detail="Pilot not found.")
+    approval = {
+        "id": uuid.uuid4().hex[:16],
+        "pilot_id": pilot_id,
+        "decision": payload.decision,
+        "approver": payload.approver.strip(),
+        "role": payload.role.strip(),
+        "notes": payload.notes.strip(),
+        "recorded_by": user.get("id", "unknown"),
+        "created_at": datetime.now().isoformat(),
+    }
+    approvals = _phase6f_load(PHASE6F_APPROVALS_FILE, [])
+    approvals.append(approval)
+    _phase6f_save(PHASE6F_APPROVALS_FILE, approvals[-5000:])
+    phase6f_append_event(
+        pilot_id, f"approval_{payload.decision}", user.get("id", "unknown"),
+        f"{approval['approver']} ({approval['role']})"
+    )
+    return {
+        "status": "complete",
+        "message": f"Pilot approval recorded as {payload.decision}.",
+        "approval": approval,
+        "readiness": phase6f_pilot_readiness(pilot),
+    }
+
+
+@app.post("/api/pilots/{pilot_id}/validations")
+def phase6f_record_validation(
+    pilot_id: str, payload: Phase6FValidationModel, request: Request
+) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+    pilot = phase6f_pilot_by_id(pilot_id)
+    if not pilot:
+        raise HTTPException(status_code=404, detail="Pilot not found.")
+    allowed = set(PHASE6F_REQUIRED_CHECKS) | {
+        "camera_health_verified",
+        "recording_verified",
+        "mobile_access_verified",
+        "customer_training_complete",
+        "support_escalation_tested",
+    }
+    if payload.check_key not in allowed:
+        raise HTTPException(status_code=400, detail="Unknown pilot validation check.")
+    validation = {
+        "id": uuid.uuid4().hex[:16],
+        "pilot_id": pilot_id,
+        "check_key": payload.check_key,
+        "passed": payload.passed,
+        "evidence": payload.evidence.strip(),
+        "recorded_by": user.get("id", "unknown"),
+        "created_at": datetime.now().isoformat(),
+    }
+    validations = _phase6f_load(PHASE6F_VALIDATIONS_FILE, [])
+    validations.append(validation)
+    _phase6f_save(PHASE6F_VALIDATIONS_FILE, validations[-10000:])
+    phase6f_append_event(
+        pilot_id,
+        "validation_passed" if payload.passed else "validation_failed",
+        user.get("id", "unknown"),
+        payload.check_key,
+    )
+    return {
+        "status": "complete",
+        "message": "Pilot validation recorded.",
+        "validation": validation,
+        "readiness": phase6f_pilot_readiness(pilot),
+    }
+
+
+@app.put("/api/pilots/{pilot_id}/status")
+def phase6f_change_pilot_status(
+    pilot_id: str, payload: Phase6FPilotStatusModel, request: Request
+) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+
+    pilots = _phase6f_load(PHASE6F_PILOTS_FILE, [])
+    pilot = next((item for item in pilots if item.get("id") == pilot_id), None)
+    if not pilot:
+        raise HTTPException(status_code=404, detail="Pilot not found.")
+
+    current = pilot.get("status", "draft")
+    target = payload.status
+    allowed = {
+        "draft": {"ready", "cancelled"},
+        "ready": {"active", "draft", "cancelled"},
+        "active": {"paused", "completed", "rolled_back"},
+        "paused": {"active", "rolled_back", "cancelled"},
+        "completed": set(),
+        "rolled_back": set(),
+        "cancelled": set(),
+    }
+    if target not in allowed.get(current, set()):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pilot cannot move from {current} to {target}.",
+        )
+
+    readiness = phase6f_pilot_readiness(pilot)
+    if target in {"ready", "active"} and not readiness["ready"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Pilot readiness blockers must be cleared before this status change.",
+        )
+
+    now = datetime.now().isoformat()
+    pilot["status"] = target
+    pilot["updated_at"] = now
+    pilot["status_reason"] = payload.reason.strip()
+    if target == "active":
+        pilot["activated_at"] = now
+    elif target == "completed":
+        pilot["completed_at"] = now
+    elif target == "rolled_back":
+        pilot["rolled_back_at"] = now
+
+    _phase6f_save(PHASE6F_PILOTS_FILE, pilots)
+    phase6f_append_event(
+        pilot_id, f"status_{target}", user.get("id", "unknown"), payload.reason
+    )
+    return {
+        "status": "complete",
+        "message": f"Pilot status changed to {target}.",
+        "pilot": pilot,
+        "readiness": phase6f_pilot_readiness(pilot),
+        "external_action_performed": False,
+    }
+
+
+@app.get("/pilots", response_class=HTMLResponse)
+def phase6f_pilots_page(request: Request):
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
+
+    content = """
+    <header class="topbar">
+      <div><p class="eyebrow">Phase 6F</p><h1>Controlled customer pilots</h1></div>
+      <span class="pill">Approval-gated</span>
+    </header>
+    <section class="panel">
+      <div class="panel-head"><div><h2>Create bounded pilot</h2><div class="health-detail">Creates a local pilot record only. It does not deploy, activate cameras, or contact a provider.</div></div></div>
+      <form id="phase6f-create" class="settings-grid">
+        <label>Pilot name<input id="p6f-name" required placeholder="Houston assisted-living pilot"></label>
+        <label>Owner<input id="p6f-owner" required placeholder="Pilot operations lead"></label>
+        <label>Customer IDs<textarea id="p6f-customers" rows="4" placeholder="One customer ID per line"></textarea></label>
+        <label>Window hours<input id="p6f-window" type="number" min="1" max="720" value="72"></label>
+        <label>Success criteria<textarea id="p6f-success" rows="4" placeholder="One criterion per line"></textarea></label>
+        <label>Rollback trigger<textarea id="p6f-rollback" rows="4" required placeholder="Example: recording success below 99% for 15 minutes"></textarea></label>
+        <label>Notes<textarea id="p6f-notes" rows="3"></textarea></label>
+        <div><button class="action-button" type="submit">Create draft pilot</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>Pilot register</h2><div class="health-detail">Readiness requires all mandatory checks, two active approvals, and a healthy Phase 6E snapshot.</div></div><button class="secondary-button" id="p6f-refresh">Refresh</button></div>
+      <div id="p6f-list"></div>
+    </section>
+    """
+    scripts = """
+    <script>
+    const p6fEsc=value=>String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const p6fLines=id=>document.getElementById(id).value.split(/\\r?\\n/).map(x=>x.trim()).filter(Boolean);
+    async function p6fLoad(){
+      const response=await fetch('/api/pilots'),data=await response.json();
+      if(!response.ok){showToast(data.detail||'Could not load pilots.');return;}
+      document.getElementById('p6f-list').innerHTML=(data.pilots||[]).map(item=>{
+        const r=item.readiness||{};
+        return `<article class="feature-card">
+          <div class="panel-head"><div><h3>${p6fEsc(item.name)}</h3><p>${p6fEsc(item.owner)} · ${p6fEsc(item.customer_ids?.length||0)} customers · ${p6fEsc(item.window_hours)} hours</p></div><span class="pill">${p6fEsc(item.status)}</span></div>
+          <p><b>Readiness:</b> ${r.ready?'Ready':'Blocked'} · approvals ${p6fEsc(r.active_approval_count||0)}/2</p>
+          <p class="health-detail">${p6fEsc((r.blockers||[]).join(' ')||'All readiness gates are satisfied.')}</p>
+          <a class="secondary-button" href="/api/pilots/${encodeURIComponent(item.id)}">View pilot JSON</a>
+        </article>`;
+      }).join('')||'<div class="empty">No pilot records exist.</div>';
+    }
+    document.getElementById('p6f-refresh').onclick=p6fLoad;
+    document.getElementById('phase6f-create').onsubmit=async event=>{
+      event.preventDefault();
+      const payload={
+        name:document.getElementById('p6f-name').value,
+        owner:document.getElementById('p6f-owner').value,
+        customer_ids:p6fLines('p6f-customers'),
+        window_hours:Number(document.getElementById('p6f-window').value||72),
+        success_criteria:p6fLines('p6f-success'),
+        rollback_trigger:document.getElementById('p6f-rollback').value,
+        notes:document.getElementById('p6f-notes').value
+      };
+      const response=await fetch('/api/pilots',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();
+      showToast(data.message||data.detail||'Pilot request complete.');
+      if(response.ok){event.currentTarget.reset();document.getElementById('p6f-window').value='72';p6fLoad();}
+    };
+    p6fLoad();
+    </script>
+    """
+    return page_shell("Controlled pilots", "settings", content, scripts)

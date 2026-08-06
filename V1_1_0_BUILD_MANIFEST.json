@@ -1,0 +1,12 @@
+{
+  "product": "AnyAiCam VMS",
+  "version": "1.1.0",
+  "release_name": "Camera Discovery and Secure Credential Session",
+  "artifact": "main_v1_1_0_camera_discovery_override.py",
+  "sha256": "5c32c646e9a76ebedc89206c89c92364b00e50a0e4e8d2d344342c21f89c8e86",
+  "syntax_validation": "passed",
+  "private_network_only": true,
+  "max_hosts_default": 256,
+  "credential_persistence": false,
+  "authentication_attempted": false
+}
