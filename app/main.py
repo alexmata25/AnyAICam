@@ -5376,6 +5376,10 @@ NAV_ITEMS = [
     ("business-users", "/business-users", "♛", "Business users"),
     ("users", "/users", "♙", "Camera sharing users"),
     ("tenant-camera-sharing", "/tenant/camera-sharing", "♙", "Camera sharing"),
+    ("customer-users", "/customer-admin/users", "♙", "Customer users"),
+    ("customer-sites", "/customer-admin/sites", "⌂", "Customer sites"),
+    ("customer-cameras", "/customer-admin/cameras", "◉", "Customer cameras"),
+    ("customer-permissions", "/customer-admin/permissions", "◆", "Permissions"),
     ("pricing", "/pricing", "$", "Pricing"),
     ("appliances", "/partner/appliance-dashboard", "▤", "Appliances"),
     ("partner-sales", "/partner-sales", "↗", "Partner sales"),
@@ -5504,6 +5508,7 @@ from pwa_routes import register_pwa_routes
 from mobile_notifications import register_mobile_notification_routes
 from edge.routes import register_edge_discovery_routes
 from tenancy.routes import register_tenant_routes
+from customer_experience import register_customer_experience_routes
 
 register_business_routes(app, page_shell)
 register_pricing_routes(app, page_shell)
@@ -5512,6 +5517,11 @@ register_partner_workspace_routes(app, page_shell)
 register_appliance_cloud_routes(app, page_shell)
 register_cloud_feature_routes(app, page_shell)
 register_website_partner_routes(app, page_shell)
+customer_experience = register_customer_experience_routes(
+    app,
+    page_shell=page_shell,
+    current_user=current_user,
+)
 register_customer_platform_routes(
     app,
     page_shell=page_shell,

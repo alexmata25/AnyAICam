@@ -133,15 +133,13 @@ def register_tenant_routes(
         domain, role = normalize_role(identity)
         if domain != "platform" or role not in {"owner", "sales"}:
             raise HTTPException(status_code=403, detail="Platform owner or sales access is required.")
-        content = '''<header class="topbar"><div><p class="eyebrow">Platform administration</p><h1>New Customer</h1></div><span class="pill">Tenant-isolated</span></header>
-<section class="panel"><div class="panel-head"><div><h2>Customer onboarding</h2><p class="health-detail">Creates the organization, primary administrator, default site, subscription, license, and Edge assignment in one transaction.</p></div></div>
-<form id="tenant-onboarding" class="rule-form">
-<fieldset><legend>1. Organization</legend><label>Company name<input name="tenant_name" required minlength="2" maxlength="120"></label><label>Default site<input name="site_name" value="Primary Site" required></label></fieldset>
-<fieldset><legend>2. Primary administrator</legend><label>Name<input name="admin_name" required></label><label>Email<input name="admin_email" type="email" required></label></fieldset>
-<fieldset><legend>3. Subscription</legend><label>Plan<select name="plan_code"><option value="trial">Trial</option><option value="starter">Starter</option><option value="professional">Professional</option><option value="enterprise">Enterprise</option></select></label><label>Camera limit<input name="camera_limit" type="number" min="1" max="512" value="4"></label></fieldset>
-<fieldset><legend>4. Edge assignment</legend><label>Existing appliance ID (optional)<input name="appliance_id"></label><label>Cloud ID (optional)<input name="cloud_id"></label></fieldset>
-<button class="action-button" type="submit">Create customer</button></form><div id="tenant-result" class="health-detail" style="margin-top:14px"></div></section>'''
-        scripts = '''<script>document.getElementById('tenant-onboarding').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget,button=form.querySelector('button[type=submit]'),data=Object.fromEntries(new FormData(form));data.camera_limit=Number(data.camera_limit);button.disabled=true;try{const response=await fetch('/api/tenants/onboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}),result=await response.json();if(!response.ok)throw new Error(result.detail||'Customer could not be created.');document.getElementById('tenant-result').textContent=`Customer created — Tenant: ${result.tenant.id}; Administrator: ${result.primary_administrator.email}; Temporary password: ${result.invitation.temporary_password}; Appliance: ${result.appliance.cloud_id}`;form.reset();showToast('Customer tenant created.')}catch(error){showToast(error.message)}finally{button.disabled=false}});</script>'''
+        from customer_experience.pages import onboarding_wizard_page
+        with connect() as db:
+            appliances = [dict(row) for row in db.execute(
+                """SELECT id,cloud_id FROM appliances
+                   WHERE tenant_id IS NULL OR tenant_id='' ORDER BY cloud_id"""
+            ).fetchall()]
+        content, scripts = onboarding_wizard_page(appliances)
         return page_shell("New Customer", "new-customer", content, scripts)
 
     @app.get("/tenant/camera-sharing", response_class=HTMLResponse)

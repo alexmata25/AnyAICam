@@ -52,7 +52,10 @@ class TenantOnboardingService:
         tenant_name = _text(payload.get("tenant_name"), "Company name", 2, 120)
         admin_name = _text(payload.get("admin_name"), "Administrator name", 2, 120)
         admin_email = _email(payload.get("admin_email"))
+        company_email = _email(payload.get("company_email") or admin_email)
+        company_phone = " ".join(str(payload.get("company_phone") or "").split())[:40]
         site_name = _text(payload.get("site_name") or "Primary Site", "Site name", 2, 120)
+        site_address = " ".join(str(payload.get("site_address") or "").split())[:240]
         plan_code = _text(payload.get("plan_code") or "starter", "Plan", 2, 50).lower()
         if plan_code not in {"starter", "professional", "enterprise", "trial"}:
             raise ValueError("Unsupported subscription plan.")
@@ -83,13 +86,13 @@ class TenantOnboardingService:
                 (tenant_id, slug, tenant_name, "active", "customer", now, actor.get("id") or actor.get("email")),
             )
             db.execute(
-                """INSERT INTO customers(id,partner_id,name,company,email,status,source,created_at,created_by,tenant_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (tenant_id, partner_id, tenant_name, tenant_name, admin_email, "active", "real", now, actor.get("id"), tenant_id),
+                """INSERT INTO customers(id,partner_id,name,company,email,phone,status,source,created_at,created_by,tenant_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (tenant_id, partner_id, tenant_name, tenant_name, company_email, company_phone, "active", "real", now, actor.get("id"), tenant_id),
             )
             db.execute(
-                "INSERT INTO sites(id,customer_id,name,site_type,created_at,tenant_id) VALUES(?,?,?,?,?,?)",
-                (site_id, tenant_id, site_name, "default", now, tenant_id),
+                "INSERT INTO sites(id,customer_id,name,address,site_type,created_at,tenant_id) VALUES(?,?,?,?,?,?,?)",
+                (site_id, tenant_id, site_name, site_address, "default", now, tenant_id),
             )
             db.execute(
                 """INSERT INTO partner_users(
@@ -144,7 +147,8 @@ class TenantOnboardingService:
             "subscription": {"id": subscription_id, "plan_code": plan_code, "status": "trial" if plan_code == "trial" else "pending"},
             "license": {"id": license_id, "status": "pending", "camera_limit": camera_limit},
             "appliance": {"id": appliance_id, "cloud_id": cloud_id, "status": "pending"},
-            "invitation": {"id": invitation_id, "expires_at": expires_at, "temporary_password": temporary_password},
+            "invitation": {"id": invitation_id, "email": admin_email, "status": "pending", "expires_at": expires_at, "temporary_password": temporary_password},
+            "next_steps": {"camera_discovery": f"/edge/camera-provisioning?appliance={appliance_id}", "customer_dashboard": "/customer-portal"},
         }
 
     def grant_camera_access(self, actor: dict, tenant_id: str, user_id: str, camera_id: str, permissions: dict) -> dict:
@@ -187,4 +191,3 @@ class TenantOnboardingService:
                 (camera["tenant_id"], identity.get("id"), camera_id),
             ).fetchone()
         return authorize_camera(identity, permission, str(camera["tenant_id"]), dict(share) if share else None).allowed
-

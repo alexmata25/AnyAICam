@@ -13,7 +13,7 @@ PLATFORM_NAVIGATION = {
 }
 
 CUSTOMER_NAVIGATION = {
-    "customer_admin": {"live", "events", "alerts", "playback", "media", "dashboard", "settings", "tenant-camera-sharing", "subscription-portal", "phone", "help"},
+    "customer_admin": {"live", "events", "alerts", "playback", "media", "dashboard", "settings", "tenant-camera-sharing", "customer-users", "customer-sites", "customer-cameras", "customer-permissions", "subscription-portal", "phone", "help"},
     "manager": {"live", "events", "alerts", "playback", "media", "dashboard", "settings", "phone", "help"},
     "viewer": {"live", "events", "alerts", "playback", "dashboard", "phone", "help"},
     "guard": {"live", "events", "alerts", "phone", "help"},

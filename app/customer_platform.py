@@ -86,7 +86,7 @@ def register_customer_platform_routes(
     record_audit: Callable,
     is_master_admin: Callable,
 ):
-    @app.get("/customer-portal", response_class=HTMLResponse)
+    @app.get("/customer-app", response_class=HTMLResponse)
     def customer_portal(request: Request):
         user = current_user(request)
         if not _is_customer(user):
