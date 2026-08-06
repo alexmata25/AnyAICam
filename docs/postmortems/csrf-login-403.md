@@ -1,7 +1,9 @@
 # Postmortem: Production Login CSRF 403
 
-Date: 2026-08-06  
-Status: Resolved  
+Date: 2026-08-06
+
+Status: Resolved
+
 Affected component: Shared browser fetch wrapper and authentication forms
 
 ## Summary
