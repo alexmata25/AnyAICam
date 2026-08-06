@@ -116,7 +116,7 @@ LOCKOUT_MINUTES = int(os.environ.get("ANYAICAM_LOCKOUT_MINUTES", "15"))
 SECURE_COOKIES = os.environ.get("ANYAICAM_SECURE_COOKIES", "true").lower() == "true"
 BACKUPS_FOLDER = RECORDINGS_FOLDER / "backups"
 RESTORE_STAGING_FOLDER = RECORDINGS_FOLDER / "restore_staging"
-APP_VERSION = os.environ.get("ANYAICAM_VERSION", "0.9.0")
+APP_VERSION = os.environ.get("ANYAICAM_VERSION", "0.9.1")
 BUILD_ID = os.environ.get("ANYAICAM_BUILD_ID", "local")
 PUBLIC_BASE_URL = os.environ.get("ANYAICAM_PUBLIC_URL", "").rstrip("/")
 PHONE_ACCESS_URL = os.environ.get("ANYAICAM_PHONE_URL", "").strip().rstrip("/")
