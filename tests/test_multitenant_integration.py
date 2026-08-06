@@ -31,6 +31,11 @@ class MultiTenantIntegrationTests(unittest.TestCase):
         for route in ("/customer-portal", "/customer-admin/users", "/customer-admin/sites", "/customer-admin/cameras", "/customer-admin/permissions"):
             self.assertIn(route, CUSTOMER_EXPERIENCE)
 
+    def test_tenant_onboarding_uses_configured_invitation_email_service(self):
+        self.assertIn('get_email_service().send(', TENANT_ROUTES)
+        self.assertIn('"invitation"', TENANT_ROUTES)
+        self.assertIn('invitation["delivery_status"]', TENANT_ROUTES)
+
     def test_domain_boundary_is_enforced_in_authentication_middleware(self):
         self.assertIn("allowed, reason = identity_route_allowed(user, path)", MAIN)
         self.assertIn("PLATFORM_ONLY_PATH_PREFIXES", MAIN)

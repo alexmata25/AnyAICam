@@ -17,7 +17,7 @@ Platform Owners and Sales users can open `/admin/customers/new`. The wizard coll
 7. Invitation email preparation
 8. Completion summary
 
-Submission uses `/api/tenants/onboard` and the transactional `TenantOnboardingService`. The customer, administrator, membership, site, subscription, license, invitation, and appliance assignment therefore share one tenant ID. Camera discovery remains an Edge operation; the wizard never asks AWS to reach a private RTSP address.
+Submission uses `/api/tenants/onboard` and the transactional `TenantOnboardingService`. The customer, administrator, membership, site, subscription, license, invitation, and appliance assignment therefore share one tenant ID. The configured email abstraction sends or previews the invitation without changing onboarding success if an external provider is temporarily unavailable. Camera discovery remains an Edge operation; the wizard never asks AWS to reach a private RTSP address.
 
 ## Customer dashboard
 

@@ -12,12 +12,13 @@ Command:
 python -m unittest -v tests.test_customer_experience tests.test_tenant_onboarding tests.test_tenant_migration tests.test_multitenant_integration tests.test_tenancy_policy
 ```
 
-Result: **19 tests passed**. The existing JavaScript CSRF wrapper regression also passed.
+Result: **20 tests passed**. The existing JavaScript CSRF wrapper regression also passed.
 
 Covered behavior:
 
 - All eight required wizard stages are rendered.
 - Wizard submits through the tenant-safe onboarding API.
+- Invitation delivery uses the configured preview or SMTP email abstraction.
 - Completion links to Edge camera discovery.
 - Customer dashboard excludes a second tenant's cameras, events, alerts, and appliances.
 - Customer user, site, and camera administration lists are tenant scoped.

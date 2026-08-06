@@ -25,7 +25,7 @@ Adds the guided customer onboarding and tenant-scoped customer experience on `fe
 
 ## Verification
 
-- Focused Phase 6 suite: 19/19 passed; CSRF browser-wrapper regression passed.
+- Focused Phase 6 suite: 20/20 passed; CSRF browser-wrapper regression passed.
 - Deployment: not performed.
 - Merge/tag: not performed.
 

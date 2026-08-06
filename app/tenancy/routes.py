@@ -96,6 +96,35 @@ def register_tenant_routes(
             raise HTTPException(status_code=403, detail=str(error)) from error
         except (TypeError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        invitation = result["invitation"]
+        login_url = f"{str(request.base_url).rstrip('/')}/login"
+        invitation_text = (
+            f"Welcome to AnyAiCam.\n\n"
+            f"Your organization: {result['tenant']['name']}\n"
+            f"Login: {invitation['email']}\n"
+            f"Temporary password: {invitation['temporary_password']}\n"
+            f"Sign in: {login_url}\n\n"
+            "You will be required to create a permanent password after signing in."
+        )
+        delivery_status = "failed"
+        try:
+            from email_service import get_email_service
+            delivery = get_email_service().send(
+                "invitation",
+                invitation["email"],
+                "Welcome to AnyAiCam",
+                invitation_text,
+                metadata={"tenant_id": result["tenant"]["id"], "invitation_id": invitation["id"]},
+            )
+            delivery_status = str(delivery.get("status") or "processed")
+        except (OSError, RuntimeError, ValueError):
+            delivery_status = "failed"
+        with connect() as db:
+            db.execute(
+                "UPDATE invitations SET email_preview=? WHERE id=? AND tenant_id=?",
+                (invitation_text, invitation["id"], result["tenant"]["id"]),
+            )
+        invitation["delivery_status"] = delivery_status
         record_audit(request, "tenant.created", f"tenant:{result['tenant']['id']}", "New customer tenant created.")
         return {"status": "complete", **result}
 
