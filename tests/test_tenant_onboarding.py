@@ -16,8 +16,8 @@ from tenancy.service import TenantOnboardingService
 SCHEMA = """
 CREATE TABLE partners(id TEXT PRIMARY KEY,name TEXT,approval_status TEXT,source TEXT,created_at TEXT);
 CREATE TABLE tenants(id TEXT PRIMARY KEY,slug TEXT UNIQUE,name TEXT,status TEXT,tenant_type TEXT,created_at TEXT,created_by TEXT);
-CREATE TABLE customers(id TEXT PRIMARY KEY,partner_id TEXT,name TEXT,company TEXT,email TEXT,status TEXT,source TEXT,created_at TEXT,created_by TEXT,tenant_id TEXT);
-CREATE TABLE sites(id TEXT PRIMARY KEY,customer_id TEXT,name TEXT,site_type TEXT,created_at TEXT,tenant_id TEXT);
+CREATE TABLE customers(id TEXT PRIMARY KEY,partner_id TEXT,name TEXT,company TEXT,email TEXT,phone TEXT,status TEXT,source TEXT,created_at TEXT,created_by TEXT,tenant_id TEXT);
+CREATE TABLE sites(id TEXT PRIMARY KEY,customer_id TEXT,name TEXT,address TEXT,site_type TEXT,created_at TEXT,tenant_id TEXT);
 CREATE TABLE partner_users(id TEXT PRIMARY KEY,partner_id TEXT,email TEXT UNIQUE,name TEXT,role TEXT,password_hash TEXT,approved INTEGER,customer_id TEXT,created_at TEXT,account_status TEXT,must_change_password INTEGER,tenant_id TEXT,identity_domain TEXT,platform_role TEXT,customer_role TEXT);
 CREATE TABLE tenant_memberships(tenant_id TEXT,user_id TEXT,role TEXT,status TEXT,created_at TEXT,created_by TEXT,PRIMARY KEY(tenant_id,user_id));
 CREATE TABLE tenant_subscriptions(id TEXT PRIMARY KEY,tenant_id TEXT,plan_code TEXT,status TEXT,camera_limit INTEGER,starts_at TEXT,renews_at TEXT,created_at TEXT,created_by TEXT);

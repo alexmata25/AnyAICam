@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
 PARTNER_DB = (ROOT / "app" / "partner_db.py").read_text(encoding="utf-8")
 TENANT_ROUTES = (ROOT / "app" / "tenancy" / "routes.py").read_text(encoding="utf-8")
+CUSTOMER_EXPERIENCE = (ROOT / "app" / "customer_experience" / "routes.py").read_text(encoding="utf-8")
 
 
 class MultiTenantIntegrationTests(unittest.TestCase):
@@ -23,6 +24,12 @@ class MultiTenantIntegrationTests(unittest.TestCase):
         self.assertIn("from tenancy.routes import register_tenant_routes", MAIN)
         self.assertIn("tenant_onboarding = register_tenant_routes(", MAIN)
         self.assertNotIn("def onboard_tenant(", MAIN)
+
+    def test_customer_experience_is_registered_as_a_module(self):
+        self.assertIn("from customer_experience import register_customer_experience_routes", MAIN)
+        self.assertIn("register_customer_experience_routes(", MAIN)
+        for route in ("/customer-portal", "/customer-admin/users", "/customer-admin/sites", "/customer-admin/cameras", "/customer-admin/permissions"):
+            self.assertIn(route, CUSTOMER_EXPERIENCE)
 
     def test_domain_boundary_is_enforced_in_authentication_middleware(self):
         self.assertIn("allowed, reason = identity_route_allowed(user, path)", MAIN)
