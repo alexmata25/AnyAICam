@@ -5228,6 +5228,68 @@ def camera_detail(camera_number: int) -> str:
     return page_shell(f"Camera {camera_number}", "live", content, scripts)
 
 
+@app.get("/camera/{camera_number}/settings", response_class=HTMLResponse)
+def camera_settings(camera_number: int, request: Request) -> str:
+    if camera_number < 1 or camera_number > CAMERA_COUNT:
+        raise HTTPException(status_code=404, detail="Camera not found")
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page(
+            f"Camera {camera_number} settings", "live", "manage_settings"
+        )
+
+    event_settings = get_event_settings(camera_number).model_dump()
+    camera_configured = bool(
+        os.environ.get(f"CAMERA{camera_number}_HOST", "").strip()
+    )
+    live_state = camera_process_state[camera_number]["live"]
+    recording_state = camera_process_state[camera_number]["recording"]
+    record_audit(
+        request,
+        "view",
+        f"camera:{camera_number}:settings",
+        "Opened camera settings.",
+    )
+    content = f"""<header class="topbar"><div><p class="eyebrow">Camera configuration</p><h1>Camera {camera_number} settings</h1></div><a class="ghost-button" href="/">Back to live view</a></header>
+    <section class="health-grid">
+      <form class="panel" id="camera-settings-form">
+        <div class="panel-head"><div><h2>Events and motion</h2><div class="health-detail">Settings apply only to Camera {camera_number}.</div></div></div>
+        <label><input id="camera-motion-enabled" type="checkbox" {'checked' if event_settings['enabled'] else ''}> Motion detection enabled</label>
+        <label>Sensitivity <strong id="camera-sensitivity-value">{event_settings['sensitivity']}</strong><input id="camera-sensitivity" type="range" min="1" max="100" value="{event_settings['sensitivity']}"></label>
+        <label>Minimum event duration<input id="camera-minimum-duration" type="number" min="1" max="60" value="{event_settings['minimum_duration_seconds']}"> seconds</label>
+        <label>Cooldown<input id="camera-cooldown" type="number" min="0" max="3600" value="{event_settings['cooldown_seconds']}"> seconds</label>
+        <button class="action-button" type="submit">Save Camera {camera_number} settings</button>
+      </form>
+      <aside class="panel">
+        <div class="panel-head"><h2>Camera status</h2><span class="pill {'wait' if not camera_configured else ''}">{'Configured' if camera_configured else 'Needs configuration'}</span></div>
+        <div class="health-list">
+          <div class="health-row"><div><div class="health-name">Live worker</div><div class="health-detail">Current local process state</div></div><strong>{escape(live_state.title())}</strong></div>
+          <div class="health-row"><div><div class="health-name">Recording worker</div><div class="health-detail">Current local process state</div></div><strong>{escape(recording_state.title())}</strong></div>
+          <div class="health-row"><div><div class="health-name">Connection configuration</div><div class="health-detail">Credentials are never displayed here</div></div><strong>{'Present' if camera_configured else 'Missing'}</strong></div>
+        </div>
+        <div style="margin-top:16px"><a class="download" href="/camera/{camera_number}">Open Camera {camera_number}</a></div>
+      </aside>
+    </section>"""
+    scripts = f"""<script>
+    const sensitivity=document.getElementById('camera-sensitivity');
+    sensitivity.addEventListener('input',()=>document.getElementById('camera-sensitivity-value').textContent=sensitivity.value);
+    document.getElementById('camera-settings-form').addEventListener('submit',async event=>{{
+      event.preventDefault();
+      const payload={{
+        camera:{camera_number},
+        enabled:document.getElementById('camera-motion-enabled').checked,
+        sensitivity:Number(sensitivity.value),
+        minimum_duration_seconds:Number(document.getElementById('camera-minimum-duration').value),
+        cooldown_seconds:Number(document.getElementById('camera-cooldown').value),
+        zones:{json.dumps(event_settings['zones'])}
+      }};
+      const response=await fetch('/api/cameras/{camera_number}/event-settings',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
+      const result=await response.json();showToast(result.message||'Camera settings saved.');
+    }});
+    </script>"""
+    return page_shell(f"Camera {camera_number} settings", "live", content, scripts)
+
+
 
 @app.get("/health")
 def health_endpoint() -> JSONResponse:
@@ -7730,7 +7792,7 @@ def home() -> str:
             <button class="camera-action" id="audio{n}" type="button" title="Mute or unmute browser audio" onclick="toggleCameraAudio({n})">
                 <span class="camera-action-icon">◖</span><span id="audio-label{n}">Unmute</span>
             </button>
-            <a class="camera-action" title="Open camera and recording settings" href="/settings">
+            <a class="camera-action" title="Open Camera {n} settings" href="/camera/{n}/settings">
                 <span class="camera-action-icon">⚙</span><span>Settings</span>
             </a>
             <button class="camera-action" id="analytics{n}" type="button" title="Show or hide the analytics overlay" onclick="toggleAnalytics({n})">
