@@ -1,4 +1,5 @@
 import hmac
+import logging
 import secrets
 import time
 from datetime import datetime,timedelta
@@ -11,6 +12,25 @@ from cloud_config import settings
 from partner_db import connection,password_hash,row,verify_password
 from token_security import sign,unsign
 from redirect_security import safe_redirect
+
+
+logger = logging.getLogger('anyaicam.security')
+
+
+def csrf_validation(cookie: str | None, header: str | None) -> tuple[bool, str]:
+    """Return a redacted CSRF decision without weakening double-submit validation."""
+    if not cookie:
+        return False, 'missing_cookie'
+    if not header:
+        return False, 'missing_header'
+    if not hmac.compare_digest(cookie,header):
+        return False, 'token_mismatch'
+    try:
+        if unsign(cookie)!='csrf':
+            return False, 'invalid_signature'
+    except (TypeError, ValueError):
+        return False, 'invalid_signature'
+    return True, 'valid'
 
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
@@ -36,7 +56,15 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
         if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
             cookie=request.cookies.get('anyaicam_csrf'); header=request.headers.get('x-csrf-token')
-            if not cookie or not header or not hmac.compare_digest(cookie,header) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+            csrf_valid,csrf_reason=csrf_validation(cookie,header)
+            if not csrf_valid:
+                if request.url.path=='/logout':
+                    logger.warning(
+                        'logout_csrf_failed reason=%s cookie_present=%s header_present=%s lengths_match=%s method=%s path=%s host=%s origin_present=%s forwarded_host_present=%s forwarded_proto_present=%s',
+                        csrf_reason,bool(cookie),bool(header),bool(cookie and header and len(cookie)==len(header)),request.method,request.url.path,
+                        request.headers.get('host',''),bool(request.headers.get('origin')),bool(request.headers.get('x-forwarded-host')),bool(request.headers.get('x-forwarded-proto')),
+                    )
+                return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' "+' '.join(settings.allowed_origins)+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"

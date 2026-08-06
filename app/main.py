@@ -5469,14 +5469,11 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         for key, url, label in mobile_items
     )
     scripts += """<script>
-document.addEventListener('submit',async event=>{
-  const form=event.target;
-  if(!(form instanceof HTMLFormElement)||!form.matches('.sidebar-auth[action="/logout"]'))return;
-  event.preventDefault();
-  const submitter=event.submitter||form.querySelector('button[type="submit"]');
-  if(submitter)submitter.disabled=true;
+document.getElementById('sidebar-logout')?.addEventListener('click',async event=>{
+  const submitter=event.currentTarget;
+  submitter.disabled=true;
   try{
-    const response=await window.fetch(form.action,{method:'POST'});
+    const response=await window.fetch(new URL('/logout',window.location.href),{method:'POST'});
     if(response.redirected){window.location.assign(response.url);return}
     if(!response.ok){
       const payload=await response.json().catch(()=>({}));
@@ -5484,7 +5481,7 @@ document.addEventListener('submit',async event=>{
     }
     window.location.assign('/login');
   }catch(error){
-    if(submitter)submitter.disabled=false;
+    submitter.disabled=false;
     showToast(error.message||'Logout failed.');
   }
 });
@@ -5492,7 +5489,7 @@ document.addEventListener('submit',async event=>{
     if cloud_settings.staging:
         content='<div class="mock-banner" role="status"><strong>STAGING ENVIRONMENT</strong> · Test data and services only</div>'+content
     content = license_warning_banner() + content
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0a0d12"><link rel="icon" type="image/png" href="/static/brand-icon.png"><title>{escape(title)} · AnyAiCam</title><style>{STYLES}</style></head><body><div class="shell"><aside class="sidebar"><div class="brand"><img class="brand-logo" src="/static/brand-icon.png" alt="AnyAiCam"></div><nav class="nav" aria-label="Primary">{navigation}</nav><form class="sidebar-auth" method="post" action="/logout"><button class="sidebar-logout" type="submit" aria-label="Log out of AnyAiCam"><span class="sidebar-logout-icon" aria-hidden="true">↪</span><span>Log out</span></button></form></aside><main class="content">{content}</main></div><nav class="mobile-nav" aria-label="Mobile">{mobile}</nav><div class="toast" id="toast" role="status"></div>{scripts}<script>const nativeFetch=window.fetch.bind(window);window.fetch=(input,options={{}})=>{{const method=(options.method||'GET').toUpperCase(),requestUrl=typeof input==='string'?new URL(input,window.location.href):new URL(input.url),sameOrigin=requestUrl.origin===window.location.origin;if(sameOrigin&&['POST','PUT','PATCH','DELETE'].includes(method)){{const csrf=document.cookie.split('; ').find(item=>item.startsWith('anyaicam_csrf='));if(csrf){{let token=decodeURIComponent(csrf.split('=').slice(1).join('='));token=token.replace(/^"(.*)"$/,'$1');options.headers={{...(options.headers||{{}}),'X-CSRF-Token':token}}}}}}return nativeFetch(input,options)}};function showToast(message){{const toast=document.getElementById('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>toast.classList.remove('show'),3200)}}function comingSoon(label){{showToast(/saved|error|failed|no live/i.test(label)?label:label+' is ready for a future update.')}}document.addEventListener('DOMContentLoaded',()=>{{const activeTab=document.querySelector('.sidebar .nav a.active');if(activeTab){{requestAnimationFrame(()=>activeTab.scrollIntoView({{block:'center',inline:'nearest',behavior:'auto'}}));}}const mobileActive=document.querySelector('.mobile-nav a.active');if(mobileActive){{requestAnimationFrame(()=>mobileActive.scrollIntoView({{block:'nearest',inline:'center',behavior:'auto'}}));}}}});</script></body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0a0d12"><link rel="icon" type="image/png" href="/static/brand-icon.png"><title>{escape(title)} · AnyAiCam</title><style>{STYLES}</style></head><body><div class="shell"><aside class="sidebar"><div class="brand"><img class="brand-logo" src="/static/brand-icon.png" alt="AnyAiCam"></div><nav class="nav" aria-label="Primary">{navigation}</nav><div class="sidebar-auth"><button id="sidebar-logout" class="sidebar-logout" type="button" aria-label="Log out of AnyAiCam"><span class="sidebar-logout-icon" aria-hidden="true">↪</span><span>Log out</span></button></div></aside><main class="content">{content}</main></div><nav class="mobile-nav" aria-label="Mobile">{mobile}</nav><div class="toast" id="toast" role="status"></div>{scripts}<script>const nativeFetch=window.fetch.bind(window);window.fetch=(input,options={{}})=>{{const method=(options.method||'GET').toUpperCase(),requestUrl=typeof input==='string'?new URL(input,window.location.href):new URL(input.url),sameOrigin=requestUrl.origin===window.location.origin;if(sameOrigin&&['POST','PUT','PATCH','DELETE'].includes(method)){{const csrf=document.cookie.split('; ').find(item=>item.startsWith('anyaicam_csrf='));if(csrf){{let token=decodeURIComponent(csrf.split('=').slice(1).join('='));token=token.replace(/^"(.*)"$/,'$1');options.headers={{...(options.headers||{{}}),'X-CSRF-Token':token}}}}}}return nativeFetch(input,options)}};function showToast(message){{const toast=document.getElementById('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>toast.classList.remove('show'),3200)}}function comingSoon(label){{showToast(/saved|error|failed|no live/i.test(label)?label:label+' is ready for a future update.')}}document.addEventListener('DOMContentLoaded',()=>{{const activeTab=document.querySelector('.sidebar .nav a.active');if(activeTab){{requestAnimationFrame(()=>activeTab.scrollIntoView({{block:'center',inline:'nearest',behavior:'auto'}}));}}const mobileActive=document.querySelector('.mobile-nav a.active');if(mobileActive){{requestAnimationFrame(()=>mobileActive.scrollIntoView({{block:'nearest',inline:'center',behavior:'auto'}}));}}}});</script></body></html>"""
 
 
 from business_portal import register_business_routes
