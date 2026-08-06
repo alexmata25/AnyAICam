@@ -40,6 +40,16 @@ from pydantic import BaseModel, Field
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from passlib.context import CryptContext
 
+from edge_streaming import (
+    HLS_URL_PREFIX,
+    StreamStatus,
+    canonical_hls_url,
+    classify_stream,
+    playlist_snapshot,
+    remove_startup_manifests,
+    rtsp_endpoint_ready,
+)
+
 try:
     from pywebpush import webpush, WebPushException
 except ImportError:
@@ -277,6 +287,11 @@ MOTION_COOLDOWN_SECONDS = int(os.environ.get("MOTION_COOLDOWN_SECONDS", "15"))
 AI_PERSON_DETECTION_ENABLED = os.environ.get("AI_PERSON_DETECTION_ENABLED", "true").lower() == "true"
 AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL_SECONDS", "5")))
 AI_PERSON_COOLDOWN_SECONDS = max(5, int(os.environ.get("AI_PERSON_COOLDOWN_SECONDS", "30")))
+HLS_FRESHNESS_SECONDS = max(5, int(os.environ.get("ANYAICAM_HLS_FRESHNESS_SECONDS", "15")))
+RTSP_READINESS_TIMEOUT_SECONDS = max(
+    0.2, float(os.environ.get("ANYAICAM_RTSP_READINESS_TIMEOUT_SECONDS", "2"))
+)
+CAMERA_RETRY_SECONDS = max(1, int(os.environ.get("ANYAICAM_CAMERA_RETRY_SECONDS", "10")))
 YOLO_MODEL_NAME = os.environ.get("ANYAICAM_YOLO_MODEL", "yolov8n.pt")
 YOLO_CONFIDENCE = float(os.environ.get("ANYAICAM_YOLO_CONFIDENCE", "0.35"))
 YOLO_IMAGE_SIZE = int(os.environ.get("ANYAICAM_YOLO_IMAGE_SIZE", "640"))
@@ -291,7 +306,13 @@ YOLO_ALLOWED_CLASSES = {
 }
 ffmpeg_processes: list[subprocess.Popen] = []
 camera_process_state = {
-    camera_number: {"live": "starting", "recording": "starting"}
+    camera_number: {
+        "live": "starting",
+        "recording": "starting",
+        "rtsp": "unknown",
+        "live_error": None,
+        "recording_error": None,
+    }
     for camera_number in range(1, CAMERA_COUNT + 1)
 }
 camera_reconnect_counts = {camera_number: 0 for camera_number in range(1, CAMERA_COUNT + 1)}
@@ -1779,12 +1800,25 @@ def diagnostics_snapshot() -> dict:
 
 def camera_url(camera_number: int) -> str:
     host = os.environ[f"CAMERA{camera_number}_HOST"]
+    port = int(os.environ.get(f"CAMERA{camera_number}_PORT", "554"))
     username = quote(os.environ[f"CAMERA{camera_number}_USERNAME"], safe="")
     password = quote(os.environ[f"CAMERA{camera_number}_PASSWORD"], safe="")
     path = os.environ.get(
         f"CAMERA{camera_number}_PATH", "/Streaming/Channels/101"
     )
-    return f"rtsp://{username}:{password}@{host}:554{path}"
+    return f"rtsp://{username}:{password}@{host}:{port}{path}"
+
+
+def camera_rtsp_readiness(camera_number: int) -> tuple[bool, str]:
+    """Probe a camera only from an edge/combined runtime before launching FFmpeg."""
+    if RUNTIME_ROLE not in {"edge", "combined"}:
+        return False, "rtsp ingestion is disabled outside the edge runtime"
+    host = os.environ.get(f"CAMERA{camera_number}_HOST", "").strip()
+    try:
+        port = int(os.environ.get(f"CAMERA{camera_number}_PORT", "554"))
+    except ValueError:
+        return False, "camera RTSP port is invalid"
+    return rtsp_endpoint_ready(host, port, RTSP_READINESS_TIMEOUT_SECONDS)
 
 
 def start_live_stream(camera_number: int) -> subprocess.Popen:
@@ -1863,17 +1897,42 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
     starter = start_live_stream if mode == "live" else start_recording
     while True:
         camera_process_state[camera_number][mode] = "connecting"
-        process = starter(camera_number)
+        ready, readiness_detail = await asyncio.to_thread(
+            camera_rtsp_readiness, camera_number
+        )
+        camera_process_state[camera_number]["rtsp"] = "ready" if ready else "offline"
+        camera_process_state[camera_number][f"{mode}_error"] = (
+            None if ready else readiness_detail
+        )
+        if not ready:
+            camera_process_state[camera_number][mode] = "offline"
+            if mode == "live":
+                camera_reconnect_counts[camera_number] += 1
+            await asyncio.sleep(CAMERA_RETRY_SECONDS)
+            continue
+        try:
+            process = starter(camera_number)
+        except (KeyError, OSError, ValueError) as error:
+            camera_process_state[camera_number][mode] = "error"
+            camera_process_state[camera_number][f"{mode}_error"] = str(error)[:240]
+            if mode == "live":
+                camera_reconnect_counts[camera_number] += 1
+            await asyncio.sleep(CAMERA_RETRY_SECONDS)
+            continue
         ffmpeg_processes.append(process)
         camera_process_state[camera_number][mode] = "running"
         return_code = await asyncio.to_thread(process.wait)
-        camera_reconnect_counts[camera_number] += 1
-        camera_process_state[camera_number][mode] = "retrying"
+        if mode == "live":
+            camera_reconnect_counts[camera_number] += 1
+        camera_process_state[camera_number][mode] = "error"
+        camera_process_state[camera_number][f"{mode}_error"] = (
+            f"ffmpeg {mode} process exited with code {return_code}"
+        )
         print(
             f"Camera {camera_number} {mode} process exited with "
-            f"code {return_code}; retrying in 10 seconds."
+            f"code {return_code}; retrying in {CAMERA_RETRY_SECONDS} seconds."
         )
-        await asyncio.sleep(10)
+        await asyncio.sleep(CAMERA_RETRY_SECONDS)
 
 
 def load_motion_events() -> list[dict]:
@@ -4299,6 +4358,11 @@ async def lifespan(app: FastAPI):
     ai_tasks = []
 
     if RUNTIME_ROLE in {"edge", "combined"}:
+        removed_manifests = remove_startup_manifests(HLS_FOLDER)
+        structured_log(
+            "edge.hls_startup_cleanup",
+            removed_manifests=len(removed_manifests),
+        )
         for camera_number in range(1, CAMERA_COUNT + 1):
             supervisor_tasks.append(
                 asyncio.create_task(process_supervisor(camera_number, "live"))
@@ -4316,6 +4380,15 @@ async def lifespan(app: FastAPI):
                 asyncio.create_task(ai_person_detector(camera_number))
                 for camera_number in range(1, CAMERA_COUNT + 1)
             ]
+    else:
+        for camera_number in range(1, CAMERA_COUNT + 1):
+            camera_process_state[camera_number].update(
+                live="offline",
+                recording="offline",
+                rtsp="disabled",
+                live_error="RTSP ingestion is disabled in the cloud runtime.",
+                recording_error="RTSP ingestion is disabled in the cloud runtime.",
+            )
 
     health_task = (
         asyncio.create_task(health_monitor())
@@ -4447,6 +4520,9 @@ async def forwarded_https_middleware(request: Request, call_next):
     response.headers.setdefault(
         "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
     )
+    if request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["CDN-Cache-Control"] = "no-store"
     return response
 app.add_middleware(ProductionSecurityMiddleware)
 if cloud_settings.deployed:
@@ -5224,7 +5300,7 @@ def camera_detail(camera_number: int) -> str:
     if camera_number < 1 or camera_number > CAMERA_COUNT:
         raise HTTPException(status_code=404, detail="Camera not found")
     content = f"""<header class="topbar"><div><p class="eyebrow">Camera detail</p><h1>Camera {camera_number}</h1></div><a class="ghost-button" href="/">Back to cameras</a></header><section class="panel"><div class="camera-view" style="border-radius:10px"><video id="detail-video" controls muted playsinline></video><div class="camera-placeholder" id="detail-placeholder"><span class="signal">◉</span><strong>Waiting for live hardware</strong><small>The controls remain available while this camera is offline.</small></div></div><div class="camera-tools" style="justify-content:center"><button class="camera-tool" onclick="comingSoon('Microphone requires compatible camera hardware')" title="Microphone">◖</button><button class="camera-tool" id="detail-mute" title="Mute">♩</button><button class="camera-tool" onclick="comingSoon('Snapshot uses the live camera frame')" title="Snapshot">◉</button><button class="camera-tool" onclick="document.getElementById('detail-video').requestFullscreen()" title="Full screen">⛶</button><a class="camera-tool" href="/playback" title="Playback">◴</a></div></section><div class="workspace-tabs" style="margin-top:18px"><button class="workspace-tab active">Live</button><a class="workspace-tab" href="/playback" style="text-decoration:none">Playback</a><a class="workspace-tab" href="/analytics" style="text-decoration:none">Analytics · Demo</a></div>"""
-    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/hls/camera{camera_number}.m3u8';if(Hls.isSupported()){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>const video=document.getElementById('detail-video'),placeholder=document.getElementById('detail-placeholder'),source='/static/hls/camera{camera_number}.m3u8';if(Hls.isSupported()){{const hls=new Hls();hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}else if(video.canPlayType('application/vnd.apple.mpegurl')){{video.src=source;video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}})}}document.getElementById('detail-mute').addEventListener('click',e=>{{video.muted=!video.muted;e.currentTarget.textContent=video.muted?'♩':'♫';showToast(video.muted?'Camera muted':'Camera audio enabled')}});</script>"""
     return page_shell(f"Camera {camera_number}", "live", content, scripts)
 
 
@@ -5519,25 +5595,45 @@ def camera_status() -> dict:
     now = time.time()
     cameras = []
     for camera_number in range(1, CAMERA_COUNT + 1):
-        manifest = HLS_FOLDER / f"camera{camera_number}.m3u8"
-        manifest_age = None
-        if manifest.exists():
-            try:
-                manifest_age = max(0, round(now - manifest.stat().st_mtime))
-            except OSError:
-                pass
-        streaming = manifest_age is not None and manifest_age < 15
+        playlist = playlist_snapshot(
+            HLS_FOLDER,
+            camera_number,
+            HLS_FRESHNESS_SECONDS,
+            now,
+        )
+        status = classify_stream(
+            playlist,
+            camera_process_state[camera_number]["live"],
+        )
         cameras.append(
             {
                 "camera": camera_number,
-                "online": streaming,
-                "stream": "online" if streaming else camera_process_state[camera_number]["live"],
+                "online": status is StreamStatus.LIVE,
+                "status": status.value,
+                "status_label": status.value.title(),
+                "stream": status.value,
+                "hls_url": canonical_hls_url(camera_number),
+                "playlist_fresh": playlist["fresh"],
+                "manifest_age_seconds": playlist["manifest_age_seconds"],
+                "segment_age_seconds": playlist["segment_age_seconds"],
+                "latest_segment": playlist["latest_segment"],
+                "rtsp_ready": camera_process_state[camera_number]["rtsp"] == "ready",
+                "worker_state": camera_process_state[camera_number]["live"],
                 "recording": camera_process_state[camera_number]["recording"],
-                "last_stream_update_seconds": manifest_age,
+                "last_stream_update_seconds": playlist["manifest_age_seconds"],
                 "reconnects": camera_reconnect_counts[camera_number],
+                "error": (
+                    camera_process_state[camera_number]["live_error"]
+                    if status is StreamStatus.ERROR else None
+                ),
             }
         )
-    return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
+    return {
+        "cameras": cameras,
+        "runtime_role": RUNTIME_ROLE,
+        "freshness_seconds": HLS_FRESHNESS_SECONDS,
+        "checked_at": datetime.now().isoformat(),
+    }
 
 
 def system_metrics() -> dict:
@@ -7788,7 +7884,38 @@ function toggleAnalytics(n){
     button.classList.toggle('active',overlay.classList.contains('visible'));
     showToast(`Camera ${n} analytics overlay ${overlay.classList.contains('visible')?'shown':'hidden'}.`);
 }
-function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}for(let n=1;n<=4;n++)connectCamera(n);
+const cameraPlayers=new Map();
+function connectCamera(n,source){
+    if(cameraPlayers.has(n))return;
+    const video=document.getElementById(`camera${n}`);
+    if(!video.dataset.stateListeners){video.addEventListener('playing',()=>{const label=document.getElementById(`pause-label${n}`),button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.dataset.stateListeners='ready'}
+    if(window.Hls&&Hls.isSupported()){
+        const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});
+        hls.loadSource(source);hls.attachMedia(video);
+        hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){disconnectCamera(n);refreshCameraStates()}});
+        cameraPlayers.set(n,hls);
+    }else if(video.canPlayType('application/vnd.apple.mpegurl')){
+        video.src=source;cameraPlayers.set(n,{destroy(){video.removeAttribute('src');video.load()}});
+    }else{
+        setState(n,'Error');cameraPlayers.set(n,{destroy(){}});
+    }
+}
+function disconnectCamera(n){
+    const player=cameraPlayers.get(n);if(player){player.destroy();cameraPlayers.delete(n)}
+    const video=document.getElementById(`camera${n}`);video.pause();video.removeAttribute('src');video.load();
+}
+async function refreshCameraStates(){
+    try{
+        const response=await fetch('/api/cameras/status',{cache:'no-store'});if(!response.ok)return;
+        const data=await response.json();
+        (data.cameras||[]).forEach(camera=>{
+            const n=Number(camera.camera),isLive=camera.status==='live';
+            setState(n,camera.status_label||'Error',isLive);
+            if(isLive)connectCamera(n,camera.hls_url);else disconnectCamera(n);
+        });
+    }catch(error){for(let n=1;n<=4;n++){setState(n,'Error');disconnectCamera(n)}}
+}
+refreshCameraStates();setInterval(refreshCameraStates,5000);
 const grid=document.getElementById('camera-grid');const savedLayout=localStorage.getItem('camera-layout')||'4';function setLayout(layout){grid.dataset.layout=layout;document.querySelectorAll('.layout-button').forEach(button=>button.classList.toggle('active',button.dataset.layout===layout));localStorage.setItem('camera-layout',layout)}document.querySelectorAll('.layout-button').forEach(button=>button.addEventListener('click',()=>setLayout(button.dataset.layout)));setLayout(savedLayout);
 </script>"""
     return page_shell("Live view", "live", content, scripts)
@@ -8172,24 +8299,27 @@ def dashboard() -> str:
 
     scripts = """<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
 const dashboardPlayers = new Map();
-function attachDashboardStream(cameraNumber){
+function attachDashboardStream(cameraNumber,source){
     const video=document.getElementById(`dashboard-video-${cameraNumber}`);
     const placeholder=document.getElementById(`dashboard-placeholder-${cameraNumber}`);
-    const source=`/hls/camera${cameraNumber}.m3u8`;
-    if(!video)return;
+    if(!video||dashboardPlayers.has(cameraNumber))return;
     const showVideo=()=>{placeholder.hidden=true;video.classList.add('ready');video.play().catch(()=>{})};
     const showPlaceholder=()=>{placeholder.hidden=false;video.classList.remove('ready')};
     if(window.Hls&&Hls.isSupported()){
-        const existing=dashboardPlayers.get(cameraNumber);if(existing)existing.destroy();
         const hls=new Hls({liveSyncDurationCount:2,maxBufferLength:8});
         dashboardPlayers.set(cameraNumber,hls);hls.loadSource(source);hls.attachMedia(video);
         hls.on(Hls.Events.MANIFEST_PARSED,showVideo);
         hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)showPlaceholder()});
     }else if(video.canPlayType('application/vnd.apple.mpegurl')){
-        video.src=source;video.addEventListener('loadedmetadata',showVideo,{once:true});video.addEventListener('error',showPlaceholder,{once:true});
+        video.src=source;dashboardPlayers.set(cameraNumber,{destroy(){video.removeAttribute('src');video.load()}});video.addEventListener('loadedmetadata',showVideo,{once:true});video.addEventListener('error',showPlaceholder,{once:true});
     }
 }
-for(let cameraNumber=1;cameraNumber<=4;cameraNumber++)attachDashboardStream(cameraNumber);
+function detachDashboardStream(cameraNumber){
+    const video=document.getElementById(`dashboard-video-${cameraNumber}`),placeholder=document.getElementById(`dashboard-placeholder-${cameraNumber}`),player=dashboardPlayers.get(cameraNumber);
+    if(player){player.destroy();dashboardPlayers.delete(cameraNumber)}
+    if(video){video.pause();video.removeAttribute('src');video.load();video.classList.remove('ready')}
+    if(placeholder)placeholder.hidden=false;
+}
 async function updateDashboard(){
     try{
         const [statusResponse,metricsResponse,intelligenceResponse]=await Promise.all([
@@ -8205,12 +8335,13 @@ async function updateDashboard(){
             const detail=document.getElementById(`dashboard-detail-${camera.camera}`);
             const card=document.getElementById(`dashboard-camera-${camera.camera}`);
             if(camera.online)onlineCount++;
-            live.textContent=camera.online?'LIVE':'OFFLINE';live.classList.toggle('wait',!camera.online);
+            live.textContent=camera.status_label.toUpperCase();live.classList.toggle('wait',!camera.online);
             rec.classList.toggle('inactive',camera.recording!=='running');
             detail.textContent=camera.online
                 ? `Online · ${camera.recording==='running'?'Recording active':'Recording '+camera.recording}`
                 : `Stream ${camera.stream} · recording ${camera.recording}`;
             card.classList.toggle('offline',!camera.online);
+            if(camera.online)attachDashboardStream(camera.camera,camera.hls_url);else detachDashboardStream(camera.camera);
         });
         document.getElementById('dashboard-camera-summary').textContent=`${onlineCount} of ${statusData.cameras.length} cameras online`;
         document.getElementById('today-cameras-count').textContent=`${onlineCount}/${statusData.cameras.length}`;
@@ -14450,7 +14581,7 @@ def sites() -> str:
                     const detail = document.getElementById(`site-camera-detail-${camera.camera}`);
                     if (marker) marker.classList.toggle('offline', !camera.online);
                     if (state) {
-                        state.textContent = camera.online ? 'Online' : 'Reconnecting';
+                        state.textContent = camera.status_label || 'Error';
                         state.classList.toggle('offline', !camera.online);
                     }
                     if (detail) {
