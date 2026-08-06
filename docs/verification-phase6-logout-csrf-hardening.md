@@ -18,6 +18,7 @@ Covered cases:
 - The CSRF cookie is retained across logout
 - Login form behavior and quote normalization are unchanged
 - No active native HTML form can submit directly to `/logout`
+- Logout passes a relative string—not an unsupported JavaScript `URL` object—to the shared wrapper
 - Redacted diagnostic logging does not contain token values
 
 ## Local limitation

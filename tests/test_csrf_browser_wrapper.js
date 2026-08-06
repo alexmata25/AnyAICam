@@ -41,6 +41,7 @@ window.fetch = (input, options = {}) => {
     "/login",
     "login",
     "https://app.anyaicam.com/login",
+    "/logout",
   ]) {
     capturedHeader = null;
     await window.fetch(input, { method: "POST" });

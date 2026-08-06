@@ -5473,7 +5473,7 @@ document.getElementById('sidebar-logout')?.addEventListener('click',async event=
   const submitter=event.currentTarget;
   submitter.disabled=true;
   try{
-    const response=await window.fetch(new URL('/logout',window.location.href),{method:'POST'});
+    const response=await window.fetch('/logout',{method:'POST'});
     if(response.redirected){window.location.assign(response.url);return}
     if(!response.ok){
       const payload=await response.json().catch(()=>({}));

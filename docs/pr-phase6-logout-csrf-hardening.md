@@ -7,7 +7,7 @@ Eliminates the direct browser form-submission path that could post `/logout` wit
 ## Changes
 
 - Replaced the sidebar logout form with a non-submit button.
-- Added an explicit click handler using `window.fetch` and an absolute same-origin URL.
+- Added an explicit click handler using `window.fetch('/logout', ...)`, allowing the shared wrapper to resolve the relative same-origin URL.
 - Preserved redirect handling, quote normalization, cookie settings, and strict server validation.
 - Added structured CSRF failure categories and redacted failed-logout diagnostics.
 - Expanded regression coverage for valid, missing, mismatched, and invalidly signed tokens.
