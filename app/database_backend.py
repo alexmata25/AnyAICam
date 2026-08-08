@@ -10,6 +10,24 @@ from cloud_config import settings
 def backend(): return os.getenv('ANYAICAM_DATABASE_BACKEND',settings.database_backend).lower()
 
 
+def sqlite_target_path() -> Path:
+    return Path(os.getenv('ANYAICAM_PARTNER_DB',settings.sqlite_path))
+
+
+def postgres_target_url() -> str:
+    return os.getenv('ANYAICAM_DATABASE_URL',settings.database_url)
+
+
+def target_key():
+    """Hashable identity of the database `connect()` would open right now.
+
+    Lets callers (see `partner_db.ensure_database_initialized`) notice when the
+    effective connection target changes within a single process - e.g. isolated
+    test databases sharing one interpreter - which a one-time import side effect
+    cannot detect."""
+    return ('sqlite',str(sqlite_target_path())) if backend()=='sqlite' else ('postgresql',postgres_target_url())
+
+
 def _postgres_sql(sql: str) -> str:
     converted=sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT','BIGSERIAL PRIMARY KEY')
     if re.match(r'\s*INSERT OR IGNORE\s+',converted,re.I):
@@ -20,13 +38,13 @@ def _postgres_sql(sql: str) -> str:
 @contextmanager
 def connect():
     if backend()=='sqlite':
-        path=Path(os.getenv('ANYAICAM_PARTNER_DB',settings.sqlite_path)); path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path); db.row_factory=sqlite3.Row; db.execute('PRAGMA foreign_keys=ON')
+        path=sqlite_target_path(); path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path); db.row_factory=sqlite3.Row; db.execute('PRAGMA foreign_keys=ON')
     else:
         try:
             import psycopg
             from psycopg.rows import dict_row
         except ImportError as error: raise RuntimeError('Install psycopg[binary] to use PostgreSQL.') from error
-        raw=psycopg.connect(os.getenv('ANYAICAM_DATABASE_URL',settings.database_url),row_factory=dict_row)
+        raw=psycopg.connect(postgres_target_url(),row_factory=dict_row)
         class Adapter:
             def execute(self,sql,params=()): return raw.execute(_postgres_sql(sql),params)
             def commit(self): raw.commit()
