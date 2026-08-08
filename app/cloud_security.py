@@ -34,7 +34,7 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if request.url.query: destination+='?'+request.url.query
             return RedirectResponse(destination,status_code=308)
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
-        if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
+        if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path not in {'/partner-logout','/logout'}:
             cookie=request.cookies.get('anyaicam_csrf'); header=request.headers.get('x-csrf-token')
             if not cookie or not header or not hmac.compare_digest(cookie,header) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
