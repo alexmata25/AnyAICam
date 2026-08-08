@@ -7,10 +7,12 @@ from pathlib import Path
 
 TEST_DB=Path(tempfile.gettempdir())/'anyaicam-pwa-mobile-test.db'
 TEST_DB.unlink(missing_ok=True)
-os.environ['ANYAICAM_DATABASE_BACKEND']='sqlite'
-os.environ['ANYAICAM_PARTNER_DB']=str(TEST_DB)
+os.environ.setdefault('ANYAICAM_DATABASE_BACKEND','sqlite')
 
-import partner_db
+import database_backend
+
+with database_backend.override_target(sqlite_path=TEST_DB):
+    import partner_db
 from customer_policy import notification_scope_allowed
 from mobile_security import issue_mobile_tokens,register_device,revoke_device,rotate_refresh_token
 from notification_engine import fanout_appliance_event
@@ -19,6 +21,16 @@ from notification_engine import fanout_appliance_event
 class PwaMobileTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # See test_partner_website.py: scope this class's database access to
+        # its own TEST_DB rather than relying on whichever test module's
+        # import ran last to leave ANYAICAM_PARTNER_DB pointed here.
+        # addClassCleanup is registered immediately after __enter__() so the
+        # override is always torn down, even if a later line in setUpClass
+        # (e.g. one of the seed inserts below) raises.
+        cls._target=database_backend.override_target(sqlite_path=TEST_DB)
+        cls._target.__enter__()
+        cls.addClassCleanup(cls._target.__exit__,None,None,None)
+
         now=datetime.now().isoformat()
         with partner_db.connection() as db:
             db.execute('INSERT INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',('partner','Partner','approved','real',now))

@@ -1,3 +1,4 @@
+import contextvars
 import os
 import re
 import sqlite3
@@ -10,12 +11,39 @@ from cloud_config import settings
 def backend(): return os.getenv('ANYAICAM_DATABASE_BACKEND',settings.database_backend).lower()
 
 
+_sqlite_path_override: 'contextvars.ContextVar[str | None]' = contextvars.ContextVar('anyaicam_sqlite_path_override',default=None)
+_database_url_override: 'contextvars.ContextVar[str | None]' = contextvars.ContextVar('anyaicam_database_url_override',default=None)
+
+
 def sqlite_target_path() -> Path:
-    return Path(os.getenv('ANYAICAM_PARTNER_DB',settings.sqlite_path))
+    override=_sqlite_path_override.get()
+    return Path(override) if override is not None else Path(os.getenv('ANYAICAM_PARTNER_DB',settings.sqlite_path))
 
 
 def postgres_target_url() -> str:
-    return os.getenv('ANYAICAM_DATABASE_URL',settings.database_url)
+    override=_database_url_override.get()
+    return override if override is not None else os.getenv('ANYAICAM_DATABASE_URL',settings.database_url)
+
+
+@contextmanager
+def override_target(*,sqlite_path=None,database_url=None):
+    """Scope connect()/target_key() to an explicit database for the duration of
+    this block, regardless of what ANYAICAM_PARTNER_DB/ANYAICAM_DATABASE_URL
+    currently hold in os.environ.
+
+    os.environ is process-global, but pytest imports every test module before
+    running any test, so whichever module's import last wrote
+    ANYAICAM_PARTNER_DB is what every test in the session sees during
+    execution - an import-order-sensitive collision, not real isolation. This
+    override is a contextvars.ContextVar, so it is scoped to wherever it's
+    actually entered (e.g. a test's own setUp/tearDown window) instead of
+    leaking across unrelated test files or code that never asked for it."""
+    sqlite_token=_sqlite_path_override.set(str(sqlite_path)) if sqlite_path is not None else None
+    url_token=_database_url_override.set(database_url) if database_url is not None else None
+    try: yield
+    finally:
+        if sqlite_token is not None: _sqlite_path_override.reset(sqlite_token)
+        if url_token is not None: _database_url_override.reset(url_token)
 
 
 def target_key():
