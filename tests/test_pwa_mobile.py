@@ -45,7 +45,7 @@ class PwaMobileTests(unittest.TestCase):
     def test_pwa_manifest_and_routes(self):
         root=Path(__file__).parents[1]; root=root/'app' if (root/'app').exists() else root; manifest=json.loads((root/'pwa'/'manifest.webmanifest').read_text(encoding='utf-8')); routes=(root/'pwa_routes.py').read_text(encoding='utf-8')
         self.assertEqual(manifest['display'],'standalone'); self.assertEqual(manifest['start_url'].split('?')[0],'/customer-portal')
-        self.assertIn('/manifest.webmanifest',routes); self.assertIn('/service-worker.js',routes); self.assertIn('/pwa-offline',routes)
+        self.assertIn('/manifest.webmanifest',routes); self.assertIn('/service-worker.js',routes); self.assertIn('/offline',routes)
         self.assertTrue((root/'pwa'/'service-worker.js').exists()); self.assertTrue((root/'pwa'/'offline.html').exists())
 
     def test_mobile_authentication_and_refresh_rotation(self):
