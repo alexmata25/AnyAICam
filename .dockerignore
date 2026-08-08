@@ -1,14 +1,70 @@
-.git
+# Version control and local editor metadata
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Secrets and machine-local environment configuration
 .env
 .env.*
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.venv/
-venv/
-recordings/
-static/hls/
-backups/
+*.env
+
+# Python environments, bytecode, and tool caches
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/.venv/
+**/venv/
+
+# Generated video, recordings, clips, uploads, and runtime backups
+**/recordings/
+**/clips/
+**/uploads/
+**/backups/
+**/static/hls/
+
+# Runtime caches, logs, and temporary working directories
+**/cache/
+**/.cache/
+**/logs/
+**/tmp/
+**/temp/
 *.log
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+# Packaged exports and archives
 *.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
+# Tests are not needed in the runtime image
+tests/
+app/tests/
+app/test_*.py
+
+# Historical source snapshots and one-time patch artifacts
+app/main.backup.py
+app/main_before_*.py
+app/main_phase*_override*.py
+app/main_v*_override*.py
+app/*_before_*.py
+app/*.before-*
+app/* - Copy*
+app/apply_phase*.py
+app/v*_patch.py
+app/*_hotfix.py

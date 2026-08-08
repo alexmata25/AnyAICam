@@ -1,9 +1,163 @@
+# AnyAiCam secrets and local environment
 .env
-__pycache__/
-*.pyc
-app/static/hls/
+.env.*
+*.env
+*.env.*
+!*.env.example
+!*.env.*.example
+!**/*.env.example
+!**/*.env.*.example
+aws.env
+aws-*.env
+*.local.env
 
+# Cloudflare credentials and tunnel state
+.cloudflare/
+.cloudflared/
+**/.cloudflared/
+cloudflared/
+**/cloudflared/
+*cloudflare-token*
+*cloudflare-credentials*
+*tunnel-credentials*.json
+cert.pem
+
+# AWS CLI credentials and local state
+.aws/
+**/.aws/
+aws_credentials*
+aws-credentials*
+
+# SSH and private keys
+.ssh/
+**/.ssh/
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime media and application data
 recordings/
+**/recordings/
+clips/
+**/clips/
+uploads/
+**/uploads/
+hls/
+**/hls/
+app/static/hls/
+static/hls/
+logs/
+**/logs/
+runtime/
+**/runtime/
+docker-data/
+docker-volumes/
+volumes/
+*.pid
+*.pid.lock
+
+# Runtime databases and queues
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs and diagnostics
+*.log
 logs.txt
+web-errors.txt
+*.trace
+
+# Python generated files and environments
 __pycache__/
-*.pyc
+**/__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# General build and package output
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+.cache/
+**/.cache/
+tmp/
+temp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local backup and repair copies
+*.bak
+*.backup
+*.backup.py
+*.old
+*.orig
+*.rej
+*.before-*
+*_before_*.py
+* - Copy.*
+
+# JavaScript tooling, if introduced
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+*.iml
+
+# Operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100/
+.Trashes/
+
+# Test and tool reports
+coverage.xml
+junit.xml
+test-results/
+.hypothesis/
+
+# Keep source, documentation, deployment examples, and required model assets tracked.
+!app/
+!appliance-agent/
+!deploy/
+!docs/
+!tests/
+!Dockerfile
+!Dockerfile.production
+!docker-compose.yml
+!requirements.txt
+!app/yolov8n.pt
