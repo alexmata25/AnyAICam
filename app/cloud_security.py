@@ -14,6 +14,18 @@ from redirect_security import safe_redirect
 
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
+    @staticmethod
+    def _unquote_double_submit_value(value: str) -> str:
+        # Mirrors Starlette's own Cookie-header unquoting (http.cookies
+        # unquotes on read). A double-submit token read client-side from
+        # document.cookie can still carry a literal wrapping quote pair --
+        # e.g. any cookie a pre-fix server issued with base64 '=' padding,
+        # already sitting in someone's browser -- while request.cookies.get()
+        # never does. Stripping one matching pair here makes the two sides
+        # comparable again without touching the HMAC/signature check itself.
+        if len(value)>=2 and value[0]=='"'==value[-1]: return value[1:-1]
+        return value
+
     async def dispatch(self,request: Request,call_next):
         origin=request.headers.get('origin','').rstrip('/')
         method=request.method.upper()
@@ -35,8 +47,22 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             return RedirectResponse(destination,status_code=308)
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
         if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
-            cookie=request.cookies.get('anyaicam_csrf'); header=request.headers.get('x-csrf-token')
-            if not cookie or not header or not hmac.compare_digest(cookie,header) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+            cookie=request.cookies.get('anyaicam_csrf'); token=request.headers.get('x-csrf-token')
+            if not token and request.headers.get('content-type','').split(';')[0].strip().lower()=='application/x-www-form-urlencoded':
+                # Plain HTML form posts (e.g. /login) can't set a custom header, so accept the
+                # same double-submit token from a hidden form field as a fallback.
+                # Read the full body via .body() *before* .form(). .form() parses urlencoded
+                # bodies through .stream(), a one-shot read Starlette's BaseHTTPMiddleware does
+                # NOT replay to the downstream app; .body() caches the bytes, which it DOES
+                # replay -- otherwise routes with their own Form(...) params (e.g. /login,
+                # /customer-register, /register) would receive an empty body here.
+                try: await request.body()
+                except Exception: pass
+                try: form_token=(await request.form()).get('csrf_token')
+                except Exception: form_token=None
+                if isinstance(form_token,str): token=form_token
+            if isinstance(token,str): token=self._unquote_double_submit_value(token)
+            if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
         response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' "+' '.join(settings.allowed_origins)+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"

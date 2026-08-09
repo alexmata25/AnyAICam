@@ -64,7 +64,7 @@ class DeploymentSecurityTests(unittest.TestCase):
         for header in ('Content-Security-Policy','X-Frame-Options','X-Content-Type-Options','Strict-Transport-Security'):
             self.assertIn(header,source)
         self.assertIn('settings.allowed_origins',source)
-        self.assertIn("response.headers.pop('server',None)",source)
+        self.assertIn("del response.headers['server']",source)
 
     def test_proxy_health_and_websocket_preparation(self):
         caddy=deployment_file('Caddyfile').read_text(encoding='utf-8')

@@ -6,14 +6,24 @@ from pathlib import Path
 
 TEST_DB=Path(tempfile.gettempdir())/'anyaicam-unified-platform-test.db'
 TEST_DB.unlink(missing_ok=True)
-os.environ['ANYAICAM_DATABASE_BACKEND']='sqlite'
-os.environ['ANYAICAM_PARTNER_DB']=str(TEST_DB)
+os.environ.setdefault('ANYAICAM_DATABASE_BACKEND','sqlite')
 
-import partner_db
+import database_backend
+
+with database_backend.override_target(sqlite_path=TEST_DB):
+    import partner_db
 from customer_policy import camera_action_allowed,live_session_state,role_destination,same_customer
 
 
 class UnifiedCustomerPlatformTests(unittest.TestCase):
+    def setUp(self):
+        # See test_partner_website.py: scope this file's database access to its
+        # own TEST_DB rather than relying on whichever test module's import ran
+        # last to leave ANYAICAM_PARTNER_DB pointed here.
+        self._target=database_backend.override_target(sqlite_path=TEST_DB)
+        self._target.__enter__()
+        self.addCleanup(self._target.__exit__,None,None,None)
+
     def test_shared_platform_migrations_exist(self):
         tables={item['name'] for item in partner_db.rows("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertTrue({'user_sessions','customer_camera_permissions','customer_site_permissions','customer_clip_shares','mfa_settings','live_view_sessions','customer_clip_jobs'}<=tables)

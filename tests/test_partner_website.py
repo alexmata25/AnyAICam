@@ -6,16 +6,27 @@ from pathlib import Path
 
 TEST_DB=Path(tempfile.gettempdir())/'anyaicam-partner-website-test.db'
 TEST_DB.unlink(missing_ok=True)
-os.environ['ANYAICAM_DATABASE_BACKEND']='sqlite'
-os.environ['ANYAICAM_PARTNER_DB']=str(TEST_DB)
+os.environ.setdefault('ANYAICAM_DATABASE_BACKEND','sqlite')
 
-import partner_db
+import database_backend
+
+with database_backend.override_target(sqlite_path=TEST_DB):
+    import partner_db
 
 PARTNER_ROLES={'administrator','partner_owner','salesperson','technician'}
 
 
 class PartnerWebsiteTests(unittest.TestCase):
     def setUp(self):
+        # Scope every test's database access to this file's own TEST_DB. Other
+        # test modules set the same ANYAICAM_PARTNER_DB env var for their own
+        # (different) temp file at import time, and since pytest imports all
+        # test modules before running any of them, only the last-imported
+        # module's env value would otherwise survive into execution - this
+        # override makes the target explicit instead of order-dependent.
+        self._target=database_backend.override_target(sqlite_path=TEST_DB)
+        self._target.__enter__()
+        self.addCleanup(self._target.__exit__,None,None,None)
         now=datetime.now().isoformat()
         with partner_db.connection() as db:
             for table in ('partner_terms_acceptances','invitations','partner_users','partner_applications','partners'):
