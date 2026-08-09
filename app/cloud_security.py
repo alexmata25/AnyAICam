@@ -12,6 +12,8 @@ from partner_db import connection,password_hash,row,verify_password
 from token_security import sign,unsign
 from redirect_security import safe_redirect
 
+_MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
+
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
     @staticmethod
@@ -48,9 +50,20 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
         if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
             cookie=request.cookies.get('anyaicam_csrf'); token=request.headers.get('x-csrf-token')
+            # No cookie means the final check below can never pass regardless of
+            # what the body contains -- fail now instead of buffering a body an
+            # anonymous, cookie-less caller controls the size of.
+            if not cookie: return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
             if not token and request.headers.get('content-type','').split(';')[0].strip().lower()=='application/x-www-form-urlencoded':
                 # Plain HTML form posts (e.g. /login) can't set a custom header, so accept the
                 # same double-submit token from a hidden form field as a fallback.
+                # Cap what we'll buffer for this: legitimate login/register forms are a
+                # few hundred bytes; anything else -- or an absent/unparsable
+                # Content-Length -- isn't a genuine one, so reject before request.body().
+                content_length=request.headers.get('content-length')
+                try: oversized=content_length is None or int(content_length)>_MAX_CSRF_FORM_BODY_BYTES
+                except ValueError: oversized=True
+                if oversized: return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
                 # Read the full body via .body() *before* .form(). .form() parses urlencoded
                 # bodies through .stream(), a one-shot read Starlette's BaseHTTPMiddleware does
                 # NOT replay to the downstream app; .body() caches the bytes, which it DOES
