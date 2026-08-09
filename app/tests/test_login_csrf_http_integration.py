@@ -28,10 +28,13 @@ os.environ.setdefault('ANYAICAM_CSRF_ENABLED', 'true')
 
 # Reserve a free loopback port and lock the origin allowlist to it *before*
 # cloud_config.settings (a frozen, import-time singleton) is constructed.
-_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-_probe.bind(('127.0.0.1', 0))
-PORT = _probe.getsockname()[1]
-_probe.close()
+# The socket stays open and is handed directly to uvicorn (Server.serve(sockets=...))
+# instead of being closed and reopened by port number later -- closing and
+# reopening leaves a window where another process on the host can grab the
+# same ephemeral port before the server thread gets to it.
+_bound_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+_bound_socket.bind(('127.0.0.1', 0))
+PORT = _bound_socket.getsockname()[1]
 ORIGIN = f'http://127.0.0.1:{PORT}'
 os.environ.setdefault('ANYAICAM_ALLOWED_ORIGINS', ORIGIN)
 
@@ -42,6 +45,7 @@ from starlette.routing import Route
 
 import cloud_security
 from cloud_config import settings
+from cloud_security import _MAX_CSRF_FORM_BODY_BYTES
 
 
 async def _login_get(request):
@@ -84,14 +88,19 @@ class _ServerThread(threading.Thread):
     quoting and Cookie-header round-tripping go through the actual stdlib
     http.cookies machinery -- not a hand-built Request object."""
 
-    def __init__(self):
+    def __init__(self, sock):
         super().__init__(daemon=True)
-        config = uvicorn.Config(app, host='127.0.0.1', port=PORT, log_level='warning')
+        self._sock = sock
+        config = uvicorn.Config(app, log_level='warning')
         self.server = uvicorn.Server(config)
 
     def run(self):
         import asyncio
-        asyncio.run(self.server.serve())
+        # Pass the already-bound socket straight through (the same mechanism
+        # uvicorn documents for sharing sockets with a Gunicorn worker) so
+        # there's no separate bind() here that could race with anything else
+        # on the host for this port number.
+        asyncio.run(self.server.serve(sockets=[self._sock]))
 
     def wait_ready(self, timeout=10):
         deadline = time.time() + timeout
@@ -104,6 +113,7 @@ class _ServerThread(threading.Thread):
     def stop(self):
         self.server.should_exit = True
         self.join(timeout=5)
+        self._sock.close()
 
 
 class LoginCsrfHttpIntegrationTests(unittest.TestCase):
@@ -123,7 +133,7 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         )
         cls._settings_patch = patch.object(cloud_security, 'settings', patched)
         cls._settings_patch.start()
-        cls.thread = _ServerThread()
+        cls.thread = _ServerThread(_bound_socket)
         cls.thread.start()
         cls.thread.wait_ready()
 
@@ -161,13 +171,6 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         except HTTPError as exc:
             return exc.code, exc.read()
 
-    def assertReachedLoginHandler(self, status, body):
-        # The CSRF gate must not have intercepted the request. Any outcome
-        # other than the middleware's own 403 means the request passed
-        # through to the stand-in handler.
-        if status == 403:
-            self.assertNotIn(b'CSRF validation failed', body)
-
     def test_get_cookie_then_post_form_field_round_trip_passes(self):
         # The exact repro: fresh cookie jar, GET /login, copy the cookie
         # value into the hidden form field the way the login page's own JS
@@ -178,7 +181,8 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         token = self._jar_cookie_value(jar)
         self.assertIsNotNone(token)
         status, body = self._post_login(jar, form_token=token)
-        self.assertReachedLoginHandler(status, body)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'email=None password=None')
 
     def test_get_cookie_then_post_header_round_trip_passes(self):
         # Same round trip via the pre-existing X-CSRF-Token header flow
@@ -188,7 +192,8 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         self._get_login(jar)
         token = self._jar_cookie_value(jar)
         status, body = self._post_login(jar, header_token=token)
-        self.assertReachedLoginHandler(status, body)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'email=None password=None')
 
     def test_legacy_padded_quoted_cookie_still_verifies(self):
         # Simulates a cookie issued by the pre-fix server: base64 padding
@@ -204,7 +209,8 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         jar = CookieJar()
         jar.set_cookie(_make_cookie('anyaicam_csrf', quoted, ORIGIN))
         status, body = self._post_login(jar, form_token=quoted)
-        self.assertReachedLoginHandler(status, body)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'email=None password=None')
 
     def test_tampered_token_is_still_rejected(self):
         jar = CookieJar()
@@ -232,6 +238,124 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         status, body = self._post_login(jar, raw_body=raw_body)
         self.assertEqual(status, 200)
         self.assertEqual(body, b'email=test@example.invalid password=notarealpassword')
+
+    def test_oversized_cookieless_body_is_rejected_without_buffering(self):
+        # No anyaicam_csrf cookie at all, so the CSRF check can never pass --
+        # proven here by declaring a Content-Length far beyond
+        # _MAX_CSRF_FORM_BODY_BYTES and never actually sending that many
+        # bytes. If the middleware tried to read/buffer the body before
+        # checking for the cookie, this would hang waiting for bytes that
+        # never arrive; getting a prompt 403 instead proves the
+        # reject-before-buffer ordering.
+        host, port_str = ORIGIN.split('://', 1)[1].split(':')
+        port = int(port_str)
+        declared_length = _MAX_CSRF_FORM_BODY_BYTES * 100
+        request_head = (
+            f'POST /login HTTP/1.1\r\n'
+            f'Host: {host}:{port}\r\n'
+            f'Origin: {ORIGIN}\r\n'
+            f'Content-Type: application/x-www-form-urlencoded\r\n'
+            f'Content-Length: {declared_length}\r\n'
+            f'Connection: close\r\n'
+            f'\r\n'
+        ).encode()
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(request_head)
+            # Deliberately do not send the declared_length bytes of body.
+            sock.settimeout(5)
+            response = b''
+            try:
+                # "Connection: close" means the server closes the socket
+                # after writing the response, so read until EOF to capture
+                # the full response (status line, headers, and body).
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+            except TimeoutError:
+                self.fail('server did not respond promptly -- it likely blocked reading the body')
+        status_line = response.split(b'\r\n', 1)[0]
+        self.assertIn(b'403', status_line)
+        self.assertIn(b'CSRF validation failed', response)
+
+    def test_chunked_form_under_limit_passes_and_preserves_body(self):
+        # No Content-Length at all (Transfer-Encoding: chunked) must not be
+        # treated as disqualifying on its own -- only an over-cap body is.
+        jar = CookieJar()
+        self._get_login(jar)
+        token = self._jar_cookie_value(jar)
+        cookie_header = f'anyaicam_csrf={token}'
+        form_body = f'email=test%40example.invalid&password=notarealpassword&csrf_token={token}'.encode()
+        host, port_str = ORIGIN.split('://', 1)[1].split(':')
+        port = int(port_str)
+        chunk = b'%x\r\n' % len(form_body) + form_body + b'\r\n0\r\n\r\n'
+        request_head = (
+            f'POST /login HTTP/1.1\r\n'
+            f'Host: {host}:{port}\r\n'
+            f'Origin: {ORIGIN}\r\n'
+            f'Cookie: {cookie_header}\r\n'
+            f'Content-Type: application/x-www-form-urlencoded\r\n'
+            f'Transfer-Encoding: chunked\r\n'
+            f'Connection: close\r\n'
+            f'\r\n'
+        ).encode()
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(request_head + chunk)
+            sock.settimeout(5)
+            response = b''
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                response += piece
+        status_line = response.split(b'\r\n', 1)[0]
+        self.assertTrue(status_line.startswith(b'HTTP/1.1 200'), status_line)
+        self.assertIn(b'email=test@example.invalid password=notarealpassword', response)
+
+    def test_oversized_chunked_body_is_rejected_without_unbounded_buffering(self):
+        # A valid, matching cookie this time -- isolates the size-cap check
+        # from the no-cookie short-circuit that
+        # test_oversized_cookieless_body_is_rejected_without_buffering covers.
+        jar = CookieJar()
+        self._get_login(jar)
+        token = self._jar_cookie_value(jar)
+        cookie_header = f'anyaicam_csrf={token}'
+        host, port_str = ORIGIN.split('://', 1)[1].split(':')
+        port = int(port_str)
+        request_head = (
+            f'POST /login HTTP/1.1\r\n'
+            f'Host: {host}:{port}\r\n'
+            f'Origin: {ORIGIN}\r\n'
+            f'Cookie: {cookie_header}\r\n'
+            f'Content-Type: application/x-www-form-urlencoded\r\n'
+            f'Transfer-Encoding: chunked\r\n'
+            f'Connection: close\r\n'
+            f'\r\n'
+        ).encode()
+        # 9 complete 8192-byte chunks = 73728 bytes, over the 65536 cap. Send
+        # them as complete, validly-encoded chunks and then simply stop --
+        # no terminating 0-length chunk -- to prove the server responded
+        # before demanding the rest of the stream.
+        filler = b'a' * 8192
+        one_chunk = b'2000\r\n' + filler + b'\r\n'  # 0x2000 == 8192
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(request_head)
+            for _ in range(9):
+                sock.sendall(one_chunk)
+            sock.settimeout(5)
+            response = b''
+            try:
+                while True:
+                    piece = sock.recv(4096)
+                    if not piece:
+                        break
+                    response += piece
+            except TimeoutError:
+                self.fail('server did not respond promptly -- it likely blocked reading the chunked body')
+        status_line = response.split(b'\r\n', 1)[0]
+        self.assertTrue(status_line.startswith(b'HTTP/1.1 403'), status_line)
+        self.assertIn(b'CSRF validation failed', response)
 
 
 if __name__ == '__main__':

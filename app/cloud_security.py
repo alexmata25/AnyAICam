@@ -12,6 +12,8 @@ from partner_db import connection,password_hash,row,verify_password
 from token_security import sign,unsign
 from redirect_security import safe_redirect
 
+_MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
+
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
     @staticmethod
@@ -25,6 +27,28 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
         # comparable again without touching the HMAC/signature check itself.
         if len(value)>=2 and value[0]=='"'==value[-1]: return value[1:-1]
         return value
+
+    @staticmethod
+    async def _read_body_capped(request: Request, limit: int):
+        # Mirrors Request.body()'s own caching -- sets request._body, which
+        # BaseHTTPMiddleware's _CachedRequest replays to the downstream app --
+        # but reads via .stream() and stops as soon as more than `limit`
+        # bytes have arrived, instead of buffering an unbounded or chunked
+        # body in full first. Returns the cached bytes, or None if the body
+        # exceeded the cap (nothing is cached in that case).
+        if hasattr(request,'_body'):
+            body=request._body
+            return body if len(body)<=limit else None
+        chunks=[]; total=0
+        try:
+            async for chunk in request.stream():
+                total+=len(chunk)
+                if total>limit: return None
+                chunks.append(chunk)
+        except Exception: return None
+        body=b''.join(chunks)
+        request._body=body
+        return body
 
     async def dispatch(self,request: Request,call_next):
         origin=request.headers.get('origin','').rstrip('/')
@@ -48,16 +72,32 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
         if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
             cookie=request.cookies.get('anyaicam_csrf'); token=request.headers.get('x-csrf-token')
+            # No cookie means the final check below can never pass regardless of
+            # what the body contains -- fail now instead of buffering a body an
+            # anonymous, cookie-less caller controls the size of.
+            if not cookie: return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
             if not token and request.headers.get('content-type','').split(';')[0].strip().lower()=='application/x-www-form-urlencoded':
                 # Plain HTML form posts (e.g. /login) can't set a custom header, so accept the
                 # same double-submit token from a hidden form field as a fallback.
-                # Read the full body via .body() *before* .form(). .form() parses urlencoded
-                # bodies through .stream(), a one-shot read Starlette's BaseHTTPMiddleware does
-                # NOT replay to the downstream app; .body() caches the bytes, which it DOES
-                # replay -- otherwise routes with their own Form(...) params (e.g. /login,
-                # /customer-register, /register) would receive an empty body here.
-                try: await request.body()
-                except Exception: pass
+                # A declared Content-Length that's negative, unparsable, or over the
+                # cap can be rejected without reading anything. An absent
+                # Content-Length (e.g. chunked transfer-encoding) is not itself
+                # disqualifying -- _read_body_capped below bounds that case instead.
+                content_length=request.headers.get('content-length')
+                try:
+                    parsed_length=int(content_length) if content_length is not None else None
+                    declared_oversized=parsed_length is not None and (parsed_length<0 or parsed_length>_MAX_CSRF_FORM_BODY_BYTES)
+                except ValueError: declared_oversized=True
+                if declared_oversized: return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+                # Read the body ourselves, capped at _MAX_CSRF_FORM_BODY_BYTES, and
+                # cache it the same way Request.body() does so BaseHTTPMiddleware
+                # replays it downstream (otherwise routes with their own Form(...)
+                # params, e.g. /login, /customer-register, /register, would receive
+                # an empty body). This also bounds chunked/no-Content-Length bodies:
+                # reading stops as soon as the cap is exceeded rather than buffering
+                # an unbounded stream first.
+                if await self._read_body_capped(request,_MAX_CSRF_FORM_BODY_BYTES) is None:
+                    return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
                 try: form_token=(await request.form()).get('csrf_token')
                 except Exception: form_token=None
                 if isinstance(form_token,str): token=form_token
