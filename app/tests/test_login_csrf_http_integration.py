@@ -279,6 +279,84 @@ class LoginCsrfHttpIntegrationTests(unittest.TestCase):
         self.assertIn(b'403', status_line)
         self.assertIn(b'CSRF validation failed', response)
 
+    def test_chunked_form_under_limit_passes_and_preserves_body(self):
+        # No Content-Length at all (Transfer-Encoding: chunked) must not be
+        # treated as disqualifying on its own -- only an over-cap body is.
+        jar = CookieJar()
+        self._get_login(jar)
+        token = self._jar_cookie_value(jar)
+        cookie_header = f'anyaicam_csrf={token}'
+        form_body = f'email=test%40example.invalid&password=notarealpassword&csrf_token={token}'.encode()
+        host, port_str = ORIGIN.split('://', 1)[1].split(':')
+        port = int(port_str)
+        chunk = b'%x\r\n' % len(form_body) + form_body + b'\r\n0\r\n\r\n'
+        request_head = (
+            f'POST /login HTTP/1.1\r\n'
+            f'Host: {host}:{port}\r\n'
+            f'Origin: {ORIGIN}\r\n'
+            f'Cookie: {cookie_header}\r\n'
+            f'Content-Type: application/x-www-form-urlencoded\r\n'
+            f'Transfer-Encoding: chunked\r\n'
+            f'Connection: close\r\n'
+            f'\r\n'
+        ).encode()
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(request_head + chunk)
+            sock.settimeout(5)
+            response = b''
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                response += piece
+        status_line = response.split(b'\r\n', 1)[0]
+        self.assertTrue(status_line.startswith(b'HTTP/1.1 200'), status_line)
+        self.assertIn(b'email=test@example.invalid password=notarealpassword', response)
+
+    def test_oversized_chunked_body_is_rejected_without_unbounded_buffering(self):
+        # A valid, matching cookie this time -- isolates the size-cap check
+        # from the no-cookie short-circuit that
+        # test_oversized_cookieless_body_is_rejected_without_buffering covers.
+        jar = CookieJar()
+        self._get_login(jar)
+        token = self._jar_cookie_value(jar)
+        cookie_header = f'anyaicam_csrf={token}'
+        host, port_str = ORIGIN.split('://', 1)[1].split(':')
+        port = int(port_str)
+        request_head = (
+            f'POST /login HTTP/1.1\r\n'
+            f'Host: {host}:{port}\r\n'
+            f'Origin: {ORIGIN}\r\n'
+            f'Cookie: {cookie_header}\r\n'
+            f'Content-Type: application/x-www-form-urlencoded\r\n'
+            f'Transfer-Encoding: chunked\r\n'
+            f'Connection: close\r\n'
+            f'\r\n'
+        ).encode()
+        # 9 complete 8192-byte chunks = 73728 bytes, over the 65536 cap. Send
+        # them as complete, validly-encoded chunks and then simply stop --
+        # no terminating 0-length chunk -- to prove the server responded
+        # before demanding the rest of the stream.
+        filler = b'a' * 8192
+        one_chunk = b'2000\r\n' + filler + b'\r\n'  # 0x2000 == 8192
+        with socket.create_connection((host, port), timeout=5) as sock:
+            sock.sendall(request_head)
+            for _ in range(9):
+                sock.sendall(one_chunk)
+            sock.settimeout(5)
+            response = b''
+            try:
+                while True:
+                    piece = sock.recv(4096)
+                    if not piece:
+                        break
+                    response += piece
+            except TimeoutError:
+                self.fail('server did not respond promptly -- it likely blocked reading the chunked body')
+        status_line = response.split(b'\r\n', 1)[0]
+        self.assertTrue(status_line.startswith(b'HTTP/1.1 403'), status_line)
+        self.assertIn(b'CSRF validation failed', response)
+
 
 if __name__ == '__main__':
     unittest.main()
