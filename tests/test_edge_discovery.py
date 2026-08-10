@@ -204,5 +204,38 @@ class CameraInventorySanitizationTests(unittest.TestCase):
             self.assertNotIn("user:password", path.read_text(encoding="utf-8"))
 
 
+class V110ScanSourceTests(unittest.TestCase):
+    """Static checks that the live v1.1.0 scan route (app/main.py) keeps RTSP
+    candidate URLs out of the browser response and V110_DISCOVERY_FILE
+    history, retaining them only for CameraInventoryStore reconciliation.
+
+    Source-inspection only - app/main.py is not imported here (matching this
+    repo's existing convention, e.g. tests/test_edge_streaming.py's
+    EdgeStreamingIntegrationSourceTests) and no production code is touched.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.main = (Path(__file__).resolve().parents[1] / "app" / "main.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_replacement_b_appends_redacted_dict_not_raw_result(self):
+        self.assertIn("inventory_candidates.append(result)", self.main)
+        self.assertIn("devices.append({", self.main)
+        self.assertIn(
+            'if key not in {"stream_urls", "stream_url_source", "stream_urls_verified"}',
+            self.main,
+        )
+        self.assertNotIn("devices.append(result)", self.main)
+
+    def test_replacement_c_reconcile_uses_inventory_candidates_not_devices(self):
+        self.assertIn(
+            "CameraInventoryStore(V110_INVENTORY_FILE).reconcile(str(network), inventory_candidates)",
+            self.main,
+        )
+        self.assertNotIn("reconcile(str(network), devices)", self.main)
+
+
 if __name__ == "__main__":
     unittest.main()

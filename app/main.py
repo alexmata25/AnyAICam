@@ -145949,14 +145949,19 @@ def v110_scan(payload: V110DiscoveryModel, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="No allowed discovery ports selected.")
 
     devices = []
+    inventory_candidates = []
     for host in network.hosts():
         result = v110_probe_host(str(host), ports)
         if result:
-            devices.append(result)
+            inventory_candidates.append(result)
+            devices.append({
+                key: value for key, value in result.items()
+                if key not in {"stream_urls", "stream_url_source", "stream_urls_verified"}
+            })
 
     inventory_total = None
     try:
-        inventory = CameraInventoryStore(V110_INVENTORY_FILE).reconcile(str(network), devices)
+        inventory = CameraInventoryStore(V110_INVENTORY_FILE).reconcile(str(network), inventory_candidates)
         inventory_total = len(inventory["cameras"])
     except (OSError, ValueError) as exc:
         structured_log(
