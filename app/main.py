@@ -64,6 +64,21 @@ import os
 import re
 
 
+ANALYTICS_FEATURES = [
+    ("Smart alerts", "Prioritize events that need attention."),
+    ("Smart motion", "Search motion events by camera and time."),
+    ("Line crossing", "Detect movement across a defined boundary."),
+    ("Intrusion", "Monitor activity inside protected zones."),
+    ("License plate recognition", "Capture and search vehicle plates."),
+    ("People counting", "Measure entries, exits, and foot traffic."),
+    ("Occupancy", "Track how many people are within a space."),
+    ("Vehicle search", "Find vehicles across recorded footage."),
+]
+
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
 
 
 
@@ -492,6 +507,8 @@ except ImportError:
 
 
 
+
+STATIC_FOLDER = Path("/app/static")
 
 HLS_FOLDER = Path("/app/static/hls")
 
@@ -2483,6 +2500,8 @@ MOTION_COOLDOWN_SECONDS = int(os.environ.get("MOTION_COOLDOWN_SECONDS", "15"))
 
 
 AI_PERSON_DETECTION_ENABLED = os.environ.get("AI_PERSON_DETECTION_ENABLED", "true").lower() == "true"
+
+AI_ENABLED = AI_PERSON_DETECTION_ENABLED
 
 
 
