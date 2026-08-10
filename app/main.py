@@ -145821,10 +145821,14 @@ def v101_cloud_sites_page(request: Request):
 # never written to JSON, logs, backups, or audit records.
 # ============================================================================
 
+from edge_discovery import candidate_stream_urls, _safe_rtsp_url
+from camera_inventory import CameraInventoryStore
+
 ANYAICAM_V110_MARKER = "AnyAiCam VMS v1.1.0 — Camera Discovery and Secure Credential Session"
 ANYAICAM_VERSION = "1.1.0"
 
 V110_DISCOVERY_FILE = RECORDINGS_FOLDER / "v110_camera_discovery.json"
+V110_INVENTORY_FILE = RECORDINGS_FOLDER / "v110_camera_inventory.json"
 V110_MAX_HOSTS = int(os.environ.get("V110_MAX_HOSTS", "256"))
 V110_CONNECT_TIMEOUT = float(os.environ.get("V110_CONNECT_TIMEOUT", "0.35"))
 V110_ALLOWED_PORTS = tuple(
@@ -145899,12 +145903,29 @@ def v110_probe_host(host: str, ports: list[int]) -> dict | None:
         hints.append("rtsp")
     if any(port in open_ports for port in (80, 443, 8000, 8080, 8443)):
         hints.append("web")
+
+    # Network-free enrichment only: derived from the open_ports already
+    # found by the TCP scan above. No additional probe is made here.
+    stream_urls = []
+    if 554 in open_ports:
+        stream_urls = [
+            sanitized for candidate in candidate_stream_urls(host, "Unknown", 554)
+            if (sanitized := _safe_rtsp_url(candidate))
+        ]
+
     return {
+        "id": uuid.uuid5(uuid.NAMESPACE_URL, f"v110-discovery://{host}").hex,
+        "name": f"Camera {host}",
         "ip": host,
         "open_ports": open_ports,
         "service_hints": hints,
         "classification": "possible_camera_or_recorder",
         "credential_status": "not_provided",
+        "onvif": False,
+        "rtsp": "rtsp" in hints,
+        "stream_urls": stream_urls,
+        "stream_url_source": "candidate" if stream_urls else "none",
+        "stream_urls_verified": False,
     }
 
 
@@ -145933,6 +145954,18 @@ def v110_scan(payload: V110DiscoveryModel, request: Request) -> dict:
         if result:
             devices.append(result)
 
+    inventory_total = None
+    try:
+        inventory = CameraInventoryStore(V110_INVENTORY_FILE).reconcile(str(network), devices)
+        inventory_total = len(inventory["cameras"])
+    except (OSError, ValueError) as exc:
+        structured_log(
+            "v110.camera_inventory_reconcile_failed",
+            network=str(network),
+            error=str(exc)[:240],
+            actor=user.get("id", "unknown"),
+        )
+
     record = {
         "id": uuid.uuid4().hex[:16],
         "site_id": payload.site_id.strip(),
@@ -145944,6 +145977,7 @@ def v110_scan(payload: V110DiscoveryModel, request: Request) -> dict:
         "scanned_by": user.get("id", "unknown"),
         "credential_data_stored": False,
         "authentication_attempted": False,
+        "inventory_total": inventory_total,
     }
     records = _v110_load(V110_DISCOVERY_FILE, [])
     records.append(record)
