@@ -130,6 +130,19 @@ class LoginCsrfTests(unittest.TestCase):
         self.assertIn("anyaicam_csrf=([^;]*)", source)
         self.assertIn("this.csrf_token.value=decodeURIComponent(match[1])", source)
 
+    def test_logout_form_wires_hidden_csrf_field_to_cookie(self):
+        # Same double-submit-cookie wiring as the login form above
+        # (fix/vms-logout-csrf), applied to the VMS logout form. Before this
+        # fix, the logout <form> had no csrf_token field and wasn't a
+        # fetch() call, so the middleware's header check and form-field
+        # fallback both failed and every logout hit a 403 CSRF error.
+        source = (ROOT / 'main.py').read_text(encoding='utf-8')
+        self.assertIn('action="/logout" id="logout-form"', source)
+        self.assertIn("getElementById('logout-form')", source)
+        self.assertIn('<input type="hidden" name="csrf_token" value="">', source)
+        self.assertIn("anyaicam_csrf=([^;]*)", source)
+        self.assertIn("this.csrf_token.value=decodeURIComponent(match[1])", source)
+
 
 if __name__ == '__main__':
     unittest.main()
