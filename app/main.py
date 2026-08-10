@@ -2654,7 +2654,10 @@ camera_process_state = {
 
 
 
-    camera_number: {"live": "starting", "recording": "starting"}
+    camera_number: {
+        "live": "starting", "recording": "starting",
+        "last_exit_code": None, "last_error": None, "last_error_at": None,
+    }
 
 
 
@@ -16123,7 +16126,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-    return subprocess.Popen(command)
+    return subprocess.Popen(command, stderr=subprocess.PIPE)
 
 
 
@@ -16672,6 +16675,39 @@ async def retention_worker() -> None:
 
 
 
+CAMERA_STDERR_MAX_LINES = 20
+CAMERA_ERROR_MAX_CHARS = 500
+_CAMERA_STREAM_URL_PATTERN = re.compile(r"rtsp://\S+", re.IGNORECASE)
+
+
+def _redact_camera_stream_error(text: str) -> str:
+    return _CAMERA_STREAM_URL_PATTERN.sub("rtsp://<redacted>", text)
+
+
+async def _drain_camera_stderr(camera_number: int, process: subprocess.Popen, buffer: list[str]) -> None:
+    """Keep mirroring ffmpeg's stderr to the process log exactly as before,
+    while also retaining a small bounded tail in memory for camera-status
+    diagnostics. Runs concurrently with process.wait() so the pipe is never
+    left undrained (which would otherwise stall ffmpeg once the OS pipe
+    buffer filled)."""
+    def read_lines() -> None:
+        try:
+            for raw_line in iter(process.stderr.readline, b""):
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                print(f"[camera{camera_number}] {line}")
+                buffer.append(line)
+                if len(buffer) > CAMERA_STDERR_MAX_LINES:
+                    del buffer[0]
+        except (OSError, ValueError):
+            pass
+    await asyncio.to_thread(read_lines)
+
+
+def _bounded_camera_error(stderr_tail: list[str]) -> str:
+    joined = " ".join(line.strip() for line in stderr_tail[-5:] if line.strip())
+    return _redact_camera_stream_error(joined)[:CAMERA_ERROR_MAX_CHARS]
+
+
 async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
@@ -16737,6 +16773,13 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
         camera_process_state[camera_number][mode] = "running"
 
+        stderr_tail: list[str] = []
+        drain_task = None
+        if mode == "live" and process.stderr is not None:
+            drain_task = asyncio.create_task(
+                _drain_camera_stderr(camera_number, process, stderr_tail)
+            )
+
 
 
 
@@ -16745,6 +16788,14 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         return_code = await asyncio.to_thread(process.wait)
+
+        if drain_task is not None:
+            await drain_task
+
+        if mode == "live":
+            camera_process_state[camera_number]["last_exit_code"] = return_code
+            camera_process_state[camera_number]["last_error"] = _bounded_camera_error(stderr_tail)
+            camera_process_state[camera_number]["last_error_at"] = datetime.now().isoformat()
 
 
 
@@ -49415,6 +49466,9 @@ def camera_status() -> dict:
 
 
                 "reconnects": camera_reconnect_counts[camera_number],
+                "last_exit_code": camera_process_state[camera_number].get("last_exit_code"),
+                "last_error": camera_process_state[camera_number].get("last_error"),
+                "last_error_at": camera_process_state[camera_number].get("last_error_at"),
 
 
 
@@ -70629,6 +70683,8 @@ def camera_health_page() -> str:
 
               <td id="camera-health-reconnects-{camera_number}">{camera_reconnect_counts.get(camera_number, 0)}</td>
 
+              <td class="health-code" id="camera-health-error-{camera_number}" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="">—</td>
+
 
 
 
@@ -70861,7 +70917,7 @@ def camera_health_page() -> str:
 
 
 
-            <th>Recording</th><th>AI</th><th>Last stream update</th><th>Reconnects</th><th></th>
+            <th>Recording</th><th>AI</th><th>Last stream update</th><th>Reconnects</th><th>Last error</th><th></th>
 
 
 
@@ -71600,6 +71656,8 @@ def camera_health_page() -> str:
 
 
             document.getElementById(`camera-health-reconnects-${number}`).textContent=camera.reconnects;
+
+          const errorCell=document.getElementById(`camera-health-error-${number}`);if(errorCell){errorCell.textContent=camera.last_error||'—';errorCell.title=camera.last_error||'';}
 
 
 
