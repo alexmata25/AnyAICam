@@ -139049,6 +139049,30 @@ function setLayout(value) {{
 
 
 
+function pad2(n) {{
+  return String(n).padStart(2, '0');
+}}
+
+function parseBackendUtcTimestamp(value) {{
+  // Backend event/recording timestamps are naive (no timezone suffix) but
+  // are always the container clock, which is UTC. Interpret them as UTC
+  // explicitly instead of letting the browser assume local time.
+  if (!value) return null;
+  const text = String(value);
+  const hasOffset = /[zZ]$|[+-]\\d{{2}}:?\\d{{2}}$/.test(text);
+  return new Date(hasOffset ? text : text + 'Z');
+}}
+
+function formatLocalStamp(date) {{
+  if (!date || Number.isNaN(date.getTime())) return '';
+  return `${{date.getFullYear()}}-${{pad2(date.getMonth() + 1)}}-${{pad2(date.getDate())}} ${{pad2(date.getHours())}}:${{pad2(date.getMinutes())}}:${{pad2(date.getSeconds())}}`;
+}}
+
+function localDateKey(date) {{
+  if (!date || Number.isNaN(date.getTime())) return '';
+  return `${{date.getFullYear()}}-${{pad2(date.getMonth() + 1)}}-${{pad2(date.getDate())}}`;
+}}
+
 function dayStart() {{
 
 
@@ -139103,7 +139127,7 @@ function secondsFromDay(value) {{
 
 
 
-  const result = (new Date(value) - dayStart()) / 1000;
+  const result = (parseBackendUtcTimestamp(value) - dayStart()) / 1000;
 
 
 
@@ -139373,7 +139397,7 @@ function renderTimeline() {{
 
 
 
-      if (!String(recording.start || '').startsWith(dateValue)) return;
+      if (localDateKey(parseBackendUtcTimestamp(recording.start)) !== dateValue) return;
 
 
 
@@ -139508,7 +139532,7 @@ function renderTimeline() {{
 
 
 
-      if (!String(event.timestamp || '').startsWith(dateValue)) return;
+      if (localDateKey(parseBackendUtcTimestamp(event.timestamp)) !== dateValue) return;
 
 
 
@@ -139589,7 +139613,7 @@ function renderTimeline() {{
 
 
 
-      segment.title = `${{event.event_type}} · Camera ${{camera}} · ${{String(event.timestamp).replace('T',' ').slice(0,19)}}`;
+      segment.title = `${{event.event_type}} · Camera ${{camera}} · ${{formatLocalStamp(parseBackendUtcTimestamp(event.timestamp))}}`;
 
 
 
@@ -139724,7 +139748,7 @@ function renderTimeline() {{
 
 
 
-            `Camera ${{event.camera}} · ${{String(event.timestamp).replace('T',' ').slice(0,19)}}`;
+            `Camera ${{event.camera}} · ${{formatLocalStamp(parseBackendUtcTimestamp(event.timestamp))}}`;
 
 
 
@@ -140318,7 +140342,7 @@ function showTimelinePreview(mouse, event) {{
 
 
 
-  const stamp = String(event.timestamp || '').replace('T',' ').slice(0,19);
+  const stamp = formatLocalStamp(parseBackendUtcTimestamp(event.timestamp));
 
 
 
