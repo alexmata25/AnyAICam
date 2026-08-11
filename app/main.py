@@ -45856,7 +45856,8 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-        if allowed_keys is None or item[0] in allowed_keys
+        if (allowed_keys is None or item[0] in allowed_keys)
+        and (item[0] != "customer-app-settings" or shell_role in CUSTOMER_PORTAL_ROLES)
 
 
 
