@@ -40537,7 +40537,7 @@ def safe_login_destination(user: dict, requested_path: str) -> str:
 
 
 
-    if destination in {"", "/"}:
+    if destination in {"", "/", "/login"}:
 
 
 
