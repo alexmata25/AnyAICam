@@ -148,6 +148,28 @@ class CameraHealthPageSourceTests(unittest.TestCase):
             with self.subTest(existing=existing):
                 self.assertIn(existing, self.source)
 
+class CameraDetailLiveViewSourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.main_source = MAIN_PY.read_text(encoding="utf-8")
+        cls.security_source = (
+            MAIN_PY.parent / "cloud_security.py"
+        ).read_text(encoding="utf-8")
 
+    def test_camera_detail_uses_static_hls_path(self):
+        self.assertIn(
+            "source='/static/hls/camera{camera_number}.m3u8'",
+            self.main_source,
+        )
+        self.assertNotIn(
+            "source='/hls/camera{camera_number}.m3u8'",
+            self.main_source,
+        )
+
+    def test_csp_allows_hls_js_cdn(self):
+        self.assertIn(
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
+            self.security_source,
+        )
 if __name__ == "__main__":
     unittest.main()
