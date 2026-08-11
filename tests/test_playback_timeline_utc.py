@@ -117,8 +117,14 @@ class RecordingSeekOffsetUnchangedSourceTests(unittest.TestCase):
         )
 
     def test_click_handlers_still_use_precomputed_offset_directly(self):
+        # Hover-preview tooltip: unchanged.
         self.assertIn("if (match) tooltipVideo.currentTime = Number(match[1]);", self.source)
-        self.assertIn("    location.href = selectedEvent.recording;", self.source)
+        # "Open recording" (fix/playback-open-recording-inline) no longer
+        # navigates via location.href -- it applies the same precomputed
+        # #t= offset to an in-page player instead. See
+        # tests/test_playback_open_recording.py for focused coverage.
+        self.assertNotIn("location.href = selectedEvent.recording;", self.source)
+        self.assertIn("if (match) openPlayer.currentTime = Number(match[1]);", self.source)
 
 
 if __name__ == "__main__":

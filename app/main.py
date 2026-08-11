@@ -138401,7 +138401,7 @@ def playback() -> str:
 
 
 
-          <div class="selected-event-summary" id="selected-event-summary" hidden><div><strong id="selected-event-title">Selected event</strong><br><small id="selected-event-detail"></small></div><div class="monitor-toolbar-group"><button id="open-selected-recording">Open recording</button><button id="clear-selected-event">Clear</button></div></div>
+          <div class="selected-event-summary" id="selected-event-summary" hidden><div><strong id="selected-event-title">Selected event</strong><br><small id="selected-event-detail"></small></div><video id="selected-recording-player" class="selected-recording-player" controls playsinline hidden></video><div class="monitor-toolbar-group"><button id="open-selected-recording">Open recording</button><button id="clear-selected-event">Clear</button></div></div>
 
 
 
@@ -139659,6 +139659,13 @@ function renderTimeline() {{
 
 
         selectedEvent = event;
+
+        const newSelectionPlayer = document.getElementById('selected-recording-player');
+        if (newSelectionPlayer) {{
+          newSelectionPlayer.pause();
+          newSelectionPlayer.hidden = true;
+          newSelectionPlayer.removeAttribute('src');
+        }}
 
 
 
@@ -141406,6 +141413,13 @@ function initializeMonitor() {{
 
     document.getElementById('selected-event-summary').hidden = true;
 
+    const clearedPlayer = document.getElementById('selected-recording-player');
+    if (clearedPlayer) {{
+      clearedPlayer.pause();
+      clearedPlayer.hidden = true;
+      clearedPlayer.removeAttribute('src');
+    }}
+
 
 
 
@@ -141458,7 +141472,20 @@ function initializeMonitor() {{
 
 
 
-    location.href = selectedEvent.recording;
+    const openPlayer = document.getElementById('selected-recording-player');
+    if (!openPlayer) return;
+    const source = previewRecordingUrl(selectedEvent.recording);
+    if (!source) return showToast('This recording could not be opened.');
+    const recordingRef = selectedEvent.recording;
+    openPlayer.src = source;
+    openPlayer.hidden = false;
+    openPlayer.addEventListener('loadedmetadata', () => {{
+      try {{
+        const match = new URL(recordingRef, location.origin).hash.match(/t=(\\d+(?:\\.\\d+)?)/);
+        if (match) openPlayer.currentTime = Number(match[1]);
+      }} catch (error) {{}}
+      openPlayer.play().catch(() => {{}});
+    }}, {{once:true}});
 
 
 
