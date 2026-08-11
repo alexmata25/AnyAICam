@@ -83924,7 +83924,7 @@ def evidence_integrity_page(request: Request) -> str:
 
 
 
-        return permission_denied_page("Evidence integrity", "cases", "view_analytics")
+        return permission_denied_page("Evidence integrity", "evidence", "view_analytics")
 
 
 
@@ -84329,7 +84329,7 @@ def evidence_integrity_page(request: Request) -> str:
 
 
 
-    return page_shell("Evidence integrity", "cases", content, scripts)
+    return page_shell("Evidence integrity", "evidence", content, scripts)
 
 
 
