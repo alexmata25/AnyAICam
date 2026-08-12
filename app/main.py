@@ -46655,6 +46655,8 @@ register_mobile_notification_routes(
 
 def camera_detail(camera_number: int) -> str:
 
+    today = datetime.now().strftime("%Y-%m-%d")
+
 
 
 
@@ -46698,7 +46700,14 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    return page_shell(f"Camera {camera_number}", "live", content, scripts)
+    events_section = f"""<section class="panel" style="margin-top:14px"><div class="panel-head"><h2>Motion events</h2><div class="monitor-toolbar-group"><button id="camera-events-prev-day" type="button">&lt;</button><input id="camera-events-date" type="date" value="{today}"><button id="camera-events-next-day" type="button">&gt;</button><button id="camera-events-today" type="button">Today</button></div></div><div class="feature-grid" id="camera-events-list"><div class="empty-stage">Loading motion events…</div></div></section>"""
+
+    # Built as a plain (non f-string) template with placeholder substitution
+    # so none of this JavaScript's own { } braces need doubling.
+    events_scripts_template = """<script>(function(){var dateInput=document.getElementById('camera-events-date');var list=document.getElementById('camera-events-list');function escapeHtml(value){return String(value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}function buildCameraEventsHtml(events){if(!events.length){return '<div class="empty-stage">No motion events for this day.</div>'}return events.map(function(event){var stamp=String(event.start_time||event.timestamp||'').replace('T',' ').slice(0,19);var confidence=Number(event.confidence||0);var thumb=event.thumbnail?('<img src="'+escapeHtml(event.thumbnail)+'" alt="Motion" style="width:120px;aspect-ratio:16/9;object-fit:cover;border-radius:7px">'):'<div class="feature-icon">⌁</div>';var tag=event.linked_recording?'a':'div';var hrefAttr=event.linked_recording?(' href="'+escapeHtml(event.linked_recording)+'"'):'';var note=event.linked_recording?'':'<span class="health-detail">No recording linked</span>';return '<'+tag+' class="feature-card"'+hrefAttr+'>'+thumb+'<h2>Motion event</h2><p>'+escapeHtml(stamp)+' · '+confidence.toFixed(1)+'% confidence</p>'+note+'</'+tag+'>'}).join('')}function shiftDayValue(value,delta){var current=new Date(value+'T00:00:00');current.setDate(current.getDate()+delta);return current.toISOString().slice(0,10)}function loadCameraEvents(){list.innerHTML='<div class="empty-stage">Loading motion events…</div>';fetch('/api/events?camera=__CAMERA_NUMBER__&date='+dateInput.value+'&limit=100').then(function(response){return response.json()}).then(function(data){list.innerHTML=buildCameraEventsHtml(data.events||[])}).catch(function(){list.innerHTML='<div class="empty-stage">Motion events could not be loaded.</div>'})}document.getElementById('camera-events-prev-day').addEventListener('click',function(){dateInput.value=shiftDayValue(dateInput.value,-1);loadCameraEvents()});document.getElementById('camera-events-next-day').addEventListener('click',function(){dateInput.value=shiftDayValue(dateInput.value,1);loadCameraEvents()});document.getElementById('camera-events-today').addEventListener('click',function(){dateInput.value='__TODAY_VALUE__';loadCameraEvents()});dateInput.addEventListener('change',loadCameraEvents);loadCameraEvents()})();</script>"""
+    events_scripts = events_scripts_template.replace("__CAMERA_NUMBER__", str(camera_number)).replace("__TODAY_VALUE__", today)
+
+    return page_shell(f"Camera {camera_number}", "live", content + events_section, scripts + events_scripts)
 
 
 
@@ -49905,7 +49914,7 @@ def metrics_api() -> dict:
 
 
 
-def events_api(camera: int | None = None, limit: int = 100) -> dict:
+def events_api(camera: int | None = None, date: str | None = None, limit: int = 100) -> dict:
 
 
 
@@ -49942,6 +49951,12 @@ def events_api(camera: int | None = None, limit: int = 100) -> dict:
 
 
         events = [event for event in events if event.get("camera") == camera]
+
+    if date:
+        events = [
+            event for event in events
+            if str(event.get("start_time") or event.get("timestamp") or "")[:10] == date
+        ]
 
 
 
@@ -68949,7 +68964,7 @@ def home() -> str:
 
 
 
-        <div class="camera-view">
+        <div class="camera-view" style="cursor:pointer" onclick="openCameraPage({n})">
 
 
 
@@ -69399,6 +69414,7 @@ async function captureSnapshot(n){const video=document.getElementById(`camera${n
 
 
 
+function openCameraPage(n){location.href=`/camera/${n}`}
 function fullscreenCamera(n){
 
 
