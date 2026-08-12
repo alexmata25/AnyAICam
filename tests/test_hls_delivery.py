@@ -16,6 +16,12 @@ class HlsDeliverySourceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.source = MAIN_PY.read_text(encoding="utf-8")
+        live_player_start = cls.source.index("function connectCamera(n)")
+        live_player_end_marker = "for(let n=1;n<=4;n++)connectCamera(n);"
+        live_player_end = cls.source.index(live_player_end_marker, live_player_start)
+        cls.live_player_source = cls.source[
+            live_player_start : live_player_end + len(live_player_end_marker)
+        ]
 
     def test_canonical_hls_path_matches_ffmpeg_and_live_players(self):
         self.assertIn('HLS_URL_PREFIX = "/static/hls"', self.source)
@@ -54,6 +60,18 @@ class HlsDeliverySourceTests(unittest.TestCase):
             self.source,
         )
         self.assertIn('id="camera-events-list"', self.source)
+
+    def test_live_page_uses_three_segment_window_sync_and_starts_playback(self):
+        self.assertIn(
+            "new Hls({liveSyncDurationCount:1,liveMaxLatencyDurationCount:2})",
+            self.live_player_source,
+        )
+        self.assertIn(
+            "hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>"
+            "setState(n,'Click play to start'))})",
+            self.live_player_source,
+        )
+        self.assertNotIn("currentTime", self.live_player_source)
 
 
 if __name__ == "__main__":
