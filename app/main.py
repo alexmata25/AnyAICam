@@ -2704,6 +2704,19 @@ health_issues: dict[str, dict] = {}
 
 health_alert_times: dict[str, float] = {}
 
+# The exact set of "type" values health_monitor() ever writes (stream
+# offline/recording stopped/reconnect failures/high CPU/low disk space).
+# These are stateful conditions already tracked live and self-healing via
+# health_issues -- a persisted, unread copy of one of these types is only
+# ever stale history, never a new fact once the live condition clears.
+HEALTH_ISSUE_ALERT_TYPES = {
+    "stream_offline",
+    "recording_stopped",
+    "reconnect_failures",
+    "high_cpu",
+    "low_disk_space",
+}
+
 
 
 
@@ -44362,7 +44375,7 @@ STYLES += """
 
 
 
-.dashboard-intelligence{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:16px;margin-bottom:24px}.ai-summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.ai-summary-card{padding:15px;border:1px solid rgba(170,196,207,.16);border-radius:12px;background:rgba(10,15,25,.28)}.ai-summary-label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.ai-summary-value{display:block;margin-top:7px;font-size:25px;font-weight:850}.ai-summary-detail{display:block;margin-top:5px;color:var(--muted);font-size:11px}.alert-stack{display:grid;gap:9px}.alert-card{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:11px;align-items:start;padding:12px;border:1px solid rgba(170,196,207,.15);border-radius:11px;background:rgba(10,15,25,.28);color:var(--text);text-decoration:none}.alert-card:hover{border-color:rgba(67,209,204,.55)}.alert-icon{display:grid;place-items:center;width:31px;height:31px;border-radius:9px;background:#2d2a1f;color:#ffd27d;font-weight:900}.alert-card.critical .alert-icon{background:#3a2024;color:#ff9a9a}.alert-message{font-weight:720;font-size:13px;line-height:1.35}.alert-meta{margin-top:4px;color:var(--muted);font-size:11px}.alert-severity{padding:4px 7px;border-radius:999px;background:#302a1d;color:#f0ca72;font-size:10px;font-weight:800;text-transform:uppercase}.alert-card.critical .alert-severity{background:#3c2025;color:#ffaaaa}.alert-empty{padding:20px;border:1px dashed rgba(170,196,207,.2);border-radius:11px;color:var(--muted);text-align:center}.dashboard-alert-count{display:inline-grid;place-items:center;min-width:23px;height:23px;padding:0 7px;border-radius:999px;background:#3c2025;color:#ffb2b2;font-size:11px;font-weight:850}.activity-bars{display:flex;align-items:end;gap:6px;height:86px;margin-top:14px;padding-top:8px;border-bottom:1px solid rgba(170,196,207,.22)}.activity-bar{flex:1;min-width:10px;border-radius:4px 4px 0 0;background:linear-gradient(180deg,var(--brand),var(--brand-action));position:relative}.activity-bar span{position:absolute;bottom:-19px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--muted)}.intelligence-note{margin-top:23px;color:var(--muted);font-size:11px}@media(max-width:1050px){.dashboard-intelligence{grid-template-columns:1fr}.ai-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:700px){.ai-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.alert-card{grid-template-columns:auto minmax(0,1fr)}.alert-severity{grid-column:2;justify-self:start}}
+.dashboard-intelligence{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:16px;margin-bottom:24px}.ai-summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.ai-summary-card{padding:15px;border:1px solid rgba(170,196,207,.16);border-radius:12px;background:rgba(10,15,25,.28)}.ai-summary-label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.ai-summary-value{display:block;margin-top:7px;font-size:25px;font-weight:850}.ai-summary-detail{display:block;margin-top:5px;color:var(--muted);font-size:11px}.alert-stack{display:grid;gap:9px}.alert-card{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:11px;align-items:start;padding:12px;border:1px solid rgba(170,196,207,.15);border-radius:11px;background:rgba(10,15,25,.28);color:var(--text);text-decoration:none}.alert-card:hover{border-color:rgba(67,209,204,.55)}.alert-icon{display:grid;place-items:center;width:31px;height:31px;border-radius:9px;background:#2d2a1f;color:#ffd27d;font-weight:900}.alert-card.critical .alert-icon{background:#3a2024;color:#ff9a9a}.alert-message{font-weight:720;font-size:13px;line-height:1.35}.alert-meta{margin-top:4px;color:var(--muted);font-size:11px}.alert-severity{padding:4px 7px;border-radius:999px;background:#302a1d;color:#f0ca72;font-size:10px;font-weight:800;text-transform:uppercase}.alert-card.critical .alert-severity{background:#3c2025;color:#ffaaaa}.alert-empty{padding:20px;border:1px dashed rgba(170,196,207,.2);border-radius:11px;color:var(--muted);text-align:center}.alert-card.compact{grid-template-columns:auto minmax(0,1fr) auto;gap:8px;padding:7px 10px;align-items:center}.alert-card.compact .alert-icon{width:20px;height:20px;font-size:11px}.alert-card.compact .alert-message{font-size:12px;font-weight:650}.alert-card.compact .alert-meta{display:none}.alert-card.compact .alert-severity{padding:2px 6px;font-size:9px}.dashboard-alert-count{display:inline-grid;place-items:center;min-width:23px;height:23px;padding:0 7px;border-radius:999px;background:#3c2025;color:#ffb2b2;font-size:11px;font-weight:850}.activity-bars{display:flex;align-items:end;gap:6px;height:86px;margin-top:14px;padding-top:8px;border-bottom:1px solid rgba(170,196,207,.22)}.activity-bar{flex:1;min-width:10px;border-radius:4px 4px 0 0;background:linear-gradient(180deg,var(--brand),var(--brand-action));position:relative}.activity-bar span{position:absolute;bottom:-19px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--muted)}.intelligence-note{margin-top:23px;color:var(--muted);font-size:11px}@media(max-width:1050px){.dashboard-intelligence{grid-template-columns:1fr}.ai-summary-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:700px){.ai-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.alert-card{grid-template-columns:auto minmax(0,1fr)}.alert-severity{grid-column:2;justify-self:start}}
 
 
 
@@ -70169,7 +70182,11 @@ def dashboard_intelligence_api() -> dict:
 
 
 
-    unread_alerts = [alert for alert in alerts if not alert.get("read", False)]
+    unread_alerts = [
+        alert for alert in alerts
+        if not alert.get("read", False)
+        and alert.get("event_type") not in HEALTH_ISSUE_ALERT_TYPES
+    ]
 
 
 
@@ -70260,6 +70277,7 @@ def dashboard_intelligence_api() -> dict:
 
 
             "href": f'/camera/{issue.get("camera")}' if issue.get("camera") else "/dashboard",
+            "category": "health",
 
 
 
@@ -70341,6 +70359,7 @@ def dashboard_intelligence_api() -> dict:
 
 
             "href": f'/camera/{alert.get("camera")}' if alert.get("camera") else "/alerts",
+            "category": "event",
 
 
 
@@ -73881,7 +73900,7 @@ function renderIntelligence(data){
 
 
 
-    alerts.slice(0,6).forEach(alert=>{const link=document.createElement('a');link.href=alert.href||'/alerts';link.className=`alert-card ${alert.severity==='critical'?'critical':''}`;const icon=document.createElement('span');icon.className='alert-icon';icon.textContent=alert.severity==='critical'?'!':'⚠';const body=document.createElement('div');const message=document.createElement('div');message.className='alert-message';message.textContent=alert.message||'System alert';const meta=document.createElement('div');meta.className='alert-meta';meta.textContent=`${(alert.type||'alert').replaceAll('_',' ')} · ${formatAlertTime(alert.timestamp)}`;body.append(message,meta);const severity=document.createElement('span');severity.className='alert-severity';severity.textContent=alert.severity||'warning';link.append(icon,body,severity);stack.appendChild(link)});
+    alerts.slice(0,6).forEach(alert=>{const link=document.createElement('a');link.href=alert.href||'/alerts';link.className=`alert-card ${alert.severity==='critical'?'critical':''} ${alert.category==='health'?'compact':''}`;const icon=document.createElement('span');icon.className='alert-icon';icon.textContent=alert.severity==='critical'?'!':'⚠';const body=document.createElement('div');const message=document.createElement('div');message.className='alert-message';message.textContent=alert.message||'System alert';const meta=document.createElement('div');meta.className='alert-meta';meta.textContent=`${(alert.type||'alert').replaceAll('_',' ')} · ${formatAlertTime(alert.timestamp)}`;body.append(message,meta);const severity=document.createElement('span');severity.className='alert-severity';severity.textContent=alert.severity||'warning';link.append(icon,body,severity);stack.appendChild(link)});
 
 
 
