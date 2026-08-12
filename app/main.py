@@ -118062,7 +118062,11 @@ def alerts() -> str:
 
 
 
-    health_alerts = [alert for alert in in_app_alerts(30)["alerts"] if alert.get("event_type") != "motion"]
+    health_alerts = [
+        alert for alert in in_app_alerts(30)["alerts"]
+        if alert.get("event_type") != "motion"
+        and alert.get("event_type") not in HEALTH_ISSUE_ALERT_TYPES
+    ]
 
 
 
@@ -118081,6 +118085,14 @@ def alerts() -> str:
 
 
         alert_cards.insert(0, f'<article class="feature-card"><div class="feature-icon">!</div><h2>{escape(alert.get("event_type", "health").replace("_", " ").title())}</h2><p>{escape(alert.get("message", "System health alert"))}</p><span class="coming">In-app alert</span></article>')
+
+
+
+    for issue in health_issues.values():
+
+
+
+        alert_cards.insert(0, f'<article class="feature-card"><div class="feature-icon">!</div><h2>{escape(str(issue.get("type", "health")).replace("_", " ").title())}</h2><p>{escape(issue.get("message", "System health alert"))}</p><span class="coming">Active</span></article>')
 
 
 
