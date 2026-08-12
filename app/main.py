@@ -512,6 +512,10 @@ STATIC_FOLDER = Path("/app/static")
 
 HLS_FOLDER = Path("/app/static/hls")
 
+HLS_URL_PREFIX = "/static/hls"
+
+HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
+
 
 
 
@@ -39676,6 +39680,15 @@ async def forwarded_https_middleware(request: Request, call_next):
 
 
 
+
+    # Live playlists are rewritten every second and reference a three-segment
+    # rolling window. Reusing an old manifest makes the player request
+    # segments that FFmpeg has already deleted.
+    if request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
+        response.headers["Cache-Control"] = HLS_CACHE_CONTROL
+        response.headers["CDN-Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
 
     if forwarded_proto == "https":
 
