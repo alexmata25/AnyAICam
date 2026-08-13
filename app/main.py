@@ -16123,7 +16123,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
         "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
-        "-f", "hls", "-hls_time", "1", "-hls_list_size", "3",
+        "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
         output_file,
 
@@ -69103,231 +69103,15 @@ def home() -> str:
 
 
 
-        <div class="camera-tools polished" aria-label="Camera {n} controls">
-
-
-
-
-
-
-
-
-            <button class="camera-action" type="button" title="Enter fullscreen" onclick="fullscreenCamera({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">⛶</span><span>Fullscreen</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <button class="camera-action" id="pause{n}" type="button" title="Pause or resume this live view" onclick="toggleLivePlayback({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">Ⅱ</span><span id="pause-label{n}">Pause</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <button class="camera-action" type="button" title="Save a snapshot from the current live frame" onclick="captureSnapshot({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">▣</span><span>Snapshot</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <a class="camera-action" title="Open recordings for Camera {n}" href="/playback?camera={n}">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">▶</span><span>Playback</span>
-
-
-
-
-
-
-
-
-            </a>
-
-
-
-
-
-
-
-
-            <a class="camera-action" title="Open the dedicated Camera {n} page" href="/camera/{n}">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">↗</span><span>Open</span>
-
-
-
-
-
-
-
-
-            </a>
-
-
-
-
-
-
-
-
-            <button class="camera-action" id="audio{n}" type="button" title="Mute or unmute browser audio" onclick="toggleCameraAudio({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">◖</span><span id="audio-label{n}">Unmute</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <a class="camera-action" title="Open camera and recording settings" href="/settings">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">⚙</span><span>Settings</span>
-
-
-
-
-
-
-
-
-            </a>
-
-
-
-
-
-
-
-
-            <button class="camera-action" id="analytics{n}" type="button" title="Show or hide the analytics overlay" onclick="toggleAnalytics({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">◇</span><span>Analytics</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
+        <div class="camera-tools" aria-label="Camera {n} controls">
+            <button class="camera-tool" type="button" title="Fullscreen" onclick="fullscreenCamera({n})">⛶</button>
+            <button class="camera-tool" id="pause{n}" type="button" title="Pause or resume" onclick="toggleLivePlayback({n})">Ⅱ<span class="sr-only" id="pause-label{n}">Pause</span></button>
+            <button class="camera-tool" type="button" title="Snapshot" onclick="captureSnapshot({n})">▣</button>
+            <a class="camera-tool" title="Playback" href="/playback?camera={n}">▶</a>
+            <a class="camera-tool" title="Open camera" href="/camera/{n}">↗</a>
+            <button class="camera-tool" id="audio{n}" type="button" title="Mute or unmute audio" onclick="toggleCameraAudio({n})">◖<span class="sr-only" id="audio-label{n}">Unmute</span></button>
+            <a class="camera-tool" title="Settings" href="/settings">⚙</a>
+            <button class="camera-tool" id="analytics{n}" type="button" title="Analytics overlay" onclick="toggleAnalytics({n})">◇</button>
         </div>
 
 
@@ -69797,7 +69581,7 @@ function toggleAnalytics(n){
 
 
 
-function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:1,liveMaxLatencyDurationCount:2});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}for(let n=1;n<=4;n++)connectCamera(n);
+function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}for(let n=1;n<=4;n++)connectCamera(n);
 
 
 
