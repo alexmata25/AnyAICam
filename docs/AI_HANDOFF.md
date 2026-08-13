@@ -335,13 +335,22 @@ A small, separately-approved cleanup/checkpoint between Phase 0 and Phase 1:
 6. **Minimum live-upload permissions: `s3:PutObject` only.** Explicitly no `ListBucket`, no `GetObject`, no `DeleteObject`, no access to the `recordings/` prefix, and — enforced by the per-request session policy, not just the base role policy — no access to any other camera's, appliance's, site's, or customer's prefix.
 7. **Session naming:** CloudTrail-readable, based on appliance/camera identity plus a unique/session value (e.g. the `{appliance_id}-{camera_id}-{timestamp}` shape suggested during planning). The exact format is a Phase 2 concern — it must be validated against AWS's `RoleSessionName` character/length rules when the `AssumeRole` call is actually implemented, not decided here.
 8. **No ABAC / session tags for V1.** The inline session-policy design is used instead — simpler, and it expresses the exact S3 resource prefix directly rather than through tag-matching conditions in the role's own policy.
-9. **The trust-policy `Principal` is still unresolved — and now confirmed blocked, not just unconfirmed.** A production check (2026-08-13, see §3) found no IAM instance profile attached to the live EC2 instance (`i-0f0fb6a78871b20d4`) at all — the metadata endpoint returned 404 for `iam/security-credentials/`, and the running container instead has static-looking `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` injected as plain environment variables. **There is currently no AWS-side role for this deployment that could serve as the trust-policy principal.** It is represented below as an explicit `<ANYAICAM_APP_TASK_ROLE_ARN>` placeholder and must **not** be guessed or hardcoded. Resolving it requires one of two remediation paths — a separate decision, not made here:
-   - **(a)** Create/attach a proper IAM instance profile to the EC2 instance and use *its* role ARN as the trust-policy principal, or
-   - **(b)** Migrate this deployment to actually run via the already-committed `ecs-task-definition.json` (which already assumes `ANYAICAM_RUNTIME_ROLE=cloud` and implies an ECS task role) and use that task role's ARN instead.
+9. **The trust-policy `Principal` — path chosen 2026-08-13, concrete ARN still unresolved (nothing created yet).** Between the two remediation paths originally identified, the standing V1 decision is now: **keep the current Docker-on-EC2 deployment and use an EC2 instance profile as the AWS application identity** (path (a) below) — ECS migration (path (b)) is explicitly deferred as a separate, later, independently-authorized decision, not part of this design.
+   - **(a) — CHOSEN for V1.** Create a dedicated EC2 application IAM role, attach it to `i-0f0fb6a78871b20d4` via an instance profile, and use *that role's* ARN as the live-upload role's trust-policy principal. Full two-role design in "EC2 application identity for the current Docker-on-EC2 deployment" below.
+   - **(b) — deferred, not decided now.** Migrate this deployment to actually run via the already-committed `ecs-task-definition.json` (which already assumes `ANYAICAM_RUNTIME_ROLE=cloud` and implies an ECS task role). Would also resolve the `RUNTIME_ROLE=edge`-in-production drift (§3/§6) as a side effect, which is worth remembering if this is revisited later — but is not being done now.
    
-   Neither path is decided or executed here — both require their own explicit authorization, and (b) would also resolve the `RUNTIME_ROLE=edge`-in-production drift noted in §3/§6 as a side effect, which is worth keeping in mind when that decision is made, but is not being made now.
+   The concrete ARN this produces is still unresolved because **nothing in AWS has been created yet** — this section only documents the approved design and the exact resources/commands that *would* create it, pending separate execution authorization.
 
-#### A. Trust policy template
+### EC2 application identity for the current Docker-on-EC2 deployment (chosen path, APPROVED design, not yet applied — 2026-08-13)
+
+Standing V1 decision: **keep the current Docker-on-EC2 deployment; do not migrate to ECS in this phase.** The AWS application identity is a dedicated EC2 instance profile attached to `i-0f0fb6a78871b20d4`. Two IAM roles, not one:
+
+- **A — EC2 Application Role.** The machine identity for the AnyAiCam AWS-side application itself. Its only permission is `sts:AssumeRole` on role B below — deliberately **no broad S3 permissions**, so a compromise of the application process alone cannot read/write S3 directly, only obtain a further-scoped, short-lived, `live/`-only upload session.
+- **B — Live Upload Role** (`anyaicam-live-relay-upload`, as already designed above). Trust principal is role A's ARN, not a generic placeholder. Base permissions and per-camera session-policy narrowing are unchanged from the design already approved above.
+
+Explicitly **not doing in this step:** creating anything in AWS, changing `ANYAICAM_RUNTIME_ROLE`, touching Cloudflare/camera config, or migrating to ECS. This is design only.
+
+#### A1. EC2 Application Role — trust policy (trusts the EC2 service, so the instance can assume it)
 
 ```json
 {
@@ -349,15 +358,47 @@ A small, separately-approved cleanup/checkpoint between Phase 0 and Phase 1:
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": { "AWS": "<ANYAICAM_APP_TASK_ROLE_ARN>" },
+      "Principal": { "Service": "ec2.amazonaws.com" },
       "Action": "sts:AssumeRole"
     }
   ]
 }
 ```
-No `sts:ExternalId` condition, per decision 5. `<ANYAICAM_APP_TASK_ROLE_ARN>` must be replaced with the real, confirmed ARN of the IAM role the FastAPI/ECS task actually runs as — not a placeholder value, and not guessed.
 
-#### B. Base live-upload role policy
+#### A2. EC2 Application Role — permissions policy (may ONLY assume the live-upload role; no direct S3 access)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumeLiveUploadRoleOnly",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anyaicam-live-relay-upload"
+    }
+  ]
+}
+```
+`<AWS_ACCOUNT_ID>` is unresolved for the same reason `<ANYAICAM_S3_BUCKET>` is — no AWS CLI access has been used yet to look it up, and it must not be guessed.
+
+#### B1. Live Upload Role — trust policy (updates the earlier generic template: the principal is now role A specifically, not an ECS task role)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anyaicam-ec2-app-role" },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+No `sts:ExternalId` condition, per decision 5. The principal is the EC2 Application Role's ARN (role A) — resolvable only once role A actually exists in AWS with a known account ID; not guessed here.
+
+#### B2. Live Upload Role — base permissions policy
 
 ```json
 {
@@ -372,7 +413,7 @@ No `sts:ExternalId` condition, per decision 5. `<ANYAICAM_APP_TASK_ROLE_ARN>` mu
   ]
 }
 ```
-`<ANYAICAM_S3_BUCKET>` resolves to whatever the already-configured `ANYAICAM_S3_BUCKET` environment value is (same bucket recordings already use). This is the *maximum* the role can ever do — `s3:PutObject` under `live/` only, nothing else. The per-camera narrowing to one exact prefix happens only via the session policy below, applied at `AssumeRole` time; this base policy alone would still let a session write to any camera's `live/` prefix, which is why the session policy is mandatory on every call, not optional hardening.
+`<ANYAICAM_S3_BUCKET>` resolves to whatever the already-configured `ANYAICAM_S3_BUCKET` environment value is (same bucket recordings already use) — confirmed present as a key on the live container but its value was not captured, and separately confirmed **currently empty** in production (per the 2026-08-13 check), meaning recording-to-S3 upload is not actually active in production today regardless of the Phase 0.1 hashlib fix. Must not be guessed. This is the *maximum* role B can ever do — `s3:PutObject` under `live/` only, nothing else. The per-camera narrowing to one exact prefix happens only via the session policy below, applied at `AssumeRole` time; this base policy alone would still let a session write to any camera's `live/` prefix, which is why the session policy is mandatory on every call, not optional hardening.
 
 #### C. Per-camera inline AssumeRole session-policy template
 
@@ -390,14 +431,75 @@ No `sts:ExternalId` condition, per decision 5. `<ANYAICAM_APP_TASK_ROLE_ARN>` mu
 ```
 Phase 2 (not started) is where FastAPI substitutes the real `{customer_id}/{site_id}/{appliance_id}/{camera_id}` values for the authorized relay session and passes this as the `Policy` parameter on the `sts:assume_role` call, after `authenticate_appliance()` and the existing tenant/customer/site/appliance/camera authorization checks succeed.
 
-#### Remaining information needed from AWS before the role can be created
+#### Exact AWS resources this design would create (none created yet)
 
-1. **A decision on remediation path (a) or (b) above, and then the real ARN it produces** — needed to fill in `<ANYAICAM_APP_TASK_ROLE_ARN>` in template A. As of the 2026-08-13 production check, **no such role currently exists for this deployment** (no instance profile attached to `i-0f0fb6a78871b20d4`), so this is not just "unconfirmed" but genuinely blocked until an instance profile is created or the deployment moves to ECS. Must be confirmed from the live AWS account, never guessed.
-2. **Confirmation of the exact `ANYAICAM_S3_BUCKET` value** already in use for recordings, to substitute into templates B and C. (The 2026-08-13 check confirmed this env var exists on the running container but its value was not captured/recorded.)
-3. **Confirmation of who has permission to create IAM roles/policies (and, if path (a) is chosen, instance profiles)** in the target AWS account, and whether that happens by hand, via the AWS Console/CLI, or via existing infrastructure-as-code (none was found tracked in this repo — no Terraform/CDK/CloudFormation was located during the original audit) — worth deciding before Phase 1 execution, not during this design step.
-4. Once 1–2 are known, the verification checklist from the planning discussion (`aws iam get-role`, a scoped `aws sts assume-role` with the session-policy template, a positive `PutObject` to the matching prefix, and a negative `PutObject` to a different camera's prefix to confirm denial) is what actually proves the design works before any Phase 2 code depends on it.
-5. Separately (not blocking Phase 1's IAM design, but needed before Phase 1 can be *executed* in production): a decision on whether/how to fix the confirmed `RUNTIME_ROLE=edge`-in-production drift (§3/§6). Flagged, not scheduled — no fix is being made now.
+1. IAM policy `assume-live-upload-role-only` (template A2), attached to a new IAM role `anyaicam-ec2-app-role` (template A1) with trust to `ec2.amazonaws.com`.
+2. IAM instance profile `anyaicam-ec2-app-role` containing that role.
+3. An association between that instance profile and EC2 instance `i-0f0fb6a78871b20d4`.
+4. IAM role `anyaicam-live-relay-upload` (template B1), `MaxSessionDuration` set to `900` to hard-cap it at the V1 credential lifetime (decision 4) regardless of what any future application code requests.
+5. IAM policy `live-segment-upload-only` (template B2), attached to that role.
+
+No S3 bucket, no CloudFront distribution, and no lifecycle policy are created by this step — those are later phases (§8 implementation-phase list, phases 2 and 5).
+
+#### Safe, read-only ways to determine whether an AnyAiCam S3 bucket already exists
+
+None of these require write access, and none were run during this planning step:
+- `aws s3api list-buckets` (or `aws s3 ls`) from any location with authenticated AWS CLI access — the live EC2 instance does not have the CLI installed, so this needs to run from wherever AWS access already exists (e.g. a laptop with `aws configure`, or AWS CloudShell in the Console).
+- AWS Console → S3 → the bucket list → search for a name containing `anyaicam`.
+- AWS Console → CloudTrail → Event history → filter for `CreateBucket` events with a resource name containing `anyaicam`, which would also show who created it and when, if it exists.
+- Locally, informationally only (not authoritative, may be a stale placeholder): the repo's untracked `deploy/.env.production.example` or local `.env`/`aws.env` files may reference an `ANYAICAM_S3_BUCKET=` value — worth checking yourself, since those files are already known (from the original audit) to contain other real secrets and were deliberately not opened or printed during this session.
+- The running container itself was already checked (per this session's production check) and has `ANYAICAM_S3_BUCKET` present as a key but **empty** — not useful for discovering an existing bucket, but confirms recording-to-S3 upload is not currently active in production.
+
+#### AWS CLI commands that would eventually apply this design (illustrative — NOT executed)
+
+```bash
+# A1 + A2: EC2 application role
+aws iam create-role --role-name anyaicam-ec2-app-role \
+  --assume-role-policy-document file://a1-ec2-app-role-trust.json \
+  --description "AnyAiCam EC2 application machine identity; may only assume the live-upload role"
+aws iam put-role-policy --role-name anyaicam-ec2-app-role \
+  --policy-name assume-live-upload-role-only \
+  --policy-document file://a2-ec2-app-role-permissions.json
+
+# Instance profile, containing role A, attached to the running instance
+aws iam create-instance-profile --instance-profile-name anyaicam-ec2-app-role
+aws iam add-role-to-instance-profile \
+  --instance-profile-name anyaicam-ec2-app-role --role-name anyaicam-ec2-app-role
+aws ec2 associate-iam-instance-profile \
+  --instance-id i-0f0fb6a78871b20d4 \
+  --iam-instance-profile Name=anyaicam-ec2-app-role
+
+# B1 + B2: live-upload role, MaxSessionDuration hard-capped at the V1 credential lifetime
+aws iam create-role --role-name anyaicam-live-relay-upload \
+  --assume-role-policy-document file://b1-live-upload-role-trust.json \
+  --max-session-duration 900 \
+  --description "AnyAiCam live-media S3 upload identity; narrowed per-camera by inline session policy"
+aws iam put-role-policy --role-name anyaicam-live-relay-upload \
+  --policy-name live-segment-upload-only \
+  --policy-document file://b2-live-upload-base-policy.json
+
+# Verify IMDS exposes the new role -- run FROM the EC2 instance itself afterward
+curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# expect the role name "anyaicam-ec2-app-role", not empty/404
+```
+AWS Console equivalents: IAM → Roles → Create role (twice, for A and B, using the JSON above as the trust/permissions documents) → EC2 → Instances → select the instance → Actions → Security → Modify IAM role, to attach the resulting instance profile.
+
+#### Verification checklist (to run only after execution is separately authorized)
+
+1. `aws iam get-role --role-name anyaicam-ec2-app-role` and `--role-name anyaicam-live-relay-upload` — confirm both exist with the intended trust policies and nothing else attached (`aws iam list-role-policies` / `list-attached-role-policies` should show exactly one inline/attached policy each).
+2. `aws ec2 describe-iam-instance-profile-associations --filters Name=instance-id,Values=i-0f0fb6a78871b20d4` — confirm the instance profile is actually associated with the running instance.
+3. From the EC2 instance itself: `curl http://169.254.169.254/latest/meta-data/iam/security-credentials/` now returns the role name instead of 404.
+4. A scoped `aws sts assume-role --role-arn <live-upload-role-arn> --role-session-name test --policy file://<template-C-filled-in>` succeeds and returns temporary credentials; a `PutObject` with those credentials to the *matching* camera prefix succeeds, and a `PutObject` to a *different* camera's prefix (or outside `live/`) is denied.
+5. Confirm the Docker container's boto3 client actually ends up using the instance-profile credentials rather than the existing (currently empty-valued) `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` env vars — boto3's default credential chain checks explicit environment variables *before* falling back to the instance-metadata service, so those variables may need to be fully unset (not just empty) in the container's environment for this to work correctly. **This is a deployment-configuration consideration to keep in mind for whenever execution is authorized — no `.env`/compose change is being made now.**
+
+#### Remaining information needed from AWS before any of this can be created
+
+1. **`<AWS_ACCOUNT_ID>`** — needed in templates A2 and B1. Not guessed; must come from an authenticated AWS CLI/Console session (`aws sts get-caller-identity` is the standard read-only way to get it, once AWS CLI access is available from somewhere).
+2. **`<ANYAICAM_S3_BUCKET>`** — the real bucket name, needed in templates B2 and C. Confirmed present as an env-var key on the live container but empty; see the read-only discovery methods above.
+3. **Confirmation of who has permission to create IAM roles/policies/instance profiles** in the target AWS account, and whether that happens by hand, via the Console/CLI, or via existing infrastructure-as-code (none was found tracked in this repo — no Terraform/CDK/CloudFormation was located during the original audit).
+4. Once 1–2 are known, the verification checklist above is what actually proves the design works before any Phase 2 code depends on it.
+5. Separately (not blocking this IAM design, but needed before it can be *fully* exercised end-to-end): a decision on whether/how to fix the confirmed `RUNTIME_ROLE=edge`-in-production drift (§3/§6), and the boto3-credential-chain/env-var consideration in verification-checklist item 5 above. Both flagged, neither scheduled — no fix is being made now.
 
 **Architecture status: APPROVED — the direction above (corrected media format, direct-to-S3 data plane, STS-scoped credentials, control/data-plane separation, hybrid on-demand publishing) is the accepted design.**
-**Implementation status: Phase 0 (characterization tests) APPROVED and COMPLETE. Phase 0.1 (hashlib fix + cleanup checkpoint) COMPLETE. Phase 1 IAM DESIGN APPROVED (documented above) but NOT APPLIED to AWS — the trust-policy principal is now confirmed blocked (no IAM instance profile attached to the live EC2 instance as of the 2026-08-13 production check; see §3 and the Phase 1 remediation-path note above) rather than merely unresolved, and nothing has been created in AWS. Production is also confirmed running `RUNTIME_ROLE=edge`, contradicting the committed `ecs-task-definition.json` — flagged as drift to correct later, deliberately not touched now. Phase 2 and all subsequent phases are NOT YET AUTHORIZED — each requires a separate, explicit go-ahead before any transport code is written.**
+**Implementation status: Phase 0 (characterization tests) APPROVED and COMPLETE. Phase 0.1 (hashlib fix + cleanup checkpoint) COMPLETE. Phase 1 IAM DESIGN APPROVED, including the V1 identity path (2026-08-13): keep the current Docker-on-EC2 deployment, use an EC2 instance profile (two-role design: EC2 application role + live-upload role) as the AWS application identity — ECS migration is explicitly deferred as a separate future decision. Nothing has been applied to AWS yet; `<AWS_ACCOUNT_ID>` and `<ANYAICAM_S3_BUCKET>` remain unresolved and must not be guessed. Production is also confirmed running `RUNTIME_ROLE=edge`, contradicting the committed `ecs-task-definition.json` — flagged as drift to correct later, deliberately not touched now. Phase 2 and all subsequent phases, and execution of the AWS resource creation documented above, are NOT YET AUTHORIZED — each requires a separate, explicit go-ahead.**
 
