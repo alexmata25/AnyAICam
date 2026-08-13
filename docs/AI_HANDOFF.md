@@ -322,9 +322,9 @@ A small, separately-approved cleanup/checkpoint between Phase 0 and Phase 1:
 - Full `app/tests/` suite re-run after the fix: **45/45 passing.**
 - Finding #2 (test-suite import-order fragility) remains an open, un-fixed TODO — intentionally out of scope for both Phase 0 and Phase 0.1.
 
-### Phase 1 — APPROVED DESIGN, not yet applied (2026-08-13)
+### Phase 1 — EXECUTED and VERIFIED in AWS (2026-08-13)
 
-**Status: PLAN APPROVED. Nothing has been applied to AWS. No application code has been written. Phase 2 has not started.** This section is the IAM design for scoped, short-lived live-upload credentials, per implementation phase 1 in this section's phase list above. It replaces the earlier chat-only draft with the corrected, approved version below.
+**Status: IAM EXECUTED AND FUNCTIONALLY VERIFIED IN AWS. No application code has been written. Phase 2 has not started.** This section is the IAM design for scoped, short-lived live-upload credentials, per implementation phase 1 in this section's phase list above. The design below was created for real in the AWS account and functionally verified — see "Phase 1 execution result — VERIFIED" near the end of this section for the exact evidence. This is no longer a plan-only section.
 
 **Decisions (approved, corrected from the initial draft):**
 1. **One IAM role** for all AnyAiCam live-media uploads — not one role per camera/appliance/customer.
@@ -436,7 +436,7 @@ Phase 2 (not started) is where FastAPI substitutes the real `{customer_id}/{site
 1. IAM policy `assume-live-upload-role-only` (template A2), attached to a new IAM role `anyaicam-ec2-app-role` (template A1) with trust to `ec2.amazonaws.com`.
 2. IAM instance profile `anyaicam-ec2-app-role` containing that role.
 3. An association between that instance profile and EC2 instance `i-0f0fb6a78871b20d4`.
-4. IAM role `anyaicam-live-relay-upload` (template B1), `MaxSessionDuration` set to `900` to hard-cap it at the V1 credential lifetime (decision 4) regardless of what any future application code requests.
+4. IAM role `anyaicam-live-relay-upload` (template B1). Corrected during execution: AWS IAM does not allow a role's `MaxSessionDuration` to be set below 3600 seconds (1 hour) — the role's maximum session duration stays at AWS's default 1 hour. The V1 900-second (15-minute) credential lifetime (decision 4) is enforced instead by requesting `DurationSeconds=900` on each `sts:AssumeRole` call, which is a Phase 2 application-code concern, not a role-level setting.
 5. IAM policy `live-segment-upload-only` (template B2), attached to that role.
 
 No S3 bucket, no CloudFront distribution, and no lifecycle policy are created by this step — those are later phases (§8 implementation-phase list, phases 2 and 5).
@@ -469,10 +469,11 @@ aws ec2 associate-iam-instance-profile \
   --instance-id i-0f0fb6a78871b20d4 \
   --iam-instance-profile Name=anyaicam-ec2-app-role
 
-# B1 + B2: live-upload role, MaxSessionDuration hard-capped at the V1 credential lifetime
+# B1 + B2: live-upload role. MaxSessionDuration is left at AWS's 1-hour default --
+# IAM rejects any value below 3600s, so the 15-minute V1 credential lifetime is
+# enforced at AssumeRole call time via DurationSeconds=900 instead (Phase 2, not here).
 aws iam create-role --role-name anyaicam-live-relay-upload \
   --assume-role-policy-document file://b1-live-upload-role-trust.json \
-  --max-session-duration 900 \
   --description "AnyAiCam live-media S3 upload identity; narrowed per-camera by inline session policy"
 aws iam put-role-policy --role-name anyaicam-live-relay-upload \
   --policy-name live-segment-upload-only \
@@ -505,10 +506,36 @@ AWS Console equivalents: IAM → Roles → Create role (twice, for A and B, usin
 
 #### Remaining information needed before any of this can be created
 
-1. **Confirmation of who has permission to create IAM roles/policies/instance profiles** in the target AWS account, and whether that happens by hand, via the Console/CLI, or via existing infrastructure-as-code (none was found tracked in this repo — no Terraform/CDK/CloudFormation was located during the original audit).
-2. The IAM verification checklist above is what actually proves the design works before any Phase 2 code depends on it — not yet run.
-3. Separately (not blocking this IAM design, but needed before it can be *fully* exercised end-to-end): a decision on whether/how to fix the confirmed `RUNTIME_ROLE=edge`-in-production drift (§3/§6), and the boto3-credential-chain/env-var consideration in verification-checklist item 5 above. Both flagged, neither scheduled — no fix is being made now.
+1. ~~Confirmation of who has permission to create IAM roles/policies/instance profiles~~ — resolved by execution: the user created both roles directly via the AWS Console (IAM → Create role → Add permissions → Create inline policy), by hand, not via infrastructure-as-code (still none tracked in this repo).
+2. ~~The IAM verification checklist above is what actually proves the design works — not yet run.~~ — **now run and passed; see "Phase 1 execution result — VERIFIED" immediately below.**
+3. Separately (not blocking this IAM design, but still needed before it can be *fully* exercised end-to-end by Phase 2 code): a decision on whether/how to fix the confirmed `RUNTIME_ROLE=edge`-in-production drift (§3/§6), and the boto3-credential-chain/env-var consideration in verification-checklist item 5 above. Both still flagged, neither scheduled — no fix is being made now.
+
+#### Phase 1 execution result — VERIFIED (2026-08-13)
+
+Phase 1 IAM is now **executed and functionally verified in the real AWS account**, not merely designed. Every fact below was verified directly in AWS, not assumed from the design documents above.
+
+**Created:**
+- IAM role `anyaicam-ec2-app-role` (the EC2 Application Role, template A1/A2).
+- IAM role `anyaicam-live-relay-upload` (the Live Upload Role, template B1/B2).
+- Inline policy `live-segment-upload-only` on `anyaicam-live-relay-upload`: `s3:PutObject` only, resource `arn:aws:s3:::anyaicam2026/live/*` — exactly template B2, no broader S3 permissions were added.
+- Trust relationship on `anyaicam-live-relay-upload` limited to exactly one principal: `arn:aws:iam::880690594006:role/anyaicam-ec2-app-role` — exactly template B1.
+
+**Attached and verified live in AWS:**
+- `anyaicam-ec2-app-role` is attached to production EC2 instance `i-0f0fb6a78871b20d4` via an instance profile.
+- The instance profile was verified **active through IMDSv2** on the instance itself — `iam/security-credentials/` now exposes `anyaicam-ec2-app-role` (previously 404, per the §3 production check before this role existed).
+
+**Functionally verified (not just "created," actually exercised):**
+- `sts:AssumeRole` from `anyaicam-ec2-app-role` into `arn:aws:iam::880690594006:role/anyaicam-live-relay-upload` succeeds.
+- Requesting `DurationSeconds=900` on that `AssumeRole` call succeeds and returns a 15-minute session — confirming the V1 credential-lifetime target (decision 4) is achievable even though the role's own `MaxSessionDuration` stays at AWS's 1-hour default (see the corrected note on decision 4/exact-resources above: IAM does not allow lowering a role's own max below 3600s).
+- Using that session, `s3:PutObject` to `s3://anyaicam2026/live/test-customer/test-site/test-appliance/camera1/` **succeeds** — the allowed, matching prefix.
+- Using that same session, `s3:PutObject` to the *different*, unauthorized `camera2` prefix is **denied with `AccessDenied`** — confirming the session-policy-narrowing design (template C's intent) actually holds, not just in theory.
+- The base `anyaicam-ec2-app-role` (role A) was confirmed **unable to call `s3:DeleteObject` directly** — consistent with role A having no S3 permissions of its own beyond `sts:AssumeRole` on role B (template A2).
+- A temporary test object (`iam-test.txt`) created during this verification was manually deleted from the S3 console afterward — no test artifacts were left in `anyaicam2026`.
+
+**What this proves:** the approved Phase 1 design (one shared role, session-policy-narrowed per camera, `s3:PutObject`-only, no `ListBucket`/`GetObject`/`DeleteObject`, EC2-instance-profile-based trust, no `sts:ExternalId`) is not just written down correctly — it behaves correctly against the real AWS account, including the negative case (a session cannot write outside its authorized prefix) and the privilege-separation case (the base app role cannot touch S3 directly). This is the evidence Phase 2 application code can now be built against.
+
+**What this does NOT do:** no application code was written or changed, `ANYAICAM_RUNTIME_ROLE` was not touched, the confirmed production drift (§3/§6) was not fixed, and Phase 2 has not started.
 
 **Architecture status: APPROVED — the direction above (corrected media format, direct-to-S3 data plane, STS-scoped credentials, control/data-plane separation, hybrid on-demand publishing) is the accepted design.**
-**Implementation status: Phase 0 (characterization tests) APPROVED and COMPLETE. Phase 0.1 (hashlib fix + cleanup checkpoint) COMPLETE. Phase 1 IAM DESIGN APPROVED, including the V1 identity path (2026-08-13): keep the current Docker-on-EC2 deployment, use an EC2 instance profile (two-role design: EC2 application role + live-upload role) as the AWS application identity — ECS migration is explicitly deferred as a separate future decision. Both template placeholders are now RESOLVED and substituted into the JSON above: `<AWS_ACCOUNT_ID>` = `880690594006`, `<ANYAICAM_S3_BUCKET>` = `anyaicam2026` (confirmed via read-only AWS-side verification — region, public-access-block, encryption, and absence of conflicting `recordings/` objects all consistent with it being the intended, not-yet-wired-up production media bucket). **Nothing has still been applied to AWS** — the IAM JSON is fully resolved and ready, but role/policy/instance-profile creation and attachment remain unexecuted pending separate authorization. Production is also confirmed running `RUNTIME_ROLE=edge`, contradicting the committed `ecs-task-definition.json` — flagged as drift to correct later, deliberately not touched now. Phase 2 and all subsequent phases, and execution of the AWS resource creation documented above, are NOT YET AUTHORIZED — each requires a separate, explicit go-ahead.**
+**Implementation status: Phase 0 (characterization tests) APPROVED and COMPLETE. Phase 0.1 (hashlib fix + cleanup checkpoint) COMPLETE. Phase 1 IAM EXECUTED AND FUNCTIONALLY VERIFIED in AWS (2026-08-13) — both roles exist, the instance profile is attached and confirmed live via IMDSv2, `AssumeRole` with `DurationSeconds=900` works, the per-camera session-policy narrowing was proven with both a positive (`camera1`, allowed) and negative (`camera2`, denied) test, and the base app role was confirmed to have no direct S3 access. No broader S3 permissions were added than designed. Production is still confirmed running `RUNTIME_ROLE=edge`, contradicting the committed `ecs-task-definition.json` — this drift was deliberately NOT touched during Phase 1 execution and remains flagged for a later, separate fix. Phase 2 and all subsequent phases are NOT YET AUTHORIZED — each requires a separate, explicit go-ahead before any application code is written.**
 
