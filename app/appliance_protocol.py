@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -8,6 +9,8 @@ from pathlib import Path
 
 ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update'}
 FORBIDDEN_KEYS = {'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
+LIVE_RELAY_SESSION_DURATION_SECONDS = 900  # V1 credential lifetime (docs/AI_HANDOFF.md Phase 1 decision 4)
+_SESSION_NAME_SAFE = re.compile(r'[^\w+=,.@-]')
 
 
 def validate_request_time(timestamp: int, now: int | None = None, window_seconds: int = 300) -> bool:
@@ -67,3 +70,23 @@ class OfflineQueue:
 def cloud_settings() -> dict:
     mode=os.getenv('ANYAICAM_CLOUD_MODE','local').lower()
     return {'mode':mode,'base_url':os.getenv('ANYAICAM_CLOUD_URL','http://host.docker.internal:8000' if mode in {'local','mock'} else ''),'mock':mode=='mock'}
+
+
+def live_relay_s3_prefix(customer_id: str,site_id: str,appliance_id: str,camera_id: str) -> str:
+    # docs/AI_HANDOFF.md Phase 1 template C: the exact prefix every issued session is scoped to.
+    return f'live/{customer_id}/{site_id}/{appliance_id}/{camera_id}/'
+
+
+def live_relay_session_policy(bucket: str,customer_id: str,site_id: str,appliance_id: str,camera_id: str) -> dict:
+    # docs/AI_HANDOFF.md Phase 1 template C, filled in per-request. Passed as the `Policy`
+    # parameter on sts:assume_role -- narrows the shared live-upload role down to exactly
+    # one camera's prefix for this session. Verified in AWS during Phase 1 execution:
+    # PutObject to this prefix succeeds, PutObject to any other camera's prefix is denied.
+    prefix=live_relay_s3_prefix(customer_id,site_id,appliance_id,camera_id)
+    return {'Version':'2012-10-17','Statement':[{'Effect':'Allow','Action':'s3:PutObject','Resource':f'arn:aws:s3:::{bucket}/{prefix}*'}]}
+
+
+def live_relay_session_name(appliance_id: str,camera_id: str,now: int | None=None) -> str:
+    # CloudTrail-readable and within AWS's RoleSessionName rules ([\w+=,.@-]{2,64}).
+    raw=f'{appliance_id}-{camera_id}-{now or int(time.time())}'
+    return _SESSION_NAME_SAFE.sub('-',raw)[:64]

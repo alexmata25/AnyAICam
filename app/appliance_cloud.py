@@ -1,22 +1,41 @@
 from cloud_config import settings as cloud_settings
 import json
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta
 from html import escape
+from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from appliance_protocol import ALLOWED_COMMANDS, RateLimiter, cloud_settings, health_state, sanitize_appliance_payload, validate_request_time
+from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, validate_request_time
+from live_manifest import LiveManifestStore
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
 logger=logging.getLogger('anyaicam.appliance')
 request_limiter=RateLimiter(120,60); activation_limiter=RateLimiter(10,300)
+
+# Phase 2 (docs/AI_HANDOFF.md §8): cloud-side control plane for the live-relay
+# media path. Defaults to disabled -- with ANYAICAM_LIVE_RELAY_ENABLED unset,
+# both new routes below refuse before ever touching boto3/STS. No appliance
+# or frontend code calls these endpoints yet (Phases 3/4/6); they exist so
+# Phase 2 can be built and tested in isolation, per the approved phase plan.
+LIVE_RELAY_ENABLED=os.getenv('ANYAICAM_LIVE_RELAY_ENABLED','false').strip().lower()=='true'
+LIVE_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_LIVE_UPLOAD_ROLE_ARN','').strip()
+LIVE_RELAY_S3_BUCKET=os.getenv('ANYAICAM_S3_BUCKET','').strip()
+LIVE_RELAY_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).strip()
+live_manifest_store=LiveManifestStore(Path(os.getenv('ANYAICAM_LIVE_MANIFEST_FILE','/app/recordings/live_manifest.json')))
 
 
 def _bearer(request: Request) -> str:
@@ -41,6 +60,12 @@ def authenticate_appliance(request: Request) -> dict:
     except Exception as error:
         raise HTTPException(status_code=409,detail='Duplicate or replayed appliance request.') from error
     return appliance
+
+
+def _authorized_camera(appliance: dict,camera_id: str) -> dict:
+    camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
+    if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
+    return camera
 
 
 def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
@@ -113,6 +138,55 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
                 if cursor.rowcount: accepted.append(item)
         notifications=sum(fanout_appliance_event(appliance,item) for item in accepted)
         return {'status':'accepted','inserted':inserted,'duplicates':duplicates,'notifications_created':notifications}
+
+    @app.post('/api/appliance/live/{camera_id}/session')
+    def live_relay_session(request: Request,camera_id: str) -> dict:
+        # docs/AI_HANDOFF.md §8 Phase 2: issues a short-lived, camera-scoped S3 upload
+        # credential. FastAPI never receives a media byte through this endpoint -- it
+        # only authenticates, authorizes, and brokers an STS credential.
+        appliance=authenticate_appliance(request)
+        if not LIVE_RELAY_ENABLED: raise HTTPException(status_code=404,detail='Live relay is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        if boto3 is None or not LIVE_UPLOAD_ROLE_ARN or not LIVE_RELAY_S3_BUCKET or not LIVE_RELAY_AWS_REGION:
+            raise HTTPException(status_code=503,detail='Live relay is not configured.')
+        policy=live_relay_session_policy(LIVE_RELAY_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        session_name=live_relay_session_name(appliance['id'],camera_id)
+        try:
+            sts=boto3.client('sts',region_name=LIVE_RELAY_AWS_REGION)
+            assumed=sts.assume_role(RoleArn=LIVE_UPLOAD_ROLE_ARN,RoleSessionName=session_name,Policy=json.dumps(policy),DurationSeconds=LIVE_RELAY_SESSION_DURATION_SECONDS)
+        except Exception as error:
+            logger.exception('live_relay.assume_role_failed appliance_id=%s camera_id=%s',appliance['id'],camera_id)
+            raise HTTPException(status_code=502,detail='Could not obtain a live-upload credential.') from error
+        issued=assumed['Credentials']
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.live_relay_session_issued','camera',camera_id,{'session_name':session_name})
+        return {
+            'status':'accepted',
+            'bucket':LIVE_RELAY_S3_BUCKET,
+            'key_prefix':live_relay_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id),
+            'credentials':{
+                'access_key_id':issued['AccessKeyId'],
+                'secret_access_key':issued['SecretAccessKey'],
+                'session_token':issued['SessionToken'],
+                'expiration':issued['Expiration'].isoformat(),
+            },
+        }
+
+    @app.post('/api/appliance/live/{camera_id}/segment-available')
+    def live_relay_segment_available(request: Request,camera_id: str,payload: dict) -> dict:
+        # docs/AI_HANDOFF.md §8 Phase 2: tiny JSON bookkeeping only -- the segment
+        # itself was already PutObject'd directly to S3 by the appliance using the
+        # credential from live_relay_session() above; this call never carries media.
+        appliance=authenticate_appliance(request)
+        if not LIVE_RELAY_ENABLED: raise HTTPException(status_code=404,detail='Live relay is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        safe=sanitize_appliance_payload(payload); segment_key=str(safe.get('segment_key','')).strip()
+        if not segment_key: raise HTTPException(status_code=400,detail='segment_key is required.')
+        expected_prefix=live_relay_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        if not segment_key.startswith(expected_prefix):
+            raise HTTPException(status_code=403,detail="segment_key is outside this camera's authorized prefix.")
+        sequence=safe.get('sequence')
+        entry=live_manifest_store.record_segment(camera_id,segment_key,int(sequence) if sequence is not None else None)
+        return {'status':'accepted','segment_count':len(entry['segments'])}
 
     @app.get('/api/appliance/{cloud_id}/scan-jobs')
     def secure_scan_jobs(request: Request,cloud_id: str) -> dict:
