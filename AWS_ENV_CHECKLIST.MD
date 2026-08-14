@@ -26,7 +26,10 @@
 
 ## Future playback
 
-- [ ] `ANYAICAM_CLOUDFRONT_URL`
+- [x] `ANYAICAM_CLOUDFRONT_URL=https://d31cxfv0l904ar.cloudfront.net`
+  - CloudFront distribution ID: `E1LBM1M5362SXK` (docs/AI_HANDOFF.md §8, Phase 5 result).
+  - Distribution currently remains **DISABLED** intentionally, until viewer authorization/signing (trusted key group, signed URL/cookie minting) is implemented and separately authorized.
+  - Checking this off means the CloudFront endpoint now exists and is known — it does **NOT** mean live viewer traffic is enabled.
 
 ## Phase 13A safety
 
