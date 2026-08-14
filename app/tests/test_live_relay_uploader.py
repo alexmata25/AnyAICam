@@ -9,6 +9,7 @@ of the ANYAICAM_PARTNER_DB import-order workarounds used elsewhere in this
 test suite are needed here.
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -53,6 +54,7 @@ class ResetStateMixin:
         relay._sessions.clear()
         relay._uploaded_segments.clear()
         relay._next_sequence.clear()
+        relay._last_applied_relay_state.clear()
 
 
 class LoadApplianceIdentityTests(ResetStateMixin, unittest.TestCase):
@@ -515,6 +517,225 @@ class LiveRelayWorkerDisabledTests(ResetStateMixin, unittest.IsolatedAsyncioTest
         with patch.object(relay, "RUNTIME_ROLE", "edge"), patch.object(relay, "LIVE_RELAY_ENABLED", False):
             await self._run_briefly_then_cancel()
         self.assertEqual(relay.live_relay_state["worker_status"], "disabled")
+
+
+class RelayCommandReconciliationTests(ResetStateMixin, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self._tempdir = tempfile.TemporaryDirectory(prefix="anyaicam-live-relay-commands-")
+        self._commands_file = Path(self._tempdir.name) / "live_relay_commands.json"
+        self._patch = patch.object(relay, "RELAY_COMMANDS_FILE", self._commands_file)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tempdir.cleanup()
+        super().tearDown()
+
+    def _write_desired_state(self, state: dict) -> None:
+        self._commands_file.parent.mkdir(parents=True, exist_ok=True)
+        self._commands_file.write_text(json.dumps(state), encoding="utf-8")
+
+    # --- basic activation/deactivation ---
+
+    def test_activates_the_requested_camera(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self.assertTrue(relay.is_relay_active(5))
+        self.assertEqual(relay.active_camera_numbers(), [5])
+
+    def test_deactivates_when_desired_state_says_inactive(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": False}})
+        relay._reconcile_relay_commands()
+        self.assertFalse(relay.is_relay_active(5))
+
+    def test_unrelated_cameras_are_never_touched(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self.assertFalse(relay.is_relay_active(6))
+        self.assertFalse(relay.is_relay_active(1))
+
+    def test_missing_file_is_a_no_op_and_preserves_default_off(self):
+        relay._reconcile_relay_commands()
+        self.assertEqual(relay.active_camera_numbers(), [])
+
+    # --- malformed/invalid state ---
+
+    def test_malformed_camera_number_key_is_skipped_and_does_not_raise(self):
+        self._write_desired_state({"not-a-number": {"camera_id": "cam-x", "active": True}})
+        relay._reconcile_relay_commands()
+        self.assertEqual(relay.active_camera_numbers(), [])
+
+    def test_one_malformed_entry_does_not_block_a_valid_transition(self):
+        self._write_desired_state({
+            "5": {"camera_id": "cam-5", "active": True},
+            "bad": {"camera_id": "cam-bad", "active": True},
+            "6": "not-a-dict",
+        })
+        relay._reconcile_relay_commands()
+        self.assertTrue(relay.is_relay_active(5))
+        self.assertFalse(relay.is_relay_active(6))
+
+    def test_non_dict_json_state_is_treated_as_empty(self):
+        self._commands_file.parent.mkdir(parents=True, exist_ok=True)
+        self._commands_file.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+        relay._reconcile_relay_commands()
+        self.assertEqual(relay.active_camera_numbers(), [])
+
+    def test_corrupted_json_state_is_treated_as_empty(self):
+        self._commands_file.parent.mkdir(parents=True, exist_ok=True)
+        self._commands_file.write_text("{not valid json", encoding="utf-8")
+        relay._reconcile_relay_commands()
+        self.assertEqual(relay.active_camera_numbers(), [])
+
+    # --- idempotency ---
+
+    def test_unchanged_active_state_does_not_repeatedly_invoke_set_relay_active(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+            relay._reconcile_relay_commands()
+            relay._reconcile_relay_commands()
+        mock_set.assert_called_once_with(5, "cam-5", True)
+
+    def test_true_to_false_invokes_exactly_one_transition(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": False}})
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+        mock_set.assert_called_once_with(5, "cam-5", False)
+
+    def test_camera_id_change_while_active_deactivates_old_then_activates_new(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5-old", "active": True}})
+        relay._reconcile_relay_commands()
+        self._write_desired_state({"5": {"camera_id": "cam-5-new", "active": True}})
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+        self.assertEqual(
+            mock_set.call_args_list,
+            [unittest.mock.call(5, "cam-5-old", False), unittest.mock.call(5, "cam-5-new", True)],
+        )
+
+    # --- removal / disappearance handling ---
+
+    def test_active_camera_then_entry_removed_deactivates_exactly_once(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self._write_desired_state({})
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+        mock_set.assert_called_once_with(5, "cam-5", False)
+
+    def test_removed_entry_is_also_removed_from_last_applied_state(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self.assertIn(5, relay._last_applied_relay_state)
+        self._write_desired_state({})
+        relay._reconcile_relay_commands()
+        self.assertNotIn(5, relay._last_applied_relay_state)
+
+    def test_non_bool_active_value_is_rejected(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": "true"}})
+        relay._reconcile_relay_commands()
+        self.assertEqual(relay.active_camera_numbers(), [])
+
+    def test_active_camera_then_file_missing_deactivates_exactly_once(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self._commands_file.unlink()
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+        mock_set.assert_called_once_with(5, "cam-5", False)
+
+    def test_repeated_empty_or_missing_state_does_not_repeat_deactivate(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        relay._reconcile_relay_commands()
+        self._commands_file.unlink()
+        relay._reconcile_relay_commands()
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+            relay._reconcile_relay_commands()
+        mock_set.assert_not_called()
+
+    def test_malformed_entry_does_not_accidentally_deactivate_an_unrelated_valid_camera(self):
+        self._write_desired_state({
+            "5": {"camera_id": "cam-5", "active": True},
+            "6": {"camera_id": "cam-6", "active": True},
+        })
+        relay._reconcile_relay_commands()
+        self.assertTrue(relay.is_relay_active(5))
+        self.assertTrue(relay.is_relay_active(6))
+        self._write_desired_state({
+            "5": {"camera_id": "cam-5", "active": "not-a-bool"},
+            "6": {"camera_id": "cam-6", "active": True},
+        })
+        with patch.object(relay, "set_relay_active") as mock_set:
+            relay._reconcile_relay_commands()
+        # camera 5's now-malformed entry is treated as absent -> deactivated
+        # exactly once; camera 6's unchanged valid entry triggers no call at all.
+        mock_set.assert_called_once_with(5, "cam-5", False)
+
+    # --- wiring into the worker loop ---
+
+    async def test_worker_disabled_path_never_calls_reconcile(self):
+        with patch.object(relay, "RUNTIME_ROLE", "cloud"), \
+                patch.object(relay, "LIVE_RELAY_ENABLED", True), \
+                patch.object(relay, "_reconcile_relay_commands") as mock_reconcile:
+            task = asyncio.create_task(relay.live_relay_worker(Path("/nonexistent")))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(BaseException):
+                await task
+        mock_reconcile.assert_not_called()
+
+    async def test_worker_enabled_path_reconciles_desired_state_end_to_end(self):
+        self._write_desired_state({"5": {"camera_id": "cam-5", "active": True}})
+        with patch.object(relay, "RUNTIME_ROLE", "edge"), \
+                patch.object(relay, "LIVE_RELAY_ENABLED", True), \
+                patch.object(relay, "SCAN_SECONDS", 0.01), \
+                patch.object(relay, "_relay_camera_once"):
+            task = asyncio.create_task(relay.live_relay_worker(Path("/nonexistent")))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(BaseException):
+                await task
+        self.assertTrue(relay.is_relay_active(5))
+
+
+class RelayCommandValidatorTests(unittest.TestCase):
+    def test_valid_camera_number_is_accepted(self):
+        self.assertEqual(relay._validate_camera_number(5), 5)
+        self.assertEqual(relay._validate_camera_number("5"), 5)
+
+    def test_boolean_camera_number_is_rejected(self):
+        self.assertIsNone(relay._validate_camera_number(True))
+        self.assertIsNone(relay._validate_camera_number(False))
+
+    def test_out_of_range_camera_number_is_rejected(self):
+        for bad in (0, -1, 257, 10000):
+            with self.subTest(bad=bad):
+                self.assertIsNone(relay._validate_camera_number(bad))
+
+    def test_non_numeric_camera_number_is_rejected(self):
+        self.assertIsNone(relay._validate_camera_number("not-a-number"))
+        self.assertIsNone(relay._validate_camera_number(None))
+
+    def test_valid_camera_id_is_accepted(self):
+        self.assertEqual(relay._validate_camera_id("cam-5"), "cam-5")
+
+    def test_blank_camera_id_is_rejected(self):
+        self.assertIsNone(relay._validate_camera_id("   "))
+        self.assertIsNone(relay._validate_camera_id(""))
+
+    def test_oversized_camera_id_is_rejected(self):
+        self.assertIsNone(relay._validate_camera_id("x" * 129))
+
+    def test_non_string_camera_id_is_rejected(self):
+        self.assertIsNone(relay._validate_camera_id(12345))
+        self.assertIsNone(relay._validate_camera_id(None))
 
 
 if __name__ == "__main__":

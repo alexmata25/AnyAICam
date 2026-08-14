@@ -30,6 +30,8 @@ class AgentConfig:
     def queue_file(self): return Path(self.state_dir)/'offline_queue.db'
     @property
     def cameras_file(self): return Path(self.state_dir)/'cameras.json'
+    @property
+    def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
 
     @classmethod
     def load(cls,path: str|Path|None=None):

@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update'}
+ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay'}
 FORBIDDEN_KEYS = {'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
 LIVE_RELAY_SESSION_DURATION_SECONDS = 900  # V1 credential lifetime (docs/AI_HANDOFF.md Phase 1 decision 4)
 _SESSION_NAME_SAFE = re.compile(r'[^\w+=,.@-]')

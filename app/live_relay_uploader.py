@@ -65,6 +65,7 @@ LIVE_RELAY_ENABLED = os.environ.get("ANYAICAM_LIVE_RELAY_ENABLED", "false").stri
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
+RELAY_COMMANDS_FILE = STATE_DIR / "live_relay_commands.json"  # Phase 4: written by appliance-agent commands.py
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
 SCAN_SECONDS = max(0.5, float(os.environ.get("ANYAICAM_LIVE_RELAY_SCAN_SECONDS", "1.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_LIVE_RELAY_SESSION_RENEW_MARGIN_SECONDS", "120")))
@@ -77,6 +78,7 @@ _active_cameras: dict[int, str] = {}           # camera_number -> camera_id, pre
 _sessions: dict[int, dict] = {}                # camera_number -> {credentials, bucket, key_prefix, expires_at}
 _uploaded_segments: dict[int, list[str]] = {}  # camera_number -> recently uploaded segment filenames (bounded, ordered)
 _next_sequence: dict[int, int] = {}            # camera_number -> next sequence number to report
+_last_applied_relay_state: dict[int, tuple[str, bool]] = {}  # Phase 4: camera_number -> (camera_id, active) last actually applied via set_relay_active()
 
 
 def set_relay_active(camera_number: int, camera_id: str, active: bool = True) -> None:
@@ -99,6 +101,66 @@ def is_relay_active(camera_number: int) -> bool:
 def active_camera_numbers() -> list[int]:
     with _lock:
         return sorted(_active_cameras)
+
+
+def _validate_camera_number(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 1 <= number <= 256 else None
+
+
+def _validate_camera_id(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    return trimmed if trimmed and len(trimmed) <= 128 else None
+
+
+def _parse_relay_commands_file() -> dict[int, tuple[str, bool]]:
+    try:
+        raw = json.loads(RELAY_COMMANDS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    desired: dict[int, tuple[str, bool]] = {}
+    for camera_number_key, entry in raw.items():
+        camera_number = _validate_camera_number(camera_number_key)
+        if camera_number is None or not isinstance(entry, dict):
+            logger.warning("live_relay.relay_command_entry_invalid key=%r", camera_number_key)
+            continue
+        camera_id = _validate_camera_id(entry.get("camera_id"))
+        active = entry.get("active")
+        if camera_id is None or not isinstance(active, bool):
+            logger.warning("live_relay.relay_command_entry_invalid camera_number=%s", camera_number_key)
+            continue
+        desired[camera_number] = (camera_id, active)
+    return desired
+
+
+def _reconcile_relay_commands() -> None:
+    desired = _parse_relay_commands_file()
+
+    for camera_number in list(_last_applied_relay_state):
+        if camera_number in desired:
+            continue
+        previous_camera_id, previous_active = _last_applied_relay_state.pop(camera_number)
+        if previous_active:
+            set_relay_active(camera_number, previous_camera_id, False)
+
+    for camera_number, (camera_id, active) in desired.items():
+        previous = _last_applied_relay_state.get(camera_number)
+        if previous == (camera_id, active):
+            continue
+        if previous is not None and active and previous[0] != camera_id and previous[1]:
+            set_relay_active(camera_number, previous[0], False)
+        if previous is not None or active:
+            set_relay_active(camera_number, camera_id, active)
+        _last_applied_relay_state[camera_number] = (camera_id, active)
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -328,6 +390,7 @@ async def live_relay_worker(hls_folder: Path) -> None:
     logger.info("live_relay.worker_started status=%s", live_relay_state["worker_status"])
     while True:
         try:
+            await asyncio.to_thread(_reconcile_relay_commands)
             for camera_number, camera_id in list(_active_cameras.items()):
                 await asyncio.to_thread(_relay_camera_once, hls_folder, camera_number, camera_id)
             live_relay_state["last_scan_at"] = datetime.now().isoformat()
