@@ -5202,6 +5202,7 @@ from partner_portal import register_partner_routes
 from partner_portal import require_partner_access
 from partner_workspace import register_partner_workspace_routes, render_partner_workspace
 from appliance_cloud import register_appliance_cloud_routes
+from live_playlist import register_live_playlist_routes
 from cloud_features import register_cloud_feature_routes
 from website_partner import register_website_partner_routes
 from customer_platform import register_customer_platform_routes
@@ -5213,6 +5214,7 @@ register_pricing_routes(app, page_shell)
 register_partner_routes(app, page_shell)
 register_partner_workspace_routes(app, page_shell)
 register_appliance_cloud_routes(app, page_shell)
+register_live_playlist_routes(app)
 register_cloud_feature_routes(app, page_shell)
 register_website_partner_routes(app, page_shell)
 register_customer_platform_routes(
