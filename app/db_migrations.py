@@ -65,3 +65,16 @@ def apply_migrations():
                             {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='customer_camera_permissions'").fetchall()})
         for name,definition in (('can_alerts','INTEGER NOT NULL DEFAULT 1'),('can_settings','INTEGER NOT NULL DEFAULT 0')):
             if name not in permission_columns: db.execute(f'ALTER TABLE customer_camera_permissions ADD COLUMN {name} {definition}')
+
+        # Phase 6a (docs/AI_HANDOFF.md Sec 8): nullable, additive camera_number
+        # mapping column -- never inferred, only ever set via an explicit
+        # technician/customer assignment (see camera_mapping.py). The partial
+        # unique index enforces "unique per appliance" (not global, not per
+        # customer) and is the authoritative backstop against a race between
+        # two concurrent assignments; camera_mapping.assign_camera_number()
+        # checks this same invariant first for a clean error message.
+        camera_columns=({item['name'] for item in db.execute('PRAGMA table_info(cameras)').fetchall()}
+                        if backend()=='sqlite' else
+                        {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='cameras'").fetchall()})
+        if 'camera_number' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN camera_number INTEGER')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_appliance_camera_number ON cameras(appliance_id,camera_number) WHERE camera_number IS NOT NULL')
