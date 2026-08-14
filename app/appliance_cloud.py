@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, validate_request_time
+from edge.camera_compatibility import NOT_SUPPORTED, PARTIALLY_SUPPORTED, evaluate_scan_results
 from live_manifest import LiveManifestStore
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
@@ -205,10 +206,19 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         if not job: raise HTTPException(status_code=404,detail='Discovery job not found.')
         status=str(payload.get('status','running')); progress=max(0,min(100,int(payload.get('progress',0)))); results=sanitize_appliance_payload(payload.get('results',[]))
         if status not in {'running','complete','error'}: raise HTTPException(status_code=400,detail='Unsupported discovery status.')
+        # Camera-compatibility extension (docs/AI_HANDOFF.md): evaluate each
+        # discovered device's compatibility only *after* sanitize_appliance_payload()
+        # above has already stripped credentials -- the compatibility engine never
+        # sees a username/password/rtsp_url, and never does its own network I/O.
+        if status=='complete': results=evaluate_scan_results(results)
         with connection() as db:
             db.execute('UPDATE camera_scan_jobs SET status=?,progress=?,results_json=?,message=?,updated_at=? WHERE id=?',(status,progress,json.dumps(results),str(payload.get('message','Discovery update received.'))[:500],datetime.now().isoformat(),job_id))
             if status=='complete':
-                for index,item in enumerate(results,1): db.execute('INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,name,resolution,status,created_at) VALUES(?,?,?,?,?,?,?,?)',(str(item.get('id') or secrets.token_hex(5)),job['customer_id'],appliance['site_id'],appliance['id'],item.get('name') or f'Discovered Camera {index}',item.get('resolution','2mp'),'discovered',datetime.now().isoformat()))
+                for index,item in enumerate(results,1):
+                    compatibility_status=item.get('compatibility_status')
+                    if compatibility_status==NOT_SUPPORTED: continue  # never onboarded -- see camera_compatibility.py
+                    camera_status='needs_review' if compatibility_status==PARTIALLY_SUPPORTED else 'discovered'
+                    db.execute('INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,name,resolution,status,created_at) VALUES(?,?,?,?,?,?,?,?)',(str(item.get('id') or secrets.token_hex(5)),job['customer_id'],appliance['site_id'],appliance['id'],item.get('name') or f'Discovered Camera {index}',item.get('resolution','2mp'),camera_status,datetime.now().isoformat()))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.discovery_result','camera_scan_job',job_id,{'status':status,'count':len(results)}); return {'message':'Discovery result accepted.'}
 
     @app.get('/api/appliance/commands')
