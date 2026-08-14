@@ -4290,6 +4290,13 @@ async def health_monitor() -> None:
         await asyncio.sleep(30)
 
 
+import live_relay_uploader  # Phase 3 (docs/AI_HANDOFF.md §8): appliance-side live-segment
+# watcher/uploader. Standalone module (see its own docstring) with no dependency
+# on anything else in this file; imported here only so lifespan() below can
+# start/stop its background task the same way it already does for
+# cloud_upload_worker_placeholder().
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ffmpeg_processes
@@ -4327,6 +4334,11 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} else None
     )
     cloud_upload_task = asyncio.create_task(cloud_upload_worker_placeholder())
+    live_relay_task = (
+        asyncio.create_task(live_relay_uploader.live_relay_worker(HLS_FOLDER))
+        if RUNTIME_ROLE in {"edge", "combined"} and live_relay_uploader.LIVE_RELAY_ENABLED
+        else None
+    )
 
     structured_log(
         "startup.complete",
@@ -4344,6 +4356,8 @@ async def lifespan(app: FastAPI):
         if health_task:
             health_task.cancel()
         cloud_upload_task.cancel()
+        if live_relay_task:
+            live_relay_task.cancel()
 
         pending = []
         if retention_task:
@@ -4354,6 +4368,8 @@ async def lifespan(app: FastAPI):
         if health_task:
             pending.append(health_task)
         pending.append(cloud_upload_task)
+        if live_relay_task:
+            pending.append(live_relay_task)
         await asyncio.gather(*pending, return_exceptions=True)
 
         for process in ffmpeg_processes:
