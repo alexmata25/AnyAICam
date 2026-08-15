@@ -448,6 +448,18 @@ class UpdateStateMachine:
                 "no prior version to roll back to -- this was the first-ever activation on this device",
                 now=self._now(),
             )
+            self._delete_marker()  # bugfix: this branch returns without ever
+            # calling _activate_and_restart() (there is nowhere to activate),
+            # so nothing else on this path would otherwise delete the
+            # now-stale marker -- every OTHER way of reaching ROLLBACK_FAILED
+            # already does (via _conclude_rollback_failed() or
+            # _activate_and_restart()'s own VersionNotInstalled handler).
+            # Leaving it in place would make every subsequent restart
+            # re-discover the same stale marker and needlessly re-run
+            # health_check() + re-append duplicate UNHEALTHY/ROLLBACK_FAILED
+            # transitions forever, contradicting this module's own stated
+            # invariant that reaching ROLLBACK_FAILED always deletes the
+            # marker.
             return self._result_from_history(update_id)
 
         ok, error = self._activate_and_restart(

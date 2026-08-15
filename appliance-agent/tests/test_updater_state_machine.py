@@ -756,6 +756,40 @@ class RollbackToConclusionTests(StateMachineTestCase):
         self.assertIn("first-ever activation", result.error)
         self.assertEqual(self.restart.calls, 1)  # no second restart was ever attempted
         self.assertEqual(installer.current_version(self.pointer_file), "1.1.0")  # left exactly where it was
+        # Regression (bugfix): this branch returns without ever calling
+        # _activate_and_restart(), so it must delete the marker itself --
+        # every other way of reaching ROLLBACK_FAILED already does.
+        self.assertFalse(self.pending_file.exists())
+
+    def test_no_prior_version_rollback_failed_does_not_repeat_on_a_later_fresh_restart(self):
+        # Regression (bugfix): before the fix, the marker was left behind
+        # by the "no prior version" branch, so a LATER fresh-process
+        # resume_if_pending() call would re-discover it, re-run
+        # health_check(), and append duplicate UNHEALTHY/ROLLBACK_FAILED
+        # transitions forever. With the marker correctly deleted, a later
+        # restart must find nothing to resume at all.
+        manifest_dict, signature, package_bytes = self.make_update(version="1.1.0")
+        machine = self.make_machine(source=FakeUpdateSourceProvider(package_bytes=package_bytes))
+        machine.process_install_update(manifest_dict, signature)
+
+        self.health.result = False
+        first_result = self.make_machine().resume_if_pending()
+        self.assertEqual(first_result.state, UpdateState.ROLLBACK_FAILED)
+
+        transitions_after_first = self.make_machine().history.transitions("upd-1")
+        health_calls_after_first = self.health.calls
+        restarts_after_first = self.restart.calls
+
+        # A later, genuinely fresh restart -- must be a clean no-op.
+        second_result = self.make_machine().resume_if_pending()
+
+        self.assertIsNone(second_result)
+        self.assertEqual(self.health.calls, health_calls_after_first)  # health_check() never re-invoked
+        self.assertEqual(self.restart.calls, restarts_after_first)  # no new restart attempted
+        self.assertEqual(
+            self.make_machine().history.transitions("upd-1"), transitions_after_first,
+        )  # no duplicate transitions appended
+        self.assertTrue(self.make_machine().history.is_terminal("upd-1"))
 
     def test_good_version_directory_missing_at_rollback_time_is_rollback_failed(self):
         self.install_and_activate_directly("1.0.0")
