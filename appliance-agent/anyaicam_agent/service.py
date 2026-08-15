@@ -13,22 +13,25 @@ from .metrics import collect
 from .portal import PortalClient,PortalError,sanitize
 from .queue import OfflineQueue
 from .updater.factory import build_update_state_machine
+from .updater.health import make_health_check
 from .updater.restart import make_restart_signal
 
 
 class ApplianceAgent:
     def __init__(self,config):
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
-        # RDM-2 Group 2A/2B: health_check is still left as
-        # build_update_state_machine()'s own safe placeholder here --
-        # Group 2F wires the real one. restart_signal is now the real
-        # wrapper (Group 2B) around this same agent's own stop_event --
-        # exactly the mechanism commands.py's existing restart_service
-        # handler already uses. state_machine itself is constructed
-        # unconditionally so resolve_update_state() can always run at
-        # startup, regardless of whether this agent has ever processed
-        # an install_update command.
-        self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event))
+        # RDM-2 Group 2A/2B/2F: restart_signal is the real wrapper
+        # (Group 2B) around this same agent's own stop_event -- exactly
+        # the mechanism commands.py's existing restart_service handler
+        # already uses. health_check is now the real one too (Group 2F):
+        # minimal local filesystem/state accessibility checks plus a
+        # bounded, short-timeout authenticated cloud probe reusing this
+        # same self.client -- see updater/health.py for the full retry/
+        # timeout budget and fail-closed rationale. state_machine itself
+        # is constructed unconditionally so resolve_update_state() can
+        # always run at startup, regardless of whether this agent has
+        # ever processed an install_update command.
+        self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event),health_check=make_health_check(config,self.client))
         self.update_resume_failed=False
     def resolve_update_state(self):
         # RDM-2 Groups 2A/2E: runs once at startup, before any command

@@ -248,6 +248,50 @@ class ReportUpdateResultTests(ServiceTestCase):
         self.assertEqual(agent.queue.count(), 0)
 
 
+class RealHealthCheckWiringTests(ServiceTestCase):
+    """RDM-2 Group 2F: proves ApplianceAgent's REAL health_check wiring
+    (updater/health.py's make_health_check(), not Group 2A's do-nothing
+    placeholder) is actually exercised end-to-end through a genuine
+    resume_if_pending() call -- only agent.client.request() is
+    controlled, everything else (state_machine, history, installer,
+    the marker file) is real, matching this file's established
+    Group 6 real-wiring test pattern."""
+
+    def _install_and_mark_pending(self, agent, update_id="upd-1", version="1.0.0"):
+        tar_path = self._make_tar(Path(self._tmp.name) / f"{version}.tar", version)
+        installer.install_candidate(tar_path, version, self.config.update_versions_dir, self.config.update_staging_dir)
+        installer.activate(version, self.config.update_versions_dir, self.config.current_version_pointer_file)
+        agent.state_machine.history.begin_attempt(update_id, "", version, now=1000.0)
+        marker = PendingValidation(update_id=update_id, from_version="", to_version=version,
+                                    attempt="install", deadline="2099-01-01T00:00:00+00:00")
+        self.config.pending_validation_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config.pending_validation_file.write_text(json.dumps(marker.as_dict()), encoding="utf-8")
+
+    def test_real_health_check_wiring_reaches_healthy(self):
+        agent = ApplianceAgent(self.config)
+        self._install_and_mark_pending(agent)
+        agent.client.request = MagicMock(return_value={"commands": []})  # real cloud probe succeeds
+
+        result = agent.state_machine.resume_if_pending()
+
+        self.assertEqual(result.state.value, "healthy")
+        self.assertFalse(self.config.pending_validation_file.exists())
+        agent.client.request.assert_called_with("GET", "/api/appliance/commands")
+
+    def test_real_health_check_wiring_reaches_unhealthy_and_rollback_path(self):
+        agent = ApplianceAgent(self.config)
+        self._install_and_mark_pending(agent)
+        agent.client.request = MagicMock(side_effect=PortalError("connection refused"))  # real cloud probe fails
+
+        result = agent.state_machine.resume_if_pending()
+
+        # No prior version to roll back to (first-ever activation) --
+        # matches this file's existing established terminal outcome for
+        # this exact scenario (see test_a_real_concluding_resume_result_is_handled_without_raising).
+        self.assertEqual(result.state.value, "rollback_failed")
+        self.assertFalse(self.config.pending_validation_file.exists())
+
+
 class RunCallOrderTests(ServiceTestCase):
     def test_resolve_update_state_runs_before_the_main_loop(self):
         save_credential(self.config, {"appliance_id": "app-1", "credential": "secret"})
