@@ -58,6 +58,24 @@ class ConstructionTests(ServiceTestCase):
         agent = ApplianceAgent(self.config)
         self.assertFalse(agent.update_resume_failed)
 
+    def test_state_machine_restart_signal_is_wired_to_this_agents_stop_event(self):
+        # RDM-2 Group 2B: proves the real wiring end-to-end -- calling
+        # the state machine's restart_signal must set THIS agent's own
+        # stop_event, the same one commands.py's existing
+        # restart_service handler sets. No longer Group 2A's
+        # do-nothing placeholder.
+        agent = ApplianceAgent(self.config)
+        self.assertFalse(agent.stop_event.is_set())
+        agent.state_machine.restart_signal()
+        self.assertTrue(agent.stop_event.is_set())
+
+    def test_each_agent_instance_gets_its_own_independent_restart_signal(self):
+        agent_a = ApplianceAgent(self.config)
+        agent_b = ApplianceAgent(self.config)
+        agent_a.state_machine.restart_signal()
+        self.assertTrue(agent_a.stop_event.is_set())
+        self.assertFalse(agent_b.stop_event.is_set())
+
 
 class ResolveUpdateStateTests(ServiceTestCase):
     def test_nothing_pending_leaves_flag_false_and_raises_nothing(self):
