@@ -22,6 +22,15 @@ class AgentConfig:
     state_dir: str=str(DEFAULT_STATE_DIR)
     log_dir: str=str(DEFAULT_LOG_DIR)
 
+    # RDM-2 (device-side integration, Group 2A): the manifest
+    # target/channel values this device presents to UpdateStateMachine.
+    # Not per-camera/per-customer -- these describe the appliance
+    # software itself. Defaults are not invented: 'anyaicam-appliance'
+    # matches every RDM-1 test manifest's target value, and 'stable'
+    # matches UpdateStateMachine's own constructor default (Group 6).
+    update_target: str='anyaicam-appliance'
+    update_channel: str='stable'
+
     def __post_init__(self): self.discovery_networks=self.discovery_networks or []
 
     @property
@@ -57,7 +66,7 @@ class AgentConfig:
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
         if path.exists(): data=json.loads(path.read_text(encoding='utf-8'))
-        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH'}
+        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL'}
         for key,environment in aliases.items():
             if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity'} else os.environ[environment]
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})

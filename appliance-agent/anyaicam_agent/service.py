@@ -12,11 +12,49 @@ from .discovery import scan
 from .metrics import collect
 from .portal import PortalClient,PortalError,sanitize
 from .queue import OfflineQueue
+from .updater.factory import build_update_state_machine
 
 
 class ApplianceAgent:
     def __init__(self,config):
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
+        # RDM-2 Group 2A: restart_signal/health_check are left as
+        # build_update_state_machine()'s own safe placeholders here --
+        # Groups 2B/2F wire the real ones. state_machine itself is
+        # constructed unconditionally so resolve_update_state() can
+        # always run at startup, regardless of whether this agent has
+        # ever processed an install_update command.
+        self.state_machine=build_update_state_machine(config)
+        self.update_resume_failed=False
+    def resolve_update_state(self):
+        # RDM-2 Group 2A: runs once at startup, before any command
+        # processing -- per UpdateStateMachine.resume_if_pending()'s own
+        # documented call-order requirement (resume_if_pending() first,
+        # then sweep_orphaned_state()).
+        #
+        # If resume_if_pending() raises, this process must never allow a
+        # NEW install_update to begin until a future restart re-evaluates
+        # cleanly -- self.update_resume_failed is the interlock flag a
+        # later group (2C) reads before dispatching install_update.
+        # Nothing else about normal agent operation is affected: this
+        # method never re-raises, so a broken update-resume can never
+        # prevent heartbeat/camera/discovery/command-polling from
+        # starting.
+        try:
+            result=self.state_machine.resume_if_pending()
+            if result is not None:
+                # Group 2E will replace this log line with a real report
+                # call to the cloud (POST .../updates/{id}/result). Group
+                # 2A only needs the sequencing and the interlock flag to
+                # be correct -- reporting is a later group's concern.
+                self.log.info('Update resume concluded: %s',result.as_dict())
+        except Exception:
+            self.log.exception('resume_if_pending() failed; blocking new install_update commands until next restart')
+            self.update_resume_failed=True
+        try:
+            self.state_machine.sweep_orphaned_state()
+        except Exception:
+            self.log.exception('sweep_orphaned_state() failed; continuing startup')
     def cameras(self):
         try: return json.loads(self.config.cameras_file.read_text(encoding='utf-8'))
         except (OSError,json.JSONDecodeError): return []
@@ -50,6 +88,7 @@ class ApplianceAgent:
     def run(self):
         if not self.client.credential: raise RuntimeError('Appliance is not activated. Run anyaicam-setup first.')
         self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',self.config.cloud_id,self.config.mode)
+        self.resolve_update_state()
         while not self.stop_event.is_set():
             try: self.cycle()
             except Exception: self.log.exception('Unhandled agent cycle error')
