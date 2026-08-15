@@ -38,6 +38,25 @@ LIVE_RELAY_S3_BUCKET=os.getenv('ANYAICAM_S3_BUCKET','').strip()
 LIVE_RELAY_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).strip()
 live_manifest_store=LiveManifestStore(Path(os.getenv('ANYAICAM_LIVE_MANIFEST_FILE','/app/recordings/live_manifest.json')))
 
+# RDM-2 Group 2D (docs/AI_HANDOFF.md): cloud-side post-restart update-result
+# reporting. Defaults to disabled, same fail-closed-by-default convention as
+# LIVE_RELAY_ENABLED above -- gates ONLY the new update_result() route below.
+# It does NOT gate the already-shipped Group 2C install_update dispatch path
+# (queue_command()/appliance-side command handling); narrowing that path was
+# explicitly out of scope for this group.
+REMOTE_UPDATE_ENABLED=os.getenv('ANYAICAM_REMOTE_UPDATE_ENABLED','false').strip().lower()=='true'
+
+# The full set of UpdateState values UpdateStateMachine.resume_if_pending()
+# can actually conclude with (appliance-agent/anyaicam_agent/updater/
+# state_machine.py's own docstring) -- broader than just the three terminal
+# outcomes, since a rollback triggered mid-resume returns an in-progress
+# 'restarting' result awaiting its OWN next restart. 'activation_failed' is
+# terminal on the device side (in updater.models.TERMINAL_STATES); 'restarting'
+# is not -- this cloud-side distinction is used below to detect a conflicting
+# SECOND, different terminal report for the same (appliance_id,update_id).
+_ACCEPTED_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed','restarting'}
+_TERMINAL_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed'}
+
 
 def _bearer(request: Request) -> str:
     return request.headers.get('authorization','').removeprefix('Bearer ').strip()
@@ -238,6 +257,52 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             changed=db.execute('UPDATE appliance_commands SET status=?,completed_at=?,error=? WHERE id=? AND appliance_id=? AND status IN (\'delivered\',\'pending\')',(status,datetime.now().isoformat(),str(payload.get('error',''))[:500],command_id,appliance['id'])).rowcount
         if not changed: raise HTTPException(status_code=409,detail='Command is unknown or already finalized.')
         audit({'email':appliance['cloud_id'],'role':'appliance'},f'appliance.command_{status}','appliance_command',command_id); return {'status':'accepted'}
+
+    @app.post('/api/appliance/updates/{update_id}/result')
+    def update_result(request: Request,update_id: str,payload: dict) -> dict:
+        # RDM-2 Group 2D (docs/AI_HANDOFF.md): durable post-restart outcome
+        # reporting for UpdateStateMachine.resume_if_pending() conclusions --
+        # a DEDICATED, update_id-keyed endpoint, deliberately not a reuse of
+        # the generic command_result() channel above (that one is keyed by
+        # the CLOUD's own one-shot dispatch id and cannot represent an
+        # update_id that legitimately reports more than once across a
+        # rollback's own restart cycle). Ownership is structural, not an
+        # explicit check: every read/write below is scoped to the
+        # AUTHENTICATED appliance['id'], never to any caller-supplied
+        # identifier, so an appliance can never affect another appliance's
+        # history even if it guesses another appliance's update_id string.
+        appliance=authenticate_appliance(request)
+        if not REMOTE_UPDATE_ENABLED: raise HTTPException(status_code=404,detail='Remote update reporting is not enabled.')
+        if not isinstance(payload,dict): raise HTTPException(status_code=400,detail='Update result payload must be a JSON object.')
+        body_update_id=payload.get('update_id')
+        if not isinstance(body_update_id,str) or not body_update_id or body_update_id!=update_id:
+            raise HTTPException(status_code=400,detail='update_id in the request body must be a non-empty string matching the URL.')
+        state=payload.get('state')
+        if state not in _ACCEPTED_UPDATE_RESULT_STATES: raise HTTPException(status_code=400,detail='Unsupported update state.')
+        from_version=payload.get('from_version'); to_version=payload.get('to_version')
+        if not isinstance(from_version,str) or not isinstance(to_version,str):
+            raise HTTPException(status_code=400,detail='from_version and to_version are required strings.')
+        duration=payload.get('duration_seconds')
+        if isinstance(duration,bool) or not isinstance(duration,(int,float)) or duration<0:
+            raise HTTPException(status_code=400,detail='duration_seconds must be a non-negative number.')
+        rollback_from=payload.get('rollback_from')
+        if rollback_from is not None and not isinstance(rollback_from,str):
+            raise HTTPException(status_code=400,detail='rollback_from must be a string or null.')
+        error=str(payload.get('error','') or '')[:500]; duration=float(duration); now=datetime.now().isoformat()
+
+        existing=rows('SELECT * FROM appliance_update_history WHERE appliance_id=? AND update_id=?',(appliance['id'],update_id))
+        same_state=next((item for item in existing if item['state']==state),None)
+        if same_state is not None:
+            if (same_state['from_version'],same_state['to_version'],same_state['error'],same_state['rollback_from'],float(same_state['duration_seconds']))==(from_version,to_version,error,rollback_from,duration):
+                return {'status':'accepted','duplicate':True}
+            raise HTTPException(status_code=409,detail='A different result was already recorded for this update_id and state.')
+        if any(item['state'] in _TERMINAL_UPDATE_RESULT_STATES for item in existing):
+            raise HTTPException(status_code=409,detail='This update_id already has a terminal result on record.')
+
+        with connection() as db:
+            db.execute('INSERT INTO appliance_update_history(appliance_id,update_id,from_version,to_version,state,error,rollback_from,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(appliance['id'],update_id,from_version,to_version,state,error,rollback_from,duration,now))
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.update_result_recorded','appliance_update_history',update_id,{'state':state})
+        return {'status':'accepted'}
 
     @app.post('/api/admin/appliances/{appliance_id}/activation-token')
     def admin_activation_token(request: Request,appliance_id: str,payload: dict) -> dict:
