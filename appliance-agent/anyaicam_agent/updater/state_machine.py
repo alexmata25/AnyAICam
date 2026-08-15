@@ -328,6 +328,33 @@ class UpdateStateMachine:
                 pre_activation.append(update_id)
         return {"removed_staging_entries": removed, "pre_activation_in_progress_update_ids": pre_activation}
 
+    def has_unresolved_activation(self) -> bool:
+        """RDM-2 (device-side integration, Group 2C): True iff a
+        pending_validation marker currently exists on disk -- i.e. this
+        device has activated (or attempted to roll back to) a version
+        whose health has not yet been confirmed by a subsequent restart's
+        resume_if_pending() call. While this is True, commands.py's
+        install_update interlock blocks any NEW install_update: letting a
+        second pointer flip stack on top of unresolved post-activation
+        state would break every crash-timing guarantee resume_if_pending()
+        relies on (see the module docstring) -- it assumes at most one
+        marker is ever pending at a time.
+
+        Uses an explicit stat() call rather than Path.exists():
+        FileNotFoundError unambiguously means "no marker is pending", but
+        ANY OTHER OSError (permission denied, an I/O error, a parent
+        directory replaced by a file, etc.) means this device cannot
+        currently determine whether a marker exists at all -- and an
+        interlock whose own existence-check is unreliable must fail
+        closed (propagate the error so the caller blocks new updates)
+        rather than silently behave as if nothing were pending.
+        """
+        try:
+            self.pending_validation_file.stat()
+            return True
+        except FileNotFoundError:
+            return False
+
     # -- the main pipeline (pre-activation) --------------------------------
 
     def _run_pipeline(self, manifest: Manifest, from_version: str, to_version: str) -> UpdateResult:

@@ -184,6 +184,31 @@ class StateMachineTestCase(unittest.TestCase):
         installer.activate(version, self.versions_dir, self.pointer_file)
 
 
+# -- RDM-2 Group 2C: has_unresolved_activation() --------------------------
+
+class HasUnresolvedActivationTests(StateMachineTestCase):
+    def test_no_marker_file_is_not_unresolved(self):
+        machine = self.make_machine()
+        self.assertFalse(machine.has_unresolved_activation())
+
+    def test_marker_file_present_is_unresolved(self):
+        machine = self.make_machine()
+        machine.pending_validation_file.parent.mkdir(parents=True, exist_ok=True)
+        machine.pending_validation_file.write_text("{}", encoding="utf-8")
+        self.assertTrue(machine.has_unresolved_activation())
+
+    def test_a_real_stat_failure_other_than_missing_propagates(self):
+        # A real OS-level condition (ENOTDIR), not a mock: pending_
+        # validation_file is pointed at a path whose PARENT component is
+        # itself a regular file, not a directory, so stat() raises
+        # something other than FileNotFoundError.
+        blocking_file = self.root / "blocking_file"
+        blocking_file.write_text("not a directory", encoding="utf-8")
+        machine = self.make_machine(pending_validation_file=blocking_file / "pending_validation.json")
+        with self.assertRaises(OSError):
+            machine.has_unresolved_activation()
+
+
 # -- happy path -----------------------------------------------------------
 
 class HappyPathTests(StateMachineTestCase):

@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import os
 import platform
@@ -63,7 +65,86 @@ def _set_relay_command(config,payload,active):
     return 'completed',{'camera_number':camera_number,'active':bool(active)},''
 
 
-def execute(command,payload,config,stop_event=None):
+def _parse_install_update_payload(payload):
+    """RDM-2 Group 2C: validates the install_update wire payload's
+    structural shape only -- {"manifest": {...}, "signature": "<base64>"}.
+    Returns (manifest_dict, signature_bytes, None) on success, or (None,
+    None, error_message) on any structural problem. Never raises -- every
+    failure is reported the same way every other command here reports a
+    bad payload: a normal 'failed' result, not an exception. Semantic/
+    cryptographic verification of the decoded signature bytes happens
+    later, inside UpdateStateMachine.process_install_update() -- this
+    function's only job is getting the wire payload into the (dict,
+    bytes) shape that method expects.
+
+    Strict base64 (base64.b64decode(..., validate=True)) is used
+    deliberately: lenient decoding silently ignores non-alphabet
+    characters rather than rejecting them, which could let a corrupted
+    or truncated signature decode into different bytes than the sender
+    intended instead of failing cleanly here.
+    """
+    if not isinstance(payload,dict):
+        return None,None,'install_update payload must be a JSON object.'
+    manifest_dict=payload.get('manifest')
+    if not isinstance(manifest_dict,dict):
+        return None,None,'install_update payload is missing a required "manifest" object.'
+    raw_signature=payload.get('signature')
+    if not isinstance(raw_signature,str) or not raw_signature:
+        return None,None,'install_update payload is missing a required "signature" (base64) string.'
+    try:
+        signature=base64.b64decode(raw_signature,validate=True)
+    except (binascii.Error,ValueError) as error:
+        return None,None,f'install_update payload "signature" is not valid base64: {error}'
+    return manifest_dict,signature,None
+
+
+# UpdateResult.state (an updater.models.UpdateState value) -> the
+# 'completed'/'failed' status this command channel reports, per the
+# approved RDM-2 Group 2C mapping. Covers every UpdateState reachable
+# from a LIVE process_install_update() call (rejected, download_failed,
+# verify_failed, install_failed, activation_failed, restarting,
+# restart_failed) AND from an idempotent replay of an already-terminal
+# update_id -- which can additionally surface healthy/rolled_back/
+# rollback_failed, states only ever concluded by a LATER restart's
+# resume_if_pending() call, never by this live command path itself.
+# Deliberately no default/fallback entry: an UpdateState this table does
+# not know how to map is a programming error to surface loudly (KeyError),
+# not a state to silently guess a status for.
+_INSTALL_UPDATE_STATUS_BY_STATE={
+    'rejected':'failed',
+    'download_failed':'failed',
+    'verify_failed':'failed',
+    'install_failed':'failed',
+    'activation_failed':'failed',
+    'restarting':'completed',   # provisional -- see _install_update_result()
+    'restart_failed':'failed',  # activated, but restart_signal() itself failed
+    'healthy':'completed',      # only reachable via idempotent replay
+    'rolled_back':'failed',     # requested version did not end up running
+    'rollback_failed':'failed',
+}
+
+
+def _install_update_result(result):
+    """Maps one UpdateResult (from process_install_update(), whether a
+    live pipeline run or an idempotent-replay _result_from_history()) to
+    this command channel's (status, result_dict, error) shape."""
+    state_value=result.state.value
+    status=_INSTALL_UPDATE_STATUS_BY_STATE[state_value]
+    payload=result.as_dict()
+    if state_value=='restarting':
+        # RESTARTING means activation succeeded and a restart was just
+        # signaled -- NOT a final outcome. The real healthy/rolled_back/
+        # rollback_failed conclusion is only knowable after this
+        # device's NEXT restart runs resume_if_pending(), and reporting
+        # that conclusion back to the cloud is a later group's job, not
+        # this one's. health_confirmed=False makes the provisional
+        # nature of this 'completed' explicit in the payload itself,
+        # rather than letting it be mistaken for a final answer.
+        payload['health_confirmed']=False
+    return status,payload,result.error
+
+
+def execute(command,payload,config,stop_event=None,*,state_machine=None,update_resume_failed=False):
     if command not in ALLOWED: return 'failed',{},'Unsupported command; arbitrary shell execution is disabled.'
     if command=='refresh_cameras': return 'completed',{'cameras':scan(config.discovery_networks)},''
     if command=='run_diagnostics': return 'completed',diagnostics(config),''
@@ -72,4 +153,26 @@ def execute(command,payload,config,stop_event=None):
     if command=='restart_service':
         if stop_event: stop_event.set()
         return 'completed',{'restart_requested':True},''
+    if command=='install_update':
+        # RDM-2 Group 2C: the startup/update interlock is checked BEFORE
+        # any payload parsing -- cheaper, and it means a malformed
+        # payload delivered while an interlock condition is active
+        # always reports the interlock's own reason, never a
+        # payload-parsing error that would be misleading about why the
+        # update was actually refused.
+        if state_machine is None:
+            return 'failed',{},'Secure updater is not configured for this agent version.'
+        if update_resume_failed:
+            return 'failed',{},'Update resume did not complete cleanly after the last restart; new updates are blocked until the next successful restart.'
+        try:
+            unresolved=state_machine.has_unresolved_activation()
+        except OSError as error:
+            return 'failed',{},f'Could not determine update state due to a local storage error: {error}; new updates are blocked until this is resolved.'
+        if unresolved:
+            return 'failed',{},'A previous update is still awaiting restart/health confirmation; new updates are blocked until it resolves.'
+        manifest_dict,signature,parse_error=_parse_install_update_payload(payload)
+        if parse_error:
+            return 'failed',{},parse_error
+        result=state_machine.process_install_update(manifest_dict,signature)
+        return _install_update_result(result)
     return 'failed',{},'Secure updater is not configured for this agent version.'

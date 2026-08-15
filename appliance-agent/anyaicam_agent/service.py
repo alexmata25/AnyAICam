@@ -78,7 +78,7 @@ class ApplianceAgent:
     def poll_commands(self):
         try:
             for item in self.client.request('GET','/api/appliance/commands').get('commands',[]):
-                status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
+                status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event,state_machine=self.state_machine,update_resume_failed=self.update_resume_failed); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
         except PortalError as error: self.log.debug('Command poll unavailable: %s',error)
     def sync_configuration(self):
         try:
