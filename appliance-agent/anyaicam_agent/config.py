@@ -33,6 +33,26 @@ class AgentConfig:
     @property
     def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
 
+    # RDM-1 (Remote Device Management): additive-only properties, same style
+    # as the ones above. Update state lives under state_dir (mutable
+    # runtime state, like credential_file/queue_file); the trusted public
+    # key lives under config_dir (provisioned, read-only trust material,
+    # like agent.json).
+    @property
+    def updates_dir(self): return Path(self.state_dir)/'updates'
+    @property
+    def update_versions_dir(self): return self.updates_dir/'versions'
+    @property
+    def update_staging_dir(self): return self.updates_dir/'staging'
+    @property
+    def update_history_file(self): return self.updates_dir/'update_history.db'
+    @property
+    def pending_validation_file(self): return self.updates_dir/'pending_validation.json'
+    @property
+    def current_version_pointer_file(self): return self.updates_dir/'current_version.txt'
+    @property
+    def trusted_public_key_file(self): return Path(self.config_dir)/'trusted_signing_key.pem'
+
     @classmethod
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
