@@ -191,6 +191,28 @@ class ValidResultTests(UpdateResultEndpointTestCase):
         states = {item["state"] for item in self._rows_for()} | {item["state"] for item in self._rows_for(update_id="upd-2")}
         self.assertEqual(states, {"restarting", "activation_failed"})
 
+    def test_restart_failed_is_accepted(self):
+        # RDM-2 Group 2E corrective addition: a rollback triggered during
+        # resume_if_pending() whose own restart_signal() then itself
+        # raises -- a real, reachable resume_if_pending() outcome Group
+        # 2D's original design missed.
+        result = update_result(FakeRequest(), "upd-1", _payload(state="restart_failed"))
+        self.assertEqual(result, {"status": "accepted"})
+        rows_ = self._rows_for()
+        self.assertEqual(rows_[0]["state"], "restart_failed")
+
+    def test_restart_failed_is_not_terminal_a_later_different_state_is_accepted(self):
+        # restart_failed must NOT be in _TERMINAL_UPDATE_RESULT_STATES --
+        # a later real restart can still reconcile the same update_id to
+        # an actual conclusion (rolled_back/rollback_failed). If this
+        # were wrongly treated as terminal, the later report below would
+        # incorrectly 409.
+        update_result(FakeRequest(), "upd-1", _payload(state="restart_failed"))
+        result = update_result(FakeRequest(), "upd-1", _payload(state="rolled_back", rollback_from="1.0.0"))
+        self.assertEqual(result, {"status": "accepted"})
+        states = {item["state"] for item in self._rows_for()}
+        self.assertEqual(states, {"restart_failed", "rolled_back"})
+
 
 # -- idempotent replay / conflicts -----------------------------------------
 

@@ -31,34 +31,71 @@ class ApplianceAgent:
         self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event))
         self.update_resume_failed=False
     def resolve_update_state(self):
-        # RDM-2 Group 2A: runs once at startup, before any command
+        # RDM-2 Groups 2A/2E: runs once at startup, before any command
         # processing -- per UpdateStateMachine.resume_if_pending()'s own
         # documented call-order requirement (resume_if_pending() first,
-        # then sweep_orphaned_state()).
+        # then sweep_orphaned_state()). Reporting sits between the two.
         #
-        # If resume_if_pending() raises, this process must never allow a
-        # NEW install_update to begin until a future restart re-evaluates
-        # cleanly -- self.update_resume_failed is the interlock flag a
-        # later group (2C) reads before dispatching install_update.
-        # Nothing else about normal agent operation is affected: this
-        # method never re-raises, so a broken update-resume can never
-        # prevent heartbeat/camera/discovery/command-polling from
-        # starting.
+        # Deliberately THREE separate try/except blocks, not one: a
+        # failure in report_update_result() must never be caught by the
+        # SAME except that sets update_resume_failed below -- by the time
+        # reporting runs, resume_if_pending() has ALREADY concluded
+        # successfully; only the CLOUD's awareness of that conclusion is
+        # at stake, never this device's own understanding of its update
+        # state. Sharing one try/except across resume+report would
+        # incorrectly block future install_update commands on a pure
+        # network/reporting failure. This method never re-raises for any
+        # of the three steps, so a broken update-resume, reporting
+        # failure, or sweep can never prevent heartbeat/camera/discovery/
+        # command-polling from starting.
+        result=None
         try:
             result=self.state_machine.resume_if_pending()
-            if result is not None:
-                # Group 2E will replace this log line with a real report
-                # call to the cloud (POST .../updates/{id}/result). Group
-                # 2A only needs the sequencing and the interlock flag to
-                # be correct -- reporting is a later group's concern.
-                self.log.info('Update resume concluded: %s',result.as_dict())
         except Exception:
             self.log.exception('resume_if_pending() failed; blocking new install_update commands until next restart')
             self.update_resume_failed=True
+        if result is not None:
+            try:
+                self.report_update_result(result)
+            except Exception:
+                self.log.exception('Reporting update result to the cloud failed; will retry via the offline queue')
         try:
             self.state_machine.sweep_orphaned_state()
         except Exception:
             self.log.exception('sweep_orphaned_state() failed; continuing startup')
+    def report_update_result(self,result):
+        # RDM-2 Group 2E: reports one concluded UpdateResult (from
+        # resume_if_pending()) to Group 2D's dedicated endpoint. Payload
+        # is result.as_dict() verbatim -- it already matches exactly what
+        # that endpoint expects, no transformation needed.
+        #
+        # Deliberately does NOT call self.send_or_queue() -- that
+        # helper's blanket "queue on ANY PortalError" behavior is correct
+        # for heartbeat/cameras/commands/discovery (left completely
+        # unchanged by this method) but wrong here: a 404 (remote-update
+        # reporting disabled cloud-side) or a 409 (a permanent, never-
+        # retryable conflict -- see app/appliance_cloud.py's
+        # update_result()) would never succeed no matter how many times
+        # it is retried, so queuing either would only grow the local
+        # queue forever for nothing. Every OTHER outcome (401/403,
+        # network timeout, unknown status) reuses the SAME OfflineQueue
+        # instance and the same durable atomic-write discipline
+        # send_or_queue() itself uses -- never a second queue, never new
+        # local state.
+        path=f'/api/appliance/updates/{result.update_id}/result'
+        payload=result.as_dict()
+        key=f'update-result-{result.update_id}-{result.state.value}'
+        try:
+            self.client.request('POST',path,payload)
+        except PortalError as error:
+            if error.status_code==404:
+                self.log.warning('Update result reporting is disabled on the cloud (404); dropping report update_id=%s state=%s',result.update_id,result.state.value)
+                return
+            if error.status_code==409:
+                self.log.error('Update result report update_id=%s state=%s was rejected as a conflict (409); not retrying: %s',result.update_id,result.state.value,error)
+                return
+            self.queue.put(key,'POST',path,sanitize(payload))
+            self.log.warning('Queued offline update result report update_id=%s state=%s error=%s',result.update_id,result.state.value,error)
     def cameras(self):
         try: return json.loads(self.config.cameras_file.read_text(encoding='utf-8'))
         except (OSError,json.JSONDecodeError): return []

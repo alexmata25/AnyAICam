@@ -1,3 +1,4 @@
+import io
 import json
 import tempfile
 import unittest
@@ -7,8 +8,9 @@ from unittest.mock import MagicMock,patch
 
 from anyaicam_agent.commands import execute
 from anyaicam_agent.config import AgentConfig,load_credential,save_credential
-from anyaicam_agent.portal import PortalClient
+from anyaicam_agent.portal import PortalClient,PortalError
 from anyaicam_agent.queue import OfflineQueue
+from urllib.error import HTTPError,URLError
 
 
 class AgentTests(unittest.TestCase):
@@ -34,6 +36,45 @@ class AgentTests(unittest.TestCase):
         response=MagicMock(); response.read.return_value=b'{}'; response.__enter__.return_value=response; urlopen.return_value=response
         PortalClient('https://portal.example','appliance-1','credential').request('POST','/api/appliance/cameras',{'cameras':[{'name':'Front','username':'admin','password':'hidden','rtsp_url':'rtsp://hidden'}]}); body=json.loads(urlopen.call_args.args[0].data)
         self.assertEqual(body,{'cameras':[{'name':'Front'}]})
+
+    def test_portal_error_status_code_defaults_to_none(self):
+        # RDM-2 Group 2E: additive, backward-compatible -- every existing
+        # PortalError(message) call site (unchanged elsewhere in this
+        # file/codebase) keeps working with status_code defaulting to None.
+        self.assertIsNone(PortalError('boom').status_code)
+
+    def test_portal_error_status_code_can_be_set(self):
+        self.assertEqual(PortalError('boom',status_code=404).status_code,404)
+
+    @patch('urllib.request.urlopen')
+    def test_http_error_response_attaches_its_status_code(self,urlopen):
+        body=io.BytesIO(json.dumps({'detail':'not found'}).encode())
+        urlopen.side_effect=HTTPError('https://portal.example/x',404,'Not Found',{},body)
+        with self.assertRaises(PortalError) as ctx:
+            PortalClient('https://portal.example','appliance-1','credential').request('POST','/x',{})
+        self.assertEqual(ctx.exception.status_code,404)
+
+    @patch('urllib.request.urlopen')
+    def test_http_409_response_attaches_its_status_code(self,urlopen):
+        body=io.BytesIO(json.dumps({'detail':'conflict'}).encode())
+        urlopen.side_effect=HTTPError('https://portal.example/x',409,'Conflict',{},body)
+        with self.assertRaises(PortalError) as ctx:
+            PortalClient('https://portal.example','appliance-1','credential').request('POST','/x',{})
+        self.assertEqual(ctx.exception.status_code,409)
+
+    @patch('urllib.request.urlopen')
+    def test_network_failure_has_no_status_code(self,urlopen):
+        urlopen.side_effect=URLError('connection refused')
+        with self.assertRaises(PortalError) as ctx:
+            PortalClient('https://portal.example','appliance-1','credential').request('POST','/x',{})
+        self.assertIsNone(ctx.exception.status_code)
+
+    def test_not_activated_error_has_no_status_code(self):
+        # No HTTP request is ever made here (fails before urlopen) -- the
+        # pre-flight check must also produce a status_code-less PortalError.
+        with self.assertRaises(PortalError) as ctx:
+            PortalClient('https://portal.example').request('POST','/x',{})
+        self.assertIsNone(ctx.exception.status_code)
 
 
     def _relay_config(self,folder):

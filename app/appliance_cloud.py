@@ -54,7 +54,20 @@ REMOTE_UPDATE_ENABLED=os.getenv('ANYAICAM_REMOTE_UPDATE_ENABLED','false').strip(
 # terminal on the device side (in updater.models.TERMINAL_STATES); 'restarting'
 # is not -- this cloud-side distinction is used below to detect a conflicting
 # SECOND, different terminal report for the same (appliance_id,update_id).
-_ACCEPTED_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed','restarting'}
+#
+# RDM-2 Group 2E corrective addition: 'restart_failed' -- a rollback
+# triggered DURING resume_if_pending() whose OWN restart_signal() call
+# then itself raises. The pointer flip to the good version already
+# durably succeeded; only the restart signal failed. This is a real,
+# reachable resume_if_pending() outcome that Group 2D's original design
+# missed. Like 'restarting', it is accepted but NOT terminal here --
+# device-side, RESTART_FAILED is deliberately absent from
+# updater.models.TERMINAL_STATES (see state_machine.py's own docstring)
+# specifically so a LATER real restart can still reconcile the same
+# update_id to an actual conclusion (rolled_back/rollback_failed). Adding
+# it to _TERMINAL_UPDATE_RESULT_STATES instead would incorrectly reject
+# that later, legitimate report as a 409 conflict.
+_ACCEPTED_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed','restarting','restart_failed'}
 _TERMINAL_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed'}
 
 
