@@ -1,0 +1,189 @@
+"""Phase 6c (docs/AI_HANDOFF.md Sec 8): customer-facing live-view session
+start/stop routes -- the first real use of the previously dormant
+live_view_sessions table (created under an earlier, unrelated migration;
+confirmed unused before this phase).
+
+Reuses, never redesigns: camera_mapping.resolve_camera_number (Phase 6a),
+the existing start_live_relay/stop_live_relay appliance commands and
+their {camera_number, camera_id} payload contract (Phase 2/4, unchanged),
+and the appliance_commands table's own INSERT shape (already used by
+appliance_cloud.py's queue_command() for partner-initiated commands --
+this module queues the SAME way, just from a customer-scoped route
+instead of a partner-scoped one, since queue_command() itself requires
+partner/appliance.action permission a customer_owner does not have).
+
+Authorization logic (customer_owner role, camera ownership, can_live
+permission) is deliberately duplicated here rather than imported from
+live_playlist.py -- an explicit scope decision for this phase, not an
+oversight; see docs/AI_HANDOFF.md Phase 6c for the record of that
+decision.
+
+States are deliberately minimal: 'requested' -> 'stopped' (customer-
+initiated) or 'requested' -> 'expired' (lazy sweep, see
+_sweep_expired_sessions() below). No 'ready'/'failed' state -- whether a
+session's relay is actually flowing media is left entirely to the
+frontend polling the already-built GET .../live/playlist.m3u8 route
+(Phase 6b); this module has no visibility into segment arrival at all.
+
+No AWS/S3 access of any kind -- this module only ever writes to the
+existing appliance_commands and live_view_sessions tables. The appliance
+device never receives an AWS credential as a result of anything here
+(unchanged from every prior live-relay phase).
+"""
+
+import json
+import secrets
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI, HTTPException, Request
+
+from appliance_protocol import sanitize_appliance_payload
+from camera_mapping import resolve_camera_number
+from partner_db import audit, connection
+from partner_portal import partner_identity
+
+SESSION_DURATION_SECONDS = 1800  # 30 minutes -- a generous single-sitting live-view window
+COMMAND_EXPIRES_MINUTES = 5  # how long the queued start/stop command stays valid for delivery
+
+
+def _customer_owner(request: Request) -> dict:
+    identity = partner_identity(request)
+    if not identity or identity.get('role') != 'customer_owner':
+        raise HTTPException(status_code=403, detail='Customer owner permission required.')
+    return identity
+
+
+def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
+    """Camera lookup + can_live permission check, scoped to the
+    authenticated customer -- mirrors live_playlist.py's own inline
+    logic exactly (see module docstring for why this is duplicated,
+    not shared)."""
+    camera = db.execute(
+        'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+        (camera_id, identity['customer_id']),
+    ).fetchone()
+    if not camera:
+        raise HTTPException(status_code=404, detail='Camera not found.')
+
+    user = db.execute(
+        'SELECT id FROM partner_users WHERE email=?',
+        (identity['email'],),
+    ).fetchone()
+    if not user:
+        raise HTTPException(status_code=403, detail='Customer owner permission required.')
+
+    permission = db.execute(
+        'SELECT can_live FROM customer_camera_permissions WHERE user_id=? AND camera_id=?',
+        (user['id'], camera_id),
+    ).fetchone()
+    if not permission or not permission['can_live']:
+        raise HTTPException(status_code=403, detail='Not authorized to view this camera live.')
+
+    return {**dict(camera), 'user_id': user['id']}
+
+
+def _sweep_expired_sessions(db, now: datetime) -> None:
+    """Lazy expiry: no background job, no scheduler -- every start/stop
+    call first marks any of its own stale 'requested' rows 'expired'.
+    Mirrors appliance_cloud.py's own appliance_commands expiry sweep
+    (same UPDATE-before-read shape), scoped to state='requested' only --
+    an already-'stopped' row is a terminal, customer-initiated outcome
+    and must never be overwritten by a later sweep."""
+    db.execute(
+        "UPDATE live_view_sessions SET state='expired' WHERE state='requested' AND expires_at<?",
+        (now.isoformat(),),
+    )
+
+
+def _queue_relay_command(db, *, appliance_id: str, command: str, camera_number: int, camera_id: str, now: datetime) -> None:
+    """Inserts an appliance_commands row exactly the same shape
+    appliance_cloud.py's queue_command() already uses -- this module
+    queues the SAME way, from a customer-scoped route instead of a
+    partner-scoped one (queue_command() itself requires partner/
+    appliance.action permission a customer_owner does not have)."""
+    command_id = secrets.token_hex(7)
+    expires = now + timedelta(minutes=COMMAND_EXPIRES_MINUTES)
+    payload = sanitize_appliance_payload({'camera_number': camera_number, 'camera_id': camera_id})
+    db.execute(
+        'INSERT INTO appliance_commands(id,appliance_id,command,payload_json,status,created_at,expires_at,created_by) '
+        'VALUES(?,?,?,?,?,?,?,?)',
+        (command_id, appliance_id, command, json.dumps(payload), 'pending', now.isoformat(), expires.isoformat(), 'customer-live-view'),
+    )
+
+
+def register_live_view_session_routes(app: FastAPI) -> None:
+    @app.post('/api/customer/cameras/{camera_id}/live/start')
+    def start_live_view(request: Request, camera_id: str) -> dict:
+        identity = _customer_owner(request)
+        now = datetime.now()
+        with connection() as db:
+            _sweep_expired_sessions(db, now)
+            camera = _authorized_camera(db, camera_id, identity)
+
+            camera_number = resolve_camera_number(db, camera_id, camera['appliance_id'], identity['customer_id'])
+            if camera_number is None:
+                raise HTTPException(status_code=409, detail='Camera has no assigned relay slot; live view is unavailable.')
+
+            session_id = secrets.token_hex(12)
+            expires = now + timedelta(seconds=SESSION_DURATION_SECONDS)
+            db.execute(
+                'INSERT INTO live_view_sessions(id,customer_id,site_id,camera_id,user_id,requested_by,role,state,'
+                'transport,requested_at,ready_at,failed_at,expires_at,error,relay_reference) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (
+                    session_id, identity['customer_id'], camera['site_id'], camera_id, camera['user_id'],
+                    identity['email'], identity['role'], 'requested', 'not_configured',
+                    now.isoformat(), None, None, expires.isoformat(), None, None,
+                ),
+            )
+            _queue_relay_command(
+                db, appliance_id=camera['appliance_id'], command='start_live_relay',
+                camera_number=camera_number, camera_id=camera_id, now=now,
+            )
+            audit(identity, 'customer.live_view_started', 'live_view_session', session_id, {'camera_id': camera_id})
+
+        return {'session_id': session_id, 'status': 'requested', 'expires_at': expires.isoformat()}
+
+    @app.post('/api/customer/live/sessions/{session_id}/stop')
+    def stop_live_view(request: Request, session_id: str) -> dict:
+        identity = _customer_owner(request)
+        now = datetime.now()
+        with connection() as db:
+            _sweep_expired_sessions(db, now)
+
+            session = db.execute(
+                'SELECT * FROM live_view_sessions WHERE id=? AND customer_id=?',
+                (session_id, identity['customer_id']),
+            ).fetchone()
+            if not session:
+                raise HTTPException(status_code=404, detail='Live view session not found.')
+
+            if session['state'] != 'requested':
+                # Already stopped/expired -- idempotent no-op, matching this
+                # project's established duplicate-replay-is-a-200 pattern
+                # (e.g. RDM-2's update_result endpoint). Never re-queues a
+                # second stop command for an already-terminal session.
+                return {'session_id': session_id, 'status': session['state']}
+
+            camera = db.execute(
+                'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+                (session['camera_id'], identity['customer_id']),
+            ).fetchone()
+            camera_number = None
+            if camera:
+                camera_number = resolve_camera_number(db, session['camera_id'], camera['appliance_id'], identity['customer_id'])
+            if camera and camera_number is not None:
+                _queue_relay_command(
+                    db, appliance_id=camera['appliance_id'], command='stop_live_relay',
+                    camera_number=camera_number, camera_id=session['camera_id'], now=now,
+                )
+            # else: the camera was deleted or unassigned after the session
+            # started -- rare, but the customer's own session is still
+            # marked stopped below regardless; there is simply no valid
+            # {camera_number, camera_id} payload left to queue a real
+            # appliance command with.
+
+            db.execute("UPDATE live_view_sessions SET state='stopped' WHERE id=?", (session_id,))
+            audit(identity, 'customer.live_view_stopped', 'live_view_session', session_id, {'camera_id': session['camera_id']})
+
+        return {'session_id': session_id, 'status': 'stopped'}
