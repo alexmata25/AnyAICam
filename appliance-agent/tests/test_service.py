@@ -19,6 +19,7 @@ import io
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -27,11 +28,13 @@ APPLIANCE_AGENT_DIR = Path(__file__).resolve().parents[1]
 if str(APPLIANCE_AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(APPLIANCE_AGENT_DIR))
 
+from anyaicam_agent.commands import execute
 from anyaicam_agent.config import AgentConfig, save_credential
 from anyaicam_agent.portal import PortalError
 from anyaicam_agent.service import ApplianceAgent
 from anyaicam_agent.updater import installer
 from anyaicam_agent.updater.models import PendingValidation, UpdateResult, UpdateState
+from anyaicam_agent.updater.s3_source import ManifestSource
 import json
 
 
@@ -76,6 +79,15 @@ class ConstructionTests(ServiceTestCase):
         agent_a.state_machine.restart_signal()
         self.assertTrue(agent_a.stop_event.is_set())
         self.assertFalse(agent_b.stop_event.is_set())
+
+    def test_state_machine_source_is_the_real_manifest_source(self):
+        # RDM-2 Group 2G: no more Group 2A's _UnconfiguredSource
+        # placeholder -- always the real ManifestSource, unconditionally
+        # (gated entirely by the CLOUD's own feature flag, not a device-
+        # side toggle).
+        agent = ApplianceAgent(self.config)
+        self.assertIsInstance(agent.state_machine.source, ManifestSource)
+        self.assertIs(agent.state_machine.source._client, agent.client)
 
 
 class ResolveUpdateStateTests(ServiceTestCase):
@@ -290,6 +302,170 @@ class RealHealthCheckWiringTests(ServiceTestCase):
         # this exact scenario (see test_a_real_concluding_resume_result_is_handled_without_raising).
         self.assertEqual(result.state.value, "rollback_failed")
         self.assertFalse(self.config.pending_validation_file.exists())
+
+
+class PeriodicSourceCheckCadenceTests(ServiceTestCase):
+    """RDM-2 Group 2G: check_for_source_update()'s own cadence gate --
+    config.update_check_interval_seconds (default 900s), deliberately
+    separate from checkin_seconds' much more frequent normal poll."""
+
+    def test_default_interval_is_900_seconds(self):
+        self.assertEqual(self.config.update_check_interval_seconds, 900)
+
+    def test_first_call_is_due_and_runs(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        agent.state_machine.check_and_install.assert_called_once()
+
+    def test_second_call_within_the_interval_is_skipped(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        agent.check_for_source_update()
+        agent.check_for_source_update()
+        agent.state_machine.check_and_install.assert_called_once()  # still just once
+
+    def test_call_after_the_interval_elapses_runs_again(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        self.assertEqual(agent.state_machine.check_and_install.call_count, 1)
+        agent._next_source_check_at = time.time() - 1  # simulate the interval having elapsed
+        agent.check_for_source_update()
+        self.assertEqual(agent.state_machine.check_and_install.call_count, 2)
+
+    def test_a_custom_configured_interval_is_honored(self):
+        config = AgentConfig(state_dir=self._tmp.name, config_dir=self._tmp.name, log_dir=self._tmp.name, update_check_interval_seconds=5)
+        agent = ApplianceAgent(config)
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        self.assertEqual(agent.state_machine.check_and_install.call_count, 1)
+        agent._next_source_check_at = time.time() - 1
+        agent.check_for_source_update()
+        self.assertEqual(agent.state_machine.check_and_install.call_count, 2)
+
+    def test_check_and_install_is_not_called_on_every_normal_cycle(self):
+        # The real proof that this does NOT run on every normal poll:
+        # three consecutive cycle() calls (each of which calls
+        # check_for_source_update() as its last step) only trigger ONE
+        # check_and_install() call, within the 900s default window.
+        save_credential(self.config, {"appliance_id": "app-1", "credential": "secret"})
+        agent = ApplianceAgent(self.config)
+        agent.sync_configuration = MagicMock()
+        agent.cameras = MagicMock(return_value=[])
+        agent.send_or_queue = MagicMock(return_value=True)
+        agent.flush = MagicMock()
+        agent.poll_commands = MagicMock()
+        agent.poll_discovery = MagicMock()
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+
+        agent.cycle()
+        agent.cycle()
+        agent.cycle()
+
+        agent.state_machine.check_and_install.assert_called_once()
+
+
+class PeriodicSourceCheckInterlockTests(ServiceTestCase):
+    """RDM-2 Group 2G: check_and_install() has no built-in protection of
+    its own against running while a previous activation is still
+    unresolved (has_unresolved_activation() was built in Group 2C
+    specifically for commands.py's own install_update handler). The
+    SAME interlock is applied here, at this new call site, for the same
+    reason -- see check_for_source_update()'s own docstring."""
+
+    def test_does_not_run_while_update_resume_failed_is_set(self):
+        agent = ApplianceAgent(self.config)
+        agent.update_resume_failed = True
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        agent.state_machine.check_and_install.assert_not_called()
+
+    def test_does_not_run_while_has_unresolved_activation_is_true(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.has_unresolved_activation = MagicMock(return_value=True)
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        agent.state_machine.check_and_install.assert_not_called()
+
+    def test_has_unresolved_activation_oserror_blocks_this_cycle_without_raising(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.has_unresolved_activation = MagicMock(side_effect=OSError("disk error"))
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()  # must not raise
+        agent.state_machine.check_and_install.assert_not_called()
+
+    def test_runs_normally_when_neither_interlock_condition_is_active(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        agent.state_machine.check_and_install.assert_called_once()
+
+
+class NoConcurrentPullPushUpdateExecutionTests(ServiceTestCase):
+    """RDM-2 Group 2G: end-to-end proof, using a REAL pending_validation
+    marker (not mocked has_unresolved_activation()) -- the exact
+    artifact commands.py's install_update handler would leave behind
+    after triggering a real activation -- that no two update pipelines
+    can ever be in flight at once, from either direction."""
+
+    def _install_and_mark_pending(self, agent):
+        tar_path = self._make_tar(Path(self._tmp.name) / "1.0.0.tar", "1.0.0")
+        installer.install_candidate(tar_path, "1.0.0", self.config.update_versions_dir, self.config.update_staging_dir)
+        installer.activate("1.0.0", self.config.update_versions_dir, self.config.current_version_pointer_file)
+        marker = PendingValidation(update_id="upd-1", from_version="", to_version="1.0.0",
+                                    attempt="install", deadline="2099-01-01T00:00:00+00:00")
+        self.config.pending_validation_file.parent.mkdir(parents=True, exist_ok=True)
+        self.config.pending_validation_file.write_text(json.dumps(marker.as_dict()), encoding="utf-8")
+
+    def test_periodic_pull_is_blocked_by_a_real_marker_from_a_prior_install_update_command(self):
+        agent = ApplianceAgent(self.config)
+        self._install_and_mark_pending(agent)
+        self.assertTrue(agent.state_machine.has_unresolved_activation())  # sanity: the marker is really there
+
+        agent.state_machine.check_and_install = MagicMock(return_value=None)
+        agent.check_for_source_update()
+        agent.state_machine.check_and_install.assert_not_called()
+
+    def test_cloud_pushed_install_update_is_also_blocked_by_the_same_real_marker(self):
+        # The OTHER direction, already correct since Group 2C -- included
+        # here so "no concurrent pull/push" is proven in one place, both
+        # ways, against the SAME real marker artifact.
+        agent = ApplianceAgent(self.config)
+        self._install_and_mark_pending(agent)
+
+        status, result, error = execute(
+            "install_update", {"manifest": {}, "signature": "AA=="}, self.config,
+            state_machine=agent.state_machine, update_resume_failed=False,
+        )
+        self.assertEqual(status, "failed")
+        self.assertIn("awaiting restart", error.lower())
+
+
+class SourceCheckFailureIsolationTests(ServiceTestCase):
+    def test_check_and_install_exception_does_not_raise_and_does_not_set_update_resume_failed(self):
+        agent = ApplianceAgent(self.config)
+        agent.state_machine.check_and_install = MagicMock(side_effect=RuntimeError("network exploded"))
+        agent.check_for_source_update()  # must not raise
+        self.assertFalse(agent.update_resume_failed)
+
+    def test_cycle_completes_every_other_step_even_when_the_source_check_fails(self):
+        save_credential(self.config, {"appliance_id": "app-1", "credential": "secret"})
+        agent = ApplianceAgent(self.config)
+        agent.sync_configuration = MagicMock()
+        agent.cameras = MagicMock(return_value=[])
+        agent.send_or_queue = MagicMock(return_value=True)
+        agent.flush = MagicMock()
+        agent.poll_commands = MagicMock()
+        agent.poll_discovery = MagicMock()
+        agent.state_machine.check_and_install = MagicMock(side_effect=RuntimeError("boom"))
+
+        agent.cycle()  # must not raise
+
+        agent.sync_configuration.assert_called_once()
+        agent.poll_commands.assert_called_once()
+        agent.poll_discovery.assert_called_once()
 
 
 class RunCallOrderTests(ServiceTestCase):

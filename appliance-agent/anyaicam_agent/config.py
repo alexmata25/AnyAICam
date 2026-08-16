@@ -31,6 +31,15 @@ class AgentConfig:
     update_target: str='anyaicam-appliance'
     update_channel: str='stable'
 
+    # RDM-2 (device-side integration, Group 2G): how often service.py's
+    # periodic pull path (check_for_source_update()) calls the already-
+    # existing UpdateStateMachine.check_and_install(). Deliberately a
+    # SEPARATE, much slower cadence than checkin_seconds (the normal
+    # heartbeat/camera/command poll interval) -- checking for a new
+    # software update does not need, and must not run at, the same
+    # frequency as routine operational polling.
+    update_check_interval_seconds: int=900
+
     def __post_init__(self): self.discovery_networks=self.discovery_networks or []
 
     @property
@@ -66,9 +75,9 @@ class AgentConfig:
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
         if path.exists(): data=json.loads(path.read_text(encoding='utf-8'))
-        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL'}
+        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS'}
         for key,environment in aliases.items():
-            if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity'} else os.environ[environment]
+            if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','update_check_interval_seconds'} else os.environ[environment]
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})
 
     def save(self,path: str|Path|None=None):

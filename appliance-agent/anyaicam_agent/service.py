@@ -15,24 +15,32 @@ from .queue import OfflineQueue
 from .updater.factory import build_update_state_machine
 from .updater.health import make_health_check
 from .updater.restart import make_restart_signal
+from .updater.s3_source import make_manifest_source
 
 
 class ApplianceAgent:
     def __init__(self,config):
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
-        # RDM-2 Group 2A/2B/2F: restart_signal is the real wrapper
+        # RDM-2 Group 2A/2B/2F/2G: restart_signal is the real wrapper
         # (Group 2B) around this same agent's own stop_event -- exactly
         # the mechanism commands.py's existing restart_service handler
-        # already uses. health_check is now the real one too (Group 2F):
+        # already uses. health_check is the real one too (Group 2F):
         # minimal local filesystem/state accessibility checks plus a
         # bounded, short-timeout authenticated cloud probe reusing this
         # same self.client -- see updater/health.py for the full retry/
-        # timeout budget and fail-closed rationale. state_machine itself
+        # timeout budget and fail-closed rationale. source is now real
+        # too (Group 2G): the cloud's authenticated manifest endpoint
+        # plus a direct, unauthenticated GET against whatever presigned
+        # S3 URL that endpoint returns -- this device never receives an
+        # AWS credential of any kind. Gated entirely by the CLOUD's own
+        # feature flag (default off, see app/appliance_cloud.py); no
+        # device-side toggle exists or is needed. state_machine itself
         # is constructed unconditionally so resolve_update_state() can
         # always run at startup, regardless of whether this agent has
         # ever processed an install_update command.
-        self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event),health_check=make_health_check(config,self.client))
+        self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event),health_check=make_health_check(config,self.client),source=make_manifest_source(self.client))
         self.update_resume_failed=False
+        self._next_source_check_at=0.0
     def resolve_update_state(self):
         # RDM-2 Groups 2A/2E: runs once at startup, before any command
         # processing -- per UpdateStateMachine.resume_if_pending()'s own
@@ -99,6 +107,62 @@ class ApplianceAgent:
                 return
             self.queue.put(key,'POST',path,sanitize(payload))
             self.log.warning('Queued offline update result report update_id=%s state=%s error=%s',result.update_id,result.state.value,error)
+    def check_for_source_update(self):
+        # RDM-2 Group 2G: the periodic PULL path -- calls the ALREADY-
+        # EXISTING UpdateStateMachine.check_and_install() (built in
+        # RDM-1, never previously called by anything in the real
+        # runtime) on its own slow cadence (config.update_check_interval_
+        # seconds, default 900s), deliberately separate from
+        # checkin_seconds' much more frequent normal poll interval.
+        #
+        # Isolated in its own try/except, matching resolve_update_state()'s
+        # established discipline (Groups 2E/2F): a failure here is
+        # logged and skipped for THIS cycle, never sets
+        # update_resume_failed, and never blocks/delays heartbeat/
+        # camera-sync/command-polling -- this method is called from
+        # cycle(), which already tolerates any single step failing
+        # without aborting the rest.
+        #
+        # INTERLOCK (see docs/AI_HANDOFF.md RDM-2 Group 2G): check_and_
+        # install() -> process_install_update() has NO built-in
+        # protection against running while a previous activation is
+        # still unresolved -- has_unresolved_activation() (Group 2C) was
+        # built specifically for commands.py's own install_update
+        # handler, not for this state-machine entry point. The SAME
+        # check is applied here, for the SAME reason: letting a second
+        # pointer flip stack on top of unresolved post-activation state
+        # would break resume_if_pending()'s crash-timing guarantees.
+        # Both call sites (this one and commands.py's) now independently
+        # enforce the identical interlock, so process_install_update()
+        # is never reachable from either path (cloud-pushed OR self-
+        # polled) while a marker is pending. Also checks
+        # update_resume_failed for the same reason commands.py does: an
+        # unresolved resume means this device's own update state is not
+        # currently trustworthy enough to layer a new attempt on top of.
+        now=time.time()
+        if now<self._next_source_check_at:
+            return
+        self._next_source_check_at=now+self.config.update_check_interval_seconds
+        try:
+            if self.update_resume_failed:
+                self.log.debug('Skipping periodic update check: update resume did not complete cleanly.')
+                return
+            if self.state_machine.has_unresolved_activation():
+                self.log.debug('Skipping periodic update check: a previous update is still awaiting restart/health confirmation.')
+                return
+            result=self.state_machine.check_and_install()
+            if result is not None:
+                # A pre-restart outcome (REJECTED/DOWNLOAD_FAILED/etc.)
+                # from THIS self-initiated pull is recorded durably in
+                # the local update history (RDM-1) but not separately
+                # reported to the cloud here -- Group 2D's endpoint is
+                # scoped to POST-RESTART conclusions only (Group 2E). If
+                # this pull DOES trigger an actual restart, the real
+                # conclusion is reported the normal way, via
+                # resolve_update_state() on this device's next startup.
+                self.log.info('Periodic update check concluded: %s',result.as_dict())
+        except Exception:
+            self.log.exception('Periodic update source check failed; will retry next cycle')
     def cameras(self):
         try: return json.loads(self.config.cameras_file.read_text(encoding='utf-8'))
         except (OSError,json.JSONDecodeError): return []
@@ -128,7 +192,7 @@ class ApplianceAgent:
             if merged: self.config.cameras_file.parent.mkdir(parents=True,exist_ok=True); self.config.cameras_file.write_text(json.dumps(merged,indent=2),encoding='utf-8')
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
     def cycle(self):
-        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery()
+        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.check_for_source_update()
     def run(self):
         if not self.client.credential: raise RuntimeError('Appliance is not activated. Run anyaicam-setup first.')
         self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',self.config.cloud_id,self.config.mode)

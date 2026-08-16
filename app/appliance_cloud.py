@@ -18,6 +18,7 @@ from live_manifest import LiveManifestStore
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
+from updates_storage import UPDATES_PRESIGNED_TTL_SECONDS, ManifestNotFound, NotConfigured, UpdatesStorageError, get_latest_manifest, presign_package_url
 
 try:
     import boto3
@@ -69,6 +70,14 @@ REMOTE_UPDATE_ENABLED=os.getenv('ANYAICAM_REMOTE_UPDATE_ENABLED','false').strip(
 # that later, legitimate report as a 409 conflict.
 _ACCEPTED_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed','restarting','restart_failed'}
 _TERMINAL_UPDATE_RESULT_STATES={'healthy','rolled_back','rollback_failed','activation_failed'}
+
+# RDM-2 Group 2G (docs/AI_HANDOFF.md): cloud-side authenticated manifest
+# endpoint -- the real UpdateSourceProvider backend. Same fail-closed-by-
+# default convention as LIVE_RELAY_ENABLED/REMOTE_UPDATE_ENABLED above --
+# gates ONLY the new updates_latest() route below. S3 is the sole source
+# of truth for what is currently published (see updates_storage.py) --
+# there is no local database table backing this.
+UPDATES_SOURCE_ENABLED=os.getenv('ANYAICAM_UPDATES_SOURCE_ENABLED','false').strip().lower()=='true'
 
 
 def _bearer(request: Request) -> str:
@@ -316,6 +325,46 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             db.execute('INSERT INTO appliance_update_history(appliance_id,update_id,from_version,to_version,state,error,rollback_from,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(appliance['id'],update_id,from_version,to_version,state,error,rollback_from,duration,now))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.update_result_recorded','appliance_update_history',update_id,{'state':state})
         return {'status':'accepted'}
+
+    @app.get('/api/appliance/updates/latest')
+    def updates_latest(request: Request,target: str,channel: str) -> dict:
+        # RDM-2 Group 2G (docs/AI_HANDOFF.md): the authenticated manifest
+        # endpoint backing the real UpdateSourceProvider (appliance-agent's
+        # updater/s3_source.py). S3 is the sole source of truth -- this
+        # reads manifests/{target}/{channel}/latest.json directly via
+        # updates_storage.py, with NO local database involvement at all
+        # (no published_updates table exists). The appliance receives
+        # only a presigned S3 GET URL for the package here -- never an
+        # AWS credential of any kind. target/channel are content
+        # selectors, not per-appliance secrets: any authenticated
+        # appliance asking for the same target/channel gets the same
+        # published content every other one would.
+        authenticate_appliance(request)
+        if not UPDATES_SOURCE_ENABLED: raise HTTPException(status_code=404,detail='Remote update source is not enabled.')
+        try:
+            envelope=get_latest_manifest(target,channel)
+        except ManifestNotFound:
+            return {'status':'no_update_available'}
+        except NotConfigured as error:
+            raise HTTPException(status_code=503,detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400,detail=str(error)) from error
+        except UpdatesStorageError as error:
+            raise HTTPException(status_code=502,detail=f'Could not read the published manifest: {error}') from error
+        manifest=envelope.get('manifest'); signature=envelope.get('signature')
+        if not isinstance(manifest,dict) or not isinstance(signature,str):
+            raise HTTPException(status_code=502,detail='Published manifest envelope is malformed.')
+        version=manifest.get('version')
+        if not isinstance(version,str) or not version:
+            raise HTTPException(status_code=502,detail='Published manifest is missing a version.')
+        try:
+            package_url=presign_package_url(target,channel,version)
+        except ValueError as error:
+            raise HTTPException(status_code=400,detail=str(error)) from error
+        except UpdatesStorageError as error:
+            raise HTTPException(status_code=502,detail=f'Could not presign the package URL: {error}') from error
+        expires_at=(datetime.now()+timedelta(seconds=UPDATES_PRESIGNED_TTL_SECONDS)).isoformat()
+        return {'manifest':manifest,'signature':signature,'package_url':package_url,'expires_at':expires_at}
 
     @app.post('/api/admin/appliances/{appliance_id}/activation-token')
     def admin_activation_token(request: Request,appliance_id: str,payload: dict) -> dict:
