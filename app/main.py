@@ -4295,6 +4295,10 @@ import live_relay_uploader  # Phase 3 (docs/AI_HANDOFF.md §8): appliance-side l
 # on anything else in this file; imported here only so lifespan() below can
 # start/stop its background task the same way it already does for
 # cloud_upload_worker_placeholder().
+import live_relay_idle_sweep  # Phase 6e (docs/AI_HANDOFF.md §8): cloud-side idle-relay
+# auto-stop worker. Same standalone-module, lifespan()-wired shape as
+# live_relay_uploader's own worker, just for the opposite (cloud/combined)
+# side of this feature -- see its own docstring for the full design.
 
 
 @asynccontextmanager
@@ -4339,6 +4343,11 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and live_relay_uploader.LIVE_RELAY_ENABLED
         else None
     )
+    live_relay_idle_sweep_task = (
+        asyncio.create_task(live_relay_idle_sweep.live_relay_idle_sweep_worker())
+        if RUNTIME_ROLE in {"cloud", "combined"}
+        else None
+    )
 
     structured_log(
         "startup.complete",
@@ -4358,6 +4367,8 @@ async def lifespan(app: FastAPI):
         cloud_upload_task.cancel()
         if live_relay_task:
             live_relay_task.cancel()
+        if live_relay_idle_sweep_task:
+            live_relay_idle_sweep_task.cancel()
 
         pending = []
         if retention_task:
@@ -4370,6 +4381,8 @@ async def lifespan(app: FastAPI):
         pending.append(cloud_upload_task)
         if live_relay_task:
             pending.append(live_relay_task)
+        if live_relay_idle_sweep_task:
+            pending.append(live_relay_idle_sweep_task)
         await asyncio.gather(*pending, return_exceptions=True)
 
         for process in ffmpeg_processes:

@@ -140,6 +140,13 @@ def register_live_view_session_routes(app: FastAPI) -> None:
                 db, appliance_id=camera['appliance_id'], command='start_live_relay',
                 camera_number=camera_number, camera_id=camera_id, now=now,
             )
+            # Phase 6e (docs/AI_HANDOFF.md Sec 8): a new viewer starting
+            # always establishes a fresh relay lifecycle -- clear any
+            # idle-auto-stop tracking left over from a prior idle period,
+            # in the same transaction as the new session and start
+            # command, so live_relay_idle_sweep.py's grace-period clock
+            # (if one was running) never fires against an active viewer.
+            db.execute('DELETE FROM live_relay_idle_tracking WHERE camera_id=?', (camera_id,))
             audit(identity, 'customer.live_view_started', 'live_view_session', session_id, {'camera_id': camera_id})
 
         return {'session_id': session_id, 'status': 'requested', 'expires_at': expires.isoformat()}

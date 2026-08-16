@@ -75,6 +75,13 @@ def _make_db():
         "camera_id TEXT, user_id TEXT, requested_by TEXT, role TEXT, state TEXT, transport TEXT, "
         "requested_at TEXT, ready_at TEXT, failed_at TEXT, expires_at TEXT, error TEXT, relay_reference TEXT)"
     )
+    # Phase 6e (docs/AI_HANDOFF.md Sec 8): start_live_view() clears this
+    # table's tracking row for the camera it starts -- see
+    # test_live_relay_idle_sweep.py for the idle-sweep side of this table.
+    db.execute(
+        "CREATE TABLE live_relay_idle_tracking(camera_id TEXT PRIMARY KEY, appliance_id TEXT, "
+        "idle_since TEXT, stop_queued_at TEXT)"
+    )
     return db
 
 
@@ -208,6 +215,30 @@ class StartLiveViewTests(LiveViewSessionsTestCase):
         expires_at = datetime.fromisoformat(result["expires_at"])
         delta = (expires_at - before).total_seconds()
         self.assertAlmostEqual(delta, live_view_sessions.SESSION_DURATION_SECONDS, delta=5)
+
+    def test_start_clears_an_existing_idle_tracking_row_for_the_camera(self):
+        # Phase 6e (docs/AI_HANDOFF.md Sec 8): a returning viewer always
+        # cancels any in-progress idle-auto-stop cycle for that camera --
+        # see test_live_relay_idle_sweep.py for the full idle-sweep
+        # lifecycle this row belongs to.
+        _seed(self.db)
+        self.db.execute(
+            "INSERT INTO live_relay_idle_tracking(camera_id,appliance_id,idle_since,stop_queued_at) "
+            "VALUES(?,?,?,?)",
+            ("cam-1", "app-1", datetime.now().isoformat(), None),
+        )
+
+        start_live_view(request=object(), camera_id="cam-1")
+
+        row = self.db.execute(
+            "SELECT * FROM live_relay_idle_tracking WHERE camera_id='cam-1'"
+        ).fetchone()
+        self.assertIsNone(row)
+
+    def test_start_is_harmless_when_no_idle_tracking_row_exists(self):
+        _seed(self.db)
+        result = start_live_view(request=object(), camera_id="cam-1")
+        self.assertEqual(result["status"], "requested")
 
 
 # -- stop_live_view -----------------------------------------------------

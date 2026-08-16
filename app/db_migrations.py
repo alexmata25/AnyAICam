@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS notification_deliveries(id TEXT PRIMARY KEY,notificat
     ('20260815_rdm2_update_history','''
 CREATE TABLE IF NOT EXISTS appliance_update_history(appliance_id TEXT NOT NULL,update_id TEXT NOT NULL,from_version TEXT NOT NULL,to_version TEXT NOT NULL,state TEXT NOT NULL,error TEXT NOT NULL DEFAULT '',rollback_from TEXT,duration_seconds REAL NOT NULL DEFAULT 0,created_at TEXT NOT NULL,PRIMARY KEY(appliance_id,update_id,state),FOREIGN KEY(appliance_id) REFERENCES appliances(id));
 '''),
+    ('20260816_live_relay_idle_tracking','''
+CREATE TABLE IF NOT EXISTS live_relay_idle_tracking(camera_id TEXT PRIMARY KEY,appliance_id TEXT NOT NULL,idle_since TEXT NOT NULL,stop_queued_at TEXT,FOREIGN KEY(camera_id) REFERENCES cameras(id));
+'''),
 ]
 
 
