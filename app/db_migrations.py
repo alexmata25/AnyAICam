@@ -84,3 +84,13 @@ def apply_migrations():
                         {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='cameras'").fetchall()})
         if 'camera_number' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN camera_number INTEGER')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_appliance_camera_number ON cameras(appliance_id,camera_number) WHERE camera_number IS NOT NULL')
+
+        # Phase 6f (docs/AI_HANDOFF.md Sec 8): nullable-by-default, fail-closed
+        # per-appliance live-relay pilot eligibility. Effective enablement
+        # requires BOTH this flag AND the existing global
+        # ANYAICAM_LIVE_RELAY_ENABLED kill switch (see appliance_cloud.py's
+        # live_relay_session()) -- this column alone never enables anything.
+        appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
+                           if backend()=='sqlite' else
+                           {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
+        if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')

@@ -16,6 +16,7 @@ existing Phase 0 tests.
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -61,6 +62,7 @@ _ROUTE_APP = FastAPI()
 appliance_cloud.register_appliance_cloud_routes(_ROUTE_APP, lambda *_args, **_kwargs: "")
 live_relay_session = _endpoint(_ROUTE_APP, "/api/appliance/live/{camera_id}/session")
 live_relay_segment_available = _endpoint(_ROUTE_APP, "/api/appliance/live/{camera_id}/segment-available")
+set_live_relay_pilot = _endpoint(_ROUTE_APP, "/api/admin/appliances/{appliance_id}/live-relay-pilot")
 
 
 class FakeRequest:
@@ -73,7 +75,23 @@ class FakeRequest:
         self.client = None
 
 
-FAKE_APPLIANCE = {"id": "appliance-1", "cloud_id": "TESTCLOUD1", "customer_id": "customer-1", "site_id": "site-1"}
+class _ConnectionContext:
+    def __init__(self, db):
+        self._db = db
+
+    def __enter__(self):
+        return self._db
+
+    def __exit__(self, *_args):
+        return False
+
+
+# Phase 6f (docs/AI_HANDOFF.md §8): live_relay_pilot=1 here so every existing
+# positive-path test below (written before Phase 6f) continues to reach the
+# same code path it always has -- pilot-gating itself is exercised by its own
+# dedicated test class (LiveRelayPilotGatingTests) using locally-constructed
+# appliance dicts, not by varying this shared fixture.
+FAKE_APPLIANCE = {"id": "appliance-1", "cloud_id": "TESTCLOUD1", "customer_id": "customer-1", "site_id": "site-1", "live_relay_pilot": 1}
 FAKE_CAMERA = {"id": "camera-1", "customer_id": "customer-1", "site_id": "site-1", "appliance_id": "appliance-1"}
 
 
@@ -223,6 +241,155 @@ class LiveRelaySegmentAvailableEndpointTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 live_relay_segment_available(FakeRequest(), "camera-9", {"segment_key": prefix + "segment_1.ts"})
         self.assertEqual(ctx.exception.status_code, 403)
+
+
+class LiveRelayPilotGatingTests(unittest.TestCase):
+    """Phase 6f (docs/AI_HANDOFF.md §8): live_relay_session() is the single
+    authoritative capability gate -- effective enablement requires BOTH the
+    global ANYAICAM_LIVE_RELAY_ENABLED flag AND this appliance's own
+    live_relay_pilot column. Neither alone is sufficient, and the fail-closed
+    default (column absent/0) must never be treated as eligible."""
+
+    def setUp(self):
+        self._patches = [
+            patch.object(appliance_cloud, "audit"),
+            patch.object(appliance_cloud, "row", return_value=FAKE_CAMERA),
+            patch.object(appliance_cloud, "LIVE_UPLOAD_ROLE_ARN", "arn:aws:iam::880690594006:role/anyaicam-live-relay-upload"),
+            patch.object(appliance_cloud, "LIVE_RELAY_S3_BUCKET", "anyaicam2026"),
+            patch.object(appliance_cloud, "LIVE_RELAY_AWS_REGION", "us-east-1"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+
+    @staticmethod
+    def _appliance(**overrides):
+        return {**FAKE_APPLIANCE, **overrides}
+
+    def test_global_on_pilot_on_succeeds(self):
+        expiration = MagicMock()
+        expiration.isoformat.return_value = "2026-01-01T00:15:00"
+        mock_sts_client = MagicMock()
+        mock_sts_client.assume_role.return_value = {
+            "Credentials": {
+                "AccessKeyId": "AKIAEXAMPLE", "SecretAccessKey": "secretexample",
+                "SessionToken": "tokenexample", "Expiration": expiration,
+            }
+        }
+        with patch.object(appliance_cloud, "authenticate_appliance", return_value=self._appliance(live_relay_pilot=1)), \
+                patch.object(appliance_cloud, "LIVE_RELAY_ENABLED", True), \
+                patch.object(appliance_cloud.boto3, "client", return_value=mock_sts_client):
+            result = live_relay_session(FakeRequest(), "camera-1")
+        self.assertEqual(result["status"], "accepted")
+
+    def test_global_on_pilot_off_returns_404(self):
+        with patch.object(appliance_cloud, "authenticate_appliance", return_value=self._appliance(live_relay_pilot=0)), \
+                patch.object(appliance_cloud, "LIVE_RELAY_ENABLED", True), \
+                patch.object(appliance_cloud, "boto3") as mock_boto3:
+            with self.assertRaises(HTTPException) as ctx:
+                live_relay_session(FakeRequest(), "camera-1")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.detail, "Live relay is not enabled.")
+        mock_boto3.client.assert_not_called()
+
+    def test_global_on_pilot_key_missing_defaults_to_ineligible(self):
+        # Simulates a not-yet-migrated-in-this-process-image row shape or any
+        # caller that omits the key entirely -- .get() must fail closed.
+        appliance_without_pilot_key = {"id": "appliance-1", "cloud_id": "TESTCLOUD1", "customer_id": "customer-1", "site_id": "site-1"}
+        with patch.object(appliance_cloud, "authenticate_appliance", return_value=appliance_without_pilot_key), \
+                patch.object(appliance_cloud, "LIVE_RELAY_ENABLED", True):
+            with self.assertRaises(HTTPException) as ctx:
+                live_relay_session(FakeRequest(), "camera-1")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_global_off_pilot_on_still_returns_404(self):
+        # The global flag remains the master kill switch regardless of
+        # per-appliance pilot eligibility.
+        with patch.object(appliance_cloud, "authenticate_appliance", return_value=self._appliance(live_relay_pilot=1)), \
+                patch.object(appliance_cloud, "LIVE_RELAY_ENABLED", False), \
+                patch.object(appliance_cloud, "boto3") as mock_boto3:
+            with self.assertRaises(HTTPException) as ctx:
+                live_relay_session(FakeRequest(), "camera-1")
+        self.assertEqual(ctx.exception.status_code, 404)
+        mock_boto3.client.assert_not_called()
+
+    def test_global_off_pilot_off_returns_404(self):
+        with patch.object(appliance_cloud, "authenticate_appliance", return_value=self._appliance(live_relay_pilot=0)), \
+                patch.object(appliance_cloud, "LIVE_RELAY_ENABLED", False):
+            with self.assertRaises(HTTPException) as ctx:
+                live_relay_session(FakeRequest(), "camera-1")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+
+class SetLiveRelayPilotAdminRouteTests(unittest.TestCase):
+    """Phase 6f: POST /api/admin/appliances/{appliance_id}/live-relay-pilot --
+    the mechanism, not any real activation (never invoked against a real
+    appliance by this test suite, only an in-memory fixture row)."""
+
+    def setUp(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("CREATE TABLE appliances(id TEXT PRIMARY KEY, live_relay_pilot INTEGER NOT NULL DEFAULT 0)")
+        self.db.execute("INSERT INTO appliances(id, live_relay_pilot) VALUES(?,?)", ("appliance-1", 0))
+        self.db.commit()
+        self._patches = [
+            patch.object(appliance_cloud, "require_partner_access", return_value={"email": "admin@example.com", "role": "administrator"}),
+            patch.object(appliance_cloud, "audit"),
+            patch.object(appliance_cloud, "connection", return_value=_ConnectionContext(self.db)),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        self.db.close()
+
+    def _pilot_value(self, appliance_id="appliance-1"):
+        row = self.db.execute("SELECT live_relay_pilot FROM appliances WHERE id=?", (appliance_id,)).fetchone()
+        return row["live_relay_pilot"] if row else None
+
+    def test_administrator_can_enable_pilot(self):
+        result = set_live_relay_pilot(FakeRequest(), "appliance-1", {"enabled": True})
+        self.assertEqual(result, {"appliance_id": "appliance-1", "live_relay_pilot": True})
+        self.assertEqual(self._pilot_value(), 1)
+        appliance_cloud.audit.assert_called_once()
+
+    def test_administrator_can_disable_pilot(self):
+        self.db.execute("UPDATE appliances SET live_relay_pilot=1 WHERE id='appliance-1'")
+        self.db.commit()
+        result = set_live_relay_pilot(FakeRequest(), "appliance-1", {"enabled": False})
+        self.assertEqual(result, {"appliance_id": "appliance-1", "live_relay_pilot": False})
+        self.assertEqual(self._pilot_value(), 0)
+
+    def test_toggling_twice_is_idempotent(self):
+        set_live_relay_pilot(FakeRequest(), "appliance-1", {"enabled": True})
+        result = set_live_relay_pilot(FakeRequest(), "appliance-1", {"enabled": True})
+        self.assertEqual(result["live_relay_pilot"], True)
+        self.assertEqual(self._pilot_value(), 1)
+
+    def test_non_administrator_role_is_rejected(self):
+        with patch.object(
+            appliance_cloud, "require_partner_access",
+            side_effect=HTTPException(status_code=403, detail="Administrator access required."),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                set_live_relay_pilot(FakeRequest(), "appliance-1", {"enabled": True})
+        self.assertEqual(ctx.exception.status_code, 403)
+        appliance_cloud.audit.assert_not_called()
+
+    def test_unknown_appliance_id_returns_404_and_does_not_audit(self):
+        # Deliberately does NOT inherit revoke_appliance()'s silent-no-op
+        # shape -- an unknown appliance_id must 404, and the audit call must
+        # never fire for a change that didn't happen.
+        with self.assertRaises(HTTPException) as ctx:
+            set_live_relay_pilot(FakeRequest(), "appliance-does-not-exist", {"enabled": True})
+        self.assertEqual(ctx.exception.status_code, 404)
+        appliance_cloud.audit.assert_not_called()
+        self.assertEqual(self._pilot_value("appliance-1"), 0)  # untouched
 
 
 if __name__ == "__main__":

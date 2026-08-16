@@ -187,7 +187,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         # credential. FastAPI never receives a media byte through this endpoint -- it
         # only authenticates, authorizes, and brokers an STS credential.
         appliance=authenticate_appliance(request)
-        if not LIVE_RELAY_ENABLED: raise HTTPException(status_code=404,detail='Live relay is not enabled.')
+        # Phase 6f (docs/AI_HANDOFF.md §8): the global kill switch AND this
+        # appliance's own pilot eligibility must both hold -- this is the
+        # single authoritative point where live-relay capability (a real AWS
+        # credential) is ever granted. Same message/status reused for both
+        # "globally off" and "not in the pilot" so a rejected appliance can
+        # never distinguish the two.
+        if not LIVE_RELAY_ENABLED or not appliance.get('live_relay_pilot'):
+            raise HTTPException(status_code=404,detail='Live relay is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
         if boto3 is None or not LIVE_UPLOAD_ROLE_ARN or not LIVE_RELAY_S3_BUCKET or not LIVE_RELAY_AWS_REGION:
             raise HTTPException(status_code=503,detail='Live relay is not configured.')
@@ -378,6 +385,24 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         identity=require_partner_access(request,{'administrator'}); now=datetime.now().isoformat()
         with connection() as db: db.execute('UPDATE appliance_credentials SET revoked_at=? WHERE appliance_id=? AND revoked_at IS NULL',(now,appliance_id)); db.execute("UPDATE appliances SET state='revoked',online_status='revoked',credential_revoked_at=? WHERE id=?",(now,appliance_id))
         audit(identity,'appliance.credentials_revoked','appliance',appliance_id); return {'message':'Appliance credentials revoked.'}
+
+    @app.post('/api/admin/appliances/{appliance_id}/live-relay-pilot')
+    def set_live_relay_pilot(request: Request,appliance_id: str,payload: dict) -> dict:
+        # Phase 6f (docs/AI_HANDOFF.md §8): the mechanism that makes "one
+        # pilot appliance at a time" achievable -- building it is in scope,
+        # using it against any real appliance is not (see docs). Unlike
+        # revoke_appliance() above, an unknown appliance_id must 404 and must
+        # never reach audit() -- the UPDATE's own rowcount against the
+        # appliances.id primary key is the existence check, the same
+        # atomic-rowcount idiom already used in live_relay_idle_sweep.py's
+        # Phase C claim, portable across sqlite/postgres.
+        identity=require_partner_access(request,{'administrator'})
+        enabled=1 if payload.get('enabled') else 0
+        with connection() as db:
+            cursor=db.execute('UPDATE appliances SET live_relay_pilot=? WHERE id=?',(enabled,appliance_id))
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Appliance not found.')
+        audit(identity,'appliance.live_relay_pilot_changed','appliance',appliance_id,{'enabled':bool(enabled)})
+        return {'appliance_id':appliance_id,'live_relay_pilot':bool(enabled)}
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
