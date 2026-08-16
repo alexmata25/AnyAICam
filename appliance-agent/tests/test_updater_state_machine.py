@@ -833,6 +833,64 @@ class RollbackToConclusionTests(StateMachineTestCase):
         self.assertIsNone(self.make_machine().resume_if_pending())
 
 
+# -- RDM-2 Group 2I: rollback_from metadata on rollback conclusions ---------
+
+class RollbackFromMetadataTests(StateMachineTestCase):
+    def _install_upgrade_and_trigger_rollback(self):
+        self.install_and_activate_directly("1.0.0")
+        manifest_dict, signature, package_bytes = self.make_update(version="1.1.0")
+        machine = self.make_machine(source=FakeUpdateSourceProvider(package_bytes=package_bytes))
+        machine.process_install_update(manifest_dict, signature)  # 1.1.0 activated, restart #1
+
+        self.health.result = False
+        self.make_machine().resume_if_pending()  # unhealthy -> rollback triggered, restart #2
+
+    def test_rolled_back_result_carries_the_bad_version_as_rollback_from(self):
+        self._install_upgrade_and_trigger_rollback()
+
+        self.health.result = True  # the good, old version validates fine
+        result = self.make_machine().resume_if_pending()
+
+        self.assertEqual(result.state, UpdateState.ROLLED_BACK)
+        self.assertEqual(result.rollback_from, "1.1.0")  # the version rolled back FROM
+
+    def test_rollback_failed_result_also_carries_the_bad_version_as_rollback_from(self):
+        self._install_upgrade_and_trigger_rollback()
+
+        self.health.result = False  # even the "good" version now fails validation
+        result = self.make_machine().resume_if_pending()
+
+        self.assertEqual(result.state, UpdateState.ROLLBACK_FAILED)
+        self.assertEqual(result.rollback_from, "1.1.0")
+
+    def test_rollback_failed_with_no_prior_version_also_carries_rollback_from(self):
+        # Reached via _begin_rollback()'s "nowhere to roll back to" guard
+        # -- a different code path than the marker-driven rollback
+        # failure above (no marker ever exists for this branch), proving
+        # the fix in _result_from_history() is state+row-based, not
+        # marker-based, so it covers every path that reaches
+        # ROLLBACK_FAILED, not just the one this group's own composed
+        # end-to-end test happens to exercise.
+        manifest_dict, signature, package_bytes = self.make_update(version="1.1.0")
+        machine = self.make_machine(source=FakeUpdateSourceProvider(package_bytes=package_bytes))
+        machine.process_install_update(manifest_dict, signature)
+
+        self.health.result = False
+        result = self.make_machine().resume_if_pending()
+
+        self.assertEqual(result.state, UpdateState.ROLLBACK_FAILED)
+        self.assertEqual(result.rollback_from, "1.1.0")
+
+    def test_non_rollback_terminal_results_have_rollback_from_none(self):
+        manifest_dict, signature, package_bytes = self.make_update()
+        machine = self.make_machine(source=FakeUpdateSourceProvider(package_bytes=package_bytes))
+        machine.process_install_update(manifest_dict, signature)
+        result = self.make_machine().resume_if_pending()
+
+        self.assertEqual(result.state, UpdateState.HEALTHY)
+        self.assertIsNone(result.rollback_from)
+
+
 # -- malformed / corrupt marker quarantine and reconciliation ---------------
 
 class MarkerCorruptionTests(StateMachineTestCase):

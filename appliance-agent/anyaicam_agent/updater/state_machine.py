@@ -716,8 +716,21 @@ class UpdateStateMachine:
             # (re)processed -- the same externally visible outcome as an
             # outright rejection.
             state = UpdateState.REJECTED
+        # RDM-2 Group 2I: rollback_from is populated for ROLLED_BACK and
+        # ROLLBACK_FAILED, and only those -- derived purely from data this
+        # row already durably stores, no marker needed. row["to_version"]
+        # is fixed once at begin_attempt() and always describes the
+        # update's ORIGINAL (install) direction, never flipped by a
+        # rollback (see this module's own docstring and
+        # _reconcile_orphaned_post_activation_row()'s), so whenever this
+        # update_id's outcome is a rollback conclusion, row["to_version"]
+        # IS, by construction, the bad version that was rolled back from
+        # -- true for every path that reaches this method after a
+        # rollback (the marker-present path, the marker-lost
+        # reconciliation path, and a later terminal-replay lookup alike).
+        rollback_from = row["to_version"] if state in (UpdateState.ROLLED_BACK, UpdateState.ROLLBACK_FAILED) else None
         return UpdateResult(
             update_id=update_id, from_version=row["from_version"], to_version=row["to_version"],
-            state=state, error=row["error"],
+            state=state, error=row["error"], rollback_from=rollback_from,
             duration_seconds=max(0.0, row["updated_at"] - row["created_at"]),
         )

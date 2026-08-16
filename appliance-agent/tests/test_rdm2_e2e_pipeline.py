@@ -471,16 +471,16 @@ class RollbackPathTests(Rdm2E2EPipelineTestCase):
         # above), which is the durable fact this row's state describes.
         self.assertEqual(rolled_back_row["from_version"], "1.0.0")
         self.assertEqual(rolled_back_row["to_version"], "1.1.0")
-        # RDM-2 Group 2H finding (not a bug fixed by this group -- see
-        # the accompanying report): UpdateStateMachine never populates
-        # UpdateResult.rollback_from anywhere in state_machine.py, for
-        # ANY conclusion, including a genuine ROLLED_BACK one. Every
-        # existing test that exercises a non-null rollback_from value
-        # hand-authors it directly into an isolated fixture/payload; this
-        # is the first test where the value flows from a REAL device
-        # conclusion into the REAL cloud report, and it is None -- this
-        # assertion documents that ACTUAL behavior, not an assumption.
-        self.assertIsNone(rolled_back_row["rollback_from"])
+        # RDM-2 Group 2I: UpdateStateMachine now populates
+        # UpdateResult.rollback_from for a genuine ROLLED_BACK conclusion
+        # (fixed in state_machine.py's _result_from_history() -- see
+        # docs/AI_HANDOFF.md RDM-2 Group 2I). Group 2H's own real
+        # composed chain first exposed this gap (documented there with an
+        # assertion that the value was None); this is the same real
+        # chain, now proving the corrected value flows from a REAL device
+        # conclusion into the REAL cloud report -- not a hand-authored
+        # fixture.
+        self.assertEqual(rolled_back_row["rollback_from"], "1.1.0")
 
 
 if __name__ == "__main__":
