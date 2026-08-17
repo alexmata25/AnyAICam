@@ -11,17 +11,29 @@ impossible for a caller to sign an arbitrary CloudFront URL or arbitrary S3
 key through this module -- a function-signature guarantee, not a
 caller-discipline convention.
 
-No key material is created or retrieved here. get_configured_signer() is a
-production entry-point stub that always returns None in this phase -- real
-Secrets Manager retrieval is deferred to whichever future phase creates the
-actual CloudFront key-pair/trusted-key-group AWS resources (not this one).
-Every real call path fails closed by construction until that phase exists.
+get_configured_signer() assumes the narrowly-scoped, Secrets-Manager-only
+signing-key-reader role via STS (least-privilege, per the already-approved
+Phase 1 two-role pattern this project already uses for the live-upload
+credential in appliance_cloud.py), retrieves the CloudFront private key PEM
+from Secrets Manager in the configured secret region, and wraps it into an
+rsa_signer callback via cryptography_rsa_signer(). The constructed signer is
+cached at module level (thread-safe, lazy, process-lifetime) so that
+live_playlist.py's per-poll calls to this function do not pay a fresh
+STS + Secrets Manager round trip on every ~2-second playlist poll. Every
+failure -- missing configuration, STS failure, Secrets Manager failure,
+empty/malformed key, or boto3/cryptography being unavailable -- is caught
+and reported as None, never raised and never permanently cached, so every
+real call path fails closed by construction and a transient AWS failure
+self-heals on the next call instead of requiring a process restart.
 
 CloudFrontSigner requires RSA-PKCS1v15 padding with SHA-1 hashing -- this is
 CloudFront's own fixed signing spec (confirmed from
 botocore.signers.CloudFrontSigner's own docstring), not a choice made here.
 """
 
+import logging
+import os
+import threading
 from datetime import datetime, timedelta, timezone
 from re import compile as re_compile
 from typing import Callable
@@ -34,7 +46,25 @@ try:
 except ImportError:
     CloudFrontSigner = None
 
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
+logger = logging.getLogger("anyaicam.live_cdn_signing")
+
 SIGNED_SEGMENT_URL_TTL_SECONDS = 20  # fixed; not caller-configurable
+
+# get_configured_signer()'s AWS configuration. Deliberately separate from
+# live_playlist.py's ANYAICAM_CLOUDFRONT_URL/ANYAICAM_CLOUDFRONT_KEY_PAIR_ID
+# -- this module only ever produces the rsa_signer callback, never the
+# CloudFront domain or key-pair-id used to build/label the signed URL.
+SIGNING_KEY_ROLE_ARN_ENV = "ANYAICAM_CLOUDFRONT_SIGNING_KEY_ROLE_ARN"
+SIGNING_KEY_SECRET_NAME_ENV = "ANYAICAM_CLOUDFRONT_SIGNING_KEY_SECRET_NAME"
+SIGNING_KEY_SECRET_REGION_ENV = "ANYAICAM_CLOUDFRONT_SIGNING_KEY_SECRET_REGION"
+
+_SIGNING_KEY_READER_SESSION_NAME = "anyaicam-cloudfront-signing-key-reader"
+_SIGNING_KEY_READER_SESSION_DURATION_SECONDS = 900
 
 # Mirrors the exact shape already used for per-camera-number local playlist
 # validation in live_relay_uploader.py (`^camera{N}[0-9_.\-]*\.ts$`),
@@ -42,6 +72,13 @@ SIGNED_SEGMENT_URL_TTL_SECONDS = 20  # fixed; not caller-configurable
 # from the S3 key prefix (customer/site/appliance/camera_id), not from the
 # filename matching one specific camera_number.
 _SEGMENT_FILENAME_PATTERN = re_compile(r"^camera\d+[0-9_.\-]*\.ts$")
+
+# Lazily populated by get_configured_signer(); guarded by _signer_cache_lock.
+# A failed fetch leaves this None so the next call retries -- never
+# permanently cached. Tests reset this directly (see
+# test_live_cdn_signing.py's GetConfiguredSignerCacheTests.setUp/tearDown).
+_cached_signer: Callable[[bytes], bytes] | None = None
+_signer_cache_lock = threading.Lock()
 
 
 def _require_nonempty_str(value, label: str) -> str:
@@ -161,12 +198,83 @@ def cryptography_rsa_signer(private_key) -> Callable[[bytes], bytes]:
     return _sign
 
 
-def get_configured_signer() -> Callable[[bytes], bytes] | None:
-    """Production entry point (not implemented in this phase). Always
-    returns None -- never raises -- so every caller has one uniform
-    fail-closed signal to act on. Real Secrets Manager retrieval of the
-    CloudFront private key is deferred to whichever future phase creates
-    the actual key-pair/trusted-key-group AWS resources; until then, every
-    real call path fails closed by construction, not by coincidence.
+def _fetch_signer_from_aws() -> Callable[[bytes], bytes] | None:
+    """Assumes the signing-key-reader role via STS, retrieves the
+    CloudFront private key PEM from Secrets Manager in the configured
+    secret region, and wraps it via cryptography_rsa_signer(). Never
+    raises: every failure is caught, logged with a static message only
+    (no exception args, no secret/credential value ever interpolated into
+    the log call), and reported as None. Called at most once per process
+    unless every prior call has failed -- see get_configured_signer().
     """
-    return None
+    role_arn = os.environ.get(SIGNING_KEY_ROLE_ARN_ENV, "").strip()
+    secret_name = os.environ.get(SIGNING_KEY_SECRET_NAME_ENV, "").strip()
+    secret_region = os.environ.get(SIGNING_KEY_SECRET_REGION_ENV, "").strip()
+    if not (role_arn and secret_name and secret_region):
+        return None
+    if boto3 is None:
+        return None
+
+    try:
+        assumed = boto3.client("sts").assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=_SIGNING_KEY_READER_SESSION_NAME,
+            DurationSeconds=_SIGNING_KEY_READER_SESSION_DURATION_SECONDS,
+        )
+        reader_credentials = assumed["Credentials"]
+        secret = boto3.client(
+            "secretsmanager",
+            region_name=secret_region,
+            aws_access_key_id=reader_credentials["AccessKeyId"],
+            aws_secret_access_key=reader_credentials["SecretAccessKey"],
+            aws_session_token=reader_credentials["SessionToken"],
+        ).get_secret_value(SecretId=secret_name)
+    except Exception:
+        # Static message only -- never log the exception's str()-formatted
+        # args with credential/secret values interpolated in, and never
+        # pass reader_credentials/secret into this call.
+        logger.exception("live_cdn_signing.signing_key_fetch_failed")
+        return None
+
+    key_pem = secret.get("SecretString") or ""
+    if not key_pem.strip():
+        return None
+
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        private_key = serialization.load_pem_private_key(key_pem.encode("utf-8"), password=None)
+    except Exception:
+        logger.exception("live_cdn_signing.signing_key_parse_failed")
+        return None
+    finally:
+        key_pem = None  # best-effort only; Python strings/bytes aren't securely erasable.
+
+    return cryptography_rsa_signer(private_key)
+
+
+def get_configured_signer() -> Callable[[bytes], bytes] | None:
+    """Production entry point. Returns a cached rsa_signer callback backed
+    by the real CloudFront private key, or None if signing is not
+    configured or could not be obtained -- never raises, so every caller
+    has one uniform fail-closed signal to act on.
+
+    Thread-safe, lazy, process-lifetime caching: the first successful call
+    fetches from AWS (STS assume-role + Secrets Manager GetSecretValue) and
+    caches the resulting callable; every later call in this process reuses
+    it without another AWS round trip, which matters because
+    live_playlist.py calls this on every playlist poll (~every 2 seconds
+    per active viewer). A failed fetch is never cached -- the next call
+    retries from scratch, so a transient AWS failure self-heals without
+    requiring a process restart. Rotating the underlying secret takes
+    effect only after the process restarts/redeploys (the cache has no
+    TTL); that is an accepted tradeoff, not an oversight, given the
+    alternative is a fresh AWS round trip on every live-view poll.
+    """
+    global _cached_signer
+    if _cached_signer is not None:
+        return _cached_signer
+    with _signer_cache_lock:
+        if _cached_signer is None:
+            _cached_signer = _fetch_signer_from_aws()
+        return _cached_signer
