@@ -16120,8 +16120,17 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
+        *(
+            ["-c:v", "copy"]
+            if os.environ.get(
+                f"CAMERA{camera_number}_HLS_VIDEO_MODE",
+                "libx264",
+            ).strip().lower() == "copy"
+            else [
+                "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
+            ]
+        ),
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",

@@ -281,7 +281,7 @@ class RouteWiringSourceTests(unittest.TestCase):
 
     def test_existing_toolbar_open_camera_link_is_unchanged(self):
         self.assertIn(
-            '<a class="camera-action" title="Open the dedicated Camera {n} page" href="/camera/{n}">',
+            '<a class="camera-tool" title="Open camera" href="/camera/{n}">↗</a>',
             self.source,
         )
 

@@ -63,7 +63,7 @@ class HlsDeliverySourceTests(unittest.TestCase):
 
     def test_live_page_uses_three_segment_window_sync_and_starts_playback(self):
         self.assertIn(
-            "new Hls({liveSyncDurationCount:1,liveMaxLatencyDurationCount:2})",
+            "new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5})",
             self.live_player_source,
         )
         self.assertIn(
