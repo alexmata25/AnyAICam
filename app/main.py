@@ -146422,3 +146422,125 @@ def v111_camera_verification_page(request: Request):
     </script>
     """
     return page_shell("Camera verification", "settings", content, scripts)
+
+# Final playback layout correction
+STYLES += r"""
+/* ===== Playback / Monitor final layout ===== */
+
+.monitor-shell{
+  display:grid!important;
+  grid-template-columns:180px minmax(0,1fr)!important;
+  gap:12px!important;
+  align-items:start!important;
+}
+
+.monitor-picker{
+  width:auto!important;
+  min-width:0!important;
+  padding:10px!important;
+}
+
+.monitor-camera-item{
+  padding:8px!important;
+  font-size:12px!important;
+}
+
+/* Do not let earlier viewport-height rules hide grid rows. */
+.monitor-work{
+  display:flex!important;
+  flex-direction:column!important;
+  height:auto!important;
+  max-height:none!important;
+  min-height:0!important;
+  overflow:visible!important;
+}
+
+.monitor-toolbar{
+  flex:0 0 auto!important;
+}
+
+/* Four-camera playback must remain a true 2 x 2 matrix. */
+.monitor-grid{
+  flex:none!important;
+  width:100%!important;
+  height:auto!important;
+  min-height:0!important;
+  max-height:none!important;
+  overflow:visible!important;
+  gap:8px!important;
+  grid-auto-rows:auto!important;
+}
+
+.monitor-grid[data-layout="1"]{
+  grid-template-columns:minmax(0,1fr)!important;
+}
+
+.monitor-grid[data-layout="4"]{
+  grid-template-columns:repeat(2,minmax(0,1fr))!important;
+}
+
+.monitor-grid[data-layout="9"]{
+  grid-template-columns:repeat(3,minmax(0,1fr))!important;
+}
+
+.monitor-grid[data-layout="16"]{
+  grid-template-columns:repeat(4,minmax(0,1fr))!important;
+}
+
+.monitor-tile{
+  min-width:0!important;
+  min-height:0!important;
+  height:auto!important;
+}
+
+.monitor-video{
+  position:relative!important;
+  width:100%!important;
+  height:auto!important;
+  min-height:0!important;
+  aspect-ratio:16/9!important;
+}
+
+.monitor-video video{
+  width:100%!important;
+  height:100%!important;
+  object-fit:contain!important;
+}
+
+/* Timeline follows the complete camera grid instead of covering it. */
+.monitor-timeline{
+  flex:none!important;
+  display:block!important;
+  position:relative!important;
+  width:100%!important;
+  height:auto!important;
+  min-height:285px!important;
+  max-height:none!important;
+  margin-top:12px!important;
+  overflow:auto!important;
+  z-index:1!important;
+}
+
+#create-clip{
+  flex:none!important;
+  max-height:none!important;
+}
+
+@media(max-width:1050px){
+  .monitor-shell{
+    grid-template-columns:1fr!important;
+  }
+
+  .monitor-picker{
+    position:static!important;
+  }
+}
+
+@media(max-width:760px){
+  .monitor-grid[data-layout="4"],
+  .monitor-grid[data-layout="9"],
+  .monitor-grid[data-layout="16"]{
+    grid-template-columns:1fr!important;
+  }
+}
+"""
