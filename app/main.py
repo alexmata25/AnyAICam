@@ -512,6 +512,10 @@ STATIC_FOLDER = Path("/app/static")
 
 HLS_FOLDER = Path("/app/static/hls")
 
+HLS_URL_PREFIX = "/static/hls"
+
+HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
+
 
 
 
@@ -16116,10 +16120,19 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
 
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
+        *(
+            ["-c:v", "copy"]
+            if os.environ.get(
+                f"CAMERA{camera_number}_HLS_VIDEO_MODE",
+                "libx264",
+            ).strip().lower() == "copy"
+            else [
+                "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
+            ]
+        ),
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
-        "-f", "hls", "-hls_time", "1", "-hls_list_size", "3",
+        "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
         output_file,
 
@@ -39677,6 +39690,15 @@ async def forwarded_https_middleware(request: Request, call_next):
 
 
 
+    # Live playlists are rewritten every second and reference a three-segment
+    # rolling window. Reusing an old manifest makes the player request
+    # segments that FFmpeg has already deleted.
+    if request.url.path.startswith(f"{HLS_URL_PREFIX}/"):
+        response.headers["Cache-Control"] = HLS_CACHE_CONTROL
+        response.headers["CDN-Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+
     if forwarded_proto == "https":
 
 
@@ -46655,6 +46677,8 @@ register_mobile_notification_routes(
 
 def camera_detail(camera_number: int) -> str:
 
+    today = datetime.now().strftime("%Y-%m-%d")
+
 
 
 
@@ -46698,7 +46722,14 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    return page_shell(f"Camera {camera_number}", "live", content, scripts)
+    events_section = f"""<section class="panel" style="margin-top:14px"><div class="panel-head"><h2>Motion events</h2><div class="monitor-toolbar-group"><button id="camera-events-prev-day" type="button">&lt;</button><input id="camera-events-date" type="date" value="{today}"><button id="camera-events-next-day" type="button">&gt;</button><button id="camera-events-today" type="button">Today</button></div></div><div class="feature-grid" id="camera-events-list"><div class="empty-stage">Loading motion events…</div></div></section>"""
+
+    # Built as a plain (non f-string) template with placeholder substitution
+    # so none of this JavaScript's own { } braces need doubling.
+    events_scripts_template = """<script>(function(){var dateInput=document.getElementById('camera-events-date');var list=document.getElementById('camera-events-list');function escapeHtml(value){return String(value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}function buildCameraEventsHtml(events){if(!events.length){return '<div class="empty-stage">No motion events for this day.</div>'}return events.map(function(event){var stamp=String(event.start_time||event.timestamp||'').replace('T',' ').slice(0,19);var confidence=Number(event.confidence||0);var thumb=event.thumbnail?('<img src="'+escapeHtml(event.thumbnail)+'" alt="Motion" style="width:120px;aspect-ratio:16/9;object-fit:cover;border-radius:7px">'):'<div class="feature-icon">⌁</div>';var tag=event.linked_recording?'a':'div';var hrefAttr=event.linked_recording?(' href="'+escapeHtml(event.linked_recording)+'"'):'';var note=event.linked_recording?'':'<span class="health-detail">No recording linked</span>';return '<'+tag+' class="feature-card"'+hrefAttr+'>'+thumb+'<h2>Motion event</h2><p>'+escapeHtml(stamp)+' · '+confidence.toFixed(1)+'% confidence</p>'+note+'</'+tag+'>'}).join('')}function shiftDayValue(value,delta){var current=new Date(value+'T00:00:00');current.setDate(current.getDate()+delta);return current.toISOString().slice(0,10)}function loadCameraEvents(){list.innerHTML='<div class="empty-stage">Loading motion events…</div>';fetch('/api/events?camera=__CAMERA_NUMBER__&date='+dateInput.value+'&limit=100').then(function(response){return response.json()}).then(function(data){list.innerHTML=buildCameraEventsHtml(data.events||[])}).catch(function(){list.innerHTML='<div class="empty-stage">Motion events could not be loaded.</div>'})}document.getElementById('camera-events-prev-day').addEventListener('click',function(){dateInput.value=shiftDayValue(dateInput.value,-1);loadCameraEvents()});document.getElementById('camera-events-next-day').addEventListener('click',function(){dateInput.value=shiftDayValue(dateInput.value,1);loadCameraEvents()});document.getElementById('camera-events-today').addEventListener('click',function(){dateInput.value='__TODAY_VALUE__';loadCameraEvents()});dateInput.addEventListener('change',loadCameraEvents);loadCameraEvents()})();</script>"""
+    events_scripts = events_scripts_template.replace("__CAMERA_NUMBER__", str(camera_number)).replace("__TODAY_VALUE__", today)
+
+    return page_shell(f"Camera {camera_number}", "live", content + events_section, scripts + events_scripts)
 
 
 
@@ -49905,7 +49936,7 @@ def metrics_api() -> dict:
 
 
 
-def events_api(camera: int | None = None, limit: int = 100) -> dict:
+def events_api(camera: int | None = None, date: str | None = None, limit: int = 100) -> dict:
 
 
 
@@ -49942,6 +49973,12 @@ def events_api(camera: int | None = None, limit: int = 100) -> dict:
 
 
         events = [event for event in events if event.get("camera") == camera]
+
+    if date:
+        events = [
+            event for event in events
+            if str(event.get("start_time") or event.get("timestamp") or "")[:10] == date
+        ]
 
 
 
@@ -68949,7 +68986,7 @@ def home() -> str:
 
 
 
-        <div class="camera-view">
+        <div class="camera-view" style="cursor:pointer" onclick="openCameraPage({n})">
 
 
 
@@ -69075,231 +69112,15 @@ def home() -> str:
 
 
 
-        <div class="camera-tools polished" aria-label="Camera {n} controls">
-
-
-
-
-
-
-
-
-            <button class="camera-action" type="button" title="Enter fullscreen" onclick="fullscreenCamera({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">⛶</span><span>Fullscreen</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <button class="camera-action" id="pause{n}" type="button" title="Pause or resume this live view" onclick="toggleLivePlayback({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">Ⅱ</span><span id="pause-label{n}">Pause</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <button class="camera-action" type="button" title="Save a snapshot from the current live frame" onclick="captureSnapshot({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">▣</span><span>Snapshot</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <a class="camera-action" title="Open recordings for Camera {n}" href="/playback?camera={n}">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">▶</span><span>Playback</span>
-
-
-
-
-
-
-
-
-            </a>
-
-
-
-
-
-
-
-
-            <a class="camera-action" title="Open the dedicated Camera {n} page" href="/camera/{n}">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">↗</span><span>Open</span>
-
-
-
-
-
-
-
-
-            </a>
-
-
-
-
-
-
-
-
-            <button class="camera-action" id="audio{n}" type="button" title="Mute or unmute browser audio" onclick="toggleCameraAudio({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">◖</span><span id="audio-label{n}">Unmute</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
-            <a class="camera-action" title="Open camera and recording settings" href="/settings">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">⚙</span><span>Settings</span>
-
-
-
-
-
-
-
-
-            </a>
-
-
-
-
-
-
-
-
-            <button class="camera-action" id="analytics{n}" type="button" title="Show or hide the analytics overlay" onclick="toggleAnalytics({n})">
-
-
-
-
-
-
-
-
-                <span class="camera-action-icon">◇</span><span>Analytics</span>
-
-
-
-
-
-
-
-
-            </button>
-
-
-
-
-
-
-
-
+        <div class="camera-tools" aria-label="Camera {n} controls">
+            <button class="camera-tool" type="button" title="Fullscreen" onclick="fullscreenCamera({n})">⛶</button>
+            <button class="camera-tool" id="pause{n}" type="button" title="Pause or resume" onclick="toggleLivePlayback({n})">Ⅱ<span class="sr-only" id="pause-label{n}">Pause</span></button>
+            <button class="camera-tool" type="button" title="Snapshot" onclick="captureSnapshot({n})">▣</button>
+            <a class="camera-tool" title="Playback" href="/playback?camera={n}">▶</a>
+            <a class="camera-tool" title="Open camera" href="/camera/{n}">↗</a>
+            <button class="camera-tool" id="audio{n}" type="button" title="Mute or unmute audio" onclick="toggleCameraAudio({n})">◖<span class="sr-only" id="audio-label{n}">Unmute</span></button>
+            <a class="camera-tool" title="Settings" href="/settings">⚙</a>
+            <button class="camera-tool" id="analytics{n}" type="button" title="Analytics overlay" onclick="toggleAnalytics({n})">◇</button>
         </div>
 
 
@@ -69399,6 +69220,7 @@ async function captureSnapshot(n){const video=document.getElementById(`camera${n
 
 
 
+function openCameraPage(n){location.href=`/camera/${n}`}
 function fullscreenCamera(n){
 
 
@@ -69768,7 +69590,7 @@ function toggleAnalytics(n){
 
 
 
-function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}for(let n=1;n<=4;n++)connectCamera(n);
+function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}for(let n=1;n<=4;n++)connectCamera(n);
 
 
 
@@ -146600,3 +146422,125 @@ def v111_camera_verification_page(request: Request):
     </script>
     """
     return page_shell("Camera verification", "settings", content, scripts)
+
+# Final playback layout correction
+STYLES += r"""
+/* ===== Playback / Monitor final layout ===== */
+
+.monitor-shell{
+  display:grid!important;
+  grid-template-columns:180px minmax(0,1fr)!important;
+  gap:12px!important;
+  align-items:start!important;
+}
+
+.monitor-picker{
+  width:auto!important;
+  min-width:0!important;
+  padding:10px!important;
+}
+
+.monitor-camera-item{
+  padding:8px!important;
+  font-size:12px!important;
+}
+
+/* Do not let earlier viewport-height rules hide grid rows. */
+.monitor-work{
+  display:flex!important;
+  flex-direction:column!important;
+  height:auto!important;
+  max-height:none!important;
+  min-height:0!important;
+  overflow:visible!important;
+}
+
+.monitor-toolbar{
+  flex:0 0 auto!important;
+}
+
+/* Four-camera playback must remain a true 2 x 2 matrix. */
+.monitor-grid{
+  flex:none!important;
+  width:100%!important;
+  height:auto!important;
+  min-height:0!important;
+  max-height:none!important;
+  overflow:visible!important;
+  gap:8px!important;
+  grid-auto-rows:auto!important;
+}
+
+.monitor-grid[data-layout="1"]{
+  grid-template-columns:minmax(0,1fr)!important;
+}
+
+.monitor-grid[data-layout="4"]{
+  grid-template-columns:repeat(2,minmax(0,1fr))!important;
+}
+
+.monitor-grid[data-layout="9"]{
+  grid-template-columns:repeat(3,minmax(0,1fr))!important;
+}
+
+.monitor-grid[data-layout="16"]{
+  grid-template-columns:repeat(4,minmax(0,1fr))!important;
+}
+
+.monitor-tile{
+  min-width:0!important;
+  min-height:0!important;
+  height:auto!important;
+}
+
+.monitor-video{
+  position:relative!important;
+  width:100%!important;
+  height:auto!important;
+  min-height:0!important;
+  aspect-ratio:16/9!important;
+}
+
+.monitor-video video{
+  width:100%!important;
+  height:100%!important;
+  object-fit:contain!important;
+}
+
+/* Timeline follows the complete camera grid instead of covering it. */
+.monitor-timeline{
+  flex:none!important;
+  display:block!important;
+  position:relative!important;
+  width:100%!important;
+  height:auto!important;
+  min-height:285px!important;
+  max-height:none!important;
+  margin-top:12px!important;
+  overflow:auto!important;
+  z-index:1!important;
+}
+
+#create-clip{
+  flex:none!important;
+  max-height:none!important;
+}
+
+@media(max-width:1050px){
+  .monitor-shell{
+    grid-template-columns:1fr!important;
+  }
+
+  .monitor-picker{
+    position:static!important;
+  }
+}
+
+@media(max-width:760px){
+  .monitor-grid[data-layout="4"],
+  .monitor-grid[data-layout="9"],
+  .monitor-grid[data-layout="16"]{
+    grid-template-columns:1fr!important;
+  }
+}
+"""
