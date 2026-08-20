@@ -38358,6 +38358,9 @@ async def health_monitor() -> None:
 
 
 
+import live_relay_uploader
+
+
 @asynccontextmanager
 
 
@@ -38683,6 +38686,11 @@ async def lifespan(app: FastAPI):
 
 
     cloud_upload_task = asyncio.create_task(cloud_upload_worker_placeholder())
+    live_relay_task = (
+        asyncio.create_task(live_relay_uploader.live_relay_worker(HLS_FOLDER))
+        if RUNTIME_ROLE in {"edge", "combined"} and live_relay_uploader.LIVE_RELAY_ENABLED
+        else None
+    )
 
 
 
@@ -38836,6 +38844,8 @@ async def lifespan(app: FastAPI):
 
 
         cloud_upload_task.cancel()
+        if live_relay_task:
+            live_relay_task.cancel()
 
 
 
@@ -38926,6 +38936,8 @@ async def lifespan(app: FastAPI):
 
 
         pending.append(cloud_upload_task)
+        if live_relay_task:
+            pending.append(live_relay_task)
 
 
 

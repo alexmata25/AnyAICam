@@ -10,6 +10,7 @@ services:
     - ./app:/app
     - ./recordings:/app/recordings
     - ./data/config:/opt/anyaicam/data/config
+    - /var/lib/anyaicam:/var/lib/anyaicam
     restart: unless-stopped
     healthcheck:
       test:
