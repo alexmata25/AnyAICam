@@ -30,7 +30,7 @@ import pytest
 
 from database_backend import override_target
 
-with override_target("/tmp/test_recording_process_watchdog.db"):
+with override_target(sqlite_path="/tmp/test_recording_process_watchdog.db"):
     import main
 
 
@@ -150,6 +150,7 @@ async def test_stalled_recording_is_killed_after_threshold(tmp_path):
     process = _sleeper_process()
     try:
         await main._recording_progress_watchdog(CAMERA_NUMBER, process)  # awaited directly, returns once it kills
+        await asyncio.to_thread(process.wait, 2)  # kill() is async at the OS level; wait for the exit to land
         assert process.poll() is not None  # confirmed killed
     finally:
         if process.poll() is None:
