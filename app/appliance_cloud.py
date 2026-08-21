@@ -174,6 +174,19 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             },
         }
 
+    @app.get('/api/appliance/recordings/status')
+    def recording_upload_status(request: Request) -> dict:
+        # Deliberately the cheapest possible check -- a single env-var read,
+        # no S3/STS call, no per-camera authorization -- so the appliance can
+        # call this every scan tick (not just when a session is expiring)
+        # without adding any real load. Exists so an EC2-side disable takes
+        # effect on the appliance within one scan interval instead of only
+        # once an already-cached, still-valid STS session (up to 900s) runs
+        # out -- see recording_uploader.py's _upload_currently_authorized()
+        # and _ensure_session()'s revalidation.
+        authenticate_appliance(request)
+        return {'enabled':RECORDING_UPLOAD_ENABLED}
+
     @app.post('/api/appliance/recordings/{camera_id}/credentials')
     def recording_upload_credentials(request: Request,camera_id: str) -> dict:
         # R1 (recording-pipeline roadmap): mirrors live_relay_session()
