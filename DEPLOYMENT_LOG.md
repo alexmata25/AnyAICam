@@ -6,6 +6,50 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — Pilot activation prep: playback format resolved, MKV → MP4 remux
+
+**Phase:** Pre-activation step of the controlled pilot rollout (between R5
+and the AWS activation steps). Not a new R-numbered phase — a required fix
+identified while resolving the pilot activation's playback-format gate.
+
+**Codec confirmation:** you ran `ffprobe` against a real, recent recording
+on the real pilot appliance (`7eb499b6d1`) and confirmed `codec_name=h264`,
+`1280x720`. This resolved the open playback-format question from R3/R4's
+deployment log entries.
+
+**Production backup:** `app/recording_uploader.py.pre-h264-mp4-remux-20260820-222535`.
+
+**Commit:** `be47a87a8920d04ddb8c68b7ff1e7b7d1b4a898b` on branch
+`production-reconcile-20260820`, pushed to GitHub, synced to the Ryzen 5
+worktree — all three confirmed at this commit with matching file hashes.
+
+**Files changed:**
+- `app/recording_uploader.py` — new `_remux_to_mp4()` (ffmpeg `-map 0 -c copy -movflags +faststart`, no re-encode — free given the confirmed H.264 codec) writes to a dedicated per-camera staging subfolder; the original MKV is never opened for writing, moved, or deleted. New `_verify_output_duration()` (ffprobe-based, advisory if ffprobe itself is unavailable, a real failure on genuine mismatch) confirms the remux didn't truncate the recording before it's ever uploaded. `_upload_recording()`'s `Content-Type` changed to `video/mp4`; the uploaded S3 key now derives from the MP4 filename, so R2's catalog automatically references the MP4 object with **zero R2 code changes**.
+- `app/tests/test_recording_remux.py` *(new)* — 8 tests: 7 fast/mocked failure-path tests, plus one **real integration test** that generates an actual H.264-in-MKV clip with ffmpeg and runs the genuine `_remux_to_mp4()` against it (not mocked), confirming a valid, correctly-timed, faststart MP4 with the codec preserved.
+
+**Verification performed:**
+- `ast.parse` clean.
+- **50/50 tests passed** (8 new + 12 existing R3 + 9 R1 + 5 R2 + 7 R4 + 9 R5) run inside the actual deployed container — including the real ffmpeg integration test, which genuinely exercises the production remux path end-to-end (not just mocked).
+- Confirmed R4's `_customer_camera_recordings()` needs **no code change** — its `{name}` field already derives from `s3_key.rsplit('/', 1)[-1]`, and the presigned-URL logic and the Playback page's `<video controls>` element were already fully file-extension-agnostic.
+- Real production `recordings` table confirmed still 0 rows. Live-relay, R1, R2, R4, R5, and all customer-facing routes confirmed unaffected.
+- `docker compose restart vms` → healthy, no new errors in logs.
+- **Zero AWS configuration changed** — `ANYAICAM_RECORDING_UPLOAD_ENABLED` remains unset; this is still fully inert in production.
+
+**File hash verification (EC2 == GitHub == Ryzen 5), all at commit `be47a87`:**
+
+| File | SHA-256 |
+|---|---|
+| `app/recording_uploader.py` | `cdede512...3ac8ffa25a0a58269e` |
+| `app/tests/test_recording_remux.py` | `31c3c591...835e26cc1fc8469a813` |
+
+**Rollback:** restore `recording_uploader.py.pre-h264-mp4-remux-20260820-222535`, restart `vms`. On Git: `git revert be47a87` followed by a push.
+
+**Playback format decision: SETTLED.** MP4 (faststart, stream-copied H.264) is the production format for the confirmed-H.264 pilot camera. No CPU-heavy transcode was introduced. If a future camera's codec is ever not H.264, browser support for that codec in MP4 is a separate, not-yet-decided question.
+
+**Next step:** AWS IAM/S3 activation (upload/read/delete roles + recordings bucket + lifecycle), one component at a time, per the controlled pilot plan — not yet started.
+
+---
+
 ## 2026-08-21 — R5: Recording retention and lifecycle sweep (foundation only)
 
 **Phase:** R5 of the recording-pipeline roadmap. Scope: retention policy
