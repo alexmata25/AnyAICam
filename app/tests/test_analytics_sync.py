@@ -340,10 +340,30 @@ def test_module_has_no_write_call_to_the_local_events_file_anywhere():
 
 
 def test_module_never_imports_or_references_the_detection_code_path():
+    # Checks actual code, not the module's own docstring -- the docstring
+    # legitimately names these functions in prose to explain that this
+    # module never calls them, so a bare substring check over the whole
+    # source (docstring included) would misfire on its own documentation.
+    # ast strips docstrings out as plain Expr statements, so walking the
+    # parsed tree's real Import/Call/Attribute nodes checks only code that
+    # could actually execute.
+    import ast
     import inspect
-    source = inspect.getsource(asy)
-    for forbidden in ("ai_person_detector", "motion_detector", "save_yolo_events", "append_analytics_event", "import main"):
-        assert forbidden not in source
+
+    tree = ast.parse(inspect.getsource(asy))
+    referenced_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            referenced_names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            referenced_names.add(node.module)
+        elif isinstance(node, ast.Name):
+            referenced_names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            referenced_names.add(node.attr)
+
+    for forbidden in ("ai_person_detector", "motion_detector", "save_yolo_events", "append_analytics_event", "main"):
+        assert forbidden not in referenced_names
 
 
 # --------------------------------------------------------- worker gating (disabled by default, edge-only)
