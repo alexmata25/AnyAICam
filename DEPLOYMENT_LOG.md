@@ -6,6 +6,51 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — R3: Appliance-side recording uploader (foundation only)
+
+**Phase:** R3 of the recording-pipeline roadmap. Scope: the appliance-side
+uploader module and its `main.py` wiring only, per the approved
+architecture. R4 was explicitly not started.
+
+**Production backup:** `app/main.py.pre-r3-recording-uploader-20260820-211216`
+(the one existing file this phase modified; the uploader module and its
+test file are new).
+
+**Commit:** `6ffdbf586cb1f57dc6cb3ca12c07a978b9e7426c` on branch
+`production-reconcile-20260820` (amended once to fix a commit-message
+quoting bug on my end — the file changes in the amended commit are
+identical to the original; only the message text changed), pushed to
+GitHub, synced to the Ryzen 5 worktree — all three confirmed at this
+commit with matching file hashes.
+
+**Files changed:**
+- `app/recording_uploader.py` *(new)* — watches each camera's completed local recording files, requests R1 credentials, uploads via boto3, notifies R2's catalog endpoint. Mirrors `live_relay_uploader.py`'s security model exactly (duplicated, not imported). Not gated by a per-camera "active" flag (recording is continuous, unlike on-demand live viewing). Failed uploads are retried on the next scan rather than dropped, since a recording is durable evidence. No transcoding — uploads MKV as produced; the playback-format decision remains open for R4/later.
+- `app/main.py` *(modified, +10 lines)* — four small additions mirroring `live_relay_task`'s exact lifespan wiring shape (import, task creation, cancel-on-shutdown, graceful-wait append).
+- `app/tests/test_recording_uploader.py` *(new)* — 12 tests against a monkeypatched `RECORDINGS_FOLDER`, never touching the real path.
+
+**Verification performed:**
+- `ast.parse` clean on both files, locally and on production.
+- **26/26 tests passed** (12 new + 9 R1 + 5 R2) run inside the actual deployed container via the same ephemeral pytest install/cleanup pattern as R2.
+- Confirmed inside the container: `RUNTIME_ROLE=cloud` on this box, so the new worker task correctly stays `None`/inert — identical to how `live_relay_task` already behaves here.
+- All 4 `main.py` wiring points confirmed present.
+- Live-relay route, R1's credentials route, R2's notification route, and all customer-facing routes (`/customer-live`, `/playback`, `/customer-account`) confirmed unaffected (still their expected `401`/`303`).
+- `docker compose restart vms` → healthy, no new errors in logs.
+- Recordings table confirmed still empty (0 rows) — nothing has actually uploaded, by design (flag off, real IAM role not yet applied).
+
+**File hash verification (EC2 == GitHub == Ryzen 5), all at commit `6ffdbf5`:**
+
+| File | SHA-256 |
+|---|---|
+| `app/main.py` | `699d68cc...0210a6262b3fb8b8c` |
+| `app/recording_uploader.py` | `61d60b2d...36a60387f37b936ae4bec8f` |
+| `app/tests/test_recording_uploader.py` | `b34cb5f9...b90a05fe948f49c92` |
+
+**Rollback:** restore `main.py.pre-r3-recording-uploader-20260820-211216`, delete `app/recording_uploader.py`, restart `vms`. On Git: `git revert 6ffdbf5` followed by a push.
+
+**Not done in R3 (explicitly deferred):** no customer-facing retrieval or Playback wiring (R4), no retention/lifecycle sweep (R5), no analytics association (R6/R7), no per-appliance pilot gate. Still fully disabled by default — the flag is unset and the real AWS IAM role from R1's design doc has not been applied, so no real upload can occur yet even if the flag were flipped alone.
+
+---
+
 ## 2026-08-21 — R2: Recording catalog table + notification endpoint
 
 **Phase:** R2 of the recording-pipeline roadmap. Scope: the `recordings`
