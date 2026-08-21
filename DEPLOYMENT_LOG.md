@@ -6,6 +6,92 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — Pilot activation: AWS recording resources verified, cloud-side config set (still inert)
+
+**Phase:** First activation step of the controlled pilot rollout. Not a
+code change — the real AWS resources for the recording pipeline were
+created by the account owner, verified from EC2, and their identifiers
+were added to production config. Both feature flags remain `false`;
+nothing is enabled yet.
+
+**AWS resources created (by the account owner, outside this session):**
+- S3 bucket `anyaicam-recordings-prod-20260820` — private, SSE-S3,
+  versioning disabled, Object Lock disabled, lifecycle rule
+  `anyaicam-recordings-failsafe` (deletes incomplete multipart uploads
+  after 7 days).
+- `anyaicam-recording-upload-role`, `anyaicam-recording-read-role`,
+  `anyaicam-recording-lifecycle-role` — the three roles designed in
+  `docs/r1-recording-iam.md`, `docs/r4-recording-read-iam.md`,
+  `docs/r5-recording-lifecycle-iam.md`.
+- `anyaicam-ec2-app-role` given a new inline policy
+  `assume-recording-roles`, scoped to `sts:AssumeRole` on only those
+  three roles.
+
+**Verification performed from EC2 (real AWS calls, no code changes):**
+- Confirmed the running instance resolves to
+  `assumed-role/anyaicam-ec2-app-role/i-0f0fb6a78871b20d4` in account
+  `880690594006`.
+- All three roles accepted `sts:AssumeRole` from that identity (trust
+  policy confirmed working, not just reviewed as a document).
+- Real object-level privilege-separation test against a throwaway key
+  (`recordings/_verification_probe/.../probe.txt`): upload role could
+  `PutObject` but not `GetObject`/`DeleteObject`; read role could
+  `GetObject` (byte-for-byte match against what was uploaded) but not
+  `PutObject`/`DeleteObject`; lifecycle role could `DeleteObject` but
+  not `PutObject`/`GetObject`. Test object created and removed as part
+  of this check — nothing left behind in the bucket.
+- **Not independently verifiable from EC2:** bucket-level settings
+  (encryption, versioning, Object Lock, the lifecycle rule itself) —
+  by design none of the three roles, nor the base EC2 role, carry any
+  bucket-level read permission, only single object-level actions each.
+  Those specific settings are taken on the account owner's report, not
+  independently confirmed here.
+
+**Config change:** `.env` on EC2 (gitignored, not a tracked file — no
+git commit for this step, hence no commit SHA below) gained:
+```
+ANYAICAM_RECORDING_UPLOAD_ROLE_ARN=arn:aws:iam::880690594006:role/anyaicam-recording-upload-role
+ANYAICAM_RECORDING_READ_ROLE_ARN=arn:aws:iam::880690594006:role/anyaicam-recording-read-role
+ANYAICAM_RECORDING_LIFECYCLE_ROLE_ARN=arn:aws:iam::880690594006:role/anyaicam-recording-lifecycle-role
+ANYAICAM_RECORDING_S3_BUCKET=anyaicam-recordings-prod-20260820
+ANYAICAM_RECORDING_UPLOAD_ENABLED=false
+ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED=false
+```
+`AWS_REGION=us-east-1` was already set from the live-relay work and is
+unchanged.
+
+**Why this is still inert:** `ANYAICAM_RECORDING_UPLOAD_ENABLED=false`
+keeps R1's credentials-issuing endpoint returning 404 exactly as before.
+R4's presigned-URL path has no separate flag — it fails closed on its
+own whenever the `recordings` table has no `status='available'` rows,
+which is still the case (0 rows). `ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED=false`
+keeps R5 off entirely. **Also still true regardless of these flags:**
+`RUNTIME_ROLE=cloud` on EC2 means the actual ffmpeg remux/transcode/
+upload worker (`recording_uploader.py`) does not and cannot run here —
+it only runs under `RUNTIME_ROLE in {edge, combined}`, i.e. on the
+physical pilot appliance itself. Enabling appliance-side recording
+upload is a separate step, being done directly on the appliance by the
+account owner (who has SSH access there), not from this session.
+
+**Production backup:** `.env.pre-recording-aws-config-20260820-234809`.
+
+**Verification performed after the config change:**
+`docker compose restart vms` → healthy, no new errors in logs.
+
+**Rollback:** restore `.env.pre-recording-aws-config-20260820-234809`,
+restart `vms`.
+
+**Next steps (one component at a time, each to be reported before the
+next):** (1) appliance-side `RUNTIME_ROLE`/`ANYAICAM_RECORDING_UPLOAD_ENABLED`
+verification and activation, done directly on the pilot appliance; (2)
+flip `ANYAICAM_RECORDING_UPLOAD_ENABLED=true` on EC2 once the appliance
+side is confirmed ready; (3) confirm a real recording reaches the
+`recordings` catalog; (4) confirm customer Playback can retrieve and
+play it back in a browser; (5) only then consider enabling the
+retention sweep, and only against a real, already-verified recording.
+
+---
+
 ## 2026-08-21 — Pilot activation prep: codec-aware cloud copy (H.264 remux, HEVC transcode, unsupported fail-safe)
 
 **Phase:** Pre-activation step of the controlled pilot rollout, extending the
