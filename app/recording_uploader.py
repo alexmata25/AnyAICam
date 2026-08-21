@@ -72,6 +72,27 @@ deleted by this module under any outcome -- ffmpeg only ever reads it;
 the derived MP4 (remuxed or transcoded) lives in a dedicated
 per-camera staging subfolder and is the only file this module ever
 removes.
+
+Backlog cutoff (first-activation safety): a camera that has been
+recording locally for days before upload is ever enabled must not
+have that entire history auto-uploaded the moment the flag flips.
+_load_or_establish_cutoff() persists a single, appliance-wide moment
+-- the first time this worker ever runs -- to CUTOFF_FILE in
+STATE_DIR (the same host-mounted, restart-durable directory
+credential.json already lives in). Only completed recordings whose
+own started_at is at or after that moment are ever eligible for
+upload; anything older is left on local disk untouched, forever --
+see _pending_recording_files(). A missing cutoff file means "never
+activated before" and is created fresh at the current moment, so the
+very first scan after that already enforces it -- there is no window
+where a missing file could be read as "no cutoff." A restart reads
+the existing file back unchanged; the cutoff never moves forward on
+its own, so a brief restart never re-exposes backlog that was already
+excluded. A present-but-corrupt cutoff file fails safe by blocking
+every file (an effectively-infinite cutoff) rather than guessing --
+guessing a too-old cutoff risks repeating the exact backlog-drain this
+mechanism exists to prevent, and guessing a too-new one risks silently
+losing real recent recordings, so neither guess is acceptable.
 """
 
 import asyncio
@@ -100,6 +121,10 @@ RECORDING_UPLOAD_ENABLED = os.environ.get("ANYAICAM_RECORDING_UPLOAD_ENABLED", "
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
+# Backlog-cutoff persistence (see module docstring). Overridable purely for
+# tests -- production always uses the default, same STATE_DIR credential.json
+# already lives in.
+CUTOFF_FILE = Path(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CUTOFF_FILE", str(STATE_DIR / "recording_upload_cutoff.json")))
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
 # RECORDINGS_FOLDER is intentionally hardcoded, matching main.py's own
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
@@ -133,6 +158,9 @@ _sessions: dict[int, dict] = {}            # camera_number -> {credentials, buck
 _uploaded_files: dict[int, list[str]] = {}  # camera_number -> successfully uploaded+notified filenames (bounded)
 _unsupported_codec_files: dict[int, set[str]] = {}  # camera_number -> filenames already logged as unsupported/undetected this process lifetime -- avoids re-probing/re-logging the same permanently-bad file every scan
 _transcode_semaphore = threading.Semaphore(TRANSCODE_MAX_CONCURRENCY)
+_cutoff_lock = threading.Lock()
+_cutoff_cache: datetime | None = None       # loaded/established once per process lifetime -- see _load_or_establish_cutoff()
+_backlog_skip_logged: set[int] = set()      # camera_numbers already logged as having pre-cutoff backlog this process lifetime -- avoids re-logging the same stable count every scan
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -438,11 +466,66 @@ def _completed_recording_files(camera_number: int) -> list[Path]:
     return candidates[:-1] if len(candidates) > 1 else []
 
 
+def _load_or_establish_cutoff() -> datetime:
+    """The single, appliance-wide backlog cutoff -- see the module
+    docstring. Naive local-time throughout, matching
+    _recording_started_at()'s own naive local-time return value
+    exactly (this file's one exception, expiration in _ensure_session(),
+    is a completely separate AWS-credential concern using
+    datetime.now(timezone.utc); recording timestamps never do).
+    Cached after the first call each process lifetime -- the on-disk
+    file is only ever read (or written, on first-ever activation)
+    once per process, never polled every scan."""
+    global _cutoff_cache
+    with _cutoff_lock:
+        if _cutoff_cache is not None:
+            return _cutoff_cache
+        try:
+            raw = json.loads(CUTOFF_FILE.read_text())
+            cutoff = datetime.fromisoformat(raw["cutoff"])
+        except FileNotFoundError:
+            cutoff = datetime.now()
+            try:
+                CUTOFF_FILE.parent.mkdir(parents=True, exist_ok=True)
+                CUTOFF_FILE.write_text(json.dumps({"cutoff": cutoff.isoformat()}))
+                logger.info("recording_upload.cutoff_established cutoff=%s", cutoff.isoformat())
+            except OSError as error:
+                # Cutoff still enforced in-memory for the rest of this
+                # process even though persistence failed -- a restart
+                # before this write ever succeeds simply establishes a
+                # fresh (later, never earlier) cutoff at that point, which
+                # is still safe: it can only ever exclude more backlog,
+                # never less.
+                logger.warning("recording_upload.cutoff_write_failed cutoff=%s error=%s", cutoff.isoformat(), error)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            # Corrupt or unreadable state: guessing a cutoff either risks
+            # repeating a backlog drain (guess too old) or silently losing
+            # real recent recordings (guess too new). Neither is
+            # acceptable, so upload is fully paused -- nothing is ever
+            # "at or after" datetime.max -- until an operator repairs or
+            # removes CUTOFF_FILE.
+            logger.warning("recording_upload.cutoff_corrupt_failing_safe path=%s error=%s", CUTOFF_FILE, error)
+            cutoff = datetime.max
+        _cutoff_cache = cutoff
+        return cutoff
+
+
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
     folder_resolved = _recording_folder(camera_number).resolve()
+    cutoff = _load_or_establish_cutoff()
     pending = []
+    skipped_backlog = 0
     for local_path in _completed_recording_files(camera_number):
         if local_path.name in already_uploaded:
+            continue
+        started_at = _recording_started_at(local_path, camera_number)
+        if started_at is not None and started_at < cutoff:
+            # Pre-cutoff backlog: never auto-uploaded, never touched,
+            # never retried -- see the module docstring. A file with an
+            # unparseable name (started_at is None) is NOT treated as
+            # backlog here; it falls through to _relay_camera_once()'s
+            # existing unparseable-filename handling unchanged.
+            skipped_backlog += 1
             continue
         try:
             resolved = local_path.resolve()
@@ -452,6 +535,9 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
             logger.warning("recording_upload.file_path_outside_recordings_folder camera=%s path=%s", camera_number, resolved)
             continue
         pending.append(local_path)
+    if skipped_backlog and camera_number not in _backlog_skip_logged:
+        logger.info("recording_upload.pre_cutoff_backlog_skipped camera=%s count=%s cutoff=%s", camera_number, skipped_backlog, cutoff.isoformat())
+        _backlog_skip_logged.add(camera_number)
     return pending
 
 
