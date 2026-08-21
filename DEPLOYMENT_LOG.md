@@ -6,6 +6,51 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — R1: Recording-upload credential issuance (foundation only)
+
+**Phase:** R1 of the recording-pipeline roadmap (distinct from the earlier
+Live Phase 1–8 numbering). Scope: IAM design + credential-issuance
+endpoint only, per the approved architecture. R2 was explicitly not
+started.
+
+**Production backup:** `app/appliance_cloud.py.pre-r1-recording-credentials-20260820-204658`
+(the one existing file this phase modified; all other changes were new files).
+
+**Commit:** `569ea0ff9e99edfbb080ee2dad9a98f5b83b843a` on branch
+`production-reconcile-20260820`, pushed to GitHub, synced to the Ryzen 5
+worktree (`/home/alejandro/anyaicam-production-reconcile`) — all three
+confirmed at this same commit SHA with matching file hashes below.
+
+**Files changed:**
+- `app/recording_credentials.py` (new) — tenant-scoped prefix/policy/session-name helpers, mirroring `appliance_protocol.py`'s live-relay equivalents.
+- `app/appliance_cloud.py` (modified) — new `POST /api/appliance/recordings/{camera_id}/credentials` route, gated behind `ANYAICAM_RECORDING_UPLOAD_ENABLED` (default off, not set in production) plus unset role ARN/bucket — fails closed (404 disabled / 503 unconfigured).
+- `app/tests/test_recording_credentials.py` (new) — 9 tests, all passing, proving per-camera and per-customer prefix/policy isolation.
+- `docs/r1-recording-iam.md` (new) — IAM role design + illustrative (not executed) AWS CLI commands; real role creation requires IAM-admin AWS credentials this application does not have.
+
+**Verification performed:**
+- `ast.parse` clean on both edited/new Python files, locally and on production.
+- `pytest app/tests/test_recording_credentials.py` — 9/9 passed (run in the local `anyaicam` venv; the production container has no pytest installed).
+- Inside the running container: `import appliance_cloud` succeeds; `recording_s3_prefix()`/`recording_session_policy()` produce correct, isolated output.
+- `docker compose restart vms` → `healthy`; no new errors/tracebacks in logs.
+- New route confirmed registered and reachable: unauthenticated `POST /api/appliance/recordings/{camera_id}/credentials` returns `401`, identical to the existing live-relay route's own unauthenticated response — proving it's wired through the same `authenticate_appliance()` gate without weakening it.
+- Live-relay route (`/api/appliance/live/{camera_id}/session`) confirmed unaffected — same `401` as before this change.
+- No customer-facing route, page, or behavior touched — this phase is 100% backend/appliance-facing and entirely inert (feature flag off) even once deployed.
+
+**File hash verification (EC2 == GitHub == Ryzen 5):**
+
+| File | SHA-256 |
+|---|---|
+| `app/recording_credentials.py` | `946ae120...66f8bffa` |
+| `app/appliance_cloud.py` | `c1fe7127...0ded95e` |
+| `app/tests/test_recording_credentials.py` | `b5bb06a5...7dfdf591` |
+| `docs/r1-recording-iam.md` | `831e1fee...2909ad48` |
+
+**Rollback:** `cp app/appliance_cloud.py.pre-r1-recording-credentials-20260820-204658 app/appliance_cloud.py`, delete `app/recording_credentials.py`, restart `vms` — reverts production to its R0 state. On Git: `git revert 569ea0f` (or reset the branch to `5f42bd4`) followed by a push.
+
+**Not done in R1 (explicitly deferred):** no `recordings` catalog table or migration, no notification endpoint, no appliance-side uploader, no customer-facing retrieval/Playback wiring, no retention/lifecycle logic, no analytics association, no per-appliance pilot gate (mirrors how live relay's own per-appliance gate arrived much later, as its own phase) — all of that is R2 onward.
+
+---
+
 ## 2026-08-21 — R0: Source-of-truth reconciliation
 
 **Phase:** R0 (recording-pipeline roadmap; distinct from the earlier Live
