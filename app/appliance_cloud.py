@@ -1,22 +1,35 @@
 from cloud_config import settings as cloud_settings
 import json
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta
 from html import escape
+from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from appliance_protocol import ALLOWED_COMMANDS, RateLimiter, cloud_settings, health_state, sanitize_appliance_payload, validate_request_time
+from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
+from live_manifest import LiveManifestStore
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
 logger=logging.getLogger('anyaicam.appliance')
 request_limiter=RateLimiter(120,60); activation_limiter=RateLimiter(10,300)
+LIVE_RELAY_ENABLED=os.getenv('ANYAICAM_LIVE_RELAY_ENABLED','false').strip().lower()=='true'
+LIVE_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_LIVE_UPLOAD_ROLE_ARN','').strip()
+LIVE_RELAY_S3_BUCKET=os.getenv('ANYAICAM_S3_BUCKET','').strip()
+LIVE_RELAY_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).strip()
+live_manifest_store=LiveManifestStore(Path(os.getenv('ANYAICAM_LIVE_MANIFEST_FILE','/app/recordings/live_manifest.json')))
 
 
 def _bearer(request: Request) -> str:
@@ -41,6 +54,12 @@ def authenticate_appliance(request: Request) -> dict:
     except Exception as error:
         raise HTTPException(status_code=409,detail='Duplicate or replayed appliance request.') from error
     return appliance
+
+
+def _authorized_camera(appliance: dict,camera_id: str) -> dict:
+    camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
+    if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
+    return camera
 
 
 def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
@@ -100,7 +119,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status FROM cameras WHERE appliance_id=? ORDER BY name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     @app.post('/api/appliance/events')
     def events(request: Request,payload: dict) -> dict:
@@ -113,6 +132,50 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
                 if cursor.rowcount: accepted.append(item)
         notifications=sum(fanout_appliance_event(appliance,item) for item in accepted)
         return {'status':'accepted','inserted':inserted,'duplicates':duplicates,'notifications_created':notifications}
+
+    @app.post('/api/appliance/live/{camera_id}/session')
+    def live_relay_session(request: Request,camera_id: str) -> dict:
+        appliance=authenticate_appliance(request)
+        if not LIVE_RELAY_ENABLED or not appliance.get('live_relay_pilot'):
+            raise HTTPException(status_code=404,detail='Live relay is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        if boto3 is None or not LIVE_UPLOAD_ROLE_ARN or not LIVE_RELAY_S3_BUCKET or not LIVE_RELAY_AWS_REGION:
+            raise HTTPException(status_code=503,detail='Live relay is not configured.')
+        policy=live_relay_session_policy(LIVE_RELAY_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        session_name=live_relay_session_name(appliance['id'],camera_id)
+        try:
+            sts=boto3.client('sts',region_name=LIVE_RELAY_AWS_REGION)
+            assumed=sts.assume_role(RoleArn=LIVE_UPLOAD_ROLE_ARN,RoleSessionName=session_name,Policy=json.dumps(policy),DurationSeconds=LIVE_RELAY_SESSION_DURATION_SECONDS)
+        except Exception as error:
+            logger.exception('live_relay.assume_role_failed appliance_id=%s camera_id=%s',appliance['id'],camera_id)
+            raise HTTPException(status_code=502,detail='Could not obtain a live-upload credential.') from error
+        issued=assumed['Credentials']
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.live_relay_session_issued','camera',camera_id,{'session_name':session_name})
+        return {
+            'status':'accepted',
+            'bucket':LIVE_RELAY_S3_BUCKET,
+            'key_prefix':live_relay_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id),
+            'credentials':{
+                'access_key_id':issued['AccessKeyId'],
+                'secret_access_key':issued['SecretAccessKey'],
+                'session_token':issued['SessionToken'],
+                'expiration':issued['Expiration'].isoformat(),
+            },
+        }
+
+    @app.post('/api/appliance/live/{camera_id}/segment-available')
+    def live_relay_segment_available(request: Request,camera_id: str,payload: dict) -> dict:
+        appliance=authenticate_appliance(request)
+        if not LIVE_RELAY_ENABLED: raise HTTPException(status_code=404,detail='Live relay is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        safe=sanitize_appliance_payload(payload); segment_key=str(safe.get('segment_key','')).strip()
+        if not segment_key: raise HTTPException(status_code=400,detail='segment_key is required.')
+        expected_prefix=live_relay_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        if not segment_key.startswith(expected_prefix):
+            raise HTTPException(status_code=403,detail="segment_key is outside this camera's authorized prefix.")
+        sequence=safe.get('sequence')
+        entry=live_manifest_store.record_segment(camera_id,segment_key,int(sequence) if sequence is not None else None)
+        return {'status':'accepted','segment_count':len(entry['segments'])}
 
     @app.get('/api/appliance/{cloud_id}/scan-jobs')
     def secure_scan_jobs(request: Request,cloud_id: str) -> dict:
@@ -129,13 +192,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
         job=row('SELECT * FROM camera_scan_jobs WHERE id=? AND appliance_id=?',(job_id,appliance['id']))
         if not job: raise HTTPException(status_code=404,detail='Discovery job not found.')
-        status=str(payload.get('status','running')); progress=max(0,min(100,int(payload.get('progress',0)))); results=sanitize_appliance_payload(payload.get('results',[]))
+        status=str(payload.get('status','running')); progress=max(0,min(100,int(payload.get('progress',0)))); results=sanitize_discovery_results(payload.get('results',[]))
         if status not in {'running','complete','error'}: raise HTTPException(status_code=400,detail='Unsupported discovery status.')
         with connection() as db:
             db.execute('UPDATE camera_scan_jobs SET status=?,progress=?,results_json=?,message=?,updated_at=? WHERE id=?',(status,progress,json.dumps(results),str(payload.get('message','Discovery update received.'))[:500],datetime.now().isoformat(),job_id))
-            if status=='complete':
-                for index,item in enumerate(results,1): db.execute('INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,name,resolution,status,created_at) VALUES(?,?,?,?,?,?,?,?)',(str(item.get('id') or secrets.token_hex(5)),job['customer_id'],appliance['site_id'],appliance['id'],item.get('name') or f'Discovered Camera {index}',item.get('resolution','2mp'),'discovered',datetime.now().isoformat()))
-        audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.discovery_result','camera_scan_job',job_id,{'status':status,'count':len(results)}); return {'message':'Discovery result accepted.'}
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.discovery_result','camera_scan_job',job_id,{'status':status,'count':len(results)}); return {'message':'Discovery result accepted; no camera records created until explicit binding.'}
 
     @app.get('/api/appliance/commands')
     def appliance_commands(request: Request) -> dict:
@@ -167,6 +228,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         identity=require_partner_access(request,{'administrator'}); now=datetime.now().isoformat()
         with connection() as db: db.execute('UPDATE appliance_credentials SET revoked_at=? WHERE appliance_id=? AND revoked_at IS NULL',(now,appliance_id)); db.execute("UPDATE appliances SET state='revoked',online_status='revoked',credential_revoked_at=? WHERE id=?",(now,appliance_id))
         audit(identity,'appliance.credentials_revoked','appliance',appliance_id); return {'message':'Appliance credentials revoked.'}
+
+    @app.post('/api/admin/appliances/{appliance_id}/live-relay-pilot')
+    def set_live_relay_pilot(request: Request,appliance_id: str,payload: dict) -> dict:
+        identity=require_partner_access(request,{'administrator'})
+        enabled=1 if payload.get('enabled') else 0
+        with connection() as db:
+            cursor=db.execute('UPDATE appliances SET live_relay_pilot=? WHERE id=?',(enabled,appliance_id))
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Appliance not found.')
+        audit(identity,'appliance.live_relay_pilot_changed','appliance',appliance_id,{'enabled':bool(enabled)})
+        return {'appliance_id':appliance_id,'live_relay_pilot':bool(enabled)}
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:

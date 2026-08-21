@@ -1,6 +1,6 @@
 from datetime import datetime
 
-CUSTOMER_ROLES={'customer_owner','customer_viewer','customer_admin','manager','viewer','guard'}
+CUSTOMER_ROLES={'customer_owner','customer_viewer'}
 CAMERA_ACTION_COLUMNS={
     'live':'can_live','playback':'can_playback','download':'can_download','share':'can_share',
     'alerts':'can_alerts','settings':'can_settings',
@@ -13,24 +13,14 @@ def role_destination(role: str) -> str:
         'partner_owner':'/partner?tab=customers',
         'salesperson':'/partner-quotes',
         'technician':'/partner/appliance-dashboard',
-        'owner':'/admin-portal',
-        'sales':'/admin/customers/new',
-        'support':'/admin-support',
-        'installer':'/partner-installations',
-        'billing':'/billing-operations',
-        'operations':'/operations',
         'customer_owner':'/customer-account',
         'customer_viewer':'/customer-account',
-        'customer_admin':'/customer-account',
-        'manager':'/customer-account',
-        'viewer':'/customer-account',
-        'guard':'/customer-account',
     }.get(role,'/partner-login')
 
 
 def camera_action_allowed(role: str,action: str,permission: dict | None,configured_permissions: int) -> bool:
-    if role in {'administrator','customer_owner','customer_admin'}: return True
-    if role not in {'customer_viewer','manager','viewer','guard'} or action not in CAMERA_ACTION_COLUMNS: return False
+    if role in {'administrator','customer_owner'}: return True
+    if role!='customer_viewer' or action not in CAMERA_ACTION_COLUMNS: return False
     if configured_permissions==0: return action in {'live','playback','alerts'}
     return bool(permission and permission.get(CAMERA_ACTION_COLUMNS[action],0))
 

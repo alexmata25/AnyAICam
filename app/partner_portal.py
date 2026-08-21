@@ -17,7 +17,6 @@ from partner_db import authenticate_detailed, audit, allowed, connection, passwo
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
-from tenancy.policy import CUSTOMER_ROLES, PLATFORM_ROLES, normalize_role
 
 SESSION_COOKIE = 'anyaicam_partner_session'
 SESSION_SECRETS = ([os.getenv('ANYAICAM_PORTAL_SECRET')] if os.getenv('ANYAICAM_PORTAL_SECRET') else settings.app_secrets) or [secrets.token_hex(32)]
@@ -28,39 +27,23 @@ try:
 except json.JSONDecodeError:
     PORTAL_ACCOUNTS = {}
 QUOTES_FILE = Path('/app/recordings/partner_quotes.json')
-LEGACY_PLATFORM_ROLES = {'super_admin', 'administrator', 'partner_owner', 'salesperson', 'technician'}
-LEGACY_CUSTOMER_ROLES = {'customer_owner', 'customer_viewer'}
-PARTNER_ROLES = LEGACY_PLATFORM_ROLES | PLATFORM_ROLES
-AUTH_ROLES = PARTNER_ROLES | LEGACY_CUSTOMER_ROLES | CUSTOMER_ROLES
-CUSTOMER_LOGIN_ROLES = LEGACY_CUSTOMER_ROLES | CUSTOMER_ROLES | {'administrator', 'owner'}
+PARTNER_ROLES = {'administrator', 'partner_owner', 'salesperson', 'technician'}
+AUTH_ROLES = PARTNER_ROLES | {'customer_owner', 'customer_viewer'}
+CUSTOMER_LOGIN_ROLES = {'customer_owner','customer_viewer','administrator'}
 
 
 def destination_for_role(role: str) -> str:
     return role_destination(role)
 
 
-def _token(email: str, role: str, partner_id=None, customer_id=None,session_id=None,identity=None) -> str:
-    domain, canonical_role = normalize_role(identity or {'role': role})
-    payload = json.dumps({
-        'email': email, 'role': role, 'partner_id': partner_id,
-        'customer_id': customer_id, 'tenant_id': (identity or {}).get('tenant_id') or customer_id,
-        'identity_domain': domain, 'platform_role': canonical_role if domain == 'platform' else None,
-        'customer_role': canonical_role if domain == 'customer' else None,
-        'session_id':session_id, 'expires': int(time.time()) + 28800,
-    }, separators=(',', ':')).encode()
+def _token(email: str, role: str, partner_id=None, customer_id=None,session_id=None) -> str:
+    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + 28800}, separators=(',', ':')).encode()
     encoded = urlsafe_b64encode(payload).decode().rstrip('=')
     signature = hmac.new(SESSION_SECRETS[0].encode(), encoded.encode(), hashlib.sha256).hexdigest()
     return encoded + '.' + signature
 
 
 def _identity(request: Request) -> dict | None:
-    # The main application session is the canonical unified login. Retain the
-    # signed partner cookie as a compatibility path for existing deployments.
-    application_identity = getattr(request.state, 'user', None)
-    if application_identity:
-        domain, canonical_role = normalize_role(application_identity)
-        if canonical_role != 'invalid':
-            return {**application_identity, 'identity_domain': domain, 'role': canonical_role}
     token = request.cookies.get(SESSION_COOKIE, '')
     try:
         encoded, signature = token.rsplit('.', 1)
@@ -77,13 +60,7 @@ def _identity(request: Request) -> dict | None:
 
 def _require(request: Request, roles=PARTNER_ROLES) -> dict:
     identity = _identity(request)
-    if not identity:
-        raise HTTPException(status_code=403, detail='Partner authorization required.')
-    domain, canonical_role = normalize_role(identity)
-    role_allowed = identity['role'] in roles or canonical_role in roles
-    if 'administrator' in roles and domain == 'platform' and canonical_role == 'owner':
-        role_allowed = True
-    if domain != 'platform' or not role_allowed:
+    if not identity or identity['role'] not in roles:
         raise HTTPException(status_code=403, detail='Partner authorization required.')
     return identity
 
@@ -118,7 +95,15 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         configured = bool(ADMIN_EMAIL and ADMIN_PASSWORD)
         note = 'Partner access is configured.' if configured else 'Set ANYAICAM_ADMIN_EMAIL and ANYAICAM_ADMIN_PASSWORD in the private server environment to activate protected access.'
         content=f'''<header class="topbar"><div><p class="eyebrow">Protected portal</p><h1>Partner sign in</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><p class="health-detail">{note}</p><form class="rule-form" id="partner-login-form"><label>Email<input id="partner-email" type="email" required></label><label>Password<input id="partner-password" type="password" required></label><button class="action-button">Sign in</button><a class="download" href="/forgot-password">Forgot password?</a></form></section>'''
-        scripts='''<script>document.getElementById('partner-login-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/partner-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('partner-email').value,password:document.getElementById('partner-password').value})});if(response.ok)location.href='/partner-prices';else showToast('Invalid or unconfigured partner credentials.')})</script>'''
+        scripts='''<script>document.getElementById('partner-login-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/partner-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('partner-email').value,password:document.getElementById('partner-password').value})});if(response.ok){
+    if(response.redirected){
+        location.href=response.url;
+    }else{
+        location.reload();
+    }
+}else{
+    showToast('Invalid or unconfigured partner credentials.');
+}})</script>'''
         return shell('Partner login','partner-login',content,scripts)
 
     @app.post('/api/partner-login')
@@ -146,8 +131,8 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         audit(user or {'email':email,'role':role},'login.succeeded','partner_user',user.get('id','') if user else '')
         destination='/change-password' if user and user.get('must_change_password') else ('/customer-portal' if payload.get('customer_only') and role=='administrator' else destination_for_role(role))
         session_id=secrets.token_hex(16); now=datetime.now(); expiry=now+timedelta(hours=8)
-        with connection() as db: db.execute('INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent,tenant_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(session_id,user.get('id') if user else None,email,role,'Web browser','cookie',now.isoformat(),now.isoformat(),expiry.isoformat(),request.client.host if request.client else None,request.headers.get('user-agent','')[:500],user.get('tenant_id') if user else None))
-        response=RedirectResponse(destination,status_code=303); response.set_cookie(SESSION_COOKIE,_token(email,role,user.get('partner_id') if user else None,user.get('customer_id') if user else None,session_id,user),httponly=True,samesite='strict',secure=settings.secure_cookies,max_age=28800,domain=settings.cookie_domain or None); return response
+        with connection() as db: db.execute('INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(session_id,user.get('id') if user else None,email,role,'Web browser','cookie',now.isoformat(),now.isoformat(),expiry.isoformat(),request.client.host if request.client else None,request.headers.get('user-agent','')[:500]))
+        response=RedirectResponse(destination,status_code=303); response.set_cookie(SESSION_COOKIE,_token(email,role,user.get('partner_id') if user else None,user.get('customer_id') if user else None,session_id),httponly=True,samesite='strict',secure=settings.secure_cookies,max_age=28800,domain=settings.cookie_domain or None); return response
 
     @app.post('/partner-logout')
     def partner_logout(request: Request):

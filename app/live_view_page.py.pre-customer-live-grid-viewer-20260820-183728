@@ -1,0 +1,222 @@
+"""Phase 6d (docs/AI_HANDOFF.md Sec 8): the cloud-specific live-view
+frontend surface -- a standalone page, in the cloud `partner_identity()`
+auth system Phase 1-6c already use, that drives the full customer flow:
+click -> start-session (Phase 6c) -> poll the playlist route (Phase 6b)
+until it has real segments -> attach hls.js -> stop-session (Phase 6c)
+on explicit stop or page unload.
+
+Deliberately NOT built on `/customer-portal` (`app/customer_platform.py`):
+that page's own auth (`current_user()`/`authenticated_user()`) reads a
+completely different cookie/session mechanism (itsdangerous-signed,
+backed by main.py's local `load_sessions()`/`load_users()`) than
+`partner_identity()` (HMAC-signed, backed by `partner_db`'s
+`user_sessions` table) -- a pre-existing mismatch confirmed during Phase
+6d's own investigation, not something this phase fixes; it is worked
+around by living entirely in the correct (cloud) auth system instead.
+
+Authorization logic (customer_owner role, camera ownership, can_live
+permission) is deliberately duplicated here rather than imported from
+live_playlist.py/live_view_sessions.py -- the same explicit scope
+decision those two modules already made relative to each other.
+
+No AWS/S3 access, no new backend contract: this module only ever reads
+`cameras`/`partner_users`/`customer_camera_permissions` to decide
+whether to render the page at all, then hands the browser three URLs
+(the Phase 6c start route, the Phase 6c stop route, and the Phase 6b
+playlist route) -- every actual state transition (session creation,
+relay start/stop, segment delivery) is driven entirely by those
+already-reviewed, unchanged routes.
+"""
+
+import json
+from html import escape
+from typing import Callable
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from partner_db import connection
+from partner_portal import partner_identity
+
+POLL_INTERVAL_MS = 2000
+POLL_TIMEOUT_MS = 45000
+
+
+def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
+    """Camera lookup + can_live permission check, scoped to the
+    authenticated customer -- mirrors live_playlist.py's/
+    live_view_sessions.py's own inline logic exactly (see module
+    docstring for why this is duplicated, not shared). Only used to
+    decide whether to render the page at all; the actual start/stop/
+    playlist calls this page's own JavaScript makes are independently
+    re-checked by Phase 6b/6c's own routes regardless."""
+    camera = db.execute(
+        'SELECT * FROM cameras WHERE id=? AND customer_id=?',
+        (camera_id, identity['customer_id']),
+    ).fetchone()
+    if not camera:
+        raise HTTPException(status_code=404, detail='Camera not found.')
+
+    user = db.execute(
+        'SELECT id FROM partner_users WHERE email=?',
+        (identity['email'],),
+    ).fetchone()
+    if not user:
+        raise HTTPException(status_code=403, detail='Customer owner permission required.')
+
+    if identity.get('role') != 'customer_owner':
+        permission = db.execute(
+            'SELECT can_live FROM customer_camera_permissions WHERE user_id=? AND camera_id=?',
+            (user['id'], camera_id),
+        ).fetchone()
+        if not permission or not permission['can_live']:
+            raise HTTPException(status_code=403, detail='Not authorized to view this camera live.')
+
+    return dict(camera)
+
+
+def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
+    @app.get('/customer-live')
+    def customer_live_landing(request: Request):
+        identity = partner_identity(request)
+        if not identity or identity.get('role') != 'customer_owner':
+            return RedirectResponse('/partner-login', status_code=303)
+
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id FROM cameras '
+                'WHERE customer_id=? '
+                'ORDER BY camera_number, id LIMIT 1',
+                (identity['customer_id'],),
+            ).fetchone()
+
+        if not camera:
+            return RedirectResponse('/customer-account', status_code=303)
+
+        return RedirectResponse(
+            f"/customer/cameras/{camera['id']}/live",
+            status_code=303,
+        )
+
+    @app.get('/customer/cameras/{camera_id}/live', response_class=HTMLResponse)
+    def live_view_page(request: Request, camera_id: str):
+        identity = partner_identity(request)
+        # Matches Phase 6b/6c's own exact role requirement -- this
+        # page's JavaScript calls those SAME routes, so gating any
+        # broader here (e.g. also allowing customer_viewer, as
+        # /customer-account's own redirect check does) would only
+        # render a page whose every start/stop call then 403s.
+        if not identity or identity.get('role') != 'customer_owner':
+            return RedirectResponse('/partner-login', status_code=303)
+
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+
+        camera_name = camera.get('name') or camera_id
+        start_url = f'/api/customer/cameras/{camera_id}/live/start'
+        playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
+
+        content = (
+            f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
+            f'<h1>{escape(camera_name)}</h1></div>'
+            f'<a class="ghost-button" href="/customer-account">Back</a></header>'
+            f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
+            f'<video id="live-view-video" controls muted playsinline></video>'
+            f'<div class="camera-placeholder" id="live-view-placeholder">'
+            f'<span class="signal">◉</span>'
+            f'<strong id="live-view-status">Starting live view…</strong>'
+            f'<small>This can take a few seconds.</small></div></div>'
+            f'<div class="camera-tools" style="justify-content:center">'
+            f'<button class="camera-tool" id="live-view-mute" title="Mute">♪</button>'
+            f'<button class="camera-tool" id="live-view-stop" title="Stop">◼</button>'
+            f'<button class="camera-tool" id="live-view-retry" title="Retry" hidden>↻</button>'
+            f'</div></section>'
+        )
+
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+(function(){{
+  const startUrl={json.dumps(start_url)};
+  const playlistUrl={json.dumps(playlist_url)};
+  const pollIntervalMs={POLL_INTERVAL_MS};
+  const pollTimeoutMs={POLL_TIMEOUT_MS};
+  const video=document.getElementById('live-view-video');
+  const placeholder=document.getElementById('live-view-placeholder');
+  const statusLabel=document.getElementById('live-view-status');
+  const muteButton=document.getElementById('live-view-mute');
+  const stopButton=document.getElementById('live-view-stop');
+  const retryButton=document.getElementById('live-view-retry');
+  let sessionId=null, hls=null, pollTimer=null, stopped=false;
+
+  function setStatus(text){{statusLabel.textContent=text}}
+  function stopPolling(){{if(pollTimer){{clearTimeout(pollTimer);pollTimer=null}}}}
+
+  async function stopSession(isUnload){{
+    if(!sessionId||stopped)return;
+    stopped=true;
+    const url=`/api/customer/live/sessions/${{sessionId}}/stop`;
+    if(isUnload){{
+      try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}
+    }}else{{
+      try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}
+    }}
+  }}
+
+  function showUnavailable(){{
+    stopPolling();
+    setStatus('Live view unavailable right now.');
+    retryButton.hidden=false;
+  }}
+
+  async function pollPlaylist(deadline){{
+    if(stopped)return;
+    if(Date.now()>deadline){{showUnavailable();return}}
+    let response=null;
+    try{{response=await fetch(playlistUrl,{{cache:'no-store'}})}}catch(e){{}}
+    if(response&&response.ok){{
+      const text=await response.text();
+      if(text.includes('#EXTINF')){{attachPlayer();return}}
+    }}else if(response&&[403,404,409,503].includes(response.status)){{
+      // Structural failures never resolve by polling longer -- stop
+      // immediately rather than waiting out the full timeout.
+      showUnavailable();return;
+    }}
+    pollTimer=setTimeout(()=>pollPlaylist(deadline),pollIntervalMs);
+  }}
+
+  function attachPlayer(){{
+    stopPolling();
+    setStatus('Connecting…');
+    if(window.Hls&&Hls.isSupported()){{
+      hls=new Hls();
+      hls.loadSource(playlistUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
+      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)setStatus('Reconnecting…')}});
+    }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
+      video.src=playlistUrl;
+      video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
+    }}else{{
+      setStatus('This browser cannot play live video.');
+    }}
+  }}
+
+  async function startSession(){{
+    stopped=false;retryButton.hidden=true;setStatus('Starting live view…');
+    let response;
+    try{{response=await fetch(startUrl,{{method:'POST'}})}}catch(e){{showUnavailable();return}}
+    if(!response.ok){{showUnavailable();return}}
+    const body=await response.json();
+    sessionId=body.session_id;
+    pollPlaylist(Date.now()+pollTimeoutMs);
+  }}
+
+  muteButton.addEventListener('click',()=>{{video.muted=!video.muted;muteButton.textContent=video.muted?'♪':'♫'}});
+  stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
+  retryButton.addEventListener('click',startSession);
+  window.addEventListener('pagehide',()=>stopSession(true));
+
+  startSession();
+}})();
+</script>'''
+
+        return page_shell(f'Live view · {camera_name}', 'live', content, scripts)

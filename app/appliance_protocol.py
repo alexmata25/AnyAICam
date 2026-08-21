@@ -1,13 +1,17 @@
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update'}
+ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay'}
 FORBIDDEN_KEYS = {'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
+DISCOVERY_FORBIDDEN_KEYS = FORBIDDEN_KEYS | {'rtsp_urls','stream_url','stream_urls','ip','ip_address','host','mac','mac_address','onvif_xaddrs'}
+LIVE_RELAY_SESSION_DURATION_SECONDS = 900
+_SESSION_NAME_SAFE = re.compile(r'[^\w+=,.@-]')
 
 
 def validate_request_time(timestamp: int, now: int | None = None, window_seconds: int = 300) -> bool:
@@ -19,6 +23,26 @@ def sanitize_appliance_payload(value):
         return {key: sanitize_appliance_payload(item) for key,item in value.items() if key.lower() not in FORBIDDEN_KEYS}
     if isinstance(value, list): return [sanitize_appliance_payload(item) for item in value]
     return value
+
+
+def sanitize_discovery_results(value) -> list[dict]:
+    """Strip edge addressing and replace address-derived identity fields."""
+    def scrub(item):
+        if isinstance(item, dict):
+            return {key: scrub(child) for key, child in item.items() if key.lower() not in DISCOVERY_FORBIDDEN_KEYS}
+        if isinstance(item, list):
+            return [scrub(child) for child in item]
+        return item
+
+    safe = scrub(value)
+    if not isinstance(safe, list):
+        return []
+    results = []
+    for index, item in enumerate(safe, 1):
+        if not isinstance(item, dict):
+            continue
+        results.append({**item, 'id': f'candidate-{index}', 'name': f'Discovered camera {index}'})
+    return results
 
 
 def health_state(payload: dict) -> tuple[str,list[str]]:
@@ -67,3 +91,17 @@ class OfflineQueue:
 def cloud_settings() -> dict:
     mode=os.getenv('ANYAICAM_CLOUD_MODE','local').lower()
     return {'mode':mode,'base_url':os.getenv('ANYAICAM_CLOUD_URL','http://host.docker.internal:8000' if mode in {'local','mock'} else ''),'mock':mode=='mock'}
+
+
+def live_relay_s3_prefix(customer_id: str,site_id: str,appliance_id: str,camera_id: str) -> str:
+    return f'live/{customer_id}/{site_id}/{appliance_id}/{camera_id}/'
+
+
+def live_relay_session_policy(bucket: str,customer_id: str,site_id: str,appliance_id: str,camera_id: str) -> dict:
+    prefix=live_relay_s3_prefix(customer_id,site_id,appliance_id,camera_id)
+    return {'Version':'2012-10-17','Statement':[{'Effect':'Allow','Action':'s3:PutObject','Resource':f'arn:aws:s3:::{bucket}/{prefix}*'}]}
+
+
+def live_relay_session_name(appliance_id: str,camera_id: str,now: int | None=None) -> str:
+    raw=f'{appliance_id}-{camera_id}-{now or int(time.time())}'
+    return _SESSION_NAME_SAFE.sub('-',raw)[:64]

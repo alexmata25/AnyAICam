@@ -1,5 +1,4 @@
 import hmac
-import logging
 import secrets
 import time
 from datetime import datetime,timedelta
@@ -13,27 +12,44 @@ from partner_db import connection,password_hash,row,verify_password
 from token_security import sign,unsign
 from redirect_security import safe_redirect
 
-
-logger = logging.getLogger('anyaicam.security')
-
-
-def csrf_validation(cookie: str | None, header: str | None) -> tuple[bool, str]:
-    """Return a redacted CSRF decision without weakening double-submit validation."""
-    if not cookie:
-        return False, 'missing_cookie'
-    if not header:
-        return False, 'missing_header'
-    if not hmac.compare_digest(cookie,header):
-        return False, 'token_mismatch'
-    try:
-        if unsign(cookie)!='csrf':
-            return False, 'invalid_signature'
-    except (TypeError, ValueError):
-        return False, 'invalid_signature'
-    return True, 'valid'
+_MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
 
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
+    @staticmethod
+    def _unquote_double_submit_value(value: str) -> str:
+        # Mirrors Starlette's own Cookie-header unquoting (http.cookies
+        # unquotes on read). A double-submit token read client-side from
+        # document.cookie can still carry a literal wrapping quote pair --
+        # e.g. any cookie a pre-fix server issued with base64 '=' padding,
+        # already sitting in someone's browser -- while request.cookies.get()
+        # never does. Stripping one matching pair here makes the two sides
+        # comparable again without touching the HMAC/signature check itself.
+        if len(value)>=2 and value[0]=='"'==value[-1]: return value[1:-1]
+        return value
+
+    @staticmethod
+    async def _read_body_capped(request: Request, limit: int):
+        # Mirrors Request.body()'s own caching -- sets request._body, which
+        # BaseHTTPMiddleware's _CachedRequest replays to the downstream app --
+        # but reads via .stream() and stops as soon as more than `limit`
+        # bytes have arrived, instead of buffering an unbounded or chunked
+        # body in full first. Returns the cached bytes, or None if the body
+        # exceeded the cap (nothing is cached in that case).
+        if hasattr(request,'_body'):
+            body=request._body
+            return body if len(body)<=limit else None
+        chunks=[]; total=0
+        try:
+            async for chunk in request.stream():
+                total+=len(chunk)
+                if total>limit: return None
+                chunks.append(chunk)
+        except Exception: return None
+        body=b''.join(chunks)
+        request._body=body
+        return body
+
     async def dispatch(self,request: Request,call_next):
         origin=request.headers.get('origin','').rstrip('/')
         method=request.method.upper()
@@ -55,19 +71,41 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             return RedirectResponse(destination,status_code=308)
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
         if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
-            cookie=request.cookies.get('anyaicam_csrf'); header=request.headers.get('x-csrf-token')
-            csrf_valid,csrf_reason=csrf_validation(cookie,header)
-            if not csrf_valid:
-                if request.url.path=='/logout':
-                    logger.warning(
-                        'logout_csrf_failed reason=%s cookie_present=%s header_present=%s lengths_match=%s method=%s path=%s host=%s origin_present=%s forwarded_host_present=%s forwarded_proto_present=%s',
-                        csrf_reason,bool(cookie),bool(header),bool(cookie and header and len(cookie)==len(header)),request.method,request.url.path,
-                        request.headers.get('host',''),bool(request.headers.get('origin')),bool(request.headers.get('x-forwarded-host')),bool(request.headers.get('x-forwarded-proto')),
-                    )
-                return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+            cookie=request.cookies.get('anyaicam_csrf'); token=request.headers.get('x-csrf-token')
+            # No cookie means the final check below can never pass regardless of
+            # what the body contains -- fail now instead of buffering a body an
+            # anonymous, cookie-less caller controls the size of.
+            if not cookie: return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+            if not token and request.headers.get('content-type','').split(';')[0].strip().lower()=='application/x-www-form-urlencoded':
+                # Plain HTML form posts (e.g. /login) can't set a custom header, so accept the
+                # same double-submit token from a hidden form field as a fallback.
+                # A declared Content-Length that's negative, unparsable, or over the
+                # cap can be rejected without reading anything. An absent
+                # Content-Length (e.g. chunked transfer-encoding) is not itself
+                # disqualifying -- _read_body_capped below bounds that case instead.
+                content_length=request.headers.get('content-length')
+                try:
+                    parsed_length=int(content_length) if content_length is not None else None
+                    declared_oversized=parsed_length is not None and (parsed_length<0 or parsed_length>_MAX_CSRF_FORM_BODY_BYTES)
+                except ValueError: declared_oversized=True
+                if declared_oversized: return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+                # Read the body ourselves, capped at _MAX_CSRF_FORM_BODY_BYTES, and
+                # cache it the same way Request.body() does so BaseHTTPMiddleware
+                # replays it downstream (otherwise routes with their own Form(...)
+                # params, e.g. /login, /customer-register, /register, would receive
+                # an empty body). This also bounds chunked/no-Content-Length bodies:
+                # reading stops as soon as the cap is exceeded rather than buffering
+                # an unbounded stream first.
+                if await self._read_body_capped(request,_MAX_CSRF_FORM_BODY_BYTES) is None:
+                    return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
+                try: form_token=(await request.form()).get('csrf_token')
+                except Exception: form_token=None
+                if isinstance(form_token,str): token=form_token
+            if isinstance(token,str): token=self._unquote_double_submit_value(token)
+            if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' "+' '.join(settings.allowed_origins)+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' "+' '.join(settings.allowed_origins)+" https://d31cxfv0l904ar.cloudfront.net; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'

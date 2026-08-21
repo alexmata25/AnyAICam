@@ -45,6 +45,7 @@ self.addEventListener('fetch',event=>{
   const url=new URL(event.request.url);
   if(url.origin!==location.origin)return;
   if(event.request.mode==='navigate'){event.respondWith(fetch(event.request).catch(()=>caches.match('/offline')));return;}
+  if(url.pathname.startsWith('/static/hls/')){event.respondWith(fetch(event.request));return;}
   event.respondWith(caches.match(event.request).then(hit=>hit||fetch(event.request).then(response=>{
     if(response.ok&&url.pathname.startsWith('/static/')){const copy=response.clone();caches.open(CACHE).then(cache=>cache.put(event.request,copy));}
     return response;

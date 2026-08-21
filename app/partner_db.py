@@ -4,39 +4,53 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from database_backend import backend,connect as database_connect
+from database_backend import backend,connect as database_connect,target_key as database_target_key
 
 DB_FILE = Path(os.getenv('ANYAICAM_PARTNER_DB', '/app/recordings/partner_portal.db'))
 REAL_SOURCE = 'real'
 DEMO_SOURCE = 'demo'
 
 ROLE_PERMISSIONS = {
-    'super_admin': {'*'},
     'administrator': {'*'},
     'partner_owner': {'partner.view','customer.create','customer.view','customer.edit','quote.create','user.invite','appliance.assign','appliance.action','pricing.view','pricing.edit','audit.view'},
     'salesperson': {'partner.view','customer.create','customer.view','customer.edit','quote.create','pricing.view'},
     'technician': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action'},
     'customer_owner': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure'},
     'customer_viewer': {'customer.self.view'},
-    'owner': {'*'},
-    'sales': {'partner.view','customer.create','customer.view','customer.edit','quote.create','pricing.view'},
-    'support': {'partner.view','customer.view','audit.view'},
-    'installer': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action'},
-    'billing': {'partner.view','customer.view','pricing.view'},
-    'operations': {'partner.view','customer.view','appliance.assign','appliance.action','audit.view'},
-    'customer_admin': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure'},
-    'manager': {'customer.self.view','camera.self.configure'},
-    'viewer': {'customer.self.view'},
-    'guard': {'customer.self.view'},
 }
+
+
+_initialized_targets: set = set()
+_initialization_lock = threading.Lock()
 
 
 @contextmanager
 def connection():
+    ensure_database_initialized()
     with database_connect() as db: yield db
+
+
+def ensure_database_initialized() -> None:
+    """Run schema initialization for the currently configured database target,
+    once per target for the life of this process.
+
+    Uses database_connect() (never connection()) during initialization itself,
+    since connection() calls this function first - going through connection()
+    here would recurse. A target is marked initialized only after
+    initialize_database() returns successfully, so a failed attempt is retried
+    on the next call instead of being cached as done. The lock makes concurrent
+    callers for a not-yet-initialized target block on one real initialization
+    rather than racing to create the schema twice."""
+    target = database_target_key()
+    if target in _initialized_targets: return
+    with _initialization_lock:
+        if target in _initialized_targets: return  # another thread may have finished while we waited
+        initialize_database()
+        _initialized_targets.add(target)
 
 
 def initialize_database() -> None:
@@ -65,7 +79,7 @@ def initialize_database() -> None:
         '''CREATE TABLE IF NOT EXISTS appliance_events(appliance_id TEXT NOT NULL,event_id TEXT NOT NULL,event_type TEXT,camera_id TEXT,event_timestamp TEXT,payload_json TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(appliance_id,event_id),FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
         '''CREATE TABLE IF NOT EXISTS appliance_commands(id TEXT PRIMARY KEY,appliance_id TEXT NOT NULL,command TEXT NOT NULL,payload_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT,completed_at TEXT,expires_at TEXT NOT NULL,error TEXT,created_by TEXT,FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
     ]
-    with connection() as db:
+    with database_connect() as db:
         for statement in statements: db.execute(statement)
         appliance_columns={item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()} if backend()=='sqlite' else {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()}
         if 'activation_status' not in appliance_columns: db.execute("ALTER TABLE appliances ADD COLUMN activation_status TEXT NOT NULL DEFAULT 'pending'")
@@ -74,8 +88,6 @@ def initialize_database() -> None:
     bootstrap_admin()
     from db_migrations import apply_migrations
     apply_migrations()
-    from tenancy.migrations import apply_tenant_migration
-    apply_tenant_migration()
 
 
 def password_hash(password: str) -> str:
@@ -93,7 +105,7 @@ def bootstrap_admin() -> None:
     email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower(); password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
     if not email or not password: return
     now=datetime.now().isoformat(); partner_id='anyaicam-primary'
-    with connection() as db:
+    with database_connect() as db:
         db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
         existing=db.execute('SELECT id FROM partner_users WHERE email=?',(email,)).fetchone()
         if not existing: db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(secrets.token_hex(5),partner_id,email,'Administrator','administrator',password_hash(password),now))
@@ -116,7 +128,7 @@ def authenticate_detailed(email: str,password: str):
     if user.get('must_change_password') and user.get('invitation_expires_at') and user['invitation_expires_at']<datetime.now().isoformat(): return None,'invitation_expired'
     if status in {'suspended','revoked'}: return None,status
     if status=='pending' or not user.get('approved'): return None,'pending'
-    if user.get('role') in {'super_admin','administrator','partner_owner','salesperson','technician','owner','sales','support','installer','billing','operations'}:
+    if user.get('role') in {'administrator','partner_owner','salesperson','technician'}:
         approval=str(user.get('partner_approval_status') or 'pending').lower()
         if approval in {'rejected','revoked','suspended'}: return None,'revoked' if approval=='rejected' else approval
         if approval!='approved': return None,'pending'
@@ -147,4 +159,4 @@ def execute(query: str,params=()) -> None:
     with connection() as db: db.execute(query,params)
 
 
-initialize_database()
+ensure_database_initialized()

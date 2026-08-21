@@ -12,6 +12,7 @@ from partner_db import audit,connection,password_hash,rows
 from partner_portal import PARTNER_ROLES,destination_for_role,partner_identity,require_partner_access
 
 PAGE=Path(__file__).with_name('partner.html')
+CUSTOMER_LOGIN_PAGE=Path(__file__).with_name('customer-login.html')
 VALID_APPLICATION_STATUSES={'pending','approved','rejected','more_information_required'}
 
 
@@ -26,6 +27,10 @@ def _portal_destination(login_url,path):
 def register_website_partner_routes(app: FastAPI,shell) -> None:
     @app.get('/partner.html')
     def public_partner_page(): return FileResponse(PAGE,media_type='text/html')
+
+    @app.get('/customer-login.html')
+    def public_customer_login_page():
+        return FileResponse(CUSTOMER_LOGIN_PAGE,media_type='text/html')
 
     @app.get('/api/website/partner-session')
     def website_session(request: Request):
