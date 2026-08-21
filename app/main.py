@@ -492,6 +492,8 @@ except ImportError:
 
     YOLO = None
 
+import analytics_rules_engine
+
 
 
 
@@ -5600,6 +5602,10 @@ class AnalyticsEventModel(BaseModel):
 
 
     mock: bool = True
+
+    rule_id: str | None = None
+    analytic_type: str | None = None
+    zone_name: str | None = None
 
 
 
@@ -31987,6 +31993,22 @@ def get_alert_rule(camera_number: int) -> AlertRuleModel:
     )
 
 
+def get_analytics_rules(camera_number: int) -> list[dict]:
+    """This camera's currently-configured, saved analytics rules
+    (AnalyticsRuleModel-shaped dicts) for ai_person_detector()'s rule-
+    evaluation branch. Deliberately duplicates the same
+    load_json_list(ANALYTICS_RULES_FILE) + camera filter already
+    inline in analytics_rules_api() (GET /api/analytics/rules) rather
+    than sharing it, so this addition never risks changing that
+    existing, already-working route's behavior. A missing/corrupt/
+    empty rules file reads as "no rules configured" (load_json_list's
+    own existing fail-safe) -- evaluate_rules() already treats an
+    empty list as a fast no-op, which is exactly today's (rule-less)
+    YOLO detection behavior."""
+    rules = load_json_list(ANALYTICS_RULES_FILE)
+    return [rule for rule in rules if rule.get("camera") == camera_number]
+
+
 
 
 
@@ -36286,7 +36308,10 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
+    detections = analytics_rules_engine.update_tracker(camera_number, detections)
+
     return {
+
 
 
 
@@ -37189,6 +37214,89 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     return saved_events
 
 
+def save_rule_events(camera_number: int, result: dict, fired_rules: list[dict]) -> list[dict]:
+    """Persists rule-triggered events (intrusion/line_crossing/
+    people_count) produced by analytics_rules_engine.evaluate_rules()
+    through the exact same append_analytics_event() storage path
+    ordinary YOLO detection events already use in save_yolo_events() --
+    same file, same shape, same downstream customer-facing API and
+    (future) cloud sync, just with the new optional rule_id/
+    analytic_type/zone_name fields populated and direction actually
+    used.
+
+    Deliberately independent of save_yolo_events() and its caller's
+    AI_PERSON_COOLDOWN_SECONDS gate -- see ai_person_detector(), which
+    calls this every cycle a rule fires, never gated by that cooldown.
+    Deduplication for rule events is analytics_rules_engine's own
+    responsibility (state-machine transitions, not a wall-clock
+    cooldown) -- by the time a fired-rule dict reaches this function,
+    it is already a real, once-only event to persist, never a repeat
+    of one already saved.
+
+    Builds its own annotated thumbnail rather than sharing
+    save_yolo_events()'s drawing logic -- deliberate duplication,
+    matching this project's established convention of small
+    independent helpers over shared ones, and keeping this addition
+    from touching save_yolo_events()'s already-proven internals at
+    all."""
+    frame = result.get("frame")
+    if not fired_rules or frame is None or cv2 is None:
+        return []
+
+    now = datetime.now()
+    day_folder = AI_THUMBNAILS_FOLDER / now.strftime("%Y-%m-%d")
+    day_folder.mkdir(parents=True, exist_ok=True)
+    event_group_id = uuid.uuid4().hex[:12]
+    filename = f"camera{camera_number}_{now.strftime('%H-%M-%S')}_rule_{event_group_id}.jpg"
+    output_path = day_folder / filename
+
+    annotated = frame.copy()
+    rule_color = (96, 96, 255)  # distinct from save_yolo_events()'s per-class palette -- visually marks a rule-triggered thumbnail
+    for fired in fired_rules:
+        box = fired.get("box")
+        if not box:
+            continue
+        x, y, width, height = box["x"], box["y"], box["width"], box["height"]
+        cv2.rectangle(annotated, (x, y), (x + width, y + height), rule_color, 2)
+        label = f"{fired.get('analytic_type', 'rule')} {fired.get('zone_name') or ''}".strip()
+        cv2.putText(annotated, label, (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, rule_color, 2, cv2.LINE_AA)
+
+    thumbnail_url = None
+    if cv2.imwrite(str(output_path), annotated):
+        thumbnail_url = f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/{quote(filename)}"
+
+    linked_recording = linked_recording_for(camera_number, now)
+
+    saved_events = []
+    for fired in fired_rules:
+        event = AnalyticsEventModel(
+            id=uuid.uuid4().hex[:12],
+            camera=camera_number,
+            site="home",
+            rule_name=fired.get("zone_name") or f"{str(fired.get('analytic_type', 'rule')).replace('_', ' ').title()} rule",
+            event_type=fired["event_type"],
+            direction=fired.get("direction"),
+            timestamp=now,
+            confidence=round(float(fired.get("confidence", 0)), 4),
+            thumbnail=thumbnail_url,
+            linked_recording=linked_recording,
+            mock=False,
+            rule_id=fired.get("rule_id"),
+            analytic_type=fired.get("analytic_type"),
+            zone_name=fired.get("zone_name"),
+        ).model_dump(mode="json")
+        event["object_count"] = 1
+        event["detections"] = [{
+            "class_id": None,
+            "class_name": fired["event_type"],
+            "confidence": fired.get("confidence"),
+            "track_id": fired.get("track_id"),
+        }]
+        append_analytics_event(event)
+        saved_events.append(event)
+    return saved_events
+
+
 
 
 
@@ -37835,6 +37943,16 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
                         )
+
+            if detections:
+                frame = result.get("frame")
+                frame_height, frame_width = frame.shape[:2] if frame is not None else (0, 0)
+                rules = get_analytics_rules(camera_number)
+                fired_rules = analytics_rules_engine.evaluate_rules(
+                    camera_number, detections, rules, frame_width, frame_height,
+                )
+                if fired_rules:
+                    await asyncio.to_thread(save_rule_events, camera_number, result, fired_rules)
 
 
 
