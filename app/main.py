@@ -16734,6 +16734,60 @@ def _bounded_camera_error(stderr_tail: list[str]) -> str:
     return _redact_camera_stream_error(joined)[:CAMERA_ERROR_MAX_CHARS]
 
 
+# Recording-mode-only stall watchdog. A camera's RTSP session can remain
+# TCP ESTABLISHED while delivering zero bytes -- ffmpeg has no read timeout
+# on this input, so it blocks forever waiting for data that isn't coming,
+# and process_supervisor's own recovery (below) only ever triggers on an
+# actual process exit, which never happens in this state. The watchdog
+# below detects exactly that condition -- the camera's current recording
+# segment file has stopped growing -- and kills the process; every line of
+# process_supervisor's existing exit-triggered retry/restart logic then
+# runs completely unmodified, exactly as it would for any other crash.
+# Scoped to mode == "recording" only -- start_live_stream()/Live View/HLS
+# never gets a watchdog and is not touched by any of this.
+RECORDING_SEGMENT_SECONDS = 300  # must match start_recording()'s own "-segment_time 300"
+RECORDING_STALL_GRACE_SECONDS = 60
+RECORDING_PROGRESS_CHECK_INTERVAL_SECONDS = 30
+
+
+def _newest_recording_file(camera_number: int) -> Path | None:
+    folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+    try:
+        candidates = sorted(folder.glob(f"camera{camera_number}_*.mkv"), key=lambda item: item.name)
+    except OSError:
+        return None
+    return candidates[-1] if candidates else None
+
+
+async def _recording_progress_watchdog(camera_number: int, process: subprocess.Popen) -> None:
+    """Kills `process` if its camera's current (still-being-written)
+    recording segment file hasn't grown in more than one segment
+    interval plus a grace margin. Purely observational -- only ever
+    reads a file's size, never moves, renames, or deletes anything, and
+    never touches the recording-upload cutoff. Returns on its own once
+    the process it's watching has already exited, so there is nothing
+    to clean up on the normal-exit path beyond the cancel() the caller
+    already does defensively."""
+    stall_threshold = RECORDING_SEGMENT_SECONDS + RECORDING_STALL_GRACE_SECONDS
+    last_size = None
+    last_progress_at = time.monotonic()
+    while process.poll() is None:
+        await asyncio.sleep(RECORDING_PROGRESS_CHECK_INTERVAL_SECONDS)
+        current = _newest_recording_file(camera_number)
+        try:
+            size = current.stat().st_size if current is not None else None
+        except OSError:
+            size = None
+        if size != last_size:
+            last_size = size
+            last_progress_at = time.monotonic()
+            continue
+        if time.monotonic() - last_progress_at > stall_threshold:
+            print(f"Camera {camera_number} recording process stalled (no file growth for over {stall_threshold}s); killing for restart.")
+            process.kill()
+            return
+
+
 async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
@@ -16806,6 +16860,9 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
                 _drain_camera_stderr(camera_number, process, stderr_tail)
             )
 
+        watchdog_task = None
+        if mode == "recording":
+            watchdog_task = asyncio.create_task(_recording_progress_watchdog(camera_number, process))
 
 
 
@@ -16813,7 +16870,11 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
 
-        return_code = await asyncio.to_thread(process.wait)
+        try:
+            return_code = await asyncio.to_thread(process.wait)
+        finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
 
         if drain_task is not None:
             await drain_task
