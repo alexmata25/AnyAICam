@@ -226,7 +226,9 @@ def _control_plane_post(path: str, payload: dict) -> dict | None:
         CLOUD_URL + path, data=json.dumps(payload).encode(), headers=headers, method="POST"
     )
     try:
+        logger.info("recording_upload.http_call_begin path=%s", path)
         with urllib.request.urlopen(request, timeout=10) as response:
+            logger.info("recording_upload.http_call_returned path=%s", path)
             return json.loads(response.read().decode() or "{}")
     except urllib.error.HTTPError as error:
         logger.warning("recording_upload.control_plane_http_error path=%s status=%s", path, error.code)
@@ -243,7 +245,9 @@ def _control_plane_get(path: str) -> dict | None:
     appliance_id, credential = identity
     request = urllib.request.Request(CLOUD_URL + path, headers=_control_plane_headers(appliance_id, credential), method="GET")
     try:
+        logger.info("recording_upload.http_call_begin path=%s", path)
         with urllib.request.urlopen(request, timeout=10) as response:
+            logger.info("recording_upload.http_call_returned path=%s", path)
             return json.loads(response.read().decode() or "{}")
     except urllib.error.HTTPError as error:
         logger.warning("recording_upload.control_plane_http_error path=%s status=%s", path, error.code)
