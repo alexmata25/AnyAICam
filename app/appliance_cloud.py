@@ -214,6 +214,50 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             },
         }
 
+    @app.post('/api/appliance/recordings/{camera_id}/available')
+    def recording_available(request: Request,camera_id: str,payload: dict) -> dict:
+        # R2 (recording-pipeline roadmap): catalogs one completed
+        # recording object, mirroring live_relay_segment_available()
+        # below almost exactly -- same auth/flag/prefix-validation
+        # shape, writing to the durable `recordings` table (R1's own
+        # migration) instead of the ephemeral live manifest. Nothing
+        # calls this route yet (that's R3's appliance-side uploader);
+        # nothing reads what it catalogs (that's R4).
+        appliance=authenticate_appliance(request)
+        if not RECORDING_UPLOAD_ENABLED: raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        safe=sanitize_appliance_payload(payload)
+        s3_key=str(safe.get('s3_key','')).strip()
+        if not s3_key: raise HTTPException(status_code=400,detail='s3_key is required.')
+        expected_prefix=recording_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        if not s3_key.startswith(expected_prefix):
+            raise HTTPException(status_code=403,detail="s3_key is outside this camera's authorized prefix.")
+        started_at=str(safe.get('started_at','')).strip(); ended_at=str(safe.get('ended_at','')).strip()
+        if not started_at or not ended_at: raise HTTPException(status_code=400,detail='started_at and ended_at are required.')
+        duration_seconds=safe.get('duration_seconds'); size_bytes=safe.get('size_bytes')
+        recording_id=secrets.token_hex(12); now=datetime.now().isoformat()
+        with connection() as db:
+            try:
+                db.execute(
+                    'INSERT INTO recordings(id,customer_id,site_id,appliance_id,camera_id,s3_key,started_at,ended_at,duration_seconds,size_bytes,status,created_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (recording_id,camera['customer_id'],camera['site_id'],appliance['id'],camera_id,s3_key,started_at,ended_at,
+                     int(duration_seconds) if duration_seconds is not None else None,
+                     int(size_bytes) if size_bytes is not None else None,
+                     'available',now),
+                )
+            except Exception:
+                # Idempotent replay: a byte-identical (camera_id, s3_key)
+                # resubmission is a 200 no-op, not an error -- the same
+                # duplicate-replay-is-a-200 pattern already used for
+                # appliance_commands/update-result reporting elsewhere
+                # in this codebase.
+                existing=db.execute('SELECT id FROM recordings WHERE camera_id=? AND s3_key=?',(camera_id,s3_key)).fetchone()
+                if existing: return {'status':'duplicate','recording_id':existing['id']}
+                raise HTTPException(status_code=500,detail='Could not record this upload.')
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.recording_available','recording',recording_id,{'camera_id':camera_id,'s3_key':s3_key})
+        return {'status':'accepted','recording_id':recording_id}
+
     @app.post('/api/appliance/live/{camera_id}/segment-available')
     def live_relay_segment_available(request: Request,camera_id: str,payload: dict) -> dict:
         appliance=authenticate_appliance(request)

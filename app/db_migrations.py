@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS notification_deliveries(id TEXT PRIMARY KEY,notificat
     ('20260816_live_relay_idle_tracking','''
 CREATE TABLE IF NOT EXISTS live_relay_idle_tracking(camera_id TEXT PRIMARY KEY,appliance_id TEXT NOT NULL,idle_since TEXT NOT NULL,stop_queued_at TEXT,FOREIGN KEY(camera_id) REFERENCES cameras(id));
 '''),
+    ('20260821_recordings_catalog','''
+CREATE TABLE IF NOT EXISTS recordings(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,site_id TEXT NOT NULL,appliance_id TEXT NOT NULL,camera_id TEXT NOT NULL,s3_key TEXT NOT NULL,started_at TEXT NOT NULL,ended_at TEXT NOT NULL,duration_seconds INTEGER,size_bytes INTEGER,status TEXT NOT NULL DEFAULT 'available',created_at TEXT NOT NULL,UNIQUE(camera_id,s3_key),FOREIGN KEY(customer_id) REFERENCES customers(id),FOREIGN KEY(site_id) REFERENCES sites(id),FOREIGN KEY(appliance_id) REFERENCES appliances(id),FOREIGN KEY(camera_id) REFERENCES cameras(id));
+CREATE INDEX IF NOT EXISTS idx_recordings_camera_started ON recordings(camera_id,started_at);
+'''),
 ]
 
 
