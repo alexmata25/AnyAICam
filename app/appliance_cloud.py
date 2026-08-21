@@ -41,6 +41,10 @@ RECORDING_UPLOAD_ENABLED=os.getenv('ANYAICAM_RECORDING_UPLOAD_ENABLED','false').
 RECORDING_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_RECORDING_UPLOAD_ROLE_ARN','').strip()
 RECORDING_S3_BUCKET=os.getenv('ANYAICAM_RECORDING_S3_BUCKET','').strip()
 RECORDING_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).strip()
+# Analytics-event sync (separate milestone, separate flag from recording
+# upload -- deliberately independently toggleable). No AWS/STS involved at
+# all; this only ever writes to the detection_events SQL table.
+ANALYTICS_SYNC_ENABLED=os.getenv('ANYAICAM_ANALYTICS_SYNC_ENABLED','false').strip().lower()=='true'
 
 
 def _bearer(request: Request) -> str:
@@ -270,6 +274,50 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
                 raise HTTPException(status_code=500,detail='Could not record this upload.')
         audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.recording_available','recording',recording_id,{'camera_id':camera_id,'s3_key':s3_key})
         return {'status':'accepted','recording_id':recording_id}
+
+    @app.post('/api/appliance/analytics/{camera_id}/events')
+    def analytics_event_available(request: Request,camera_id: str,payload: dict) -> dict:
+        # Analytics-event sync milestone: catalogs one local YOLO/motion
+        # detection event into the durable, tenant-scoped detection_events
+        # table. Mirrors recording_available() above almost exactly --
+        # same auth/flag shape, same idempotent-replay-is-a-200 pattern.
+        # customer_id/site_id/appliance_id/camera_id are ALL resolved
+        # server-side from the authenticated appliance + the
+        # authorized-camera lookup below -- camera['site_id'] (the
+        # camera's own authoritative site) is what's stored, never
+        # anything from the payload. Only a fixed allowlist of fields is
+        # ever read from the payload; local-only fields like the
+        # appliance's thumbnail file path or linked_recording are never
+        # looked at, so they can never reach this table by construction.
+        appliance=authenticate_appliance(request)
+        if not ANALYTICS_SYNC_ENABLED: raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        safe=sanitize_appliance_payload(payload)
+        local_event_id=str(safe.get('local_event_id','')).strip()
+        event_type=str(safe.get('event_type','')).strip()
+        event_timestamp=str(safe.get('event_timestamp','')).strip()
+        if not local_event_id or not event_type or not event_timestamp:
+            raise HTTPException(status_code=400,detail='local_event_id, event_type, and event_timestamp are required.')
+        confidence=safe.get('confidence')
+        object_count=safe.get('object_count')
+        detections=safe.get('detections')
+        detections_json=json.dumps(detections) if isinstance(detections,list) else None
+        event_id=secrets.token_hex(12); now=datetime.now().isoformat()
+        with connection() as db:
+            try:
+                db.execute(
+                    'INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,confidence,object_count,detections_json,event_timestamp,created_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (event_id,camera['customer_id'],camera['site_id'],appliance['id'],camera_id,local_event_id,event_type,
+                     float(confidence) if confidence is not None else None,
+                     int(object_count) if object_count is not None else 1,
+                     detections_json,event_timestamp,now),
+                )
+            except Exception:
+                existing=db.execute('SELECT id FROM detection_events WHERE camera_id=? AND local_event_id=?',(camera_id,local_event_id)).fetchone()
+                if existing: return {'status':'duplicate','event_id':existing['id']}
+                raise HTTPException(status_code=500,detail='Could not record this event.')
+        return {'status':'accepted','event_id':event_id}
 
     @app.post('/api/appliance/live/{camera_id}/segment-available')
     def live_relay_segment_available(request: Request,camera_id: str,payload: dict) -> dict:
