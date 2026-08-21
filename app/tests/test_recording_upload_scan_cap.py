@@ -37,17 +37,28 @@ def _isolated_state(tmp_path, monkeypatch):
 
 
 def _make_eligible_recording(tmp_path, camera_number, started_at):
+    """Writes one fake recording file. Does NOT create a "still open"
+    placeholder itself -- call _make_still_open_placeholder() once,
+    after every real file for a camera has been created, so there is
+    exactly one such placeholder (not one per call, which would itself
+    become an extra, unintended "eligible" file since only the single
+    lexicographically-last candidate is ever excluded)."""
     folder = ru._recording_folder(camera_number)
     folder.mkdir(parents=True, exist_ok=True)
     name = f"camera{camera_number}_{started_at.strftime('%Y-%m-%d_%H-%M-%S')}.mkv"
     path = folder / name
     path.write_bytes(b"fake-recording")
-    # Companion far-future file so `path` is never treated as "still open".
-    newest_name = f"camera{camera_number}_{(started_at + timedelta(days=3650)).strftime('%Y-%m-%d_%H-%M-%S')}.mkv"
-    newest = folder / newest_name
-    if not newest.exists():
-        newest.write_bytes(b"placeholder")
     return path
+
+
+def _make_still_open_placeholder(camera_number):
+    """Exactly one far-future file so every real file created so far
+    for this camera is treated as "closed" -- _completed_recording_files()
+    excludes only the single lexicographically-last candidate."""
+    folder = ru._recording_folder(camera_number)
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"camera{camera_number}_2099-01-01_00-00-00.mkv"
+    (folder / name).write_bytes(b"placeholder-still-open")
 
 
 def _wire_fake_upload_chain(monkeypatch, tmp_path):
@@ -127,6 +138,7 @@ def test_unset_cap_processes_every_eligible_file_exactly_as_before(tmp_path, mon
     ru._cutoff_cache = datetime.now() - timedelta(hours=1)
     for minute in (10, 20, 30):
         _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=minute))
+    _make_still_open_placeholder(1)
 
     ru._relay_camera_once(1, "camera-1-id")
 
@@ -139,6 +151,7 @@ def test_cap_of_one_processes_exactly_one_file_per_camera_per_scan(tmp_path, mon
     ru._cutoff_cache = datetime.now() - timedelta(hours=1)
     for minute in (10, 20, 30):
         _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=minute))
+    _make_still_open_placeholder(1)
 
     ru._relay_camera_once(1, "camera-1-id")
 
@@ -151,6 +164,7 @@ def test_cap_of_two_caps_at_exactly_two_when_three_are_eligible(tmp_path, monkey
     ru._cutoff_cache = datetime.now() - timedelta(hours=1)
     for minute in (10, 20, 30):
         _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=minute))
+    _make_still_open_placeholder(1)
 
     ru._relay_camera_once(1, "camera-1-id")
 
@@ -163,6 +177,7 @@ def test_cap_larger_than_eligible_count_uploads_all_of_them(tmp_path, monkeypatc
     ru._cutoff_cache = datetime.now() - timedelta(hours=1)
     for minute in (10, 20):
         _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=minute))
+    _make_still_open_placeholder(1)
 
     ru._relay_camera_once(1, "camera-1-id")
 
@@ -176,6 +191,7 @@ def test_pre_cutoff_files_remain_excluded_regardless_of_cap(tmp_path, monkeypatc
     ru._cutoff_cache = cutoff
     old = _make_eligible_recording(tmp_path, 1, cutoff - timedelta(days=1))
     _make_eligible_recording(tmp_path, 1, cutoff + timedelta(minutes=5))
+    _make_still_open_placeholder(1)
 
     ru._relay_camera_once(1, "camera-1-id")
 
@@ -190,6 +206,7 @@ def test_files_beyond_the_cap_remain_on_disk_untouched_and_eligible_next_scan(tm
     ru._cutoff_cache = datetime.now() - timedelta(hours=1)
     first = _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=30))
     second = _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=20))
+    _make_still_open_placeholder(1)
     second_bytes = second.read_bytes()
 
     ru._relay_camera_once(1, "camera-1-id")
@@ -215,6 +232,7 @@ def test_next_scan_picks_up_the_leftover_file_capped_run_after_capped_run(tmp_pa
     ru._cutoff_cache = datetime.now() - timedelta(hours=1)
     _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=30))
     _make_eligible_recording(tmp_path, 1, datetime.now() - timedelta(minutes=20))
+    _make_still_open_placeholder(1)
 
     ru._relay_camera_once(1, "camera-1-id")
     assert len(ru._uploaded_files.get(1, [])) == 1
