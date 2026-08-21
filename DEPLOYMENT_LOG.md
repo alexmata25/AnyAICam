@@ -6,6 +6,48 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — R2: Recording catalog table + notification endpoint
+
+**Phase:** R2 of the recording-pipeline roadmap. Scope: the `recordings`
+catalog table and its notification endpoint only, per the approved
+architecture. R3 was explicitly not started.
+
+**Production backups:**
+- `app/db_migrations.py.pre-r2-recordings-catalog-20260820-205758`
+- `app/appliance_cloud.py.pre-r2-recordings-catalog-20260820-205758`
+
+**Commit:** `255d28991a5e57a6d768e3bc5a9c22ff3b0353e1` on branch
+`production-reconcile-20260820`, pushed to GitHub, synced to the Ryzen 5
+worktree — all three confirmed at this commit with matching file hashes.
+
+**Files changed:**
+- `app/db_migrations.py` — new `20260821_recordings_catalog` migration: `recordings` table (`customer_id`/`site_id`/`appliance_id`/`camera_id`/`s3_key`/`started_at`/`ended_at`/`duration_seconds`/`size_bytes`/`status`/`created_at`), `UNIQUE(camera_id,s3_key)` for idempotent replay, `idx_recordings_camera_started` for R4's future timeline query.
+- `app/appliance_cloud.py` — new `POST /api/appliance/recordings/{camera_id}/available` route, mirroring `live_relay_segment_available()`'s exact auth/flag/prefix-validation shape; still gated behind `ANYAICAM_RECORDING_UPLOAD_ENABLED` (default off).
+- `app/tests/test_recordings_catalog.py` *(new)* — 5 tests against a throwaway sqlite DB via the real `initialize_database()` chain.
+
+**Verification performed:**
+- `ast.parse` clean on both edited files, locally and on production.
+- Migration applied automatically on `docker compose restart vms` — confirmed directly against the real production DB: `recordings` table present with all 12 expected columns, **0 rows**, `schema_migrations` records `20260821_recordings_catalog`.
+- All **14** R1+R2 tests (9 credential tests + 5 catalog tests) run **inside the actual deployed container** via an ephemeral `pip install --target=` of pytest (removed immediately after — confirmed `import pytest` fails again post-cleanup, no permanent change to the container's dependencies) — **14/14 passed**.
+- New route returns the same `422`/`401` shape the existing `segment-available` route already returns for a missing/unauthenticated request — not a new pattern, matches precedent exactly.
+- Live-relay route and R1's credentials route both confirmed unaffected (still `401`).
+- `docker compose restart vms` → healthy, no new errors in logs.
+- Customer-facing routes (`/customer-live`, `/playback`, `/customer-account`) confirmed unchanged — this phase touched zero customer-facing code.
+
+**File hash verification (EC2 == GitHub == Ryzen 5), all at commit `255d289`:**
+
+| File | SHA-256 |
+|---|---|
+| `app/db_migrations.py` | `9d2c67aa...86788dc39` |
+| `app/appliance_cloud.py` | `b493894a...7034b73648f` |
+| `app/tests/test_recordings_catalog.py` | `3db7bc35...ea0b59e3dc10` |
+
+**Rollback:** restore both `.pre-r2-recordings-catalog-20260820-205758` backups, restart `vms` — the `recordings` table itself is harmless to leave in place (empty, nothing reads or writes it once the route/migration code is reverted), or can be dropped manually if desired. On Git: `git revert 255d289` followed by a push.
+
+**Not done in R2 (explicitly deferred):** no appliance-side uploader that calls this route (R3), no customer-facing retrieval or Playback wiring of any kind (R4), no retention/lifecycle sweep (R5), no analytics association (R6/R7), no per-appliance pilot gate. Subscriptions/entitlement behavior untouched.
+
+---
+
 ## 2026-08-21 — R1: Recording-upload credential issuance (foundation only)
 
 **Phase:** R1 of the recording-pipeline roadmap (distinct from the earlier
