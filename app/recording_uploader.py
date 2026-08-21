@@ -316,7 +316,31 @@ def _session_expires_soon(session: dict) -> bool:
     return remaining <= SESSION_RENEW_MARGIN_SECONDS
 
 
+def _upload_currently_authorized() -> bool:
+    """Cheap, no-AWS-call authorization check -- deliberately calls the
+    tiny GET /api/appliance/recordings/status route (a single env-var
+    read on the cloud side) rather than the /credentials POST (a real
+    STS AssumeRole), so this can run on every scan tick without adding
+    meaningful load. Fails closed: any network failure, HTTP error, or
+    malformed response is treated identically to an explicit
+    "disabled" response -- never as "assume it's still fine." This
+    exists so an EC2-side disable takes effect on the appliance within
+    one scan interval, rather than only once an already-cached,
+    still-valid STS session (up to RECORDING_SESSION_DURATION_SECONDS)
+    finally expires on its own."""
+    response = _control_plane_get("/api/appliance/recordings/status")
+    if not isinstance(response, dict):
+        return False
+    return response.get("enabled") is True
+
+
 def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
+    if not _upload_currently_authorized():
+        # Revalidated before using EITHER a cached session OR fetching a
+        # new one -- a cached-but-now-unauthorized session is evicted
+        # immediately rather than left to expire on its own 900s clock.
+        _sessions.pop(camera_number, None)
+        return None
     session = _sessions.get(camera_number)
     if session and not _session_expires_soon(session):
         return session
