@@ -51768,6 +51768,156 @@ def analytics_events() -> list[dict]:
     return stored if stored else mock_analytics_events()
 
 
+def _customer_detection_events(request: Request) -> list[dict] | None:
+    """This portal customer's own detection_events rows for the
+    customer-facing analytics API, or None when the caller isn't a
+    portal customer_owner/customer_viewer identity at all -- callers
+    must treat None as "render the existing legacy/mock analytics
+    experience unchanged", never as "no events". Mirrors
+    _customer_playback_cameras()'s exact identity/role/scoping pattern:
+    customer_owner sees every row for their own customer_id;
+    customer_viewer is further restricted to cameras they hold
+    can_playback=1 on in customer_camera_permissions (reusing that
+    existing permission rather than adding a dedicated
+    can_view_analytics column, matching this milestone's smallest-
+    change scope). customer_id/camera scope always comes from the
+    authenticated identity and server-side joins here -- never from
+    any request parameter, so a caller cannot widen their own view by
+    passing e.g. a different camera/site value."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    select = (
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, '
+        'c.camera_number AS camera, s.name AS site_name '
+        'FROM detection_events de '
+        'JOIN cameras c ON c.id = de.camera_id '
+        'JOIN sites s ON s.id = de.site_id '
+    )
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            rows = db.execute(
+                select + 'WHERE de.customer_id = ? ORDER BY de.event_timestamp DESC',
+                (identity["customer_id"],),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            rows = db.execute(
+                select + 'JOIN customer_camera_permissions p ON p.camera_id = de.camera_id AND p.user_id = ? '
+                'WHERE de.customer_id = ? AND p.can_playback = 1 ORDER BY de.event_timestamp DESC',
+                (user["id"], identity["customer_id"]),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "site": row["site_name"],
+            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "event_type": row["event_type"],
+            "direction": None,
+            "timestamp": row["event_timestamp"],
+            "confidence": row["confidence"],
+            "thumbnail": None,
+            "linked_recording": None,
+            "plate_number": None,
+            "vehicle_color": None,
+            "mock": False,
+        }
+        for row in rows
+    ]
+
+
+def _build_analytics_summary(events: list[dict], mock_data: bool) -> dict:
+    """Pure aggregation over an already-fetched events list -- shared by
+    both the customer-scoped and legacy/mock branches of
+    analytics_summary_api() so the type/camera/hourly/7-day breakdown
+    logic exists exactly once instead of being duplicated per branch.
+    Never fetches anything itself; the caller decides which events
+    list and mock_data value it represents. Logic here is unchanged
+    from the original single-branch analytics_summary_api() body --
+    only parameterized, not rewritten -- so the legacy/mock branch's
+    output is byte-for-byte identical to before this change."""
+    now = datetime.now()
+
+    def parse_time(event: dict) -> datetime | None:
+        raw = event.get("timestamp") or event.get("start_time")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    valid_events = [(event, parse_time(event)) for event in events]
+    valid_events = [(event, stamp) for event, stamp in valid_events if stamp is not None]
+    last_24_start = now - timedelta(hours=24)
+    last_7_start = now - timedelta(days=7)
+    today_key = now.strftime("%Y-%m-%d")
+    recent_24 = [(event, stamp) for event, stamp in valid_events if stamp >= last_24_start]
+    recent_7 = [(event, stamp) for event, stamp in valid_events if stamp >= last_7_start]
+
+    type_counts: dict[str, int] = {}
+    camera_counts = {str(camera): 0 for camera in range(1, CAMERA_COUNT + 1)}
+    confidence_values: list[float] = []
+    for event, _ in recent_7:
+        event_type = str(event.get("event_type", "unknown"))
+        type_counts[event_type] = type_counts.get(event_type, 0) + 1
+        camera_key = str(event.get("camera", ""))
+        if camera_key in camera_counts:
+            camera_counts[camera_key] += 1
+        try:
+            confidence = float(event.get("confidence", 0))
+            confidence_values.append(confidence * 100 if confidence <= 1 else confidence)
+        except (TypeError, ValueError):
+            pass
+
+    hourly_counts = [0] * 24
+    for _, stamp in recent_24:
+        hours_ago = int((now - stamp).total_seconds() // 3600)
+        if 0 <= hours_ago < 24:
+            hourly_counts[23 - hours_ago] += 1
+
+    seven_day = []
+    for days_ago in range(6, -1, -1):
+        day = (now - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        seven_day.append({
+            "day": day,
+            "label": (now - timedelta(days=days_ago)).strftime("%a"),
+            "count": sum(1 for _, stamp in recent_7 if stamp.strftime("%Y-%m-%d") == day),
+        })
+
+    peak_hour = max(range(24), key=lambda hour: hourly_counts[hour]) if hourly_counts else 0
+    active_camera = max(camera_counts, key=camera_counts.get) if camera_counts else "1"
+    today_count = sum(1 for _, stamp in valid_events if stamp.strftime("%Y-%m-%d") == today_key)
+    average_confidence = round(sum(confidence_values) / len(confidence_values), 1) if confidence_values else 0
+
+    return {
+        "total_events": len(events),
+        "today_count": today_count,
+        "last_24_count": len(recent_24),
+        "last_7_count": len(recent_7),
+        "average_confidence": average_confidence,
+        "peak_hour": peak_hour,
+        "active_camera": int(active_camera),
+        "type_counts": type_counts,
+        "camera_counts": camera_counts,
+        "hourly_counts": hourly_counts,
+        "seven_day": seven_day,
+        "mock_data": mock_data,
+        "checked_at": now.isoformat(),
+    }
+
+
 
 
 
@@ -55411,240 +55561,43 @@ def create_analytics_rule(rule: AnalyticsRuleModel) -> dict:
 
 
 @app.get("/api/analytics/events")
-
-
-
-
-
-
-
-
 def analytics_event_search(
-
-
-
-
-
-
-
-
+    request: Request,
     event_type: str | None = None,
-
-
-
-
-
-
-
-
     camera: int | None = None,
-
-
-
-
-
-
-
-
     site: str | None = None,
-
-
-
-
-
-
-
-
     plate: str | None = None,
-
-
-
-
-
-
-
-
     color: str | None = None,
-
-
-
-
-
-
-
-
     date_from: str | None = None,
-
-
-
-
-
-
-
-
     date_to: str | None = None,
-
-
-
-
-
-
-
-
 ) -> dict:
-
-
-
-
-
-
-
-
-    events = analytics_events()
-
-
-
-
-
-
-
-
+    # Customer-portal identity, if any, gets its own tenant-scoped real
+    # rows (mock_data always False, even when the list is empty) --
+    # everyone else falls through to the exact original legacy/mock
+    # behavior, unchanged.
+    customer_events = _customer_detection_events(request)
+    if customer_events is not None:
+        events = customer_events
+        mock_data = False
+    else:
+        events = analytics_events()
+        mock_data = not ANALYTICS_EVENTS_FILE.exists()
     if event_type:
-
-
-
-
-
-
-
-
         events = [event for event in events if event.get("event_type") == event_type]
-
-
-
-
-
-
-
-
     if camera:
-
-
-
-
-
-
-
-
         events = [event for event in events if event.get("camera") == camera]
-
-
-
-
-
-
-
-
     if site:
-
-
-
-
-
-
-
-
         events = [event for event in events if event.get("site", "").lower() == site.lower()]
-
-
-
-
-
-
-
-
     if plate:
-
-
-
-
-
-
-
-
         events = [event for event in events if plate.lower() in (event.get("plate_number") or "").lower()]
-
-
-
-
-
-
-
-
     if color:
-
-
-
-
-
-
-
-
         events = [event for event in events if color.lower() in (event.get("vehicle_color") or "").lower()]
-
-
-
-
-
-
-
-
     if date_from:
-
-
-
-
-
-
-
-
         events = [event for event in events if event.get("timestamp", "")[:10] >= date_from]
-
-
-
-
-
-
-
-
     if date_to:
-
-
-
-
-
-
-
-
         events = [event for event in events if event.get("timestamp", "")[:10] <= date_to]
-
-
-
-
-
-
-
-
     events.sort(key=lambda event: event.get("timestamp", ""), reverse=True)
-
-
-
-
-
-
-
-
-    return {"events": events, "mock_data": not ANALYTICS_EVENTS_FILE.exists()}
+    return {"events": events, "mock_data": mock_data}
 
 
 
@@ -55672,645 +55625,15 @@ def analytics_event_search(
 
 
 @app.get("/api/analytics/summary")
-
-
-
-
-
-
-
-
-def analytics_summary_api() -> dict:
-
-
-
-
-
-
-
-
-    now = datetime.now()
-
-
-
-
-
-
-
-
-    events = analytics_events()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def parse_time(event: dict) -> datetime | None:
-
-
-
-
-
-
-
-
-        raw = event.get("timestamp") or event.get("start_time")
-
-
-
-
-
-
-
-
-        if not raw:
-
-
-
-
-
-
-
-
-            return None
-
-
-
-
-
-
-
-
-        try:
-
-
-
-
-
-
-
-
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
-
-
-
-
-
-
-
-
-        except ValueError:
-
-
-
-
-
-
-
-
-            return None
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    valid_events = [(event, parse_time(event)) for event in events]
-
-
-
-
-
-
-
-
-    valid_events = [(event, stamp) for event, stamp in valid_events if stamp is not None]
-
-
-
-
-
-
-
-
-    last_24_start = now - timedelta(hours=24)
-
-
-
-
-
-
-
-
-    last_7_start = now - timedelta(days=7)
-
-
-
-
-
-
-
-
-    today_key = now.strftime("%Y-%m-%d")
-
-
-
-
-
-
-
-
-    recent_24 = [(event, stamp) for event, stamp in valid_events if stamp >= last_24_start]
-
-
-
-
-
-
-
-
-    recent_7 = [(event, stamp) for event, stamp in valid_events if stamp >= last_7_start]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    type_counts: dict[str, int] = {}
-
-
-
-
-
-
-
-
-    camera_counts = {str(camera): 0 for camera in range(1, CAMERA_COUNT + 1)}
-
-
-
-
-
-
-
-
-    confidence_values: list[float] = []
-
-
-
-
-
-
-
-
-    for event, _ in recent_7:
-
-
-
-
-
-
-
-
-        event_type = str(event.get("event_type", "unknown"))
-
-
-
-
-
-
-
-
-        type_counts[event_type] = type_counts.get(event_type, 0) + 1
-
-
-
-
-
-
-
-
-        camera_key = str(event.get("camera", ""))
-
-
-
-
-
-
-
-
-        if camera_key in camera_counts:
-
-
-
-
-
-
-
-
-            camera_counts[camera_key] += 1
-
-
-
-
-
-
-
-
-        try:
-
-
-
-
-
-
-
-
-            confidence = float(event.get("confidence", 0))
-
-
-
-
-
-
-
-
-            confidence_values.append(confidence * 100 if confidence <= 1 else confidence)
-
-
-
-
-
-
-
-
-        except (TypeError, ValueError):
-
-
-
-
-
-
-
-
-            pass
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    hourly_counts = [0] * 24
-
-
-
-
-
-
-
-
-    for _, stamp in recent_24:
-
-
-
-
-
-
-
-
-        hours_ago = int((now - stamp).total_seconds() // 3600)
-
-
-
-
-
-
-
-
-        if 0 <= hours_ago < 24:
-
-
-
-
-
-
-
-
-            hourly_counts[23 - hours_ago] += 1
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    seven_day = []
-
-
-
-
-
-
-
-
-    for days_ago in range(6, -1, -1):
-
-
-
-
-
-
-
-
-        day = (now - timedelta(days=days_ago)).strftime("%Y-%m-%d")
-
-
-
-
-
-
-
-
-        seven_day.append({
-
-
-
-
-
-
-
-
-            "day": day,
-
-
-
-
-
-
-
-
-            "label": (now - timedelta(days=days_ago)).strftime("%a"),
-
-
-
-
-
-
-
-
-            "count": sum(1 for _, stamp in recent_7 if stamp.strftime("%Y-%m-%d") == day),
-
-
-
-
-
-
-
-
-        })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    peak_hour = max(range(24), key=lambda hour: hourly_counts[hour]) if hourly_counts else 0
-
-
-
-
-
-
-
-
-    active_camera = max(camera_counts, key=camera_counts.get) if camera_counts else "1"
-
-
-
-
-
-
-
-
-    today_count = sum(1 for _, stamp in valid_events if stamp.strftime("%Y-%m-%d") == today_key)
-
-
-
-
-
-
-
-
-    average_confidence = round(sum(confidence_values) / len(confidence_values), 1) if confidence_values else 0
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    return {
-
-
-
-
-
-
-
-
-        "total_events": len(events),
-
-
-
-
-
-
-
-
-        "today_count": today_count,
-
-
-
-
-
-
-
-
-        "last_24_count": len(recent_24),
-
-
-
-
-
-
-
-
-        "last_7_count": len(recent_7),
-
-
-
-
-
-
-
-
-        "average_confidence": average_confidence,
-
-
-
-
-
-
-
-
-        "peak_hour": peak_hour,
-
-
-
-
-
-
-
-
-        "active_camera": int(active_camera),
-
-
-
-
-
-
-
-
-        "type_counts": type_counts,
-
-
-
-
-
-
-
-
-        "camera_counts": camera_counts,
-
-
-
-
-
-
-
-
-        "hourly_counts": hourly_counts,
-
-
-
-
-
-
-
-
-        "seven_day": seven_day,
-
-
-
-
-
-
-
-
-        "mock_data": not ANALYTICS_EVENTS_FILE.exists(),
-
-
-
-
-
-
-
-
-        "checked_at": now.isoformat(),
-
-
-
-
-
-
-
-
-    }
+def analytics_summary_api(request: Request) -> dict:
+    # Customer-portal identity, if any, gets its own tenant-scoped real
+    # summary (mock_data always False, even when there are zero real
+    # events) -- everyone else falls through to the exact original
+    # legacy/mock aggregation, unchanged.
+    customer_events = _customer_detection_events(request)
+    if customer_events is not None:
+        return _build_analytics_summary(customer_events, mock_data=False)
+    return _build_analytics_summary(analytics_events(), mock_data=not ANALYTICS_EVENTS_FILE.exists())
 
 
 
