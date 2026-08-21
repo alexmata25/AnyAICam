@@ -40,17 +40,23 @@ OFF this camera's "already handled" list and is retried on the next
 scan rather than dropped -- see _relay_camera_once()'s docstring for
 the exact mechanism.
 
-Playback format: recordings are uploaded exactly as start_recording()
-already writes them (MKV, video copied, no re-encode). No transcoding
-is performed by this module -- the playback-format decision (fMP4 vs.
-native vs. VOD-HLS) from the architecture doc remains open and, if a
-transcode step is wanted, is a follow-up addition to _upload_recording()
-below, not a redesign of the upload/notify flow this phase builds.
+Playback format: the pilot camera's codec was confirmed H.264 (ffprobe,
+2026-08-21) -- MKV itself is not reliably playable in a browser
+<video> element regardless of interior codec (no MKV demuxer in
+Chrome/Edge/Firefox), so each completed recording is stream-copy
+remuxed (no re-encode, no CPU-heavy transcode -- see _remux_to_mp4())
+into a standard, faststart MP4 before upload. If a future camera's
+codec is ever not H.264, this same remux would still run but MP4
+playback support for that codec is a separate, not-yet-decided
+question -- this module does not attempt to detect or branch on codec.
 
 This module never touches start_recording(), RECORDINGS_FOLDER's own
 naming, camera_url(), or the local recording pipeline in any way --
 local recording behavior is identical whether or not this worker is
-enabled.
+enabled. The original MKV is never opened for writing, moved, or
+deleted by this module under any outcome -- ffmpeg only ever reads it;
+the remuxed MP4 lives in a dedicated per-camera staging subfolder and
+is the only file this module ever removes.
 """
 
 import asyncio
@@ -59,6 +65,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 import urllib.error
@@ -87,6 +94,8 @@ SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SCAN_SEC
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CONFIG_REFRESH_SECONDS", "300.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SESSION_RENEW_MARGIN_SECONDS", "120")))
 MAX_TRACKED_FILES_PER_CAMERA = 200  # generous vs. live relay's 50: a recording that fails upload stays untracked (retried), so this only bounds successes
+REMUX_TIMEOUT_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_REMUX_TIMEOUT_SECONDS", "120")))
+DURATION_VERIFY_TOLERANCE_SECONDS = 10.0  # ffprobe's reported duration vs. (ended_at - started_at); relative tolerance below scales this up for longer clips
 
 recording_upload_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None}
 
@@ -263,6 +272,105 @@ def _recording_folder(camera_number: int) -> Path:
     return RECORDINGS_FOLDER / f"camera{camera_number}"
 
 
+def _staging_folder(camera_number: int) -> Path:
+    return _recording_folder(camera_number) / "_upload_staging"
+
+
+def _cleanup_staged_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _verify_output_duration(mp4_path: Path, expected_duration_seconds: float, camera_number: int) -> bool:
+    """Advisory when ffprobe itself can't be run at all (missing binary,
+    or times out) -- proceeds without verifying rather than blocking
+    every upload on an optional check. A real mismatch once ffprobe
+    DOES successfully report a duration is treated as a genuine remux
+    failure, not advisory -- this is the "preserve duration accurately"
+    guarantee actually being checked, not just assumed."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(mp4_path)],
+            capture_output=True, timeout=30, text=True, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if result.returncode != 0 or not result.stdout.strip():
+        return True
+    try:
+        actual_duration = float(result.stdout.strip())
+    except ValueError:
+        return True
+    tolerance = max(DURATION_VERIFY_TOLERANCE_SECONDS, expected_duration_seconds * 0.1)
+    if abs(actual_duration - expected_duration_seconds) > tolerance:
+        logger.warning(
+            "recording_upload.remux_duration_mismatch camera=%s expected=%.1f actual=%.1f",
+            camera_number, expected_duration_seconds, actual_duration,
+        )
+        return False
+    return True
+
+
+def _remux_to_mp4(mkv_path: Path, camera_number: int, expected_duration_seconds: float) -> Path | None:
+    """Stream-copy remux (no re-encode -- the pilot camera's own codec
+    is confirmed H.264, 2026-08-21) from the original MKV into a
+    browser-playable MP4 with the moov atom moved to the front
+    (+faststart), so a presigned S3 GET URL is seekable via ordinary
+    HTTP Range requests with no server-side change needed. Every
+    stream present is copied (-map 0 -c copy) rather than hardcoding
+    which tracks exist, matching start_recording()'s own optional-audio
+    convention (0:a:0?).
+
+    The original MKV is never opened for writing, never moved, never
+    deleted -- ffmpeg only ever reads it here. The MP4 is written to a
+    dedicated per-camera staging subfolder; the caller is responsible
+    for removing it once its own upload attempt concludes.
+
+    Returns None (caller skips this file, retried next scan) on any
+    failure: ffmpeg missing, non-zero exit, empty/missing output, or a
+    duration ffprobe reports as implausibly different from the
+    source's actual (ended_at - started_at) -- never uploads a file
+    that might be truncated or corrupt."""
+    staging_folder = _staging_folder(camera_number)
+    try:
+        staging_folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    output_path = staging_folder / (mkv_path.stem + ".mp4")
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(mkv_path), "-map", "0", "-c", "copy", "-movflags", "+faststart", str(output_path)],
+            capture_output=True, timeout=REMUX_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.warning("recording_upload.remux_failed camera=%s path=%s error=%s", camera_number, mkv_path, error)
+        _cleanup_staged_file(output_path)
+        return None
+
+    if result.returncode != 0:
+        logger.warning("recording_upload.remux_nonzero_exit camera=%s path=%s code=%s", camera_number, mkv_path, result.returncode)
+        _cleanup_staged_file(output_path)
+        return None
+
+    try:
+        output_size = output_path.stat().st_size
+    except OSError:
+        return None
+    if output_size <= 0:
+        logger.warning("recording_upload.remux_empty_output camera=%s path=%s", camera_number, mkv_path)
+        _cleanup_staged_file(output_path)
+        return None
+
+    if not _verify_output_duration(output_path, expected_duration_seconds, camera_number):
+        _cleanup_staged_file(output_path)
+        return None
+
+    return output_path
+
+
 def _recording_filename_pattern(camera_number: int) -> re.Pattern:
     # Requires the literal "camera{N}_" prefix for *this* camera followed by
     # start_recording()'s own strftime shape, ".mkv" only -- anything else
@@ -336,16 +444,18 @@ def _upload_recording(session: dict, local_path: Path, started_at: datetime) -> 
     )
     date_part = started_at.strftime("%Y/%m/%d")
     recording_key = f"{session['key_prefix']}{date_part}/{local_path.name}"
-    client.upload_file(str(local_path), session["bucket"], recording_key, ExtraArgs={"ContentType": "video/x-matroska"})
+    client.upload_file(str(local_path), session["bucket"], recording_key, ExtraArgs={"ContentType": "video/mp4"})
     return recording_key
 
 
 def _relay_camera_once(camera_number: int, camera_id: str) -> None:
-    """A failed upload or a failed/rejected catalog notification is
-    deliberately NOT added to _uploaded_files -- unlike live relay's
-    segments, a recording is durable evidence, not a disposable 2-second
-    fragment, so it stays pending and is retried on the next scan
-    instead of being dropped."""
+    """A failed remux, upload, or catalog notification is deliberately
+    NOT added to _uploaded_files -- unlike live relay's segments, a
+    recording is durable evidence, not a disposable 2-second fragment,
+    so it stays pending and is retried on the next scan instead of
+    being dropped. The original MKV is untouched by every one of these
+    failure paths; only the derived MP4 staging file is ever cleaned
+    up, and only after its own upload attempt concludes."""
     session = _ensure_session(camera_number, camera_id)
     if not session:
         return
@@ -362,21 +472,32 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
         except OSError:
             continue
         ended_at = datetime.fromtimestamp(stat.st_mtime)
+        expected_duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
+
+        mp4_path = _remux_to_mp4(local_path, camera_number, expected_duration_seconds)
+        if mp4_path is None:
+            continue  # original MKV untouched; retried next scan
+
         try:
-            recording_key = _upload_recording(session, local_path, started_at)
+            size_bytes = mp4_path.stat().st_size
+            recording_key = _upload_recording(session, mp4_path, started_at)
         except Exception as error:
             logger.warning("recording_upload.file_upload_failed camera=%s path=%s error=%s", camera_number, local_path, error)
+            _cleanup_staged_file(mp4_path)
             continue
+
         response = _control_plane_post(
             f"/api/appliance/recordings/{camera_id}/available",
             {
                 "s3_key": recording_key,
                 "started_at": started_at.isoformat(),
                 "ended_at": ended_at.isoformat(),
-                "duration_seconds": max(0, int((ended_at - started_at).total_seconds())),
-                "size_bytes": stat.st_size,
+                "duration_seconds": max(0, int(expected_duration_seconds)),
+                "size_bytes": size_bytes,
             },
         )
+        _cleanup_staged_file(mp4_path)  # transient artifact -- the S3 object is already durable at this point regardless of the notify outcome below
+
         if not isinstance(response, dict) or response.get("status") not in {"accepted", "duplicate"}:
             logger.warning("recording_upload.notify_failed camera=%s path=%s", camera_number, local_path)
             continue
