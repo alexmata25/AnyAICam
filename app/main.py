@@ -1,5 +1,5 @@
 import asyncio
-
+import concurrent.futures
 
 
 
@@ -16705,6 +16705,24 @@ CAMERA_STDERR_MAX_LINES = 20
 CAMERA_ERROR_MAX_CHARS = 500
 _CAMERA_STREAM_URL_PATTERN = re.compile(r"rtsp://\S+", re.IGNORECASE)
 
+# Dedicated executor for the two long-lived, indefinitely-blocking camera
+# calls below (process.wait() and the stderr-drain loop) -- mirrors
+# live_relay_uploader.py's own _relay_executor pattern exactly. Both calls
+# block for as long as their camera process keeps running, which for a
+# continuously-recording/streaming camera is indefinite by design; sharing
+# asyncio.to_thread()'s process-wide default executor with these permanent
+# holders was confirmed (2026-08-21, real pilot appliance) to starve every
+# other to_thread() caller in the process -- including recording_uploader.py's
+# own scan loop, whose asyncio.to_thread(_relay_camera_once, ...) dispatch
+# was proven to queue forever behind exactly this contention. Sized for 12
+# concurrent long-lived holders (4 cameras x 2 modes for process.wait(), plus
+# 4 more for live-mode's stderr drain) with headroom; oversized relative to
+# CPU count is correct here since every one of these threads spends its time
+# blocked on wait()/read(), not computing.
+_CAMERA_PROCESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="camera_process_wait",
+)
+
 
 def _redact_camera_stream_error(text: str) -> str:
     return _CAMERA_STREAM_URL_PATTERN.sub("rtsp://<redacted>", text)
@@ -16726,7 +16744,7 @@ async def _drain_camera_stderr(camera_number: int, process: subprocess.Popen, bu
                     del buffer[0]
         except (OSError, ValueError):
             pass
-    await asyncio.to_thread(read_lines)
+    await asyncio.get_running_loop().run_in_executor(_CAMERA_PROCESS_EXECUTOR, read_lines)
 
 
 def _bounded_camera_error(stderr_tail: list[str]) -> str:
@@ -16871,7 +16889,7 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         try:
-            return_code = await asyncio.to_thread(process.wait)
+            return_code = await asyncio.get_running_loop().run_in_executor(_CAMERA_PROCESS_EXECUTOR, process.wait)
         finally:
             if watchdog_task is not None:
                 watchdog_task.cancel()
