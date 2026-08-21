@@ -6,6 +6,56 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — R4: Connect customer Playback to the recording catalog (foundation only)
+
+**Phase:** R4 of the recording-pipeline roadmap. Scope: customer retrieval
+wiring only, per the approved architecture. R5 was explicitly not started.
+
+**Production backup:** `app/main.py.pre-r4-customer-playback-wiring-20260820-213548`.
+
+**Commit:** `b04fe0065c351e6cf252ad762f27e05325754c48` on branch
+`production-reconcile-20260820`, pushed to GitHub, synced to the Ryzen 5
+worktree — all three confirmed at this commit with matching file hashes.
+
+**Files changed:**
+- `app/main.py` — `_customer_camera_recordings(camera_id)` now runs a real query against R2's `recordings` table (`WHERE camera_id=? AND status='available'`), returning the `{start,end,url,name}` shape the Playback UI has expected since it was built. New `_presigned_recording_url(s3_key)` signs GET URLs via a dedicated, read-only STS role — fails closed (`None`) when unconfigured; a recording with no signable URL is skipped, never shown as a dead link.
+- `docs/r4-recording-read-iam.md` *(new)* — the read-only role's IAM design + illustrative (not executed) AWS CLI commands, same split as R1's doc.
+- `app/tests/test_customer_recordings_r4.py` *(new)* — 7 tests, including a direct, formal re-verification of the approved gate (owner sees all own cameras; viewer with no `can_playback` grant sees none).
+
+**Verification performed:**
+- `ast.parse` clean on `main.py`.
+- **33/33 tests passed** (7 new + 12 R3 + 9 R1 + 5 R2) run inside the actual deployed container — `main.py` can only be imported there or via Windows-native Python (a pre-existing, already-documented project constraint).
+- Confirmed the real production `recordings` table is still **0 rows** after the test run — all test seeding used a throwaway sqlite file via `override_target()`, never the real database.
+- Live-relay, R1, R2, R3, and all customer-facing routes (`/customer-live`, `/playback`, `/customer-account`) confirmed unaffected.
+- `docker compose restart vms` → healthy, no new errors in logs.
+- **Zero frontend changes** — the Playback page's timeline, legend, clip list, and transport controls are byte-for-byte untouched. Zero changes to Live, Settings, partner portal, or admin portal. Subscriptions/entitlements untouched.
+
+**File hash verification (EC2 == GitHub == Ryzen 5), all at commit `b04fe00`:**
+
+| File | SHA-256 |
+|---|---|
+| `app/main.py` | `b9dd1c68...c72f1c4f0777cabc3c5b086c2` |
+| `app/tests/test_customer_recordings_r4.py` | `49fa602d...eeeb2950e3615318d56596` |
+| `docs/r4-recording-read-iam.md` | `03b18831...6663bdd` |
+
+**Rollback:** restore `main.py.pre-r4-customer-playback-wiring-20260820-213548`, restart `vms`. On Git: `git revert b04fe00` followed by a push.
+
+**What's implemented:**
+- The real tenant-safe query path from the `recordings` catalog to the customer Playback page, gated by the same `customer_owner`/`customer_viewer` scoping already proven for Live and the camera list.
+- A working, fail-closed presigned-URL mechanism, ready for real traffic the moment its role exists.
+- Formal test coverage of the exact approved access-control gate.
+
+**What still needs to be done before this is customer-visible:**
+1. **R1's upload-role IAM** (`docs/r1-recording-iam.md`) must be applied in AWS, and `ANYAICAM_RECORDING_UPLOAD_ENABLED` set true, before any real recording can be uploaded at all.
+2. **R4's new read-role IAM** (`docs/r4-recording-read-iam.md`) must *also* be applied — a separate, read-only role from the upload role — before any uploaded recording can actually be served to a customer's browser, and `ANYAICAM_RECORDING_READ_ROLE_ARN`/`ANYAICAM_RECORDING_S3_BUCKET`/`AWS_REGION` set.
+3. A real appliance running R3's uploader (pilot appliance, `RUNTIME_ROLE=edge`) needs to actually produce and upload recordings for any catalog row to exist.
+4. **R5 (retention/lifecycle)** hasn't been built yet — recordings would currently accumulate with no expiration once real uploads begin.
+5. The playback-format decision (native MKV vs. transcoded fMP4 vs. VOD-HLS) is still open — R3 currently uploads native MKV, which may not play/seek reliably in all browsers once real footage exists; this doesn't block R4/R5 but should be revisited before broad rollout.
+
+Until all of #1–#3 above are done, Playback will continue to show "No recordings available yet" for every customer — correctly and safely, by design.
+
+---
+
 ## 2026-08-21 — R3: Appliance-side recording uploader (foundation only)
 
 **Phase:** R3 of the recording-pipeline roadmap. Scope: the appliance-side
