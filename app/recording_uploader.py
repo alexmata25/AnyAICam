@@ -40,23 +40,38 @@ OFF this camera's "already handled" list and is retried on the next
 scan rather than dropped -- see _relay_camera_once()'s docstring for
 the exact mechanism.
 
-Playback format: the pilot camera's codec was confirmed H.264 (ffprobe,
-2026-08-21) -- MKV itself is not reliably playable in a browser
+Playback format: MKV itself is not reliably playable in a browser
 <video> element regardless of interior codec (no MKV demuxer in
-Chrome/Edge/Firefox), so each completed recording is stream-copy
-remuxed (no re-encode, no CPU-heavy transcode -- see _remux_to_mp4())
-into a standard, faststart MP4 before upload. If a future camera's
-codec is ever not H.264, this same remux would still run but MP4
-playback support for that codec is a separate, not-yet-decided
-question -- this module does not attempt to detect or branch on codec.
+Chrome/Edge/Firefox), so every completed recording gets a browser-
+compatible cloud copy prepared before upload -- automatically, per
+file, based on its own actual codec (_detect_video_codec()), never a
+fixed assumption and never something a customer or installer has to
+configure:
+
+  - H.264 (confirmed on the pilot camera, 2026-08-21): stream-copy
+    remux into a standard, faststart MP4 -- no re-encode, negligible
+    CPU (_remux_to_mp4()).
+  - H.265/HEVC: a real re-encode to H.264 is required -- browser HEVC
+    support is inconsistent enough that a stream-copy remux alone
+    would not be reliably playable. A fast x264 preset bounds the
+    CPU cost per job, and a module-level semaphore
+    (TRANSCODE_MAX_CONCURRENCY, default 1) bounds how many transcodes
+    ever run at once on this appliance, regardless of how many
+    cameras have pending files -- see _transcode_hevc_to_h264().
+  - Anything else, or a codec ffprobe can't even determine: fails
+    safe. No cloud copy is prepared, no catalog notification is ever
+    sent for that file (so no broken Playback entry can exist), the
+    reason is logged once, and the original recording is left exactly
+    as it was -- see _prepare_cloud_copy().
 
 This module never touches start_recording(), RECORDINGS_FOLDER's own
 naming, camera_url(), or the local recording pipeline in any way --
 local recording behavior is identical whether or not this worker is
 enabled. The original MKV is never opened for writing, moved, or
 deleted by this module under any outcome -- ffmpeg only ever reads it;
-the remuxed MP4 lives in a dedicated per-camera staging subfolder and
-is the only file this module ever removes.
+the derived MP4 (remuxed or transcoded) lives in a dedicated
+per-camera staging subfolder and is the only file this module ever
+removes.
 """
 
 import asyncio
@@ -96,6 +111,19 @@ SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_UP
 MAX_TRACKED_FILES_PER_CAMERA = 200  # generous vs. live relay's 50: a recording that fails upload stays untracked (retried), so this only bounds successes
 REMUX_TIMEOUT_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_REMUX_TIMEOUT_SECONDS", "120")))
 DURATION_VERIFY_TOLERANCE_SECONDS = 10.0  # ffprobe's reported duration vs. (ended_at - started_at); relative tolerance below scales this up for longer clips
+CODEC_DETECT_TIMEOUT_SECONDS = 30
+# H.265/HEVC needs a real re-encode -- these bound its CPU footprint on the
+# appliance. TRANSCODE_MAX_CONCURRENCY is the queued/limited-concurrency
+# mechanism: at most this many transcodes run at once, across every camera
+# on this appliance, regardless of how many files are pending; everything
+# beyond that blocks (queues) on _transcode_semaphore.acquire() rather than
+# starting. TRANSCODE_THREADS additionally caps ffmpeg's own internal
+# thread count per job, so even a single transcode doesn't claim every core.
+TRANSCODE_PRESET = os.environ.get("ANYAICAM_RECORDING_TRANSCODE_PRESET", "veryfast").strip()
+TRANSCODE_CRF = max(0, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_CRF", "23")))
+TRANSCODE_THREADS = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_THREADS", "2")))
+TRANSCODE_TIMEOUT_SECONDS = max(60, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_TIMEOUT_SECONDS", "600")))
+TRANSCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_MAX_CONCURRENCY", "1")))
 
 recording_upload_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None}
 
@@ -103,6 +131,8 @@ _lock = threading.Lock()
 _camera_map: dict[int, dict] = {}          # camera_number -> {"camera_id":..., "site_id":...}, refreshed periodically
 _sessions: dict[int, dict] = {}            # camera_number -> {credentials, bucket, key_prefix, expires_at}
 _uploaded_files: dict[int, list[str]] = {}  # camera_number -> successfully uploaded+notified filenames (bounded)
+_unsupported_codec_files: dict[int, set[str]] = {}  # camera_number -> filenames already logged as unsupported/undetected this process lifetime -- avoids re-probing/re-logging the same permanently-bad file every scan
+_transcode_semaphore = threading.Semaphore(TRANSCODE_MAX_CONCURRENCY)
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -425,6 +455,116 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
     return pending
 
 
+def _detect_video_codec(mkv_path: Path) -> str | None:
+    """ffprobe's first video stream's codec_name, lowercased. None means
+    "couldn't determine" -- callers must treat that identically to a
+    genuinely unsupported codec, never assume h264 by default."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", str(mkv_path)],
+            capture_output=True, timeout=CODEC_DETECT_TIMEOUT_SECONDS, text=True, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.warning("recording_upload.codec_detect_failed path=%s error=%s", mkv_path, error)
+        return None
+    if result.returncode != 0:
+        return None
+    codec = result.stdout.strip().lower()
+    return codec or None
+
+
+def _transcode_hevc_to_h264(mkv_path: Path, camera_number: int, expected_duration_seconds: float) -> Path | None:
+    """Real re-encode via ffmpeg's libx264 encoder -- H.265/HEVC has no
+    free (stream-copy) path to a codec browsers reliably decode, unlike
+    H.264. TRANSCODE_PRESET is chosen for speed over compression
+    efficiency (this is a one-time background job, not a live stream),
+    and TRANSCODE_THREADS caps ffmpeg's own thread use per job so a
+    single transcode doesn't claim every core on the appliance.
+
+    _transcode_semaphore is the queued/limited-concurrency mechanism:
+    acquire() blocks (queues) here, with no timeout, until fewer than
+    TRANSCODE_MAX_CONCURRENCY transcodes are already running anywhere
+    on this appliance -- safe to block indefinitely since this always
+    runs inside asyncio.to_thread(), never on the event loop itself.
+    Audio is stream-copied unchanged (already AAC, already
+    MP4-compatible) -- only the video stream is actually re-encoded."""
+    staging_folder = _staging_folder(camera_number)
+    try:
+        staging_folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    output_path = staging_folder / (mkv_path.stem + ".mp4")
+
+    _transcode_semaphore.acquire()
+    try:
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(mkv_path),
+                 "-map", "0:v:0", "-map", "0:a:0?",
+                 "-c:v", "libx264", "-preset", TRANSCODE_PRESET, "-crf", str(TRANSCODE_CRF),
+                 "-threads", str(TRANSCODE_THREADS),
+                 "-c:a", "copy", "-movflags", "+faststart", str(output_path)],
+                capture_output=True, timeout=TRANSCODE_TIMEOUT_SECONDS, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            logger.warning("recording_upload.transcode_failed camera=%s path=%s error=%s", camera_number, mkv_path, error)
+            _cleanup_staged_file(output_path)
+            return None
+    finally:
+        _transcode_semaphore.release()
+
+    if result.returncode != 0:
+        logger.warning("recording_upload.transcode_nonzero_exit camera=%s path=%s code=%s", camera_number, mkv_path, result.returncode)
+        _cleanup_staged_file(output_path)
+        return None
+
+    try:
+        output_size = output_path.stat().st_size
+    except OSError:
+        return None
+    if output_size <= 0:
+        logger.warning("recording_upload.transcode_empty_output camera=%s path=%s", camera_number, mkv_path)
+        _cleanup_staged_file(output_path)
+        return None
+
+    if not _verify_output_duration(output_path, expected_duration_seconds, camera_number):
+        _cleanup_staged_file(output_path)
+        return None
+
+    return output_path
+
+
+def _prepare_cloud_copy(mkv_path: Path, camera_number: int, expected_duration_seconds: float) -> Path | None:
+    """Codec-aware dispatch -- the customer/installer never chooses a
+    conversion method, this decides automatically per file:
+
+      - h264 -> _remux_to_mp4() (stream copy, negligible CPU)
+      - hevc/h265 -> _transcode_hevc_to_h264() (real re-encode,
+        concurrency-limited)
+      - anything else, or undetectable -> fails safe: no cloud copy is
+        prepared, so _relay_camera_once() never notifies R2's catalog
+        endpoint for this file and no broken Playback entry can ever
+        exist for it. Logged once (not every scan) via
+        _unsupported_codec_files -- the original recording is left
+        exactly as it was in every case."""
+    already_known_unsupported = _unsupported_codec_files.get(camera_number, set())
+    if mkv_path.name in already_known_unsupported:
+        return None
+
+    codec = _detect_video_codec(mkv_path)
+    if codec == "h264":
+        return _remux_to_mp4(mkv_path, camera_number, expected_duration_seconds)
+    if codec in {"hevc", "h265"}:
+        return _transcode_hevc_to_h264(mkv_path, camera_number, expected_duration_seconds)
+
+    logger.warning(
+        "recording_upload.codec_unsupported camera=%s path=%s codec=%s",
+        camera_number, mkv_path, codec or "undetected",
+    )
+    _unsupported_codec_files.setdefault(camera_number, set()).add(mkv_path.name)
+    return None
+
+
 def _remember_uploaded(camera_number: int, filename: str) -> None:
     uploaded = _uploaded_files.setdefault(camera_number, [])
     uploaded.append(filename)
@@ -449,13 +589,17 @@ def _upload_recording(session: dict, local_path: Path, started_at: datetime) -> 
 
 
 def _relay_camera_once(camera_number: int, camera_id: str) -> None:
-    """A failed remux, upload, or catalog notification is deliberately
-    NOT added to _uploaded_files -- unlike live relay's segments, a
-    recording is durable evidence, not a disposable 2-second fragment,
-    so it stays pending and is retried on the next scan instead of
-    being dropped. The original MKV is untouched by every one of these
-    failure paths; only the derived MP4 staging file is ever cleaned
-    up, and only after its own upload attempt concludes."""
+    """A failed codec-prep (remux or transcode -- see
+    _prepare_cloud_copy()), upload, or catalog notification is
+    deliberately NOT added to _uploaded_files -- unlike live relay's
+    segments, a recording is durable evidence, not a disposable
+    2-second fragment, so it stays pending and is retried on the next
+    scan instead of being dropped (an unsupported/undetectable codec
+    is the one exception -- see _prepare_cloud_copy()'s own per-process
+    de-dup, which never retries or re-logs it, but still never touches
+    or deletes the original either). The original MKV is untouched by
+    every one of these paths; only the derived MP4 staging file is
+    ever cleaned up, and only after its own upload attempt concludes."""
     session = _ensure_session(camera_number, camera_id)
     if not session:
         return
@@ -474,9 +618,9 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
         ended_at = datetime.fromtimestamp(stat.st_mtime)
         expected_duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
 
-        mp4_path = _remux_to_mp4(local_path, camera_number, expected_duration_seconds)
+        mp4_path = _prepare_cloud_copy(local_path, camera_number, expected_duration_seconds)
         if mp4_path is None:
-            continue  # original MKV untouched; retried next scan
+            continue  # unsupported codec, or remux/transcode failed -- original MKV untouched either way
 
         try:
             size_bytes = mp4_path.stat().st_size
