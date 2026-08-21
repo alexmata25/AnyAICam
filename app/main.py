@@ -137506,38 +137506,101 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
         ]
 
 
+def _presigned_recording_url(s3_key: str) -> str | None:
+    """R4 (recording-pipeline roadmap): signs a short-lived GET URL for
+    one recording object. Fails closed (returns None) whenever the
+    read-capable role isn't configured -- see
+    docs/r4-recording-read-iam.md -- the same "code built, real AWS
+    role applied separately" pattern R1 already established for upload
+    credentials. This app's own EC2 instance role deliberately has no
+    direct S3 access (R1's IAM design), so generating a valid presigned
+    URL requires assuming a dedicated, read-only, GetObject-scoped role
+    via STS -- never the write-only upload role, which cannot read.
+    A recording with no signable URL is skipped by the caller rather
+    than shown as a dead link -- see _customer_camera_recordings()."""
+    role_arn = os.getenv('ANYAICAM_RECORDING_READ_ROLE_ARN', '').strip()
+    bucket = os.getenv('ANYAICAM_RECORDING_S3_BUCKET', '').strip()
+    region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', '')).strip()
+    if not role_arn or not bucket or not region:
+        return None
+    try:
+        import boto3
+    except ImportError:
+        return None
+    try:
+        sts = boto3.client('sts', region_name=region)
+        assumed = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=f'recording-read-{secrets.token_hex(6)}',
+            DurationSeconds=900,
+        )
+        creds = assumed['Credentials']
+        s3 = boto3.client(
+            's3', region_name=region,
+            aws_access_key_id=creds['AccessKeyId'],
+            aws_secret_access_key=creds['SecretAccessKey'],
+            aws_session_token=creds['SessionToken'],
+        )
+        return s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': s3_key}, ExpiresIn=900)
+    except Exception:
+        logging.getLogger('anyaicam.recording_read').exception('recording_read.presign_failed')
+        return None
+
+
 def _customer_camera_recordings(camera_id: str) -> list[dict]:
     """Recorded clips available for one customer camera (by cameras.id),
-    each shaped {"start", "end", "url", "name"}. Deliberately returns []
-    unconditionally today -- confirmed by direct investigation (2026-08-20)
-    that the only on-disk recording pipeline in this codebase
-    (RECORDINGS_FOLDER/camera{N}/*.mkv, keyed by the legacy
-    appliance-local camera_number) is fed by THIS box's own local
-    test-camera env vars (CAMERA1_HOST..CAMERA4_HOST, private LAN IPs),
-    not by any customer's actual appliance, is empty/inactive right now,
-    and is fundamentally unsafe to key customer playback on: camera_number
-    is only unique per-appliance (see db_migrations.py's
-    idx_cameras_appliance_camera_number), never globally, so a second
-    customer/appliance sharing a camera_number would collide in the same
-    shared folder. The real multi-tenant recording pipeline (appliance-
-    captured footage retrievable by this cameras.id) does not exist yet --
-    this app's own startup diagnostics self-report
-    "cloud_recording_ready": false, and the customer_clip_shares/
-    recording_id schema meant for this is entirely unused. Once that
-    pipeline exists, replace this function's body with the real
-    per-camera-id query; every caller (the customer Playback page) already
-    expects exactly this shape and needs no other change."""
-    return []
+    each shaped {"start", "end", "url", "name"} -- the exact shape the
+    customer Playback page's JS has expected since it was built.
+
+    Ownership/permission authorization for camera_id is already fully
+    enforced by the caller before this is ever invoked -- see
+    _customer_playback_cameras(), which only ever returns cameras the
+    authenticated identity is actually allowed to see (the full fleet
+    for customer_owner, or only can_playback-granted cameras for
+    customer_viewer). This function trusts that upstream scoping and
+    only ever queries recordings already narrowed to the camera_id it
+    was given, exactly as its own docstring always said the real query
+    would once R2's catalog existed.
+
+    A recording whose object can't be presigned yet (R4's read-role
+    from docs/r4-recording-read-iam.md not yet applied in AWS) is
+    skipped entirely rather than shown as a dead link -- honest-empty
+    beats broken-link, matching this whole project's established
+    fail-closed convention."""
+    from partner_db import connection
+    with connection() as db:
+        catalog_rows = db.execute(
+            "SELECT s3_key, started_at, ended_at FROM recordings "
+            "WHERE camera_id=? AND status='available' "
+            "ORDER BY started_at",
+            (camera_id,),
+        ).fetchall()
+
+    recordings = []
+    for catalog_row in catalog_rows:
+        url = _presigned_recording_url(catalog_row['s3_key'])
+        if not url:
+            continue
+        recordings.append({
+            'start': catalog_row['started_at'],
+            'end': catalog_row['ended_at'],
+            'url': url,
+            'name': catalog_row['s3_key'].rsplit('/', 1)[-1],
+        })
+    return recordings
 
 
 def _render_customer_playback(cameras: list[dict]) -> str:
     """Renders the customer Playback page for an already-scoped camera
     list (see _customer_playback_cameras()). Never shows live video --
-    the video element only ever receives a recorded clip's own URL, and
-    with no recording backend wired up yet (_customer_camera_recordings()
-    always returns []), it honestly shows "No recordings available yet"
-    instead of substituting live HLS the way the legacy monitor-wall
-    template does."""
+    the video element only ever receives a recorded clip's own URL.
+    _customer_camera_recordings() now queries R2's real catalog (R4),
+    but still returns [] in practice today: the catalog is empty until
+    R3's appliance uploader is enabled, and even a populated catalog
+    entry is skipped rather than shown until R4's own read-role
+    (docs/r4-recording-read-iam.md) is applied in AWS -- so this page
+    still honestly shows "No recordings available yet" exactly as
+    before, for real reasons rather than a hardcoded stub."""
     if not cameras:
         content = (
             '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
