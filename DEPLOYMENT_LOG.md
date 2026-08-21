@@ -6,6 +6,61 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — R5: Recording retention and lifecycle sweep (foundation only)
+
+**Phase:** R5 of the recording-pipeline roadmap. Scope: retention policy
+enforcement and automatic cleanup only, per the approved architecture and
+your explicit preference for straightforward hard deletion over an
+archive tier.
+
+**Production backup:** `app/main.py.pre-r5-retention-sweep-20260820-215013`.
+
+**Commit:** `c274c218f785b5e80cc4f935584541ac4b90c826` on branch
+`production-reconcile-20260820`, pushed to GitHub, synced to the Ryzen 5
+worktree — all three confirmed at this commit with matching file hashes.
+
+**Files changed:**
+- `app/recording_retention_sweep.py` *(new)* — periodic cloud-side worker (mirrors `live_relay_idle_sweep.py`'s tick/worker shape) that hard-deletes a recording (S3 object + catalog row) once older than its **owning customer's own current plan's `retention_days`** — never hardcoded. A recording with no plan on file is left alone. A recording is only removed from the catalog after its S3 delete is confirmed, so a failure is retried, not lost track of.
+- `app/main.py` *(modified, +14 lines)* — four small additions mirroring the existing worker-wiring shape, dual-gated (`RUNTIME_ROLE` + its own dedicated `ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED` flag, defaulting off).
+- `docs/r5-recording-lifecycle-iam.md` *(new)* — the delete-only role's IAM design (a **fourth**, independently-scoped role — upload/read/delete are each their own role now), plus an illustrative S3 bucket lifecycle rule as a failsafe backstop (not the primary mechanism — S3 rules can't read a database column).
+- `app/tests/test_recording_retention_sweep.py` *(new)* — 9 tests, including a direct, formal re-verification of the exact approved gate.
+
+**Verification performed:**
+- `ast.parse` clean on both files, locally and on production.
+- **42/42 tests passed** (9 new + 12 R3 + 9 R1 + 5 R2 + 7 R4) run inside the actual deployed container.
+- **The exact approved gate, verified directly**: a 2-day-plan customer's recording 3 days old is confirmed deleted (object-delete called, catalog row removed); a 30-day-plan customer's recording at the same age is confirmed untouched (object-delete never attempted). Also verified: most-recent-plan selection on a plan upgrade, no-plan-on-file safety (never deletes, regardless of age), failed-delete retry-safety, and the exactly-at-the-boundary edge case (not yet expired at exactly N days).
+- Confirmed inside the container: worker correctly stays inert on this box (`RUNTIME_ROLE=cloud`, flag unset).
+- Real production `recordings` table confirmed still 0 rows after the test run.
+- Live-relay, R1, R2, R3, R4, and all customer-facing routes confirmed unaffected. **Zero customer, partner, or admin UI changes** — this phase is entirely a cloud-side background worker.
+- `docker compose restart vms` → healthy, no new errors in logs.
+
+**File hash verification (EC2 == GitHub == Ryzen 5), all at commit `c274c21`:**
+
+| File | SHA-256 |
+|---|---|
+| `app/main.py` | `8af25948...ca14ecd90932abb7af3c1a07` |
+| `app/recording_retention_sweep.py` | `c590c504...ec63b5f8acac07b5e15e94f9a` |
+| `app/tests/test_recording_retention_sweep.py` | `abdcf18a...94ec242fa0d7f632ce81f9df8` |
+| `docs/r5-recording-lifecycle-iam.md` | `eb7628f7...8f23820bd4e9f3a9f65bde76` |
+
+**Rollback:** restore `main.py.pre-r5-retention-sweep-20260820-215013`, delete `app/recording_retention_sweep.py`, restart `vms`. On Git: `git revert c274c21` followed by a push.
+
+**What's implemented (R1 through R5 complete):**
+- End-to-end foundation: tenant-safe upload credentials (R1) → durable catalog (R2) → appliance-side uploader (R3) → customer-facing retrieval with presigned URLs (R4) → automatic, plan-derived retention cleanup (R5).
+- Four independently-scoped IAM roles designed (upload/read/delete, plus the pre-existing live-relay role), each fails closed until applied.
+- Every phase individually tested, verified against the real deployed container, and fully synced across EC2/GitHub/Ryzen 5.
+
+**What still remains before production rollout:**
+1. **Three IAM roles must actually be applied in AWS** — `docs/r1-recording-iam.md` (upload), `docs/r4-recording-read-iam.md` (read), `docs/r5-recording-lifecycle-iam.md` (delete) — none of this application code can create them; each requires IAM-admin AWS credentials.
+2. **A dedicated recordings S3 bucket** (or prefix decision finalized) with the illustrative failsafe lifecycle rule from `docs/r5-recording-lifecycle-iam.md` actually applied.
+3. **Four feature flags flipped on**, in order, only after each is individually verified: `ANYAICAM_RECORDING_UPLOAD_ENABLED` (R1/R3), `ANYAICAM_RECORDING_RETENTION_SWEEP_ENABLED` (R5) — `ANYAICAM_RECORDING_READ_ROLE_ARN` (R4) is set as soon as its role exists, no separate boolean flag gates it.
+4. **A real pilot appliance** running R3's uploader end-to-end, producing real catalog rows — the R1/R3 architecture gate ("one real end-to-end upload confirmed on the pilot appliance") has not yet been exercised against real AWS.
+5. **The playback-format decision is still open** — R3 uploads native MKV; this should be revisited before broad rollout since MKV isn't reliably browser-seekable (the original reason customer Playback was never wired to the legacy local recording scheme in the first place).
+6. **Cost and monitoring**: no alerting exists yet on sweep failures, upload failures, or unexpected deletion volume — worth adding before this runs unattended in production.
+7. Everything remains fully disabled by default; flipping flags on should happen one at a time, verified at each step, ideally against a single pilot appliance/customer before any broader rollout — matching the same discipline the live-relay rollout (Phase 6f/8) already used.
+
+---
+
 ## 2026-08-21 — R4: Connect customer Playback to the recording catalog (foundation only)
 
 **Phase:** R4 of the recording-pipeline roadmap. Scope: customer retrieval
