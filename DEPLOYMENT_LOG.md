@@ -6,6 +6,102 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — Customer-facing analytics reads: tenant-scoped cloud `detection_events` replaces mock fallback
+
+**Feature:** authenticated portal customers now see their own real,
+tenant-scoped detection events through the existing
+`GET /api/analytics/events` and `GET /api/analytics/summary` routes
+(and the existing `/analytics` page, unchanged — its client-side
+`fetch()` calls are same-origin and already carry the customer's
+session cookie), instead of the local `analytics_events.json`/mock
+fallback. Every non-customer caller (no session, or a non-customer-
+portal role) is completely unaffected — same
+`analytics_events()`/`mock_analytics_events()` fallback as before,
+byte-for-byte.
+
+**Application commit deployed:** `f69629f`
+**Branch:** `production-reconcile-20260820`
+**Deployment time:** `2026-08-21T21:12:02Z`
+
+**Implementation (`app/main.py` only):**
+- New `_customer_detection_events(request)` — mirrors
+  `_customer_playback_cameras()`'s exact identity/role/scoping
+  pattern (`partner_identity(request)`, gated to
+  `CUSTOMER_PORTAL_ROLES`). `customer_owner` is scoped strictly to
+  `detection_events.customer_id == identity.customer_id`;
+  `customer_viewer` is further restricted to cameras where
+  `customer_camera_permissions.can_playback=1` (reusing that existing
+  permission rather than adding a dedicated `can_view_analytics`
+  column — a smallest-change choice, worth a dedicated permission
+  later if the two should diverge). Returns `None` for any
+  non-customer-portal caller, which both routes treat as "render the
+  existing legacy/mock experience unchanged". Scope always comes from
+  the authenticated identity and server-side JOINs to
+  `cameras`/`sites` — never from any request parameter.
+- New `_build_analytics_summary(events, mock_data)` — the original
+  aggregation body extracted verbatim and parameterized, zero logic
+  changes, shared by both branches so the type/camera/hourly/7-day
+  breakdown exists exactly once.
+- `analytics_event_search()` (`GET /api/analytics/events`) and
+  `analytics_summary_api()` (`GET /api/analytics/summary`) both gained
+  a `request: Request` parameter and branch on
+  `_customer_detection_events(request)`. A real customer with zero
+  events gets `[]` with `mock_data:false` — an honest empty state can
+  never be reported as demo/mock activity.
+- Untouched by this milestone: YOLO/person detection, motion
+  detection, the analytics-sync worker (edge → cloud ingestion into
+  `detection_events`), and the recording pipeline. This is a read-path
+  change only.
+
+**Validation (disposable environment — fresh clone, standalone
+container, never touching the real `anyaicam-vms`):**
+- New suite (`tests/test_customer_analytics_events.py`): **16/16 passed**
+- Full suite: **128/128 passed**
+
+**Production backup checkpoint:** `20260821-210607`
+- DB: `recordings/partner_portal.db.sqlite-backup-pre-customer-analytics-deploy-20260821-210607`
+- `.env`: `backups/env-pre-customer-analytics-deploy-20260821-210607`
+- App directory: `backups/app-pre-customer-analytics-deploy-20260821-210607.tar.gz`
+- Compose file: `backups/docker-compose.pre-customer-analytics-deploy-20260821-210607.yml`
+- Rollback reference: `backups/rollback-reference-20260821-210607.txt`
+
+**Verification performed after deployment:**
+- Production container healthy after `docker compose up -d --force-recreate vms`.
+- `detection_events` remained exactly 1 row; proof event `b2609518c1ae`
+  unchanged (same id, camera, site, event_type, confidence, timestamp).
+- Real authenticated `customer_owner` call (minted via the app's own
+  live session-signing mechanism against the real, already-existing
+  account for this customer — no new DB rows, no session_id, nothing
+  written) returned:
+  - `GET /api/analytics/events` → `mock_data:false`, exactly 1 event,
+    `camera:3`, `site:"Home"`, `event_type:"car"`,
+    `confidence:0.6666`, `thumbnail:null`, `linked_recording:null`.
+  - `GET /api/analytics/summary` → `total_events:1`,
+    `type_counts:{"car":1}`, `camera_counts:{"3":1}`,
+    `active_camera:3`, `mock_data:false`.
+- Authenticated non-customer (`administrator`) call to both routes
+  confirmed the legacy path is reached and behaves exactly as before
+  (same local-file-backed response, unaffected by this change).
+- Existing appliance/recording routes remained healthy; real appliance
+  traffic (`/configuration`, `/heartbeat`, `/cameras`, `/commands`,
+  `/scan-jobs`, `/recordings/status`) uninterrupted through the
+  recreate.
+- Zero new errors/tracebacks/exceptions in logs since the recreate.
+- Ryzen was not touched during this rollout.
+
+**Current safety state:** `ANYAICAM_ANALYTICS_SYNC_ENABLED=false`,
+`ANYAICAM_RECORDING_UPLOAD_ENABLED=false` — analytics ingestion
+(edge → cloud sync into `detection_events`) remains disabled on both
+EC2 and Ryzen; this milestone only changes how the single existing
+proof row is *read*, not how new rows arrive.
+
+**Rollback:** restore the `20260821-210607` checkpoint (DB/`.env`/app
+directory/compose file) or `git revert f69629f`, then
+`docker compose up -d --force-recreate vms`. No schema rollback
+required — this milestone added no migration and no new table.
+
+---
+
 ## 2026-08-21 — Pilot activation: AWS recording resources verified, cloud-side config set (still inert)
 
 **Phase:** First activation step of the controlled pilot rollout. Not a
