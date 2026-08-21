@@ -6,6 +6,109 @@ before being considered done. Format: newest entry first.
 
 ---
 
+## 2026-08-21 — Pilot activation prep: codec-aware cloud copy (H.264 remux, HEVC transcode, unsupported fail-safe)
+
+**Phase:** Pre-activation step of the controlled pilot rollout, extending the
+prior MKV → MP4 remux entry below from H.264-only to codec-aware. Not a new
+R-numbered phase. Prompted by your requirement that AnyAiCam support both
+H.264 and H.265/HEVC cameras automatically, with no manual codec selection
+by the customer or installer, and with appliance CPU load considered for
+any transcode work.
+
+**Production backup:** `app/recording_uploader.py.pre-codec-aware-20260820-223745`.
+
+**Commit:** `d779e57a4a67678e4bc3e08b1012f583c579d44e` on branch
+`production-reconcile-20260820`, pushed to GitHub, synced to the Ryzen 5
+worktree — all three confirmed at this commit with matching file hashes.
+
+**What changed:**
+- `_detect_video_codec()` *(new)* — ffprobe-based codec detection run once
+  per completed recording before any cloud copy is prepared. Returns
+  `None` (never raises) on any probe failure.
+- `_prepare_cloud_copy()` *(new)* — the codec-aware dispatch point, now
+  called from `_relay_camera_once()` in place of the old direct call to
+  `_remux_to_mp4()`:
+  - **h264** → `_remux_to_mp4()` (unchanged stream-copy path from the
+    prior entry — still free, still no re-encode).
+  - **hevc / h265** → `_transcode_hevc_to_h264()` *(new)* — a real
+    `ffmpeg -c:v libx264` re-encode (audio stream-copied, not
+    re-encoded), faststart, same duration-verification check as the
+    remux path. Browser support for HEVC is not assumed.
+  - **anything else, or undetected** → returns `None`. The original MKV
+    is left completely untouched, the reason is logged once per file
+    (a per-camera in-memory set avoids re-probing/re-logging the same
+    file on every scan tick), and **no `recordings` catalog row is ever
+    created** for it — Playback never gets a broken entry.
+- **Appliance CPU protection:** a new module-level
+  `threading.Semaphore` (`_transcode_semaphore`, default concurrency 1,
+  env `ANYAICAM_RECORDING_TRANSCODE_MAX_CONCURRENCY`) wraps the HEVC
+  transcode's ffmpeg call, so multiple HEVC cameras on the same
+  appliance queue for transcode capacity one at a time by default rather
+  than running concurrently and overwhelming the appliance. Runs inside
+  `asyncio.to_thread()`, so the blocking `.acquire()` never touches the
+  event loop.
+- New env-configurable constants: `CODEC_DETECT_TIMEOUT_SECONDS`,
+  `ANYAICAM_RECORDING_TRANSCODE_PRESET` (default `veryfast`),
+  `ANYAICAM_RECORDING_TRANSCODE_CRF` (default `23`),
+  `ANYAICAM_RECORDING_TRANSCODE_THREADS` (default `2`),
+  `ANYAICAM_RECORDING_TRANSCODE_TIMEOUT_SECONDS` (default `600`),
+  `ANYAICAM_RECORDING_TRANSCODE_MAX_CONCURRENCY` (default `1`).
+- `app/tests/test_recording_codec_aware.py` *(new)* — 14 tests: fast/mocked
+  detection and dispatch-branch tests (h264→remux only, hevc/h265→
+  transcode only, unsupported codec calls neither and leaves the original
+  file's bytes untouched, undetectable codec fails safe, no staging
+  output for an unsupported codec, the unsupported-codec de-dup cache
+  probes only once across three scans), a concurrency test proving the
+  semaphore actually caps simultaneous execution at 1, and two **real
+  ffmpeg/ffprobe integration tests**: a genuine H.264-in-MKV clip is
+  detected and routed to remux only, and — the strongest proof this
+  works — a genuine HEVC-in-MKV clip is run through the real (unmocked)
+  `_transcode_hevc_to_h264()` and the *output* file is reprobed to
+  confirm its own codec is h264 (a real re-encode happened, not a
+  renamed copy), with duration preserved and the original MKV untouched.
+
+**Verification performed:**
+- `ast.parse` clean on both changed/new files.
+- `docker compose restart vms` → healthy, no new errors in logs.
+- New suite (14 tests) plus the existing remux suite (8 tests) run
+  inside the real deployed container via an ephemeral pytest install
+  (removed afterward): **22/22 passed**, including both real ffmpeg
+  integration tests.
+- Full existing regression suite run: 13 pre-existing failures in
+  `test_login_csrf.py`, `test_login_csrf_http_integration.py`, and
+  `test_partner_db_initialization.py` were confirmed to **already exist
+  on the prior baseline** (`718dbd0`) — the pre-edit backup was
+  temporarily restored, the container restarted, and the same three
+  files re-run against it, producing the identical 13 failures. None of
+  the three files reference `recording_uploader.py`. Not a regression
+  introduced by this change; the codec-aware file was restored
+  immediately after this comparison and reconfirmed healthy.
+- Zero AWS configuration changed — this is appliance-local ffmpeg
+  processing only; `ANYAICAM_RECORDING_UPLOAD_ENABLED` remains unset and
+  the entire pipeline remains fully inert in production.
+
+**File hash verification (EC2 == GitHub == Ryzen 5), both at commit `d779e57`:**
+
+| File | SHA-256 |
+|---|---|
+| `app/recording_uploader.py` | `e4fe843e...49eb82c43ee4b6a236321f` |
+| `app/tests/test_recording_codec_aware.py` | `43820ea1...ea6ea6f8f6d21a95aa76253` |
+
+**Rollback:** restore `recording_uploader.py.pre-codec-aware-20260820-223745`,
+restart `vms`. On Git: `git revert d779e57` followed by a push.
+
+**Codec support decision: SETTLED.** The recording pipeline now handles
+H.264 (free remux) and H.265/HEVC (concurrency-limited real transcode)
+automatically per-file, with a safe no-op for anything else. No customer
+or installer codec selection exists or is needed.
+
+**Next step:** AWS IAM/S3 activation (upload/read/delete roles + recordings
+bucket + lifecycle), one component at a time, per the controlled pilot
+plan — still not started; no AWS credentials have been available anywhere
+reachable throughout this project.
+
+---
+
 ## 2026-08-21 — Pilot activation prep: playback format resolved, MKV → MP4 remux
 
 **Phase:** Pre-activation step of the controlled pilot rollout (between R5
