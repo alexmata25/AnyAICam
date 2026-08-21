@@ -150,6 +150,35 @@ TRANSCODE_THREADS = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_THRE
 TRANSCODE_TIMEOUT_SECONDS = max(60, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_TIMEOUT_SECONDS", "600")))
 TRANSCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_MAX_CONCURRENCY", "1")))
 
+
+def _parse_max_files_per_scan() -> int | None:
+    """Unset/empty (the default) means no cap -- exactly today's
+    behavior, every eligible file gets processed in one scan. A set,
+    valid positive integer caps how many of the already
+    cutoff-filtered pending files _relay_camera_once() processes per
+    camera per scan; anything left over stays on disk, still eligible,
+    picked up on a later scan -- nothing is dropped, only deferred. An
+    invalid value (non-numeric, zero, or negative) is a configuration
+    mistake, not a request to remove the limit -- silently falling
+    back to "no cap" here would be exactly backwards from what whoever
+    set this clearly intended, so it fails safe to the tightest
+    possible cap (1) instead, logged once so it's diagnosable."""
+    raw = os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_FILES_PER_SCAN", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("recording_upload.max_files_per_scan_invalid raw=%r failing_safe_to=1", raw)
+        return 1
+    if value < 1:
+        logger.warning("recording_upload.max_files_per_scan_invalid raw=%r failing_safe_to=1", raw)
+        return 1
+    return value
+
+
+MAX_FILES_PER_SCAN = _parse_max_files_per_scan()
+
 recording_upload_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None}
 
 _lock = threading.Lock()
@@ -690,7 +719,10 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     if not session:
         return
     already = set(_uploaded_files.get(camera_number, []))
-    for local_path in _pending_recording_files(camera_number, already):
+    pending = _pending_recording_files(camera_number, already)
+    if MAX_FILES_PER_SCAN is not None:
+        pending = pending[:MAX_FILES_PER_SCAN]
+    for local_path in pending:
         if not local_path.exists():
             continue
         started_at = _recording_started_at(local_path, camera_number)
