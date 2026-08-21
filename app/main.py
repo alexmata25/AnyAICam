@@ -38440,6 +38440,7 @@ async def health_monitor() -> None:
 import live_relay_uploader
 import recording_uploader
 import recording_retention_sweep
+import analytics_sync
 
 
 @asynccontextmanager
@@ -38782,6 +38783,11 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"} and recording_retention_sweep.RETENTION_SWEEP_ENABLED
         else None
     )
+    analytics_sync_task = (
+        asyncio.create_task(analytics_sync.analytics_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and analytics_sync.ANALYTICS_SYNC_ENABLED
+        else None
+    )
 
 
 
@@ -38941,6 +38947,8 @@ async def lifespan(app: FastAPI):
             recording_upload_task.cancel()
         if recording_retention_sweep_task:
             recording_retention_sweep_task.cancel()
+        if analytics_sync_task:
+            analytics_sync_task.cancel()
 
 
 
@@ -39037,6 +39045,8 @@ async def lifespan(app: FastAPI):
             pending.append(recording_upload_task)
         if recording_retention_sweep_task:
             pending.append(recording_retention_sweep_task)
+        if analytics_sync_task:
+            pending.append(analytics_sync_task)
 
 
 

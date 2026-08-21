@@ -1,0 +1,383 @@
+"""Edge-side analytics-sync worker: tests for analytics_sync.py.
+
+Covers the properties explicitly required for this milestone: the
+persisted synced-id state survives a restart; a failed event's
+local_event_id is never marked synced, so it is retried rather than
+permanently skipped; the per-scan cap is respected and defaults to a
+conservative non-zero value; only the fixed six-field allowlist is
+ever sent in an outgoing payload; and this module never writes to
+ANALYTICS_EVENTS_FILE or any thumbnail file, and never imports or
+calls into the existing YOLO/motion-detection code path.
+
+Fast/pure tests only -- no network, no FastAPI app, no AWS. Every test
+gets its own isolated ANALYTICS_EVENTS_FILE/SYNC_STATE_FILE via
+tmp_path, and resets the module's in-memory caches so no test can see
+another's.
+"""
+
+import json
+
+import pytest
+
+import analytics_sync as asy
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_EVENTS_FILE", tmp_path / "analytics_events.json")
+    monkeypatch.setattr(asy, "SYNC_STATE_FILE", tmp_path / "state" / "analytics_sync_state.json")
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", asy.DEFAULT_MAX_EVENTS_PER_SCAN)
+    asy._synced_ids_cache = None
+    asy._unknown_camera_logged.clear()
+    with asy._lock:
+        asy._camera_map.clear()
+    yield tmp_path
+    asy._synced_ids_cache = None
+    asy._unknown_camera_logged.clear()
+    with asy._lock:
+        asy._camera_map.clear()
+
+
+def _write_local_events(tmp_path, events):
+    asy.ANALYTICS_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    asy.ANALYTICS_EVENTS_FILE.write_text(json.dumps(events), encoding="utf-8")
+
+
+def _event(event_id, *, camera=1, event_type="person", timestamp="2026-08-21T10:00:00", confidence=0.9, object_count=1, detections=None):
+    return {
+        "id": event_id,
+        "camera": camera,
+        "site": "home",
+        "rule_name": f"Local YOLO {event_type} detection",
+        "event_type": event_type,
+        "timestamp": timestamp,
+        "confidence": confidence,
+        "thumbnail": f"/recordings/media/ai/2026-08-21/camera{camera}_10-00-00_{event_id}.jpg",
+        "linked_recording": f"camera{camera}_2026-08-21_10-00-00.mkv",
+        "mock": False,
+        "object_count": object_count,
+        "detections": detections if detections is not None else [{"class_name": event_type, "confidence": confidence, "x": 1, "y": 2, "width": 3, "height": 4}],
+    }
+
+
+def _register_camera(camera_number, camera_id="cam-abc123", site_id="site-xyz789"):
+    with asy._lock:
+        asy._camera_map[camera_number] = {"camera_id": camera_id, "site_id": site_id}
+
+
+# --------------------------------------------------------- synced-id state persistence / restart durability
+
+
+def test_missing_state_file_reads_as_nothing_synced(tmp_path):
+    assert asy._load_synced_ids() == []
+
+
+def test_corrupt_state_file_fails_safe_to_nothing_synced_not_a_crash(tmp_path):
+    asy.SYNC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    asy.SYNC_STATE_FILE.write_text("{not valid json", encoding="utf-8")
+    assert asy._load_synced_ids() == []
+
+
+def test_persisted_id_survives_a_simulated_restart(tmp_path):
+    asy._persist_synced_id("evt-1")
+    # Simulate a fresh process: drop the in-memory cache, forcing a re-read
+    # from disk.
+    asy._synced_ids_cache = None
+    assert "evt-1" in asy._load_synced_ids()
+
+
+def test_persist_writes_the_expected_json_shape(tmp_path):
+    asy._persist_synced_id("evt-1")
+    saved = json.loads(asy.SYNC_STATE_FILE.read_text())
+    assert saved == {"synced_event_ids": ["evt-1"]}
+
+
+def test_persist_is_idempotent_for_the_same_id(tmp_path):
+    asy._persist_synced_id("evt-1")
+    asy._persist_synced_id("evt-1")
+    assert asy._load_synced_ids().count("evt-1") == 1
+
+
+def test_state_size_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "MAX_TRACKED_SYNCED_IDS", 3)
+    for i in range(5):
+        asy._persist_synced_id(f"evt-{i}")
+    ids = asy._load_synced_ids()
+    assert len(ids) == 3
+    # Oldest evicted first, newest retained.
+    assert ids == ["evt-2", "evt-3", "evt-4"]
+
+
+# --------------------------------------------------------- failure-safe cursor: a failure never permanently skips an event
+
+
+def test_successful_event_is_marked_synced(tmp_path, monkeypatch):
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-ok")])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted", "event_id": "server-1"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert "evt-ok" in asy._load_synced_ids()
+
+
+def test_duplicate_response_is_treated_as_success_not_a_failure(tmp_path, monkeypatch):
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-dup")])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "duplicate", "event_id": "server-1"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert "evt-dup" in asy._load_synced_ids()
+
+
+def test_failed_event_is_never_marked_synced_and_is_retried(tmp_path, monkeypatch):
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-fail")])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: None)  # network failure / HTTP error
+
+    first = asy._sync_pending_events()
+    assert first == {"attempted": 1, "synced": 0, "failed": 1}
+    assert "evt-fail" not in asy._load_synced_ids()
+
+    # Next scan: still pending, attempted again -- not silently dropped.
+    second = asy._sync_pending_events()
+    assert second == {"attempted": 1, "synced": 0, "failed": 1}
+
+
+def test_one_failed_event_does_not_block_a_later_event_in_the_same_scan(tmp_path, monkeypatch):
+    _register_camera(1)
+    _write_local_events(tmp_path, [
+        _event("evt-a", timestamp="2026-08-21T10:00:00"),
+        _event("evt-b", timestamp="2026-08-21T10:01:00"),
+    ])
+
+    def _post(path, payload):
+        if payload["local_event_id"] == "evt-a":
+            return None  # fails
+        return {"status": "accepted", "event_id": "server-b"}
+
+    monkeypatch.setattr(asy, "_control_plane_post", _post)
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 2, "synced": 1, "failed": 1}
+    synced = asy._load_synced_ids()
+    assert "evt-a" not in synced
+    assert "evt-b" in synced
+
+
+def test_malformed_local_event_is_not_marked_synced(tmp_path, monkeypatch):
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-bad", event_type="")])  # missing required event_type
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(payload) or {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 0, "failed": 1}
+    assert calls == []  # never even attempted a network call for unsendable data
+    assert "evt-bad" not in asy._load_synced_ids()
+
+
+def test_event_for_unrecognized_camera_is_left_pending_not_counted_against_cap(tmp_path, monkeypatch):
+    # No camera registered at all.
+    _write_local_events(tmp_path, [_event("evt-unknown", camera=9)])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(payload) or {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 0, "synced": 0, "failed": 0}
+    assert calls == []
+    assert "evt-unknown" not in asy._load_synced_ids()
+
+
+# --------------------------------------------------------- per-scan cap
+
+
+def test_default_cap_is_conservative_and_nonzero():
+    assert asy.DEFAULT_MAX_EVENTS_PER_SCAN > 0
+    assert asy.DEFAULT_MAX_EVENTS_PER_SCAN <= 50  # conservative first-rollout bound, not a fire-hose
+
+
+def test_unset_env_uses_the_conservative_default(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_ANALYTICS_SYNC_MAX_EVENTS_PER_SCAN", raising=False)
+    assert asy._parse_max_events_per_scan() == asy.DEFAULT_MAX_EVENTS_PER_SCAN
+
+
+def test_invalid_env_fails_safe_to_the_tightest_cap_not_unlimited(monkeypatch):
+    for bad in ("0", "-5", "not-a-number"):
+        monkeypatch.setenv("ANYAICAM_ANALYTICS_SYNC_MAX_EVENTS_PER_SCAN", bad)
+        assert asy._parse_max_events_per_scan() == 1
+
+
+def test_valid_env_is_honored(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_ANALYTICS_SYNC_MAX_EVENTS_PER_SCAN", "7")
+    assert asy._parse_max_events_per_scan() == 7
+
+
+def test_cap_limits_events_attempted_per_scan(tmp_path, monkeypatch):
+    _register_camera(1)
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 2)
+    _write_local_events(tmp_path, [_event(f"evt-{i}", timestamp=f"2026-08-21T10:0{i}:00") for i in range(5)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 2, "synced": 2, "failed": 0}
+    # The remaining three stay pending for a later scan.
+    assert len(asy._load_synced_ids()) == 2
+
+
+def test_leftover_events_beyond_the_cap_are_picked_up_on_a_later_scan(tmp_path, monkeypatch):
+    _register_camera(1)
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 2)
+    _write_local_events(tmp_path, [_event(f"evt-{i}", timestamp=f"2026-08-21T10:0{i}:00") for i in range(3)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    asy._sync_pending_events()
+    second = asy._sync_pending_events()
+
+    assert second == {"attempted": 1, "synced": 1, "failed": 0}
+    assert len(asy._load_synced_ids()) == 3
+
+
+def test_oldest_events_are_synced_first(tmp_path, monkeypatch):
+    _register_camera(1)
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 1)
+    # File is newest-first, matching append_analytics_event()'s own
+    # reverse-chronological sort.
+    _write_local_events(tmp_path, [
+        _event("evt-new", timestamp="2026-08-21T10:05:00"),
+        _event("evt-old", timestamp="2026-08-21T10:00:00"),
+    ])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    assert asy._load_synced_ids() == ["evt-old"]
+
+
+# --------------------------------------------------------- outgoing payload allowlist
+
+
+def test_payload_contains_only_the_six_allowlisted_fields(tmp_path):
+    payload = asy._build_payload(_event("evt-1"))
+    assert set(payload.keys()) == {"local_event_id", "event_type", "confidence", "object_count", "detections", "event_timestamp"}
+
+
+def test_payload_never_includes_thumbnail_or_linked_recording(tmp_path):
+    event = _event("evt-1")
+    assert "thumbnail" in event and "linked_recording" in event  # sanity: the source event really has them
+    payload = asy._build_payload(event)
+    serialized = json.dumps(payload)
+    assert "thumbnail" not in serialized
+    assert "linked_recording" not in serialized
+    assert event["thumbnail"] not in serialized
+    assert event["linked_recording"] not in serialized
+
+
+def test_payload_never_includes_site_camera_or_mock_fields(tmp_path):
+    payload = asy._build_payload(_event("evt-1"))
+    serialized = json.dumps(payload)
+    assert '"site"' not in serialized
+    assert '"camera"' not in serialized
+    assert '"mock"' not in serialized
+    assert '"rule_name"' not in serialized
+
+
+def test_payload_maps_local_event_fields_to_the_expected_names(tmp_path):
+    event = _event("evt-1", event_type="dog", timestamp="2026-08-21T11:22:33", confidence=0.5, object_count=2)
+    payload = asy._build_payload(event)
+    assert payload["local_event_id"] == "evt-1"
+    assert payload["event_type"] == "dog"
+    assert payload["event_timestamp"] == "2026-08-21T11:22:33"
+    assert payload["confidence"] == 0.5
+    assert payload["object_count"] == 2
+    assert payload["detections"] == event["detections"]
+
+
+def test_the_actual_post_uses_the_expected_camera_scoped_path(tmp_path, monkeypatch):
+    _register_camera(1, camera_id="cam-real-id")
+    _write_local_events(tmp_path, [_event("evt-1")])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(path) or {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    assert calls == ["/api/appliance/analytics/cam-real-id/events"]
+
+
+# --------------------------------------------------------- this module never touches the local analytics record or the detection path
+
+
+def test_local_events_file_is_never_modified(tmp_path, monkeypatch):
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-1")])
+    before = asy.ANALYTICS_EVENTS_FILE.read_text(encoding="utf-8")
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    after = asy.ANALYTICS_EVENTS_FILE.read_text(encoding="utf-8")
+    assert after == before
+
+
+def test_module_has_no_write_call_to_the_local_events_file_anywhere():
+    # A structural guarantee, not just a behavioral one for the cases
+    # exercised above: nothing in this module ever calls write_text /
+    # write_bytes / unlink on ANALYTICS_EVENTS_FILE, because no such call
+    # exists in the source at all.
+    import inspect
+    source = inspect.getsource(asy)
+    # The only writes in this module are to SYNC_STATE_FILE.
+    assert "ANALYTICS_EVENTS_FILE.write_text" not in source
+    assert "ANALYTICS_EVENTS_FILE.write_bytes" not in source
+    assert "ANALYTICS_EVENTS_FILE.unlink" not in source
+
+
+def test_module_never_imports_or_references_the_detection_code_path():
+    import inspect
+    source = inspect.getsource(asy)
+    for forbidden in ("ai_person_detector", "motion_detector", "save_yolo_events", "append_analytics_event", "import main"):
+        assert forbidden not in source
+
+
+# --------------------------------------------------------- worker gating (disabled by default, edge-only)
+
+
+def test_flag_defaults_false(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_ANALYTICS_SYNC_ENABLED", raising=False)
+    import importlib
+    reloaded = importlib.reload(asy)
+    assert reloaded.ANALYTICS_SYNC_ENABLED is False
+    importlib.reload(asy)  # restore a clean module state for subsequent tests
+
+
+@pytest.mark.anyio
+async def test_worker_sleeps_forever_without_syncing_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_ENABLED", False)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-1")])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(path) or {"status": "accepted"})
+
+    import asyncio
+    task = asyncio.ensure_future(asy.analytics_sync_worker())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert calls == []
+    assert asy.analytics_sync_state["worker_status"] == "disabled"
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
