@@ -774,8 +774,18 @@ async def recording_upload_worker() -> None:
     recording_upload_state["worker_status"] = "running" if boto3 is not None else "dependency_missing"
     logger.info("recording_upload.worker_started status=%s", recording_upload_state["worker_status"])
     last_config_refresh = 0.0
+    scan_number = 0
     while True:
         try:
+            scan_number += 1
+            # Diagnostic-only heartbeat: this codebase stays silent on an
+            # uneventful successful scan by convention, which made a
+            # genuinely stuck loop indistinguishable from a healthy-but-
+            # boring one in the logs. This single unconditional line at
+            # the top of every real iteration removes that ambiguity --
+            # it changes nothing about timing, credentials, S3 behavior,
+            # the cutoff, or the per-scan upload cap.
+            logger.info("recording_upload.scan_tick_begin scan_number=%s at=%s", scan_number, datetime.now().isoformat())
             now = time.monotonic()
             if now - last_config_refresh >= CONFIG_REFRESH_SECONDS:
                 await asyncio.to_thread(_refresh_camera_map)
