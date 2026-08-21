@@ -719,6 +719,7 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     or deletes the original either). The original MKV is untouched by
     every one of these paths; only the derived MP4 staging file is
     ever cleaned up, and only after its own upload attempt concludes."""
+    logger.info("recording_upload.relay_camera_once_entered camera=%s", camera_number)
     session = _ensure_session(camera_number, camera_id)
     if not session:
         return
@@ -795,9 +796,12 @@ async def recording_upload_worker() -> None:
                 await asyncio.to_thread(_refresh_camera_map)
                 last_config_refresh = now
             for camera_number in _known_camera_numbers():
+                logger.info("recording_upload.known_camera_numbers_done camera=%s", camera_number)
                 identity = _camera_identity(camera_number)
+                logger.info("recording_upload.camera_identity_done camera=%s found=%s", camera_number, identity is not None)
                 if not identity:
                     continue
+                logger.info("recording_upload.to_thread_dispatch_begin camera=%s", camera_number)
                 await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
             recording_upload_state["last_scan_at"] = datetime.now().isoformat()
             recording_upload_state["last_error"] = None
