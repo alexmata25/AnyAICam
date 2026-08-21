@@ -1,6 +1,7 @@
 from cloud_config import settings as cloud_settings
 import json
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta
@@ -14,9 +15,30 @@ from appliance_protocol import ALLOWED_COMMANDS, RateLimiter, cloud_settings, he
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
+from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, recording_s3_prefix, recording_session_name, recording_session_policy
+
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 
 logger=logging.getLogger('anyaicam.appliance')
 request_limiter=RateLimiter(120,60); activation_limiter=RateLimiter(10,300)
+# R1 (recording-pipeline roadmap): independent flag/role/bucket, deliberately
+# not shared with any live-relay config -- see docs/r1-recording-iam.md. All
+# three are unset until that IAM design is actually applied, so
+# recording_upload_credentials() below fails closed with 503 even if
+# ANYAICAM_RECORDING_UPLOAD_ENABLED were ever set true ahead of that.
+RECORDING_UPLOAD_ENABLED=os.getenv('ANYAICAM_RECORDING_UPLOAD_ENABLED','false').strip().lower()=='true'
+RECORDING_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_RECORDING_UPLOAD_ROLE_ARN','').strip()
+RECORDING_S3_BUCKET=os.getenv('ANYAICAM_RECORDING_S3_BUCKET','').strip()
+RECORDING_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).strip()
+
+
+def _authorized_camera(appliance: dict,camera_id: str) -> dict:
+    camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
+    if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
+    return camera
 
 
 def _bearer(request: Request) -> str:
@@ -100,7 +122,80 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status FROM cameras WHERE appliance_id=? ORDER BY name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        # camera_number added for R3 (recording_uploader.py's camera-map
+        # refresh, which needs it to resolve a local camera folder to a
+        # cameras.id) -- everything else in this route is unchanged.
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+
+    @app.post('/api/appliance/recordings/{camera_id}/credentials')
+    def recording_upload_credentials(request: Request,camera_id: str) -> dict:
+        # R1 (recording-pipeline roadmap): fails closed with 503 until the
+        # real IAM role/bucket from docs/r1-recording-iam.md are applied
+        # and the three RECORDING_* env vars above are set.
+        appliance=authenticate_appliance(request)
+        if not RECORDING_UPLOAD_ENABLED:
+            raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
+            raise HTTPException(status_code=503,detail='Recording upload is not configured.')
+        policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        session_name=recording_session_name(appliance['id'],camera_id)
+        try:
+            sts=boto3.client('sts',region_name=RECORDING_AWS_REGION)
+            assumed=sts.assume_role(RoleArn=RECORDING_UPLOAD_ROLE_ARN,RoleSessionName=session_name,Policy=json.dumps(policy),DurationSeconds=RECORDING_SESSION_DURATION_SECONDS)
+        except Exception as error:
+            logger.exception('recording_upload.assume_role_failed appliance_id=%s camera_id=%s',appliance['id'],camera_id)
+            raise HTTPException(status_code=502,detail='Could not obtain a recording-upload credential.') from error
+        issued=assumed['Credentials']
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.recording_upload_credentials_issued','camera',camera_id,{'session_name':session_name})
+        return {
+            'status':'accepted',
+            'bucket':RECORDING_S3_BUCKET,
+            'key_prefix':recording_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id),
+            'credentials':{
+                'access_key_id':issued['AccessKeyId'],
+                'secret_access_key':issued['SecretAccessKey'],
+                'session_token':issued['SessionToken'],
+                'expiration':issued['Expiration'].isoformat(),
+            },
+        }
+
+    @app.post('/api/appliance/recordings/{camera_id}/available')
+    def recording_available(request: Request,camera_id: str,payload: dict) -> dict:
+        # R2 (recording-pipeline roadmap): catalogs one completed recording
+        # object into the recordings table (this branch's db_migrations.py
+        # addition).
+        appliance=authenticate_appliance(request)
+        if not RECORDING_UPLOAD_ENABLED: raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
+        camera=_authorized_camera(appliance,camera_id)
+        safe=sanitize_appliance_payload(payload)
+        s3_key=str(safe.get('s3_key','')).strip()
+        if not s3_key: raise HTTPException(status_code=400,detail='s3_key is required.')
+        expected_prefix=recording_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        if not s3_key.startswith(expected_prefix):
+            raise HTTPException(status_code=403,detail="s3_key is outside this camera's authorized prefix.")
+        started_at=str(safe.get('started_at','')).strip(); ended_at=str(safe.get('ended_at','')).strip()
+        if not started_at or not ended_at: raise HTTPException(status_code=400,detail='started_at and ended_at are required.')
+        duration_seconds=safe.get('duration_seconds'); size_bytes=safe.get('size_bytes')
+        recording_id=secrets.token_hex(12); now=datetime.now().isoformat()
+        with connection() as db:
+            try:
+                db.execute(
+                    'INSERT INTO recordings(id,customer_id,site_id,appliance_id,camera_id,s3_key,started_at,ended_at,duration_seconds,size_bytes,status,created_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (recording_id,camera['customer_id'],camera['site_id'],appliance['id'],camera_id,s3_key,started_at,ended_at,
+                     int(duration_seconds) if duration_seconds is not None else None,
+                     int(size_bytes) if size_bytes is not None else None,
+                     'available',now),
+                )
+            except Exception:
+                # Idempotent replay: a byte-identical (camera_id, s3_key)
+                # resubmission is a 200 no-op, not an error.
+                existing=db.execute('SELECT id FROM recordings WHERE camera_id=? AND s3_key=?',(camera_id,s3_key)).fetchone()
+                if existing: return {'status':'duplicate','recording_id':existing['id']}
+                raise HTTPException(status_code=500,detail='Could not record this upload.')
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.recording_available','recording',recording_id,{'camera_id':camera_id,'s3_key':s3_key})
+        return {'status':'accepted','recording_id':recording_id}
 
     @app.post('/api/appliance/events')
     def events(request: Request,payload: dict) -> dict:

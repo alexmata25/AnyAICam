@@ -38359,6 +38359,8 @@ async def health_monitor() -> None:
 
 
 import live_relay_uploader
+import recording_uploader
+import recording_retention_sweep
 
 
 @asynccontextmanager
@@ -38691,6 +38693,16 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and live_relay_uploader.LIVE_RELAY_ENABLED
         else None
     )
+    recording_upload_task = (
+        asyncio.create_task(recording_uploader.recording_upload_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and recording_uploader.RECORDING_UPLOAD_ENABLED
+        else None
+    )
+    recording_retention_sweep_task = (
+        asyncio.create_task(recording_retention_sweep.recording_retention_sweep_worker())
+        if RUNTIME_ROLE in {"cloud", "combined"} and recording_retention_sweep.RETENTION_SWEEP_ENABLED
+        else None
+    )
 
 
 
@@ -38846,6 +38858,10 @@ async def lifespan(app: FastAPI):
         cloud_upload_task.cancel()
         if live_relay_task:
             live_relay_task.cancel()
+        if recording_upload_task:
+            recording_upload_task.cancel()
+        if recording_retention_sweep_task:
+            recording_retention_sweep_task.cancel()
 
 
 
@@ -38938,6 +38954,10 @@ async def lifespan(app: FastAPI):
         pending.append(cloud_upload_task)
         if live_relay_task:
             pending.append(live_relay_task)
+        if recording_upload_task:
+            pending.append(recording_upload_task)
+        if recording_retention_sweep_task:
+            pending.append(recording_retention_sweep_task)
 
 
 
