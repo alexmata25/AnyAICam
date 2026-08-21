@@ -137,7 +137,9 @@ async def test_stderr_drain_uses_the_dedicated_executor(monkeypatch):
 async def test_live_mode_still_gets_stderr_drain_recording_mode_does_not(monkeypatch):
     """Regression guard: the executor swap must not have disturbed the
     existing mode == "live" condition that gates the drain task."""
-    live_dummy = _sleeper_process()
+    live_dummy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], stderr=subprocess.PIPE,
+    )  # live mode's drain-gate requires process.stderr is not None
     recording_dummy = _sleeper_process()
     monkeypatch.setattr(main, "start_live_stream", lambda n: live_dummy)
     monkeypatch.setattr(main, "start_recording", lambda n: recording_dummy)
