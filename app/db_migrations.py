@@ -97,6 +97,18 @@ def apply_migrations():
         if 'talk_down_supported' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_supported INTEGER')
         if 'talk_down_metadata' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_metadata TEXT')
         if 'talk_down_verified_at' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_verified_at TEXT')
+        # cloud_recording_mode has NO hidden default by design: NULL means
+        # "not explicitly set for this camera" and every consumer (the
+        # GET /api/appliance/configuration route, and the appliance's own
+        # recording_uploader.py) must treat NULL exactly like 'continuous'
+        # -- upload everything, today's unchanged behavior -- never like
+        # 'motion'. Only an explicit 'motion' value (set via
+        # POST /api/admin/cameras/{camera_id}/cloud-recording-mode) ever
+        # turns on upload-time motion-gating for that camera. This is the
+        # only plan-mode signal in the system; recording_mode on
+        # AnalyticsRuleModel/quote objects is a separate, unrelated,
+        # sales-quote-only field this column does not read from or write to.
+        if 'cloud_recording_mode' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN cloud_recording_mode TEXT')
 
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else

@@ -151,7 +151,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,cloud_recording_mode AS recording_mode FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     @app.post('/api/appliance/events')
     def events(request: Request,payload: dict) -> dict:
@@ -411,6 +411,23 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Appliance not found.')
         audit(identity,'appliance.live_relay_pilot_changed','appliance',appliance_id,{'enabled':bool(enabled)})
         return {'appliance_id':appliance_id,'live_relay_pilot':bool(enabled)}
+
+    @app.post('/api/admin/cameras/{camera_id}/cloud-recording-mode')
+    def set_cloud_recording_mode(request: Request,camera_id: str,payload: dict) -> dict:
+        # No hidden default, by design (see db_migrations.py's own comment
+        # on this column): only these two explicit values are ever
+        # accepted, or null to clear back to "not set" (== continuous
+        # behavior everywhere it's read). Anything else is a 400, never
+        # silently coerced to one side or the other.
+        identity=require_partner_access(request,{'administrator'})
+        mode=payload.get('cloud_recording_mode')
+        if mode is not None and mode not in ('motion','continuous'):
+            raise HTTPException(status_code=400,detail="cloud_recording_mode must be 'motion', 'continuous', or null.")
+        with connection() as db:
+            cursor=db.execute('UPDATE cameras SET cloud_recording_mode=? WHERE id=?',(mode,camera_id))
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
+        audit(identity,'camera.cloud_recording_mode_changed','camera',camera_id,{'cloud_recording_mode':mode})
+        return {'camera_id':camera_id,'cloud_recording_mode':mode}
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
