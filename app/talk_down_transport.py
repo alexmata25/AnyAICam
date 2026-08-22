@@ -48,6 +48,7 @@ import secrets
 import socket
 import struct
 import time
+from typing import Callable
 
 logger = logging.getLogger("anyaicam.talk_down_transport")
 
@@ -111,15 +112,33 @@ def _digest_authorization(challenge: dict, username: str, password: str, method:
     return "Digest " + ", ".join(parts)
 
 
-def _rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str, extra_headers: str = "", auth_header: str | None = None, body: bytes = b"", attempt: str = "initial") -> str:
+def _rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str, request_uri: str, extra_headers: str = "", auth_header: str | None = None, body: bytes = b"", attempt: str = "initial") -> str:
     """Sends one RTSP request and returns the raw response text.
+
+    `next_cseq` is a zero-argument callable returning the next CSeq to
+    use, called exactly once per actual request sent. Confirmed by real
+    Camera 2 evidence and cross-checked against RFC 2326 SS12.17 and two
+    mature reference clients (Live555's RTSPClient::resendCommand(),
+    which does `request->cseq() = ++fCSeq` on a digest retry; FFmpeg's
+    libavformat/rtsp.c, whose 401-retry path re-enters
+    ff_rtsp_send_cmd_with_content_async(), which does `rt->seq++` on
+    every call): a digest 401-challenge-then-retry is a distinct request
+    (it received an actual response, so it isn't the "repeated because
+    of lack of acknowledgement" case RFC 2326 exempts from incrementing)
+    and must get a fresh, incremented CSeq, not reuse the original's.
+    Threading a single shared counter through every call (see
+    OnvifBackchannelTransport._next_cseq()) instead of a caller-hardcoded
+    literal is what makes every request on one connection -- every
+    stage, every retry -- get a strictly increasing CSeq with no caller
+    needing to know how many requests came before it.
+
     `attempt` is a caller-supplied label ("initial" or "digest_retry")
     purely for the diagnostic log line below -- it has no effect on
     what's actually sent. Logs method/CSeq/attempt/request_uri before
-    sending and the resulting status line (or "no_response") after --
-    added during the CSeq-monotonicity investigation. Never logs
-    auth_header, credentials, passwords, or the digest nonce/response;
-    those never appear in this log line at all."""
+    sending and the resulting status line (or "no_response") after.
+    Never logs auth_header, credentials, passwords, or the digest
+    nonce/response; those never appear in this log line at all."""
+    cseq = next_cseq()
     headers = f"{method} {request_uri} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: anyaicam-talk-down/0.1\r\n{extra_headers}"
     if auth_header:
         headers += f"Authorization: {auth_header}\r\n"
@@ -150,8 +169,8 @@ def _status_line(response: str) -> str:
     return lines[0] if lines else ""
 
 
-def _authenticated_rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str, username: str, password: str, extra_headers: str = "", body: bytes = b"") -> str:
-    first = _rtsp_request(sock, cseq, method, request_uri, extra_headers=extra_headers, body=body, attempt="initial")
+def _authenticated_rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str, request_uri: str, username: str, password: str, extra_headers: str = "", body: bytes = b"") -> str:
+    first = _rtsp_request(sock, next_cseq, method, request_uri, extra_headers=extra_headers, body=body, attempt="initial")
     status_line = _status_line(first)
     if " 401 " not in status_line:
         return first
@@ -167,7 +186,7 @@ def _authenticated_rtsp_request(sock: socket.socket, cseq: int, method: str, req
     challenge = _parse_digest_challenge(www_authenticate.partition(":")[2].strip())
     cnonce = secrets.token_hex(8)
     auth = _digest_authorization(challenge, username, password, method, request_uri, cnonce, "00000001")
-    return _rtsp_request(sock, cseq + 1, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body, attempt="digest_retry")
+    return _rtsp_request(sock, next_cseq, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body, attempt="digest_retry")
 
 
 # ---------------------------------------------------------- SDP control-URI resolution (pure)
@@ -256,9 +275,25 @@ class OnvifBackchannelTransport(TalkDownTransport):
         self._rtp_remote: tuple[str, int] | None = None
         self._sequence = 0
         self._ssrc = secrets.randbits(32)
+        self._cseq = 0  # one shared counter for every RTSP request on this connection, see _next_cseq()
 
     def _request_uri(self) -> str:
         return f"rtsp://{self.host}:{self.port}{self.rtsp_path}"
+
+    def _next_cseq(self) -> int:
+        """The single source of truth for this connection's CSeq --
+        every RTSP request connect()/close() sends, across every stage
+        and every digest retry, calls this instead of any stage
+        hardcoding its own literal. Real Camera 2 evidence: DESCRIBE's
+        401-then-retry consumed CSeq 1 and 2, and SETUP's own hardcoded
+        literal (2) then collided with the CSeq the retry had already
+        used -- this method is what makes that impossible, for any
+        number of stages or retries, without any of them needing to
+        know how many requests came before. Matches RFC 2326 SS12.17 and
+        both Live555 (RTSPClient::fCSeq) and FFmpeg (rt->seq): a single
+        per-connection counter, incremented once per actual request."""
+        self._cseq += 1
+        return self._cseq
 
     def connect(self) -> None:
         # Every stage below logs its own outcome (never credentials/
@@ -273,7 +308,7 @@ class OnvifBackchannelTransport(TalkDownTransport):
         self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout_seconds)
         uri = self._request_uri()
 
-        describe = _authenticated_rtsp_request(self._sock, 1, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\n")
+        describe = _authenticated_rtsp_request(self._sock, self._next_cseq, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\n")
         describe_status = _status_line(describe)
         logger.info("talk_down_transport.stage stage=describe_response host=%s port=%s status=%s", self.host, self.port, describe_status or "no_response")
         if " 200 " not in describe_status:
@@ -294,7 +329,7 @@ class OnvifBackchannelTransport(TalkDownTransport):
         self._rtp_socket.bind(("0.0.0.0", 0))
         local_port = self._rtp_socket.getsockname()[1]
         setup = _authenticated_rtsp_request(
-            self._sock, 2, "SETUP", setup_uri, self.username, self.password,
+            self._sock, self._next_cseq, "SETUP", setup_uri, self.username, self.password,
             extra_headers=f"Transport: RTP/AVP;unicast;client_port={local_port}-{local_port + 1}\r\n",
         )
         setup_status = _status_line(setup)
@@ -309,7 +344,7 @@ class OnvifBackchannelTransport(TalkDownTransport):
         self._rtp_remote = (self.host, self._extract_server_port(setup) or self.port)
 
         record = _authenticated_rtsp_request(
-            self._sock, 3, "RECORD", uri, self.username, self.password,
+            self._sock, self._next_cseq, "RECORD", uri, self.username, self.password,
             extra_headers=f"Session: {self._session_id}\r\nRange: npt=0.000-\r\n",
         )
         record_status = _status_line(record)
@@ -328,7 +363,7 @@ class OnvifBackchannelTransport(TalkDownTransport):
     def close(self) -> None:
         if self._sock is not None and self._session_id is not None:
             try:
-                _rtsp_request(self._sock, 4, "TEARDOWN", self._request_uri(), extra_headers=f"Session: {self._session_id}\r\n")
+                _rtsp_request(self._sock, self._next_cseq, "TEARDOWN", self._request_uri(), extra_headers=f"Session: {self._session_id}\r\n")
             except OSError:
                 pass
         if self._sock is not None:
