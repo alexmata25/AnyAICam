@@ -43,12 +43,15 @@ class _ScriptedSocket:
     def __init__(self, responses):
         self._responses = {method: list(chunks) for method, chunks in responses.items()}
         self._pending = b""
+        self.sent_requests = []  # every raw request line+headers actually sent, in order
 
     def settimeout(self, *_args, **_kwargs):
         pass
 
     def sendall(self, data):
-        method = data.decode().split(" ", 1)[0]
+        text = data.decode()
+        self.sent_requests.append(text)
+        method = text.split(" ", 1)[0]
         queue = self._responses.get(method, [])
         self._pending = queue.pop(0) if queue else b""
 
@@ -63,7 +66,9 @@ class _ScriptedSocket:
 def _make_transport(monkeypatch, responses):
     fake_socket = _ScriptedSocket(responses)
     monkeypatch.setattr(transport.socket, "create_connection", lambda *a, **k: fake_socket)
-    return transport.OnvifBackchannelTransport(host="10.0.0.1", port=80, username="user", password="pass", rtsp_path="/onvif/media")
+    built = transport.OnvifBackchannelTransport(host="10.0.0.1", port=80, username="user", password="pass", rtsp_path="/onvif/media")
+    built._test_fake_socket = fake_socket  # test-only handle, not used by production code
+    return built
 
 
 _DESCRIBE_OK = (
@@ -125,10 +130,37 @@ def test_authenticated_request_survives_401_with_no_www_authenticate_header(monk
 
 
 def test_connect_succeeds_with_well_formed_responses(monkeypatch):
+    # Also the "existing successful DESCRIBE -> SETUP -> RECORD path"
+    # regression proof for the SDP control-URI fix: this fixture's SDP
+    # uses the plain relative fragment shape ("trackID=2"), and
+    # _resolve_control_uri() must still produce the exact same SETUP
+    # request URI it always did for that shape.
     t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
     t.connect()  # must not raise
     assert t._session_id == "abc123"
     assert t._rtp_remote == ("10.0.0.1", 6000)
+    setup_request_line = next(r for r in t._test_fake_socket.sent_requests if r.startswith("SETUP")).splitlines()[0]
+    assert setup_request_line.startswith("SETUP rtsp://10.0.0.1:80/onvif/media/trackID=2 RTSP/1.0")
+
+
+def test_connect_uses_an_absolute_sdp_control_uri_directly_no_doubling(monkeypatch):
+    # The exact real Camera 2 shape: SDP a=control: is already an
+    # absolute rtsp:// URI. Pre-fix, connect() blindly concatenated it
+    # onto the base URI (f"{base}/{control}"), producing
+    # ".../onvif/media//rtsp://10.0.0.1:80/onvif/media/trackID=2" --
+    # SETUP still returned 200 (a lenient camera), RECORD then got no
+    # response at all. This proves the actual bytes sent for SETUP now
+    # carry the absolute control URI untouched, with no doubling.
+    describe_absolute_control = (
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Type: application/sdp\r\n\r\n"
+        b"v=0\r\nm=audio 0 RTP/AVP 0\r\na=control:rtsp://10.0.0.1:80/onvif/media/trackID=2\r\n"
+    )
+    t = _make_transport(monkeypatch, {"DESCRIBE": [describe_absolute_control], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t.connect()  # must not raise
+    assert t._session_id == "abc123"
+    setup_request_line = next(r for r in t._test_fake_socket.sent_requests if r.startswith("SETUP")).splitlines()[0]
+    assert setup_request_line.startswith("SETUP rtsp://10.0.0.1:80/onvif/media/trackID=2 RTSP/1.0")
+    assert "//rtsp://" not in setup_request_line
 
 
 def test_connect_succeeds_after_a_valid_401_digest_challenge_and_retry(monkeypatch):

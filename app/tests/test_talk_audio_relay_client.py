@@ -158,6 +158,55 @@ def test_backchannel_control_none_when_no_audio_section():
     assert transport.OnvifBackchannelTransport._find_backchannel_control(sdp) is None
 
 
+# ------------------------------------------------------------- SDP control-URI resolution (real Camera 2 fix: absolute vs. relative a=control:)
+#
+# Real Camera 2 (192.168.0.38) evidence: its SDP a=control: for the
+# audio section is an already-absolute "rtsp://192.168.0.38:554/
+# trackID=2", not a relative fragment. The previous code
+# (f"{base_uri}/{control}") always concatenated, producing
+# "rtsp://192.168.0.38:554//rtsp://192.168.0.38:554/trackID=2" --
+# SETUP tolerated it (lenient camera), RECORD did not.
+
+def test_resolve_control_uri_absolute_rtsp_is_used_as_is():
+    resolved = transport._resolve_control_uri("rtsp://192.168.0.38:554/", "rtsp://192.168.0.38:554/trackID=2")
+    assert resolved == "rtsp://192.168.0.38:554/trackID=2"
+    assert "//rtsp://" not in resolved  # no doubling, the exact production bug
+
+
+def test_resolve_control_uri_absolute_rtsps_is_used_as_is():
+    resolved = transport._resolve_control_uri("rtsp://host:554/", "rtsps://host:322/trackID=2")
+    assert resolved == "rtsps://host:322/trackID=2"
+
+
+def test_resolve_control_uri_plain_relative_fragment():
+    resolved = transport._resolve_control_uri("rtsp://host:554/Streaming/Channels/101", "trackID=2")
+    assert resolved == "rtsp://host:554/Streaming/Channels/101/trackID=2"
+
+
+def test_resolve_control_uri_leading_slash_relative_path():
+    resolved = transport._resolve_control_uri("rtsp://host:554/Streaming/Channels/101", "/trackID=2")
+    assert resolved == "rtsp://host:554/trackID=2"  # replaces the base's own path entirely
+
+
+def test_resolve_control_uri_no_double_slash_when_base_has_trailing_slash():
+    # The bare "/" default rtsp_path -- the previous code produced a
+    # double slash here too, for the plain-relative case, whenever a
+    # camera had no explicit rtsp_path override.
+    resolved = transport._resolve_control_uri("rtsp://host:554/", "trackID=2")
+    assert resolved == "rtsp://host:554/trackID=2"
+    assert "//" not in resolved.split("://", 1)[1]
+
+
+def test_resolve_control_uri_same_result_with_or_without_base_trailing_slash():
+    with_slash = transport._resolve_control_uri("rtsp://host:554/", "trackID=2")
+    without_slash = transport._resolve_control_uri("rtsp://host:554", "trackID=2")
+    assert with_slash == without_slash == "rtsp://host:554/trackID=2"
+
+
+def test_resolve_control_uri_none_control_falls_back_to_base_uri_unchanged():
+    assert transport._resolve_control_uri("rtsp://host:554/Streaming/Channels/101", None) == "rtsp://host:554/Streaming/Channels/101"
+
+
 # ------------------------------------------------------------- message dispatch / session lifecycle
 
 def test_start_message_creates_a_session_with_no_video_flags_in_ffmpeg_command(monkeypatch):

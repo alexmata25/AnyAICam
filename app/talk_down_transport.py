@@ -159,6 +159,54 @@ def _authenticated_rtsp_request(sock: socket.socket, cseq: int, method: str, req
     return _rtsp_request(sock, cseq + 1, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body)
 
 
+# ---------------------------------------------------------- SDP control-URI resolution (pure)
+
+def _resolve_control_uri(base_uri: str, control: str | None) -> str:
+    """Resolves an SDP a=control: attribute value against the base RTSP
+    request URI, per RTSP/SDP convention (RFC 2326 Appendix C.1.1 /
+    RFC 8866): the value may be
+
+      - None (no control attribute at all, or no audio section in the
+        SDP) -- the base URI is used unchanged, exactly as before this
+        function existed.
+      - an already-absolute rtsp:// or rtsps:// URI -- used exactly
+        as-is, never touched, never concatenated onto anything. Real
+        Camera 2 evidence: this camera's SDP returns
+        "rtsp://<host>:554/trackID=2" here, an absolute URI -- the
+        previous code's f"{base_uri}/{control}" blindly concatenated
+        it onto the base URI regardless, producing the doubled
+        "rtsp://host:554//rtsp://host:554/trackID=2" that made SETUP
+        (tolerated by a lenient camera) and then RECORD (not tolerated)
+        fail.
+      - a reference starting with "/" -- an absolute-path reference:
+        replaces the base URI's own path entirely, keeping only its
+        scheme+authority (host:port), the standard resolution rule for
+        this shape.
+      - a plain relative fragment (e.g. "trackID=2", the common ONVIF/
+        Hikvision-style per-track suffix) -- appended to the base URI
+        with exactly one "/" separator, regardless of whether the base
+        URI itself already ends in one (this is what the previous code
+        got wrong even for this simple case whenever rtsp_path was the
+        bare "/" default: f"{base_uri}/{control}" produced a double
+        slash there too).
+
+    Pure function, no network/state -- independently testable."""
+    if not control:
+        return base_uri
+    lowered = control.lower()
+    if lowered.startswith("rtsp://") or lowered.startswith("rtsps://"):
+        return control
+    if control.startswith("/"):
+        scheme_end = base_uri.find("://")
+        if scheme_end == -1:
+            return base_uri.rstrip("/") + "/" + control.lstrip("/")
+        authority_start = scheme_end + 3
+        authority_end = base_uri.find("/", authority_start)
+        authority = base_uri[:authority_end] if authority_end != -1 else base_uri
+        return authority + control
+    return base_uri.rstrip("/") + "/" + control
+
+
 # ---------------------------------------------------------- RTP/PCMU packetization (pure)
 
 def build_rtp_packet(payload: bytes, sequence_number: int, timestamp: int, ssrc: int, payload_type: int = 0) -> bytes:
@@ -222,10 +270,13 @@ class OnvifBackchannelTransport(TalkDownTransport):
 
         # SDP parsing: _find_backchannel_control() never raises -- an
         # empty/audio-section-less body just means setup_uri falls back
-        # to the base RTSP uri (see its own docstring).
+        # to the base RTSP uri (see its own docstring). _resolve_control
+        # _uri() then correctly handles whichever of the three real-
+        # world control-attribute shapes this camera used -- absolute,
+        # leading-slash, or plain relative -- never naively concatenating.
         sdp_body = describe.split("\r\n\r\n", 1)[-1]
         audio_control = self._find_backchannel_control(sdp_body)
-        setup_uri = f"{uri}/{audio_control}" if audio_control else uri
+        setup_uri = _resolve_control_uri(uri, audio_control)
         logger.info("talk_down_transport.stage stage=sdp_parsing audio_control=%s setup_uri=%s", audio_control, setup_uri)
 
         self._rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
