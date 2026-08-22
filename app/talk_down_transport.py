@@ -308,7 +308,19 @@ class OnvifBackchannelTransport(TalkDownTransport):
         self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout_seconds)
         uri = self._request_uri()
 
-        describe = _authenticated_rtsp_request(self._sock, self._next_cseq, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\n")
+        # Require: www.onvif.org/ver20/backchannel -- ONVIF Streaming
+        # Spec SS5.3.2: a client wanting a bidirectional (backchannel)
+        # connection includes this on DESCRIBE; a server that
+        # understands it includes an ADDITIONAL a=sendonly audio media
+        # section in its SDP for the backchannel track, distinct from
+        # the normal a=recvonly playback audio track. Diagnostic-only
+        # for now: added here (matching go2rtc's own proven real-world
+        # pattern of putting this header on DESCRIBE only, not on
+        # SETUP/RECORD/TEARDOWN) to observe whether Camera 2's SDP
+        # actually changes when this is present, before deciding
+        # whether any track-selection or verb change is warranted --
+        # see the stage=sdp_raw_body diagnostic already in place below.
+        describe = _authenticated_rtsp_request(self._sock, self._next_cseq, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\nRequire: www.onvif.org/ver20/backchannel\r\n")
         describe_status = _status_line(describe)
         logger.info("talk_down_transport.stage stage=describe_response host=%s port=%s status=%s", self.host, self.port, describe_status or "no_response")
         if " 200 " not in describe_status:
