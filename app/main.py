@@ -38442,6 +38442,7 @@ import recording_uploader
 import recording_retention_sweep
 import analytics_sync
 import talk_down_discovery
+import talk_audio_relay_client
 
 
 @asynccontextmanager
@@ -38794,6 +38795,11 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and talk_down_discovery.TALK_DOWN_DISCOVERY_ENABLED
         else None
     )
+    talk_audio_relay_client_task = (
+        asyncio.create_task(talk_audio_relay_client.talk_audio_relay_client_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and talk_audio_relay_client.TALK_AUDIO_ENABLED
+        else None
+    )
 
 
 
@@ -38957,6 +38963,8 @@ async def lifespan(app: FastAPI):
             analytics_sync_task.cancel()
         if talk_down_discovery_task:
             talk_down_discovery_task.cancel()
+        if talk_audio_relay_client_task:
+            talk_audio_relay_client_task.cancel()
 
 
 
@@ -39057,6 +39065,8 @@ async def lifespan(app: FastAPI):
             pending.append(analytics_sync_task)
         if talk_down_discovery_task:
             pending.append(talk_down_discovery_task)
+        if talk_audio_relay_client_task:
+            pending.append(talk_audio_relay_client_task)
 
 
 

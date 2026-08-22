@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+websockets
 psycopg[binary]
 boto3
 passlib[bcrypt]==1.7.4
