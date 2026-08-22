@@ -394,7 +394,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                   data-camera-id="{escape(camera['id'], quote=True)}"
                   title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
                   aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                  {'' if camera['enabled'] else 'disabled'}>◖</button>
+                  {'' if camera['enabled'] else 'disabled'}>🎤</button>
                 <a class="ghost-button" href="/customer/cameras/{escape(camera['id'], quote=True)}/live">Full screen</a>
               </div>
             </article>'''
@@ -564,7 +564,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-mute" title="Mute">♪</button>'
             f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
             f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
-            f'{"" if talk_state["enabled"] else "disabled"}>◖</button>'
+            f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
             f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot">◉</button>'
             f'<button class="camera-tool" id="live-view-download" title="Download">⬇</button>'
             f'<button class="camera-tool" id="live-view-share" title="Share">↗</button>'
