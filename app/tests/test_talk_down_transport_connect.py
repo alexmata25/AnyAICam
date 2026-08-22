@@ -20,9 +20,18 @@ create_connection() is monkeypatched to return the fake, so this is
 pure/fast and needs no Docker. Each failure case is asserted to raise
 a clean ConnectionError tagged with the exact protocol stage
 (stage=describe_response / setup_response / session_extraction /
-record_response) rather than an unguarded IndexError, and one full
+play_response) rather than an unguarded IndexError, and one full
 happy-path case proves the fix didn't change well-formed-response
 behavior at all.
+
+connect() sends PLAY, not RECORD, to start the backchannel -- proven
+against the real Camera 2 by a controlled, single-variable test (see
+talk_down_transport.py's own module docstring and connect()'s
+comments): RECORD, tried both with and without the ONVIF backchannel
+Require header in two separate isolated tests, got no response either
+way; PLAY succeeded cleanly without needing a Require header of its
+own. Every fixture/test below that scripts the final start-the-
+backchannel stage uses "PLAY" accordingly.
 """
 
 import pytest
@@ -84,7 +93,7 @@ _SETUP_OK = (
     b"RTSP/1.0 200 OK\r\nCSeq: 2\r\nSession: abc123;timeout=60\r\n"
     b"Transport: RTP/AVP;unicast;client_port=5000-5001;server_port=6000-6001\r\n\r\n"
 )
-_RECORD_OK = b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: abc123;timeout=60\r\n\r\n"
+_PLAY_OK = b"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: abc123;timeout=60\r\n\r\n"
 
 
 def test_connect_raises_clean_error_when_describe_gets_no_response(monkeypatch):
@@ -101,11 +110,11 @@ def test_connect_raises_clean_error_when_setup_gets_no_response(monkeypatch):
     assert "stage=setup_response" in str(excinfo.value)
 
 
-def test_connect_raises_clean_error_when_record_gets_no_response(monkeypatch):
-    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [b""]})
+def test_connect_raises_clean_error_when_play_gets_no_response(monkeypatch):
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [b""]})
     with pytest.raises(ConnectionError) as excinfo:
         t.connect()
-    assert "stage=record_response" in str(excinfo.value)
+    assert "stage=play_response" in str(excinfo.value)
 
 
 def test_connect_raises_clean_error_when_setup_response_has_no_session_header(monkeypatch):
@@ -135,12 +144,12 @@ def test_authenticated_request_survives_401_with_no_www_authenticate_header(monk
 
 
 def test_connect_succeeds_with_well_formed_responses(monkeypatch):
-    # Also the "existing successful DESCRIBE -> SETUP -> RECORD path"
+    # Also the "existing successful DESCRIBE -> SETUP -> PLAY path"
     # regression proof for the SDP control-URI fix: this fixture's SDP
     # uses the plain relative fragment shape ("trackID=2"), and
     # _resolve_control_uri() must still produce the exact same SETUP
     # request URI it always did for that shape.
-    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
     t.connect()  # must not raise
     assert t._session_id == "abc123"
     assert t._rtp_remote == ("10.0.0.1", 6000)
@@ -153,14 +162,16 @@ def test_connect_uses_an_absolute_sdp_control_uri_directly_no_doubling(monkeypat
     # absolute rtsp:// URI. Pre-fix, connect() blindly concatenated it
     # onto the base URI (f"{base}/{control}"), producing
     # ".../onvif/media//rtsp://10.0.0.1:80/onvif/media/trackID=2" --
-    # SETUP still returned 200 (a lenient camera), RECORD then got no
-    # response at all. This proves the actual bytes sent for SETUP now
-    # carry the absolute control URI untouched, with no doubling.
+    # SETUP still returned 200 (a lenient camera) even with the doubled
+    # URI, but the backchannel itself (RECORD at the time this bug was
+    # found; PLAY now) got no response at all. This proves the actual
+    # bytes sent for SETUP now carry the absolute control URI untouched,
+    # with no doubling.
     describe_absolute_control = (
         b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Type: application/sdp\r\n\r\n"
         b"v=0\r\nm=audio 0 RTP/AVP 0\r\na=control:rtsp://10.0.0.1:80/onvif/media/trackID=2\r\n"
     )
-    t = _make_transport(monkeypatch, {"DESCRIBE": [describe_absolute_control], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t = _make_transport(monkeypatch, {"DESCRIBE": [describe_absolute_control], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
     t.connect()  # must not raise
     assert t._session_id == "abc123"
     setup_request_line = next(r for r in t._test_fake_socket.sent_requests if r.startswith("SETUP")).splitlines()[0]
@@ -183,7 +194,7 @@ def test_connect_succeeds_after_a_valid_401_digest_challenge_and_retry(monkeypat
     # other test in this file; the port itself is irrelevant to what's
     # being proven here.
     challenge = b'RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Digest realm="IPCam", nonce="abc123nonce", qop="auth"\r\n\r\n'
-    t = _make_transport(monkeypatch, {"DESCRIBE": [challenge, _DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t = _make_transport(monkeypatch, {"DESCRIBE": [challenge, _DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
     t.connect()  # must not raise
     assert t._session_id == "abc123"
 
@@ -209,7 +220,7 @@ def _www_authenticate_challenge(cseq_echo: int) -> bytes:
 
 
 def test_every_request_gets_a_strictly_increasing_cseq(monkeypatch):
-    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
     t.connect()
     cseqs = [_cseq_of(r) for r in t._test_fake_socket.sent_requests]
     assert cseqs == sorted(cseqs)
@@ -217,7 +228,7 @@ def test_every_request_gets_a_strictly_increasing_cseq(monkeypatch):
 
 
 def test_401_digest_retry_consumes_a_new_cseq(monkeypatch):
-    t = _make_transport(monkeypatch, {"DESCRIBE": [_www_authenticate_challenge(1), _DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_www_authenticate_challenge(1), _DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
     t.connect()
     describe_requests = [r for r in t._test_fake_socket.sent_requests if r.startswith("DESCRIBE")]
     assert len(describe_requests) == 2
@@ -230,7 +241,7 @@ def test_setup_continues_from_the_cseq_describes_retry_already_used(monkeypatch)
     # The exact real Camera 2 shape: DESCRIBE needs a 401->retry (two
     # requests, CSeq N and N+1); SETUP's own first attempt must then
     # start at N+2, never reuse N+1.
-    t = _make_transport(monkeypatch, {"DESCRIBE": [_www_authenticate_challenge(1), _DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_www_authenticate_challenge(1), _DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
     t.connect()
     describe_cseqs = [_cseq_of(r) for r in t._test_fake_socket.sent_requests if r.startswith("DESCRIBE")]
     setup_cseqs = [_cseq_of(r) for r in t._test_fake_socket.sent_requests if r.startswith("SETUP")]
@@ -240,15 +251,79 @@ def test_setup_continues_from_the_cseq_describes_retry_already_used(monkeypatch)
 
 
 def test_no_duplicate_cseq_across_a_full_sequence_with_retries_at_every_stage(monkeypatch):
-    # The worst case: every one of DESCRIBE, SETUP, and RECORD needs its
+    # The worst case: every one of DESCRIBE, SETUP, and PLAY needs its
     # own 401->digest-retry cycle on the same connection.
     t = _make_transport(monkeypatch, {
         "DESCRIBE": [_www_authenticate_challenge(1), _DESCRIBE_OK],
         "SETUP": [_www_authenticate_challenge(1), _SETUP_OK],
-        "RECORD": [_www_authenticate_challenge(1), _RECORD_OK],
+        "PLAY": [_www_authenticate_challenge(1), _PLAY_OK],
     })
     t.connect()  # must not raise
     cseqs = [_cseq_of(r) for r in t._test_fake_socket.sent_requests]
     assert len(cseqs) == 6  # 2 requests per stage x 3 stages
     assert cseqs == sorted(cseqs)
     assert len(cseqs) == len(set(cseqs)), f"duplicate CSeq found across the full sequence: {cseqs}"
+
+
+# ------------------------------------------------------------- ONVIF backchannel activation: PLAY, not RECORD; Require on DESCRIBE only
+#
+# Real Camera 2 evidence, from a controlled, single-variable test
+# against the real camera (never combining the two candidate changes
+# in one test, per instruction): RECORD -- generic RTSP's own verb for
+# client-to-server data -- got no response at all whether or not it
+# carried the ONVIF backchannel Require header (tried both, separately);
+# PLAY -- the verb ONVIF's own Profile T backchannel extension actually
+# specifies (Streaming Spec SS5.3.2) -- succeeded with a clean 200 OK
+# and a clean TEARDOWN, without needing a Require header of its own.
+# DESCRIBE's own Require header is separately confirmed necessary: it's
+# what makes the real camera's SDP response include the sendonly
+# backchannel track at all (see the two-audio-section SDP fixture
+# below) -- without it, only the ordinary recvonly playback track is
+# ever offered.
+
+_DESCRIBE_OK_TWO_AUDIO_SECTIONS = (
+    b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Type: application/sdp\r\n\r\n"
+    b"v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=Media Presentation\r\nt=0 0\r\n"
+    b"a=control:rtsp://10.0.0.1:80/onvif/media/\r\n"
+    b"m=video 0 RTP/AVP 96\r\na=control:rtsp://10.0.0.1:80/onvif/media/trackID=1\r\n"
+    b"m=audio 0 RTP/AVP 0\r\na=recvonly\r\na=control:rtsp://10.0.0.1:80/onvif/media/trackID=2\r\n"
+    b"m=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:rtsp://10.0.0.1:80/onvif/media/trackID=4\r\n"
+)
+
+
+def test_connect_sends_play_not_record_to_start_the_backchannel(monkeypatch):
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
+    t.connect()  # must not raise -- would raise if the code still sent RECORD, since no RECORD response is scripted
+    methods_sent = {r.split(" ", 1)[0] for r in t._test_fake_socket.sent_requests}
+    assert "PLAY" in methods_sent
+    assert "RECORD" not in methods_sent
+
+
+def test_play_request_carries_no_require_header(monkeypatch):
+    # The proven-successful real variant: PLAY with no Require header
+    # of its own. Asserting this directly guards against a future edit
+    # accidentally reintroducing the header on PLAY (untested against
+    # real hardware, and unnecessary per the evidence already gathered).
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
+    t.connect()
+    play_request = next(r for r in t._test_fake_socket.sent_requests if r.startswith("PLAY"))
+    assert "require" not in play_request.lower()
+
+
+def test_describe_request_carries_the_onvif_backchannel_require_header(monkeypatch):
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
+    t.connect()
+    describe_request = next(r for r in t._test_fake_socket.sent_requests if r.startswith("DESCRIBE"))
+    assert "Require: www.onvif.org/ver20/backchannel" in describe_request
+
+
+def test_connect_selects_the_sendonly_track_not_the_recvonly_one(monkeypatch):
+    # The exact real Camera 2 SDP shape once DESCRIBE's Require header
+    # is honored: an ordinary recvonly playback audio section (trackID=2)
+    # followed by the actual sendonly backchannel section (trackID=4).
+    # SETUP must target the sendonly track.
+    t = _make_transport(monkeypatch, {"DESCRIBE": [_DESCRIBE_OK_TWO_AUDIO_SECTIONS], "SETUP": [_SETUP_OK], "PLAY": [_PLAY_OK]})
+    t.connect()  # must not raise
+    setup_request_line = next(r for r in t._test_fake_socket.sent_requests if r.startswith("SETUP")).splitlines()[0]
+    assert "trackID=4" in setup_request_line
+    assert "trackID=2" not in setup_request_line

@@ -1,8 +1,9 @@
 """Generic camera talk-down (backchannel audio) transport interface,
 plus the one concrete implementation this milestone builds: standards-
-based ONVIF/RTSP backchannel (SETUP+RECORD on the audio media section
-a camera's own SDP advertises, then RTP/PCMU packets over that
-negotiated channel).
+based ONVIF/RTSP backchannel (DESCRIBE with the ONVIF backchannel
+Require tag, SETUP on the sendonly audio media section the camera's
+own SDP then advertises, PLAY to start the backchannel, then RTP/PCMU
+packets over that negotiated channel).
 
 TalkDownTransport is the seam a vendor-specific fallback would plug
 into later, exactly per the requirement that vendor-specific behavior
@@ -22,23 +23,30 @@ against the real lab cameras (WS-Security-adjacent RTSP digest with
 qop=auth/nc/cnonce/opaque/algorithm support). RTP packetization is a
 small, pure, independently-testable function.
 
-Not exercised against a real camera in this milestone -- see the
-module docstring's explicit scope note in talk_audio_relay_client.py.
-No SETUP/RECORD/RTP packet is ever sent to a real device by anything
-in this codebase yet; OnvifBackchannelTransport exists and is unit-
-tested, but its .connect()/.send() are never invoked outside a test in
-this commit.
+The DESCRIBE-Require-tag and SETUP+PLAY sequence below is proven
+against real hardware (Camera 2, 192.168.0.38), not just unit-tested:
+DESCRIBE without the Require tag returns only the camera's ordinary
+recvonly playback audio section; DESCRIBE with it returns an
+additional sendonly section (the actual backchannel track) that SETUP
+then correctly targets. Starting the backchannel itself was resolved
+by a controlled, single-variable test against the real camera: RECORD
+(generic RTSP's own verb for client-to-server data), tried both with
+and without the Require tag in two separate isolated tests, got no
+response either way; PLAY (the verb ONVIF's own Profile T backchannel
+extension actually specifies, Streaming Spec SS5.3.2) succeeded with a
+clean 200 OK and a clean TEARDOWN, without needing a Require tag of
+its own. See connect()'s own comments for exactly which combination
+was tested where.
 
 connect() logs one INFO line per protocol stage -- target host/port/
 path once at the start, then each stage's outcome (status line or
 "no_response") as it happens, not just the final failure -- added
-during the real Camera 2 DESCRIBE-gets-no-response investigation, to
-make it possible to tell which exact stage (DESCRIBE, SDP parsing,
-SETUP, session extraction, RECORD) is failing in production without
-guessing from a single exception message. Host/port/path are not
-secrets and are logged directly; credentials, the Authorization header
-value, and any digest response are never logged anywhere in this
-module.
+during the real Camera 2 investigation, to make it possible to tell
+which exact stage (DESCRIBE, SDP parsing, SETUP, session extraction,
+PLAY) is failing in production without guessing from a single
+exception message. Host/port/path are not secrets and are logged
+directly; credentials, the Authorization header value, and any digest
+response are never logged anywhere in this module.
 """
 
 import hashlib
@@ -55,7 +63,7 @@ logger = logging.getLogger("anyaicam.talk_down_transport")
 
 class TalkDownTransport:
     """The generic seam. connect() negotiates whatever the concrete
-    transport needs (e.g. RTSP SETUP/RECORD); send() delivers one
+    transport needs (e.g. RTSP SETUP/PLAY); send() delivers one
     already-encoded audio frame (PCMU bytes for the ONVIF
     implementation); close() tears the session down. No method here
     takes or returns anything camera-number/model-specific."""
@@ -251,10 +259,13 @@ def build_rtp_packet(payload: bytes, sequence_number: int, timestamp: int, ssrc:
 
 
 class OnvifBackchannelTransport(TalkDownTransport):
-    """RTSP RECORD-based ONVIF backchannel delivery: SETUP the audio
-    media section a camera's own DESCRIBE/SDP advertises, then RECORD
-    to start the backchannel, then send RTP/PCMU packets over the
-    negotiated UDP port for the session's duration, then TEARDOWN.
+    """RTSP PLAY-based ONVIF backchannel delivery: DESCRIBE with the
+    ONVIF backchannel Require tag, SETUP the sendonly audio media
+    section that then appears in the camera's own SDP, PLAY to start
+    the backchannel (the ONVIF Profile T verb -- not RECORD, which is
+    generic RTSP's own client-to-server verb but was proven, against
+    real hardware, not to work here), then send RTP/PCMU packets over
+    the negotiated UDP port for the session's duration, then TEARDOWN.
 
     Deliberately does not touch the camera's video RTSP session at all
     -- this opens its own independent RTSP connection/session purely
@@ -313,13 +324,17 @@ class OnvifBackchannelTransport(TalkDownTransport):
         # connection includes this on DESCRIBE; a server that
         # understands it includes an ADDITIONAL a=sendonly audio media
         # section in its SDP for the backchannel track, distinct from
-        # the normal a=recvonly playback audio track. Diagnostic-only
-        # for now: added here (matching go2rtc's own proven real-world
-        # pattern of putting this header on DESCRIBE only, not on
-        # SETUP/RECORD/TEARDOWN) to observe whether Camera 2's SDP
-        # actually changes when this is present, before deciding
-        # whether any track-selection or verb change is warranted --
-        # see the stage=sdp_raw_body diagnostic already in place below.
+        # the normal a=recvonly playback audio track. Confirmed
+        # necessary, not just diagnostic: without this header, the real
+        # Camera 2's DESCRIBE response has only the ordinary recvonly
+        # playback audio section (trackID=2) -- adding it is what makes
+        # the camera also offer the actual sendonly backchannel track
+        # (trackID=4) that SETUP/PLAY below need to target. Matches
+        # go2rtc's own proven real-world pattern of putting this header
+        # on DESCRIBE only, not on SETUP/PLAY/TEARDOWN -- confirmed by a
+        # controlled, isolated test against the real camera: adding this
+        # same header to RECORD (keeping RECORD as the verb) did not fix
+        # anything, ruling that variant out on its own.
         describe = _authenticated_rtsp_request(self._sock, self._next_cseq, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\nRequire: www.onvif.org/ver20/backchannel\r\n")
         describe_status = _status_line(describe)
         logger.info("talk_down_transport.stage stage=describe_response host=%s port=%s status=%s", self.host, self.port, describe_status or "no_response")
@@ -333,15 +348,6 @@ class OnvifBackchannelTransport(TalkDownTransport):
         # world control-attribute shapes this camera used -- absolute,
         # leading-slash, or plain relative -- never naively concatenating.
         sdp_body = describe.split("\r\n\r\n", 1)[-1]
-        # Temporary diagnostic: the complete raw SDP body, to determine
-        # whether this camera advertises a session-level a=control:
-        # attribute (one appearing before any m= line) -- both Live555
-        # (sessionURL()/controlPath()) and FFmpeg (rt->control_uri) use
-        # that, when present, as the target for PLAY/RECORD in preference
-        # to the base DESCRIBE URI, per the RTSP reference-implementation
-        # comparison already done for this investigation. SDP bodies
-        # never carry credentials -- safe to log in full.
-        logger.info("talk_down_transport.stage stage=sdp_raw_body sdp=%r", sdp_body)
         audio_control = self._find_backchannel_control(sdp_body)
         setup_uri = _resolve_control_uri(uri, audio_control)
         logger.info("talk_down_transport.stage stage=sdp_parsing audio_control=%s setup_uri=%s", audio_control, setup_uri)
@@ -364,14 +370,30 @@ class OnvifBackchannelTransport(TalkDownTransport):
             raise ConnectionError("SETUP returned 200 but no Session header was present (stage=session_extraction)")
         self._rtp_remote = (self.host, self._extract_server_port(setup) or self.port)
 
-        record = _authenticated_rtsp_request(
-            self._sock, self._next_cseq, "RECORD", uri, self.username, self.password,
+        # PLAY, not RECORD, starts the backchannel -- confirmed by a
+        # controlled, isolated test against the real Camera 2: RECORD
+        # (with or without the Require header -- tried in two separate
+        # tests, never combined) consistently got no response at all,
+        # while PLAY to this same aggregate session URI, with no Require
+        # header of its own, returned a clean 200 OK, followed by a
+        # clean TEARDOWN. Generic RTSP (RFC 2326) uses RECORD for
+        # client-to-server data; ONVIF's own Profile T backchannel
+        # extension (Streaming Spec SS5.3.2) reuses PLAY instead --
+        # a single PLAY call that starts both the normal playback
+        # streams and the backchannel simultaneously -- and real
+        # hardware evidence confirms Camera 2 follows the ONVIF
+        # convention here, not the generic RTSP one. No Require header
+        # on this request: that variant was tested in isolation too
+        # (RECORD+Require, kept as RECORD) and did not help on its own,
+        # so it's not carried over here.
+        play = _authenticated_rtsp_request(
+            self._sock, self._next_cseq, "PLAY", uri, self.username, self.password,
             extra_headers=f"Session: {self._session_id}\r\nRange: npt=0.000-\r\n",
         )
-        record_status = _status_line(record)
-        logger.info("talk_down_transport.stage stage=record_response host=%s port=%s status=%s", self.host, self.port, record_status or "no_response")
-        if " 200 " not in record_status:
-            raise ConnectionError(f"RECORD failed (stage=record_response): {record_status or 'no response (connection closed before any data was received)'}")
+        play_status = _status_line(play)
+        logger.info("talk_down_transport.stage stage=play_response host=%s port=%s status=%s", self.host, self.port, play_status or "no_response")
+        if " 200 " not in play_status:
+            raise ConnectionError(f"PLAY failed (stage=play_response): {play_status or 'no response (connection closed before any data was received)'}")
         logger.info("talk_down_transport.connect_succeeded host=%s port=%s", self.host, self.port)
 
     def send(self, encoded_audio: bytes) -> None:
