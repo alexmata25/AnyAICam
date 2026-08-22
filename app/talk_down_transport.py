@@ -28,14 +28,28 @@ No SETUP/RECORD/RTP packet is ever sent to a real device by anything
 in this codebase yet; OnvifBackchannelTransport exists and is unit-
 tested, but its .connect()/.send() are never invoked outside a test in
 this commit.
+
+connect() logs one INFO line per protocol stage -- target host/port/
+path once at the start, then each stage's outcome (status line or
+"no_response") as it happens, not just the final failure -- added
+during the real Camera 2 DESCRIBE-gets-no-response investigation, to
+make it possible to tell which exact stage (DESCRIBE, SDP parsing,
+SETUP, session extraction, RECORD) is failing in production without
+guessing from a single exception message. Host/port/path are not
+secrets and are logged directly; credentials, the Authorization header
+value, and any digest response are never logged anywhere in this
+module.
 """
 
 import hashlib
+import logging
 import re
 import secrets
 import socket
 import struct
 import time
+
+logger = logging.getLogger("anyaicam.talk_down_transport")
 
 
 class TalkDownTransport:
@@ -188,20 +202,21 @@ class OnvifBackchannelTransport(TalkDownTransport):
         return f"rtsp://{self.host}:{self.port}{self.rtsp_path}"
 
     def connect(self) -> None:
-        # Every stage below raises ConnectionError with an explicit
-        # stage= tag on failure, rather than letting a malformed/empty
-        # response crash with a bare exception -- talk_audio_relay_client
-        # .py's own _start_session() already logs str(error) verbatim on
-        # a connect() failure (session_id/camera_id/camera_number +
-        # error), so the stage tag alone is enough to tell DESCRIBE
-        # response handling, SETUP response handling, session
-        # extraction, and RECORD response handling apart in production
-        # logs, with no separate logging needed in this module.
+        # Every stage below logs its own outcome (never credentials/
+        # Authorization) as it happens, in addition to raising
+        # ConnectionError with an explicit stage= tag on failure --
+        # talk_audio_relay_client.py's own _start_session() already logs
+        # str(error) verbatim on a connect() failure (session_id/
+        # camera_id/camera_number/error), so between the two, production
+        # logs show both the final outcome AND exactly how far the
+        # handshake got before it failed.
+        logger.info("talk_down_transport.connect_start host=%s port=%s path=%s", self.host, self.port, self.rtsp_path)
         self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout_seconds)
         uri = self._request_uri()
 
         describe = _authenticated_rtsp_request(self._sock, 1, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\n")
         describe_status = _status_line(describe)
+        logger.info("talk_down_transport.stage stage=describe_response host=%s port=%s status=%s", self.host, self.port, describe_status or "no_response")
         if " 200 " not in describe_status:
             raise ConnectionError(f"DESCRIBE failed (stage=describe_response): {describe_status or 'no response (connection closed before any data was received)'}")
 
@@ -211,6 +226,7 @@ class OnvifBackchannelTransport(TalkDownTransport):
         sdp_body = describe.split("\r\n\r\n", 1)[-1]
         audio_control = self._find_backchannel_control(sdp_body)
         setup_uri = f"{uri}/{audio_control}" if audio_control else uri
+        logger.info("talk_down_transport.stage stage=sdp_parsing audio_control=%s setup_uri=%s", audio_control, setup_uri)
 
         self._rtp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._rtp_socket.bind(("0.0.0.0", 0))
@@ -220,10 +236,12 @@ class OnvifBackchannelTransport(TalkDownTransport):
             extra_headers=f"Transport: RTP/AVP;unicast;client_port={local_port}-{local_port + 1}\r\n",
         )
         setup_status = _status_line(setup)
+        logger.info("talk_down_transport.stage stage=setup_response host=%s port=%s status=%s", self.host, self.port, setup_status or "no_response")
         if " 200 " not in setup_status:
             raise ConnectionError(f"SETUP failed (stage=setup_response): {setup_status or 'no response (connection closed before any data was received)'}")
 
         self._session_id = self._extract_header(setup, "session").split(";")[0].strip()
+        logger.info("talk_down_transport.stage stage=session_extraction session_id_present=%s", bool(self._session_id))
         if not self._session_id:
             raise ConnectionError("SETUP returned 200 but no Session header was present (stage=session_extraction)")
         self._rtp_remote = (self.host, self._extract_server_port(setup) or self.port)
@@ -233,8 +251,10 @@ class OnvifBackchannelTransport(TalkDownTransport):
             extra_headers=f"Session: {self._session_id}\r\nRange: npt=0.000-\r\n",
         )
         record_status = _status_line(record)
+        logger.info("talk_down_transport.stage stage=record_response host=%s port=%s status=%s", self.host, self.port, record_status or "no_response")
         if " 200 " not in record_status:
             raise ConnectionError(f"RECORD failed (stage=record_response): {record_status or 'no response (connection closed before any data was received)'}")
+        logger.info("talk_down_transport.connect_succeeded host=%s port=%s", self.host, self.port)
 
     def send(self, encoded_audio: bytes) -> None:
         if self._rtp_socket is None or self._rtp_remote is None:
