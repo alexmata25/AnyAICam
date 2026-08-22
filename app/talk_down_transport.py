@@ -120,7 +120,7 @@ def _digest_authorization(challenge: dict, username: str, password: str, method:
     return "Digest " + ", ".join(parts)
 
 
-def _rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str, request_uri: str, extra_headers: str = "", auth_header: str | None = None, body: bytes = b"", attempt: str = "initial") -> str:
+def _rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str, request_uri: str, extra_headers: str = "", auth_header: str | None = None, body: bytes = b"") -> str:
     """Sends one RTSP request and returns the raw response text.
 
     `next_cseq` is a zero-argument callable returning the next CSeq to
@@ -140,12 +140,15 @@ def _rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str
     stage, every retry -- get a strictly increasing CSeq with no caller
     needing to know how many requests came before it.
 
-    `attempt` is a caller-supplied label ("initial" or "digest_retry")
-    purely for the diagnostic log line below -- it has no effect on
-    what's actually sent. Logs method/CSeq/attempt/request_uri before
-    sending and the resulting status line (or "no_response") after.
-    Never logs auth_header, credentials, passwords, or the digest
-    nonce/response; those never appear in this log line at all."""
+    No per-request logging here: the connect()-level stage logging
+    (connect_start, stage=describe_response, stage=setup_response,
+    stage=play_response, connect_succeeded, etc.) is the permanent
+    production diagnostic, kept because it makes it possible to tell
+    which exact stage of a handshake is failing in production. The
+    per-request method/CSeq/attempt/status tracing that used to live
+    here was investigation-only (added to confirm the CSeq-reuse root
+    cause) and has been removed now that the fix is confirmed working
+    against real hardware."""
     cseq = next_cseq()
     headers = f"{method} {request_uri} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: anyaicam-talk-down/0.1\r\n{extra_headers}"
     if auth_header:
@@ -153,7 +156,6 @@ def _rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str
     if body:
         headers += f"Content-Length: {len(body)}\r\n"
     headers += "\r\n"
-    logger.info("talk_down_transport.rtsp_request method=%s cseq=%s attempt=%s request_uri=%s", method, cseq, attempt, request_uri)
     sock.sendall(headers.encode() + body)
     data = b""
     while b"\r\n\r\n" not in data:
@@ -162,7 +164,6 @@ def _rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str
             break
         data += chunk
     response = data.decode(errors="replace")
-    logger.info("talk_down_transport.rtsp_response method=%s cseq=%s attempt=%s status=%s", method, cseq, attempt, _status_line(response) or "no_response")
     return response
 
 
@@ -178,7 +179,7 @@ def _status_line(response: str) -> str:
 
 
 def _authenticated_rtsp_request(sock: socket.socket, next_cseq: Callable[[], int], method: str, request_uri: str, username: str, password: str, extra_headers: str = "", body: bytes = b"") -> str:
-    first = _rtsp_request(sock, next_cseq, method, request_uri, extra_headers=extra_headers, body=body, attempt="initial")
+    first = _rtsp_request(sock, next_cseq, method, request_uri, extra_headers=extra_headers, body=body)
     status_line = _status_line(first)
     if " 401 " not in status_line:
         return first
@@ -194,7 +195,7 @@ def _authenticated_rtsp_request(sock: socket.socket, next_cseq: Callable[[], int
     challenge = _parse_digest_challenge(www_authenticate.partition(":")[2].strip())
     cnonce = secrets.token_hex(8)
     auth = _digest_authorization(challenge, username, password, method, request_uri, cnonce, "00000001")
-    return _rtsp_request(sock, next_cseq, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body, attempt="digest_retry")
+    return _rtsp_request(sock, next_cseq, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body)
 
 
 # ---------------------------------------------------------- SDP control-URI resolution (pure)
