@@ -111,13 +111,22 @@ def _digest_authorization(challenge: dict, username: str, password: str, method:
     return "Digest " + ", ".join(parts)
 
 
-def _rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str, extra_headers: str = "", auth_header: str | None = None, body: bytes = b"") -> str:
+def _rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str, extra_headers: str = "", auth_header: str | None = None, body: bytes = b"", attempt: str = "initial") -> str:
+    """Sends one RTSP request and returns the raw response text.
+    `attempt` is a caller-supplied label ("initial" or "digest_retry")
+    purely for the diagnostic log line below -- it has no effect on
+    what's actually sent. Logs method/CSeq/attempt/request_uri before
+    sending and the resulting status line (or "no_response") after --
+    added during the CSeq-monotonicity investigation. Never logs
+    auth_header, credentials, passwords, or the digest nonce/response;
+    those never appear in this log line at all."""
     headers = f"{method} {request_uri} RTSP/1.0\r\nCSeq: {cseq}\r\nUser-Agent: anyaicam-talk-down/0.1\r\n{extra_headers}"
     if auth_header:
         headers += f"Authorization: {auth_header}\r\n"
     if body:
         headers += f"Content-Length: {len(body)}\r\n"
     headers += "\r\n"
+    logger.info("talk_down_transport.rtsp_request method=%s cseq=%s attempt=%s request_uri=%s", method, cseq, attempt, request_uri)
     sock.sendall(headers.encode() + body)
     data = b""
     while b"\r\n\r\n" not in data:
@@ -125,7 +134,9 @@ def _rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str,
         if not chunk:
             break
         data += chunk
-    return data.decode(errors="replace")
+    response = data.decode(errors="replace")
+    logger.info("talk_down_transport.rtsp_response method=%s cseq=%s attempt=%s status=%s", method, cseq, attempt, _status_line(response) or "no_response")
+    return response
 
 
 def _status_line(response: str) -> str:
@@ -140,7 +151,7 @@ def _status_line(response: str) -> str:
 
 
 def _authenticated_rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str, username: str, password: str, extra_headers: str = "", body: bytes = b"") -> str:
-    first = _rtsp_request(sock, cseq, method, request_uri, extra_headers=extra_headers, body=body)
+    first = _rtsp_request(sock, cseq, method, request_uri, extra_headers=extra_headers, body=body, attempt="initial")
     status_line = _status_line(first)
     if " 401 " not in status_line:
         return first
@@ -156,7 +167,7 @@ def _authenticated_rtsp_request(sock: socket.socket, cseq: int, method: str, req
     challenge = _parse_digest_challenge(www_authenticate.partition(":")[2].strip())
     cnonce = secrets.token_hex(8)
     auth = _digest_authorization(challenge, username, password, method, request_uri, cnonce, "00000001")
-    return _rtsp_request(sock, cseq + 1, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body)
+    return _rtsp_request(sock, cseq + 1, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body, attempt="digest_retry")
 
 
 # ---------------------------------------------------------- SDP control-URI resolution (pure)
