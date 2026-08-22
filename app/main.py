@@ -2634,10 +2634,17 @@ YOLO_ALLOWED_CLASSES = {
 }
 
 
-
-
-
-
+# How long a local YOLO/motion analytics event record (analytics_events.json)
+# and its corresponding AI thumbnail JPEG (media/ai/) are kept before
+# delete_expired_analytics_events() purges them. Deliberately its own
+# setting rather than reusing RETENTION_DAYS (which governs .mkv
+# recordings and, separately, motion_events.jsonl/motion thumbnails
+# inside delete_expired_recordings()) -- analytics-event volume and
+# recording volume are unrelated quantities with unrelated useful
+# lifetimes, and an ops user tuning one should not silently move the
+# other. Same 7-day default as RETENTION_DAYS purely as a sensible
+# out-of-box value, not because the two are coupled.
+ANALYTICS_RETENTION_DAYS = max(1, int(os.environ.get("ANYAICAM_ANALYTICS_RETENTION_DAYS", "7")))
 
 
 ffmpeg_processes: list[subprocess.Popen] = []
@@ -16647,6 +16654,64 @@ def delete_expired_recordings() -> None:
 
 
 
+
+
+def delete_expired_analytics_events(now: datetime | None = None) -> None:
+    """Bounded retention for local YOLO/motion analytics data --
+    analytics_events.json (the AnalyticsEventModel JSON array
+    save_yolo_events()/append_analytics_event() write to) and its
+    corresponding AI thumbnail JPEGs under AI_THUMBNAILS_FOLDER
+    (media/ai/{date}/). Cut on ANALYTICS_RETENTION_DAYS, independent of
+    RETENTION_DAYS (see that constant's own comment for why).
+
+    Deliberately separate from delete_expired_recordings() rather than
+    folded into it: this function's only job is analytics data, so it
+    can be tested, reasoned about, and (if ever needed) disabled
+    without touching the already-load-bearing recording/motion
+    cleanup path above. Never touches RECORDINGS_FOLDER's *.mkv files,
+    MOTION_EVENTS_FILE, or MOTION_THUMBNAILS_FOLDER -- those remain
+    exactly delete_expired_recordings()'s responsibility, unchanged.
+
+    `now` is optional and defaults to datetime.now() -- present purely
+    so tests can pin an exact instant and assert precise boundary
+    behavior (an event/thumbnail exactly ANALYTICS_RETENTION_DAYS old
+    is kept, only one that's MORE than that old is purged) without
+    monkeypatching the datetime module itself, matching
+    recording_retention_sweep.py's own run_retention_sweep_tick(now=...)
+    precedent. Production call sites never pass it.
+
+    A malformed or unparseable event (missing/bad "timestamp") is
+    RETAINED, not dropped -- the opposite of how the existing motion-
+    event prune above silently discards what it can't parse. Losing a
+    detection record to a parsing hiccup is worse than leaving a few
+    bytes of extra JSON around for one more sweep; the next tick gets
+    another chance to parse it once it's actually past its window."""
+    cutoff = (now or datetime.now()) - timedelta(days=ANALYTICS_RETENTION_DAYS)
+    if ANALYTICS_EVENTS_FILE.exists():
+        original_events = load_json_list(ANALYTICS_EVENTS_FILE)
+        retained_events = []
+        for event in original_events:
+            try:
+                event_time = datetime.fromisoformat(str(event.get("timestamp", "")))
+            except (TypeError, ValueError):
+                retained_events.append(event)
+                continue
+            if event_time >= cutoff:
+                retained_events.append(event)
+        if len(retained_events) != len(original_events):
+            save_json_list(ANALYTICS_EVENTS_FILE, retained_events)
+    deleted_thumbnails = 0
+    for thumbnail in AI_THUMBNAILS_FOLDER.rglob("*.jpg"):
+        try:
+            if datetime.fromtimestamp(thumbnail.stat().st_mtime) < cutoff:
+                thumbnail.unlink(missing_ok=True)
+                deleted_thumbnails += 1
+        except OSError as error:
+            print(f"Could not inspect or delete {thumbnail}: {error}")
+    if deleted_thumbnails:
+        print(f"Analytics retention cleanup deleted {deleted_thumbnails} expired AI thumbnail(s).")
+
+
 async def retention_worker() -> None:
 
 
@@ -16666,6 +16731,7 @@ async def retention_worker() -> None:
 
 
         delete_expired_recordings()
+        delete_expired_analytics_events()
 
 
 
