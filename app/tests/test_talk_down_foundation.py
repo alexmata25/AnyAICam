@@ -452,14 +452,23 @@ def test_pointer_lifecycle_all_wired_to_stop_on_both_pages(customer_client, db_p
             _seed_tenant(db)
             _seed_camera(db, "cam-1", talk_down_supported=1)
 
+    # Real audio transport (talk_audio_relay.py / _TALK_MIC_JS) replaced
+    # the earlier placeholder REST-only start()/stop() with a single
+    # shared wireTalkMic() client used identically by both pages -- the
+    # pointer lifecycle is now wired once, inside that shared function,
+    # not duplicated inline per page. This test still proves the same
+    # underlying requirement (every release/cancel/leave path reliably
+    # stops), just against the current implementation's own names.
     cookie = {partner_portal.SESSION_COOKIE: _owner_cookie()}
     grid_html = customer_client.get("/customer-live", cookies=cookie).text
     single_html = customer_client.get("/customer/cameras/cam-1/live", cookies=cookie).text
     for html in (grid_html, single_html):
-        assert "pointerup" in html and "stopTalk" in html
-        assert "pointercancel" in html and "'pointercancel'" in html
+        assert "function wireTalkMic(button, cameraId)" in html
+        assert "wireTalkMic(" in html.split("function wireTalkMic")[1]  # actually invoked, not just defined
+        assert "pointerdown" in html and "'pointerdown', start)" in html
+        assert "pointerup" in html and "() => stop())" in html
+        assert "pointercancel" in html
         assert "pointerleave" in html
-        assert "pointerdown" in html and "startTalk" in html
 
 
 # --------------------------------------------------------- no hardcoded camera numbers/models
