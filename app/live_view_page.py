@@ -41,6 +41,97 @@ from partner_portal import partner_identity
 POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
 
+# Shared press-and-hold push-to-talk client, used identically by both
+# the /customer-live grid (one call per tile) and the single-camera
+# page (one call for its one mic button) -- written once here rather
+# than duplicated per page, unlike this module's usual per-page-
+# duplication convention, since audio capture/transport logic is
+# meaningfully more failure-prone than the small per-page auth checks
+# that convention exists for.
+#
+# Mic permission is requested only on the first real press (inside
+# start(), never at page load) -- getUserMedia() itself throws for
+# denied/unavailable devices, caught and surfaced as a toast rather
+# than left as an unhandled rejection. The WebSocket is opened only
+# after a real mic stream exists, and carries the browser's actual
+# AudioContext sample rate as a query parameter so the appliance-side
+# transcode step never has to guess it. A silent GainNode (gain=0) is
+# interposed between the capture ScriptProcessorNode and the audio
+# destination -- required by some browsers for onaudioprocess to fire
+# reliably, without which the mic's own input would otherwise be
+# audibly routed back out to the speakers.
+_TALK_MIC_JS = """
+function wireTalkMic(button, cameraId) {
+  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null, sessionId = null, stopping = false;
+
+  async function stop() {
+    if (stopping) return;
+    stopping = true;
+    button.classList.remove('active');
+    if (processor) { try { processor.disconnect() } catch (e) {} }
+    if (source) { try { source.disconnect() } catch (e) {} }
+    if (silentGain) { try { silentGain.disconnect() } catch (e) {} }
+    if (audioCtx) { try { audioCtx.close() } catch (e) {} }
+    if (mediaStream) { mediaStream.getTracks().forEach(track => track.stop()) }
+    if (ws) { try { ws.close() } catch (e) {} }
+    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null; sessionId = null;
+  }
+
+  async function start() {
+    if (button.disabled || ws || stopping === false && sessionId) return;
+    stopping = false;
+    let response;
+    try {
+      response = await fetch(`/api/customer/cameras/${cameraId}/talk/start`, { method: 'POST' });
+    } catch (e) { return; }
+    if (!response.ok) { return; }
+    const body = await response.json();
+    sessionId = body.session_id;
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      showToast('Microphone permission denied or unavailable.');
+      sessionId = null;
+      return;
+    }
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    source = audioCtx.createMediaStreamSource(mediaStream);
+    processor = audioCtx.createScriptProcessor(2048, 1, 1);
+    silentGain = audioCtx.createGain();
+    silentGain.gain.value = 0;
+
+    const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sessionId}/audio?sample_rate=${audioCtx.sampleRate}`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { button.classList.add('active') };
+    ws.onclose = () => { stop() };
+    ws.onerror = () => { stop() };
+
+    processor.onaudioprocess = (event) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const input = event.inputBuffer.getChannelData(0);
+      const pcm16 = new Int16Array(input.length);
+      for (let i = 0; i < input.length; i++) {
+        const clamped = Math.max(-1, Math.min(1, input[i]));
+        pcm16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+      }
+      ws.send(pcm16.buffer);
+    };
+    source.connect(processor);
+    processor.connect(silentGain);
+    silentGain.connect(audioCtx.destination);
+  }
+
+  button.addEventListener('pointerdown', start);
+  button.addEventListener('pointerup', () => stop());
+  button.addEventListener('pointercancel', () => stop());
+  button.addEventListener('pointerleave', () => stop());
+  window.addEventListener('pagehide', () => stop());
+}
+"""
+
 
 def _talk_down_state(supported) -> dict:
     """Maps the raw tri-state talk_down_supported column value (NULL /
@@ -201,7 +292,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<section class="live-grid">{tiles}</section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
   const pollIntervalMs={POLL_INTERVAL_MS};
@@ -279,53 +370,21 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
-  // Push-to-talk: press-and-hold only, no always-open duplex mode.
-  // Each tile's mic button is entirely independent -- talkState is
-  // keyed per camera id, so one camera's press/release/error can never
+  // Push-to-talk: press-and-hold only, real mic capture, no always-open
+  // duplex mode. Each tile's mic is wired entirely independently via
+  // wireTalkMic() (see the shared client defined once at module level)
+  // -- one camera's press/release/error/permission-denial can never
   // affect another's. Every enabled button here already reflects the
   // server-persisted capability (talk_down_supported) at page-render
-  // time; the actual start-session call below still gets its own
-  // fresh 403 if authorization has changed since the page loaded --
-  // this button never assumes the render-time state is still valid.
-  const talkState={{}};
+  // time; wireTalkMic()'s own start-session call still gets its own
+  // fresh rejection if authorization or capability has changed since
+  // the page loaded -- this button never assumes the render-time state
+  // is still valid.
   document.querySelectorAll('.talk-mic').forEach(button=>{{
-    const id=button.dataset.cameraId;
-    talkState[id]={{sessionId:null,pending:false}};
-
-    async function stopTalk(isUnload){{
-      const state=talkState[id];
-      button.classList.remove('active');
-      if(!state.sessionId)return;
-      const sessionId=state.sessionId;state.sessionId=null;
-      const url=`/api/customer/talk/sessions/${{sessionId}}/stop`;
-      if(isUnload){{try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}
-      else{{try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}}}
-    }}
-
-    async function startTalk(){{
-      const state=talkState[id];
-      if(button.disabled||state.pending||state.sessionId)return;
-      state.pending=true;
-      try{{
-        const response=await fetch(`/api/customer/cameras/${{id}}/talk/start`,{{method:'POST'}});
-        if(!response.ok){{state.pending=false;return}}
-        const body=await response.json();
-        state.sessionId=body.session_id;
-        state.pending=false;
-        button.classList.add('active');
-      }}catch(e){{
-        state.pending=false;
-      }}
-    }}
-
-    button.addEventListener('pointerdown',startTalk);
-    button.addEventListener('pointerup',()=>stopTalk(false));
-    button.addEventListener('pointercancel',()=>stopTalk(false));
-    button.addEventListener('pointerleave',()=>stopTalk(false));
+    wireTalkMic(button, button.dataset.cameraId);
   }});
   window.addEventListener('pagehide',()=>{{
     cameraIds.forEach(id=>stopSession(id,true));
-    Object.keys(talkState).forEach(id=>{{if(talkState[id].sessionId){{const url=`/api/customer/talk/sessions/${{talkState[id].sessionId}}/stop`;try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}}});
   }});
 
   cameraIds.forEach(startSession);
@@ -396,7 +455,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'</div></section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
 (function(){{
   const startUrl={json.dumps(start_url)};
   const playlistUrl={json.dumps(playlist_url)};
@@ -500,41 +559,16 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
 
-  // Push-to-talk: press-and-hold only, no always-open duplex mode. This
-  // button already reflects the server-persisted capability
-  // (talk_down_supported) at page-render time; the start-session call
-  // below still gets its own fresh 403 if authorization has changed
-  // since the page loaded -- never assumes render-time state still holds.
+  // Push-to-talk: press-and-hold only, real mic capture, no always-open
+  // duplex mode. This button already reflects the server-persisted
+  // capability (talk_down_supported) at page-render time; wireTalkMic()'s
+  // own start-session call still gets its own fresh rejection if
+  // authorization or capability has changed since the page loaded --
+  // never assumes render-time state still holds.
   const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
-  let talkSessionId=null, talkPending=false;
-  async function stopTalk(isUnload){{
-    talkButton.classList.remove('active');
-    if(!talkSessionId)return;
-    const stoppingSessionId=talkSessionId;talkSessionId=null;
-    const url=`/api/customer/talk/sessions/${{stoppingSessionId}}/stop`;
-    if(isUnload){{try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}
-    else{{try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}}}
-  }}
-  async function startTalk(){{
-    if(talkButton.disabled||talkPending||talkSessionId)return;
-    talkPending=true;
-    try{{
-      const response=await fetch(`/api/customer/cameras/{camera_id}/talk/start`,{{method:'POST'}});
-      if(!response.ok){{talkPending=false;return}}
-      const body=await response.json();
-      talkSessionId=body.session_id;
-      talkPending=false;
-      talkButton.classList.add('active');
-    }}catch(e){{
-      talkPending=false;
-    }}
-  }}
-  talkButton.addEventListener('pointerdown',startTalk);
-  talkButton.addEventListener('pointerup',()=>stopTalk(false));
-  talkButton.addEventListener('pointercancel',()=>stopTalk(false));
-  talkButton.addEventListener('pointerleave',()=>stopTalk(false));
+  wireTalkMic(talkButton, {json.dumps(camera_id)});
 
-  window.addEventListener('pagehide',()=>{{stopSession(true);stopTalk(true)}});
+  window.addEventListener('pagehide',()=>{{stopSession(true)}});
 
   startSession();
 }})();
