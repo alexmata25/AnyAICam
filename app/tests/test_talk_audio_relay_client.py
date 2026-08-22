@@ -239,7 +239,14 @@ def test_drain_forwards_transcoded_chunks_to_the_right_transport_only(monkeypatc
     monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
     monkeypatch.setattr(client, "_build_transport", lambda *a, **k: fake_transport)
 
-    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}), CAMERA_MAP))
+    # Calls _start_session() directly rather than going through
+    # _handle_message() -- the "start" dispatch already schedules its
+    # own _drain_transcoded_audio() via create_task() (covered by
+    # test_start_message_creates_a_session_with_no_video_flags_in_ffmpeg_command
+    # and friends), so also driving a second, separate drain here would
+    # race the two against the same fake stdout stream. This test's own
+    # focus is the drain function's forwarding behavior in isolation.
+    client._start_session("sess-1", "cam-1", {}, 48000, CAMERA_MAP)
     asyncio.run(client._drain_transcoded_audio("sess-1"))
 
     assert fake_transport.sent == [b"\xaa" * 160, b"\xbb" * 160]
