@@ -321,6 +321,15 @@ class OnvifBackchannelTransport(TalkDownTransport):
         # world control-attribute shapes this camera used -- absolute,
         # leading-slash, or plain relative -- never naively concatenating.
         sdp_body = describe.split("\r\n\r\n", 1)[-1]
+        # Temporary diagnostic: the complete raw SDP body, to determine
+        # whether this camera advertises a session-level a=control:
+        # attribute (one appearing before any m= line) -- both Live555
+        # (sessionURL()/controlPath()) and FFmpeg (rt->control_uri) use
+        # that, when present, as the target for PLAY/RECORD in preference
+        # to the base DESCRIBE URI, per the RTSP reference-implementation
+        # comparison already done for this investigation. SDP bodies
+        # never carry credentials -- safe to log in full.
+        logger.info("talk_down_transport.stage stage=sdp_raw_body sdp=%r", sdp_body)
         audio_control = self._find_backchannel_control(sdp_body)
         setup_uri = _resolve_control_uri(uri, audio_control)
         logger.info("talk_down_transport.stage stage=sdp_parsing audio_control=%s setup_uri=%s", audio_control, setup_uri)
