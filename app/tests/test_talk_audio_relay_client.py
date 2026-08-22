@@ -280,6 +280,50 @@ def test_drain_forwards_transcoded_chunks_to_the_right_transport_only(monkeypatc
     assert fake_transport.sent == [b"\xaa" * 160, b"\xbb" * 160]
 
 
+# ------------------------------------------------------------- RTSP port resolution (real Camera 2 fix: ONVIF SOAP port != RTSP port)
+#
+# Confirmed live against the real Camera 2 (192.168.0.38): DESCRIBE on
+# port 80 (ANYAICAM_ONVIF_PORT, the ONVIF/SOAP port) gets TCP-accepted-
+# then-closed-with-zero-bytes; port 554 answers with a real RTSP status
+# line (401 Unauthorized, the expected digest challenge), and ONVIF's
+# own GetStreamUri independently reports 554 for this camera's stream.
+# _build_transport() never made an ONVIF SOAP call itself, so
+# ANYAICAM_ONVIF_PORT was only ever being reused (incorrectly) as the
+# RTSP port here.
+
+def test_build_transport_never_uses_an_onvif_port_variable():
+    # AST-based, not substring-based: _build_transport()'s own docstring
+    # explains the fix by name ("...never ANYAICAM_ONVIF_PORT...") --
+    # a plain substring check on the raw source would false-positive on
+    # that prose, since "ANYAICAM_ONVIF_PORT" itself contains
+    # "ONVIF_PORT". Parsing just this function's body as an AST and
+    # collecting actual Name references (never docstring text) is the
+    # precise version of "this code path never touches ONVIF_PORT".
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(client._build_transport)))
+    referenced_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert "ONVIF_PORT" not in referenced_names
+
+
+def test_rtsp_port_defaults_to_554_with_no_metadata_override():
+    built = client._build_transport("10.0.0.1", "user", "pass", {})
+    assert built.port == 554
+    assert built.port != 80
+
+
+def test_discovered_rtsp_port_in_metadata_overrides_the_default():
+    built = client._build_transport("10.0.0.1", "user", "pass", {"rtsp_port": 8554})
+    assert built.port == 8554
+
+
+def test_invalid_rtsp_port_metadata_falls_back_to_the_default():
+    for bad_value in (None, "554", True, -1, 0, 3.5):
+        built = client._build_transport("10.0.0.1", "user", "pass", {"rtsp_port": bad_value})
+        assert built.port == 554, f"malformed rtsp_port {bad_value!r} should fall back to the default, not be trusted as-is"
+
+
 # ------------------------------------------------------------- transport.connect() (fix for the production send()-before-connect() bug)
 
 def test_connect_happens_before_any_send(monkeypatch):

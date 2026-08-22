@@ -59,7 +59,23 @@ TALK_AUDIO_ENABLED = os.environ.get("ANYAICAM_TALK_AUDIO_ENABLED", "false").stri
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 CREDENTIAL_FILE = os.environ.get("ANYAICAM_CREDENTIAL_FILE", f"{os.environ.get('ANYAICAM_STATE_DIR', '/var/lib/anyaicam')}/credential.json")
 RECONNECT_DELAY_SECONDS = max(1, int(os.environ.get("ANYAICAM_TALK_AUDIO_RECONNECT_SECONDS", "5")))
-ONVIF_PORT = int(os.environ.get("ANYAICAM_ONVIF_PORT", "80"))
+# The RTSP backchannel port -- deliberately NOT ANYAICAM_ONVIF_PORT.
+# ONVIF_PORT is the SOAP/management port (talk_down_discovery.py's own
+# GetProfiles/GetAudioOutputConfigurations calls, port 80 by default);
+# this module never makes an ONVIF SOAP call itself, so it never needed
+# ONVIF_PORT for anything -- it was only ever being reused (incorrectly)
+# as the RTSP port here. RTSP is its own service on its own port, same
+# as camera_url() (the working video stream) and the earlier onboarding
+# check v111_rtsp_verify() both already hard-code: 554. Confirmed live
+# against the real Camera 2: DESCRIBE on port 80 (the ONVIF/HTTP port)
+# gets TCP-accepted-then-closed-with-zero-bytes; port 554 answers with a
+# real RTSP status line (401 Unauthorized, the expected digest
+# challenge), and ONVIF's own GetStreamUri independently reports 554 for
+# this camera's stream. _build_transport() below prefers a
+# metadata-reported rtsp_port when one is available (a future discovery
+# enhancement could populate it from GetStreamUri), falling back to this
+# default only when metadata carries none.
+RTSP_PORT_DEFAULT = 554
 PCMU_SAMPLE_RATE = 8000
 
 talk_audio_relay_state: dict = {"channel_status": "disabled", "active_sessions": 0}
@@ -131,9 +147,21 @@ def _build_transport(host: str, username: str, password: str, metadata: dict) ->
     number or model name is read anywhere in this function). A future
     vendor-specific fallback would be a second branch here, selected
     the same way -- by what the metadata says, never by which camera
-    number this happens to be."""
+    number this happens to be.
+
+    RTSP port resolution prefers a metadata-reported rtsp_port (e.g. a
+    future discovery enhancement populating it from the camera's own
+    GetStreamUri, exactly like the real Camera 2 investigation's manual
+    probe did) over RTSP_PORT_DEFAULT -- never ANYAICAM_ONVIF_PORT,
+    which is a different service on a different port entirely. Strictly
+    type-checked, matching this file's own _fetch_camera_map() -- a
+    malformed/absent value from a loosely-typed dict falls back to the
+    default rather than being trusted as-is."""
     rtsp_path = metadata.get("rtsp_path") or "/"
-    return OnvifBackchannelTransport(host=host, port=ONVIF_PORT, username=username, password=password, rtsp_path=rtsp_path)
+    rtsp_port = metadata.get("rtsp_port")
+    if not isinstance(rtsp_port, int) or isinstance(rtsp_port, bool) or rtsp_port <= 0:
+        rtsp_port = RTSP_PORT_DEFAULT
+    return OnvifBackchannelTransport(host=host, port=rtsp_port, username=username, password=password, rtsp_path=rtsp_path)
 
 
 def _terminate_process(process: subprocess.Popen) -> None:

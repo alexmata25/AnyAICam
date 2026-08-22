@@ -129,3 +129,23 @@ def test_connect_succeeds_with_well_formed_responses(monkeypatch):
     t.connect()  # must not raise
     assert t._session_id == "abc123"
     assert t._rtp_remote == ("10.0.0.1", 6000)
+
+
+def test_connect_succeeds_after_a_valid_401_digest_challenge_and_retry(monkeypatch):
+    # A real, well-formed digest challenge (realm/nonce/qop) -- exactly
+    # what the real Camera 2's RTSP port 554 was confirmed to return on
+    # an unauthenticated DESCRIBE -- followed by the authenticated
+    # retry succeeding. No test elsewhere in this file previously drove
+    # a *successful* 401->digest-retry->200 cycle end to end through
+    # connect(); the existing no-WWW-Authenticate-header test only
+    # covers the failure path. This is the "existing digest 401 ->
+    # authenticated retry still works" regression proof for the
+    # RTSP-port fix in talk_audio_relay_client.py -- that fix only
+    # changes which port connect() is called against, never anything in
+    # this module, so this test uses the same port=80 default as every
+    # other test in this file; the port itself is irrelevant to what's
+    # being proven here.
+    challenge = b'RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: Digest realm="IPCam", nonce="abc123nonce", qop="auth"\r\n\r\n'
+    t = _make_transport(monkeypatch, {"DESCRIBE": [challenge, _DESCRIBE_OK], "SETUP": [_SETUP_OK], "RECORD": [_RECORD_OK]})
+    t.connect()  # must not raise
+    assert t._session_id == "abc123"
