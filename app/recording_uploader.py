@@ -106,7 +106,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -130,6 +130,26 @@ AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
 # start_recording() actually writes, not be independently configurable.
 RECORDINGS_FOLDER = Path("/app/recordings")
+# MOTION_EVENTS_FILE is intentionally hardcoded, matching main.py's own
+# MOTION_EVENTS_FILE constant exactly -- this is the same file
+# motion_detector()/store_motion_event() in main.py already write to;
+# read-only here, never written or modified by this module.
+MOTION_EVENTS_FILE = RECORDINGS_FOLDER / "motion_events.jsonl"
+# Must match start_recording()'s own "-segment_time 300" in main.py exactly
+# -- the fixed nominal duration of every completed segment, used to compute
+# each segment's [start, start+duration) time window for the motion-gate
+# below. Not independently configurable; a real change to the segment
+# length is a main.py change, not something this constant should drift
+# from on its own.
+RECORDING_SEGMENT_SECONDS = 300
+# Symmetric-by-default context padding applied to each real motion event
+# before checking whether it overlaps a segment -- so an uploaded clip
+# includes a few seconds of lead-in/lead-out around the actual motion,
+# not just the exact detected window. Independently configurable (pre vs.
+# post) since some installs may want more lead-in than lead-out or vice
+# versa; both default to the same value.
+MOTION_UPLOAD_PRE_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_PRE_PADDING_SECONDS", "15")))
+MOTION_UPLOAD_POST_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_POST_PADDING_SECONDS", "15")))
 SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SCAN_SECONDS", "30.0")))
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CONFIG_REFRESH_SECONDS", "300.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SESSION_RENEW_MARGIN_SECONDS", "120")))
@@ -259,10 +279,18 @@ def _control_plane_get(path: str) -> dict | None:
 
 def _refresh_camera_map() -> None:
     """Polls the existing, unchanged GET /api/appliance/configuration for
-    this appliance's own camera_number -> camera_id/site_id mapping.
-    Never writes anything; a failed/unreachable poll just leaves the
-    previous mapping in place, so a transient network blip never stops
-    already-known cameras from continuing to upload."""
+    this appliance's own camera_number -> camera_id/site_id/recording_mode
+    mapping. Never writes anything; a failed/unreachable poll just leaves
+    the previous mapping in place, so a transient network blip never
+    stops already-known cameras from continuing to upload.
+
+    recording_mode is deliberately normalized to exactly 'motion',
+    'continuous', or None here -- any other raw value the cloud might
+    ever send (a typo, a future third mode not yet understood by this
+    appliance build) collapses to None, which _pending_recording_files()
+    treats identically to 'continuous': upload everything. No hidden
+    default ever resolves to motion-gating; only an exact 'motion'
+    string does."""
     response = _control_plane_get("/api/appliance/configuration")
     if not isinstance(response, dict):
         return
@@ -282,7 +310,9 @@ def _refresh_camera_map() -> None:
             continue
         if not isinstance(site_id, str) or not site_id.strip():
             continue
-        mapping[camera_number] = {"camera_id": camera_id, "site_id": site_id}
+        raw_recording_mode = item.get("recording_mode")
+        recording_mode = raw_recording_mode if raw_recording_mode in ("motion", "continuous") else None
+        mapping[camera_number] = {"camera_id": camera_id, "site_id": site_id, "recording_mode": recording_mode}
     with _lock:
         _camera_map.clear()
         _camera_map.update(mapping)
@@ -523,6 +553,84 @@ def _completed_recording_files(camera_number: int) -> list[Path]:
     return candidates[:-1] if len(candidates) > 1 else []
 
 
+def _load_motion_windows(camera_number: int) -> list[tuple[datetime, datetime]] | None:
+    """Real motion-event [start_time, end_time] windows for this camera,
+    read from MOTION_EVENTS_FILE -- the same file motion_detector()/
+    store_motion_event() in main.py already write to. Read-only here:
+    this function never writes, truncates, or otherwise modifies that
+    file, mirroring analytics_sync.py's own read-only relationship to
+    ANALYTICS_EVENTS_FILE.
+
+    Returns None -- not [] -- when the file is missing, unreadable, or
+    contains not one single parseable line for ANY camera. Callers MUST
+    treat None as "motion status for this camera could not be
+    determined right now," not as "confirmed no motion" -- see
+    _pending_recording_files()'s own fail-safe handling of this return
+    value. [] (a real, distinct value) means the file was read
+    successfully and simply has no events for this specific camera --
+    that IS a confirmed "no motion for this camera" and is treated as
+    such.
+
+    One malformed line/event does not blind the whole result: it's
+    skipped and the rest of the file is still used. Only a totally
+    unreadable or empty-of-any-parseable-content file returns None."""
+    if not MOTION_EVENTS_FILE.exists():
+        return None
+    try:
+        raw_text = MOTION_EVENTS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    windows: list[tuple[datetime, datetime]] = []
+    any_line_parsed = False
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        any_line_parsed = True
+        if event.get("camera") != camera_number:
+            continue
+        try:
+            start = datetime.fromisoformat(str(event["start_time"]))
+            end = datetime.fromisoformat(str(event["end_time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        windows.append((start, end))
+    if not any_line_parsed:
+        return None  # file existed but had literally nothing parseable in it -- treat as unavailable, not as "confirmed empty"
+    return windows
+
+
+def _segment_overlaps_motion(
+    segment_start: datetime,
+    segment_end: datetime,
+    motion_windows: list[tuple[datetime, datetime]],
+    pre_padding_seconds: int = MOTION_UPLOAD_PRE_PADDING_SECONDS,
+    post_padding_seconds: int = MOTION_UPLOAD_POST_PADDING_SECONDS,
+) -> bool:
+    """Pure and independently testable. True if [segment_start,
+    segment_end) overlaps ANY motion window, each padded independently
+    by pre_padding_seconds before its own start and
+    post_padding_seconds after its own end -- so a segment that merely
+    contains a few seconds of lead-in/lead-out around a real motion
+    event still counts, not just one containing the exact detected
+    window. Standard half-open-interval overlap test: two ranges
+    overlap unless one ends before the other starts."""
+    pre_padding = timedelta(seconds=pre_padding_seconds)
+    post_padding = timedelta(seconds=post_padding_seconds)
+    for motion_start, motion_end in motion_windows:
+        padded_start = motion_start - pre_padding
+        padded_end = motion_end + post_padding
+        if segment_start <= padded_end and segment_end >= padded_start:
+            return True
+    return False
+
+
 def _load_or_establish_cutoff() -> datetime:
     """The single, appliance-wide backlog cutoff -- see the module
     docstring. Naive local-time throughout, matching
@@ -568,10 +676,51 @@ def _load_or_establish_cutoff() -> datetime:
 
 
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
+    """...same as always, PLUS (new): for a camera whose recording_mode
+    is exactly 'motion' (see _refresh_camera_map()), only queue a
+    segment whose time window overlaps a real, padded motion event.
+    Continuous-plan cameras and cameras with no explicit mode (None)
+    are completely unaffected -- this whole block is a no-op for them,
+    identical to the original function.
+
+    Motion-event data is loaded ONCE per camera per call (not once per
+    file) for efficiency, since a scan can have many pending files.
+
+    Fail-safe (explicit requirement): if motion event data can't be
+    determined at all (_load_motion_windows() returns None), every
+    file that would otherwise have been gated is uploaded anyway,
+    logged once via a dedicated warning. Silently skipping a segment
+    because motion metadata happened to be unavailable would mean
+    data a Motion-plan customer is paying for silently never reaches
+    the cloud, with no visible symptom -- uploading a few extra
+    segments in a rare failure mode is a far safer trade. This
+    function never touches or deletes any local file either way --
+    local recording and local retention (delete_expired_recordings()
+    in main.py) are completely independent of everything here.
+
+    No separate "skipped due to no motion" state is persisted
+    anywhere: a segment not yet in already_uploaded is simply
+    re-evaluated fresh on every scan for as long as it exists locally,
+    exactly like every other candidate in this function already was
+    before this change. Since the motion-overlap decision is a pure
+    function of stable inputs (the segment's own fixed time window,
+    and motion_events.jsonl), recomputing it is always safe and can
+    never "confuse" a skipped segment with an uploaded one -- there is
+    no divergent cached state that could ever drift out of sync with
+    reality. This also means a motion event that lands a little late
+    (detection latency) can still "rescue" an earlier segment for
+    upload on a later scan, as long as the segment still exists
+    locally under normal retention -- a robustness property, not a
+    bug."""
     folder_resolved = _recording_folder(camera_number).resolve()
     cutoff = _load_or_establish_cutoff()
+    identity = _camera_identity(camera_number)
+    recording_mode = identity.get("recording_mode") if identity else None
+    motion_windows = _load_motion_windows(camera_number) if recording_mode == "motion" else None
+    motion_data_unavailable = recording_mode == "motion" and motion_windows is None
     pending = []
     skipped_backlog = 0
+    skipped_no_motion = 0
     for local_path in _completed_recording_files(camera_number):
         if local_path.name in already_uploaded:
             continue
@@ -591,10 +740,19 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
         if resolved.parent != folder_resolved:
             logger.warning("recording_upload.file_path_outside_recordings_folder camera=%s path=%s", camera_number, resolved)
             continue
+        if recording_mode == "motion" and not motion_data_unavailable and started_at is not None:
+            segment_end = started_at + timedelta(seconds=RECORDING_SEGMENT_SECONDS)
+            if not _segment_overlaps_motion(started_at, segment_end, motion_windows):
+                skipped_no_motion += 1
+                continue
         pending.append(local_path)
     if skipped_backlog and camera_number not in _backlog_skip_logged:
         logger.info("recording_upload.pre_cutoff_backlog_skipped camera=%s count=%s cutoff=%s", camera_number, skipped_backlog, cutoff.isoformat())
         _backlog_skip_logged.add(camera_number)
+    if motion_data_unavailable:
+        logger.warning("recording_upload.motion_data_unavailable_uploading_anyway camera=%s", camera_number)
+    if skipped_no_motion:
+        logger.info("recording_upload.motion_gate_skipped_no_motion camera=%s count=%s", camera_number, skipped_no_motion)
     return pending
 
 
