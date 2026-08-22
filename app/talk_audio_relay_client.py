@@ -136,20 +136,36 @@ def _build_transport(host: str, username: str, password: str, metadata: dict) ->
     return OnvifBackchannelTransport(host=host, port=ONVIF_PORT, username=username, password=password, rtsp_path=rtsp_path)
 
 
-def _start_session(session_id: str, camera_id: str, metadata: dict, sample_rate: int, camera_map: dict[int, dict]) -> None:
-    """Starts one session's ffmpeg transcode subprocess and transport.
-    Never touches any OTHER session_id's state -- each call only ever
-    reads/writes _sessions[session_id]."""
+def _terminate_process(process: subprocess.Popen) -> None:
+    """Shared by _stop_session() and _start_session()'s own
+    connect-failure cleanup path -- closing stdin first (so ffmpeg sees
+    EOF and can exit on its own) then terminating, tolerating a process
+    that's already gone."""
+    try:
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        process.terminate()
+    except OSError:
+        pass
+
+
+def _start_session(session_id: str, camera_id: str, metadata: dict, sample_rate: int, camera_map: dict[int, dict]) -> bool:
+    """Starts one session's ffmpeg transcode subprocess and transport,
+    returning True only if the session is now actually live (added to
+    _sessions) -- the caller uses this to decide whether it's safe to
+    start draining transcoded audio at all. Never touches any OTHER
+    session_id's state -- each call only ever reads/writes
+    _sessions[session_id]."""
     if session_id in _sessions:
-        return  # a duplicate "start" for an already-running session -- ignore, never restart what's already live
+        return False  # a duplicate "start" for an already-running session -- ignore, never restart what's already live
     camera_number = _camera_number_for(camera_id, camera_map)
     if camera_number is None:
         logger.warning("talk_audio_relay_client.unknown_camera session_id=%s camera_id=%s", session_id, camera_id)
-        return
+        return False
     credentials = _camera_credentials(camera_number)
     if not credentials:
         logger.warning("talk_audio_relay_client.no_camera_credentials session_id=%s camera_number=%s", session_id, camera_number)
-        return
+        return False
     host, username, password = credentials
 
     process = subprocess.Popen(
@@ -158,8 +174,31 @@ def _start_session(session_id: str, camera_id: str, metadata: dict, sample_rate:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     transport = _build_transport(host, username, password, metadata)
+
+    # connect() must succeed before this session is ever considered
+    # live: _drain_transcoded_audio() calls transport.send() as soon as
+    # it sees a transcoded chunk, and send() before connect() is a
+    # guaranteed failure (the exact production bug this fixes -- see
+    # OnvifBackchannelTransport.send()'s own RuntimeError). A session
+    # that never got a working RTP channel must never reach _sessions,
+    # never get a drain task, and must leave nothing running behind.
+    try:
+        transport.connect()
+    except Exception as error:
+        logger.warning(
+            "talk_audio_relay_client.transport_connect_failed session_id=%s camera_id=%s camera_number=%s error=%s",
+            session_id, camera_id, camera_number, error,
+        )
+        _terminate_process(process)
+        try:
+            transport.close()
+        except Exception:
+            pass
+        return False
+
     _sessions[session_id] = {"process": process, "transport": transport, "camera_id": camera_id, "reader_task": None}
     talk_audio_relay_state["active_sessions"] = len(_sessions)
+    return True
 
 
 def _feed_audio(session_id: str, pcm_bytes: bytes) -> None:
@@ -181,13 +220,7 @@ def _stop_session(session_id: str) -> None:
     talk_audio_relay_state["active_sessions"] = len(_sessions)
     if session is None:
         return
-    process = session["process"]
-    try:
-        if process.stdin and not process.stdin.closed:
-            process.stdin.close()
-        process.terminate()
-    except OSError:
-        pass
+    _terminate_process(session["process"])
     transport = session["transport"]
     try:
         transport.close()
@@ -241,8 +274,13 @@ async def _handle_message(raw_message: str, camera_map: dict[int, dict]) -> None
         sample_rate = message.get("sample_rate") if isinstance(message.get("sample_rate"), int) else 48000
         if not isinstance(camera_id, str):
             return
-        _start_session(session_id, camera_id, metadata, sample_rate, camera_map)
-        asyncio.create_task(_drain_transcoded_audio(session_id))
+        started = _start_session(session_id, camera_id, metadata, sample_rate, camera_map)
+        if started:
+            asyncio.create_task(_drain_transcoded_audio(session_id))
+        # A duplicate start (already running), an unknown camera, missing
+        # credentials, or a failed transport.connect() all return False --
+        # in every one of those cases the session either doesn't exist or
+        # already has its own drain task running, so no new one is needed.
     elif message_type == "audio":
         pcm_b64 = message.get("pcm_b64")
         if isinstance(pcm_b64, str):

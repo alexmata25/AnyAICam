@@ -70,11 +70,39 @@ class _FakeTransport(transport.TalkDownTransport):
         self.closed = True
 
 
+class _OrderTrackingTransport(transport.TalkDownTransport):
+    """Records connect()/send()/close() call order, and can simulate a
+    real RTSP handshake failure (e.g. the camera refusing SETUP/RECORD)
+    by raising out of connect() -- send() asserts connect() already
+    happened, so any test using this transport would itself fail loudly
+    if the fix regressed and send() were ever reached first."""
+
+    def __init__(self, fail_connect=False):
+        self.calls = []
+        self.closed = False
+        self._fail_connect = fail_connect
+
+    def connect(self):
+        self.calls.append("connect")
+        if self._fail_connect:
+            raise ConnectionError("simulated RTSP DESCRIBE/SETUP/RECORD failure")
+
+    def send(self, encoded_audio):
+        assert "connect" in self.calls, "send() must never be called before connect() has succeeded"
+        self.calls.append(("send", encoded_audio))
+
+    def close(self):
+        self.calls.append("close")
+        self.closed = True
+
+
 @pytest.fixture(autouse=True)
 def _isolated_state():
     client._sessions.clear()
+    client.talk_audio_relay_state["active_sessions"] = 0
     yield
     client._sessions.clear()
+    client.talk_audio_relay_state["active_sessions"] = 0
 
 
 CAMERA_MAP = {1: {"camera_id": "cam-1"}, 2: {"camera_id": "cam-2"}}
@@ -250,6 +278,134 @@ def test_drain_forwards_transcoded_chunks_to_the_right_transport_only(monkeypatc
     asyncio.run(client._drain_transcoded_audio("sess-1"))
 
     assert fake_transport.sent == [b"\xaa" * 160, b"\xbb" * 160]
+
+
+# ------------------------------------------------------------- transport.connect() (fix for the production send()-before-connect() bug)
+
+def test_connect_happens_before_any_send(monkeypatch):
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: _FakeProcess(stdout_chunks=[b"\xaa" * 160]))
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    fake_transport = _OrderTrackingTransport()
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: fake_transport)
+
+    started = client._start_session("sess-1", "cam-1", {}, 48000, CAMERA_MAP)
+    assert started is True
+    asyncio.run(client._drain_transcoded_audio("sess-1"))
+
+    assert fake_transport.calls[0] == "connect"
+    assert any(isinstance(c, tuple) and c[0] == "send" for c in fake_transport.calls)
+
+
+def test_connect_failure_creates_no_active_session(monkeypatch):
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: _FakeProcess())
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: _OrderTrackingTransport(fail_connect=True))
+
+    started = client._start_session("sess-1", "cam-1", {}, 48000, CAMERA_MAP)
+
+    assert started is False
+    assert "sess-1" not in client._sessions
+    assert client.talk_audio_relay_state["active_sessions"] == 0
+
+
+def test_ffmpeg_and_transport_are_cleaned_up_on_connect_failure(monkeypatch):
+    fake_process = _FakeProcess()
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: fake_process)
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    fake_transport = _OrderTrackingTransport(fail_connect=True)
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: fake_transport)
+
+    client._start_session("sess-1", "cam-1", {}, 48000, CAMERA_MAP)
+
+    assert fake_process.terminated is True
+    assert fake_process.stdin.closed is True
+    assert fake_transport.closed is True
+    assert "close" in fake_transport.calls
+
+
+def test_no_drain_task_starts_when_connect_fails(monkeypatch):
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: _FakeProcess())
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: _OrderTrackingTransport(fail_connect=True))
+
+    drain_calls = []
+
+    async def fake_drain(session_id):
+        drain_calls.append(session_id)
+
+    monkeypatch.setattr(client, "_drain_transcoded_audio", fake_drain)
+
+    async def run():
+        await client._handle_message(
+            json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}),
+            CAMERA_MAP,
+        )
+        await asyncio.sleep(0)  # give any (wrongly) created task a chance to run before we assert none did
+
+    asyncio.run(run())
+
+    assert drain_calls == []
+    assert "sess-1" not in client._sessions
+
+
+def test_drain_task_starts_when_connect_succeeds(monkeypatch):
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: _FakeProcess())
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: _OrderTrackingTransport())
+
+    drain_calls = []
+
+    async def fake_drain(session_id):
+        drain_calls.append(session_id)
+
+    monkeypatch.setattr(client, "_drain_transcoded_audio", fake_drain)
+
+    async def run():
+        await client._handle_message(
+            json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}),
+            CAMERA_MAP,
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert drain_calls == ["sess-1"]
+    assert "sess-1" in client._sessions
+
+
+def test_duplicate_start_is_idempotent_and_connects_only_once(monkeypatch):
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: _FakeProcess())
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    fake_transport = _OrderTrackingTransport()
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: fake_transport)
+
+    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}), CAMERA_MAP))
+    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}), CAMERA_MAP))
+
+    assert fake_transport.calls.count("connect") == 1
+    assert "sess-1" in client._sessions
+
+
+def test_successful_start_feeds_audio_and_stops_cleanly(monkeypatch):
+    fake_process = _FakeProcess()
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: fake_process)
+    monkeypatch.setattr(client, "_camera_credentials", lambda n: ("10.0.0.1", "user", "pass"))
+    fake_transport = _OrderTrackingTransport()
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: fake_transport)
+
+    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-1", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}), CAMERA_MAP))
+    assert "sess-1" in client._sessions
+    assert fake_transport.calls == ["connect"]
+
+    pcm_b64 = base64.b64encode(b"\x01\x02\x03\x04").decode()
+    asyncio.run(client._handle_message(json.dumps({"type": "audio", "session_id": "sess-1", "pcm_b64": pcm_b64}), CAMERA_MAP))
+    assert fake_process.stdin.written == b"\x01\x02\x03\x04"
+
+    asyncio.run(client._handle_message(json.dumps({"type": "stop", "session_id": "sess-1"}), CAMERA_MAP))
+    assert "sess-1" not in client._sessions
+    assert fake_process.terminated is True
+    assert fake_process.stdin.closed is True
+    assert fake_transport.closed is True
 
 
 # ------------------------------------------------------------- worker gating
