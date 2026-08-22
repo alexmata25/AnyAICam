@@ -553,7 +553,28 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
+            # The shared .camera-tools class (main.py's own STYLES) is a
+            # single-row flex strip with overflow-x:auto -- fine for a
+            # handful of icons on desktop, but this page's own toolbar
+            # has 9 buttons at a fixed 34px+gap each (~360px minimum),
+            # right at the edge of common mobile viewport widths (as
+            # narrow as 360px). Past that width the row silently
+            # overflows into horizontal scroll, and whichever buttons
+            # land past the visible edge (mute among them, since it's
+            # cut off without the row ever visibly indicating there's
+            # more to scroll to) are invisible without the user knowing
+            # to scroll the toolbar itself -- the reported "mic visible,
+            # speaker/mute control missing on mobile" bug. Below 480px,
+            # this page's own <style> (loaded after the shared one, so
+            # it wins on the shared selector at equal specificity)
+            # switches the toolbar to wrap instead of horizontally
+            # scroll -- every control gets its own guaranteed spot
+            # across as many rows as needed, so nothing is ever hidden
+            # or requires discovering a scrollbar. Desktop (above 480px)
+            # is completely unaffected -- still the original single
+            # scrollable row.
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'@media(max-width:480px){{.camera-tools{{flex-wrap:wrap;overflow-x:visible}}}}</style>'
             f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
             f'<video id="live-view-video" controls muted playsinline></video>'
             f'<div class="camera-placeholder" id="live-view-placeholder">'

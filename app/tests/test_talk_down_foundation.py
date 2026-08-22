@@ -481,6 +481,48 @@ def test_wire_talk_mic_never_mutates_the_buttons_text_or_icon():
     assert "innerText" not in live_view_page._TALK_MIC_JS
 
 
+# --------------------------------------------------------- single-camera toolbar: mute stays visible next to mic on mobile
+#
+# Real mobile bug report: only the talk-mic control was visible on
+# phone-width Live View; the independent mute/unmute (incoming audio)
+# control was missing. Root cause: the shared .camera-tools toolbar
+# strip (main.py's own STYLES) is a single flex row with
+# overflow-x:auto -- fine on desktop, but this page's own 9-button
+# toolbar is right at the edge of common mobile viewport widths, so it
+# silently overflowed into horizontal scroll, with no visible affordance
+# telling the user there was more to scroll to. Below 480px the page
+# now switches the toolbar to wrap instead of horizontally scroll, so
+# every control -- mute and mic both -- always has its own visible spot.
+
+def test_single_camera_toolbar_wraps_instead_of_scrolling_on_narrow_viewports(customer_client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_tenant(db)
+            _seed_camera(db, "cam-1", talk_down_supported=1)
+
+    response = customer_client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert "@media(max-width:480px){.camera-tools{flex-wrap:wrap;overflow-x:visible}}" in response.text
+
+
+def test_single_camera_toolbar_renders_both_mute_and_mic_controls(customer_client, db_path):
+    # Both controls must be present in the rendered HTML regardless of
+    # viewport -- the fix is about visibility (CSS layout), not about
+    # either control being conditionally omitted from the DOM.
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_tenant(db)
+            _seed_camera(db, "cam-1", talk_down_supported=1)
+
+    response = customer_client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    html = response.text
+    assert 'id="live-view-mute"' in html
+    assert 'id="talk-mic-cam-1"' in html
+    # Every other toolbar control the same fix must keep visible too.
+    for expected_id in ("live-view-snapshot", "live-view-download", "live-view-share", "live-view-analytics", "live-view-bookmark", "live-view-stop"):
+        assert f'id="{expected_id}"' in html
+
+
 def test_pointer_lifecycle_all_wired_to_stop_on_both_pages(customer_client, db_path):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
