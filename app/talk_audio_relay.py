@@ -83,8 +83,27 @@ def _customer_identity_ws(websocket: WebSocket) -> dict | None:
     try:
         identity = partner_identity(websocket)
     except Exception:
-        return None
-    if not identity or identity.get("role") not in {"customer_owner", "customer_viewer"}:
+        identity = None
+    valid = bool(identity) and identity.get("role") in {"customer_owner", "customer_viewer"}
+
+    # --- TEMPORARY DIAGNOSTIC LOGGING (production talk-down 403 investigation) ---
+    # Never logs cookie values, header values beyond Host/Origin/X-Forwarded-Proto,
+    # authorization headers, secrets, or tokens. Role/customer_id are logged only
+    # when authentication actually succeeds. Remove once root cause is confirmed.
+    logger.info(
+        "talk_audio_relay_ws_diagnostic has_partner_session_cookie=%s cookie_names=%s "
+        "host=%s origin=%s x_forwarded_proto=%s identity_returned=%s role=%s customer_id=%s",
+        "anyaicam_partner_session" in websocket.cookies,
+        list(websocket.cookies.keys()),
+        websocket.headers.get("host"),
+        websocket.headers.get("origin"),
+        websocket.headers.get("x-forwarded-proto"),
+        identity is not None,
+        identity.get("role") if valid else None,
+        identity.get("customer_id") if valid else None,
+    )
+
+    if not valid:
         return None
     return identity
 
