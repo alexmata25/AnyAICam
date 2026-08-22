@@ -106,10 +106,7 @@ import subprocess
 import time
 
 
-
-
-
-
+import threading
 
 
 import uuid
@@ -2861,7 +2858,22 @@ yolo_model = None
 
 
 
-yolo_model_lock = None
+# Serializes both the lazy singleton load below (get_yolo_model()'s
+# check-then-act on yolo_model was previously a real race: two camera
+# threads could both see yolo_model is None and each construct their
+# own YOLO() instance) and every model.predict() call in
+# detect_objects_frame() (up to 4 camera threads, one per camera, call
+# into the SAME shared model concurrently via asyncio.to_thread with
+# nothing previously serializing them). A plain threading.Lock, not
+# asyncio.Lock, because these calls run on worker threads dispatched
+# via asyncio.to_thread, not directly on the event loop. With no GPU
+# on this hardware (see YOLO_DEVICE's own default), true parallel
+# CPU inference across 4 threads would mostly just have them contend
+# over the same cores/BLAS-OMP thread pools anyway -- serializing
+# predict() calls is not just the safe fix, it's expected to be
+# performance-neutral-or-better versus the previous unsynchronized
+# concurrent calls.
+yolo_model_lock = threading.Lock()
 
 
 
@@ -35669,69 +35681,20 @@ def append_analytics_event(event: dict) -> None:
 
 
 def get_yolo_model():
-
-
-
-
-
-
-
-
+    """Lazy singleton load of the shared YOLO model, race-free: the
+    check-then-act on yolo_model (is it already loaded?) and the
+    construction itself both happen inside yolo_model_lock, so two
+    camera threads racing to load the model on first use can no longer
+    both pass the None check and each construct their own YOLO()
+    instance -- only one ever does, the other just returns it."""
     global yolo_model
-
-
-
-
-
-
-
-
     if YOLO is None:
-
-
-
-
-
-
-
-
         raise RuntimeError("Ultralytics YOLO is not installed.")
-
-
-
-
-
-
-
-
-    if yolo_model is None:
-
-
-
-
-
-
-
-
-        print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
-
-
-
-
-
-
-
-
-        yolo_model = YOLO(YOLO_MODEL_NAME)
-
-
-
-
-
-
-
-
-    return yolo_model
+    with yolo_model_lock:
+        if yolo_model is None:
+            print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
+            yolo_model = YOLO(YOLO_MODEL_NAME)
+        return yolo_model
 
 
 
@@ -36029,69 +35992,23 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
     model = get_yolo_model()
-
-
-
-
-
-
-
-
-    results = model.predict(
-
-
-
-
-
-
-
-
-        source=frame,
-
-
-
-
-
-
-
-
-        conf=YOLO_CONFIDENCE,
-
-
-
-
-
-
-
-
-        imgsz=YOLO_IMAGE_SIZE,
-
-
-
-
-
-
-
-
-        device=YOLO_DEVICE,
-
-
-
-
-
-
-
-
-        verbose=False,
-
-
-
-
-
-
-
-
-    )
+    # yolo_model_lock also serializes this call, not just
+    # get_yolo_model()'s own lazy-init above -- up to 4 camera threads
+    # (one per camera) can reach this point concurrently via
+    # asyncio.to_thread, and model.predict() on a shared Ultralytics
+    # YOLO instance is not documented as safe for concurrent calls
+    # from multiple threads. Serializing here is the smallest robust
+    # fix; see yolo_model_lock's own comment for why this is also
+    # expected to be performance-neutral-or-better on this CPU-only
+    # (no GPU) hardware.
+    with yolo_model_lock:
+        results = model.predict(
+            source=frame,
+            conf=YOLO_CONFIDENCE,
+            imgsz=YOLO_IMAGE_SIZE,
+            device=YOLO_DEVICE,
+            verbose=False,
+        )
 
 
 
