@@ -62,39 +62,117 @@ POLL_TIMEOUT_MS = 45000
 # audibly routed back out to the speakers.
 _TALK_MIC_JS = """
 function wireTalkMic(button, cameraId) {
-  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null, sessionId = null, stopping = false;
+  // Press-and-hold state, keyed by a monotonically increasing generation
+  // token (pressId) rather than a single boolean -- this is what makes
+  // the async pointer lifecycle race-free. start() is async and awaits
+  // three separate things in sequence (the REST /talk/start fetch, its
+  // response.json(), then getUserMedia()); a release (pointerup/
+  // pointercancel/pointerleave/pagehide) can land after any one of
+  // those awaits resumes. Every resume point below re-checks
+  // `myPress === pressId` -- the token captured synchronously at this
+  // press's own pointerdown, before any await ran -- and refuses to
+  // proceed (including refusing to ever construct a WebSocket) once a
+  // release or a newer press has invalidated it. This is what
+  // previously let a stale start() resume after stop() had already
+  // cleared sessionId to null and open a WebSocket at
+  // /sessions/null/audio.
+  let pressId = 0;
+  let held = false;
+  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null;
+  let sessionId = null;   // the REST-created session this press currently owns, if any
+  let wsOpened = false;   // true only once this session's WebSocket has actually finished connecting
 
-  async function stop() {
-    if (stopping) return;
-    stopping = true;
-    button.classList.remove('active');
+  function cleanupOrphanSession(sid) {
+    // Best-effort: releases a REST-created talk session that will never
+    // get a WebSocket (because the press that created it ended, or
+    // permission was denied, before the socket could open), so no
+    // 'requested' row is left behind for talk_sessions.py's own
+    // expiry sweep to have to age out later. Fire-and-forget -- the
+    // stop route is already idempotent server-side, and there is no
+    // UI state left to update for a press that's already over.
+    fetch(`/api/customer/talk/sessions/${sid}/stop`, { method: 'POST' }).catch(() => {});
+  }
+
+  function teardownLocal() {
     if (processor) { try { processor.disconnect() } catch (e) {} }
     if (source) { try { source.disconnect() } catch (e) {} }
     if (silentGain) { try { silentGain.disconnect() } catch (e) {} }
     if (audioCtx) { try { audioCtx.close() } catch (e) {} }
     if (mediaStream) { mediaStream.getTracks().forEach(track => track.stop()) }
     if (ws) { try { ws.close() } catch (e) {} }
-    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null; sessionId = null;
+    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null;
+  }
+
+  function stop() {
+    held = false;
+    pressId++;   // invalidates any in-flight start() still awaiting something for the press that just ended
+    button.classList.remove('active');
+    const sid = sessionId;
+    const openedBeforeStop = wsOpened;
+    sessionId = null;
+    wsOpened = false;
+    teardownLocal();
+    if (sid && !openedBeforeStop) {
+      // Released after /talk/start created a session but before the
+      // WebSocket finished opening (still mid-fetch, mid-getUserMedia,
+      // or mid-handshake) -- nothing else will ever clean this session
+      // up, since the WebSocket route (the only other place that marks
+      // it 'stopped') never got a chance to run.
+      cleanupOrphanSession(sid);
+    }
   }
 
   async function start() {
-    if (button.disabled || ws || stopping === false && sessionId) return;
-    stopping = false;
+    if (button.disabled || held) return;
+    held = true;
+    const myPress = ++pressId;
+
     let response;
     try {
       response = await fetch(`/api/customer/cameras/${cameraId}/talk/start`, { method: 'POST' });
-    } catch (e) { return; }
-    if (!response.ok) { return; }
-    const body = await response.json();
-    sessionId = body.session_id;
-
-    try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      showToast('Microphone permission denied or unavailable.');
-      sessionId = null;
+      if (myPress === pressId) held = false;
       return;
     }
+    if (!response.ok) {
+      if (myPress === pressId) held = false;
+      return;
+    }
+    const body = await response.json();
+    const sid = body && body.session_id;
+    if (!sid) {
+      if (myPress === pressId) held = false;
+      return;
+    }
+
+    if (myPress !== pressId) {
+      // Released (or superseded by a newer press) while /talk/start was
+      // in flight -- stop() already ran and had no sessionId to see yet,
+      // so this press is the only one that knows this session exists.
+      cleanupOrphanSession(sid);
+      return;
+    }
+    sessionId = sid;   // now visible to stop(), which takes over orphan cleanup from here if released
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      if (myPress === pressId) { held = false; sessionId = null; }
+      showToast('Microphone permission denied or unavailable.');
+      cleanupOrphanSession(sid);
+      return;
+    }
+
+    if (myPress !== pressId) {
+      // Released while the permission prompt was pending. stop() already
+      // saw sessionId set and released it itself -- this stream simply
+      // arrived too late to be used; stop its tracks immediately so a
+      // granted-but-unwanted mic stays off.
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    mediaStream = stream;
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     source = audioCtx.createMediaStreamSource(mediaStream);
@@ -102,15 +180,24 @@ function wireTalkMic(button, cameraId) {
     silentGain = audioCtx.createGain();
     silentGain.gain.value = 0;
 
+    // Always built from the local `sid` captured above, never the
+    // shared `sessionId` -- this is the specific guarantee that a
+    // WebSocket can never be constructed with a null/empty session id,
+    // independent of anything stop() may have done concurrently.
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sessionId}/audio?sample_rate=${audioCtx.sampleRate}`);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { button.classList.add('active') };
-    ws.onclose = () => { stop() };
-    ws.onerror = () => { stop() };
+    const socket = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sid}/audio?sample_rate=${audioCtx.sampleRate}`);
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = () => {
+      if (myPress !== pressId) { try { socket.close() } catch (e) {} return; }
+      wsOpened = true;
+      button.classList.add('active');
+    };
+    socket.onclose = () => { if (myPress === pressId) stop(); };
+    socket.onerror = () => { if (myPress === pressId) stop(); };
+    ws = socket;
 
     processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (myPress !== pressId || !ws || ws.readyState !== WebSocket.OPEN) return;
       const input = event.inputBuffer.getChannelData(0);
       const pcm16 = new Int16Array(input.length);
       for (let i = 0; i < input.length; i++) {
