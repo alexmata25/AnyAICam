@@ -103,7 +103,22 @@ function wireTalkMic(button, cameraId) {
     ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null;
   }
 
-  function stop() {
+  function stop(event) {
+    // event is only present for a real pointerup/pointercancel/
+    // pointerleave -- stop() is also called internally (ws.onclose,
+    // ws.onerror, a stale press's own cleanup) with no event at all,
+    // so every event-only call below is guarded. preventDefault()/
+    // stopPropagation() here are defensive, matching pointerdown's own
+    // handling below; releasePointerCapture() is technically automatic
+    // on pointerup/pointercancel, but calling it explicitly costs
+    // nothing and removes any doubt.
+    if (event) {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      if (event.pointerId !== undefined) {
+        try { button.releasePointerCapture(event.pointerId); } catch (e) {}
+      }
+    }
     held = false;
     pressId++;   // invalidates any in-flight start() still awaiting something for the press that just ended
     button.classList.remove('active');
@@ -122,7 +137,29 @@ function wireTalkMic(button, cameraId) {
     }
   }
 
-  async function start() {
+  async function start(event) {
+    // Mobile press-and-hold on a button that sits near/over a playing
+    // <video> tile is a well-known source of touch-event conflicts --
+    // without these, a sustained touch-hold can be interpreted by the
+    // browser's own default gesture handling as also targeting the
+    // video underneath (observed as the video pausing on press and
+    // resuming on release). preventDefault() stops the browser's
+    // default touch handling for this pointerdown; stopPropagation()
+    // keeps it from reaching any ancestor handler; setPointerCapture()
+    // pins every subsequent pointer event for this exact touch (move,
+    // up, cancel) to this button specifically, so a finger drifting
+    // slightly during the hold can never be reinterpreted as
+    // interacting with whatever is underneath it. touch-action:none in
+    // this button's own CSS is the equivalent instruction at the CSS
+    // layer, for browsers that decide gesture handling before any JS
+    // runs at all. None of this touches press-and-hold semantics --
+    // it only ever runs once, synchronously, at the very top of the
+    // same pointerdown handler that already existed.
+    if (event) {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      try { button.setPointerCapture(event.pointerId); } catch (e) {}
+    }
     if (button.disabled || held) return;
     held = true;
     const myPress = ++pressId;
@@ -212,9 +249,9 @@ function wireTalkMic(button, cameraId) {
   }
 
   button.addEventListener('pointerdown', start);
-  button.addEventListener('pointerup', () => stop());
-  button.addEventListener('pointercancel', () => stop());
-  button.addEventListener('pointerleave', () => stop());
+  button.addEventListener('pointerup', (event) => stop(event));
+  button.addEventListener('pointercancel', (event) => stop(event));
+  button.addEventListener('pointerleave', (event) => stop(event));
   window.addEventListener('pagehide', () => stop());
 }
 """
@@ -372,6 +409,14 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.live-grid-tile{{display:grid;gap:8px}}'
             f'.live-grid-tile .camera-view{{aspect-ratio:16/9}}'
             f'.live-grid-tile-head{{display:flex;align-items:center;justify-content:space-between;gap:8px}}'
+            # touch-action:none -- stops the browser's own default
+            # touch-gesture handling for a sustained press-and-hold on
+            # this button, so it can never be interpreted as also
+            # targeting the video tile underneath/nearby (the exact
+            # cause of a real "video pauses on mic press, resumes on
+            # release" mobile bug this pairs with pointerdown's own
+            # preventDefault()/stopPropagation()/setPointerCapture()).
+            f'.talk-mic{{touch-action:none}}'
             f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
             f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
@@ -508,7 +553,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
             f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
             f'<video id="live-view-video" controls muted playsinline></video>'
             f'<div class="camera-placeholder" id="live-view-placeholder">'

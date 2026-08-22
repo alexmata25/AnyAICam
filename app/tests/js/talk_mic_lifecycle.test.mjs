@@ -92,12 +92,28 @@ function makeButton() {
     },
     _listeners: {},
     addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
+    _captureLog: [],
+    setPointerCapture(pointerId) { this._captureLog.push(["set", pointerId]); },
+    releasePointerCapture(pointerId) { this._captureLog.push(["release", pointerId]); },
   };
 }
 
-function triggerListener(target, type) {
+function triggerListener(target, type, event) {
   const fns = target._listeners[type] || [];
-  fns.forEach((fn) => fn());
+  fns.forEach((fn) => fn(event));
+}
+
+// Fake PointerEvent: records whether preventDefault()/stopPropagation()
+// were called, without needing a real DOM Event implementation.
+function makeFakePointerEvent(pointerId) {
+  const event = {
+    pointerId,
+    defaultPrevented: false,
+    propagationStopped: false,
+    preventDefault() { event.defaultPrevented = true; },
+    stopPropagation() { event.propagationStopped = true; },
+  };
+  return event;
 }
 
 function fakeStartResponse(sessionId, ok = true) {
@@ -362,6 +378,67 @@ test("no WebSocket url ever contains a null or empty session id, across every sc
     assert(!/\/sessions\/(null|undefined)?\/audio/.test(url), `a WebSocket was constructed with a missing session id: ${url}`);
   }
   assert(allConstructedWsUrls.length > 0, "sanity check: earlier scenarios should have constructed at least one real WebSocket");
+});
+
+// ---------------------------------------------------------------- touch/pointer-conflict hardening (real mobile bug: video pauses on mic press, resumes on release)
+
+test("pointerdown prevents default, stops propagation, and captures the pointer", () => {
+  resetAll();
+  const event = makeFakePointerEvent(7);
+  triggerListener(button, "pointerdown", event);
+  assert(event.defaultPrevented, "pointerdown must call preventDefault()");
+  assert(event.propagationStopped, "pointerdown must call stopPropagation()");
+  assert(
+    button._captureLog.some(([action, id]) => action === "set" && id === 7),
+    `expected setPointerCapture(7) to have been called, got: ${JSON.stringify(button._captureLog)}`
+  );
+});
+
+test("pointerup prevents default, stops propagation, and releases the pointer capture", async () => {
+  resetAll();
+  triggerListener(button, "pointerdown", makeFakePointerEvent(3));
+  fetchCalls[0].deferred.resolve(fakeStartResponse("sess-touch"));
+  await flush();
+  gumCalls[0].resolve(makeMediaStream());
+  await flush();
+  FakeWebSocket.instances[0].triggerOpen();
+
+  const upEvent = makeFakePointerEvent(3);
+  triggerListener(button, "pointerup", upEvent);
+  assert(upEvent.defaultPrevented, "pointerup must call preventDefault()");
+  assert(upEvent.propagationStopped, "pointerup must call stopPropagation()");
+  assert(
+    button._captureLog.some(([action, id]) => action === "release" && id === 3),
+    `expected releasePointerCapture(3) to have been called, got: ${JSON.stringify(button._captureLog)}`
+  );
+});
+
+test("pointercancel and pointerleave also prevent default and stop propagation", async () => {
+  for (const releaseType of ["pointercancel", "pointerleave"]) {
+    resetAll();
+    triggerListener(button, "pointerdown", makeFakePointerEvent(9));
+    fetchCalls[0].deferred.resolve(fakeStartResponse(`sess-${releaseType}`));
+    await flush();
+    const releaseEvent = makeFakePointerEvent(9);
+    triggerListener(button, releaseType, releaseEvent);
+    assert(releaseEvent.defaultPrevented, `${releaseType} must call preventDefault()`);
+    assert(releaseEvent.propagationStopped, `${releaseType} must call stopPropagation()`);
+  }
+});
+
+test("internal stop() calls with no event at all (ws.onclose, pagehide) never throw", async () => {
+  resetAll();
+  triggerListener(button, "pointerdown", makeFakePointerEvent(1));
+  fetchCalls[0].deferred.resolve(fakeStartResponse("sess-noevent"));
+  await flush();
+  gumCalls[0].resolve(makeMediaStream());
+  await flush();
+  const ws = FakeWebSocket.instances[0];
+  ws.triggerOpen();
+  // Simulates ws.onclose firing stop() with no event argument at all --
+  // must not throw, and must still fully tear the session down.
+  ws.onclose();
+  assert(!button.classList.contains("active"), "stop() with no event must still clear the active state");
 });
 
 // ---------------------------------------------------------------- runner
