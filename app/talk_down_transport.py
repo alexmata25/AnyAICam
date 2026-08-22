@@ -114,13 +114,32 @@ def _rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str,
     return data.decode(errors="replace")
 
 
+def _status_line(response: str) -> str:
+    """The first line of an RTSP response, or "" for an empty/no
+    response -- e.g. the camera closed the connection before sending
+    anything back. splitlines()[0] on an empty string raises IndexError
+    (splitlines() returns [] for ""); every call site in this module
+    goes through this helper instead of repeating that guard inline, so
+    there is exactly one place that can get it wrong, not several."""
+    lines = response.splitlines()
+    return lines[0] if lines else ""
+
+
 def _authenticated_rtsp_request(sock: socket.socket, cseq: int, method: str, request_uri: str, username: str, password: str, extra_headers: str = "", body: bytes = b"") -> str:
     first = _rtsp_request(sock, cseq, method, request_uri, extra_headers=extra_headers, body=body)
-    status_line = first.splitlines()[0] if first else ""
+    status_line = _status_line(first)
     if " 401 " not in status_line:
         return first
     www_authenticate = next((line for line in first.splitlines() if line.lower().startswith("www-authenticate")), "")
-    challenge = _parse_digest_challenge(www_authenticate.split(":", 1)[1].strip())
+    # partition(), not split(...)[1] -- partition() always returns a
+    # 3-tuple even when the separator is absent (a camera returning 401
+    # with no WWW-Authenticate header at all, or one this scan somehow
+    # missed), so this can never raise. An empty challenge here still
+    # produces a syntactically valid (if wrong) Authorization header on
+    # the retry below; if that's also rejected, the caller's own
+    # status-line check reports it as a normal, diagnosable auth
+    # failure rather than crashing here.
+    challenge = _parse_digest_challenge(www_authenticate.partition(":")[2].strip())
     cnonce = secrets.token_hex(8)
     auth = _digest_authorization(challenge, username, password, method, request_uri, cnonce, "00000001")
     return _rtsp_request(sock, cseq + 1, method, request_uri, extra_headers=extra_headers, auth_header=auth, body=body)
@@ -169,12 +188,26 @@ class OnvifBackchannelTransport(TalkDownTransport):
         return f"rtsp://{self.host}:{self.port}{self.rtsp_path}"
 
     def connect(self) -> None:
+        # Every stage below raises ConnectionError with an explicit
+        # stage= tag on failure, rather than letting a malformed/empty
+        # response crash with a bare exception -- talk_audio_relay_client
+        # .py's own _start_session() already logs str(error) verbatim on
+        # a connect() failure (session_id/camera_id/camera_number +
+        # error), so the stage tag alone is enough to tell DESCRIBE
+        # response handling, SETUP response handling, session
+        # extraction, and RECORD response handling apart in production
+        # logs, with no separate logging needed in this module.
         self._sock = socket.create_connection((self.host, self.port), timeout=self.timeout_seconds)
         uri = self._request_uri()
-        describe = _authenticated_rtsp_request(self._sock, 1, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\n")
-        if " 200 " not in describe.splitlines()[0]:
-            raise ConnectionError(f"DESCRIBE failed: {describe.splitlines()[0] if describe else 'no response'}")
 
+        describe = _authenticated_rtsp_request(self._sock, 1, "DESCRIBE", uri, self.username, self.password, extra_headers="Accept: application/sdp\r\n")
+        describe_status = _status_line(describe)
+        if " 200 " not in describe_status:
+            raise ConnectionError(f"DESCRIBE failed (stage=describe_response): {describe_status or 'no response (connection closed before any data was received)'}")
+
+        # SDP parsing: _find_backchannel_control() never raises -- an
+        # empty/audio-section-less body just means setup_uri falls back
+        # to the base RTSP uri (see its own docstring).
         sdp_body = describe.split("\r\n\r\n", 1)[-1]
         audio_control = self._find_backchannel_control(sdp_body)
         setup_uri = f"{uri}/{audio_control}" if audio_control else uri
@@ -186,17 +219,22 @@ class OnvifBackchannelTransport(TalkDownTransport):
             self._sock, 2, "SETUP", setup_uri, self.username, self.password,
             extra_headers=f"Transport: RTP/AVP;unicast;client_port={local_port}-{local_port + 1}\r\n",
         )
-        if " 200 " not in setup.splitlines()[0]:
-            raise ConnectionError(f"SETUP failed: {setup.splitlines()[0] if setup else 'no response'}")
+        setup_status = _status_line(setup)
+        if " 200 " not in setup_status:
+            raise ConnectionError(f"SETUP failed (stage=setup_response): {setup_status or 'no response (connection closed before any data was received)'}")
+
         self._session_id = self._extract_header(setup, "session").split(";")[0].strip()
+        if not self._session_id:
+            raise ConnectionError("SETUP returned 200 but no Session header was present (stage=session_extraction)")
         self._rtp_remote = (self.host, self._extract_server_port(setup) or self.port)
 
         record = _authenticated_rtsp_request(
             self._sock, 3, "RECORD", uri, self.username, self.password,
             extra_headers=f"Session: {self._session_id}\r\nRange: npt=0.000-\r\n",
         )
-        if " 200 " not in record.splitlines()[0]:
-            raise ConnectionError(f"RECORD failed: {record.splitlines()[0] if record else 'no response'}")
+        record_status = _status_line(record)
+        if " 200 " not in record_status:
+            raise ConnectionError(f"RECORD failed (stage=record_response): {record_status or 'no response (connection closed before any data was received)'}")
 
     def send(self, encoded_audio: bytes) -> None:
         if self._rtp_socket is None or self._rtp_remote is None:
