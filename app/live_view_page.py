@@ -42,38 +42,73 @@ POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
 
 
+def _talk_down_state(supported) -> dict:
+    """Maps the raw tri-state talk_down_supported column value (NULL /
+    0 / 1 -- see db_migrations.py's own note on why this is tri-state,
+    not boolean) into the exact enabled/tooltip pair the mic button
+    template needs. Never touches whether THIS identity is additionally
+    permitted to talk (can_talk) -- see _customer_live_cameras(), which
+    combines both before this ever reaches the page."""
+    if supported == 1:
+        return {"enabled": True, "tooltip": None}
+    if supported == 0:
+        return {"enabled": False, "tooltip": "Talk-down not supported by this camera"}
+    return {"enabled": False, "tooltip": "Talk-down capability not verified"}
+
+
 def _customer_live_cameras(db, identity: dict) -> list[dict]:
     """Every camera this identity may view live, scoped to identity's own
     customer_id: the full fleet for customer_owner, or only the subset
     explicitly granted can_live for customer_viewer -- same ownership/
     permission rule _authorized_camera() applies to one camera_id from a
     URL, evaluated here for the whole fleet at once so /customer-live can
-    render a grid instead of picking a single camera to redirect to."""
+    render a grid instead of picking a single camera to redirect to.
+
+    Each returned dict also carries talk_enabled/talk_tooltip -- the
+    server-persisted camera CAPABILITY state (talk_down_supported),
+    rendered here purely so the page can show the mic button's initial
+    state without a separate capability round-trip per camera per page
+    load, per the architecture requirement that Live View reads
+    persisted state rather than probing on every load. This is a
+    capability hint only, not the authorization decision -- whether
+    THIS identity may actually start a talk session (customer_owner's
+    implicit access vs. customer_viewer's own can_talk=1 grant) is
+    re-checked from scratch, server-side, by
+    talk_sessions.py's _authorized_talk_camera() at session-start time,
+    exactly like every other authorization in this codebase never
+    trusts what a page merely rendered. A viewer lacking can_talk still
+    sees an enabled-looking mic for a capable camera and gets a real
+    403 the moment they try to use it -- a UX gap acceptable for this
+    foundation, not a security one."""
     if identity.get('role') == 'customer_owner':
-        return [
+        cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT id, name FROM cameras WHERE customer_id=? '
+                'SELECT id, name, talk_down_supported FROM cameras WHERE customer_id=? '
                 'ORDER BY camera_number, id',
                 (identity['customer_id'],),
             ).fetchall()
         ]
+    else:
+        user = db.execute(
+            'SELECT id FROM partner_users WHERE email=?',
+            (identity['email'],),
+        ).fetchone()
+        if not user:
+            return []
 
-    user = db.execute(
-        'SELECT id FROM partner_users WHERE email=?',
-        (identity['email'],),
-    ).fetchone()
-    if not user:
-        return []
+        cameras = [
+            dict(camera) for camera in db.execute(
+                'SELECT c.id, c.name, c.talk_down_supported FROM cameras c '
+                'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
+                'WHERE c.customer_id=? AND p.can_live=1 '
+                'ORDER BY c.camera_number, c.id',
+                (user['id'], identity['customer_id']),
+            ).fetchall()
+        ]
 
-    return [
-        dict(camera) for camera in db.execute(
-            'SELECT c.id, c.name FROM cameras c '
-            'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
-            'WHERE c.customer_id=? AND p.can_live=1 '
-            'ORDER BY c.camera_number, c.id',
-            (user['id'], identity['customer_id']),
-        ).fetchall()
-    ]
+    for camera in cameras:
+        camera.update(_talk_down_state(camera.pop('talk_down_supported')))
+    return cameras
 
 
 def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
@@ -140,6 +175,11 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
               </div>
               <div class="live-grid-tile-head">
                 <span>{escape(camera.get('name') or camera['id'])}</span>
+                <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
+                  data-camera-id="{escape(camera['id'], quote=True)}"
+                  title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
+                  aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
+                  {'' if camera['enabled'] else 'disabled'}>◖</button>
                 <a class="ghost-button" href="/customer/cameras/{escape(camera['id'], quote=True)}/live">Full screen</a>
               </div>
             </article>'''
@@ -154,6 +194,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.live-grid-tile{{display:grid;gap:8px}}'
             f'.live-grid-tile .camera-view{{aspect-ratio:16/9}}'
             f'.live-grid-tile-head{{display:flex;align-items:center;justify-content:space-between;gap:8px}}'
+            f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
+            f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
             f'</style>'
             f'<section class="live-grid">{tiles}</section>'
@@ -237,7 +279,54 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
-  window.addEventListener('pagehide',()=>{{cameraIds.forEach(id=>stopSession(id,true))}});
+  // Push-to-talk: press-and-hold only, no always-open duplex mode.
+  // Each tile's mic button is entirely independent -- talkState is
+  // keyed per camera id, so one camera's press/release/error can never
+  // affect another's. Every enabled button here already reflects the
+  // server-persisted capability (talk_down_supported) at page-render
+  // time; the actual start-session call below still gets its own
+  // fresh 403 if authorization has changed since the page loaded --
+  // this button never assumes the render-time state is still valid.
+  const talkState={{}};
+  document.querySelectorAll('.talk-mic').forEach(button=>{{
+    const id=button.dataset.cameraId;
+    talkState[id]={{sessionId:null,pending:false}};
+
+    async function stopTalk(isUnload){{
+      const state=talkState[id];
+      button.classList.remove('active');
+      if(!state.sessionId)return;
+      const sessionId=state.sessionId;state.sessionId=null;
+      const url=`/api/customer/talk/sessions/${{sessionId}}/stop`;
+      if(isUnload){{try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}
+      else{{try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}}}
+    }}
+
+    async function startTalk(){{
+      const state=talkState[id];
+      if(button.disabled||state.pending||state.sessionId)return;
+      state.pending=true;
+      try{{
+        const response=await fetch(`/api/customer/cameras/${{id}}/talk/start`,{{method:'POST'}});
+        if(!response.ok){{state.pending=false;return}}
+        const body=await response.json();
+        state.sessionId=body.session_id;
+        state.pending=false;
+        button.classList.add('active');
+      }}catch(e){{
+        state.pending=false;
+      }}
+    }}
+
+    button.addEventListener('pointerdown',startTalk);
+    button.addEventListener('pointerup',()=>stopTalk(false));
+    button.addEventListener('pointercancel',()=>stopTalk(false));
+    button.addEventListener('pointerleave',()=>stopTalk(false));
+  }});
+  window.addEventListener('pagehide',()=>{{
+    cameraIds.forEach(id=>stopSession(id,true));
+    Object.keys(talkState).forEach(id=>{{if(talkState[id].sessionId){{const url=`/api/customer/talk/sessions/${{talkState[id].sessionId}}/stop`;try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}}});
+  }});
 
   cameraIds.forEach(startSession);
 }})();
@@ -266,11 +355,14 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         camera_name = camera.get('name') or camera_id
         start_url = f'/api/customer/cameras/{camera_id}/live/start'
         playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
+        talk_state = _talk_down_state(camera.get('talk_down_supported'))
+        talk_tooltip = talk_state['tooltip'] or 'Press and hold to talk'
 
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
+            f'<style>.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
             f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
             f'<video id="live-view-video" controls muted playsinline></video>'
             f'<div class="camera-placeholder" id="live-view-placeholder">'
@@ -279,6 +371,9 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<small>This can take a few seconds.</small></div></div>'
             f'<div class="camera-tools" style="justify-content:center">'
             f'<button class="camera-tool" id="live-view-mute" title="Mute">♪</button>'
+            f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
+            f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
+            f'{"" if talk_state["enabled"] else "disabled"}>◖</button>'
             f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot">◉</button>'
             f'<button class="camera-tool" id="live-view-download" title="Download">⬇</button>'
             f'<button class="camera-tool" id="live-view-share" title="Share">↗</button>'
@@ -404,7 +499,42 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
   stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
-  window.addEventListener('pagehide',()=>stopSession(true));
+
+  // Push-to-talk: press-and-hold only, no always-open duplex mode. This
+  // button already reflects the server-persisted capability
+  // (talk_down_supported) at page-render time; the start-session call
+  // below still gets its own fresh 403 if authorization has changed
+  // since the page loaded -- never assumes render-time state still holds.
+  const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
+  let talkSessionId=null, talkPending=false;
+  async function stopTalk(isUnload){{
+    talkButton.classList.remove('active');
+    if(!talkSessionId)return;
+    const stoppingSessionId=talkSessionId;talkSessionId=null;
+    const url=`/api/customer/talk/sessions/${{stoppingSessionId}}/stop`;
+    if(isUnload){{try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}
+    else{{try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}}}
+  }}
+  async function startTalk(){{
+    if(talkButton.disabled||talkPending||talkSessionId)return;
+    talkPending=true;
+    try{{
+      const response=await fetch(`/api/customer/cameras/{camera_id}/talk/start`,{{method:'POST'}});
+      if(!response.ok){{talkPending=false;return}}
+      const body=await response.json();
+      talkSessionId=body.session_id;
+      talkPending=false;
+      talkButton.classList.add('active');
+    }}catch(e){{
+      talkPending=false;
+    }}
+  }}
+  talkButton.addEventListener('pointerdown',startTalk);
+  talkButton.addEventListener('pointerup',()=>stopTalk(false));
+  talkButton.addEventListener('pointercancel',()=>stopTalk(false));
+  talkButton.addEventListener('pointerleave',()=>stopTalk(false));
+
+  window.addEventListener('pagehide',()=>{{stopSession(true);stopTalk(true)}});
 
   startSession();
 }})();

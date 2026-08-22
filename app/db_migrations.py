@@ -47,6 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_recordings_camera_started ON recordings(camera_id
 CREATE TABLE IF NOT EXISTS detection_events(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,site_id TEXT NOT NULL,appliance_id TEXT NOT NULL,camera_id TEXT NOT NULL,local_event_id TEXT NOT NULL,event_type TEXT NOT NULL,confidence REAL,object_count INTEGER NOT NULL DEFAULT 1,detections_json TEXT,event_timestamp TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(camera_id,local_event_id),FOREIGN KEY(customer_id) REFERENCES customers(id),FOREIGN KEY(site_id) REFERENCES sites(id),FOREIGN KEY(appliance_id) REFERENCES appliances(id),FOREIGN KEY(camera_id) REFERENCES cameras(id));
 CREATE INDEX IF NOT EXISTS idx_detection_events_camera_timestamp ON detection_events(camera_id,event_timestamp);
 '''),
+    ('20260821_talk_down_sessions','''
+CREATE TABLE IF NOT EXISTS customer_talk_sessions(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,site_id TEXT NOT NULL,camera_id TEXT NOT NULL,user_id TEXT,requested_by TEXT NOT NULL,role TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'requested',requested_at TEXT NOT NULL,ended_at TEXT,expires_at TEXT NOT NULL,FOREIGN KEY(customer_id) REFERENCES customers(id),FOREIGN KEY(site_id) REFERENCES sites(id),FOREIGN KEY(camera_id) REFERENCES cameras(id));
+CREATE INDEX IF NOT EXISTS idx_customer_talk_sessions_camera ON customer_talk_sessions(camera_id,state);
+'''),
 ]
 
 
@@ -74,7 +78,7 @@ def apply_migrations():
         permission_columns=({item['name'] for item in db.execute('PRAGMA table_info(customer_camera_permissions)').fetchall()}
                             if backend()=='sqlite' else
                             {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='customer_camera_permissions'").fetchall()})
-        for name,definition in (('can_alerts','INTEGER NOT NULL DEFAULT 1'),('can_settings','INTEGER NOT NULL DEFAULT 0')):
+        for name,definition in (('can_alerts','INTEGER NOT NULL DEFAULT 1'),('can_settings','INTEGER NOT NULL DEFAULT 0'),('can_talk','INTEGER NOT NULL DEFAULT 0')):
             if name not in permission_columns: db.execute(f'ALTER TABLE customer_camera_permissions ADD COLUMN {name} {definition}')
 
         camera_columns=({item['name'] for item in db.execute('PRAGMA table_info(cameras)').fetchall()}
@@ -82,6 +86,17 @@ def apply_migrations():
                         {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='cameras'").fetchall()})
         if 'camera_number' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN camera_number INTEGER')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_appliance_camera_number ON cameras(appliance_id,camera_number) WHERE camera_number IS NOT NULL')
+        # talk_down_supported is a tri-state, NOT a plain boolean: NULL means
+        # "never probed / capability unverified" (the honest default for
+        # every camera until real ONVIF discovery reports otherwise), 0
+        # means "probed, confirmed unsupported", 1 means "probed, confirmed
+        # supported". The frontend mic button must render differently for
+        # NULL vs 0 (same disabled state, different tooltip) -- collapsing
+        # this to a boolean would make "never checked" indistinguishable
+        # from "checked and it doesn't work".
+        if 'talk_down_supported' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_supported INTEGER')
+        if 'talk_down_metadata' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_metadata TEXT')
+        if 'talk_down_verified_at' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_verified_at TEXT')
 
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else

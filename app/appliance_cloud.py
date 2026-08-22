@@ -124,12 +124,29 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.post('/api/appliance/cameras')
     def cameras(request: Request,payload: dict) -> dict:
+        # Talk-down capability foundation: an item may optionally include a
+        # "talk_down" object -- {"supported": bool, "metadata": {...}} --
+        # reported by the appliance's own ONVIF discovery/rescan (not yet
+        # implemented on the edge side; this route is ready to receive it
+        # the moment it is). Absent/malformed talk_down leaves the
+        # camera's existing talk_down_supported value untouched -- an
+        # appliance running older code that never sends this key must
+        # never be read as "confirmed unsupported", only as "not yet
+        # reported this cycle". camera_id is always scoped to this
+        # authenticated appliance's own rows -- never trusted blindly
+        # from the payload beyond that ownership check.
         appliance=authenticate_appliance(request); safe=sanitize_appliance_payload(payload); items=safe.get('cameras',[]); now=datetime.now().isoformat()
         with connection() as db:
             for item in items:
                 camera_id=str(item.get('id',''))[:100]
                 if not camera_id: continue
                 db.execute('INSERT INTO appliance_camera_status(appliance_id,camera_id,name,online,recording,analytics,last_recording_at,last_error,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(appliance_id,camera_id) DO UPDATE SET name=excluded.name,online=excluded.online,recording=excluded.recording,analytics=excluded.analytics,last_recording_at=excluded.last_recording_at,last_error=excluded.last_error,updated_at=excluded.updated_at',(appliance['id'],camera_id,item.get('name','Camera'),int(bool(item.get('online'))),int(bool(item.get('recording'))),int(bool(item.get('analytics'))),item.get('last_recording_at'),item.get('last_error'),now))
+                talk_down=item.get('talk_down')
+                if isinstance(talk_down,dict) and 'supported' in talk_down:
+                    supported=1 if talk_down.get('supported') else 0
+                    metadata=talk_down.get('metadata')
+                    metadata_json=json.dumps(metadata) if isinstance(metadata,dict) else None
+                    db.execute('UPDATE cameras SET talk_down_supported=?,talk_down_metadata=?,talk_down_verified_at=? WHERE id=? AND appliance_id=?',(supported,metadata_json,now,camera_id,appliance['id']))
         return {'status':'accepted','camera_count':len(items),'credentials_received':False}
 
     @app.get('/api/appliance/configuration')

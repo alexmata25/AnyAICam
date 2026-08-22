@@ -46453,6 +46453,7 @@ from appliance_cloud import register_appliance_cloud_routes
 from live_playlist import register_live_playlist_routes
 from live_view_sessions import register_live_view_session_routes
 from live_view_page import register_live_view_page_routes
+from talk_sessions import register_talk_session_routes
 
 
 
@@ -46555,6 +46556,7 @@ register_appliance_cloud_routes(app, page_shell)
 register_live_playlist_routes(app)
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
+register_talk_session_routes(app)
 
 
 
