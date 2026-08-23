@@ -37230,6 +37230,42 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         append_analytics_event(event)
         smart_motion.record_object_detection(camera_number, class_name)
+        if class_name == "person" and ppe.is_camera_enabled(camera_number):
+            for person_detection in class_detections:
+                try:
+                    hx, hy, hw, hh = (
+                        person_detection["x"],
+                        person_detection["y"],
+                        person_detection["width"],
+                        person_detection["height"],
+                    )
+                    person_crop = frame[hy : hy + hh, hx : hx + hw]
+                    ppe_result = ppe.detect_ppe(person_crop, camera_number=camera_number)
+                except Exception as error:
+                    ppe_result = None
+                    print(f"Camera {camera_number} PPE skipped (non-fatal): {error}")
+                if not ppe_result:
+                    continue
+                ppe_event = AnalyticsEventModel(
+                    id=uuid.uuid4().hex[:12],
+                    camera=camera_number,
+                    site="home",
+                    rule_name=(
+                        "PPE compliant"
+                        if ppe_result["hard_hat_present"] and ppe_result["safety_vest_present"]
+                        else "PPE violation"
+                    ),
+                    event_type="ppe",
+                    timestamp=now,
+                    confidence=ppe_result["confidence"],
+                    thumbnail=thumbnail_url,
+                    linked_recording=linked_recording,
+                    mock=False,
+                ).model_dump(mode="json")
+                ppe_event["hard_hat_present"] = ppe_result["hard_hat_present"]
+                ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
+                append_analytics_event(ppe_event)
+                saved_events.append(ppe_event)
         if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number):
             for vehicle_detection in class_detections:
                 try:
@@ -38793,6 +38829,7 @@ import recording_uploader
 import recording_retention_sweep
 import analytics_sync
 import lpr
+import ppe
 import smart_motion
 import talk_down_discovery
 import people_counting
