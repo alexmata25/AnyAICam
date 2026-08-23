@@ -522,3 +522,201 @@ def test_quote_carries_all_three_price_tiers_in_correct_order(product, resolutio
     assert quote.base_price == base
     assert quote.standard_retail_price == retail
     assert quote.base_price <= quote.standard_retail_price <= quote.customer_price or quote.customer_price == quote.standard_retail_price
+
+
+# ============================================================ 20. partner attribution: QR/link/code checkout, hijack protection, transfers
+
+
+def test_new_customer_with_valid_token_is_attributed_to_that_partner():
+    token = bpp.generate_attribution_token("partner-acme", "tok-1", now=datetime(2026, 1, 1))
+    decision = bpp.resolve_attribution(None, token, now=datetime(2026, 1, 2))
+    assert decision.resolved_partner_id == "partner-acme"
+    assert decision.previous_partner_id is None
+    assert decision.reason == "new_customer_attributed_via_token"
+
+
+def test_new_customer_with_no_token_defaults_to_anyaicam_direct():
+    decision = bpp.resolve_attribution(None, None)
+    assert decision.resolved_partner_id == bpp.ANYAICAM_DIRECT_PARTNER_ID
+    assert decision.reason == "new_customer_no_token_direct"
+
+
+def test_new_customer_with_expired_token_falls_back_to_direct_without_blocking_checkout():
+    token = bpp.generate_attribution_token("partner-acme", "tok-old", valid_days=30, now=datetime(2026, 1, 1))
+    decision = bpp.resolve_attribution(None, token, now=datetime(2026, 3, 1))  # well past the 30-day expiry
+    assert decision.resolved_partner_id == bpp.ANYAICAM_DIRECT_PARTNER_ID
+    assert decision.reason == "invalid_token_defaulted_to_direct"
+
+
+def test_new_customer_with_revoked_token_falls_back_to_direct():
+    token = bpp.AttributionToken(token="tok-x", partner_id="partner-acme", created_at="2026-01-01T00:00:00", expires_at=None, revoked=True)
+    decision = bpp.resolve_attribution(None, token)
+    assert decision.resolved_partner_id == bpp.ANYAICAM_DIRECT_PARTNER_ID
+    assert decision.reason == "invalid_token_defaulted_to_direct"
+
+
+def test_previously_direct_customer_can_be_reattributed_to_a_partner():
+    """A customer who checked out with no partner isn't a protected
+    relationship -- a later valid token can attribute them."""
+    token = bpp.generate_attribution_token("partner-acme", "tok-2")
+    decision = bpp.resolve_attribution(bpp.ANYAICAM_DIRECT_PARTNER_ID, token)
+    assert decision.resolved_partner_id == "partner-acme"
+    assert decision.previous_partner_id == bpp.ANYAICAM_DIRECT_PARTNER_ID
+    assert decision.reason == "reattributed_from_direct_to_partner"
+
+
+def test_established_partner_customer_is_protected_from_a_different_partners_token():
+    """The core anti-hijack rule: partner-acme already owns this
+    customer; partner-rival's valid token must NOT move the customer."""
+    rival_token = bpp.generate_attribution_token("partner-rival", "tok-3")
+    decision = bpp.resolve_attribution("partner-acme", rival_token)
+    assert decision.resolved_partner_id == "partner-acme"
+    assert decision.reason == "hijack_attempt_blocked_existing_partner_protected"
+
+
+def test_established_partner_customer_stays_attributed_with_no_token_presented():
+    """Models renewals, plan changes, camera count changes, and
+    cancel-then-reactivate: no new token is typically presented, and
+    attribution must simply persist."""
+    decision = bpp.resolve_attribution("partner-acme", None)
+    assert decision.resolved_partner_id == "partner-acme"
+    assert decision.reason == "existing_attribution_preserved"
+
+
+def test_established_partner_customer_returning_directly_still_keeps_their_partner():
+    """'Customer leaves and later returns directly to AnyAiCam.com':
+    once server-side attribution exists, a session with no token at all
+    (as if they typed the URL in fresh) still resolves to their partner."""
+    decision = bpp.resolve_attribution("partner-acme", None)
+    assert decision.resolved_partner_id == "partner-acme"
+
+
+def test_transfer_requires_an_approving_admin_identity():
+    with pytest.raises(ValueError):
+        bpp.transfer_customer_attribution("partner-acme", "partner-beta", approved_by="", reason="customer requested")
+
+
+def test_transfer_requires_an_explicit_reason():
+    with pytest.raises(ValueError):
+        bpp.transfer_customer_attribution("partner-acme", "partner-beta", approved_by="admin-jane", reason="")
+
+
+def test_explicit_admin_transfer_moves_an_established_customer_between_partners():
+    """The ONLY path that can move a protected, established customer --
+    an explicit admin action, never a token."""
+    decision = bpp.transfer_customer_attribution("partner-acme", "partner-beta", approved_by="admin-jane", reason="customer requested new installer")
+    assert decision.resolved_partner_id == "partner-beta"
+    assert decision.previous_partner_id == "partner-acme"
+    assert "admin-jane" in decision.reason
+    assert "customer requested new installer" in decision.reason
+
+
+def test_attribution_decision_always_carries_a_reason_for_audit_history():
+    """Every resolution -- not just transfers -- produces an
+    inspectable reason string, the basis of a real audit trail."""
+    for decision in (
+        bpp.resolve_attribution(None, None),
+        bpp.resolve_attribution("partner-acme", None),
+        bpp.transfer_customer_attribution("partner-acme", "partner-beta", "admin-jane", "reason"),
+    ):
+        assert isinstance(decision.reason, str) and len(decision.reason) > 0
+        assert decision.decided_at  # timestamped
+
+
+# ============================================================ 21. discounts and promotions: centrally controlled, explicit economic treatment
+
+
+def test_ordinary_partner_quote_still_cannot_go_below_base_price_at_all():
+    """Reconfirms (post-attribution/promotion additions) that a partner
+    calling the ordinary, non-promotional path has zero way to create
+    a below-base discount -- centralized admin control is the only
+    door, and it isn't this one."""
+    with pytest.raises(bpp.BasePriceError):
+        bpp.calculate_customer_quote("motion", "2mp", customer_price=1.00, retention_days="2", partner_id="partner-acme")
+
+
+def test_promotional_quote_without_a_promotion_object_still_blocks_below_base():
+    with pytest.raises(bpp.BasePriceError):
+        bpp.calculate_promotional_quote("motion", "2mp", customer_price=1.00, retention_days="2")
+
+
+def test_promotional_quote_with_an_unapproved_promotion_still_blocks_below_base():
+    promo = bpp.Promotion(promotion_id="promo-1", absorbed_by="anyaicam", admin_approved=False, created_by="staff-jane")
+    with pytest.raises(bpp.BasePriceError):
+        bpp.calculate_promotional_quote("motion", "2mp", customer_price=1.00, retention_days="2", promotion=promo)
+
+
+def test_promotion_rejects_an_unknown_absorbed_by_value():
+    with pytest.raises(ValueError):
+        bpp.Promotion(promotion_id="promo-bad", absorbed_by="nobody", admin_approved=True, created_by="staff-jane")
+
+
+def test_shared_promotion_requires_a_valid_partner_share():
+    with pytest.raises(ValueError):
+        bpp.Promotion(promotion_id="promo-bad", absorbed_by="shared", admin_approved=True, created_by="staff-jane")  # missing partner_share
+    with pytest.raises(ValueError):
+        bpp.Promotion(promotion_id="promo-bad2", absorbed_by="shared", admin_approved=True, created_by="staff-jane", partner_share=1.5)
+
+
+def test_approved_promotion_absorbed_by_anyaicam_reduces_anyaicam_net_not_partner_earnings():
+    base = bpp.get_base_price("motion", "2mp", "2")  # $2.00
+    promo = bpp.Promotion(promotion_id="promo-launch", absorbed_by="anyaicam", admin_approved=True, created_by="staff-jane")
+    quote = bpp.calculate_promotional_quote("motion", "2mp", customer_price=1.00, retention_days="2", partner_id="partner-acme", promotion=promo)
+    assert quote.anyaicam_net == 1.00  # AnyAiCam receives less than its normal base price
+    assert quote.subsidized_amount == round(base - 1.00, 2)
+    assert quote.absorbed_by == "anyaicam"
+    assert quote.partner_earnings == 0.0  # partner is not penalized for an AnyAiCam-funded promotion
+
+
+def test_approved_promotion_absorbed_by_partner_keeps_anyaicam_net_at_full_base_price():
+    base = bpp.get_base_price("motion", "2mp", "2")
+    promo = bpp.Promotion(promotion_id="promo-partner-funded", absorbed_by="partner", admin_approved=True, created_by="staff-jane")
+    quote = bpp.calculate_promotional_quote("motion", "2mp", customer_price=1.00, retention_days="2", partner_id="partner-acme", promotion=promo)
+    assert quote.anyaicam_net == base  # AnyAiCam is made whole regardless
+    assert quote.partner_earnings < 0  # the partner absorbs the shortfall
+    assert quote.subsidized_amount == round(base - 1.00, 2)
+    assert quote.absorbed_by == "partner"
+
+
+def test_approved_promotion_shared_splits_the_shortfall_by_partner_share():
+    base = bpp.get_base_price("motion", "2mp", "2")  # 2.00
+    customer_price = 1.00
+    shortfall = round(base - customer_price, 2)  # 1.00
+    promo = bpp.Promotion(promotion_id="promo-shared", absorbed_by="shared", admin_approved=True, created_by="staff-jane", partner_share=0.25)
+    quote = bpp.calculate_promotional_quote("motion", "2mp", customer_price=customer_price, retention_days="2", partner_id="partner-acme", promotion=promo)
+    partner_shortfall = round(shortfall * 0.25, 2)
+    assert quote.partner_earnings == round(-partner_shortfall, 2)
+    assert quote.anyaicam_net == round(base - (shortfall - partner_shortfall), 2)
+    assert quote.absorbed_by == "shared"
+
+
+def test_promotional_quote_at_or_above_base_never_subsidizes_anything_even_with_a_promotion_attached():
+    """A promotion object being present doesn't force a subsidy -- if
+    the customer price already clears base, nothing is subsidized."""
+    promo = bpp.Promotion(promotion_id="promo-unused", absorbed_by="anyaicam", admin_approved=True, created_by="staff-jane")
+    quote = bpp.calculate_promotional_quote("motion", "2mp", customer_price=8.99, retention_days="2", partner_id="partner-acme", promotion=promo)
+    assert quote.subsidized_amount == 0.0
+    assert quote.absorbed_by is None
+    assert quote.anyaicam_net == quote.base_price
+
+
+def test_economic_treatment_is_stored_explicitly_not_inferred_from_retail_price():
+    """Two promotions with the identical discounted customer_price but
+    different absorbed_by produce different anyaicam_net/partner_earnings
+    -- proving the treatment comes from the stored Promotion field, not
+    from any formula involving standard_retail_price."""
+    promo_a = bpp.Promotion(promotion_id="a", absorbed_by="anyaicam", admin_approved=True, created_by="staff-jane")
+    promo_b = bpp.Promotion(promotion_id="b", absorbed_by="partner", admin_approved=True, created_by="staff-jane")
+    quote_a = bpp.calculate_promotional_quote("motion", "2mp", customer_price=1.00, retention_days="2", promotion=promo_a)
+    quote_b = bpp.calculate_promotional_quote("motion", "2mp", customer_price=1.00, retention_days="2", promotion=promo_b)
+    assert quote_a.customer_price == quote_b.customer_price == 1.00
+    assert quote_a.anyaicam_net != quote_b.anyaicam_net
+    assert quote_a.partner_earnings != quote_b.partner_earnings
+
+
+def test_service_charges_remain_untouched_by_promotion_logic():
+    """Confirms promotions apply only to subscription pricing --
+    ServiceCharge has no admin_approved/absorbed_by concept at all,
+    consistent with services being a wholly separate line item."""
+    assert not hasattr(bpp.ServiceCharge, "admin_approved")
+    assert not hasattr(bpp.ServiceCharge, "absorbed_by")
