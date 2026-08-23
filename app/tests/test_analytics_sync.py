@@ -578,6 +578,41 @@ def test_non_vehicle_event_type_passes_through_unchanged(non_vehicle_class):
     assert asy._notification_event_type(non_vehicle_class) == non_vehicle_class
 
 
+def test_smart_motion_notification_message_names_the_real_trigger():
+    event = _event("evt-sm-1", event_type="smart_motion")
+    event["triggered_by"] = "person"
+    payload = asy._build_notification_payload(event, "cam-1")
+    assert payload["message"] == "Smart Motion: person detected"
+    assert payload["event_type"] == "smart_motion"
+
+
+@pytest.mark.parametrize("triggered_by", ["car", "truck", "dog", "cat", "bicycle"])
+def test_smart_motion_notification_message_names_any_real_trigger_class(triggered_by):
+    event = _event("evt-sm-2", event_type="smart_motion")
+    event["triggered_by"] = triggered_by
+    payload = asy._build_notification_payload(event, "cam-1")
+    assert payload["message"] == f"Smart Motion: {triggered_by} detected"
+
+
+def test_smart_motion_without_a_triggered_by_falls_back_to_the_generic_cloud_message():
+    # Should never happen in practice (store_motion_event() always sets
+    # triggered_by before building a smart_motion event), but the
+    # payload must never claim a trigger that isn't real.
+    event = _event("evt-sm-3", event_type="smart_motion")
+    payload = asy._build_notification_payload(event, "cam-1")
+    assert "message" not in payload
+
+
+def test_non_smart_motion_events_never_get_a_message_override():
+    # The custom message is scoped to smart_motion only -- person/
+    # vehicle/etc. keep using the cloud's own generic title/message,
+    # completely unchanged by this addition.
+    event = _event("evt-sm-4", event_type="person")
+    event["triggered_by"] = "person"  # even if present, must be ignored here
+    payload = asy._build_notification_payload(event, "cam-1")
+    assert "message" not in payload
+
+
 @pytest.mark.parametrize("vehicle_class", ["car", "truck", "motorcycle", "bus", "bicycle"])
 def test_notification_payload_maps_vehicle_subclass_to_generic_vehicle(vehicle_class):
     event = _event("evt-1", event_type=vehicle_class)

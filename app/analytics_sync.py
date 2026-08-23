@@ -413,12 +413,24 @@ def _build_notification_payload(event: dict, camera_id: str) -> dict:
     the analytics-event POST above. Only the fields that route/fanout
     actually reads are ever sent -- no thumbnail/linked_recording (same
     local-filesystem-only exclusion as _build_payload())."""
-    return {
+    payload = {
         "id": str(event.get("id") or "").strip(),
         "event_type": _notification_event_type(str(event.get("event_type") or "").strip()),
         "camera_id": camera_id,
         "timestamp": str(event.get("timestamp") or "").strip(),
     }
+    # Smart Motion's event_type alone ("smart_motion") doesn't say what
+    # was actually seen -- the cloud's own generic title/message
+    # ("Smart Motion detected") already reads event_type, but the real
+    # detected class lives in this local event's own triggered_by
+    # field (set by store_motion_event() in main.py). The cloud's
+    # fanout_appliance_event() already supports a caller-supplied
+    # message (falls back to the generic one when absent) -- reusing
+    # that existing field rather than adding a new one.
+    triggered_by = str(event.get("triggered_by") or "").strip()
+    if payload["event_type"] == "smart_motion" and triggered_by:
+        payload["message"] = f"Smart Motion: {triggered_by} detected"
+    return payload
 
 
 def _forward_notification(event: dict, camera_id: str) -> None:
