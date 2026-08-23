@@ -119,6 +119,35 @@ def _parse_max_events_per_scan() -> int:
 
 MAX_EVENTS_PER_SCAN = _parse_max_events_per_scan()
 
+# Backlog catch-up: MAX_EVENTS_PER_SCAN above stays the deliberately
+# conservative steady-state rate (kept at its current production value,
+# unchanged by this milestone). When the real backlog grows past
+# CATCHUP_THRESHOLD_EVENTS, a scan temporarily uses the larger
+# CATCHUP_MAX_EVENTS_PER_SCAN instead -- still one bounded batch per
+# scan, never one huge burst -- automatically stepping back down to
+# the steady-state rate the instant the backlog drops back under the
+# threshold. No manual re-tuning of MAX_EVENTS_PER_SCAN is needed to
+# recover from a real outage.
+CATCHUP_THRESHOLD_EVENTS = max(1, int(os.environ.get("ANYAICAM_ANALYTICS_SYNC_CATCHUP_THRESHOLD", "100")))
+CATCHUP_MAX_EVENTS_PER_SCAN = max(
+    MAX_EVENTS_PER_SCAN, int(os.environ.get("ANYAICAM_ANALYTICS_SYNC_CATCHUP_MAX_EVENTS_PER_SCAN", "150"))
+)
+
+# Same 5000-entry cap ANALYTICS_EVENTS_FILE itself already enforces
+# (see append_analytics_event() in main.py, and MAX_TRACKED_SYNCED_IDS's
+# own comment above) -- used here purely to count the TRUE pending
+# backlog size each scan (cheap: this file is small, structured JSON,
+# never more than 5000 rows), not to select which events to send.
+_PENDING_COUNT_CEILING = 5000
+
+# Exponential backoff, applied only when an entire scan's every real
+# send attempt failed -- the strongest signal available, without new
+# exception-type plumbing through _control_plane_post, that the cloud
+# is genuinely unreachable rather than one event being malformed.
+# Resets to the base SCAN_SECONDS the instant any event succeeds again.
+BACKOFF_MAX_MULTIPLIER = max(1, int(os.environ.get("ANYAICAM_ANALYTICS_SYNC_BACKOFF_MAX_MULTIPLIER", "8")))
+_consecutive_scan_failures = 0
+
 # Controlled-rollout scope: which camera_numbers this worker is allowed to
 # sync at all. Unset (the default, and every existing test's implicit
 # assumption) means "no restriction" -- this must never narrow existing
@@ -154,7 +183,20 @@ ANALYTICS_SYNC_NOTIFY_ENABLED = os.environ.get("ANYAICAM_ANALYTICS_SYNC_NOTIFY_E
 # deliberate decision.
 LPR_NOTIFY_ENABLED = os.environ.get("ANYAICAM_LPR_NOTIFY_ENABLED", "false").strip().lower() == "true"
 
-analytics_sync_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None, "last_summary": None}
+analytics_sync_state: dict = {
+    "worker_status": "disabled",
+    "last_scan_at": None,
+    "last_config_refresh_at": None,
+    "last_error": None,
+    "last_summary": None,
+    "pending_count": 0,
+    "catchup_mode": False,
+    # "unknown" until the first real scan completes -- distinct from
+    # "connected"/"syncing"/"offline" so a not-yet-started worker never
+    # falsely reports itself as either reachable or unreachable.
+    "connectivity": "unknown",
+    "consecutive_failures": 0,
+}
 
 _lock = threading.Lock()
 _camera_map: dict[int, dict] = {}  # camera_number -> {"camera_id":..., "site_id":...}, refreshed periodically
@@ -473,10 +515,14 @@ def _sync_pending_events() -> dict:
     event loop. Never raises for an individual event's failure; only a
     genuinely unexpected local bug would propagate, which the worker
     loop's own try/except still catches."""
+    all_pending = _pending_events(_PENDING_COUNT_CEILING)
+    pending_count = len(all_pending)
+    catchup_mode = pending_count > CATCHUP_THRESHOLD_EVENTS
+    effective_cap = CATCHUP_MAX_EVENTS_PER_SCAN if catchup_mode else MAX_EVENTS_PER_SCAN
     attempted = 0
     synced = 0
     failed = 0
-    for event, camera_id in _pending_events(MAX_EVENTS_PER_SCAN):
+    for event, camera_id in all_pending[:effective_cap]:
         attempted += 1
         payload = _build_payload(event)
         if not payload["local_event_id"] or not payload["event_type"] or not payload["event_timestamp"]:
@@ -497,10 +543,17 @@ def _sync_pending_events() -> dict:
         else:
             failed += 1
             logger.warning("analytics_sync.event_sync_failed event_id=%s camera_id=%s", payload["local_event_id"], camera_id)
-    return {"attempted": attempted, "synced": synced, "failed": failed}
+    return {
+        "attempted": attempted,
+        "synced": synced,
+        "failed": failed,
+        "pending_count": pending_count,
+        "catchup_mode": catchup_mode,
+    }
 
 
 async def analytics_sync_worker() -> None:
+    global _consecutive_scan_failures
     if RUNTIME_ROLE not in {"edge", "combined"} or not ANALYTICS_SYNC_ENABLED:
         analytics_sync_state["worker_status"] = "disabled"
         while True:
@@ -521,10 +574,24 @@ async def analytics_sync_worker() -> None:
             analytics_sync_state["last_scan_at"] = datetime.now().isoformat()
             analytics_sync_state["last_error"] = None
             analytics_sync_state["last_summary"] = summary
-            await asyncio.sleep(SCAN_SECONDS)
+            analytics_sync_state["pending_count"] = summary.get("pending_count", 0)
+            analytics_sync_state["catchup_mode"] = summary.get("catchup_mode", False)
+            if summary["attempted"] > 0 and summary["synced"] == 0:
+                _consecutive_scan_failures += 1
+                analytics_sync_state["connectivity"] = "offline"
+            else:
+                _consecutive_scan_failures = 0
+                analytics_sync_state["connectivity"] = "syncing" if summary.get("catchup_mode") else "connected"
+            analytics_sync_state["consecutive_failures"] = _consecutive_scan_failures
+            backoff_multiplier = min(BACKOFF_MAX_MULTIPLIER, 2 ** _consecutive_scan_failures) if _consecutive_scan_failures else 1
+            await asyncio.sleep(SCAN_SECONDS * backoff_multiplier)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             analytics_sync_state["last_error"] = str(error)
             logger.warning("analytics_sync.worker_iteration_failed error=%s", error)
-            await asyncio.sleep(SCAN_SECONDS)
+            _consecutive_scan_failures += 1
+            analytics_sync_state["connectivity"] = "offline"
+            analytics_sync_state["consecutive_failures"] = _consecutive_scan_failures
+            backoff_multiplier = min(BACKOFF_MAX_MULTIPLIER, 2 ** _consecutive_scan_failures)
+            await asyncio.sleep(SCAN_SECONDS * backoff_multiplier)

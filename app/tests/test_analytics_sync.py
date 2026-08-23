@@ -27,13 +27,18 @@ def _isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(asy, "ANALYTICS_EVENTS_FILE", tmp_path / "analytics_events.json")
     monkeypatch.setattr(asy, "SYNC_STATE_FILE", tmp_path / "state" / "analytics_sync_state.json")
     monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", asy.DEFAULT_MAX_EVENTS_PER_SCAN)
+    monkeypatch.setattr(asy, "CATCHUP_THRESHOLD_EVENTS", 100)
+    monkeypatch.setattr(asy, "CATCHUP_MAX_EVENTS_PER_SCAN", 150)
+    monkeypatch.setattr(asy, "BACKOFF_MAX_MULTIPLIER", 8)
     asy._synced_ids_cache = None
     asy._unknown_camera_logged.clear()
+    asy._consecutive_scan_failures = 0
     with asy._lock:
         asy._camera_map.clear()
     yield tmp_path
     asy._synced_ids_cache = None
     asy._unknown_camera_logged.clear()
+    asy._consecutive_scan_failures = 0
     with asy._lock:
         asy._camera_map.clear()
 
@@ -118,7 +123,9 @@ def test_successful_event_is_marked_synced(tmp_path, monkeypatch):
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 1
+    assert summary["failed"] == 0
     assert "evt-ok" in asy._load_synced_ids()
 
 
@@ -129,7 +136,9 @@ def test_duplicate_response_is_treated_as_success_not_a_failure(tmp_path, monkey
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 1
+    assert summary["failed"] == 0
     assert "evt-dup" in asy._load_synced_ids()
 
 
@@ -139,12 +148,16 @@ def test_failed_event_is_never_marked_synced_and_is_retried(tmp_path, monkeypatc
     monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: None)  # network failure / HTTP error
 
     first = asy._sync_pending_events()
-    assert first == {"attempted": 1, "synced": 0, "failed": 1}
+    assert first["attempted"] == 1
+    assert first["synced"] == 0
+    assert first["failed"] == 1
     assert "evt-fail" not in asy._load_synced_ids()
 
     # Next scan: still pending, attempted again -- not silently dropped.
     second = asy._sync_pending_events()
-    assert second == {"attempted": 1, "synced": 0, "failed": 1}
+    assert second["attempted"] == 1
+    assert second["synced"] == 0
+    assert second["failed"] == 1
 
 
 def test_one_failed_event_does_not_block_a_later_event_in_the_same_scan(tmp_path, monkeypatch):
@@ -163,7 +176,9 @@ def test_one_failed_event_does_not_block_a_later_event_in_the_same_scan(tmp_path
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 2, "synced": 1, "failed": 1}
+    assert summary["attempted"] == 2
+    assert summary["synced"] == 1
+    assert summary["failed"] == 1
     synced = asy._load_synced_ids()
     assert "evt-a" not in synced
     assert "evt-b" in synced
@@ -177,7 +192,9 @@ def test_malformed_local_event_is_not_marked_synced(tmp_path, monkeypatch):
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 0, "failed": 1}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 0
+    assert summary["failed"] == 1
     assert calls == []  # never even attempted a network call for unsendable data
     assert "evt-bad" not in asy._load_synced_ids()
 
@@ -190,7 +207,9 @@ def test_event_for_unrecognized_camera_is_left_pending_not_counted_against_cap(t
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 0, "synced": 0, "failed": 0}
+    assert summary["attempted"] == 0
+    assert summary["synced"] == 0
+    assert summary["failed"] == 0
     assert calls == []
     assert "evt-unknown" not in asy._load_synced_ids()
 
@@ -227,7 +246,9 @@ def test_cap_limits_events_attempted_per_scan(tmp_path, monkeypatch):
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 2, "synced": 2, "failed": 0}
+    assert summary["attempted"] == 2
+    assert summary["synced"] == 2
+    assert summary["failed"] == 0
     # The remaining three stay pending for a later scan.
     assert len(asy._load_synced_ids()) == 2
 
@@ -241,7 +262,9 @@ def test_leftover_events_beyond_the_cap_are_picked_up_on_a_later_scan(tmp_path, 
     asy._sync_pending_events()
     second = asy._sync_pending_events()
 
-    assert second == {"attempted": 1, "synced": 1, "failed": 0}
+    assert second["attempted"] == 1
+    assert second["synced"] == 1
+    assert second["failed"] == 0
     assert len(asy._load_synced_ids()) == 3
 
 
@@ -420,7 +443,9 @@ def test_camera_outside_the_scope_stays_pending_not_counted_against_cap(tmp_path
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 1
+    assert summary["failed"] == 0
     assert len(calls) == 1
     assert calls[0]["local_event_id"] == "evt-cam1"
     assert "evt-cam1" in asy._load_synced_ids()
@@ -435,7 +460,9 @@ def test_camera_in_scope_is_synced_normally(tmp_path, monkeypatch):
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 1
+    assert summary["failed"] == 0
     assert "evt-cam1" in asy._load_synced_ids()
 
 
@@ -446,11 +473,15 @@ def test_camera_left_pending_by_scope_is_picked_up_once_scope_widens(tmp_path, m
     monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
 
     first = asy._sync_pending_events()
-    assert first == {"attempted": 0, "synced": 0, "failed": 0}
+    assert first["attempted"] == 0
+    assert first["synced"] == 0
+    assert first["failed"] == 0
 
     monkeypatch.setattr(asy, "SYNC_CAMERA_SCOPE", frozenset({1, 2}))
     second = asy._sync_pending_events()
-    assert second == {"attempted": 1, "synced": 1, "failed": 0}
+    assert second["attempted"] == 1
+    assert second["synced"] == 1
+    assert second["failed"] == 0
     assert "evt-cam2" in asy._load_synced_ids()
 
 
@@ -544,7 +575,9 @@ def test_a_failed_notification_does_not_prevent_the_event_from_being_marked_sync
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 1
+    assert summary["failed"] == 0
     assert "evt-1" in asy._load_synced_ids()
 
 
@@ -675,7 +708,9 @@ def test_end_to_end_sync_sends_specific_class_to_analytics_and_generic_vehicle_t
 
     summary = asy._sync_pending_events()
 
-    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert summary["attempted"] == 1
+    assert summary["synced"] == 1
+    assert summary["failed"] == 0
     analytics_call = next(c for c in calls if c[0].startswith("/api/appliance/analytics"))
     notify_call = next(c for c in calls if c[0] == "/api/appliance/events")
     assert analytics_call[1]["event_type"] == vehicle_class
@@ -711,7 +746,9 @@ def test_an_already_synced_vehicle_event_is_never_resent_or_renotified_on_a_late
     monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(path) or {"status": "accepted"})
 
     first = asy._sync_pending_events()
-    assert first == {"attempted": 1, "synced": 1, "failed": 0}
+    assert first["attempted"] == 1
+    assert first["synced"] == 1
+    assert first["failed"] == 0
     assert calls == ["/api/appliance/analytics/cam-1/events", "/api/appliance/events"]
 
     calls.clear()
@@ -725,7 +762,9 @@ def test_an_already_synced_vehicle_event_is_never_resent_or_renotified_on_a_late
     # gets retried before a synced response is received (see the
     # _build_notification_payload docstring on why reusing local_event_id
     # as the notification route's own id makes that safe too).
-    assert second == {"attempted": 0, "synced": 0, "failed": 0}
+    assert second["attempted"] == 0
+    assert second["synced"] == 0
+    assert second["failed"] == 0
     assert calls == []
 
 
@@ -756,3 +795,141 @@ def test_a_notification_retried_after_a_transient_failure_reuses_the_same_id_for
 
     assert len(notify_calls) == 1  # exactly one attempt, never a silent retry-storm
     assert notify_calls[0]["events"][0]["event_type"] == "vehicle"
+
+
+# --------------------------------------------------------- backlog catch-up / adaptive batching
+
+def test_small_backlog_stays_in_steady_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 5)
+    monkeypatch.setattr(asy, "CATCHUP_THRESHOLD_EVENTS", 100)
+    monkeypatch.setattr(asy, "CATCHUP_MAX_EVENTS_PER_SCAN", 50)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event(f"evt-{i}") for i in range(10)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary["pending_count"] == 10
+    assert summary["catchup_mode"] is False
+    assert summary["attempted"] == 5  # MAX_EVENTS_PER_SCAN, not the catch-up cap
+
+
+def test_large_backlog_enters_catchup_mode_and_uses_the_larger_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 5)
+    monkeypatch.setattr(asy, "CATCHUP_THRESHOLD_EVENTS", 20)
+    monkeypatch.setattr(asy, "CATCHUP_MAX_EVENTS_PER_SCAN", 30)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event(f"evt-{i}") for i in range(50)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary["pending_count"] == 50
+    assert summary["catchup_mode"] is True
+    assert summary["attempted"] == 30  # CATCHUP_MAX_EVENTS_PER_SCAN, not the steady-state cap
+
+
+def test_catchup_mode_still_sends_one_bounded_batch_not_the_whole_backlog(tmp_path, monkeypatch):
+    # The explicit "bounded batching, never one huge burst" requirement:
+    # even deep in catch-up mode, one scan never exceeds its own cap.
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 5)
+    monkeypatch.setattr(asy, "CATCHUP_THRESHOLD_EVENTS", 10)
+    monkeypatch.setattr(asy, "CATCHUP_MAX_EVENTS_PER_SCAN", 25)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event(f"evt-{i}") for i in range(500)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary["pending_count"] == 500
+    assert summary["attempted"] == 25
+
+
+def test_backlog_drains_below_threshold_returns_to_steady_state_next_scan(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "MAX_EVENTS_PER_SCAN", 5)
+    monkeypatch.setattr(asy, "CATCHUP_THRESHOLD_EVENTS", 20)
+    monkeypatch.setattr(asy, "CATCHUP_MAX_EVENTS_PER_SCAN", 30)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event(f"evt-{i}") for i in range(25)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    first = asy._sync_pending_events()
+    assert first["catchup_mode"] is True
+    assert first["attempted"] == 25  # all 25 synced in one catch-up batch (under the 30 cap)
+
+    second = asy._sync_pending_events()
+    assert second["pending_count"] == 0
+    assert second["catchup_mode"] is False
+    assert second["attempted"] == 0
+
+
+def test_pending_count_reflects_camera_scope_the_same_way_selection_does(tmp_path, monkeypatch):
+    # A backlog for a camera outside SYNC_CAMERA_SCOPE must not count
+    # toward triggering catch-up mode -- it was never going to be sent.
+    monkeypatch.setattr(asy, "SYNC_CAMERA_SCOPE", frozenset({1}))
+    monkeypatch.setattr(asy, "CATCHUP_THRESHOLD_EVENTS", 5)
+    _register_camera(1)
+    _register_camera(2)
+    _write_local_events(
+        tmp_path,
+        [_event(f"cam1-{i}", camera=1) for i in range(2)] + [_event(f"cam2-{i}", camera=2) for i in range(20)],
+    )
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary["pending_count"] == 2
+    assert summary["catchup_mode"] is False
+
+
+# --------------------------------------------------------- connectivity / backoff (worker loop)
+
+@pytest.mark.anyio
+async def test_worker_backs_off_and_reports_offline_when_every_send_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_ENABLED", True)
+    monkeypatch.setattr(asy, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(asy, "SCAN_SECONDS", 0.02)
+    monkeypatch.setattr(asy, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(asy, "_refresh_camera_map", lambda: None)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event(f"evt-{i}") for i in range(3)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: None)  # every send fails
+
+    import asyncio
+    task = asyncio.ensure_future(asy.analytics_sync_worker())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert asy.analytics_sync_state["connectivity"] == "offline"
+    assert asy.analytics_sync_state["consecutive_failures"] >= 1
+    assert asy.analytics_sync_state["pending_count"] == 3  # nothing marked synced -- all still pending
+
+
+@pytest.mark.anyio
+async def test_worker_reports_connected_and_resets_backoff_once_sends_succeed(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_ENABLED", True)
+    monkeypatch.setattr(asy, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(asy, "SCAN_SECONDS", 0.02)
+    monkeypatch.setattr(asy, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(asy, "_refresh_camera_map", lambda: None)
+    _register_camera(1)
+    _write_local_events(tmp_path, [_event("evt-1")])
+    asy._consecutive_scan_failures = 3  # simulate a prior outage in progress
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    import asyncio
+    task = asyncio.ensure_future(asy.analytics_sync_worker())
+    await asyncio.sleep(0.06)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert asy.analytics_sync_state["connectivity"] == "connected"
+    assert asy.analytics_sync_state["consecutive_failures"] == 0
+    assert asy.analytics_sync_state["pending_count"] == 0
