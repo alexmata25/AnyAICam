@@ -38147,7 +38147,9 @@ async def people_counting_worker(camera_number: int) -> None:
                                 continue
                             cx = (detection["x"] + detection["width"] / 2) / frame_width
                             cy = (detection["y"] + detection["height"] / 2) / frame_height
-                            centroids.append({"x": cx, "y": cy})
+                            norm_w = detection["width"] / frame_width
+                            norm_h = detection["height"] / frame_height
+                            centroids.append({"x": cx, "y": cy, "w": norm_w, "h": norm_h})
                     if debug:
                         print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f})" for c in centroids))
                     if debug:
@@ -76599,6 +76601,51 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 
     return page_shell(label, "analytics", content, scripts)
+
+
+@app.get("/api/people-counting/active-line")
+def people_counting_active_line_api(camera: int = 1) -> dict:
+    """TEMPORARY, read-only diagnostic endpoint: what counting line (if
+    any) is actively configured for People Counting on this camera
+    right now, and whether the camera is currently entitled. Reads the
+    exact same two functions the real counting worker itself reads
+    (recording_uploader._camera_identity(), _load_people_counting_rule())
+    -- this reports the TRUE active state, not a separate guess at it.
+    Purely additive: never writes anything, never affects counting
+    behavior, safe to call at any time for any camera."""
+    identity = recording_uploader._camera_identity(camera)
+    entitled = bool(identity and identity.get("people_counting_enabled"))
+    rule = _load_people_counting_rule(camera)
+    line = None
+    if rule and len(rule.get("geometry", [])) >= 2:
+        p1, p2 = rule["geometry"][0], rule["geometry"][1]
+        line = {"x1": p1.get("x"), "y1": p1.get("y"), "x2": p2.get("x"), "y2": p2.get("y"), "direction": rule.get("direction", "both")}
+    return {"camera": camera, "entitled": entitled, "line": line, "rule_id": rule.get("id") if rule else None}
+
+
+@app.get("/people-counting-preview", response_class=HTMLResponse)
+def people_counting_preview_page() -> str:
+    """TEMPORARY, read-only diagnostic page: shows the live camera feed
+    with the currently-configured People Counting line drawn on top of
+    it (fetched from /api/people-counting/active-line, refreshed every
+    5s), so a test operator can see exactly where the counting boundary
+    is before staging a walk-test. This is a brand-new, standalone
+    route -- it does not modify analytics_rule_builder, the main live-
+    view page, or any camera's existing behavior; it only reads already-
+    configured state. Defaults to PEOPLE_COUNTING_DEBUG_CAMERA (Camera 1)
+    but the camera selector works for any camera so this stays useful
+    if that constant is ever changed."""
+    camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in range(1, CAMERA_COUNT + 1))
+    content = f"""<header class="topbar"><div><p class="eyebrow">People Counting diagnostic</p><h1>Counting line preview</h1></div></header><div class="mock-banner">Read-only preview -- shows the currently active People Counting line and entitlement for the selected camera. Does not edit or create a rule.</div><section class="rule-layout"><div class="panel"><div class="panel-head"><h2>Live preview</h2><label style="font-weight:normal">Camera <select id="pcp-camera">{camera_options}</select></label></div><div class="rule-stage"><video id="pcp-video" autoplay muted playsinline></video><canvas id="pcp-canvas" width="1280" height="720"></canvas></div></div><div class="panel"><h2>Status</h2><div id="pcp-status" class="health-detail">Loading…</div></div></section>"""
+    scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
+const camera=document.getElementById('pcp-camera'),video=document.getElementById('pcp-video'),canvas=document.getElementById('pcp-canvas'),context=canvas.getContext('2d'),status=document.getElementById('pcp-status');
+camera.value='{PEOPLE_COUNTING_DEBUG_CAMERA}';
+function connectPreview(){{const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.pcpHls)window.pcpHls.destroy();if(Hls.isSupported()){{window.pcpHls=new Hls();window.pcpHls.loadSource(source);window.pcpHls.attachMedia(video)}}else video.src=source}}
+function drawLine(line){{context.clearRect(0,0,canvas.width,canvas.height);if(!line)return;context.strokeStyle='#ff6b35';context.lineWidth=5;context.beginPath();context.moveTo(line.x1*canvas.width,line.y1*canvas.height);context.lineTo(line.x2*canvas.width,line.y2*canvas.height);context.stroke();[[line.x1,line.y1],[line.x2,line.y2]].forEach(p=>{{context.beginPath();context.arc(p[0]*canvas.width,p[1]*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}
+async function refresh(){{try{{const response=await fetch(`/api/people-counting/active-line?camera=${{camera.value}}`),data=await response.json();drawLine(data.line);status.textContent=data.line?`Camera ${{data.camera}} — entitled: ${{data.entitled}} — direction: ${{data.line.direction}} — rule ${{data.rule_id}}`:`Camera ${{data.camera}} — entitled: ${{data.entitled}} — no counting line configured`}}catch(error){{status.textContent='Preview temporarily unavailable'}}}}
+camera.addEventListener('change',()=>{{connectPreview();refresh()}});connectPreview();refresh();setInterval(refresh,5000);
+</script>"""
+    return page_shell("Counting line preview", "analytics", content, scripts)
 
 
 

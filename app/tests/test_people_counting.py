@@ -24,7 +24,7 @@ matching-distance boundary.
 
 import pytest
 
-from people_counting import CountingLine, CounterState, PeopleCounter, _dedupe_same_frame, _distance, _side_of_line
+from people_counting import CountingLine, CounterState, PeopleCounter, _box_of, _dedupe_same_frame, _distance, _iou, _side_of_line
 
 
 def vertical_line(direction: str = "both") -> CountingLine:
@@ -33,6 +33,14 @@ def vertical_line(direction: str = "both") -> CountingLine:
 
 def det(x: float, y: float = 0.5) -> dict:
     return {"x": x, "y": y}
+
+
+def det_box(x: float, y: float, w: float, h: float) -> dict:
+    """A detection carrying box size, for the box-aware matching tests
+    -- plain det() (no "w"/"h" keys) is what every earlier test in this
+    file uses, and must keep behaving identically (see
+    test_no_box_info_behaves_exactly_like_before_this_feature below)."""
+    return {"x": x, "y": y, "w": w, "h": h}
 
 
 # A standard, verified-safe left-to-right walk that crosses x=0.5
@@ -539,3 +547,205 @@ def test_two_people_moving_in_the_same_direction_close_together_never_get_double
     assert len(counter.tracks) == 2
     assert len(events) == 2
     assert counter.in_count == 2
+
+
+# ============================================================ 15. box-aware matching: IoU + scale consistency, on top of velocity
+
+
+def test_no_box_info_behaves_exactly_like_before_this_feature():
+    """The safe-baseline guarantee for THIS feature, mirroring the one
+    already proven for velocity: callers that never send "w"/"h" (every
+    test above this section) must see byte-identical behavior. Runs the
+    exact fast-jump velocity scenario from section 13 and confirms the
+    same outcome."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20)])
+    counter.update([det(0.35)])
+    events = counter.update([det(0.63)])
+    assert len(counter.tracks) == 1
+    assert len(events) == 1
+    assert counter.in_count == 1
+
+
+def test_fast_crossing_bridged_by_iou_when_raw_velocity_prediction_alone_would_still_fail():
+    """The core new mechanism: a jump SO large that even the velocity-
+    predicted position (section 13's fix) is still too far away to pass
+    the plain distance gate -- but the person's box is large enough
+    (a big, close subject -- exactly the 'perspective' case) that the
+    PREDICTED box and the ACTUAL detection box clearly overlap anyway.
+    Counterfactual proof included: both the plain velocity-only distance
+    AND the fixed max_match_distance are asserted to reject this jump
+    on their own, then the real IoU is computed and asserted to clear
+    MIN_IOU_FOR_MATCH, before checking that update() still preserves the
+    track and counts the crossing."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det_box(0.25, 0.5, 0.45, 0.45)])   # frame 1: track born, side +1
+    counter.update([det_box(0.35, 0.5, 0.46, 0.46)])   # frame 2: +0.10 step -- establishes velocity, still side +1
+
+    # Counterfactuals: prove the OLD signals alone would reject this jump.
+    predicted_x = 0.35 + (0.35 - 0.25)  # = 0.45, the velocity-only prediction from frame 13's mechanism
+    raw_velocity_residual = _distance(0.72, 0.5, predicted_x, 0.5)
+    assert raw_velocity_residual > counter.max_match_distance, (
+        f"test setup error: velocity-predicted residual ({raw_velocity_residual:.3f}) must still exceed "
+        f"max_match_distance ({counter.max_match_distance}) for this test to actually exercise the NEW box signal"
+    )
+    predicted_box = _box_of(predicted_x, 0.5, 0.46, 0.46)
+    actual_box = _box_of(0.72, 0.5, 0.47, 0.47)
+    real_iou = _iou(predicted_box, actual_box)
+    assert real_iou >= 0.15, f"test setup error: IoU ({real_iou:.3f}) must clear MIN_IOU_FOR_MATCH to rescue this match"
+
+    events = counter.update([det_box(0.72, 0.5, 0.47, 0.47)])  # frame 3: the big jump -- crosses to side -1
+
+    assert len(counter.tracks) == 1, "the SAME track must have been preserved via the box-overlap signal"
+    assert len(events) == 1, "the line was genuinely crossed (0.35 left of 0.5, 0.72 right) and must be counted"
+    assert counter.in_count == 1  # new_side < 0 -> "in", by this module's fixed convention
+
+
+def test_iou_gate_still_rejects_a_jump_with_no_real_box_overlap_not_an_unlimited_reach():
+    """The box signal must not become 'anything matches' either -- a
+    jump that is both far in raw distance AND has essentially zero box
+    overlap (a small, distant-looking box landing far from the
+    prediction) must still fail to match."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det_box(0.20, 0.5, 0.08, 0.08)])
+    counter.update([det_box(0.30, 0.5, 0.08, 0.08)])
+    events = counter.update([det_box(0.90, 0.9, 0.08, 0.08)])  # far away in both x and y, small box -- no overlap possible
+    assert len(counter.tracks) == 2, "no rescue -- distance fails and there is no meaningful box overlap"
+    assert counter.out_count == 0 and counter.in_count == 0
+
+
+def test_perspective_box_growth_while_approaching_the_camera_does_not_fragment_the_track():
+    """A person walking TOWARD the camera has a box that grows steadily
+    frame to frame -- the scale-consistency penalty must tolerate this
+    gradual, expected growth (not just identical-size matches) and keep
+    the same track alive through it, then still correctly count the
+    eventual crossing."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    sequence = [
+        (0.20, 0.10, 0.10),
+        (0.28, 0.14, 0.14),
+        (0.36, 0.19, 0.19),
+        (0.44, 0.25, 0.25),
+        (0.56, 0.32, 0.32),  # crosses the line while still growing
+    ]
+    all_events = []
+    for x, w, h in sequence:
+        all_events.extend(counter.update([det_box(x, 0.5, w, h)]))
+    assert len(counter.tracks) == 1, "one continuous track throughout the approach, despite the box roughly tripling in size"
+    assert len(all_events) == 1
+    assert counter.in_count == 1
+
+
+def test_perspective_box_shrink_while_leaving_the_camera_does_not_fragment_the_track():
+    """The mirror case: a person walking AWAY has a shrinking box --
+    equally gradual, equally must not be penalized into a fragmented
+    track."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    sequence = [
+        (0.20, 0.32, 0.32),
+        (0.28, 0.25, 0.25),
+        (0.36, 0.19, 0.19),
+        (0.44, 0.14, 0.14),
+        (0.56, 0.09, 0.09),
+    ]
+    for x, w, h in sequence:
+        counter.update([det_box(x, 0.5, w, h)])
+    assert len(counter.tracks) == 1
+    assert counter.in_count == 1
+
+
+def test_intermittent_missed_detection_preserves_box_continuity_across_the_gap():
+    """Box info must survive a missed-frame gap exactly like position
+    does -- a track's last-known size is still what the next real
+    re-match is compared against, not reset to zero."""
+    line = vertical_line()
+    counter = PeopleCounter(line, max_missed_frames=3)
+    counter.update([det_box(0.20, 0.5, 0.20, 0.20)])
+    counter.update([det_box(0.35, 0.5, 0.21, 0.21)])  # velocity established, side +1
+    counter.update([])  # missed -- occlusion mid-crossing
+    events = counter.update([det_box(0.63, 0.5, 0.22, 0.22)])  # reappears on the far side, consistent size
+    assert len(counter.tracks) == 1
+    assert len(events) == 1
+    assert counter.in_count == 1  # new_side < 0 -> "in", by this module's fixed convention
+
+
+# ============================================================ 16. two nearby people: no identity swaps or accidental merges (box-aware)
+
+
+def test_two_nearby_people_same_direction_different_sizes_never_swap_or_merge():
+    """Two people close together in y (0.45 / 0.55 -- only 0.10 apart)
+    moving the SAME direction, with CLEARLY different, stable box sizes
+    (a closer/larger person and a farther/smaller person) -- proves the
+    scale signal keeps their identities straight even when they are
+    close enough in y that position alone is a weaker disambiguator
+    than in the earlier, non-box two-people tests."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det_box(0.20, 0.45, 0.30, 0.30), det_box(0.22, 0.55, 0.10, 0.10)])
+    counter.update([det_box(0.32, 0.45, 0.30, 0.30), det_box(0.34, 0.55, 0.10, 0.10)])
+    events = counter.update([det_box(0.56, 0.45, 0.30, 0.30), det_box(0.58, 0.55, 0.10, 0.10)])
+    assert len(counter.tracks) == 2, "still two distinct people, two tracks"
+    assert len(events) == 2, "both crossings counted"
+    assert counter.in_count == 2
+    # Identity check: each track's OWN box size stayed consistent with
+    # the person it actually belongs to -- a swap would show up as one
+    # track suddenly carrying the other's size.
+    sizes = sorted(t.w for t in counter.tracks.values())
+    assert sizes == pytest.approx([0.10, 0.30], abs=0.01)
+
+
+def test_two_nearby_people_opposite_directions_different_sizes_never_swap():
+    """Two people close together in y, moving TOWARD each other and
+    crossing near the same moment -- the classic swap-risk scenario --
+    with different, stable box sizes making a swap immediately
+    detectable if it happened."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    # A: larger box, moving left->right (y=0.45). B: smaller box, moving right->left (y=0.55).
+    counter.update([det_box(0.20, 0.45, 0.28, 0.28), det_box(0.80, 0.55, 0.09, 0.09)])
+    counter.update([det_box(0.32, 0.45, 0.28, 0.28), det_box(0.68, 0.55, 0.09, 0.09)])
+    a_id_before = min(counter.tracks, key=lambda tid: abs(counter.tracks[tid].cy - 0.45))
+    b_id_before = min(counter.tracks, key=lambda tid: abs(counter.tracks[tid].cy - 0.55))
+    assert a_id_before != b_id_before
+
+    events = counter.update([det_box(0.56, 0.45, 0.28, 0.28), det_box(0.44, 0.55, 0.09, 0.09)])
+
+    assert len(counter.tracks) == 2, "no merge -- still two distinct people"
+    assert len(events) == 2
+    assert counter.in_count == 1
+    assert counter.out_count == 1
+    # Identity check: track A (near y=0.45) must still be the LARGE-box
+    # track, and track B (near y=0.55) must still be the SMALL-box one
+    # -- proves no swap happened even though both crossed at the same
+    # moment on nearby paths.
+    track_a_after = counter.tracks[a_id_before]
+    track_b_after = counter.tracks[b_id_before]
+    assert track_a_after.w == pytest.approx(0.28, abs=0.01)
+    assert track_b_after.w == pytest.approx(0.09, abs=0.01)
+
+
+def test_two_nearby_people_never_merge_into_a_single_track_across_a_close_pass():
+    """A dedicated stress test for the 'no accidental merge' half of the
+    safeguard: two people with stable, distinct box sizes pass close by
+    each other (their y-separation narrows to 0.06 at the closest
+    point, tighter than in the tests above) and then separate again --
+    at no point during the sequence may the tracker collapse them into
+    one track."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    frames = [
+        (det_box(0.20, 0.40, 0.28, 0.28), det_box(0.22, 0.62, 0.09, 0.09)),
+        (det_box(0.32, 0.43, 0.28, 0.28), det_box(0.34, 0.58, 0.09, 0.09)),
+        (det_box(0.44, 0.46, 0.28, 0.28), det_box(0.46, 0.52, 0.09, 0.09)),  # closest approach: 0.06 apart in y
+        (det_box(0.56, 0.43, 0.28, 0.28), det_box(0.58, 0.58, 0.09, 0.09)),
+    ]
+    for frame in frames:
+        counter.update(list(frame))
+        assert len(counter.tracks) == 2, "must never collapse to one track, even at closest approach"
+    sizes = sorted(t.w for t in counter.tracks.values())
+    assert sizes == pytest.approx([0.09, 0.28], abs=0.01)

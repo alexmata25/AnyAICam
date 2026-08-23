@@ -31,6 +31,7 @@ and what this module consumes.
 """
 
 import itertools
+import math
 from dataclasses import dataclass
 
 
@@ -104,6 +105,68 @@ def _predicted_position(track: "Track") -> tuple[float, float]:
     return track.cx + (track.cx - track.prev_cx), track.cy + (track.cy - track.prev_cy)
 
 
+def _box_of(cx: float, cy: float, w: float, h: float) -> tuple[float, float, float, float]:
+    """A (x1, y1, x2, y2) box centered on (cx, cy) with the given
+    normalized width/height. w/h of 0 (no box info available for this
+    detection/track) produces a zero-area box -- _iou() below then
+    always returns 0.0 for it, which is exactly the correct fallback:
+    no box signal means the match decision falls back to pure centroid
+    distance, unchanged from before this feature existed."""
+    return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+
+def _iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float, float, float]) -> float:
+    """Standard intersection-over-union of two (x1, y1, x2, y2) boxes in
+    the same normalized 0.0-1.0 frame space detections/tracks already
+    use. Returns 0.0 for non-overlapping or degenerate (zero-area)
+    boxes -- never raises, never divides by zero."""
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - intersection
+    if union <= 0.0:
+        return 0.0
+    return intersection / union
+
+
+def _scale_penalty(area_a: float, area_b: float) -> float:
+    """How inconsistent two box areas are, symmetric in both directions
+    (a candidate half the size or double the size of the track's last
+    known box is penalized equally). 0.0 when identical or when either
+    area is unavailable (0) -- again, no box info means no penalty,
+    the pure-centroid fallback is preserved exactly."""
+    if area_a <= 0.0 or area_b <= 0.0:
+        return 0.0
+    ratio = area_a / area_b
+    if ratio <= 0.0:
+        return 0.0
+    return abs(math.log(ratio))
+
+
+# Matching-cost weighting: NEW additive signals on top of the existing,
+# unchanged centroid-distance gate (max_match_distance itself is never
+# widened by these -- see PeopleCounter.update()'s own docstring for
+# why that's a deliberate, explicit constraint). Kept as small, fixed
+# module constants rather than PeopleCounter constructor parameters for
+# now -- these are new, not yet field-tuned; making them adjustable
+# per-counter can follow once real walk-test data says they should be.
+SCALE_PENALTY_WEIGHT = 0.15
+IOU_BONUS_WEIGHT = 0.35
+# A candidate detection may match a track EITHER because its centroid
+# lands within max_match_distance of the predicted position (the
+# original, unchanged rule) OR because its box clearly overlaps the
+# predicted box even if the raw centroid distance is larger -- real,
+# meaningful overlap (not a token sliver) is required for this second
+# path, which is exactly what lets a bigger, closer (larger-box) person
+# bridge a bigger normalized-distance jump without max_match_distance
+# itself ever being widened for everyone.
+MIN_IOU_FOR_MATCH = 0.15
+
+
 def _dedupe_same_frame(detections: list[dict], merge_distance: float) -> list[dict]:
     """Collapses near-duplicate detections within a SINGLE frame (two
     boxes close enough together to plausibly be the same person
@@ -138,6 +201,15 @@ class Track:
     # part of the counting decision itself).
     prev_cx: float | None = None
     prev_cy: float | None = None
+    # w/h: this track's most recently observed box size (normalized,
+    # same units as cx/cy). 0.0 (the default) means "no box info seen
+    # yet for this track" -- every box-based signal (_iou, scale
+    # consistency) treats a zero-area box as "unavailable" and
+    # contributes nothing, so a track that only ever received plain
+    # {"x","y"} detections (no "w"/"h" keys) behaves EXACTLY as before
+    # this feature existed.
+    w: float = 0.0
+    h: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -257,45 +329,80 @@ class PeopleCounter:
         seam for diagnosing a real-world walk-test, not an algorithm
         change.
 
-        Matching is velocity-aware: a track with at least two prior real
-        observations predicts its next position by extrapolating its
-        most recent per-step movement (`cx + (cx - prev_cx)`), and
-        candidate detections are matched against THAT predicted point
-        rather than the track's raw last-known position. `max_match_
-        distance` itself is deliberately UNCHANGED -- this is the
-        smallest practical change: a fast-but-steady walker's real
-        frame-to-frame displacement can exceed max_match_distance from
-        their last raw position while still landing within max_match_
-        distance of where their established trajectory predicts they'll
-        be, which is exactly the real walk-test failure this fixes. A
-        brand-new track (no established velocity yet, prev_cx is None)
-        predicts using its own current position -- i.e. zero assumed
-        velocity -- which is IDENTICAL to the original fixed-distance-
-        from-last-position behavior. That's the "safe baseline" this
-        change is built on top of, not a parallel/alternate mode."""
+        Matching is velocity-aware AND box-aware. A track with at least
+        two prior real observations predicts its next CENTER position by
+        extrapolating its most recent per-step movement (`cx + (cx -
+        prev_cx)`), exactly as before. On top of that unchanged center-
+        distance signal, when box width/height are present on both the
+        detection (`det["w"]`/`det["h"]`) and the track (from its own
+        last real observation), two more signals are combined into the
+        match cost: IoU between the track's PREDICTED box (predicted
+        center + its last known size) and the candidate detection's box,
+        and a symmetric box-AREA-consistency penalty (how different the
+        candidate's size is from the track's last known size). Neither
+        `max_match_distance` NOR the underlying velocity-prediction math
+        is changed by any of this -- see the module-level SCALE_PENALTY_
+        WEIGHT/IOU_BONUS_WEIGHT/MIN_IOU_FOR_MATCH constants for exactly
+        how these NEW signals are weighted, all additive on top of the
+        existing, unchanged gate.
+
+        Acceptance gate (whether a detection-track pair may be matched
+        at all): `center_distance <= max_match_distance` (the original,
+        unwidened rule) **OR** `iou >= MIN_IOU_FOR_MATCH` (a real,
+        meaningful box overlap, not a token sliver) -- a big, close/
+        large-boxed person can bridge a bigger normalized-distance jump
+        purely because their predicted and actual boxes still clearly
+        overlap, without max_match_distance itself ever being loosened
+        for every other, smaller/farther person. Detections or tracks
+        with no box info (`w`/`h` missing or 0) always produce IoU=0.0
+        and scale-penalty=0.0, so a pure-centroid caller (any of this
+        module's earlier tests, none of which pass "w"/"h") sees
+        IDENTICAL behavior to before this feature existed.
+
+        Assignment itself is GLOBAL greedy, not per-detection-in-list-
+        order: every detection-track pair that passes the gate is
+        scored, then pairs are claimed lowest-cost-first across the
+        WHOLE frame (a claimed detection or track is removed from
+        further consideration). This -- not just the richer cost
+        function -- is what actually prevents two nearby people from
+        being able to steal each other's track purely because of which
+        order they happened to appear in the detections list."""
         self.frame_index += 1
         events: list[CrossingEvent] = []
         debug_entries: list[dict] = []
 
         deduped = _dedupe_same_frame(detections, self.dedupe_distance)
 
-        # Greedy nearest-neighbor matching: for each detection, find the
-        # closest still-unclaimed existing track's PREDICTED position,
-        # within max_match_distance (unchanged tolerance -- see the
-        # docstring above).
-        unmatched_track_ids = set(self.tracks)
-        assignment: dict[int, int] = {}  # detection index -> track id
+        # Score every (detection, track) pair that passes the gate,
+        # then assign globally by lowest cost first -- see the
+        # docstring above for exactly what each signal contributes and
+        # why this is safe for callers with no box info at all.
+        candidates: list[tuple[float, int, int]] = []  # (cost, detection_index, track_id)
         for i, det in enumerate(deduped):
-            best_id, best_dist = None, None
-            for tid in unmatched_track_ids:
-                t = self.tracks[tid]
+            det_w, det_h = det.get("w", 0.0), det.get("h", 0.0)
+            det_area = det_w * det_h
+            det_box = _box_of(det["x"], det["y"], det_w, det_h)
+            for tid, t in self.tracks.items():
                 predicted_x, predicted_y = _predicted_position(t)
                 dist = _distance(det["x"], det["y"], predicted_x, predicted_y)
-                if dist <= self.max_match_distance and (best_dist is None or dist < best_dist):
-                    best_id, best_dist = tid, dist
-            if best_id is not None:
-                assignment[i] = best_id
-                unmatched_track_ids.discard(best_id)
+                predicted_box = _box_of(predicted_x, predicted_y, t.w, t.h)
+                iou = _iou(predicted_box, det_box)
+                if dist > self.max_match_distance and iou < MIN_IOU_FOR_MATCH:
+                    continue  # neither signal accepts this pair
+                scale_pen = _scale_penalty(det_area, t.w * t.h)
+                cost = dist + SCALE_PENALTY_WEIGHT * scale_pen - IOU_BONUS_WEIGHT * iou
+                candidates.append((cost, i, tid))
+        candidates.sort(key=lambda c: c[0])
+
+        assignment: dict[int, int] = {}  # detection index -> track id
+        claimed_tracks: set[int] = set()
+        claimed_dets: set[int] = set()
+        for cost, i, tid in candidates:
+            if i in claimed_dets or tid in claimed_tracks:
+                continue
+            assignment[i] = tid
+            claimed_dets.add(i)
+            claimed_tracks.add(tid)
 
         matched_ids: set[int] = set()
         for i, det in enumerate(deduped):
@@ -359,6 +466,13 @@ class PeopleCounter:
                 # derived from the two most recent real observations.
                 track.prev_cx, track.prev_cy = track.cx, track.cy
                 track.cx, track.cy = x, y
+                # Only overwrite the track's known box size when this
+                # detection actually carries one -- a caller that never
+                # sends "w"/"h" must never have a track's size silently
+                # decay to 0 (which would poison future scale-penalty/
+                # IoU comparisons for no reason).
+                if "w" in det and "h" in det:
+                    track.w, track.h = det["w"], det["h"]
                 track.side = new_side if new_side != 0 else prev_side
                 track.last_seen_frame = self.frame_index
                 track.missed_frames = 0
@@ -366,7 +480,11 @@ class PeopleCounter:
             else:
                 tid = next(self._next_id)
                 initial_side = _side_of_line(self.line, x, y)  # no previous side to buffer against yet
-                self.tracks[tid] = Track(track_id=tid, cx=x, cy=y, last_seen_frame=self.frame_index, side=initial_side if initial_side != 0 else None)
+                self.tracks[tid] = Track(
+                    track_id=tid, cx=x, cy=y, last_seen_frame=self.frame_index,
+                    side=initial_side if initial_side != 0 else None,
+                    w=det.get("w", 0.0), h=det.get("h", 0.0),
+                )
                 matched_ids.add(tid)
                 if debug:
                     debug_entries.append({
