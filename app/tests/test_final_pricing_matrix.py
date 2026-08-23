@@ -1,18 +1,33 @@
 """Final pricing matrix milestone: regression coverage for the approved
-Local Recording / Motion Cloud / Continuous Cloud pricing applied to
-production this session.
+Local Recording / Motion Cloud / Continuous Cloud RETAIL pricing
+applied to production earlier this session -- the currently deployed
+pricing state and rollback point.
+
+IMPORTANT -- commercial model note: this file covers the deployed
+*retail* prices only (what calculate_quote() returns, what's shown as
+the customer-facing/example price, and how those numbers behave under
+a pricing change). It deliberately no longer contains any 60/40
+revenue-split or company-margin-on-retail assertions -- the commercial
+model moved to AnyAiCam Base Price + Partner Markup, covered by
+base_price_pricing.py and tests/test_base_price_pricing.py instead.
+Nothing about the deployed retail prices themselves changed when the
+commercial model changed; only the assumption of how they'd be split
+did, which is why those specific tests were removed rather than kept
+and silently wrong.
 
 Covers, per the explicit approved scope:
   1. All 24 Motion/Continuous plan prices (real calculate_quote()).
   2. Local Recording prices (pure model constants -- see the module
      docstring note below on why these aren't a real code path yet).
-  3. 60/40 split math for every plan.
-  4. Company net-after-AWS calculations and >=20% margin for every plan.
-  5. Partner quote generation (calculate_partner_quote()) -- including
-     the pre-existing, confirmed-not-a-bug 409 gap on 21/24 cells.
-  6. Customer quote generation (calculate_quote()) full response shape.
-  7. Existing quote snapshot immutability after a pricing change.
-  8. Ordering: Local <= Motion Cloud <= Continuous Cloud, every cell.
+  3. (removed) 60/40 split math -- see the note above this file's
+     AWS_COST_* constants for where this coverage moved.
+  4. Partner quote generation (calculate_partner_quote()) -- including
+     the pre-existing, confirmed-not-a-bug 409 gap on 21/24 cells, now
+     understood as evidence for why the commercial model is being
+     replaced rather than something to fix in place.
+  5. Customer quote generation (calculate_quote()) full response shape.
+  6. Existing quote snapshot immutability after a pricing change.
+  7. Ordering: Local <= Motion Cloud <= Continuous Cloud, every cell.
 
 IMPORTANT -- Local Recording has no code path in this codebase today.
 There is no 'local' key anywhere in pricing_config.py's plans schema,
@@ -31,7 +46,6 @@ override_target() before that import.
 """
 
 import json
-import math
 
 import pytest
 
@@ -74,8 +88,6 @@ AWS_COST_CONTINUOUS = {
 }
 AWS_COST_LOCAL = {"2mp": 0.505, "4mp": 0.772, "8mp": 1.251}
 
-MIN_MARGIN_PERCENT = 20.0
-
 
 def _resolutions():
     return ("2mp", "4mp", "8mp")
@@ -96,7 +108,7 @@ def db_path(tmp_path):
 def _live_pricing_config():
     """The real, currently-applied production pricing (as deployed
     this session) -- not a synthetic fixture. Every test in sections
-    1, 3, 4, 5, 6, 8 exercises this exact data."""
+    1, 4, 5, 6, 7 exercises this exact data."""
     return pricing_config.load_pricing()
 
 
@@ -118,72 +130,29 @@ def test_local_recording_price_matches_approved_working_value(resolution, expect
     assert LOCAL_RECORDING[resolution] == expected
 
 
-# ============================================================ 3. 60/40 split math, every plan
-
-
-def _split(retail):
-    partner_40 = round(retail * 0.40, 2)
-    company_60 = round(retail * 0.60, 2)
-    return partner_40, company_60
-
-
-@pytest.mark.parametrize("resolution", _resolutions())
-@pytest.mark.parametrize("mode", ("motion", "continuous"))
-@pytest.mark.parametrize("retention", _retentions())
-def test_sixty_forty_split_sums_to_full_retail(resolution, mode, retention):
-    retail = (MOTION_CLOUD if mode == "motion" else CONTINUOUS_CLOUD)[resolution][retention]
-    partner_40, company_60 = _split(retail)
-    assert math.isclose(partner_40 + company_60, retail, abs_tol=0.01)
-    assert math.isclose(partner_40, retail * 0.40, abs_tol=0.01)
-    assert math.isclose(company_60, retail * 0.60, abs_tol=0.01)
-
-
-@pytest.mark.parametrize("resolution", _resolutions())
-def test_local_recording_sixty_forty_split(resolution):
-    retail = LOCAL_RECORDING[resolution]
-    partner_40, company_60 = _split(retail)
-    assert math.isclose(partner_40 + company_60, retail, abs_tol=0.01)
-
-
-# ============================================================ 4. Company net-after-AWS and >=20% margin, every plan
-
-
-@pytest.mark.parametrize("resolution", _resolutions())
-@pytest.mark.parametrize("retention", _retentions())
-def test_motion_cloud_net_after_aws_and_margin(resolution, retention):
-    retail = MOTION_CLOUD[resolution][retention]
-    aws_cost = AWS_COST_MOTION[resolution][retention]
-    _, company_60 = _split(retail)
-    net_after_aws = company_60 - aws_cost
-    margin_percent = net_after_aws / retail * 100
-    assert net_after_aws > 0
-    assert margin_percent >= MIN_MARGIN_PERCENT
-
-
-@pytest.mark.parametrize("resolution", _resolutions())
-@pytest.mark.parametrize("retention", _retentions())
-def test_continuous_cloud_net_after_aws_and_margin(resolution, retention):
-    retail = CONTINUOUS_CLOUD[resolution][retention]
-    aws_cost = AWS_COST_CONTINUOUS[resolution][retention]
-    _, company_60 = _split(retail)
-    net_after_aws = company_60 - aws_cost
-    margin_percent = net_after_aws / retail * 100
-    assert net_after_aws > 0
-    assert margin_percent >= MIN_MARGIN_PERCENT, f"{resolution} {retention}d margin {margin_percent:.2f}% below {MIN_MARGIN_PERCENT}% floor"
-
-
-@pytest.mark.parametrize("resolution", _resolutions())
-def test_local_recording_net_after_aws_and_margin(resolution):
-    retail = LOCAL_RECORDING[resolution]
-    aws_cost = AWS_COST_LOCAL[resolution]
-    _, company_60 = _split(retail)
-    net_after_aws = company_60 - aws_cost
-    margin_percent = net_after_aws / retail * 100
-    assert margin_percent >= MIN_MARGIN_PERCENT
+# ============================================================ 3. (removed) 60/40 split math and margin-on-retail tests
+#
+# Removed per explicit instruction: the commercial model moved from a
+# 60/40 revenue split to AnyAiCam Base Price + Partner Markup (see
+# base_price_pricing.py and its own test suite,
+# tests/test_base_price_pricing.py, for the new model's full
+# coverage -- partner-cannot-undercut-base, partner-earnings math,
+# AnyAiCam-owed invariance, per-plan base prices, etc.).
+#
+# The AWS_COST_MOTION/AWS_COST_CONTINUOUS/AWS_COST_LOCAL constants
+# above are deliberately KEPT, not deleted, even though no test in
+# this file consumes them directly anymore -- they are the real,
+# measured AWS-cost research this session produced (Motion Cloud at
+# the real 0.861% busiest-camera upload fraction; Continuous at 100%;
+# Local Recording's real alert-media model), and they are exactly what
+# base_price_pricing.py's own base-price tables were derived from.
+# Preserving them here keeps the research traceable to its own
+# original derivation, alongside the still-deployed retail prices
+# they were checked against.
     assert margin_percent >= 45.0  # Local Recording runs far above the floor (real ~48-50%) -- a regression toward the bare 20% floor here would itself be a real finding
 
 
-# ============================================================ 5. Partner quote generation -- including the confirmed pre-existing 409 gap
+# ============================================================ 4. Partner quote generation -- including the confirmed pre-existing 409 gap
 
 
 PARTNER_CONFIGURED_CELLS = {("2mp", "motion", "2"), ("2mp", "motion", "30"), ("2mp", "continuous", "2")}
@@ -213,7 +182,7 @@ def test_partner_quote_generation_matches_known_configured_state(resolution, mod
             pricing_config.calculate_partner_quote(selection, config)
 
 
-# ============================================================ 6. Customer quote generation -- full response shape
+# ============================================================ 5. Customer quote generation -- full response shape
 
 
 @pytest.mark.parametrize("resolution", _resolutions())
@@ -233,7 +202,7 @@ def test_customer_quote_full_response_shape(resolution, mode, retention):
     assert quote["annual_total"] < quote["monthly_total"] * 12  # annual discount actually applied
 
 
-# ============================================================ 7. Existing quote snapshot immutability after a pricing change
+# ============================================================ 6. Existing quote snapshot immutability after a pricing change
 
 
 def _seed_customer_and_quote(db, customer_id, old_price):
@@ -295,7 +264,7 @@ def test_existing_quote_snapshot_is_unchanged_by_a_later_pricing_change(db_path)
     assert after_plan["retail_monthly"] == round(old_price * 4, 2)
 
 
-# ============================================================ 8. Ordering: Local <= Motion Cloud <= Continuous Cloud, every cell
+# ============================================================ 7. Ordering: Local <= Motion Cloud <= Continuous Cloud, every cell
 
 
 @pytest.mark.parametrize("resolution", _resolutions())
