@@ -150,18 +150,6 @@ def register_customer_platform_routes(
     record_audit: Callable,
     is_master_admin: Callable,
 ):
-    @app.get("/customer-account", response_class=HTMLResponse)
-    def customer_account(request: Request):
-        """Several customer-facing pages (Playback's "Account" link,
-        /customer-live's header link and its no-cameras fallback) already
-        link or redirect here, on the assumption this page exists. It
-        didn't -- this closes that gap by pointing to the one page that
-        already serves as the customer's account/setup hub
-        (/customer-portal: cameras, camera analytics and alerts,
-        playback, subscription, install app), rather than building a
-        second hub with duplicate content."""
-        return RedirectResponse("/customer-portal", status_code=303)
-
     @app.get("/customer-portal", response_class=HTMLResponse)
     def customer_portal(request: Request):
         user = _portal_customer_user(request)
