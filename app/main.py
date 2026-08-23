@@ -4465,6 +4465,14 @@ class EventSettingsModel(BaseModel):
 
 
     zones: list[MotionZoneModel] = Field(default_factory=lambda: [MotionZoneModel()])
+    # Optional per-camera overrides for the two global motion
+    # thresholds (ANYAICAM_MOTION_CHANGED_RATIO_THRESHOLD/
+    # ANYAICAM_MOTION_PIXEL_DIFFERENCE_THRESHOLD). None (the default)
+    # means "use the global default" -- unset for every camera except
+    # one being deliberately tuned, so this never silently changes
+    # behavior for a camera nobody has touched.
+    changed_ratio_threshold: float | None = Field(default=None, gt=0, le=1)
+    pixel_difference_threshold: int | None = Field(default=None, ge=1, le=255)
 
 
 
@@ -35192,7 +35200,11 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        if difference >= MOTION_PIXEL_DIFFERENCE_THRESHOLD:
+                        if difference >= (
+                            settings.pixel_difference_threshold
+                            if settings.pixel_difference_threshold is not None
+                            else MOTION_PIXEL_DIFFERENCE_THRESHOLD
+                        ):
 
 
 
@@ -35255,7 +35267,11 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        motion_score >= effective_threshold and changed_ratio >= MOTION_CHANGED_RATIO_THRESHOLD
+                        motion_score >= effective_threshold and changed_ratio >= (
+                            settings.changed_ratio_threshold
+                            if settings.changed_ratio_threshold is not None
+                            else MOTION_CHANGED_RATIO_THRESHOLD
+                        )
 
 
 
