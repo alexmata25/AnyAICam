@@ -92,6 +92,18 @@ def _distance(ax: float, ay: float, bx: float, by: float) -> float:
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
+def _predicted_position(track: "Track") -> tuple[float, float]:
+    """Where this track is expected to be THIS frame, extrapolated
+    linearly from its last real step (cx - prev_cx, cy - prev_cy). A
+    track with fewer than two real observations (prev_cx is still None)
+    has no established velocity -- predicts its own current position,
+    i.e. zero assumed movement, which reproduces the original fixed-
+    distance-from-last-position behavior exactly for that case."""
+    if track.prev_cx is None or track.prev_cy is None:
+        return track.cx, track.cy
+    return track.cx + (track.cx - track.prev_cx), track.cy + (track.cy - track.prev_cy)
+
+
 def _dedupe_same_frame(detections: list[dict], merge_distance: float) -> list[dict]:
     """Collapses near-duplicate detections within a SINGLE frame (two
     boxes close enough together to plausibly be the same person
@@ -118,6 +130,14 @@ class Track:
     side: int | None  # None until first classified off the line (0 = exactly on it)
     missed_frames: int = 0
     last_crossed_frame: int | None = None
+    # prev_cx/prev_cy: this track's position ONE real match before its
+    # current (cx, cy) -- None until a track has been matched at least
+    # twice. Used only to derive a simple per-step velocity estimate for
+    # predictive matching (see PeopleCounter.update()'s docstring) --
+    # never used for anything else (not exposed in crossing events, not
+    # part of the counting decision itself).
+    prev_cx: float | None = None
+    prev_cy: float | None = None
 
 
 @dataclass(frozen=True)
@@ -235,7 +255,24 @@ class PeopleCounter:
         debug entries are appended alongside the existing logic, never
         substituted for it). This is a pure, additive observability
         seam for diagnosing a real-world walk-test, not an algorithm
-        change."""
+        change.
+
+        Matching is velocity-aware: a track with at least two prior real
+        observations predicts its next position by extrapolating its
+        most recent per-step movement (`cx + (cx - prev_cx)`), and
+        candidate detections are matched against THAT predicted point
+        rather than the track's raw last-known position. `max_match_
+        distance` itself is deliberately UNCHANGED -- this is the
+        smallest practical change: a fast-but-steady walker's real
+        frame-to-frame displacement can exceed max_match_distance from
+        their last raw position while still landing within max_match_
+        distance of where their established trajectory predicts they'll
+        be, which is exactly the real walk-test failure this fixes. A
+        brand-new track (no established velocity yet, prev_cx is None)
+        predicts using its own current position -- i.e. zero assumed
+        velocity -- which is IDENTICAL to the original fixed-distance-
+        from-last-position behavior. That's the "safe baseline" this
+        change is built on top of, not a parallel/alternate mode."""
         self.frame_index += 1
         events: list[CrossingEvent] = []
         debug_entries: list[dict] = []
@@ -243,14 +280,17 @@ class PeopleCounter:
         deduped = _dedupe_same_frame(detections, self.dedupe_distance)
 
         # Greedy nearest-neighbor matching: for each detection, find the
-        # closest still-unclaimed existing track within max_match_distance.
+        # closest still-unclaimed existing track's PREDICTED position,
+        # within max_match_distance (unchanged tolerance -- see the
+        # docstring above).
         unmatched_track_ids = set(self.tracks)
         assignment: dict[int, int] = {}  # detection index -> track id
         for i, det in enumerate(deduped):
             best_id, best_dist = None, None
             for tid in unmatched_track_ids:
                 t = self.tracks[tid]
-                dist = _distance(det["x"], det["y"], t.cx, t.cy)
+                predicted_x, predicted_y = _predicted_position(t)
+                dist = _distance(det["x"], det["y"], predicted_x, predicted_y)
                 if dist <= self.max_match_distance and (best_dist is None or dist < best_dist):
                     best_id, best_dist = tid, dist
             if best_id is not None:
@@ -313,6 +353,11 @@ class PeopleCounter:
                         "prev_side": prev_side, "new_side": new_side,
                         "crossed": crossed, "crossing_reason": crossing_reason,
                     })
+                # Shift the position history by one step BEFORE
+                # overwriting cx/cy -- prev_cx/prev_cy becomes what cx/cy
+                # was, so the next call's velocity estimate is always
+                # derived from the two most recent real observations.
+                track.prev_cx, track.prev_cy = track.cx, track.cy
                 track.cx, track.cy = x, y
                 track.side = new_side if new_side != 0 else prev_side
                 track.last_seen_frame = self.frame_index

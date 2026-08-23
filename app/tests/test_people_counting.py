@@ -24,7 +24,7 @@ matching-distance boundary.
 
 import pytest
 
-from people_counting import CountingLine, CounterState, PeopleCounter, _dedupe_same_frame, _side_of_line
+from people_counting import CountingLine, CounterState, PeopleCounter, _dedupe_same_frame, _distance, _side_of_line
 
 
 def vertical_line(direction: str = "both") -> CountingLine:
@@ -405,3 +405,137 @@ def test_debug_true_does_not_change_in_out_counts_versus_debug_false():
     assert counter_plain.in_count == counter_debug.in_count
     assert counter_plain.out_count == counter_debug.out_count
     assert counter_plain.occupancy == counter_debug.occupancy
+
+
+# ============================================================ 13. velocity-aware matching: the real walk-test failure, reproduced and fixed
+
+
+def test_a_large_jump_that_exceeds_raw_fixed_distance_still_matches_when_consistent_with_established_velocity():
+    """Directly reproduces the mechanism the real Camera 1 walk-test
+    trace proved: a track takes one small step (establishing a velocity
+    estimate), then a much larger step whose RAW distance from the
+    track's last known position exceeds max_match_distance -- but whose
+    distance from the track's VELOCITY-EXTRAPOLATED predicted position
+    does not. Counterfactual proof included: a plain fixed-distance-
+    from-last-position check on that same jump is asserted to exceed
+    the threshold FIRST, then the real update() call is asserted to
+    still preserve the track (and, since this jump also crosses the
+    line, correctly count the crossing) -- proving this is a genuine
+    fix for the observed failure, not just a passing test."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20)])   # frame 1: track born at x=0.20
+    counter.update([det(0.35)])   # frame 2: step of +0.15 -- establishes velocity vx=0.15, still under the 0.20 fixed-distance tolerance so this step alone proves nothing new yet
+
+    # Counterfactual: prove a NAIVE fixed-distance-from-last-position
+    # check on the next jump would have failed.
+    raw_jump_distance = _distance(0.63, 0.5, 0.35, 0.5)
+    assert raw_jump_distance > counter.max_match_distance, (
+        f"test setup error: this jump ({raw_jump_distance:.3f}) must exceed max_match_distance "
+        f"({counter.max_match_distance}) to actually exercise the fix"
+    )
+
+    events = counter.update([det(0.63)])  # frame 3: real jump is +0.28 -- exceeds max_match_distance from the raw last position (0.35), but only 0.13 from the velocity-predicted position (0.35+0.15=0.50)
+
+    assert len(counter.tracks) == 1, "the SAME track must have been preserved, not replaced by a new one"
+    assert len(events) == 1, "the line was genuinely crossed (0.35 is left of 0.5, 0.63 is right) and must be counted"
+    assert counter.in_count == 1
+    assert counter.occupancy == 1
+
+
+def test_without_an_established_velocity_the_same_large_jump_still_loses_the_track_the_safe_baseline():
+    """The flip side, proving the 'safe baseline' claim: a track with
+    NO prior velocity (only just created) gets no benefit from
+    prediction -- an equally large jump on a brand-new track behaves
+    identically to the original fixed-distance-only logic and fails to
+    match, exactly as before this change."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20)])  # frame 1: track born, no velocity yet
+    counter.update([det(0.63)])  # frame 2: a big jump on a track with only one observation -- predicted position falls back to the track's own current position (zero assumed velocity), identical to the old behavior
+    assert len(counter.tracks) == 2, "no established velocity to bridge the gap -- a second, separate track is created, matching pre-fix behavior"
+    assert counter.in_count == 0  # the crossing is lost, exactly like the real walk-test
+
+
+def test_velocity_prediction_still_respects_max_match_distance_not_an_unlimited_reach():
+    """The fix must not become 'anything matches' -- a jump wildly
+    inconsistent with the established velocity (not just larger, but in
+    a different direction/magnitude than the trend predicts) must still
+    fail to match if it's far enough from the PREDICTED position."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20, 0.3)])
+    counter.update([det(0.35, 0.3)])  # establishes a small rightward velocity
+    # A detection far from BOTH the last position and the prediction --
+    # nothing about extrapolation should rescue an unrelated jump.
+    events = counter.update([det(0.35, 0.95)])  # same x, wildly different y
+    assert len(counter.tracks) == 2  # did not match -- a new track was created instead
+
+
+# ============================================================ 14. velocity-aware matching does not merge or swap two people crossing near each other
+
+
+def test_two_people_both_making_the_same_large_velocity_assisted_jump_stay_correctly_separate():
+    """Both people independently exhibit the exact large-jump pattern
+    from the fix above, at the same time, on either side of the frame
+    (y=0.3 and y=0.7) -- proves prediction is computed and matched
+    PER TRACK, not globally, so it can't accidentally let one track's
+    velocity "reach into" and steal the other's detection."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20, 0.3), det(0.20, 0.7)])
+    counter.update([det(0.35, 0.3), det(0.35, 0.7)])
+    events = counter.update([det(0.63, 0.3), det(0.63, 0.7)])
+    assert len(counter.tracks) == 2, "still exactly two people, two tracks -- no merge"
+    assert len(events) == 2, "both crossings counted"
+    assert counter.in_count == 2
+    track_ids = {t.track_id for t in counter.tracks.values()}
+    assert len(track_ids) == 2  # genuinely distinct identities, not one track duplicated
+
+
+def test_two_people_crossing_close_together_do_not_swap_identities_under_velocity_matching():
+    """Two people close together (y=0.45 and y=0.55, only 0.10 apart --
+    close enough that a naive nearest-detection-only match could
+    plausibly confuse them) moving in OPPOSITE directions at the same
+    large-jump pace. Correct behavior: each track's own velocity
+    predicts its own continuation, so track A (moving right) should
+    keep matching the detection that continues moving right, and track
+    B (moving left) should keep matching the one continuing left --
+    not swap onto each other's path."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20, 0.45), det(0.80, 0.55)])   # A moving right (y=0.45), B moving left (y=0.55)
+    counter.update([det(0.35, 0.45), det(0.65, 0.55)])   # A: +0.15, B: -0.15 -- velocities established, opposite directions
+    a_track_id_before = min(counter.tracks, key=lambda tid: abs(counter.tracks[tid].cy - 0.45))
+    b_track_id_before = min(counter.tracks, key=lambda tid: abs(counter.tracks[tid].cy - 0.55))
+    assert a_track_id_before != b_track_id_before
+
+    events = counter.update([det(0.63, 0.45), det(0.37, 0.55)])  # A continues right past the predicted 0.50, B continues left past the predicted 0.50
+
+    assert len(counter.tracks) == 2, "no merge -- still two distinct people"
+    # Identity preserved: the track that was near y=0.45 is still the
+    # one that ended up on the RIGHT (it was always moving right), and
+    # the one near y=0.55 is still on the LEFT.
+    a_track_after = counter.tracks[a_track_id_before]
+    b_track_after = counter.tracks[b_track_id_before]
+    assert a_track_after.cx > 0.5, "the rightward-moving person's own track continued rightward, not swapped"
+    assert b_track_after.cx < 0.5, "the leftward-moving person's own track continued leftward, not swapped"
+    assert len(events) == 2  # both crossed (A: left->right = in; B: right->left = out)
+    assert counter.in_count == 1
+    assert counter.out_count == 1
+
+
+def test_two_people_moving_in_the_same_direction_close_together_never_get_double_matched_to_one_track():
+    """Both moving the same direction, close together (y=0.40 / 0.50)
+    -- confirms the assignment logic never lets two detections both
+    claim the same track (each track_id appears at most once as a
+    match target per frame), even once predicted positions from two
+    similarly-moving tracks could plausibly land close to each other."""
+    line = vertical_line()
+    counter = PeopleCounter(line)
+    counter.update([det(0.20, 0.40), det(0.22, 0.50)])
+    counter.update([det(0.35, 0.40), det(0.37, 0.50)])
+    events = counter.update([det(0.63, 0.40), det(0.65, 0.50)])
+    assert len(counter.tracks) == 2
+    assert len(events) == 2
+    assert counter.in_count == 2
