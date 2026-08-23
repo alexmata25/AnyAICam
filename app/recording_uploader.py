@@ -290,7 +290,16 @@ def _refresh_camera_map() -> None:
     appliance build) collapses to None, which _pending_recording_files()
     treats identically to 'continuous': upload everything. No hidden
     default ever resolves to motion-gating; only an exact 'motion'
-    string does."""
+    string does.
+
+    people_counting_enabled follows the exact same normalize-to-a-
+    known-safe-value discipline: only an exact truthy 1/True from the
+    cloud ever resolves to True here; anything else (missing, null,
+    0, an unexpected type) becomes False. This is the one field
+    main.py's people_counting_worker() reads from this map -- reusing
+    this existing camera_map/refresh machinery rather than building a
+    second cloud-config-fetch mechanism, per explicit instruction to
+    prefer reuse over a parallel system."""
     response = _control_plane_get("/api/appliance/configuration")
     if not isinstance(response, dict):
         return
@@ -312,7 +321,13 @@ def _refresh_camera_map() -> None:
             continue
         raw_recording_mode = item.get("recording_mode")
         recording_mode = raw_recording_mode if raw_recording_mode in ("motion", "continuous") else None
-        mapping[camera_number] = {"camera_id": camera_id, "site_id": site_id, "recording_mode": recording_mode}
+        people_counting_enabled = item.get("people_counting_enabled") in (1, True)
+        mapping[camera_number] = {
+            "camera_id": camera_id,
+            "site_id": site_id,
+            "recording_mode": recording_mode,
+            "people_counting_enabled": people_counting_enabled,
+        }
     with _lock:
         _camera_map.clear()
         _camera_map.update(mapping)
