@@ -401,3 +401,165 @@ async def test_worker_sleeps_forever_without_syncing_when_disabled(tmp_path, mon
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+# --------------------------------------------------------- controlled-rollout camera scope
+
+
+def test_unset_camera_scope_restricts_nothing(tmp_path):
+    assert asy.SYNC_CAMERA_SCOPE is None
+
+
+def test_camera_outside_the_scope_stays_pending_not_counted_against_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "SYNC_CAMERA_SCOPE", frozenset({1}))
+    _register_camera(1, camera_id="cam-1")
+    _register_camera(2, camera_id="cam-2")
+    _write_local_events(tmp_path, [_event("evt-cam1", camera=1), _event("evt-cam2", camera=2)])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(payload) or {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert len(calls) == 1
+    assert calls[0]["local_event_id"] == "evt-cam1"
+    assert "evt-cam1" in asy._load_synced_ids()
+    assert "evt-cam2" not in asy._load_synced_ids()
+
+
+def test_camera_in_scope_is_synced_normally(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "SYNC_CAMERA_SCOPE", frozenset({1}))
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-cam1", camera=1)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert "evt-cam1" in asy._load_synced_ids()
+
+
+def test_camera_left_pending_by_scope_is_picked_up_once_scope_widens(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "SYNC_CAMERA_SCOPE", frozenset({1}))
+    _register_camera(2, camera_id="cam-2")
+    _write_local_events(tmp_path, [_event("evt-cam2", camera=2)])
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: {"status": "accepted"})
+
+    first = asy._sync_pending_events()
+    assert first == {"attempted": 0, "synced": 0, "failed": 0}
+
+    monkeypatch.setattr(asy, "SYNC_CAMERA_SCOPE", frozenset({1, 2}))
+    second = asy._sync_pending_events()
+    assert second == {"attempted": 1, "synced": 1, "failed": 0}
+    assert "evt-cam2" in asy._load_synced_ids()
+
+
+# --------------------------------------------------------- best-effort notification forwarding (disabled by default)
+
+
+def test_notify_flag_defaults_false(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_ANALYTICS_SYNC_NOTIFY_ENABLED", raising=False)
+    import importlib
+    reloaded = importlib.reload(asy)
+    assert reloaded.ANALYTICS_SYNC_NOTIFY_ENABLED is False
+    importlib.reload(asy)  # restore a clean module state for subsequent tests
+
+
+def test_notification_not_sent_when_flag_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", False)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-1")])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(path) or {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    assert calls == ["/api/appliance/analytics/cam-1/events"]  # unchanged from before this feature
+
+
+def test_notification_sent_after_a_successful_sync_when_flag_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-1", event_type="person", timestamp="2026-08-21T10:00:00")])
+    calls = []
+
+    def _post(path, payload):
+        calls.append((path, payload))
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(asy, "_control_plane_post", _post)
+
+    asy._sync_pending_events()
+
+    paths = [call[0] for call in calls]
+    assert paths == ["/api/appliance/analytics/cam-1/events", "/api/appliance/events"]
+    notify_payload = calls[1][1]
+    assert notify_payload == {"events": [{
+        "id": "evt-1", "event_type": "person", "camera_id": "cam-1", "timestamp": "2026-08-21T10:00:00",
+    }]}
+
+
+def test_notification_reuses_the_same_local_event_id_for_idempotency(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-shared-id")])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append((path, payload)) or {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    analytics_call = next(c for c in calls if c[0].startswith("/api/appliance/analytics"))
+    notify_call = next(c for c in calls if c[0] == "/api/appliance/events")
+    assert analytics_call[1]["local_event_id"] == notify_call[1]["events"][0]["id"] == "evt-shared-id"
+
+
+def test_notification_never_includes_thumbnail_or_linked_recording(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    event = _event("evt-1")
+    _write_local_events(tmp_path, [event])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append((path, payload)) or {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    notify_call = next(c for c in calls if c[0] == "/api/appliance/events")
+    serialized = json.dumps(notify_call[1])
+    assert "thumbnail" not in serialized
+    assert "linked_recording" not in serialized
+    assert event["thumbnail"] not in serialized
+
+
+def test_a_failed_notification_does_not_prevent_the_event_from_being_marked_synced(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-1")])
+
+    def _post(path, payload):
+        if path == "/api/appliance/events":
+            return None  # notification delivery fails
+        return {"status": "accepted"}  # the analytics-event sync itself succeeds
+
+    monkeypatch.setattr(asy, "_control_plane_post", _post)
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    assert "evt-1" in asy._load_synced_ids()
+
+
+def test_notification_is_never_sent_for_an_event_the_analytics_sync_itself_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-1")])
+    calls = []
+
+    def _post(path, payload):
+        calls.append(path)
+        return None  # the analytics-event sync fails
+
+    monkeypatch.setattr(asy, "_control_plane_post", _post)
+
+    asy._sync_pending_events()
+
+    assert calls == ["/api/appliance/analytics/cam-1/events"]  # never reached /api/appliance/events

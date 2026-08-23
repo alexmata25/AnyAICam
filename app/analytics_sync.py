@@ -119,6 +119,32 @@ def _parse_max_events_per_scan() -> int:
 
 MAX_EVENTS_PER_SCAN = _parse_max_events_per_scan()
 
+# Controlled-rollout scope: which camera_numbers this worker is allowed to
+# sync at all. Unset (the default, and every existing test's implicit
+# assumption) means "no restriction" -- this must never narrow existing
+# behavior for a caller that doesn't set it. A comma-separated allowlist
+# (e.g. "1") lets a single camera be validated in production before this
+# is widened to the rest -- an event for a camera_number outside this set
+# is left pending (same "not yet known" treatment as an unmapped camera),
+# never marked synced, never counted against the per-scan cap.
+_raw_camera_scope = os.environ.get("ANYAICAM_ANALYTICS_SYNC_CAMERAS", "").strip()
+SYNC_CAMERA_SCOPE: frozenset[int] | None = (
+    frozenset(int(item) for item in _raw_camera_scope.split(",") if item.strip().isdigit())
+    if _raw_camera_scope
+    else None
+)
+
+# Best-effort notification forwarding: on a successful (or idempotent-
+# duplicate) analytics-event sync, also POST the same event to the
+# existing, already-built /api/appliance/events route (notification_engine
+# .fanout_appliance_event's real trigger -- see that module for the real
+# email/in-app delivery this fans out to). Deliberately a SEPARATE flag
+# from ANALYTICS_SYNC_ENABLED so the two can be toggled independently if
+# ever needed, but both default false -- unset behaves exactly like this
+# module did before notification forwarding existed, so every pre-existing
+# test (none of which set this) is unaffected.
+ANALYTICS_SYNC_NOTIFY_ENABLED = os.environ.get("ANYAICAM_ANALYTICS_SYNC_NOTIFY_ENABLED", "false").strip().lower() == "true"
+
 analytics_sync_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None, "last_summary": None}
 
 _lock = threading.Lock()
@@ -316,6 +342,8 @@ def _pending_events(max_count: int) -> list[tuple[dict, str]]:
         camera_number = event.get("camera")
         if isinstance(camera_number, bool) or not isinstance(camera_number, int):
             continue
+        if SYNC_CAMERA_SCOPE is not None and camera_number not in SYNC_CAMERA_SCOPE:
+            continue
         identity = _camera_identity(camera_number)
         if not identity:
             if camera_number not in _unknown_camera_logged:
@@ -342,6 +370,43 @@ def _build_payload(event: dict) -> dict:
         "detections": detections if isinstance(detections, list) else None,
         "event_timestamp": str(event.get("timestamp") or "").strip(),
     }
+
+
+def _build_notification_payload(event: dict, camera_id: str) -> dict:
+    """Shape expected by the existing POST /api/appliance/events route
+    (see appliance_cloud.py's events()/notification_engine.fanout_
+    appliance_event -- the real, already-built email/in-app delivery
+    this fans out to). Reuses the SAME local_event_id as this event's
+    own id here, deliberately: that route's own dedup is `INSERT OR
+    IGNORE` keyed on (appliance_id, event_id), so a retried notification
+    POST for an event already accepted is a harmless no-op, exactly
+    matching the idempotent-duplicate semantics already relied on for
+    the analytics-event POST above. Only the fields that route/fanout
+    actually reads are ever sent -- no thumbnail/linked_recording (same
+    local-filesystem-only exclusion as _build_payload())."""
+    return {
+        "id": str(event.get("id") or "").strip(),
+        "event_type": str(event.get("event_type") or "").strip(),
+        "camera_id": camera_id,
+        "timestamp": str(event.get("timestamp") or "").strip(),
+    }
+
+
+def _forward_notification(event: dict, camera_id: str) -> None:
+    """Best-effort: a notification failure is logged but never affects
+    whether the event itself is marked synced (see _sync_pending_events)
+    -- the analytics-event POST above is this system's durable record of
+    "did this event reach the cloud"; the notification POST is a fan-out
+    of an already-recorded event, not a second thing that must succeed
+    for the first to count. Never called unless
+    ANALYTICS_SYNC_NOTIFY_ENABLED is explicitly true."""
+    payload = _build_notification_payload(event, camera_id)
+    if not payload["id"] or not payload["event_type"] or not payload["timestamp"]:
+        logger.warning("analytics_sync.notification_payload_malformed event_id=%r", event.get("id"))
+        return
+    response = _control_plane_post("/api/appliance/events", {"events": [payload]})
+    if not isinstance(response, dict) or response.get("status") != "accepted":
+        logger.warning("analytics_sync.notification_forward_failed event_id=%s camera_id=%s", payload["id"], camera_id)
 
 
 def _sync_pending_events() -> dict:
@@ -371,6 +436,8 @@ def _sync_pending_events() -> dict:
         if isinstance(response, dict) and response.get("status") in ("accepted", "duplicate"):
             _persist_synced_id(payload["local_event_id"])
             synced += 1
+            if ANALYTICS_SYNC_NOTIFY_ENABLED:
+                _forward_notification(event, camera_id)
         else:
             failed += 1
             logger.warning("analytics_sync.event_sync_failed event_id=%s camera_id=%s", payload["local_event_id"], camera_id)
