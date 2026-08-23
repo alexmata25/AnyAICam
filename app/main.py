@@ -37230,6 +37230,54 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         append_analytics_event(event)
         smart_motion.record_object_detection(camera_number, class_name)
+        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number):
+            for vehicle_detection in class_detections:
+                try:
+                    vx, vy, vw, vh = (
+                        vehicle_detection["x"],
+                        vehicle_detection["y"],
+                        vehicle_detection["width"],
+                        vehicle_detection["height"],
+                    )
+                    vehicle_crop = frame[vy : vy + vh, vx : vx + vw]
+                    plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
+                except Exception as error:
+                    plate_result = None
+                    print(f"Camera {camera_number} LPR skipped (non-fatal): {error}")
+                if not plate_result:
+                    continue
+                plate_crop_url = None
+                try:
+                    px, py, pw, ph = plate_result["region"]
+                    plate_crop_image = vehicle_crop[py : py + ph, px : px + pw]
+                    plate_filename = (
+                        f"camera{camera_number}_{now.strftime('%H-%M-%S')}_"
+                        f"plate_{uuid.uuid4().hex[:12]}.jpg"
+                    )
+                    plate_output_path = day_folder / plate_filename
+                    if cv2.imwrite(str(plate_output_path), plate_crop_image):
+                        plate_crop_url = (
+                            f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
+                            f"{quote(plate_filename)}"
+                        )
+                except Exception as error:
+                    print(f"Camera {camera_number} LPR plate-crop save skipped (non-fatal): {error}")
+                plate_event = AnalyticsEventModel(
+                    id=uuid.uuid4().hex[:12],
+                    camera=camera_number,
+                    site="home",
+                    rule_name=f"LPR ({class_name})",
+                    event_type="plate",
+                    timestamp=now,
+                    confidence=round(plate_result["confidence"] / 100, 4),
+                    plate_number=plate_result["plate_number"],
+                    plate_crop=plate_crop_url,
+                    thumbnail=thumbnail_url,
+                    linked_recording=linked_recording,
+                    mock=False,
+                ).model_dump(mode="json")
+                append_analytics_event(plate_event)
+                saved_events.append(plate_event)
 
 
 
@@ -38744,6 +38792,7 @@ import live_relay_uploader
 import recording_uploader
 import recording_retention_sweep
 import analytics_sync
+import lpr
 import smart_motion
 import talk_down_discovery
 import people_counting

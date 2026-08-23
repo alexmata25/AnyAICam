@@ -578,6 +578,41 @@ def test_non_vehicle_event_type_passes_through_unchanged(non_vehicle_class):
     assert asy._notification_event_type(non_vehicle_class) == non_vehicle_class
 
 
+def test_plate_notification_type_maps_to_lpr():
+    assert asy._notification_event_type("plate") == "lpr"
+
+
+def test_analytics_history_payload_keeps_plate_unchanged():
+    event = _event("evt-plate-1", event_type="plate")
+    payload = asy._build_payload(event)
+    assert payload["event_type"] == "plate"  # NOT "lpr" -- history keeps the real type
+
+
+def test_lpr_notify_defaults_to_disabled():
+    assert asy.LPR_NOTIFY_ENABLED is False
+
+
+def test_forward_notification_skips_plate_events_when_lpr_notify_disabled(monkeypatch):
+    monkeypatch.setattr(asy, "LPR_NOTIFY_ENABLED", False)
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append((path, payload)) or {"status": "accepted"})
+    event = _event("evt-plate-2", event_type="plate")
+    asy._forward_notification(event, "cam-1")
+    assert calls == []
+
+
+def test_forward_notification_sends_plate_events_when_lpr_notify_enabled(monkeypatch):
+    monkeypatch.setattr(asy, "LPR_NOTIFY_ENABLED", True)
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append((path, payload)) or {"status": "accepted"})
+    event = _event("evt-plate-3", event_type="plate")
+    asy._forward_notification(event, "cam-1")
+    assert len(calls) == 1
+    path, body = calls[0]
+    assert path == "/api/appliance/events"
+    assert body["events"][0]["event_type"] == "lpr"
+
+
 def test_smart_motion_notification_message_names_the_real_trigger():
     event = _event("evt-sm-1", event_type="smart_motion")
     event["triggered_by"] = "person"

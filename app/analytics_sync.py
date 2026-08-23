@@ -145,6 +145,15 @@ SYNC_CAMERA_SCOPE: frozenset[int] | None = (
 # test (none of which set this) is unaffected.
 ANALYTICS_SYNC_NOTIFY_ENABLED = os.environ.get("ANYAICAM_ANALYTICS_SYNC_NOTIFY_ENABLED", "false").strip().lower() == "true"
 
+# LPR ('plate' events) can fire far more often than person/vehicle/
+# smart_motion on any camera facing regular traffic. Analytics-
+# history sync (searchable in the Event Center/LPR page) is governed
+# by ANALYTICS_SYNC_NOTIFY_ENABLED like everything else above -- this
+# flag only gates whether a plate ALSO fans out to a notification,
+# defaulting off so LPR doesn't create noisy alerts until that's a
+# deliberate decision.
+LPR_NOTIFY_ENABLED = os.environ.get("ANYAICAM_LPR_NOTIFY_ENABLED", "false").strip().lower() == "true"
+
 analytics_sync_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None, "last_summary": None}
 
 _lock = threading.Lock()
@@ -398,7 +407,11 @@ def _notification_event_type(event_type: str) -> str:
     original event_type unchanged for anything else -- "person",
     "motion", "people_counting", etc. already match notification_
     engine.SUPPORTED literally and need no translation."""
-    return "vehicle" if event_type in VEHICLE_EVENT_TYPES else event_type
+    if event_type in VEHICLE_EVENT_TYPES:
+        return "vehicle"
+    if event_type == "plate":
+        return "lpr"
+    return event_type
 
 
 def _build_notification_payload(event: dict, camera_id: str) -> dict:
@@ -441,6 +454,8 @@ def _forward_notification(event: dict, camera_id: str) -> None:
     of an already-recorded event, not a second thing that must succeed
     for the first to count. Never called unless
     ANALYTICS_SYNC_NOTIFY_ENABLED is explicitly true."""
+    if str(event.get("event_type") or "") == "plate" and not LPR_NOTIFY_ENABLED:
+        return
     payload = _build_notification_payload(event, camera_id)
     if not payload["id"] or not payload["event_type"] or not payload["timestamp"]:
         logger.warning("analytics_sync.notification_payload_malformed event_id=%r", event.get("id"))
