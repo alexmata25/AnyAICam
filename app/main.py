@@ -38057,24 +38057,80 @@ async def people_counting_worker(camera_number: int) -> None:
     counter: "people_counting.PeopleCounter | None" = None
     configured_line_key = None
     debug = camera_number == PEOPLE_COUNTING_DEBUG_CAMERA  # TEMPORARY, walk-test diagnostics only -- see PEOPLE_COUNTING_DEBUG_CAMERA's own comment
+    # TEMPORARY reconstruction-diagnostic state, Camera-1-debug-only (see below) --
+    # exists solely to answer "why was the counter rebuilt" and is not otherwise
+    # used for counting logic. worker_session_id changes only if this whole
+    # coroutine is re-entered (a real worker/process/container restart), so
+    # comparing it across log lines distinguishes "this is a genuinely new
+    # worker invocation" from "the same worker rebuilt its counter mid-session".
+    worker_session_id = uuid.uuid4().hex[:8] if debug else None
+    ever_constructed = False
+    last_entitled = None
+    last_rule_id = None
+    if debug:
+        print(f"[PeopleCountingDebug][cam{camera_number}] worker_task_started session={worker_session_id}")
     while True:
         try:
             identity = recording_uploader._camera_identity(camera_number)
             entitled = bool(identity and identity.get("people_counting_enabled"))
             rule = _load_people_counting_rule(camera_number) if entitled else None
+            rule_id = rule.get("id") if rule else None
+            config_refresh_at = recording_uploader.recording_upload_state.get("last_config_refresh_at") if debug else None
+
             if debug:
-                print(f"[PeopleCountingDebug][cam{camera_number}] cycle_start entitled={entitled} rule_loaded={rule is not None}")
+                if last_entitled is not None and entitled != last_entitled:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] entitlement_changed session={worker_session_id} {last_entitled} -> {entitled} identity={identity} last_config_refresh_at={config_refresh_at}")
+                if last_rule_id is not None and rule_id != last_rule_id:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] rule_id_changed session={worker_session_id} {last_rule_id} -> {rule_id}")
+                print(f"[PeopleCountingDebug][cam{camera_number}] cycle_start session={worker_session_id} entitled={entitled} rule_loaded={rule is not None} rule_id={rule_id} last_config_refresh_at={config_refresh_at}")
+            last_entitled = entitled
+            last_rule_id = rule_id
+
             if entitled and rule and len(rule.get("geometry", [])) >= 2:
                 line = people_counting.CountingLine.from_rule_geometry(rule["geometry"], rule.get("direction", "both"))
                 line_key = (tuple((p.get("x"), p.get("y")) for p in rule["geometry"][:2]), rule.get("direction", "both"))
                 if counter is None or line_key != configured_line_key:
+                    # Exact reason code, per explicit instruction: distinguish a
+                    # genuine first-ever construction from "was cleared by a
+                    # de-entitlement/rule-loss cycle and is now being rebuilt"
+                    # from "entitled and rule-having the whole time, but the
+                    # rule's own geometry/direction/id changed under us".
+                    if not ever_constructed:
+                        reconstruction_reason = "first_startup"
+                    elif counter is None:
+                        reconstruction_reason = "counter_cleared_then_reentitled_or_rule_restored"
+                    else:
+                        reconstruction_reason = "line_key_changed"
+                    if debug:
+                        state_file_exists = PEOPLE_COUNTING_STATE_FILE.exists()
+                        state_file_raw = None
+                        state_file_read_error = None
+                        if state_file_exists:
+                            try:
+                                state_file_raw = PEOPLE_COUNTING_STATE_FILE.read_text()
+                            except OSError as read_error:
+                                state_file_read_error = f"{type(read_error).__name__}:{read_error}"
+                        print(
+                            f"[PeopleCountingDebug][cam{camera_number}] reconstruction_triggered session={worker_session_id} "
+                            f"reason={reconstruction_reason} previous_line_key={configured_line_key} new_line_key={line_key} "
+                            f"rule_id={rule_id} state_file_path={PEOPLE_COUNTING_STATE_FILE} state_file_exists={state_file_exists} "
+                            f"state_file_raw_len={len(state_file_raw) if state_file_raw is not None else None} "
+                            f"state_file_read_error={state_file_read_error} last_config_refresh_at={config_refresh_at}"
+                        )
                     counter = people_counting.PeopleCounter(line)
-                    saved = _people_counting_state_load_all().get(str(camera_number))
+                    ever_constructed = True
+                    saved_all = _people_counting_state_load_all()
+                    saved = saved_all.get(str(camera_number))
                     if saved:
                         counter.restore(people_counting.CounterState(**saved))
                     configured_line_key = line_key
                     if debug:
-                        print(f"[PeopleCountingDebug][cam{camera_number}] line_loaded x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction} restored_from_state={saved is not None}")
+                        print(
+                            f"[PeopleCountingDebug][cam{camera_number}] line_loaded session={worker_session_id} "
+                            f"x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction} "
+                            f"restored_from_state={saved is not None} state_file_keys_present={list(saved_all.keys())} "
+                            f"reason={reconstruction_reason}"
+                        )
                 if debug:
                     print(f"[PeopleCountingDebug][cam{camera_number}] line_in_use x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction}")
 
@@ -38129,11 +38185,24 @@ async def people_counting_worker(camera_number: int) -> None:
                 # in-progress counter/tracks. Cumulative counts already
                 # saved to PEOPLE_COUNTING_STATE_FILE are untouched and
                 # will be restored if this camera becomes entitled again.
+                if debug and counter is not None:
+                    geometry_len = len(rule.get("geometry", [])) if rule else 0
+                    print(
+                        f"[PeopleCountingDebug][cam{camera_number}] counter_cleared session={worker_session_id} "
+                        f"entitled={entitled} rule_loaded={rule is not None} geometry_len={geometry_len} "
+                        f"prior_line_key={configured_line_key}"
+                    )
                 counter = None
                 configured_line_key = None
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if debug:
+                print(
+                    f"[PeopleCountingDebug][cam{camera_number}] exception_recovery session={worker_session_id} "
+                    f"counter_alive={counter is not None} configured_line_key={configured_line_key} "
+                    f"error_type={type(error).__name__} error={error}"
+                )
             print(f"Camera {camera_number} People Counting worker error: {error}")
         await asyncio.sleep(PEOPLE_COUNTING_INTERVAL_SECONDS)
 
