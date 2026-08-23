@@ -1818,6 +1818,22 @@ def structured_log(event: str, level: str = "info", **fields) -> None:
 
 CAMERA_COUNT = 4
 
+# Camera 5 (the 8MP LTS unit added 2026-08-23) is deliberately raised into
+# CAMERA_COUNT so it gets the same recording/live-view process supervision
+# every other camera gets -- but detection (motion_detector,
+# ai_person_detector) is additionally gated below via
+# ANALYTICS_DETECTION_CAMERAS so analytics stays OFF for it until a
+# deliberate decision to turn it on, per the same allowlist pattern
+# already used by analytics_sync.py's SYNC_CAMERA_SCOPE.
+CAMERA_COUNT = 5
+
+_ANALYTICS_DETECTION_CAMERAS_RAW = os.environ.get("ANYAICAM_ANALYTICS_DETECTION_CAMERAS")
+ANALYTICS_DETECTION_CAMERAS = (
+    frozenset(int(value) for value in _ANALYTICS_DETECTION_CAMERAS_RAW.split(",") if value.strip())
+    if _ANALYTICS_DETECTION_CAMERAS_RAW
+    else None
+)
+
 
 
 
@@ -34682,6 +34698,8 @@ async def store_motion_event(
 
 
 async def motion_detector(camera_number: int) -> None:
+    if ANALYTICS_DETECTION_CAMERAS is not None and camera_number not in ANALYTICS_DETECTION_CAMERAS:
+        return
 
 
 
@@ -37224,6 +37242,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 async def ai_person_detector(camera_number: int) -> None:
+    if ANALYTICS_DETECTION_CAMERAS is not None and camera_number not in ANALYTICS_DETECTION_CAMERAS:
+        return
 
 
 
