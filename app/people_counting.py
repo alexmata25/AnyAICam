@@ -31,8 +31,7 @@ and what this module consumes.
 """
 
 import itertools
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
