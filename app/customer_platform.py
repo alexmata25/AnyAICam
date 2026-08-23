@@ -1,11 +1,12 @@
 
 import json
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Callable
 
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from partner_portal import partner_identity
@@ -113,6 +114,32 @@ def _portal_customer_camera_ids(user: dict) -> list[int]:
     return [int(camera["camera_number"]) for camera in camera_rows]
 
 
+def _portal_customer_camera_names(user: dict) -> dict[int, str]:
+    """Camera-number -> display name, for the same fleet
+    _portal_customer_camera_ids() scopes. Prefers the real cameras.name
+    column (same field live_view_page.py's /customer-live already reads)
+    over a generic "Camera N" fallback, so an installer-assigned label
+    such as "Front Door" shows up here too, without changing what's
+    stored -- read-only, display purposes only."""
+    customer_id = user.get("customer_id")
+    if not customer_id:
+        return {}
+
+    camera_rows = rows(
+        "SELECT camera_number, name FROM cameras "
+        "WHERE customer_id=? AND camera_number IS NOT NULL "
+        "ORDER BY camera_number",
+        (customer_id,),
+    )
+
+    names = {}
+    for camera in camera_rows:
+        number = int(camera["camera_number"])
+        label = (camera.get("name") or "").strip()
+        names[number] = label if label and label != f"Camera {number}" else f"Camera {number}"
+    return names
+
+
 def register_customer_platform_routes(
     app,
     *,
@@ -123,6 +150,18 @@ def register_customer_platform_routes(
     record_audit: Callable,
     is_master_admin: Callable,
 ):
+    @app.get("/customer-account", response_class=HTMLResponse)
+    def customer_account(request: Request):
+        """Several customer-facing pages (Playback's "Account" link,
+        /customer-live's header link and its no-cameras fallback) already
+        link or redirect here, on the assumption this page exists. It
+        didn't -- this closes that gap by pointing to the one page that
+        already serves as the customer's account/setup hub
+        (/customer-portal: cameras, camera analytics and alerts,
+        playback, subscription, install app), rather than building a
+        second hub with duplicate content."""
+        return RedirectResponse("/customer-portal", status_code=303)
+
     @app.get("/customer-portal", response_class=HTMLResponse)
     def customer_portal(request: Request):
         user = _portal_customer_user(request)
@@ -130,6 +169,7 @@ def register_customer_platform_routes(
             raise HTTPException(status_code=403, detail="Customer account required.")
 
         cameras = _portal_customer_camera_ids(user)
+        camera_names = _portal_customer_camera_names(user)
         feature_state = _features()
         enabled_total = 0
         entitled_total = 0
@@ -144,11 +184,17 @@ def register_customer_platform_routes(
             }
             enabled_total += len(enabled)
             entitled_total += len(entitlements)
+            camera_label = camera_names.get(camera_id, f"Camera {camera_id}")
+            if entitlements:
+                summary = f"{len(enabled)} of {len(entitlements)} paid analytics enabled"
+            else:
+                summary = "No paid analytics assigned yet — ask your installer to add features"
             cards.append(
                 f'''<article class="feature-card">
                   <div class="feature-icon">▣</div>
-                  <h2>Camera {camera_id}</h2>
-                  <p>{len(enabled)} analytics enabled · {len(entitlements)} paid entitlement(s)</p>
+                  <h2>{escape(camera_label)}</h2>
+                  <p class="health-detail">Camera {camera_id}</p>
+                  <p>{summary}</p>
                   <a class="download" href="/camera/{camera_id}">Open camera</a>
                 </article>'''
             )
@@ -187,14 +233,19 @@ def register_customer_platform_routes(
             raise HTTPException(status_code=403, detail="Customer account required.")
 
         cameras = _portal_customer_camera_ids(user)
+        camera_names = _portal_customer_camera_names(user)
         camera_options = "".join(
-            f'<option value="{camera}">Camera {camera}</option>' for camera in cameras
+            f'<option value="{camera}">{escape(camera_names.get(camera, f"Camera {camera}"))}</option>'
+            for camera in cameras
         )
         analytic_options = "".join(
-            f'''<label class="feature-toggle" data-feature="{key}">
-              <span><strong>{item["label"]}</strong><small>{item["description"]}</small></span>
+            f'''<label class="feature-toggle" data-feature="{key}" style="display:flex;align-items:center;gap:12px">
+              <span style="display:flex;flex-direction:column;gap:2px;flex:1">
+                <strong>{item["label"]}</strong>
+                <small style="color:var(--muted)">{item["description"]}</small>
+              </span>
               <input type="checkbox" id="feature-{key}">
-              <em id="entitlement-{key}">Checking plan…</em>
+              <em id="entitlement-{key}" style="font-style:normal;font-weight:600;text-transform:none">Checking plan…</em>
             </label>'''
             for key, item in ANALYTICS_CATALOG.items()
         )

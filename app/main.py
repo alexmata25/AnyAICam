@@ -46153,68 +46153,10 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
         mobile_items = [
-
-
-
-
-
-
-
-
             ("live", "/customer-live", "Cameras"),
-
-
-
-
-
-
-
-
             ("alerts", "/alerts", "Alerts"),
-
-
-
-
-
-
-
-
             ("playback", "/playback", "Playback"),
-
-
-
-
-
-
-
-
-            ("dashboard", "/customer-portal", "Home"),
-
-
-
-
-
-
-
-
-            ("customer-app-settings", "/customer-app-settings", "Alerts"),
-
-
-
-
-
-
-
-
-            ("mobile-app", "/mobile-app", "Install"),
-
-
-
-
-
-
-
-
+            ("dashboard", "/customer-portal", "Account"),
         ]
 
 
@@ -136962,7 +136904,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '<div class="panel-head"><div><h2>Choose a camera</h2><div class="health-detail">Only cameras assigned to your account appear here.</div></div></div>'
         f'<label style="display:grid;gap:7px;max-width:360px">Camera<select id="playback-camera-select">{camera_options}</select></label>'
         '</section>'
-        '<section class="playback-workspace" style="display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:16px;margin-top:16px">'
+        '<section class="playback-workspace" style="gap:16px;margin-top:16px">'
         '<div class="panel"><div class="camera-view" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
@@ -137066,7 +137008,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
       row.type='button';
       row.className='setting-link';
       row.style.cssText='width:100%;text-align:left;border:0;cursor:pointer';
-      row.innerHTML=`<div><strong>${{new Date(clip.start).toLocaleString()}}</strong><div class="health-detail">${{clip.name}}</div></div><span>Play →</span>`;
+      const durationMin=Math.max(1,Math.round((new Date(clip.end)-new Date(clip.start))/60000));row.innerHTML=`<div><strong>${{new Date(clip.start).toLocaleString()}}</strong><div class="health-detail">${{durationMin}} min recording</div></div><span>Play →</span>`;
       row.addEventListener('click',()=>playClip(clip));
       clipList.appendChild(row);
     }});
