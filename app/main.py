@@ -2522,6 +2522,24 @@ AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL
 
 AI_PERSON_COOLDOWN_SECONDS = max(5, int(os.environ.get("AI_PERSON_COOLDOWN_SECONDS", "30")))
 
+# People Counting: OFF by default, appliance-wide, no hidden default --
+# matches this session's own established convention (MOTION_DETECTION_
+# ENABLED/AI_PERSON_DETECTION_ENABLED). Even when this master flag is
+# on, a given camera only actually runs People Counting if BOTH (a) the
+# cloud has set cameras.people_counting_enabled=1 for it (read via
+# recording_uploader._camera_identity(), reused rather than duplicated
+# -- appliance_cloud.py, cloud lineage, is the source of truth) AND
+# (b) a real, enabled line_crossing rule exists for that camera in
+# ANALYTICS_RULES_FILE (reused, not a second config system -- see
+# people_counting.py's own module docstring). A faster-than-default
+# polling interval is used deliberately, ONLY for entitled+configured
+# cameras, to make frame-to-frame tracking reliable -- the ordinary
+# 5s AI_DETECTION_INTERVAL_SECONDS is too coarse for a person to be
+# reliably tracked across a line at normal walking speed.
+PEOPLE_COUNTING_ENABLED = os.environ.get("PEOPLE_COUNTING_ENABLED", "false").lower() == "true"
+PEOPLE_COUNTING_INTERVAL_SECONDS = max(0.5, float(os.environ.get("PEOPLE_COUNTING_INTERVAL_SECONDS", "1.5")))
+PEOPLE_COUNTING_STATE_FILE = RECORDINGS_FOLDER / "people_counting_state.json"
+
 
 
 
@@ -37961,6 +37979,135 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
+def _load_people_counting_rule(camera_number: int) -> dict | None:
+    """Reuses the EXISTING line_crossing rule-builder/storage (analytics_
+    rules.json) rather than a second, incompatible configuration system,
+    per explicit instruction. Returns the first enabled line_crossing
+    rule for this camera, or None if none exists -- an entitled camera
+    with no configured line simply doesn't run People Counting yet
+    (fail-safe: no crash, no guess at where a line should go)."""
+    rules = load_json_list(ANALYTICS_RULES_FILE)
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("analytic_type") == "line_crossing" and rule.get("camera") == camera_number and rule.get("enabled", True):
+            return rule
+    return None
+
+
+def _people_counting_state_load_all() -> dict:
+    """Fail-safe load: a missing or corrupt state file is treated
+    identically to 'no prior state' (every counter starts fresh at
+    0/0) rather than crashing the worker -- matches this session's
+    established fail-safe convention for every other piece of
+    persisted appliance state."""
+    if not PEOPLE_COUNTING_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(PEOPLE_COUNTING_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _people_counting_state_save(camera_number: int, counter: "people_counting.PeopleCounter") -> None:
+    """Read-modify-write of the shared state file. Known, disclosed
+    limitation for a future multi-camera phase: this isn't cross-thread
+    locked, so two cameras saving state in the same instant could race
+    -- acceptable for this narrow, single-camera validation phase (only
+    one camera's worker is ever actually entitled+configured right now)
+    and flagged explicitly in the report rather than silently accepted."""
+    all_state = _people_counting_state_load_all()
+    saved = counter.state()
+    all_state[str(camera_number)] = {"in_count": saved.in_count, "out_count": saved.out_count, "frame_index": saved.frame_index}
+    PEOPLE_COUNTING_STATE_FILE.write_text(json.dumps(all_state))
+
+
+async def people_counting_worker(camera_number: int) -> None:
+    """One task per camera, spawned only when PEOPLE_COUNTING_ENABLED
+    (the appliance-wide master switch) is on -- mirrors motion_detector/
+    ai_person_detector's own existing startup pattern exactly. Within
+    that, this specific camera only does anything once BOTH the cloud
+    entitlement flag (cameras.people_counting_enabled, read live via
+    recording_uploader._camera_identity() -- reused, not duplicated)
+    AND a configured line_crossing rule are present; otherwise it idles
+    harmlessly, re-checking every cycle so a live entitlement/rule
+    change takes effect without an appliance restart.
+
+    Reuses detect_objects_frame() -- the EXACT SAME YOLO call
+    ai_person_detector() already makes -- for detections; no new model,
+    no separate inference path. Only the polling cadence differs
+    (PEOPLE_COUNTING_INTERVAL_SECONDS, faster than the ordinary
+    AI_DETECTION_INTERVAL_SECONDS) for cameras actually running this
+    feature, since reliable line-crossing tracking needs closer-spaced
+    samples than plain presence detection does.
+
+    Crossing events are appended via append_analytics_event() -- the
+    same function save_yolo_events() already uses -- so they
+    automatically flow through the existing, already-validated
+    analytics_sync.py background sync to AWS with zero new sync code."""
+    counter: "people_counting.PeopleCounter | None" = None
+    configured_line_key = None
+    while True:
+        try:
+            identity = recording_uploader._camera_identity(camera_number)
+            entitled = bool(identity and identity.get("people_counting_enabled"))
+            rule = _load_people_counting_rule(camera_number) if entitled else None
+            if entitled and rule and len(rule.get("geometry", [])) >= 2:
+                line = people_counting.CountingLine.from_rule_geometry(rule["geometry"], rule.get("direction", "both"))
+                line_key = (tuple((p.get("x"), p.get("y")) for p in rule["geometry"][:2]), rule.get("direction", "both"))
+                if counter is None or line_key != configured_line_key:
+                    counter = people_counting.PeopleCounter(line)
+                    saved = _people_counting_state_load_all().get(str(camera_number))
+                    if saved:
+                        counter.restore(people_counting.CounterState(**saved))
+                    configured_line_key = line_key
+
+                result = await asyncio.to_thread(detect_objects_frame, camera_number)
+                if result.get("ok"):
+                    frame = result.get("frame")
+                    centroids = []
+                    if frame is not None:
+                        frame_height, frame_width = frame.shape[0], frame.shape[1]
+                        for detection in result.get("detections", []):
+                            if detection.get("class_name") != "person":
+                                continue
+                            cx = (detection["x"] + detection["width"] / 2) / frame_width
+                            cy = (detection["y"] + detection["height"] / 2) / frame_height
+                            centroids.append({"x": cx, "y": cy})
+                    events = counter.update(centroids)
+                    if events:
+                        now = datetime.now()
+                        for event in events:
+                            record = AnalyticsEventModel(
+                                camera=camera_number,
+                                site="home",
+                                rule_name=f"People Counting ({rule.get('name', 'counting line')})",
+                                event_type=f"people_counting_{event.direction}",
+                                direction=event.direction,
+                                confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
+                                thumbnail=None,
+                                linked_recording=linked_recording_for(camera_number, now),
+                                mock=False,
+                            ).model_dump(mode="json")
+                            record["occupancy"] = counter.occupancy
+                            record["in_count"] = counter.in_count
+                            record["out_count"] = counter.out_count
+                            append_analytics_event(record)
+                        await asyncio.to_thread(_people_counting_state_save, camera_number, counter)
+            else:
+                # Not (or no longer) entitled+configured -- drop any
+                # in-progress counter/tracks. Cumulative counts already
+                # saved to PEOPLE_COUNTING_STATE_FILE are untouched and
+                # will be restored if this camera becomes entitled again.
+                counter = None
+                configured_line_key = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"Camera {camera_number} People Counting worker error: {error}")
+        await asyncio.sleep(PEOPLE_COUNTING_INTERVAL_SECONDS)
+
+
 async def health_monitor() -> None:
 
 
@@ -38425,6 +38572,7 @@ import recording_uploader
 import recording_retention_sweep
 import analytics_sync
 import talk_down_discovery
+import people_counting
 import talk_audio_relay_client
 
 
@@ -38652,7 +38800,6 @@ async def lifespan(app: FastAPI):
 
 
 
-
                 for camera_number in range(1, CAMERA_COUNT + 1)
 
 
@@ -38679,6 +38826,19 @@ async def lifespan(app: FastAPI):
 
 
 
+
+        if PEOPLE_COUNTING_ENABLED:
+            # One task spawned per camera, exactly like ai_tasks above --
+            # each task idles harmlessly unless ITS OWN camera is both
+            # cloud-entitled and has a configured counting line (see
+            # people_counting_worker()'s own docstring). This master
+            # flag stays a separate, appliance-wide safety gate on top
+            # of the per-camera entitlement -- both must be true for
+            # anything to actually run.
+            people_counting_tasks = [
+                asyncio.create_task(people_counting_worker(camera_number))
+                for camera_number in range(1, CAMERA_COUNT + 1)
+            ]
 
     health_task = (
 
