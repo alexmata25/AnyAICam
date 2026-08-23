@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from partner_portal import partner_identity
-from partner_db import row, rows
+from partner_db import connection, row, rows
 
 RECORDINGS_FOLDER = Path("/app/recordings")
 FEATURES_FILE = RECORDINGS_FOLDER / "customer_camera_features.json"
@@ -26,6 +26,10 @@ ANALYTICS_CATALOG = {
 
 class CameraFeatureUpdate(BaseModel):
     analytics_enabled: dict[str, bool] = Field(default_factory=dict)
+
+
+class CameraNameUpdate(BaseModel):
+    name: str = Field(default="", max_length=60)
 
 
 class CameraAlertUpdate(BaseModel):
@@ -140,6 +144,26 @@ def _portal_customer_camera_names(user: dict) -> dict[int, str]:
     return names
 
 
+def _portal_customer_raw_camera_names(user: dict) -> dict[int, str]:
+    """Camera-number -> the literal stored cameras.name value (empty
+    string when unset), for the rename control's own input field.
+    Deliberately not reusing _portal_customer_camera_names()'s output --
+    that function substitutes the "Camera N" fallback for display
+    everywhere else, which would make an unsaved input look identical
+    to a saved name of literally "Camera N" text."""
+    customer_id = user.get("customer_id")
+    if not customer_id:
+        return {}
+
+    camera_rows = rows(
+        "SELECT camera_number, name FROM cameras "
+        "WHERE customer_id=? AND camera_number IS NOT NULL "
+        "ORDER BY camera_number",
+        (customer_id,),
+    )
+    return {int(camera["camera_number"]): (camera.get("name") or "").strip() for camera in camera_rows}
+
+
 def register_customer_platform_routes(
     app,
     *,
@@ -222,6 +246,7 @@ def register_customer_platform_routes(
 
         cameras = _portal_customer_camera_ids(user)
         camera_names = _portal_customer_camera_names(user)
+        raw_camera_names = _portal_customer_raw_camera_names(user)
         camera_options = "".join(
             f'<option value="{camera}">{escape(camera_names.get(camera, f"Camera {camera}"))}</option>'
             for camera in cameras
@@ -245,6 +270,13 @@ def register_customer_platform_routes(
         <section class="panel">
           <div class="panel-head"><div><h2>Choose a camera</h2><div class="health-detail">Paid analytics are enabled individually per camera.</div></div></div>
           <label style="display:grid;gap:7px;max-width:360px">Camera<select id="camera-select">{camera_options}</select></label>
+        </section>
+        <section class="panel" style="margin-top:16px">
+          <div class="panel-head"><div><h2>Camera name</h2><div class="health-detail">Give this camera a name your household or team will recognize, like "Front Door" or "Driveway Right." This changes the display name only -- the camera's stream, recording, and analytics are unaffected. Leave blank to use the default "Camera N" label.</div></div></div>
+          <label style="display:grid;gap:7px;max-width:360px">Display name
+            <input id="camera-name-input" type="text" maxlength="60" placeholder="Camera name">
+          </label>
+          <button class="action-button" id="save-camera-name" type="button" style="margin-top:12px">Save camera name</button>
         </section>
         <div class="notification-grid" style="margin-top:16px">
           <section class="panel">
@@ -282,6 +314,29 @@ def register_customer_platform_routes(
         <script>
         const catalog=['smart_motion','people_counting','lpr','ppe_detection'];
         const cameraSelect=document.getElementById('camera-select');
+        const cameraNameInput=document.getElementById('camera-name-input');
+        const rawCameraNames=''' + json.dumps(raw_camera_names) + ''';
+
+        function populateCameraName(){
+          const cameraId=cameraSelect.value;
+          cameraNameInput.value=rawCameraNames[cameraId]||'';
+          cameraNameInput.placeholder=`Camera ${cameraId}`;
+        }
+
+        document.getElementById('save-camera-name').onclick=async()=>{
+          const cameraId=cameraSelect.value;
+          const name=cameraNameInput.value.trim();
+          const response=await fetch(`/api/customer/cameras/${cameraId}/name`,{
+            method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})
+          });
+          const data=await response.json();
+          if(!response.ok){showToast(data.detail||'Could not save camera name.');return}
+          rawCameraNames[cameraId]=data.name;
+          cameraNameInput.value=data.name;
+          const option=cameraSelect.querySelector(`option[value="${cameraId}"]`);
+          if(option)option.textContent=data.display_name;
+          showToast(data.message||'Camera name saved.');
+        };
 
         async function loadCameraSettings(){
           const cameraId=cameraSelect.value;
@@ -359,8 +414,9 @@ def register_customer_platform_routes(
           showToast(data.message||'This device is enrolled.');
         };
 
-        cameraSelect.onchange=loadCameraSettings;
+        cameraSelect.onchange=()=>{loadCameraSettings();populateCameraName()};
         loadCameraSettings();
+        populateCameraName();
         </script>
         '''
         return page_shell("Camera analytics and alerts", "customer-app-settings", content, scripts)
@@ -428,6 +484,33 @@ def register_customer_platform_routes(
         _save(ALERTS_FILE, alerts)
         record_audit(request, "update", f"customer-camera:{camera_id}", "Customer updated per-camera notification program.")
         return {"status": "complete", "alerts": state, "message": "Camera alert program saved."}
+
+    @app.put("/api/customer/cameras/{camera_id}/name")
+    def update_customer_camera_name(camera_id: int, payload: CameraNameUpdate, request: Request):
+        """Renames one of this customer's own cameras. Reuses the same
+        cameras.name column every other customer-facing page already
+        reads (_portal_customer_camera_names(), live_view_page.py's
+        Live/detail views, _render_customer_playback()) -- no new
+        naming system, no schema change. The camera's internal id and
+        camera_number are looked up, never written; only the display
+        name column changes, so RTSP/ONVIF config, recording, and
+        analytics are completely unaffected. An empty name clears the
+        override and every reader already falls back to "Camera N"."""
+        user = _portal_customer_user(request)
+        if str(user.get("role") or "").lower() != "customer_owner":
+            raise HTTPException(status_code=403, detail="Customer owner permission required.")
+        if camera_id not in _portal_customer_camera_ids(user):
+            raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")
+
+        name = payload.name.strip()
+        with connection() as db:
+            db.execute(
+                "UPDATE cameras SET name=? WHERE customer_id=? AND camera_number=?",
+                (name, user["customer_id"], camera_id),
+            )
+        record_audit(request, "update", f"customer-camera:{camera_id}", "Customer renamed a camera.")
+        display_name = name or f"Camera {camera_id}"
+        return {"status": "complete", "name": name, "display_name": display_name, "message": "Camera name saved."}
 
     @app.get("/analytics-entitlements", response_class=HTMLResponse)
     def analytics_entitlements_page(request: Request):

@@ -51740,7 +51740,7 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
     from partner_db import connection
     select = (
         'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, '
-        'c.camera_number AS camera, s.name AS site_name '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
         'JOIN sites s ON s.id = de.site_id '
@@ -51767,6 +51767,7 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
         {
             "id": row["id"],
             "camera": row["camera"],
+            "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
             "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
             "event_type": row["event_type"],
@@ -75435,7 +75436,7 @@ def analytics() -> str:
 
 
 
-    function renderResults(events){const target=document.getElementById('analytics-results');document.getElementById('analytics-result-count').textContent=events.length+' result'+(events.length===1?'':'s');if(!events.length){target.innerHTML='<div class="empty">No events match those filters.</div>';return}target.innerHTML=events.slice(0,100).map(event=>{const title=typeLabels[event.event_type]||String(event.event_type||'Event').replaceAll('_',' '),confidence=Number(event.confidence||0),percent=Math.round(confidence<=1?confidence*100:confidence),stamp=String(event.timestamp||event.start_time||'').replace('T',' ').slice(0,19),image=event.thumbnail?`<img class="analytics-result-thumb" src="${esc(event.thumbnail)}" alt="${esc(title)}">`:'<div class="analytics-result-thumb"></div>',clip=event.linked_recording?`<a class="download" href="${esc(event.linked_recording)}">Open clip</a>`:'<span class="health-detail">No clip</span>';return `<article class="analytics-result">${image}<div><div class="analytics-result-title">${esc(title)} · Camera ${esc(event.camera)}</div><div class="analytics-result-meta">${esc(stamp)} · ${percent}% confidence${event.plate_number?' · Plate '+esc(event.plate_number):''}${event.vehicle_color?' · '+esc(event.vehicle_color):''}</div></div><div class="analytics-result-actions"><span class="analytics-pill">${esc(event.site||'home')}</span>${clip}<a class="download" href="/camera/${esc(event.camera)}">Camera</a></div></article>`}).join('')}
+    function renderResults(events){const target=document.getElementById('analytics-results');document.getElementById('analytics-result-count').textContent=events.length+' result'+(events.length===1?'':'s');if(!events.length){target.innerHTML='<div class="empty">No events match those filters.</div>';return}target.innerHTML=events.slice(0,100).map(event=>{const title=typeLabels[event.event_type]||String(event.event_type||'Event').replaceAll('_',' '),confidence=Number(event.confidence||0),percent=Math.round(confidence<=1?confidence*100:confidence),stamp=String(event.timestamp||event.start_time||'').replace('T',' ').slice(0,19),image=event.thumbnail?`<img class="analytics-result-thumb" src="${esc(event.thumbnail)}" alt="${esc(title)}">`:'<div class="analytics-result-thumb"></div>',clip=event.linked_recording?`<a class="download" href="${esc(event.linked_recording)}">Open clip</a>`:'<span class="health-detail">No clip</span>';return `<article class="analytics-result">${image}<div><div class="analytics-result-title">${esc(title)} · ${esc(event.camera_name||('Camera '+event.camera))}</div><div class="analytics-result-meta">${esc(stamp)} · ${percent}% confidence${event.plate_number?' · Plate '+esc(event.plate_number):''}${event.vehicle_color?' · '+esc(event.vehicle_color):''}</div></div><div class="analytics-result-actions"><span class="analytics-pill">${esc(event.site||'home')}</span>${clip}<a class="download" href="/camera/${esc(event.camera)}">Camera</a></div></article>`}).join('')}
 
 
 
@@ -136761,7 +136762,7 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
         if identity.get("role") == "customer_owner":
             return [
                 dict(camera) for camera in db.execute(
-                    'SELECT id, name FROM cameras WHERE customer_id=? '
+                    'SELECT id, name, camera_number FROM cameras WHERE customer_id=? '
                     'ORDER BY camera_number, id',
                     (identity["customer_id"],),
                 ).fetchall()
@@ -136776,13 +136777,27 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
 
         return [
             dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name FROM cameras c '
+                'SELECT c.id, c.name, c.camera_number FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'WHERE c.customer_id=? AND p.can_playback=1 '
                 'ORDER BY c.camera_number, c.id',
                 (user["id"], identity["customer_id"]),
             ).fetchall()
         ]
+
+
+def _camera_display_label(camera: dict) -> str:
+    """The one place "use the friendly name, else fall back to
+    'Camera N'" is decided for a cameras-table row dict that carries
+    id/name/camera_number -- shared by every customer-facing renderer
+    of a camera list so the fallback convention (Camera <number>, not
+    the internal id) stays identical everywhere instead of drifting
+    per page."""
+    name = (camera.get("name") or "").strip()
+    if name:
+        return name
+    number = camera.get("camera_number")
+    return f"Camera {number}" if number is not None else str(camera.get("id", "Camera"))
 
 
 def _presigned_recording_url(s3_key: str) -> str | None:
@@ -136890,7 +136905,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
 
     camera_tiles = "".join(
         f'<button type="button" class="playback-camera-tile{" active" if index == 0 else ""}" '
-        f'data-camera-id="{escape(camera["id"], quote=True)}">{escape(camera.get("name") or camera["id"])}</button>'
+        f'data-camera-id="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</button>'
         for index, camera in enumerate(cameras)
     )
     recordings_by_camera = {
