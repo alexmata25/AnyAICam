@@ -2500,6 +2500,15 @@ MOTION_DETECTION_ENABLED = os.environ.get("MOTION_DETECTION_ENABLED", "true").lo
 
 MOTION_THRESHOLD = float(os.environ.get("MOTION_THRESHOLD", "12"))
 
+# Per-pixel grayscale delta (0-255) to count a pixel as "changed" between
+# consecutive downsampled frames, and the fraction of in-zone pixels that
+# must change for a frame to register as real motion. Both were
+# previously hard-coded (20 and 0.08) -- made configurable per Smart
+# Motion tuning, same defaults so existing behavior is unchanged unless
+# explicitly overridden.
+MOTION_PIXEL_DIFFERENCE_THRESHOLD = int(os.environ.get("ANYAICAM_MOTION_PIXEL_DIFFERENCE_THRESHOLD", "20"))
+MOTION_CHANGED_RATIO_THRESHOLD = float(os.environ.get("ANYAICAM_MOTION_CHANGED_RATIO_THRESHOLD", "0.08"))
+
 
 
 
@@ -35183,7 +35192,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        if difference >= 20:
+                        if difference >= MOTION_PIXEL_DIFFERENCE_THRESHOLD:
 
 
 
@@ -35246,7 +35255,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        motion_score >= effective_threshold and changed_ratio >= 0.08
+                        motion_score >= effective_threshold and changed_ratio >= MOTION_CHANGED_RATIO_THRESHOLD
 
 
 
