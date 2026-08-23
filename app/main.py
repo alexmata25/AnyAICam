@@ -136888,30 +136888,36 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         )
         return page_shell("Playback", "playback", content)
 
-    camera_options = "".join(
-        f'<option value="{escape(camera["id"], quote=True)}">{escape(camera.get("name") or camera["id"])}</option>'
-        for camera in cameras
+    camera_tiles = "".join(
+        f'<button type="button" class="playback-camera-tile{" active" if index == 0 else ""}" '
+        f'data-camera-id="{escape(camera["id"], quote=True)}">{escape(camera.get("name") or camera["id"])}</button>'
+        for index, camera in enumerate(cameras)
     )
     recordings_by_camera = {
         camera["id"]: _customer_camera_recordings(camera["id"])
         for camera in cameras
     }
+    first_camera_id = cameras[0]["id"]
 
     content = (
         '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
         '<a class="ghost-button" href="/customer-account">Account</a></header>'
-        '<section class="panel">'
-        '<div class="panel-head"><div><h2>Choose a camera</h2><div class="health-detail">Only cameras assigned to your account appear here.</div></div></div>'
-        f'<label style="display:grid;gap:7px;max-width:360px">Camera<select id="playback-camera-select">{camera_options}</select></label>'
-        '</section>'
-        '<section class="playback-workspace" style="gap:16px;margin-top:16px">'
-        '<div class="panel"><div class="camera-view" style="border-radius:10px">'
+        '<style>'
+        '.playback-camera-tiles{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:4px}'
+        '.playback-camera-tile{padding:8px 16px;border-radius:999px;border:1px solid var(--line);'
+        'background:transparent;color:inherit;font:inherit;cursor:pointer}'
+        '.playback-camera-tile.active{background:var(--brand-action,#2f6f6b);color:#fff;border-color:transparent}'
+        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:70vh}'
+        '@media(min-width:900px){.playback-workspace-solo .camera-view{aspect-ratio:21/9}}'
+        '</style>'
+        f'<div class="playback-camera-tiles">{camera_tiles}</div>'
+        '<section class="playback-workspace-solo" style="margin-top:14px">'
+        '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
         '</div></div>'
-        '<div class="panel"><h2>Recordings</h2><div id="playback-clip-list" class="settings-list"></div></div>'
         '</section>'
-        '<section class="monitor-timeline" style="margin-top:16px">'
+        '<section class="monitor-timeline" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Timeline</h2></div></div>'
         '<div class="monitor-toolbar">'
         '<div class="monitor-toolbar-group">'
@@ -136924,6 +136930,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '<button id="share-selected" type="button" disabled>Share</button>'
         '<button id="create-clip" type="button" disabled>Create clip</button>'
         '<button id="bookmark-selected" type="button" disabled>Bookmark</button>'
+        '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
         '<div class="monitor-filters">'
@@ -136951,16 +136958,48 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '<span><i class="legend-dot" style="background:#e8eef6"></i>Recording</span>'
         '</div>'
         '</section>'
+        '<section class="panel" id="playback-clip-panel" hidden style="margin-top:14px">'
+        '<div class="panel-head"><div><h2>Recordings</h2><div class="health-detail">Select a point on the timeline, or browse below.</div></div></div>'
+        '<div id="playback-clip-list" class="settings-list"></div>'
+        '</section>'
     )
 
     scripts = f'''<script>
 (function(){{
   const recordingsByCamera={json.dumps(recordings_by_camera)};
-  const select=document.getElementById('playback-camera-select');
+  const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
   const placeholder=document.getElementById('playback-placeholder');
   const status=document.getElementById('playback-status');
   const clipList=document.getElementById('playback-clip-list');
+  const clipPanel=document.getElementById('playback-clip-panel');
+  const browseButton=document.getElementById('browse-recordings');
+  const viewFrame=document.getElementById('playback-view-frame');
+
+  let selectedCameraId={json.dumps(first_camera_id)};
+
+  function revealClipPanel(){{clipPanel.hidden=false}}
+  browseButton.addEventListener('click',()=>{{clipPanel.hidden=!clipPanel.hidden}});
+
+  cameraTiles.forEach(tile=>{{
+    tile.addEventListener('click',()=>{{
+      cameraTiles.forEach(item=>item.classList.remove('active'));
+      tile.classList.add('active');
+      selectedCameraId=tile.dataset.cameraId;
+      clipPanel.hidden=true;
+      renderCamera();
+    }});
+  }});
+
+  let lastTap=0;
+  viewFrame.addEventListener('dblclick',()=>{{
+    if(viewFrame.requestFullscreen)viewFrame.requestFullscreen().catch(()=>{{}});
+  }});
+  viewFrame.addEventListener('touchend',()=>{{
+    const now=Date.now();
+    if(now-lastTap<350&&viewFrame.requestFullscreen)viewFrame.requestFullscreen().catch(()=>{{}});
+    lastTap=now;
+  }});
 
   const timelineLabel=document.getElementById('playback-timeline-label');
   const timelineLane=document.getElementById('playback-timeline-lane');
@@ -136970,6 +137009,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
     placeholder.hidden=true;
     video.src=clip.url;
     video.play().catch(()=>{{}});
+    revealClipPanel();
   }}
 
   function timelinePercent(dateStr){{
@@ -136996,7 +137036,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
   }}
 
   function renderCamera(){{
-    const clips=recordingsByCamera[select.value]||[];
+    const clips=recordingsByCamera[selectedCameraId]||[];
     video.pause();
     video.removeAttribute('src');
     video.load();
@@ -137012,11 +137052,11 @@ def _render_customer_playback(cameras: list[dict]) -> str:
       row.addEventListener('click',()=>playClip(clip));
       clipList.appendChild(row);
     }});
-    timelineLabel.textContent=select.selectedOptions[0]?select.selectedOptions[0].textContent:'—';
+    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===selectedCameraId);
+    timelineLabel.textContent=activeTile?activeTile.textContent:'—';
     renderTimeline(clips);
   }}
 
-  select.addEventListener('change',renderCamera);
   renderCamera();
 }})();
 </script>'''
