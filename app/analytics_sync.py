@@ -413,12 +413,28 @@ def _build_payload(event: dict) -> dict:
     never read here, so they cannot reach the cloud regardless of what
     the local event contains."""
     detections = event.get("detections")
+    payload_detections = detections if isinstance(detections, list) else None
+    # PPE's hard_hat_present/safety_vest_present booleans are set as
+    # loose extra keys on the local event dict by main.py's PPE hook in
+    # save_yolo_events() (ppe.py's own summarize_ppe() output) -- not
+    # part of AnalyticsEventModel's fixed schema, so they were never
+    # reaching the cloud at all. Forwarded here into this same generic
+    # `detections` field (the cloud's detection_events.detections_json
+    # column already exists and is already unused for "ppe" rows) so
+    # the customer-facing PPE view can show compliant/violation status
+    # without a new column, a new endpoint field, or touching the paused
+    # LPR pipeline this same mechanism deliberately does NOT extend to.
+    if str(event.get("event_type") or "").strip() == "ppe" and payload_detections is None:
+        payload_detections = [{
+            "hard_hat_present": bool(event.get("hard_hat_present")),
+            "safety_vest_present": bool(event.get("safety_vest_present")),
+        }]
     return {
         "local_event_id": str(event.get("id") or "").strip(),
         "event_type": str(event.get("event_type") or "").strip(),
         "confidence": event.get("confidence"),
         "object_count": event.get("object_count"),
-        "detections": detections if isinstance(detections, list) else None,
+        "detections": payload_detections,
         "event_timestamp": str(event.get("timestamp") or "").strip(),
     }
 
@@ -442,15 +458,29 @@ def _build_payload(event: dict) -> dict:
 # remembers actually happened.
 VEHICLE_EVENT_TYPES = frozenset({"car", "truck", "bus", "motorcycle", "bicycle"})
 
+# people_counting_worker() (main.py, edge) writes the literal event_type
+# "people_counting_in"/"people_counting_out" per line-crossing direction
+# -- confirmed live: real crossing events synced to detection_events
+# correctly, but produced zero notifications, same root cause as the
+# vehicle sub-classes above: notification_engine.SUPPORTED only
+# recognizes the generic "people_counting", never the direction-suffixed
+# form. Same reasoning as VEHICLE_EVENT_TYPES: used only for the
+# notification payload below, never for _build_payload() above, so
+# analytics history keeps the specific in/out direction it actually
+# recorded.
+PEOPLE_COUNTING_EVENT_TYPES = frozenset({"people_counting_in", "people_counting_out"})
+
 
 def _notification_event_type(event_type: str) -> str:
     """The event_type the notification route should see: the generic
-    "vehicle" for any of the specific vehicle sub-classes above, or the
-    original event_type unchanged for anything else -- "person",
-    "motion", "people_counting", etc. already match notification_
+    "vehicle"/"people_counting" for any of the specific sub-types above,
+    or the original event_type unchanged for anything else -- "person",
+    "motion", "smart_motion", etc. already match notification_
     engine.SUPPORTED literally and need no translation."""
     if event_type in VEHICLE_EVENT_TYPES:
         return "vehicle"
+    if event_type in PEOPLE_COUNTING_EVENT_TYPES:
+        return "people_counting"
     if event_type == "plate":
         return "lpr"
     return event_type

@@ -615,6 +615,58 @@ def test_plate_notification_type_maps_to_lpr():
     assert asy._notification_event_type("plate") == "lpr"
 
 
+@pytest.mark.parametrize("direction_type", ["people_counting_in", "people_counting_out"])
+def test_people_counting_direction_notification_type_maps_to_generic(direction_type):
+    assert asy._notification_event_type(direction_type) == "people_counting"
+
+
+@pytest.mark.parametrize("direction_type", ["people_counting_in", "people_counting_out"])
+def test_analytics_history_payload_keeps_people_counting_direction_unchanged(direction_type):
+    # Same guarantee as the vehicle sub-class case: the notification
+    # path's translation must never leak into what analytics history
+    # (detection_events, via _build_payload) records -- in vs out must
+    # stay distinguishable there.
+    event = _event("evt-pc-1", event_type=direction_type)
+    payload = asy._build_payload(event)
+    assert payload["event_type"] == direction_type  # NOT "people_counting"
+
+
+# --------------------------------------------------------- PPE compliance forwarded via the existing `detections` field
+
+
+def test_ppe_event_forwards_hard_hat_and_vest_booleans_via_detections():
+    event = _event("evt-ppe-1", event_type="ppe")
+    event["detections"] = None  # ppe.py never populates a raw detections list
+    event["hard_hat_present"] = True
+    event["safety_vest_present"] = False
+    payload = asy._build_payload(event)
+    assert payload["detections"] == [{"hard_hat_present": True, "safety_vest_present": False}]
+
+
+def test_ppe_event_missing_booleans_forwards_false_not_a_crash():
+    event = _event("evt-ppe-2", event_type="ppe")
+    event["detections"] = None
+    payload = asy._build_payload(event)
+    assert payload["detections"] == [{"hard_hat_present": False, "safety_vest_present": False}]
+
+
+def test_ppe_event_with_a_real_detections_list_is_never_overwritten():
+    # If a future change ever does populate ppe.py's own raw detections
+    # list on the event, this forwarding must not clobber it.
+    real_detections = [{"class_name": "helmet", "confidence": 0.9}]
+    event = _event("evt-ppe-3", event_type="ppe", detections=real_detections)
+    event["hard_hat_present"] = True
+    payload = asy._build_payload(event)
+    assert payload["detections"] == real_detections
+
+
+def test_non_ppe_events_are_unaffected_by_the_ppe_forwarding_branch():
+    event = _event("evt-1", event_type="person")
+    event["detections"] = None
+    payload = asy._build_payload(event)
+    assert payload["detections"] is None
+
+
 def test_analytics_history_payload_keeps_plate_unchanged():
     event = _event("evt-plate-1", event_type="plate")
     payload = asy._build_payload(event)
