@@ -372,6 +372,35 @@ def _build_payload(event: dict) -> dict:
     }
 
 
+# Real detections emit the SPECIFIC vehicle sub-class YOLO produced
+# (car/truck/bus/motorcycle/bicycle), but the cloud's existing
+# notification fan-out (notification_engine.SUPPORTED) only recognizes
+# the generic "vehicle" -- confirmed live: real "car"/"motorcycle"
+# events synced to detection_events correctly, but produced zero
+# notifications, because "car" is never literally in that SUPPORTED
+# set. This is the exact same vehicle-class set already used elsewhere
+# in this codebase (see main.py's isVehicle()/`event_type in
+# {"vehicle","car","truck","bus","motorcycle","bicycle"}` checks) --
+# reused here rather than inventing a second, possibly-inconsistent
+# list. Deliberately used ONLY for the notification payload below,
+# never for _build_payload() above: the analytics-history record
+# (detection_events, via the OTHER cloud route) must keep storing the
+# exact, specific class name the detector produced, unchanged -- this
+# mapping exists purely to get a vehicle detection into the existing
+# vehicle-notification path, not to rewrite what analytics history
+# remembers actually happened.
+VEHICLE_EVENT_TYPES = frozenset({"car", "truck", "bus", "motorcycle", "bicycle"})
+
+
+def _notification_event_type(event_type: str) -> str:
+    """The event_type the notification route should see: the generic
+    "vehicle" for any of the specific vehicle sub-classes above, or the
+    original event_type unchanged for anything else -- "person",
+    "motion", "people_counting", etc. already match notification_
+    engine.SUPPORTED literally and need no translation."""
+    return "vehicle" if event_type in VEHICLE_EVENT_TYPES else event_type
+
+
 def _build_notification_payload(event: dict, camera_id: str) -> dict:
     """Shape expected by the existing POST /api/appliance/events route
     (see appliance_cloud.py's events()/notification_engine.fanout_
@@ -386,7 +415,7 @@ def _build_notification_payload(event: dict, camera_id: str) -> dict:
     local-filesystem-only exclusion as _build_payload())."""
     return {
         "id": str(event.get("id") or "").strip(),
-        "event_type": str(event.get("event_type") or "").strip(),
+        "event_type": _notification_event_type(str(event.get("event_type") or "").strip()),
         "camera_id": camera_id,
         "timestamp": str(event.get("timestamp") or "").strip(),
     }

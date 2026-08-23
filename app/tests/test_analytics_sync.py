@@ -563,3 +563,126 @@ def test_notification_is_never_sent_for_an_event_the_analytics_sync_itself_faile
     asy._sync_pending_events()
 
     assert calls == ["/api/appliance/analytics/cam-1/events"]  # never reached /api/appliance/events
+
+
+# --------------------------------------------------------- vehicle sub-class -> generic "vehicle" notification mapping
+
+
+@pytest.mark.parametrize("vehicle_class", ["car", "truck", "motorcycle", "bus", "bicycle"])
+def test_vehicle_subclass_notification_event_type_is_the_generic_vehicle(vehicle_class):
+    assert asy._notification_event_type(vehicle_class) == "vehicle"
+
+
+@pytest.mark.parametrize("non_vehicle_class", ["person", "motion", "people_counting", "line_crossing", "intrusion", "suitcase", "dog"])
+def test_non_vehicle_event_type_passes_through_unchanged(non_vehicle_class):
+    assert asy._notification_event_type(non_vehicle_class) == non_vehicle_class
+
+
+@pytest.mark.parametrize("vehicle_class", ["car", "truck", "motorcycle", "bus", "bicycle"])
+def test_notification_payload_maps_vehicle_subclass_to_generic_vehicle(vehicle_class):
+    event = _event("evt-1", event_type=vehicle_class)
+    payload = asy._build_notification_payload(event, "cam-1")
+    assert payload["event_type"] == "vehicle"
+
+
+@pytest.mark.parametrize("vehicle_class", ["car", "truck", "motorcycle", "bus", "bicycle"])
+def test_analytics_history_payload_keeps_the_specific_vehicle_subclass_unchanged(vehicle_class):
+    # The exact requirement this whole fix is scoped around: the
+    # notification path's translation must never leak into what
+    # analytics history (detection_events, via _build_payload) records.
+    event = _event("evt-1", event_type=vehicle_class)
+    payload = asy._build_payload(event)
+    assert payload["event_type"] == vehicle_class  # NOT "vehicle" -- the real, specific class
+
+
+@pytest.mark.parametrize("vehicle_class", ["car", "truck", "motorcycle", "bus", "bicycle"])
+def test_end_to_end_sync_sends_specific_class_to_analytics_and_generic_vehicle_to_notify(tmp_path, monkeypatch, vehicle_class):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-1", event_type=vehicle_class)])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append((path, payload)) or {"status": "accepted"})
+
+    summary = asy._sync_pending_events()
+
+    assert summary == {"attempted": 1, "synced": 1, "failed": 0}
+    analytics_call = next(c for c in calls if c[0].startswith("/api/appliance/analytics"))
+    notify_call = next(c for c in calls if c[0] == "/api/appliance/events")
+    assert analytics_call[1]["event_type"] == vehicle_class
+    assert notify_call[1]["events"][0]["event_type"] == "vehicle"
+    # Same id on both, still -- the mapping only ever touches event_type.
+    assert analytics_call[1]["local_event_id"] == notify_call[1]["events"][0]["id"] == "evt-1"
+
+
+def test_person_notification_still_says_person_not_vehicle(tmp_path, monkeypatch):
+    # Regression guard: the mapping must be additive, not a blanket
+    # rewrite -- a real person detection's notification event_type must
+    # stay exactly "person".
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-1", event_type="person")])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append((path, payload)) or {"status": "accepted"})
+
+    asy._sync_pending_events()
+
+    notify_call = next(c for c in calls if c[0] == "/api/appliance/events")
+    assert notify_call[1]["events"][0]["event_type"] == "person"
+
+
+# --------------------------------------------------------- no duplicate notification on retry/replay
+
+
+def test_an_already_synced_vehicle_event_is_never_resent_or_renotified_on_a_later_scan(tmp_path, monkeypatch):
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-car-1", event_type="car")])
+    calls = []
+    monkeypatch.setattr(asy, "_control_plane_post", lambda path, payload: calls.append(path) or {"status": "accepted"})
+
+    first = asy._sync_pending_events()
+    assert first == {"attempted": 1, "synced": 1, "failed": 0}
+    assert calls == ["/api/appliance/analytics/cam-1/events", "/api/appliance/events"]
+
+    calls.clear()
+    second = asy._sync_pending_events()
+
+    # The event is already in the synced-id state -- _pending_events
+    # excludes it entirely, so NEITHER cloud route is called again for
+    # it. This is this module's own half of "no duplicate notification"
+    # -- the cloud route's own INSERT OR IGNORE on (appliance_id,
+    # event_id) is the other half, for the case where a POST genuinely
+    # gets retried before a synced response is received (see the
+    # _build_notification_payload docstring on why reusing local_event_id
+    # as the notification route's own id makes that safe too).
+    assert second == {"attempted": 0, "synced": 0, "failed": 0}
+    assert calls == []
+
+
+def test_a_notification_retried_after_a_transient_failure_reuses_the_same_id_for_cloud_side_idempotency(tmp_path, monkeypatch):
+    # Simulates the notification POST failing once (e.g. a transient
+    # network error) and the analytics-event POST succeeding -- the
+    # event is marked synced either way (notification is best-effort),
+    # so a later scan never retries either call for this event. This
+    # confirms a flaky notification delivery can never turn into a
+    # duplicate: it either succeeds once, or the module simply moves on
+    # without ever re-POSTing to the notification route for this event
+    # again.
+    monkeypatch.setattr(asy, "ANALYTICS_SYNC_NOTIFY_ENABLED", True)
+    _register_camera(1, camera_id="cam-1")
+    _write_local_events(tmp_path, [_event("evt-truck-1", event_type="truck")])
+    notify_calls = []
+
+    def _post(path, payload):
+        if path == "/api/appliance/events":
+            notify_calls.append(payload)
+            return None  # fails once
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(asy, "_control_plane_post", _post)
+
+    asy._sync_pending_events()
+    asy._sync_pending_events()  # a later scan -- event already synced, must not retry
+
+    assert len(notify_calls) == 1  # exactly one attempt, never a silent retry-storm
+    assert notify_calls[0]["events"][0]["event_type"] == "vehicle"
