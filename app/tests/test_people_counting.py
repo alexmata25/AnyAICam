@@ -43,6 +43,28 @@ def det_box(x: float, y: float, w: float, h: float) -> dict:
     return {"x": x, "y": y, "w": w, "h": h}
 
 
+def horizontal_line(direction: str = "both") -> CountingLine:
+    """A ground-plane-style line running horizontally across the middle
+    of the frame (y=0.5) -- used specifically for the foot-point-vs-
+    centroid crossing tests below, since that offset is a VERTICAL
+    effect (bottom-of-box vs vertical-center) that a purely-vertical
+    counting line (this file's usual `vertical_line`, which only ever
+    tests x-position) can never expose. Walking downward (y increasing)
+    through this line is an OUT crossing; upward is IN -- same fixed
+    cross-product sign convention as every other line in this module."""
+    return CountingLine(x1=0.0, y1=0.5, x2=1.0, y2=0.5, direction=direction)
+
+
+def det_foot(x: float, y: float, w: float, h: float) -> dict:
+    """A detection carrying full box info AND its ground-contact
+    (foot) point -- bottom-center of the box, i.e. (x, y + h/2) -- the
+    exact shape main.py's real integration layer sends once foot-point
+    crossing is wired in. Horizontal position is shared with the
+    centroid; only the vertical position differs, which is the whole
+    point of the comparison below."""
+    return {"x": x, "y": y, "w": w, "h": h, "foot_x": x, "foot_y": y + h / 2}
+
+
 # A standard, verified-safe left-to-right walk that crosses x=0.5
 # between the 3rd and 4th points (0.44 -> 0.56), and a mirrored
 # right-to-left walk that crosses between the same two points reversed.
@@ -749,3 +771,106 @@ def test_two_nearby_people_never_merge_into_a_single_track_across_a_close_pass()
         assert len(counter.tracks) == 2, "must never collapse to one track, even at closest approach"
     sizes = sorted(t.w for t in counter.tracks.values())
     assert sizes == pytest.approx([0.09, 0.28], abs=0.01)
+
+
+# --- Section 17: foot-point vs centroid crossing point --------------------
+#
+# For a ground-plane doorway/walkway line viewed from an elevated,
+# angled camera (this deployment's real geometry), a person's bounding-
+# box CENTROID sits roughly at torso height, not at their actual
+# ground-contact point. The centroid's projected position relative to
+# a ground-drawn line is offset from where the person's feet truly are
+# -- an offset that grows with box height (closer to camera / taller
+# in frame) and wobbles with pose (stride, arm position) even when the
+# person's real ground position barely changes. The bottom-center of
+# the box ("foot point") is the standard, more physically-correct
+# choice for this kind of line: it approximates where the person
+# actually contacts the ground, so it crosses a ground-plane line at
+# closer to the true moment a real crossing happens, and it is less
+# sensitive to upper-body pose noise than the centroid is.
+#
+# These tests demonstrate the difference directly: the SAME underlying
+# walk (identical x/y/w/h detections, so matching/tracking behavior is
+# provably unaffected) run twice -- once through plain det_box() (no
+# foot info, today's default) and once through det_foot() (adds
+# foot_x/foot_y) -- shows the foot-point counter registering the same
+# real crossing one full frame earlier than the centroid-only counter,
+# because the person's feet reach the line before their box's vertical
+# center does.
+
+
+def test_foot_point_vs_centroid_crossing_timing_comparison():
+    """A person walks straight down (y increasing) through a horizontal
+    ground-plane line at y=0.5, with a tall, constant-size box (h=0.40)
+    typical of someone close to/prominent in frame. Fed the identical
+    x/y/w/h sequence to two separate counters -- one via det_box()
+    (centroid only), one via det_foot() (centroid + foot point) -- the
+    foot-point counter counts the OUT crossing a full frame earlier
+    than the centroid-only counter, because the box's bottom edge
+    (the person's feet) reaches y=0.5 before its vertical center does."""
+    y_values = [0.15, 0.34, 0.55]
+    w, h = 0.20, 0.40
+
+    centroid_counter = PeopleCounter(horizontal_line())
+    foot_counter = PeopleCounter(horizontal_line())
+
+    # Frame 1: establishes both trackers on side -1 ("in"), well clear
+    # of the line_buffer for both the centroid and the foot point.
+    centroid_counter.update([det_box(0.5, y_values[0], w, h)])
+    foot_counter.update([det_foot(0.5, y_values[0], w, h)])
+    assert centroid_counter.out_count == 0
+    assert foot_counter.out_count == 0
+
+    # Frame 2: the box's bottom edge (0.34 + 0.20 = 0.54) has clearly
+    # crossed y=0.5, but its vertical center (0.34) has not -- the
+    # foot-point counter counts the crossing NOW; the centroid-only
+    # counter does not yet.
+    events_centroid_f2 = centroid_counter.update([det_box(0.5, y_values[1], w, h)])
+    events_foot_f2 = foot_counter.update([det_foot(0.5, y_values[1], w, h)])
+    assert events_centroid_f2 == [], "centroid (0.34) has not reached the line yet"
+    assert centroid_counter.out_count == 0
+    assert len(events_foot_f2) == 1, "the foot point (0.54) has clearly crossed the line"
+    assert events_foot_f2[0].direction == "out"
+    assert foot_counter.out_count == 1
+
+    # Frame 3: the box's vertical center (0.55) has now also clearly
+    # crossed -- the centroid-only counter finally counts the SAME
+    # real crossing, one full frame later. The foot-point counter's
+    # count is unchanged (it already counted this crossing).
+    events_centroid_f3 = centroid_counter.update([det_box(0.5, y_values[2], w, h)])
+    events_foot_f3 = foot_counter.update([det_foot(0.5, y_values[2], w, h)])
+    assert len(events_centroid_f3) == 1
+    assert events_centroid_f3[0].direction == "out"
+    assert centroid_counter.out_count == 1
+    assert events_foot_f3 == [], "foot-point counter already counted this crossing at frame 2"
+    assert foot_counter.out_count == 1
+
+    # Both counters agree on the final outcome (one real OUT crossing,
+    # no double-counting either way) -- they differ only in WHEN they
+    # detected it, not in the correctness of the final tally. And
+    # matching/tracking was identical throughout: exactly one track in
+    # each counter for the whole sequence, proving foot points affect
+    # only the crossing decision, never association.
+    assert len(centroid_counter.tracks) == 1
+    assert len(foot_counter.tracks) == 1
+
+
+def test_no_foot_point_provided_behaves_exactly_like_before_this_feature():
+    """Explicit backward-compatibility proof, stated as its own test
+    (in addition to every pre-existing test in this file continuing to
+    pass unchanged): a caller that only ever sends plain det_box()
+    detections -- no "foot_x"/"foot_y" keys at all -- gets the exact
+    same centroid-based crossing timing as before foot-point crossing
+    existed. Reuses the same walk as the comparison test above, run
+    through only the centroid path."""
+    y_values = [0.15, 0.34, 0.55]
+    w, h = 0.20, 0.40
+    counter = PeopleCounter(horizontal_line())
+
+    counter.update([det_box(0.5, y_values[0], w, h)])
+    events_f2 = counter.update([det_box(0.5, y_values[1], w, h)])
+    assert events_f2 == [], "no foot point provided -- crossing decision must stay centroid-based"
+    events_f3 = counter.update([det_box(0.5, y_values[2], w, h)])
+    assert len(events_f3) == 1
+    assert events_f3[0].direction == "out"
+    assert counter.out_count == 1

@@ -210,6 +210,16 @@ class Track:
     # this feature existed.
     w: float = 0.0
     h: float = 0.0
+    # foot_x/foot_y: this track's most recently observed GROUND-CONTACT
+    # point (bottom-center of the detection box), used ONLY for the
+    # line-crossing side decision below -- matching/prediction (see
+    # _predicted_position, the IoU/scale-penalty cost) continues to use
+    # cx/cy exclusively, unchanged. None (the default) means "no foot
+    # point available for this track", in which case crossing decisions
+    # fall back to cx/cy exactly as before this feature existed -- see
+    # PeopleCounter.update()'s docstring for the full rationale.
+    foot_x: float | None = None
+    foot_y: float | None = None
 
 
 @dataclass(frozen=True)
@@ -366,7 +376,28 @@ class PeopleCounter:
         further consideration). This -- not just the richer cost
         function -- is what actually prevents two nearby people from
         being able to steal each other's track purely because of which
-        order they happened to appear in the detections list."""
+        order they happened to appear in the detections list.
+
+        Crossing-point choice: when a detection carries `foot_x`/
+        `foot_y` (the bottom-center of its box -- see main.py's
+        integration layer), the LINE-CROSSING decision (side, raw
+        cross value, which frame counts as "crossed") uses that point
+        instead of the centroid. Ground-plane doorway/walkway lines are
+        physically crossed by a person's FEET, not their torso -- for
+        an elevated, angled camera (exactly this deployment's geometry)
+        the centroid's projected ground position is offset from the
+        true foot position by an amount that grows with box height/
+        perspective and wobbles with pose (arm position, stride), which
+        can leave a track hovering near raw_cross=0 for many frames
+        without ever cleanly resolving. The foot point is comparatively
+        stable and matches the physically correct crossing definition.
+        This is used ONLY for the crossing decision -- matching/
+        prediction above still uses cx/cy exclusively, since a stable
+        center-of-mass point (not the more pose-sensitive foot point)
+        is what association benefits from. A detection with no foot_x/
+        foot_y falls back to the centroid for crossing too, so any
+        caller that never sends these keys (every test/caller that
+        predates this feature) behaves EXACTLY as before."""
         self.frame_index += 1
         events: list[CrossingEvent] = []
         debug_entries: list[dict] = []
@@ -407,7 +438,15 @@ class PeopleCounter:
         matched_ids: set[int] = set()
         for i, det in enumerate(deduped):
             x, y = det["x"], det["y"]
-            raw_cross = _line_cross_value(self.line, x, y)
+            det_foot_x, det_foot_y = det.get("foot_x"), det.get("foot_y")
+            # Crossing-point selection: foot point when available,
+            # centroid otherwise -- see update()'s docstring. Matching
+            # above never sees this; it always used x/y (centroid).
+            if det_foot_x is not None and det_foot_y is not None:
+                cross_x, cross_y = det_foot_x, det_foot_y
+            else:
+                cross_x, cross_y = x, y
+            raw_cross = _line_cross_value(self.line, cross_x, cross_y)
             if i in assignment:
                 tid = assignment[i]
                 track = self.tracks[tid]
@@ -437,7 +476,7 @@ class PeopleCounter:
                     else:
                         direction = "in" if new_side < 0 else "out"
                         if self.line.direction in ("both", direction):
-                            events.append(CrossingEvent(track_id=tid, direction=direction, frame_index=self.frame_index, x=x, y=y))
+                            events.append(CrossingEvent(track_id=tid, direction=direction, frame_index=self.frame_index, x=cross_x, y=cross_y))
                             if direction == "in":
                                 self.in_count += 1
                             else:
@@ -459,6 +498,8 @@ class PeopleCounter:
                         "track_id": tid, "track_status": "matched",
                         "prev_side": prev_side, "new_side": new_side,
                         "crossed": crossed, "crossing_reason": crossing_reason,
+                        "crossing_point": "foot" if det_foot_x is not None and det_foot_y is not None else "centroid",
+                        "foot_x": det_foot_x, "foot_y": det_foot_y,
                     })
                 # Shift the position history by one step BEFORE
                 # overwriting cx/cy -- prev_cx/prev_cy becomes what cx/cy
@@ -473,17 +514,25 @@ class PeopleCounter:
                 # IoU comparisons for no reason).
                 if "w" in det and "h" in det:
                     track.w, track.h = det["w"], det["h"]
+                # Same rule for foot_x/foot_y: only overwrite when this
+                # detection actually carries one, so a track that starts
+                # getting foot points mid-life doesn't retroactively
+                # break, and a caller that never sends them never has a
+                # stale None poisoned into something else.
+                if det_foot_x is not None and det_foot_y is not None:
+                    track.foot_x, track.foot_y = det_foot_x, det_foot_y
                 track.side = new_side if new_side != 0 else prev_side
                 track.last_seen_frame = self.frame_index
                 track.missed_frames = 0
                 matched_ids.add(tid)
             else:
                 tid = next(self._next_id)
-                initial_side = _side_of_line(self.line, x, y)  # no previous side to buffer against yet
+                initial_side = _side_of_line(self.line, cross_x, cross_y)  # no previous side to buffer against yet
                 self.tracks[tid] = Track(
                     track_id=tid, cx=x, cy=y, last_seen_frame=self.frame_index,
                     side=initial_side if initial_side != 0 else None,
                     w=det.get("w", 0.0), h=det.get("h", 0.0),
+                    foot_x=det_foot_x, foot_y=det_foot_y,
                 )
                 matched_ids.add(tid)
                 if debug:
@@ -492,6 +541,8 @@ class PeopleCounter:
                         "track_id": tid, "track_status": "new_track",
                         "prev_side": None, "new_side": initial_side,
                         "crossed": False, "crossing_reason": "new_track_no_prior_side",
+                        "crossing_point": "foot" if det_foot_x is not None and det_foot_y is not None else "centroid",
+                        "foot_x": det_foot_x, "foot_y": det_foot_y,
                     })
 
         expired_tracks = []

@@ -38149,16 +38149,26 @@ async def people_counting_worker(camera_number: int) -> None:
                             cy = (detection["y"] + detection["height"] / 2) / frame_height
                             norm_w = detection["width"] / frame_width
                             norm_h = detection["height"] / frame_height
-                            centroids.append({"x": cx, "y": cy, "w": norm_w, "h": norm_h})
+                            # foot_x/foot_y: bottom-center of the box (a
+                            # person's ground-contact point), used ONLY
+                            # by people_counting.py's crossing decision,
+                            # not for matching -- see that module's
+                            # update() docstring for why this is the
+                            # physically correct point for a ground-
+                            # plane doorway/walkway line.
+                            foot_x = cx
+                            foot_y = (detection["y"] + detection["height"]) / frame_height
+                            centroids.append({"x": cx, "y": cy, "w": norm_w, "h": norm_h, "foot_x": foot_x, "foot_y": foot_y})
                     if debug:
-                        print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f})" for c in centroids))
+                        print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f},foot_x={c['foot_x']:.4f},foot_y={c['foot_y']:.4f})" for c in centroids))
                     if debug:
                         events, debug_entries = counter.update(centroids, debug=True)
                         for entry in debug_entries:
                             print(
                                 f"[PeopleCountingDebug][cam{camera_number}] track={entry['track_id']} status={entry['track_status']} "
                                 f"prev_side={entry['prev_side']} new_side={entry['new_side']} crossed={entry['crossed']} "
-                                f"reason={entry['crossing_reason']} raw_cross={entry['raw_cross_value']}"
+                                f"reason={entry['crossing_reason']} raw_cross={entry['raw_cross_value']} "
+                                f"crossing_point={entry.get('crossing_point')} foot_x={entry.get('foot_x')} foot_y={entry.get('foot_y')}"
                             )
                         print(f"[PeopleCountingDebug][cam{camera_number}] totals in={counter.in_count} out={counter.out_count} occupancy={counter.occupancy}")
                     else:
@@ -76605,12 +76615,15 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 @app.get("/api/people-counting/active-line")
 def people_counting_active_line_api(camera: int = 1) -> dict:
-    """TEMPORARY, read-only diagnostic endpoint: what counting line (if
-    any) is actively configured for People Counting on this camera
-    right now, and whether the camera is currently entitled. Reads the
-    exact same two functions the real counting worker itself reads
-    (recording_uploader._camera_identity(), _load_people_counting_rule())
-    -- this reports the TRUE active state, not a separate guess at it.
+    """Read-only: what counting line (if any) is actively configured
+    for People Counting on this camera right now, and whether the
+    camera is currently entitled. Reads the exact same two functions
+    the real counting worker itself reads (recording_uploader.
+    _camera_identity(), _load_people_counting_rule()) -- this reports
+    the TRUE active state, not a separate guess at it. This is also
+    what the setup page below calls immediately after a save, so what
+    the operator sees overlaid is provably the same geometry the
+    worker consumes, not just what the browser thinks it POSTed.
     Purely additive: never writes anything, never affects counting
     behavior, safe to call at any time for any camera."""
     identity = recording_uploader._camera_identity(camera)
@@ -76623,29 +76636,107 @@ def people_counting_active_line_api(camera: int = 1) -> dict:
     return {"camera": camera, "entitled": entitled, "line": line, "rule_id": rule.get("id") if rule else None}
 
 
+class PeopleCountingLineSaveRequest(BaseModel):
+    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    geometry: list[dict] = Field(min_length=2)
+    direction: str = "both"
+
+
+@app.post("/api/people-counting/save-line")
+def people_counting_save_line_api(payload: PeopleCountingLineSaveRequest) -> dict:
+    """Saves a People Counting line for a camera by reusing the
+    EXISTING rule-builder save path (create_analytics_rule()) rather
+    than a second, parallel save mechanism -- per the same "reuse
+    existing line-rule infrastructure" principle _load_people_counting_
+    rule() already follows for reading.
+
+    Critically, this is an IN-PLACE update of the SAME rule id the
+    worker already consumes when one exists, not a new rule with a
+    fresh id: _load_people_counting_rule() returns the FIRST matching
+    line_crossing rule for a camera, so saving a new rule via the
+    generic rule-builder form (which always mints a new uuid) could
+    silently produce a line the worker never actually uses, with no
+    visible error. Reading the existing rule first and preserving its
+    id/name/other fields -- replacing only geometry and direction --
+    guarantees the geometry an operator just drew is the geometry the
+    worker reads on its very next cycle. If no rule exists yet for
+    this camera, a new one is created with sane defaults."""
+    existing = _load_people_counting_rule(payload.camera)
+    if existing:
+        rule = AnalyticsRuleModel(
+            id=existing["id"],
+            camera=payload.camera,
+            site=existing.get("site", "home"),
+            name=existing.get("name", f"People Counting line (camera {payload.camera})"),
+            analytic_type="line_crossing",
+            enabled=True,
+            direction=payload.direction,
+            sensitivity=existing.get("sensitivity", 60),
+            confidence_threshold=existing.get("confidence_threshold", 0.6),
+            schedule_start=existing.get("schedule_start", "00:00"),
+            schedule_end=existing.get("schedule_end", "23:59"),
+            retention_days=existing.get("retention_days", 30),
+            alerts_enabled=existing.get("alerts_enabled", True),
+            geometry=payload.geometry,
+        )
+    else:
+        rule = AnalyticsRuleModel(
+            camera=payload.camera,
+            name=f"People Counting line (camera {payload.camera})",
+            analytic_type="line_crossing",
+            enabled=True,
+            direction=payload.direction,
+            geometry=payload.geometry,
+        )
+    return create_analytics_rule(rule)
+
+
 @app.get("/people-counting-preview", response_class=HTMLResponse)
 def people_counting_preview_page() -> str:
-    """TEMPORARY, read-only diagnostic page: shows the live camera feed
-    with the currently-configured People Counting line drawn on top of
-    it (fetched from /api/people-counting/active-line, refreshed every
-    5s), so a test operator can see exactly where the counting boundary
-    is before staging a walk-test. This is a brand-new, standalone
-    route -- it does not modify analytics_rule_builder, the main live-
-    view page, or any camera's existing behavior; it only reads already-
-    configured state. Defaults to PEOPLE_COUNTING_DEBUG_CAMERA (Camera 1)
-    but the camera selector works for any camera so this stays useful
-    if that constant is ever changed."""
+    """A visually-verifiable People Counting line setup workflow for a
+    single camera: shows the live feed, lets an operator draw a new
+    line directly on the image, save it, and then see the EXACT SAVED
+    geometry read back and overlaid -- replacing the earlier blind
+    walk-testing approach (drawing a line elsewhere, in the general
+    rule builder, with no way to confirm it landed where intended or
+    that it's even the rule the worker is reading).
+
+    Two lines can be visible at once, in different colors, so "what's
+    currently active" is never confused with "what I just drew but
+    haven't saved yet":
+      - ACTIVE line (orange): fetched from /api/people-counting/
+        active-line, which reads the exact same functions the real
+        counting worker itself reads (_load_people_counting_rule()).
+        This is the provable ground truth, not a guess.
+      - DRAFT line (cyan): the two points the operator just clicked,
+        not yet saved.
+
+    Saving POSTs to /api/people-counting/save-line, which updates the
+    SAME rule id the worker already consumes (see that endpoint's
+    docstring for why an in-place update matters here) -- then this
+    page immediately re-fetches active-line and redraws, closing the
+    loop with the identical read path the worker uses. This is a
+    brand-new, standalone route -- it does not modify
+    analytics_rule_builder, the main live-view page, or any camera's
+    other existing behavior. Defaults to PEOPLE_COUNTING_DEBUG_CAMERA
+    (Camera 1) but the camera selector works for any camera."""
     camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in range(1, CAMERA_COUNT + 1))
-    content = f"""<header class="topbar"><div><p class="eyebrow">People Counting diagnostic</p><h1>Counting line preview</h1></div></header><div class="mock-banner">Read-only preview -- shows the currently active People Counting line and entitlement for the selected camera. Does not edit or create a rule.</div><section class="rule-layout"><div class="panel"><div class="panel-head"><h2>Live preview</h2><label style="font-weight:normal">Camera <select id="pcp-camera">{camera_options}</select></label></div><div class="rule-stage"><video id="pcp-video" autoplay muted playsinline></video><canvas id="pcp-canvas" width="1280" height="720"></canvas></div></div><div class="panel"><h2>Status</h2><div id="pcp-status" class="health-detail">Loading…</div></div></section>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">People Counting setup</p><h1>Counting line setup &amp; verification</h1></div></header><div class="mock-banner">Orange = the line the appliance worker is actually using right now (read from the same source it reads). Cyan = a new line you've drawn but not yet saved.</div><section class="rule-layout"><div class="panel"><div class="panel-head"><h2>Live camera</h2><label style="font-weight:normal">Camera <select id="pcp-camera">{camera_options}</select></label></div><div class="rule-stage"><video id="pcp-video" autoplay muted playsinline></video><canvas id="pcp-canvas" width="1280" height="720"></canvas></div><p class="health-detail">Click two points on the image to draw a new line, then Save.</p></div><div class="panel"><h2>Draw &amp; save</h2><label>Direction<select id="pcp-direction"><option value="both">Both directions</option><option value="inbound">Inbound / In</option><option value="outbound">Outbound / Out</option></select></label><div style="display:flex;gap:8px;margin-top:10px"><button class="ghost-button" id="pcp-draw">Draw new line</button><button class="ghost-button" id="pcp-clear">Clear draft</button><button class="action-button" id="pcp-save" disabled>Save line</button></div><h2 style="margin-top:20px">Status</h2><div id="pcp-status" class="health-detail">Loading…</div></div></section>"""
     scripts = f"""<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>
-const camera=document.getElementById('pcp-camera'),video=document.getElementById('pcp-video'),canvas=document.getElementById('pcp-canvas'),context=canvas.getContext('2d'),status=document.getElementById('pcp-status');
+const camera=document.getElementById('pcp-camera'),video=document.getElementById('pcp-video'),canvas=document.getElementById('pcp-canvas'),context=canvas.getContext('2d'),status=document.getElementById('pcp-status'),directionSelect=document.getElementById('pcp-direction'),drawButton=document.getElementById('pcp-draw'),clearButton=document.getElementById('pcp-clear'),saveButton=document.getElementById('pcp-save');
 camera.value='{PEOPLE_COUNTING_DEBUG_CAMERA}';
+let activeLine=null,draftPoints=[],drawing=false;
 function connectPreview(){{const source=`/static/hls/camera${{camera.value}}.m3u8`;if(window.pcpHls)window.pcpHls.destroy();if(Hls.isSupported()){{window.pcpHls=new Hls();window.pcpHls.loadSource(source);window.pcpHls.attachMedia(video)}}else video.src=source}}
-function drawLine(line){{context.clearRect(0,0,canvas.width,canvas.height);if(!line)return;context.strokeStyle='#ff6b35';context.lineWidth=5;context.beginPath();context.moveTo(line.x1*canvas.width,line.y1*canvas.height);context.lineTo(line.x2*canvas.width,line.y2*canvas.height);context.stroke();[[line.x1,line.y1],[line.x2,line.y2]].forEach(p=>{{context.beginPath();context.arc(p[0]*canvas.width,p[1]*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}
-async function refresh(){{try{{const response=await fetch(`/api/people-counting/active-line?camera=${{camera.value}}`),data=await response.json();drawLine(data.line);status.textContent=data.line?`Camera ${{data.camera}} — entitled: ${{data.entitled}} — direction: ${{data.line.direction}} — rule ${{data.rule_id}}`:`Camera ${{data.camera}} — entitled: ${{data.entitled}} — no counting line configured`}}catch(error){{status.textContent='Preview temporarily unavailable'}}}}
-camera.addEventListener('change',()=>{{connectPreview();refresh()}});connectPreview();refresh();setInterval(refresh,5000);
+function drawOneLine(line,color){{context.strokeStyle=color;context.lineWidth=5;context.beginPath();context.moveTo(line.x1*canvas.width,line.y1*canvas.height);context.lineTo(line.x2*canvas.width,line.y2*canvas.height);context.stroke();[[line.x1,line.y1],[line.x2,line.y2]].forEach(p=>{{context.beginPath();context.arc(p[0]*canvas.width,p[1]*canvas.height,8,0,Math.PI*2);context.fillStyle='#fff';context.fill()}})}}
+function redraw(){{context.clearRect(0,0,canvas.width,canvas.height);if(activeLine)drawOneLine(activeLine,'#ff6b35');if(draftPoints.length===2)drawOneLine({{x1:draftPoints[0].x,y1:draftPoints[0].y,x2:draftPoints[1].x,y2:draftPoints[1].y}},'#42e4dc');else draftPoints.forEach(p=>{{context.beginPath();context.arc(p.x*canvas.width,p.y*canvas.height,8,0,Math.PI*2);context.fillStyle='#42e4dc';context.fill()}})}}
+canvas.addEventListener('click',event=>{{if(!drawing)return;const rect=canvas.getBoundingClientRect();if(draftPoints.length>=2)draftPoints.length=0;draftPoints.push({{x:(event.clientX-rect.left)/rect.width,y:(event.clientY-rect.top)/rect.height}});saveButton.disabled=draftPoints.length<2;redraw()}});
+drawButton.addEventListener('click',()=>{{drawing=true;draftPoints.length=0;saveButton.disabled=true;redraw();status.textContent='Draw mode on -- click two points on the image.'}});
+clearButton.addEventListener('click',()=>{{draftPoints.length=0;saveButton.disabled=true;redraw()}});
+async function refresh(){{try{{const response=await fetch(`/api/people-counting/active-line?camera=${{camera.value}}`),data=await response.json();activeLine=data.line;redraw();status.textContent=data.line?`ACTIVE (what the worker uses) — camera ${{data.camera}}, entitled: ${{data.entitled}}, direction: ${{data.line.direction}}, rule ${{data.rule_id}}, geometry: (${{data.line.x1.toFixed(4)}}, ${{data.line.y1.toFixed(4)}}) → (${{data.line.x2.toFixed(4)}}, ${{data.line.y2.toFixed(4)}})`:`Camera ${{data.camera}} — entitled: ${{data.entitled}} — no counting line configured yet`}}catch(error){{status.textContent='Preview temporarily unavailable'}}}}
+saveButton.addEventListener('click',async()=>{{if(draftPoints.length<2)return;const payload={{camera:Number(camera.value),direction:directionSelect.value,geometry:draftPoints}};saveButton.disabled=true;status.textContent='Saving…';try{{const response=await fetch('/api/people-counting/save-line',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();if(result.status==='complete'){{drawing=false;draftPoints.length=0;await refresh();status.textContent='Saved — '+status.textContent}}else{{status.textContent='Save failed: '+result.message;saveButton.disabled=false}}}}catch(error){{status.textContent='Save failed: request error';saveButton.disabled=false}}}});
+camera.addEventListener('change',()=>{{drawing=false;draftPoints.length=0;saveButton.disabled=true;connectPreview();refresh()}});connectPreview();refresh();setInterval(refresh,5000);
 </script>"""
-    return page_shell("Counting line preview", "analytics", content, scripts)
+    return page_shell("Counting line setup", "analytics", content, scripts)
 
 
 
