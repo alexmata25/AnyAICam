@@ -34671,6 +34671,22 @@ async def store_motion_event(
 
 
     print(f"Motion detected on Camera {camera_number} (confidence {event.confidence:.1f}%).")
+    classification = smart_motion.classify_motion(camera_number)
+    if classification:
+        smart_event = AnalyticsEventModel(
+            camera=camera_number,
+            site="home",
+            rule_name=f"Smart Motion ({classification})",
+            event_type="smart_motion",
+            timestamp=start_time,
+            confidence=event.confidence,
+            thumbnail=thumbnail,
+            linked_recording=event.linked_recording,
+            mock=False,
+        ).model_dump(mode="json")
+        smart_event["triggered_by"] = classification
+        smart_event["motion_event_id"] = event.id
+        await asyncio.to_thread(append_analytics_event, smart_event)
 
 
 
@@ -37188,6 +37204,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         append_analytics_event(event)
+        smart_motion.record_object_detection(camera_number, class_name)
 
 
 
@@ -38702,6 +38719,7 @@ import live_relay_uploader
 import recording_uploader
 import recording_retention_sweep
 import analytics_sync
+import smart_motion
 import talk_down_discovery
 import people_counting
 import talk_audio_relay_client
