@@ -2540,6 +2540,15 @@ PEOPLE_COUNTING_ENABLED = os.environ.get("PEOPLE_COUNTING_ENABLED", "false").low
 PEOPLE_COUNTING_INTERVAL_SECONDS = max(0.5, float(os.environ.get("PEOPLE_COUNTING_INTERVAL_SECONDS", "1.5")))
 PEOPLE_COUNTING_STATE_FILE = RECORDINGS_FOLDER / "people_counting_state.json"
 
+# TEMPORARY, walk-test diagnostics only -- intentionally hardcoded, not
+# an env var, so it can't accidentally be left on for every camera in
+# a real deployment. 0 (or any camera number never actually entitled)
+# disables the extra [PeopleCountingDebug] log lines entirely. Remove
+# this constant and its use in people_counting_worker() once real-world
+# walk-test debugging is done -- it is not meant to be a permanent
+# feature of this worker.
+PEOPLE_COUNTING_DEBUG_CAMERA = int(os.environ.get("PEOPLE_COUNTING_DEBUG_CAMERA", "1"))
+
 
 
 
@@ -38047,11 +38056,14 @@ async def people_counting_worker(camera_number: int) -> None:
     analytics_sync.py background sync to AWS with zero new sync code."""
     counter: "people_counting.PeopleCounter | None" = None
     configured_line_key = None
+    debug = camera_number == PEOPLE_COUNTING_DEBUG_CAMERA  # TEMPORARY, walk-test diagnostics only -- see PEOPLE_COUNTING_DEBUG_CAMERA's own comment
     while True:
         try:
             identity = recording_uploader._camera_identity(camera_number)
             entitled = bool(identity and identity.get("people_counting_enabled"))
             rule = _load_people_counting_rule(camera_number) if entitled else None
+            if debug:
+                print(f"[PeopleCountingDebug][cam{camera_number}] cycle_start entitled={entitled} rule_loaded={rule is not None}")
             if entitled and rule and len(rule.get("geometry", [])) >= 2:
                 line = people_counting.CountingLine.from_rule_geometry(rule["geometry"], rule.get("direction", "both"))
                 line_key = (tuple((p.get("x"), p.get("y")) for p in rule["geometry"][:2]), rule.get("direction", "both"))
@@ -38061,8 +38073,14 @@ async def people_counting_worker(camera_number: int) -> None:
                     if saved:
                         counter.restore(people_counting.CounterState(**saved))
                     configured_line_key = line_key
+                    if debug:
+                        print(f"[PeopleCountingDebug][cam{camera_number}] line_loaded x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction} restored_from_state={saved is not None}")
+                if debug:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] line_in_use x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction}")
 
                 result = await asyncio.to_thread(detect_objects_frame, camera_number)
+                if debug:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] detect_objects_frame ok={result.get('ok')} error={result.get('error')} raw_detections={len(result.get('detections', []))}")
                 if result.get("ok"):
                     frame = result.get("frame")
                     centroids = []
@@ -38074,7 +38092,19 @@ async def people_counting_worker(camera_number: int) -> None:
                             cx = (detection["x"] + detection["width"] / 2) / frame_width
                             cy = (detection["y"] + detection["height"] / 2) / frame_height
                             centroids.append({"x": cx, "y": cy})
-                    events = counter.update(centroids)
+                    if debug:
+                        print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f})" for c in centroids))
+                    if debug:
+                        events, debug_entries = counter.update(centroids, debug=True)
+                        for entry in debug_entries:
+                            print(
+                                f"[PeopleCountingDebug][cam{camera_number}] track={entry['track_id']} status={entry['track_status']} "
+                                f"prev_side={entry['prev_side']} new_side={entry['new_side']} crossed={entry['crossed']} "
+                                f"reason={entry['crossing_reason']} raw_cross={entry['raw_cross_value']}"
+                            )
+                        print(f"[PeopleCountingDebug][cam{camera_number}] totals in={counter.in_count} out={counter.out_count} occupancy={counter.occupancy}")
+                    else:
+                        events = counter.update(centroids)
                     if events:
                         now = datetime.now()
                         for event in events:

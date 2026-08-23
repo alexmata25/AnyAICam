@@ -327,3 +327,81 @@ def test_side_of_line_is_a_fixed_deterministic_convention():
     line = vertical_line()
     assert _side_of_line(line, 0.9, 0.5) != _side_of_line(line, 0.1, 0.5)
     assert _side_of_line(line, 0.5, 0.5) == 0  # exactly on the line
+
+
+# ============================================================ 12. debug channel: additive, doesn't alter counting behavior
+
+
+def test_debug_false_returns_only_events_exactly_as_before():
+    """The default call shape used by all 26 tests above must be
+    completely unaffected by the debug parameter's existence."""
+    counter = PeopleCounter(vertical_line())
+    result = counter.update([det(0.20)])
+    assert isinstance(result, list)  # not a tuple -- unchanged shape
+
+
+def test_debug_true_returns_events_and_debug_entries_as_a_tuple():
+    counter = PeopleCounter(vertical_line())
+    result = counter.update([det(0.20)], debug=True)
+    assert isinstance(result, tuple) and len(result) == 2
+    events, debug_entries = result
+    assert isinstance(events, list)
+    assert isinstance(debug_entries, list)
+
+
+def test_debug_entries_report_new_track_with_no_prior_side():
+    counter = PeopleCounter(vertical_line())
+    events, debug_entries = counter.update([det(0.20)], debug=True)
+    assert len(debug_entries) == 1
+    entry = debug_entries[0]
+    assert entry["track_status"] == "new_track"
+    assert entry["prev_side"] is None
+    assert entry["crossing_reason"] == "new_track_no_prior_side"
+
+
+def test_debug_entries_report_a_counted_crossing_with_its_reason():
+    counter = PeopleCounter(vertical_line())
+    for x in (0.20, 0.32, 0.44):
+        counter.update([det(x)], debug=True)
+    events, debug_entries = counter.update([det(0.56)], debug=True)  # the crossing frame
+    assert len(events) == 1
+    assert debug_entries[0]["crossed"] is True
+    assert debug_entries[0]["crossing_reason"] == "counted_in"
+    assert debug_entries[0]["prev_side"] is not None
+    assert debug_entries[0]["new_side"] is not None
+    assert debug_entries[0]["prev_side"] != debug_entries[0]["new_side"]
+
+
+def test_debug_entries_report_a_direction_filtered_crossing_with_its_reason():
+    counter = PeopleCounter(vertical_line(direction="outbound"))
+    for x in (0.20, 0.32, 0.44):
+        counter.update([det(x)], debug=True)
+    events, debug_entries = counter.update([det(0.56)], debug=True)
+    assert len(events) == 0
+    assert debug_entries[0]["crossed"] is False
+    assert debug_entries[0]["crossing_reason"] == "side_changed_but_direction_filter_excludes_in"
+
+
+def test_debug_entries_report_missed_frames_and_expiration():
+    counter = PeopleCounter(vertical_line(), max_missed_frames=1)
+    counter.update([det(0.20)], debug=True)
+    events, debug_entries = counter.update([], debug=True)  # missed -- within grace (max=1)
+    assert debug_entries[0]["track_status"] == "missed_this_frame"
+    events, debug_entries = counter.update([], debug=True)  # missed again -- exceeds grace, pruned
+    assert debug_entries[0]["track_status"] == "expired_pruned"
+
+
+def test_debug_true_does_not_change_in_out_counts_versus_debug_false():
+    """The most important guarantee: turning on debug=True changes
+    nothing about the actual counting outcome -- run the identical
+    sequence twice, once with debug on and once off, and confirm
+    identical final in_count/out_count."""
+    counter_plain = PeopleCounter(vertical_line())
+    counter_debug = PeopleCounter(vertical_line())
+    sequence = [0.20, 0.32, 0.44, 0.56, 0.68, 0.80, 0.68, 0.56, 0.44]
+    for x in sequence:
+        counter_plain.update([det(x)])
+        counter_debug.update([det(x)], debug=True)
+    assert counter_plain.in_count == counter_debug.in_count
+    assert counter_plain.out_count == counter_debug.out_count
+    assert counter_plain.occupancy == counter_debug.occupancy

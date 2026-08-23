@@ -217,13 +217,28 @@ class PeopleCounter:
         self.in_count = max(0, occupancy)
         self.out_count = 0
 
-    def update(self, detections: list[dict]) -> list[CrossingEvent]:
+    def update(self, detections: list[dict], debug: bool = False):
         """`detections`: this frame's person-class boxes, already
         reduced to centroids -- [{"x": cx, "y": cy}, ...] in the same
         normalized 0.0-1.0 space as the counting line. Returns the
-        list of crossings counted THIS frame (usually empty)."""
+        list of crossings counted THIS frame (usually empty).
+
+        `debug=False` (the default): behavior and return value are
+        EXACTLY as before this parameter was added -- returns only
+        `events`. Every one of the 26 existing tests calls update()
+        this way and is unaffected.
+
+        `debug=True`: returns `(events, debug_entries)` instead --
+        `debug_entries` is a list of per-detection dicts capturing
+        exactly what the counting decision was and why, WITHOUT
+        changing a single line of the actual counting math below (the
+        debug entries are appended alongside the existing logic, never
+        substituted for it). This is a pure, additive observability
+        seam for diagnosing a real-world walk-test, not an algorithm
+        change."""
         self.frame_index += 1
         events: list[CrossingEvent] = []
+        debug_entries: list[dict] = []
 
         deduped = _dedupe_same_frame(detections, self.dedupe_distance)
 
@@ -261,21 +276,43 @@ class PeopleCounter:
                     new_side = -1
                 else:
                     new_side = prev_side if prev_side is not None else 0
+                crossed = False
+                crossing_reason = None
                 if (
                     prev_side is not None
                     and prev_side != 0
                     and new_side != 0
                     and prev_side != new_side
-                    and (track.last_crossed_frame is None or (self.frame_index - track.last_crossed_frame) >= self.recross_cooldown_frames)
                 ):
-                    direction = "in" if new_side < 0 else "out"
-                    if self.line.direction in ("both", direction):
-                        events.append(CrossingEvent(track_id=tid, direction=direction, frame_index=self.frame_index, x=x, y=y))
-                        if direction == "in":
-                            self.in_count += 1
+                    cooldown_ok = track.last_crossed_frame is None or (self.frame_index - track.last_crossed_frame) >= self.recross_cooldown_frames
+                    if not cooldown_ok:
+                        crossing_reason = "side_changed_but_recross_cooldown_active"
+                    else:
+                        direction = "in" if new_side < 0 else "out"
+                        if self.line.direction in ("both", direction):
+                            events.append(CrossingEvent(track_id=tid, direction=direction, frame_index=self.frame_index, x=x, y=y))
+                            if direction == "in":
+                                self.in_count += 1
+                            else:
+                                self.out_count += 1
+                            crossed = True
+                            crossing_reason = f"counted_{direction}"
                         else:
-                            self.out_count += 1
-                    track.last_crossed_frame = self.frame_index
+                            crossing_reason = f"side_changed_but_direction_filter_excludes_{direction}"
+                        track.last_crossed_frame = self.frame_index
+                elif prev_side is None:
+                    crossing_reason = "no_prior_confirmed_side_yet"
+                elif prev_side == new_side:
+                    crossing_reason = "side_unchanged"
+                elif new_side == 0:
+                    crossing_reason = "within_line_buffer_no_reclassification"
+                if debug:
+                    debug_entries.append({
+                        "detection_x": x, "detection_y": y, "raw_cross_value": raw_cross,
+                        "track_id": tid, "track_status": "matched",
+                        "prev_side": prev_side, "new_side": new_side,
+                        "crossed": crossed, "crossing_reason": crossing_reason,
+                    })
                 track.cx, track.cy = x, y
                 track.side = new_side if new_side != 0 else prev_side
                 track.last_seen_frame = self.frame_index
@@ -286,12 +323,38 @@ class PeopleCounter:
                 initial_side = _side_of_line(self.line, x, y)  # no previous side to buffer against yet
                 self.tracks[tid] = Track(track_id=tid, cx=x, cy=y, last_seen_frame=self.frame_index, side=initial_side if initial_side != 0 else None)
                 matched_ids.add(tid)
+                if debug:
+                    debug_entries.append({
+                        "detection_x": x, "detection_y": y, "raw_cross_value": raw_cross,
+                        "track_id": tid, "track_status": "new_track",
+                        "prev_side": None, "new_side": initial_side,
+                        "crossed": False, "crossing_reason": "new_track_no_prior_side",
+                    })
 
+        expired_tracks = []
         for tid in list(self.tracks):
             if tid not in matched_ids:
                 track = self.tracks[tid]
                 track.missed_frames += 1
                 if track.missed_frames > self.max_missed_frames:
+                    expired_tracks.append(tid)
                     del self.tracks[tid]
+                elif debug:
+                    debug_entries.append({
+                        "detection_x": None, "detection_y": None, "raw_cross_value": None,
+                        "track_id": tid, "track_status": "missed_this_frame",
+                        "prev_side": track.side, "new_side": track.side,
+                        "crossed": False, "crossing_reason": f"missed_frame_{track.missed_frames}_of_{self.max_missed_frames}_grace",
+                    })
+        if debug and expired_tracks:
+            for tid in expired_tracks:
+                debug_entries.append({
+                    "detection_x": None, "detection_y": None, "raw_cross_value": None,
+                    "track_id": tid, "track_status": "expired_pruned",
+                    "prev_side": None, "new_side": None,
+                    "crossed": False, "crossing_reason": "exceeded_max_missed_frames",
+                })
 
+        if debug:
+            return events, debug_entries
         return events
