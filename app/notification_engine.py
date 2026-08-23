@@ -4,7 +4,7 @@ from datetime import datetime
 from notification_service import CHANNELS
 from partner_db import connection,row,rows
 
-SUPPORTED={'motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','high_cpu','software_update'}
+SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','high_cpu','software_update'}
 
 
 def fanout_appliance_event(appliance: dict,event: dict):
