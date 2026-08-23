@@ -109,6 +109,21 @@ def apply_migrations():
         # AnalyticsRuleModel/quote objects is a separate, unrelated,
         # sales-quote-only field this column does not read from or write to.
         if 'cloud_recording_mode' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN cloud_recording_mode TEXT')
+        # people_counting_enabled follows the exact same no-hidden-default
+        # convention as cloud_recording_mode above: NULL/0 means "not
+        # entitled/not configured for People Counting" and every consumer
+        # (GET /api/appliance/configuration, and the appliance's own
+        # people-counting worker) must treat that as "do not run People
+        # Counting on this camera" -- the same appliance-wide detection
+        # loop this camera already runs for plain person/vehicle detection
+        # is completely unaffected either way. Only an explicit 1 (set via
+        # POST /api/admin/cameras/{camera_id}/people-counting) turns this
+        # on for that camera. This is the first camera-level analytics
+        # entitlement flag in the system; see the accompanying report for
+        # how the other named analytics (LPR, PPE, etc.) can adopt this
+        # same per-camera column pattern later instead of remaining
+        # appliance-wide-only toggles.
+        if 'people_counting_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN people_counting_enabled INTEGER')
 
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else

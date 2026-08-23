@@ -151,7 +151,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,cloud_recording_mode AS recording_mode FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     @app.post('/api/appliance/events')
     def events(request: Request,payload: dict) -> dict:
@@ -428,6 +428,27 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
         audit(identity,'camera.cloud_recording_mode_changed','camera',camera_id,{'cloud_recording_mode':mode})
         return {'camera_id':camera_id,'cloud_recording_mode':mode}
+
+    @app.post('/api/admin/cameras/{camera_id}/people-counting')
+    def set_people_counting_enabled(request: Request,camera_id: str,payload: dict) -> dict:
+        # Same no-hidden-default convention as cloud_recording_mode above
+        # (see db_migrations.py's own comment on this column): only an
+        # explicit true/false is ever accepted -- never coerced from a
+        # billing/add-on selection automatically, since that automatic
+        # link is exactly the analytics-entitlement disconnect this
+        # column exists to start correcting. Enabling this here is a
+        # necessary but not sufficient condition for the appliance to
+        # actually run People Counting on this camera -- the appliance
+        # also needs a configured counting-line rule for the same camera
+        # (see people_counting.py, edge lineage) and its own
+        # PEOPLE_COUNTING_ENABLED master flag turned on.
+        identity=require_partner_access(request,{'administrator'})
+        enabled=1 if payload.get('people_counting_enabled') else 0
+        with connection() as db:
+            cursor=db.execute('UPDATE cameras SET people_counting_enabled=? WHERE id=?',(enabled,camera_id))
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
+        audit(identity,'camera.people_counting_enabled_changed','camera',camera_id,{'people_counting_enabled':bool(enabled)})
+        return {'camera_id':camera_id,'people_counting_enabled':bool(enabled)}
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
