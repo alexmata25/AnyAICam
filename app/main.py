@@ -51739,7 +51739,7 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
         return None
     from partner_db import connection
     select = (
-        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, '
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
         'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
@@ -51767,6 +51767,7 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
         {
             "id": row["id"],
             "camera": row["camera"],
+            "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
             "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
@@ -51779,6 +51780,91 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
+        }
+        for row in rows
+    ]
+
+
+def _customer_notifications(request: Request, *, camera_number: int | None = None, limit: int = 100) -> list[dict] | None:
+    """This portal customer's own real notifications rows for the
+    customer-facing Smart Alerts page, or None when the caller isn't a
+    portal customer_owner/customer_viewer identity at all -- same
+    None-vs-empty-list contract as _customer_detection_events(), same
+    reason (callers must render the existing legacy experience
+    unchanged for a non-portal caller, never "no alerts").
+
+    Reads the notifications table notification_engine.fanout_
+    appliance_event() already writes on every real analytics event
+    whose event_type is in its own SUPPORTED set (smart_motion, person,
+    vehicle, people_counting, lpr once a plate is actually read, camera/
+    appliance health signals, etc.) -- this function only ever reads
+    that existing table; it creates no notifications and duplicates no
+    event. A handful of notification types (camera_offline,
+    appliance_offline, low_disk, high_cpu, software_update) are
+    system-level and carry no camera_id -- LEFT JOINed rather than
+    excluded, so real system alerts still surface here instead of
+    silently disappearing, with camera_name reported as None so the
+    caller can render them without a camera badge.
+
+    Scoping mirrors _customer_detection_events() exactly: customer_owner
+    sees every notification for their own customer_id; customer_viewer
+    is restricted to cameras they hold can_playback=1 on (reusing that
+    existing permission, same smallest-change reasoning), and never
+    sees a camera-less system alert (no camera to check permission
+    against). camera_number optionally narrows to one camera -- used by
+    the focused Live View's own Smart Alerts panel, resolved server-side
+    from the authenticated identity's own fleet, never trusted from a
+    request parameter."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    select = (
+        'SELECT n.id, n.event_type, n.severity, n.title, n.message, n.timestamp, n.thumbnail, '
+        'n.recording_id, n.camera_id, c.camera_number AS camera, c.name AS camera_display_name '
+        'FROM notifications n '
+        'LEFT JOIN cameras c ON c.id = n.camera_id '
+    )
+    params: list = [identity["customer_id"]]
+    camera_filter = ''
+    if camera_number is not None:
+        camera_filter = 'AND c.camera_number = ? '
+        params.append(camera_number)
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            rows = db.execute(
+                select + f'WHERE n.customer_id = ? {camera_filter}ORDER BY n.timestamp DESC LIMIT ?',
+                (*params, limit),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            rows = db.execute(
+                select + 'JOIN customer_camera_permissions p ON p.camera_id = n.camera_id AND p.user_id = ? '
+                f'WHERE n.customer_id = ? {camera_filter}ORDER BY n.timestamp DESC LIMIT ?',
+                (user["id"], *params, limit),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": ((row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}') if row["camera"] is not None else None,
+            "event_type": row["event_type"],
+            "severity": row["severity"],
+            "title": row["title"],
+            "message": row["message"],
+            "timestamp": row["timestamp"],
+            "thumbnail": row["thumbnail"],
+            "recording_id": row["recording_id"],
         }
         for row in rows
     ]
@@ -117142,6 +117228,186 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
+def _event_confidence_percent(confidence) -> str:
+    """Same defensive 0-1-vs-0-100 handling the customer analytics
+    search results view (renderResults()'s own JS) already uses --
+    reused here rather than assuming a scale, since different analytic
+    pipelines have historically stored confidence in different native
+    ranges (PPE/YOLO: 0-1, LPR: rescaled to 0-1 at write time, but nothing
+    here promises every future event type will be)."""
+    if confidence is None:
+        return "—"
+    value = float(confidence)
+    percent = value * 100 if value <= 1 else value
+    return f"{percent:.1f}%"
+
+
+def _customer_event_actions(camera_id) -> str:
+    """The same two useful actions on every real customer event/alert
+    row: jump to that camera's live view, or to Playback. Playback
+    isn't deep-linkable to a specific camera/time yet (see
+    _render_customer_playback()'s own docstring on the recording
+    catalog still being empty in practice) -- linking to /playback
+    generally is still strictly more useful than no playback link at
+    all, and becomes a real deep link the moment that catalog is
+    populated, with no change needed here."""
+    live_link = (
+        f'<a class="download" href="/customer/cameras/{escape(str(camera_id), quote=True)}/live">Live view</a> '
+        if camera_id else ''
+    )
+    return f'{live_link}<a class="download" href="/playback">Playback</a>'
+
+
+def _render_customer_events(request: Request) -> str:
+    """Real, tenant-scoped Events page for a portal customer. Reuses
+    _customer_playback_cameras() (the real per-customer camera fleet,
+    including Camera 5 -- analytics being off for it just means it
+    never contributes any real rows here, an honest empty state rather
+    than a special case) for the camera picker/count, and
+    _customer_detection_events() (real detection_events rows, the same
+    data _render_customer_playback()'s timeline and the /analytics
+    search page already read) for the table -- no new event store, no
+    duplicated query. Falls back to the exact original legacy events()
+    body for any non-portal caller (see events() below)."""
+    cameras = _customer_playback_cameras(request) or []
+    events_list = _customer_detection_events(request) or []
+
+    camera_options = "".join(
+        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}"> '
+        f'{escape(_camera_display_label(camera))}</label>'
+        for camera in cameras
+    )
+
+    rows = []
+    for event in events_list[:200]:
+        raw_timestamp = str(event.get("timestamp") or "")
+        try:
+            occurred_at = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+            timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
+        except ValueError:
+            timestamp_label = raw_timestamp or "Unknown time"
+        thumbnail = (
+            f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover">'
+            if event.get("thumbnail") else "—"
+        )
+        type_label = str(event.get("event_type") or "event").replace("_", " ").title()
+        camera_number = event.get("camera")
+        rows.append(
+            f'<tr data-event-camera="{escape(str(camera_number or ""), quote=True)}" data-event-type="{escape(str(event.get("event_type") or ""), quote=True)}">'
+            f'<td>{escape(timestamp_label)}</td>'
+            f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
+            f'<td>{thumbnail}</td>'
+            f'<td><span class="pill">{escape(type_label)}</span></td>'
+            f'<td>{_event_confidence_percent(event.get("confidence"))}</td>'
+            f'<td>{_customer_event_actions(event.get("camera_id"))}</td></tr>'
+        )
+    event_body = "".join(rows) or (
+        '<tr><td colspan="6"><div class="empty-stage">No analytics events yet.<br>'
+        'Events appear here as soon as your cameras detect real activity.</div></td></tr>'
+    )
+
+    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
+<div><span class="pill">{len(events_list)} event(s)</span></div></header>
+<div class="playback-workspace">
+<aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
+<input class="picker-search" id="events-search" type="search" placeholder="Search"><div id="events-camera-filters">{camera_options}</div></aside>
+<section class="work-area"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail">{len(events_list)} event(s)</span></div>
+<table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
+<tbody>{event_body}</tbody></table></section></div>"""
+
+    scripts = """<script>
+(function(){
+  const search=document.getElementById('events-search');
+  const filters=document.getElementById('events-camera-filters');
+  const rows=[...document.querySelectorAll('#events-table tbody tr[data-event-camera]')];
+  function apply(){
+    const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));
+    const query=(search.value||'').toLowerCase();
+    rows.forEach(row=>{
+      const cameraMatch=checked.has(row.dataset.eventCamera);
+      const textMatch=!query||row.textContent.toLowerCase().includes(query);
+      row.hidden=!(cameraMatch&&textMatch);
+    });
+  }
+  filters.addEventListener('change',apply);
+  search.addEventListener('input',apply);
+})();
+</script>"""
+
+    return page_shell("Events", "events", content, scripts)
+
+
+def _render_customer_alerts(request: Request) -> str:
+    """Real, tenant-scoped Smart Alerts page. Reuses _customer_notifications()
+    (real notifications rows, written by notification_engine.fanout_
+    appliance_event() on every real analytics event whose type is in
+    its own SUPPORTED set -- smart_motion, person, vehicle,
+    people_counting, lpr once a plate is actually read) -- creates no
+    alerts, duplicates no event. The "New alert" button is left exactly
+    as before (customer-created alert rules are a distinct, not-yet-
+    built feature this milestone does not touch). Falls back to the
+    exact original legacy alerts() body for any non-portal caller (see
+    alerts() below)."""
+    cameras = _customer_playback_cameras(request) or []
+    notifications_list = _customer_notifications(request) or []
+
+    camera_options = "".join(
+        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}"> '
+        f'{escape(_camera_display_label(camera))}</label>'
+        for camera in cameras
+    )
+
+    cards = []
+    for notification in notifications_list[:100]:
+        raw_timestamp = str(notification.get("timestamp") or "")
+        try:
+            occurred_at = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+            timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
+        except ValueError:
+            timestamp_label = raw_timestamp or "Unknown time"
+        thumbnail = (
+            f'<img src="{escape(notification["thumbnail"], quote=True)}" alt="Alert thumbnail" style="width:120px;aspect-ratio:16/9;object-fit:cover;border-radius:7px">'
+            if notification.get("thumbnail") else '<div class="feature-icon">♢</div>'
+        )
+        camera_label = notification.get("camera_name") or "System"
+        camera_number = notification.get("camera")
+        cards.append(
+            f'<article class="feature-card" data-alert-camera="{escape(str(camera_number or ""), quote=True)}">{thumbnail}'
+            f'<h2>{escape(str(notification.get("title") or "Alert"))} · {escape(camera_label)}</h2>'
+            f'<p>{escape(str(notification.get("message") or ""))}</p>'
+            f'<p class="health-detail">{escape(timestamp_label)}</p>'
+            f'<div class="dashboard-event-actions">{_customer_event_actions(notification.get("camera_id"))}</div></article>'
+        )
+    alert_body = "".join(cards) or (
+        '<div class="empty-stage">No alerts yet.<br>Real alerts appear here as your cameras detect activity.</div>'
+    )
+
+    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div>
+<div><button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header>
+<div class="playback-workspace">
+<aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
+<div id="alerts-camera-filters">{camera_options}</div></aside>
+<section class="work-area"><div class="panel-head"><h2>Recent alerts</h2><span class="pill">{len(notifications_list)} alert(s)</span></div>
+<div class="feature-grid" id="alerts-grid">{alert_body}</div></section></div>"""
+
+    scripts = """<script>
+(function(){
+  const filters=document.getElementById('alerts-camera-filters');
+  if(!filters)return;
+  const cards=[...document.querySelectorAll('#alerts-grid [data-alert-camera]')];
+  filters.addEventListener('change',()=>{
+    const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));
+    cards.forEach(card=>{
+      const camera=card.dataset.alertCamera;
+      card.hidden=Boolean(camera)&&!checked.has(camera);
+    });
+  });
+})();
+</script>"""
+
+    return page_shell("Alerts", "alerts", content, scripts)
+
+
 @app.get("/alerts", response_class=HTMLResponse)
 
 
@@ -117151,7 +117417,15 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
-def alerts() -> str:
+def alerts(request: Request) -> str:
+    # Customer-portal identity, if any, gets the real tenant-scoped
+    # page (real notifications, real cameras including Camera 5) --
+    # everyone else falls through to the exact original legacy body,
+    # completely unchanged below.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        return _render_customer_alerts(request)
+
 
 
 
@@ -117316,7 +117590,12 @@ def alerts() -> str:
 
 
 
-def events() -> str:
+def events(request: Request) -> str:
+    # Same dispatch pattern as alerts() above.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        return _render_customer_events(request)
+
 
 
 
@@ -136884,7 +137163,7 @@ def _customer_camera_recordings(camera_id: str) -> list[dict]:
     return recordings
 
 
-def _render_customer_playback(cameras: list[dict]) -> str:
+def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     """Renders the customer Playback page for an already-scoped camera
     list (see _customer_playback_cameras()). Never shows live video --
     the video element only ever receives a recorded clip's own URL.
@@ -136894,7 +137173,14 @@ def _render_customer_playback(cameras: list[dict]) -> str:
     entry is skipped rather than shown until R4's own read-role
     (docs/r4-recording-read-iam.md) is applied in AWS -- so this page
     still honestly shows "No recordings available yet" exactly as
-    before, for real reasons rather than a hardcoded stub."""
+    before, for real reasons rather than a hardcoded stub.
+
+    The timeline's event markers reuse _customer_detection_events()
+    (the exact same real, tenant-scoped detection_events rows the
+    Events page and /api/analytics/events already read) -- grouped
+    here by camera_number, then re-keyed to each camera's own internal
+    id to match how recordings_by_camera is already keyed. No new
+    analytics query, no duplicated data model."""
     if not cameras:
         content = (
             '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
@@ -136912,6 +137198,13 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         camera["id"]: _customer_camera_recordings(camera["id"])
         for camera in cameras
     }
+    events_by_camera_number: dict = {}
+    for event in (_customer_detection_events(request) or []):
+        events_by_camera_number.setdefault(event.get("camera"), []).append(event)
+    analytics_by_camera = {
+        camera["id"]: events_by_camera_number.get(camera.get("camera_number"), [])
+        for camera in cameras
+    }
     first_camera_id = cameras[0]["id"]
 
     content = (
@@ -136924,6 +137217,19 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '.playback-camera-tile.active{background:var(--brand-action,#2f6f6b);color:#fff;border-color:transparent}'
         '.playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:70vh}'
         '@media(min-width:900px){.playback-workspace-solo .camera-view{aspect-ratio:21/9}}'
+        # The .event-* classes were already used by this legend (and by
+        # the /analytics search results legend) but never actually had
+        # a background color defined anywhere -- every dot rendered
+        # empty. Defined once here for real, matching the palette this
+        # page's own JS below also uses for the timeline's event
+        # markers themselves, so the legend and the markers agree.
+        '.legend-dot.event-motion{background:#f0b94d}'
+        '.legend-dot.event-person{background:#4d9ef0}'
+        '.legend-dot.event-vehicle{background:#a06df0}'
+        '.legend-dot.event-lpr{background:#3dbfae}'
+        '.legend-dot.event-people_counting{background:#4dcf7a}'
+        '.legend-dot.event-intrusion{background:#f0554d}'
+        '.event-segment{cursor:pointer}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:14px">'
@@ -136949,13 +137255,13 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '</div>'
         '</div>'
         '<div class="monitor-filters">'
-        '<button class="monitor-filter active" data-filter="all" type="button" disabled>All</button>'
-        '<button class="monitor-filter" data-filter="motion" type="button" disabled>Motion</button>'
-        '<button class="monitor-filter" data-filter="person" type="button" disabled>Person</button>'
-        '<button class="monitor-filter" data-filter="vehicle" type="button" disabled>Vehicle</button>'
-        '<button class="monitor-filter" data-filter="lpr" type="button" disabled>License plate</button>'
-        '<button class="monitor-filter" data-filter="people_counting" type="button" disabled>People count</button>'
-        '<button class="monitor-filter" data-filter="intrusion" type="button" disabled>Intrusion</button>'
+        '<button class="monitor-filter active" data-filter="all" type="button">All</button>'
+        '<button class="monitor-filter active" data-filter="motion" type="button">Motion</button>'
+        '<button class="monitor-filter active" data-filter="person" type="button">Person</button>'
+        '<button class="monitor-filter active" data-filter="vehicle" type="button">Vehicle</button>'
+        '<button class="monitor-filter active" data-filter="lpr" type="button">License plate</button>'
+        '<button class="monitor-filter active" data-filter="people_counting" type="button">People count</button>'
+        '<button class="monitor-filter active" data-filter="intrusion" type="button">Intrusion</button>'
         '</div>'
         '<div class="timeline-hours"><span>00:00</span><span>02:00</span><span>04:00</span><span>06:00</span>'
         '<span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span>'
@@ -136982,6 +137288,7 @@ def _render_customer_playback(cameras: list[dict]) -> str:
     scripts = f'''<script>
 (function(){{
   const recordingsByCamera={json.dumps(recordings_by_camera)};
+  const analyticsByCamera={json.dumps(analytics_by_camera)};
   const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
   const placeholder=document.getElementById('playback-placeholder');
@@ -137032,9 +137339,44 @@ def _render_customer_playback(cameras: list[dict]) -> str:
     return (d.getHours()*3600+d.getMinutes()*60+d.getSeconds())/864;
   }}
 
-  function renderTimeline(clips){{
+  // Real event_type strings the analytics pipelines actually write
+  // (see detection_events) collapsed to the filter/legend categories
+  // this page's UI already ships -- "already supported" per this
+  // integration's own scope, not a new filter category.
+  const EVENT_COLORS={{motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0554d'}};
+  function filterCategory(eventType){{
+    if(eventType==='motion'||eventType==='smart_motion')return 'motion';
+    if(eventType==='person')return 'person';
+    if(['car','truck','bus','motorcycle','bicycle','vehicle'].includes(eventType))return 'vehicle';
+    if(eventType==='plate'||eventType==='lpr')return 'lpr';
+    if(eventType==='people_counting_in'||eventType==='people_counting_out'||eventType==='people_counting')return 'people_counting';
+    if(eventType==='intrusion')return 'intrusion';
+    return null;   // e.g. ppe -- no dedicated filter/legend slot on this page yet, shown under "All" only, in a neutral color
+  }}
+
+  // A clip actually covering the event's own timestamp is preferred;
+  // failing that, the closest clip within 5 minutes is still a useful
+  // jump-off point. No fabricated recording is ever offered -- if
+  // nothing is close enough, the caller is told plainly.
+  function findClipNear(clips,timestamp){{
+    const target=new Date(timestamp).getTime();
+    if(Number.isNaN(target))return null;
+    const covering=clips.find(clip=>target>=new Date(clip.start).getTime()&&target<=new Date(clip.end).getTime());
+    if(covering)return covering;
+    let closest=null,closestDelta=5*60*1000;
+    clips.forEach(clip=>{{
+      const delta=Math.abs(new Date(clip.start).getTime()-target);
+      if(delta<closestDelta){{closest=clip;closestDelta=delta}}
+    }});
+    return closest;
+  }}
+
+  let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
+  const filterButtons=[...document.querySelectorAll('.monitor-filter')];
+
+  function renderTimeline(clips,events){{
     timelineLane.innerHTML='';
-    if(!clips.length){{timelineEmpty.hidden=false;return}}
+    if(!clips.length&&!events.length){{timelineEmpty.hidden=false;return}}
     timelineEmpty.hidden=true;
     clips.forEach(clip=>{{
       const startPct=timelinePercent(clip.start);
@@ -137048,10 +137390,29 @@ def _render_customer_playback(cameras: list[dict]) -> str:
       segment.addEventListener('click',()=>playClip(clip));
       timelineLane.appendChild(segment);
     }});
+    events.forEach(event=>{{
+      const category=filterCategory(event.event_type);
+      if(category&&!activeFilters.has(category))return;
+      const pct=timelinePercent(event.timestamp);
+      const marker=document.createElement('div');
+      marker.className='event-segment';
+      marker.style.left=pct+'%';
+      marker.style.width='0.4%';
+      marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';
+      const label=(event.event_type||'event').replaceAll('_',' ');
+      marker.title=`${{label}} · ${{new Date(event.timestamp).toLocaleString()}}`;
+      marker.addEventListener('click',()=>{{
+        const nearby=findClipNear(clips,event.timestamp);
+        if(nearby){{playClip(nearby)}}
+        else if(typeof showToast==='function'){{showToast('No recording available for this time yet.')}}
+      }});
+      timelineLane.appendChild(marker);
+    }});
   }}
 
   function renderCamera(){{
     const clips=recordingsByCamera[selectedCameraId]||[];
+    const events=analyticsByCamera[selectedCameraId]||[];
     video.pause();
     video.removeAttribute('src');
     video.load();
@@ -137069,8 +137430,22 @@ def _render_customer_playback(cameras: list[dict]) -> str:
     }});
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===selectedCameraId);
     timelineLabel.textContent=activeTile?activeTile.textContent:'—';
-    renderTimeline(clips);
+    renderTimeline(clips,events);
   }}
+
+  filterButtons.forEach(button=>{{
+    button.addEventListener('click',()=>{{
+      if(button.dataset.filter==='all'){{
+        activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
+      }}else if(activeFilters.has(button.dataset.filter)){{
+        activeFilters.delete(button.dataset.filter);
+      }}else{{
+        activeFilters.add(button.dataset.filter);
+      }}
+      filterButtons.forEach(item=>item.classList.toggle('active',item.dataset.filter==='all'?activeFilters.size===6:activeFilters.has(item.dataset.filter)));
+      renderCamera();
+    }});
+  }});
 
   renderCamera();
 }})();
@@ -137099,7 +137474,7 @@ def playback(request: Request) -> str:
 
     _customer_cameras = _customer_playback_cameras(request)
     if _customer_cameras is not None:
-        return _render_customer_playback(_customer_cameras)
+        return _render_customer_playback(_customer_cameras, request)
 
     camera_numbers = list(range(1, CAMERA_COUNT + 1))
 
