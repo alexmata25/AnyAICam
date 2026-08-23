@@ -137189,10 +137189,23 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         )
         return page_shell("Playback", "playback", content)
 
+    # Deep-link support: the focused Live View's own "recent activity"
+    # rows link here as /playback?camera=<id>&t=<event_timestamp> so a
+    # customer never has to re-select the camera or re-hunt for the
+    # moment they already know happened -- ?camera picks the initial
+    # tile (falling back to the first camera exactly as before when
+    # absent/invalid/not owned by this identity), ?t is handed to the
+    # client to try to land on a covering/nearby recording via the
+    # SAME findClipNear() the timeline's own markers already use.
+    requested_camera_id = request.query_params.get("camera")
+    valid_camera_ids = {camera["id"] for camera in cameras}
+    initial_camera_id = requested_camera_id if requested_camera_id in valid_camera_ids else cameras[0]["id"]
+    initial_timestamp = request.query_params.get("t") or None
+
     camera_tiles = "".join(
-        f'<button type="button" class="playback-camera-tile{" active" if index == 0 else ""}" '
+        f'<button type="button" class="playback-camera-tile{" active" if camera["id"] == initial_camera_id else ""}" '
         f'data-camera-id="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</button>'
-        for index, camera in enumerate(cameras)
+        for camera in cameras
     )
     recordings_by_camera = {
         camera["id"]: _customer_camera_recordings(camera["id"])
@@ -137205,7 +137218,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         camera["id"]: events_by_camera_number.get(camera.get("camera_number"), [])
         for camera in cameras
     }
-    first_camera_id = cameras[0]["id"]
+    first_camera_id = initial_camera_id
 
     content = (
         '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
@@ -137299,6 +137312,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const viewFrame=document.getElementById('playback-view-frame');
 
   let selectedCameraId={json.dumps(first_camera_id)};
+  const initialTimestamp={json.dumps(initial_timestamp)};
 
   function revealClipPanel(){{clipPanel.hidden=false}}
   browseButton.addEventListener('click',()=>{{clipPanel.hidden=!clipPanel.hidden}});
@@ -137410,7 +137424,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
   }}
 
-  function renderCamera(){{
+  function renderCamera(seekTimestamp){{
     const clips=recordingsByCamera[selectedCameraId]||[];
     const events=analyticsByCamera[selectedCameraId]||[];
     video.pause();
@@ -137431,6 +137445,17 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===selectedCameraId);
     timelineLabel.textContent=activeTile?activeTile.textContent:'—';
     renderTimeline(clips,events);
+    // Deep-link landing: arrived here with a specific moment in mind
+    // (e.g. from the focused Live View's own recent-activity list) --
+    // jump straight to a covering/nearby recording exactly like
+    // clicking that same event's marker on the timeline would, or say
+    // plainly that nothing is available yet rather than leaving the
+    // customer to guess why nothing happened.
+    if(seekTimestamp){{
+      const nearby=findClipNear(clips,seekTimestamp);
+      if(nearby){{playClip(nearby)}}
+      else{{status.textContent='No recording available for this time yet.'}}
+    }}
   }}
 
   filterButtons.forEach(button=>{{
@@ -137447,7 +137472,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
   }});
 
-  renderCamera();
+  renderCamera(initialTimestamp);
 }})();
 </script>'''
 

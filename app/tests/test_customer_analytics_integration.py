@@ -251,17 +251,70 @@ def test_smart_alerts_panel_shows_real_notifications_for_this_camera(client, db_
     assert "Smart Motion (" in response.text or "Smart Motion" in response.text
 
 
-def test_last_hour_activity_only_shows_events_from_the_last_hour(client, db_path, tmp_path, monkeypatch):
+def test_recent_activity_is_not_limited_to_the_last_hour(client, db_path, tmp_path, monkeypatch):
+    # Recent activity shows real history newest-first, not just the
+    # last hour -- a camera that's been quiet for a while should still
+    # show its real recent past instead of an empty section.
     _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
     with sqlite3.connect(db_path) as conn:
         import datetime as dt
-        recent = (dt.datetime.now() - dt.timedelta(minutes=10)).isoformat()
         old = (dt.datetime.now() - dt.timedelta(hours=5)).isoformat()
-        _seed_detection_event(conn, "evt-recent", "cam-1", "person", 0.9, recent)
         _seed_detection_event(conn, "evt-old", "cam-1", "person", 0.9, old)
     response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "Last hour activity" in response.text
-    assert "No activity in the last hour" not in response.text
+    assert "Recent activity" in response.text
+    assert "No activity recorded yet" not in response.text
+
+
+def test_recent_activity_honest_empty_state_with_no_events(client, tmp_path, monkeypatch):
+    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
+    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert "No activity recorded yet for this camera" in response.text
+
+
+def test_recent_activity_rows_deep_link_to_playback_for_this_camera_and_time(client, db_path, tmp_path, monkeypatch):
+    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
+    with sqlite3.connect(db_path) as conn:
+        _seed_detection_event(conn, "evt-1", "cam-1", "person", 0.9, "2026-08-23T10:00:00")
+    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    # & is HTML-escaped to &amp; inside the href attribute (standard,
+    # correct HTML -- browsers decode it back to & on navigation).
+    assert "/playback?camera=cam-1&amp;t=2026-08-23T10%3A00%3A00" in response.text
+
+
+def test_ppe_and_lpr_summary_lines_are_also_clickable_playback_links(client, db_path, tmp_path, monkeypatch):
+    _grant_entitlements(monkeypatch, tmp_path, 1, ["ppe_detection", "lpr"])
+    with sqlite3.connect(db_path) as conn:
+        _seed_ppe_event(conn, "evt-ppe", "cam-1", "2026-08-23T10:00:00", hard_hat=True, vest=True)
+        _seed_detection_event(conn, "evt-plate", "cam-1", "plate", 0.6, "2026-08-23T11:00:00")
+    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    # Two distinct deep links: one per real event, each to its own moment.
+    assert "t=2026-08-23T10%3A00%3A00" in response.text
+    assert "t=2026-08-23T11%3A00%3A00" in response.text
+
+
+# --------------------------------------------------------- Playback deep-linking
+
+
+def test_playback_preselects_the_camera_from_the_query_param(client, db_path):
+    with sqlite3.connect(db_path) as conn:
+        _seed_detection_event(conn, "evt-1", "cam-5", "person", 0.8, "2026-08-23T10:00:00")
+    response = client.get("/playback?camera=cam-5&t=2026-08-23T10:00:00", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert 'class="playback-camera-tile active" data-camera-id="cam-5"' in response.text
+    assert 'const initialTimestamp="2026-08-23T10:00:00";' in response.text
+
+
+def test_playback_falls_back_to_first_camera_for_an_unknown_camera_param(client):
+    response = client.get("/playback?camera=not-a-real-camera", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert 'class="playback-camera-tile active" data-camera-id="cam-1"' in response.text
+
+
+def test_playback_without_query_params_behaves_exactly_as_before(client):
+    response = client.get("/playback", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert 'class="playback-camera-tile active" data-camera-id="cam-1"' in response.text
+    assert "const initialTimestamp=null;" in response.text
 
 
 def test_camera_5_naturally_falls_into_the_no_analytics_case(client):
