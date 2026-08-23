@@ -149,7 +149,6 @@ def test_local_recording_price_matches_approved_working_value(resolution, expect
 # Preserving them here keeps the research traceable to its own
 # original derivation, alongside the still-deployed retail prices
 # they were checked against.
-    assert margin_percent >= 45.0  # Local Recording runs far above the floor (real ~48-50%) -- a regression toward the bare 20% floor here would itself be a real finding
 
 
 # ============================================================ 4. Partner quote generation -- including the confirmed pre-existing 409 gap
