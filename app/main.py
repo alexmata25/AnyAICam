@@ -52780,6 +52780,66 @@ def internal_camera_status(request: Request) -> dict:
     return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
 
 
+@app.get("/internal/diagnostics")
+def internal_diagnostics(request: Request) -> dict:
+    """RDM 4: local-only VMS/container health snapshot for the
+    host-level anyaicam-agent's run_diagnostics command (see
+    appliance-agent/anyaicam_agent/commands.py -- today that command
+    only reports agent-process facts; this route is what lets it also
+    report the actual VMS container's health once the agent is updated
+    to call it, without inventing a second health model). Same
+    loopback-or-docker-gateway guard as /internal/camera-status, for
+    the same reason -- see that route's own docstring.
+
+    Every field below reuses an existing, already-correct source
+    rather than recomputing anything: system_metrics() (already backs
+    /api/system/metrics), camera_status()/ai_detection_status() (via
+    internal_camera_status(), already backs /internal/camera-status),
+    recording_uploader's own module-level recording_upload_state (the
+    same dict recording_upload_worker() already maintains -- 'disabled'
+    here is a correct, honest answer on a role that doesn't run
+    uploads, not a fault), and a trivial SELECT 1 against the same
+    database connection() every other route already uses."""
+    client_host = request.client.host if request.client else None
+    if client_host not in {"127.0.0.1", "::1", _docker_gateway_ip()}:
+        raise HTTPException(status_code=403, detail="This endpoint is only reachable from the appliance host itself.")
+
+    database_reachable = True
+    database_error = None
+    try:
+        from partner_db import connection
+        with connection() as db:
+            db.execute("SELECT 1")
+    except Exception as error:
+        database_reachable = False
+        database_error = str(error)[:300]
+
+    upload_state = None
+    try:
+        upload_state = {
+            "worker_status": recording_uploader.recording_upload_state.get("worker_status"),
+            "last_scan_at": recording_uploader.recording_upload_state.get("last_scan_at"),
+            "last_error": recording_uploader.recording_upload_state.get("last_error"),
+        }
+    except Exception:
+        pass  # recording_uploader always imports on this codebase today, but never let a diagnostics route itself 500
+
+    return {
+        "service": "AnyAiCam VMS",
+        "version": APP_VERSION,
+        "build_id": BUILD_ID,
+        "environment": DEPLOYMENT_ENV,
+        "runtime_role": RUNTIME_ROLE,
+        "uptime_seconds": max(0, int((datetime.now() - STARTED_AT).total_seconds())),
+        "system": system_metrics(),
+        "cameras": internal_camera_status(request)["cameras"],
+        "recording_upload": upload_state,
+        "database_reachable": database_reachable,
+        "database_error": database_error,
+        "checked_at": datetime.now().isoformat(),
+    }
+
+
 @app.get("/ai-detection", response_class=HTMLResponse)
 
 
