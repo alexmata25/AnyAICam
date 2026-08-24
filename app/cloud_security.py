@@ -1,6 +1,7 @@
 import hmac
 import secrets
 import time
+import os
 from datetime import datetime,timedelta
 
 from fastapi import HTTPException,Request
@@ -11,6 +12,27 @@ from cloud_config import settings
 from partner_db import connection,password_hash,row,verify_password
 from token_security import sign,unsign
 from redirect_security import safe_redirect
+
+def _media_src_csp() -> str:
+    """The <video> element that plays a customer's recordings loads
+    directly from a real presigned S3 URL (see _presigned_recording_url()
+    in main.py) -- media-src must allow that exact bucket's origin or
+    every browser blocks the load as a CSP violation before the video
+    element ever gets a chance to fetch anything. This was the real,
+    silent root cause behind a customer-reported Playback regression:
+    every server-side and curl/node-based test of the presigned URL
+    succeeded (CSP is a browser-only enforcement, invisible to any
+    non-browser HTTP client), while every real browser -- hard refresh,
+    incognito, made no difference -- silently refused to load it,
+    leaving the player permanently at 0:00 with no console-visible
+    network failure. Falls back to media-src 'self' blob: only (today's
+    prior behavior) if the recording bucket is not configured -- never
+    widened beyond exactly this one bucket."""
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    if not bucket:
+        return "media-src 'self' blob:"
+    return f"media-src 'self' blob: https://{bucket}.s3.amazonaws.com"
+
 
 _MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
 
@@ -105,7 +127,7 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' "+' '.join(settings.allowed_origins)+" https://d31cxfv0l904ar.cloudfront.net; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; "+_media_src_csp()+"; connect-src 'self' "+' '.join(settings.allowed_origins)+" https://d31cxfv0l904ar.cloudfront.net; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'

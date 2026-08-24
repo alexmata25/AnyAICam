@@ -186,6 +186,7 @@ from contextvars import ContextVar
 
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 
 
@@ -137186,6 +137187,25 @@ def _presigned_recording_url(s3_key: str) -> str | None:
 # "Load older recordings" pagination and event-to-playback deep links,
 # both of which query past this limit on demand instead of it ever
 # being a hard ceiling on what a customer can reach.
+# Every recording/detection-event timestamp in this system is a naive
+# string with no timezone marker, written by the appliance's own local
+# clock (recording_uploader.py's own "naive local-time throughout"
+# convention on the edge side) -- for every real deployment so far,
+# that clock is set to US Central time, not UTC. The cloud server's own
+# datetime.now() is UTC (its OS clock, unlike the appliance's, is not
+# timezone-configured), so using it directly to compute "today" for a
+# calendar-day boundary was comparing a UTC date against Central-time-
+# stamped data -- wrong for roughly five hours a day (the gap between
+# UTC midnight and Central midnight), silently hiding or misdating a
+# customer's own recent recordings/events. APPLIANCE_TIMEZONE exists so
+# every "what date is it, for the purpose of matching appliance-
+# stamped data" computation uses the same zone the data was actually
+# written in. Sites/customers have no stored per-site timezone today
+# (only an onboarding form placeholder, never persisted) -- this is
+# the smallest correct fix until that exists, not a claim that every
+# future customer is in Central time.
+APPLIANCE_TIMEZONE = ZoneInfo("America/Chicago")
+
 CUSTOMER_PLAYBACK_INITIAL_LIMIT = 50
 
 
@@ -137352,7 +137372,9 @@ def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
 def customer_camera_events(camera_id: str, request: Request, date: str | None = None) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
+    # that constant's own comment.
+    date = date or datetime.now(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d")
     return {"events": _customer_camera_events(camera_id, date)}
 
 
@@ -137460,7 +137482,10 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         camera["id"]: (_customer_recording_rows(camera["id"], limit=CUSTOMER_PLAYBACK_INITIAL_LIMIT) if camera["id"] == initial_camera_id else [])
         for camera in cameras
     }
-    today = datetime.now().strftime("%Y-%m-%d")
+    # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
+    # that constant's own comment for why: recording/event timestamps
+    # are naive strings written in the appliance's local time.
+    today = datetime.now(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d")
     # Only the initially-selected camera's today's event markers are
     # embedded -- same bounded-load reasoning as recordings_by_camera
     # above (see _customer_camera_events()'s own docstring). Other
