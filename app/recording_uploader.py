@@ -1126,6 +1126,35 @@ def _remember_uploaded(camera_number: int, filename: str) -> None:
     _record_successful_upload(camera_number, filename)
 
 
+def _report_upload_backlog() -> None:
+    """Fleet-visible summary of this appliance's own recording-upload
+    backlog -- see upload_pending_count's own column comment on the
+    cloud side (db_migrations.py). Counts every eligible camera's full
+    pending list (not truncated by MAX_FILES_PER_SCAN, unlike a single
+    scan's actual upload dispatch) so the reported number reflects the
+    real backlog size, not just this scan's throughput. A camera whose
+    recording_mode is "disabled" (see recording_upload_worker()'s own
+    skip above) is excluded here too -- its local files were never
+    upload candidates in the first place, so counting them as
+    "pending" would misrepresent the backlog, not describe it.
+    Best-effort: if the control plane is unreachable this scan,
+    _control_plane_post() already logs and returns None; nothing here
+    escalates that further, since a missed backlog report is far less
+    consequential than a missed upload."""
+    pending_total = 0
+    for camera_number in _known_camera_numbers():
+        identity = _camera_identity(camera_number)
+        if not identity or identity.get("recording_mode") == "disabled":
+            continue
+        already = _already_uploaded_for_camera(camera_number)
+        pending_total += len(_pending_recording_files(camera_number, already))
+    quarantined_total = len(_load_quarantine_state()["quarantined"])
+    _control_plane_post(
+        "/api/appliance/recordings/backlog",
+        {"pending_count": pending_total, "quarantined_count": quarantined_total},
+    )
+
+
 def _upload_recording(session: dict, local_path: Path, started_at: datetime) -> str:
     if boto3 is None:
         raise RuntimeError("boto3 is not installed.")
@@ -1269,6 +1298,7 @@ async def recording_upload_worker() -> None:
                 await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
             recording_upload_state["last_scan_at"] = datetime.now().isoformat()
             recording_upload_state["last_error"] = None
+            await asyncio.to_thread(_report_upload_backlog)
             await asyncio.sleep(SCAN_SECONDS)
         except asyncio.CancelledError:
             raise
