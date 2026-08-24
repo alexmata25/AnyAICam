@@ -50,6 +50,44 @@ def test_rejects_missing_client():
     assert getattr(excinfo.value, "status_code", None) == 403
 
 
+def test_allows_the_container_own_docker_gateway(monkeypatch):
+    """The real, empirically-confirmed calling pattern: anyaicam-agent
+    runs on the host, not inside the container, and reaches this route
+    through docker-compose's published port -- which arrives inside the
+    container's network namespace as the container's own default
+    gateway, not as 127.0.0.1. See _docker_gateway_ip()'s own comment."""
+    monkeypatch.setattr(main, "_docker_gateway_ip_cache", None)
+    monkeypatch.setattr(main, "_docker_gateway_ip", lambda: "172.18.0.1")
+    result = main.internal_camera_status(_fake_request("172.18.0.1"))
+    assert {item["camera"] for item in result["cameras"]} == set(range(1, main.CAMERA_COUNT + 1))
+
+
+def test_still_rejects_addresses_that_are_not_the_real_gateway(monkeypatch):
+    monkeypatch.setattr(main, "_docker_gateway_ip", lambda: "172.18.0.1")
+    with pytest.raises(Exception) as excinfo:
+        main.internal_camera_status(_fake_request("172.18.0.99"))
+    assert getattr(excinfo.value, "status_code", None) == 403
+
+
+def test_docker_gateway_ip_parses_real_proc_net_route_format(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "_docker_gateway_ip_cache", None)
+    route_file = tmp_path / "route"
+    route_file.write_text(
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        "eth0\t00000000\t010012AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+        "eth0\t000012AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+    )
+    real_open = open
+    monkeypatch.setattr("builtins.open", lambda path, *a, **k: real_open(route_file) if path == "/proc/net/route" else real_open(path, *a, **k))
+    assert main._docker_gateway_ip() == "172.18.0.1"
+
+
+def test_docker_gateway_ip_fails_safe_to_none_when_unreadable(monkeypatch):
+    monkeypatch.setattr(main, "_docker_gateway_ip_cache", None)
+    monkeypatch.setattr("builtins.open", lambda *a, **k: (_ for _ in ()).throw(OSError("no such file")))
+    assert main._docker_gateway_ip() is None
+
+
 def test_allows_loopback_and_returns_all_cameras():
     result = main.internal_camera_status(_fake_request("127.0.0.1"))
     assert {item["camera"] for item in result["cameras"]} == set(range(1, main.CAMERA_COUNT + 1))

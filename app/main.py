@@ -95,6 +95,8 @@ import shutil
 
 
 import subprocess
+import socket
+import struct
 
 
 
@@ -52710,6 +52712,36 @@ def ai_detection_status() -> dict:
 
 
 
+_docker_gateway_ip_cache: str | None = None
+
+
+def _docker_gateway_ip() -> str | None:
+    """The container's own default-route gateway -- for the standard
+    docker-compose "ports: 8000:8000" publishing used here, a
+    connection the *host* makes to its own published port (exactly
+    how anyaicam-agent, running outside the container, reaches this
+    route) arrives inside the container's network namespace showing
+    this gateway as the source address, not 127.0.0.1 -- confirmed
+    empirically against the real running container, not assumed.
+    Read once and cached: this only changes if the container's whole
+    network is recreated, which already requires restarting this
+    process too. Fails safe to None (matches nothing) if /proc/net/
+    route is ever unreadable or unparseable, rather than guessing."""
+    global _docker_gateway_ip_cache
+    if _docker_gateway_ip_cache is not None:
+        return _docker_gateway_ip_cache
+    try:
+        with open("/proc/net/route", encoding="ascii") as route_file:
+            for line in route_file.readlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == "00000000":
+                    _docker_gateway_ip_cache = socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+                    return _docker_gateway_ip_cache
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 @app.get("/internal/camera-status")
 def internal_camera_status(request: Request) -> dict:
     """Local-only bridge for the host-level anyaicam-agent (see
@@ -52723,12 +52755,14 @@ def internal_camera_status(request: Request) -> dict:
     Deliberately not placed under /api/ (which the auth middleware
     protects with a customer/partner session); listed in
     PUBLIC_PATH_PREFIXES like /health instead. Unlike /health, this
-    also enforces its own loopback-only check below, since per-camera
-    operational detail is more sensitive than a bare up/down signal
-    and this port is published on all host interfaces (docker-compose
-    .yml's "8000:8000"), not just loopback."""
+    also enforces its own host-only check below (loopback, or this
+    container's own docker gateway -- see _docker_gateway_ip()'s own
+    comment for why the gateway case is real, not a loophole), since
+    per-camera operational detail is more sensitive than a bare
+    up/down signal and this port is published on all host interfaces
+    (docker-compose.yml's "8000:8000"), not just loopback."""
     client_host = request.client.host if request.client else None
-    if client_host not in {"127.0.0.1", "::1"}:
+    if client_host not in {"127.0.0.1", "::1", _docker_gateway_ip()}:
         raise HTTPException(status_code=403, detail="This endpoint is only reachable from the appliance host itself.")
     recording_state = {item["camera"]: item for item in camera_status()["cameras"]}
     analytics_state = {item["camera"]: item for item in ai_detection_status()["cameras"]}
