@@ -104,6 +104,7 @@ import subprocess
 
 
 import time
+import threading
 
 
 
@@ -184,7 +185,7 @@ from contextvars import ContextVar
 
 
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 
 
@@ -137079,6 +137080,64 @@ def _camera_display_label(camera: dict) -> str:
     return f"Camera {number}" if number is not None else str(camera.get("id", "Camera"))
 
 
+_recording_read_credentials_cache: dict | None = None
+_recording_read_credentials_lock = threading.Lock()
+
+
+def _recording_read_credentials(role_arn: str, region: str) -> dict | None:
+    """Assumes ANYAICAM_RECORDING_READ_ROLE_ARN at most once every ~14
+    minutes and reuses those temporary credentials for every
+    _presigned_recording_url() call in between, instead of a fresh STS
+    AssumeRole network round-trip per recording. generate_presigned_url()
+    itself is a pure local computation once real credentials are held --
+    it never touches the network -- so the STS call was always the only
+    genuinely expensive step here.
+
+    Found and fixed as a real production incident: with the recording
+    catalog actually populated (R3's uploader now enabled), a single
+    camera's Playback render was doing one AssumeRole per recording --
+    192 recordings measured at ~15 seconds server-side for that one
+    camera alone, times every camera on the account. The customer saw a
+    populated timeline (cheap: one SQL query) but a player that never
+    received a source, because the page render either timed out or
+    took long enough to feel completely broken. This was invisible
+    before today only because the catalog was empty, never because the
+    STS-per-row pattern was actually cheap.
+
+    The refreshed 900s DurationSeconds window is used with a 60s safety
+    margin so a presign never fires on a credential set that expires
+    mid-request. Failure here (network blip, role misconfigured) is
+    never cached -- the next call simply tries again, exactly like the
+    uncached code already did on every call."""
+    global _recording_read_credentials_cache
+    with _recording_read_credentials_lock:
+        cached = _recording_read_credentials_cache
+        if cached and cached['expiration'] > datetime.now(timezone.utc) + timedelta(seconds=60):
+            return cached
+        try:
+            import boto3
+        except ImportError:
+            return None
+        try:
+            sts = boto3.client('sts', region_name=region)
+            assumed = sts.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=f'recording-read-{secrets.token_hex(6)}',
+                DurationSeconds=900,
+            )
+        except Exception:
+            logging.getLogger('anyaicam.recording_read').exception('recording_read.assume_role_failed')
+            return None
+        creds = assumed['Credentials']
+        _recording_read_credentials_cache = {
+            'access_key_id': creds['AccessKeyId'],
+            'secret_access_key': creds['SecretAccessKey'],
+            'session_token': creds['SessionToken'],
+            'expiration': creds['Expiration'],
+        }
+        return _recording_read_credentials_cache
+
+
 def _presigned_recording_url(s3_key: str) -> str | None:
     """R4 (recording-pipeline roadmap): signs a short-lived GET URL for
     one recording object. Fails closed (returns None) whenever the
@@ -137090,7 +137149,12 @@ def _presigned_recording_url(s3_key: str) -> str | None:
     URL requires assuming a dedicated, read-only, GetObject-scoped role
     via STS -- never the write-only upload role, which cannot read.
     A recording with no signable URL is skipped by the caller rather
-    than shown as a dead link -- see _customer_camera_recordings()."""
+    than shown as a dead link -- see _customer_camera_recordings().
+
+    Credentials for the assumed role are cached and reused across calls
+    -- see _recording_read_credentials()'s own comment for why; nothing
+    about which recordings are shown or how they're signed changed,
+    only how often STS gets called to do it."""
     role_arn = os.getenv('ANYAICAM_RECORDING_READ_ROLE_ARN', '').strip()
     bucket = os.getenv('ANYAICAM_RECORDING_S3_BUCKET', '').strip()
     region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', '')).strip()
@@ -137101,18 +137165,14 @@ def _presigned_recording_url(s3_key: str) -> str | None:
     except ImportError:
         return None
     try:
-        sts = boto3.client('sts', region_name=region)
-        assumed = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=f'recording-read-{secrets.token_hex(6)}',
-            DurationSeconds=900,
-        )
-        creds = assumed['Credentials']
+        creds = _recording_read_credentials(role_arn, region)
+        if not creds:
+            return None
         s3 = boto3.client(
             's3', region_name=region,
-            aws_access_key_id=creds['AccessKeyId'],
-            aws_secret_access_key=creds['SecretAccessKey'],
-            aws_session_token=creds['SessionToken'],
+            aws_access_key_id=creds['access_key_id'],
+            aws_secret_access_key=creds['secret_access_key'],
+            aws_session_token=creds['session_token'],
         )
         return s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': s3_key}, ExpiresIn=900)
     except Exception:
