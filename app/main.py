@@ -137511,10 +137511,23 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // clicking that same event's marker on the timeline would, or say
     // plainly that nothing is available yet rather than leaving the
     // customer to guess why nothing happened.
+    //
+    // No deep-link timestamp (the ordinary case: a customer just opened
+    // Playback) used to leave the player sitting at a permanently black
+    // 0:00 until a segment/row/marker was clicked -- correct in that
+    // clicking genuinely did work, but from the customer's chair a
+    // populated timeline with nothing playing reads as broken, not as
+    // "waiting for a click". Auto-loading the single most recent clip
+    // (clips is already ordered oldest-to-newest by the SQL query, so
+    // the last entry is the newest) gives an immediate, real first
+    // frame without changing anything about how clicking a different
+    // segment, row, or marker behaves afterward.
     if(seekTimestamp){{
       const nearby=findClipNear(clips,seekTimestamp);
       if(nearby){{playClip(nearby)}}
       else{{status.textContent='No recording available for this time yet.'}}
+    }}else if(clips.length){{
+      playClip(clips[clips.length-1]);
     }}
   }}
 
