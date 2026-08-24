@@ -285,12 +285,23 @@ def _refresh_camera_map() -> None:
     stops already-known cameras from continuing to upload.
 
     recording_mode is deliberately normalized to exactly 'motion',
-    'continuous', or None here -- any other raw value the cloud might
-    ever send (a typo, a future third mode not yet understood by this
-    appliance build) collapses to None, which _pending_recording_files()
-    treats identically to 'continuous': upload everything. No hidden
-    default ever resolves to motion-gating; only an exact 'motion'
-    string does.
+    'disabled', 'continuous', or None here -- any other raw value the
+    cloud might ever send (a typo, a future mode not yet understood by
+    this appliance build) collapses to None, which _pending_recording_
+    files() treats identically to 'continuous': upload everything. No
+    hidden default ever resolves to motion-gating or to disabled; only
+    an exact 'motion'/'disabled' string does either.
+
+    'disabled' is the per-camera cloud-recording-upload authorization
+    (see set_cloud_recording_mode()'s own docstring, cloud side): this
+    appliance-wide worker's own ANYAICAM_RECORDING_UPLOAD_ENABLED flag
+    is only the master permission switch, never a per-camera decision
+    on its own. recording_upload_worker() below skips a camera whose
+    recording_mode is 'disabled' entirely -- no credential request, no
+    upload attempt, no catalog notification -- before that camera's
+    scan even begins. Local recording and retention for that camera are
+    completely untouched either way, exactly like 'motion'/'continuous'
+    already are.
 
     people_counting_enabled follows the exact same normalize-to-a-
     known-safe-value discipline: only an exact truthy 1/True from the
@@ -320,7 +331,7 @@ def _refresh_camera_map() -> None:
         if not isinstance(site_id, str) or not site_id.strip():
             continue
         raw_recording_mode = item.get("recording_mode")
-        recording_mode = raw_recording_mode if raw_recording_mode in ("motion", "continuous") else None
+        recording_mode = raw_recording_mode if raw_recording_mode in ("motion", "continuous", "disabled") else None
         people_counting_enabled = item.get("people_counting_enabled") in (1, True)
         mapping[camera_number] = {
             "camera_id": camera_id,
@@ -997,6 +1008,17 @@ async def recording_upload_worker() -> None:
                 identity = _camera_identity(camera_number)
                 logger.info("recording_upload.camera_identity_done camera=%s found=%s", camera_number, identity is not None)
                 if not identity:
+                    continue
+                if identity.get("recording_mode") == "disabled":
+                    # Per-camera cloud-recording authorization (see
+                    # _refresh_camera_map()'s own docstring above): the
+                    # master ANYAICAM_RECORDING_UPLOAD_ENABLED flag is
+                    # necessary but not sufficient. Skipped before any
+                    # credential request, upload attempt, or catalog
+                    # notification for this camera -- local recording is
+                    # completely unaffected, and every other camera's own
+                    # scan this same tick is unaffected too.
+                    logger.info("recording_upload.camera_upload_disabled camera=%s", camera_number)
                     continue
                 logger.info("recording_upload.to_thread_dispatch_begin camera=%s", camera_number)
                 await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
