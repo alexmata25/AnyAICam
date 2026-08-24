@@ -141,6 +141,29 @@ CUTOFF_FILE = Path(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CUTOFF_FILE", str(S
 # quarantine is bookkeeping only.
 QUARANTINE_FILE = Path(os.environ.get("ANYAICAM_RECORDING_UPLOAD_QUARANTINE_FILE", str(STATE_DIR / "recording_upload_quarantine.json")))
 QUARANTINE_FAILURE_THRESHOLD = 3
+# Persisted "already uploaded" record (restart-continuity safety valve):
+# _uploaded_files below is in-memory-only and intentionally so for its
+# original purpose (see its own comment) -- but that meant a restart
+# reset it to empty, and _pending_recording_files() would then treat
+# every local file still on disk as an unseen candidate again, walking
+# oldest-first back through the entire local retention window before
+# ever reaching genuinely new footage (confirmed in production: hours
+# of needless re-verify-and-reupload after a restart, for a camera
+# with a full retention window of local files). This file makes
+# "already uploaded" survive a restart the same way quarantine and the
+# cutoff already do. The cloud's own /available dedup (unchanged,
+# returns "duplicate" for an already-known recording, creating no
+# second catalog row) remains the final safety net regardless -- this
+# file only avoids the needless work of getting there, it is never
+# relied on for correctness by itself.
+UPLOADED_FILE = Path(os.environ.get("ANYAICAM_RECORDING_UPLOAD_UPLOADED_FILE", str(STATE_DIR / "recording_upload_uploaded.json")))
+# Deliberately independent of, and larger than, MAX_TRACKED_FILES_PER_CAMERA
+# below (which bounds the separate in-memory-only list for a narrower,
+# same-process purpose -- see its own comment). This one needs to
+# comfortably cover a full RETENTION_DAYS window's worth of segments
+# (main.py's RETENTION_DAYS defaults to 7 days at one 300s segment
+# each, ~288/day/camera), not just the last couple hundred successes.
+MAX_PERSISTED_UPLOADED_FILES_PER_CAMERA = max(200, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_PERSISTED_FILES_PER_CAMERA", "4000")))
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
 # RECORDINGS_FOLDER is intentionally hardcoded, matching main.py's own
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
@@ -228,6 +251,8 @@ _cutoff_cache: datetime | None = None       # loaded/established once per proces
 _backlog_skip_logged: set[int] = set()      # camera_numbers already logged as having pre-cutoff backlog this process lifetime -- avoids re-logging the same stable count every scan
 _quarantine_lock = threading.Lock()
 _quarantine_cache: dict | None = None       # {"failures": {"<camera>:<filename>": count}, "quarantined": {"<camera>:<filename>", ...}} -- loaded once per process lifetime, see _load_quarantine_state()
+_uploaded_lock = threading.Lock()
+_uploaded_state_cache: dict | None = None  # {"<camera_number>": ["filename", ...]} -- loaded once per process lifetime, mirrors _quarantine_cache above
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -814,6 +839,88 @@ def _clear_upload_failures(camera_number: int, filename: str) -> None:
             _save_quarantine_state(state)
 
 
+def _load_uploaded_state() -> dict:
+    """Cached after the first call each process lifetime, same discipline
+    as _load_quarantine_state()/_load_or_establish_cutoff(). This is
+    what lets a restarted process immediately recognize local files it
+    already uploaded before the restart, instead of re-walking the
+    entire local retention window from scratch (previously the only
+    record of a successful upload was the in-memory-only
+    _uploaded_files, which reset to empty on every restart -- see
+    UPLOADED_FILE's own comment). A missing file starts empty (first
+    run ever, or state predates this feature); a corrupt file fails
+    safe by resetting to empty rather than guessing -- the worst case
+    is some already-uploaded files get harmlessly re-verified and
+    re-uploaded once (the cloud's own /available dedup, unchanged,
+    absorbs it), never that a genuinely new file gets silently
+    skipped."""
+    global _uploaded_state_cache
+    with _uploaded_lock:
+        if _uploaded_state_cache is not None:
+            return _uploaded_state_cache
+        try:
+            raw = json.loads(UPLOADED_FILE.read_text())
+            uploaded = raw.get("uploaded") if isinstance(raw.get("uploaded"), dict) else {}
+            uploaded = {key: value for key, value in uploaded.items() if isinstance(value, list)}
+        except FileNotFoundError:
+            uploaded = {}
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            logger.warning("recording_upload.uploaded_state_corrupt_resetting path=%s error=%s", UPLOADED_FILE, error)
+            uploaded = {}
+        _uploaded_state_cache = uploaded
+        return _uploaded_state_cache
+
+
+def _save_uploaded_state(state: dict) -> None:
+    try:
+        UPLOADED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        UPLOADED_FILE.write_text(json.dumps({"uploaded": state}))
+    except OSError as error:
+        # Same reasoning as _save_quarantine_state(): persistence
+        # failing doesn't lose safety in the dangerous direction -- the
+        # in-memory cache (state, held by the caller) still reflects
+        # this success for the rest of this process, so this file is
+        # never re-walked as "unseen" again this same run just because
+        # a single write failed. A restart before a later write
+        # succeeds only costs one harmless re-verify-and-reupload
+        # (cloud dedup absorbs it), never data loss or a dropped file.
+        logger.warning("recording_upload.uploaded_state_write_failed path=%s error=%s", UPLOADED_FILE, error)
+
+
+def _record_successful_upload(camera_number: int, filename: str) -> None:
+    """Persists a successful upload immediately, alongside the existing
+    in-memory _remember_uploaded() (unchanged) which calls this -- so a
+    restart immediately after this file's success still recognizes it
+    as already uploaded, instead of re-walking it. Bounded to
+    MAX_PERSISTED_UPLOADED_FILES_PER_CAMERA per camera (oldest entries
+    dropped first), the same trim discipline _remember_uploaded()
+    already applies to its own in-memory list, just with a larger cap
+    -- see MAX_PERSISTED_UPLOADED_FILES_PER_CAMERA's own comment."""
+    state = _load_uploaded_state()
+    with _uploaded_lock:
+        camera_key = str(camera_number)
+        entries = state.setdefault(camera_key, [])
+        if filename not in entries:
+            entries.append(filename)
+            del entries[:-MAX_PERSISTED_UPLOADED_FILES_PER_CAMERA]
+        _save_uploaded_state(state)
+
+
+def _already_uploaded_for_camera(camera_number: int) -> set[str]:
+    """Union of this process's own in-memory record of successful
+    uploads (_uploaded_files) and the persisted, cross-restart record
+    (_load_uploaded_state()) -- see UPLOADED_FILE's own comment for why
+    the persisted half exists. This is the exact fix for the
+    restart-reprocessing gap: immediately after a restart,
+    _uploaded_files is empty but _load_uploaded_state() still reflects
+    every prior success, so a freshly-completed *new* segment is the
+    only thing that shows up as pending -- not the whole retention
+    window."""
+    return set(_uploaded_files.get(camera_number, [])) | set(
+        _load_uploaded_state().get(str(camera_number), [])
+    )
+
+
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
     """...same as always, PLUS (new): for a camera whose recording_mode
     is exactly 'motion' (see _refresh_camera_map()), only queue a
@@ -1016,6 +1123,7 @@ def _remember_uploaded(camera_number: int, filename: str) -> None:
     uploaded = _uploaded_files.setdefault(camera_number, [])
     uploaded.append(filename)
     del uploaded[:-MAX_TRACKED_FILES_PER_CAMERA]
+    _record_successful_upload(camera_number, filename)
 
 
 def _upload_recording(session: dict, local_path: Path, started_at: datetime) -> str:
@@ -1060,7 +1168,7 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     session = _ensure_session(camera_number, camera_id)
     if not session:
         return
-    already = set(_uploaded_files.get(camera_number, []))
+    already = _already_uploaded_for_camera(camera_number)
     pending = _pending_recording_files(camera_number, already)
     if MAX_FILES_PER_SCAN is not None:
         pending = pending[:MAX_FILES_PER_SCAN]
