@@ -137309,6 +137309,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
+        '<div id="playback-debug" style="font:11px/1.5 monospace;color:#8a93a3;padding:6px 2px;word-break:break-all"></div>'
         '</div></div>'
         '</section>'
         '<section class="monitor-timeline" style="margin-top:14px">'
@@ -137364,6 +137365,26 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const analyticsByCamera={json.dumps(analytics_by_camera)};
   const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
+  const debugLine=document.getElementById('playback-debug');
+  // TEMPORARY, safe playback diagnostics -- no secrets, no full signed
+  // URLs (only the recording filename), removed once real-browser proof
+  // is captured. Surfaces exactly what the customer's own player is
+  // doing: which camera/recording is selected, whether a source was
+  // actually assigned, and which of loadedmetadata/canplay/playing/error
+  // the browser itself fires for that source -- console.log for anyone
+  // with devtools open, plus the same text in a small on-page line so it
+  // doesn't require devtools at all.
+  function debugLog(message){{console.log('[playback-debug]',message);if(debugLine)debugLine.textContent=message}}
+  ['loadedmetadata','canplay','playing','error'].forEach(eventName=>{{
+    video.addEventListener(eventName,()=>{{
+      if(eventName==='error'){{
+        const mediaError=video.error;
+        debugLog(`event=error code=${{mediaError?mediaError.code:'?'}} message=${{mediaError?mediaError.message:'unknown'}}`);
+      }}else{{
+        debugLog(`event=${{eventName}} duration=${{video.duration||0}} currentSrcSet=${{!!video.currentSrc}}`);
+      }}
+    }});
+  }});
   const placeholder=document.getElementById('playback-placeholder');
   const status=document.getElementById('playback-status');
   const clipList=document.getElementById('playback-clip-list');
@@ -137403,8 +137424,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
   function playClip(clip){{
     placeholder.hidden=true;
+    debugLog(`camera=${{selectedCameraId}} recording=${{clip.name}} srcAssigned=true`);
     video.src=clip.url;
-    video.play().catch(()=>{{}});
+    video.play().catch(error=>debugLog(`play() rejected (often normal without a prior click): ${{error && error.name}}`));
     revealClipPanel();
   }}
 
