@@ -125,6 +125,22 @@ CREDENTIAL_FILE = STATE_DIR / "credential.json"
 # tests -- production always uses the default, same STATE_DIR credential.json
 # already lives in.
 CUTOFF_FILE = Path(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CUTOFF_FILE", str(STATE_DIR / "recording_upload_cutoff.json")))
+# Bounded quarantine (head-of-line-blocking safety valve): a file whose
+# codec-prep, upload, or catalog-notification attempt fails
+# QUARANTINE_FAILURE_THRESHOLD times in a row is excluded from all
+# future scans for that camera, so one permanently-bad recording (e.g.
+# genuinely truncated by an appliance interruption -- confirmed via
+# real ffprobe/ffmpeg decode checks, not guessed) can never block every
+# newer, valid recording behind it forever. Persisted (see
+# _load_quarantine_state()) rather than kept only in memory, unlike
+# _uploaded_files above -- an in-memory-only counter would reset to 0
+# on every restart and could never actually reach the threshold on an
+# appliance that restarts more often than 3 scan cycles for that
+# camera, which defeats the whole point. The original .mkv is never
+# touched, moved, or deleted by quarantine or by anything it gates --
+# quarantine is bookkeeping only.
+QUARANTINE_FILE = Path(os.environ.get("ANYAICAM_RECORDING_UPLOAD_QUARANTINE_FILE", str(STATE_DIR / "recording_upload_quarantine.json")))
+QUARANTINE_FAILURE_THRESHOLD = 3
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
 # RECORDINGS_FOLDER is intentionally hardcoded, matching main.py's own
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
@@ -210,6 +226,8 @@ _transcode_semaphore = threading.Semaphore(TRANSCODE_MAX_CONCURRENCY)
 _cutoff_lock = threading.Lock()
 _cutoff_cache: datetime | None = None       # loaded/established once per process lifetime -- see _load_or_establish_cutoff()
 _backlog_skip_logged: set[int] = set()      # camera_numbers already logged as having pre-cutoff backlog this process lifetime -- avoids re-logging the same stable count every scan
+_quarantine_lock = threading.Lock()
+_quarantine_cache: dict | None = None       # {"failures": {"<camera>:<filename>": count}, "quarantined": {"<camera>:<filename>", ...}} -- loaded once per process lifetime, see _load_quarantine_state()
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -701,6 +719,101 @@ def _load_or_establish_cutoff() -> datetime:
         return cutoff
 
 
+def _quarantine_key(camera_number: int, filename: str) -> str:
+    return f"{camera_number}:{filename}"
+
+
+def _load_quarantine_state() -> dict:
+    """Cached after the first call each process lifetime, same discipline
+    as _load_or_establish_cutoff() -- the on-disk file is read once, then
+    kept current in memory and rewritten on every change. A missing file
+    (never quarantined anything yet) starts empty; a corrupt file fails
+    safe by resetting to empty rather than guessing -- the worst case is
+    a small number of already-counted failures need to happen again
+    before a genuinely bad file re-reaches the threshold, never that a
+    good file gets wrongly excluded."""
+    global _quarantine_cache
+    with _quarantine_lock:
+        if _quarantine_cache is not None:
+            return _quarantine_cache
+        try:
+            raw = json.loads(QUARANTINE_FILE.read_text())
+            failures = raw.get("failures") if isinstance(raw.get("failures"), dict) else {}
+            quarantined = set(raw.get("quarantined")) if isinstance(raw.get("quarantined"), list) else set()
+        except FileNotFoundError:
+            failures, quarantined = {}, set()
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            logger.warning("recording_upload.quarantine_state_corrupt_resetting path=%s error=%s", QUARANTINE_FILE, error)
+            failures, quarantined = {}, set()
+        _quarantine_cache = {"failures": failures, "quarantined": quarantined}
+        return _quarantine_cache
+
+
+def _save_quarantine_state(state: dict) -> None:
+    try:
+        QUARANTINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        QUARANTINE_FILE.write_text(json.dumps({
+            "failures": state["failures"],
+            "quarantined": sorted(state["quarantined"]),
+        }))
+    except OSError as error:
+        # Persistence failing doesn't lose safety in the dangerous
+        # direction: the in-memory cache (state, held by the caller)
+        # still reflects the incremented count/quarantine decision for
+        # the rest of this process, so a bad file is never retried
+        # unboundedly just because a single write failed. A restart
+        # before a later write succeeds only costs a few more retries
+        # against the old on-disk count -- it can never un-quarantine
+        # a file that's already excluded, since the file itself is
+        # never touched.
+        logger.warning("recording_upload.quarantine_state_write_failed path=%s error=%s", QUARANTINE_FILE, error)
+
+
+def _is_quarantined(camera_number: int, filename: str) -> bool:
+    state = _load_quarantine_state()
+    with _quarantine_lock:
+        return _quarantine_key(camera_number, filename) in state["quarantined"]
+
+
+def _record_upload_failure(camera_number: int, filename: str, reason: str) -> None:
+    """Called from every one of _relay_camera_once()'s three failure
+    points (codec-prep, upload, catalog-notify) with a reason naming
+    which one. Increments this file's persisted consecutive-failure
+    count; at QUARANTINE_FAILURE_THRESHOLD, marks it quarantined (so
+    _pending_recording_files() excludes it from every future scan for
+    this camera) and logs exactly one clear warning naming the camera,
+    filename, reason, and failure count -- never logged again for the
+    same file afterward, since a quarantined file is never retried."""
+    key = _quarantine_key(camera_number, filename)
+    state = _load_quarantine_state()
+    with _quarantine_lock:
+        count = state["failures"].get(key, 0) + 1
+        state["failures"][key] = count
+        newly_quarantined = count >= QUARANTINE_FAILURE_THRESHOLD and key not in state["quarantined"]
+        if newly_quarantined:
+            state["quarantined"].add(key)
+        _save_quarantine_state(state)
+    if newly_quarantined:
+        logger.warning(
+            "recording_upload.file_quarantined camera=%s filename=%s reason=%s failure_count=%s",
+            camera_number, filename, reason, count,
+        )
+
+
+def _clear_upload_failures(camera_number: int, filename: str) -> None:
+    """Called on a successful upload -- hygiene only, not required for
+    correctness (a succeeded file leaves the pending set for good
+    regardless), but keeps the persisted failure map from accumulating
+    stale entries for files that eventually succeeded after a transient
+    hiccup."""
+    key = _quarantine_key(camera_number, filename)
+    state = _load_quarantine_state()
+    with _quarantine_lock:
+        if key in state["failures"]:
+            del state["failures"][key]
+            _save_quarantine_state(state)
+
+
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
     """...same as always, PLUS (new): for a camera whose recording_mode
     is exactly 'motion' (see _refresh_camera_map()), only queue a
@@ -749,6 +862,13 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
     skipped_no_motion = 0
     for local_path in _completed_recording_files(camera_number):
         if local_path.name in already_uploaded:
+            continue
+        if _is_quarantined(camera_number, local_path.name):
+            # Confirmed-bad after QUARANTINE_FAILURE_THRESHOLD consecutive
+            # failures (see _record_upload_failure()) -- permanently
+            # excluded from candidacy so it can never block a newer, valid
+            # file behind it again. The file itself is untouched on disk;
+            # only its participation in future scans stops.
             continue
         started_at = _recording_started_at(local_path, camera_number)
         if started_at is not None and started_at < cutoff:
@@ -926,7 +1046,16 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     de-dup, which never retries or re-logs it, but still never touches
     or deletes the original either). The original MKV is untouched by
     every one of these paths; only the derived MP4 staging file is
-    ever cleaned up, and only after its own upload attempt concludes."""
+    ever cleaned up, and only after its own upload attempt concludes.
+
+    Each of the three failure points below also calls
+    _record_upload_failure() -- after QUARANTINE_FAILURE_THRESHOLD
+    consecutive failures for the same file, it stops being retried at
+    all (see _pending_recording_files()), so one permanently-bad
+    recording can never block every valid file behind it forever. A
+    successful upload clears that file's failure count via
+    _clear_upload_failures() -- hygiene only, not required for
+    correctness."""
     logger.info("recording_upload.relay_camera_once_entered camera=%s", camera_number)
     session = _ensure_session(camera_number, camera_id)
     if not session:
@@ -951,7 +1080,12 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
 
         mp4_path = _prepare_cloud_copy(local_path, camera_number, expected_duration_seconds)
         if mp4_path is None:
-            continue  # unsupported codec, or remux/transcode failed -- original MKV untouched either way
+            # unsupported codec, or remux/transcode failed (includes a
+            # duration-verification failure -- see _verify_output_
+            # duration()'s own specific warning, logged separately) --
+            # original MKV untouched either way
+            _record_upload_failure(camera_number, local_path.name, "remux_or_transcode_failed")
+            continue
 
         try:
             size_bytes = mp4_path.stat().st_size
@@ -959,6 +1093,7 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
         except Exception as error:
             logger.warning("recording_upload.file_upload_failed camera=%s path=%s error=%s", camera_number, local_path, error)
             _cleanup_staged_file(mp4_path)
+            _record_upload_failure(camera_number, local_path.name, "upload_failed")
             continue
 
         response = _control_plane_post(
@@ -975,7 +1110,9 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
 
         if not isinstance(response, dict) or response.get("status") not in {"accepted", "duplicate"}:
             logger.warning("recording_upload.notify_failed camera=%s path=%s", camera_number, local_path)
+            _record_upload_failure(camera_number, local_path.name, "notify_failed")
             continue
+        _clear_upload_failures(camera_number, local_path.name)
         _remember_uploaded(camera_number, local_path.name)
 
 
