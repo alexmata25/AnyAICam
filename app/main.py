@@ -40451,6 +40451,7 @@ PUBLIC_PATH_PREFIXES = (
 
 
     "/version",
+    "/internal/",
 
 
 
@@ -52707,6 +52708,42 @@ def ai_detection_status() -> dict:
 
 
 
+
+
+@app.get("/internal/camera-status")
+def internal_camera_status(request: Request) -> dict:
+    """Local-only bridge for the host-level anyaicam-agent (see
+    appliance-agent/anyaicam_agent/service.py's cameras() method) to
+    read this appliance's real, current per-camera state instead of
+    carrying forward a stale local cache -- the RDM camera-status
+    bridge this closes. Reuses camera_status() and ai_detection_status()
+    directly -- the exact same functions and state already backing the
+    authenticated /api/cameras/status and /api/ai/status routes -- so
+    there is still only one source of truth, never a second one.
+    Deliberately not placed under /api/ (which the auth middleware
+    protects with a customer/partner session); listed in
+    PUBLIC_PATH_PREFIXES like /health instead. Unlike /health, this
+    also enforces its own loopback-only check below, since per-camera
+    operational detail is more sensitive than a bare up/down signal
+    and this port is published on all host interfaces (docker-compose
+    .yml's "8000:8000"), not just loopback."""
+    client_host = request.client.host if request.client else None
+    if client_host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="This endpoint is only reachable from the appliance host itself.")
+    recording_state = {item["camera"]: item for item in camera_status()["cameras"]}
+    analytics_state = {item["camera"]: item for item in ai_detection_status()["cameras"]}
+    cameras = []
+    for camera_number in range(1, CAMERA_COUNT + 1):
+        recording_item = recording_state.get(camera_number, {})
+        analytics_item = analytics_state.get(camera_number, {})
+        cameras.append({
+            "camera": camera_number,
+            "online": bool(recording_item.get("online")),
+            "recording": bool(recording_item.get("recording")),
+            "analytics": analytics_item.get("status") == "running",
+            "last_error": recording_item.get("last_error"),
+        })
+    return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
 
 
 @app.get("/ai-detection", response_class=HTMLResponse)
