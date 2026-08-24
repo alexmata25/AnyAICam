@@ -137180,6 +137180,151 @@ def _presigned_recording_url(s3_key: str) -> str | None:
         return None
 
 
+# How many of a camera's most recent recordings the customer Playback
+# page's initial load embeds (metadata only -- see _customer_recording_
+# rows()). Older history stays reachable via Browse recordings'
+# "Load older recordings" pagination and event-to-playback deep links,
+# both of which query past this limit on demand instead of it ever
+# being a hard ceiling on what a customer can reach.
+CUSTOMER_PLAYBACK_INITIAL_LIMIT = 50
+
+
+def _row_to_recording_metadata(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "start": row["started_at"],
+        "end": row["ended_at"],
+        "name": row["s3_key"].rsplit("/", 1)[-1],
+    }
+
+
+def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, near: str | None = None) -> list[dict]:
+    """Recording METADATA only -- {id, start, end, name}, no presigned
+    URL -- the bounded, cheap counterpart _customer_camera_recordings()
+    never was: that function signs every single matching row up front
+    (see its own docstring), which is exactly what made a real
+    customer's Playback page grow past 5MB and take 8+ seconds to
+    render as their catalog grew, and is why real browser requests
+    were being canceled before the page ever finished loading. This
+    function only ever touches the database; _customer_recording_url()
+    below is the paired, one-at-a-time presign for whichever single
+    recording a customer actually selects.
+
+    Same WHERE camera_id=? AND status='available' scoping as
+    _customer_camera_recordings() -- ownership/permission
+    authorization for camera_id is the caller's job (see
+    _customer_authorized_camera_id()), exactly as it already was for
+    the un-bounded function.
+
+    - limit: most recent N rows, returned oldest-first (matching the
+      ordering _customer_camera_recordings() and the frontend's own
+      clips[clips.length-1]-is-newest convention already use).
+    - before: only rows that started strictly before this ISO
+      timestamp -- pagination for "load older recordings" once the
+      initial bounded page has been exhausted. Ignored if near is set.
+    - near: returns at most the single recording that covers this
+      timestamp, or the closest one within 5 minutes -- the exact same
+      "covering, else nearest within 5 min" contract findClipNear() in
+      the page's own JS already implements client-side, so an
+      event-to-playback deep link lands on the same recording whether
+      or not it happens to already be in the initially-loaded page.
+      Ignores limit/before."""
+    from partner_db import connection
+    with connection() as db:
+        if near:
+            covering = db.execute(
+                "SELECT id, s3_key, started_at, ended_at FROM recordings "
+                "WHERE camera_id=? AND status='available' AND started_at<=? AND ended_at>=? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (camera_id, near, near),
+            ).fetchone()
+            if covering:
+                return [_row_to_recording_metadata(covering)]
+            before_row = db.execute(
+                "SELECT id, s3_key, started_at, ended_at FROM recordings "
+                "WHERE camera_id=? AND status='available' AND started_at<=? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (camera_id, near),
+            ).fetchone()
+            after_row = db.execute(
+                "SELECT id, s3_key, started_at, ended_at FROM recordings "
+                "WHERE camera_id=? AND status='available' AND started_at>=? "
+                "ORDER BY started_at ASC LIMIT 1",
+                (camera_id, near),
+            ).fetchone()
+            candidates = [row for row in (before_row, after_row) if row]
+            if not candidates:
+                return []
+            try:
+                target = datetime.fromisoformat(near)
+                best = min(candidates, key=lambda row: abs((datetime.fromisoformat(row["started_at"]) - target).total_seconds()))
+                if abs((datetime.fromisoformat(best["started_at"]) - target).total_seconds()) > 300:
+                    return []
+            except ValueError:
+                return []
+            return [_row_to_recording_metadata(best)]
+
+        query = "SELECT id, s3_key, started_at, ended_at FROM recordings WHERE camera_id=? AND status='available'"
+        params: list = [camera_id]
+        if before:
+            query += " AND started_at<?"
+            params.append(before)
+        query += " ORDER BY started_at DESC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = db.execute(query, params).fetchall()
+    return [_row_to_recording_metadata(row) for row in reversed(rows)]
+
+
+def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
+    """Presigns exactly one recording, looked up by its own catalog id
+    and re-scoped to camera_id in the same query -- so a recording_id
+    can never be used to fetch a URL for a different camera's footage,
+    even if the two happen to belong to the same customer. Callers
+    (the /url route below) must already have verified camera_id itself
+    is one this identity is authorized to see."""
+    from partner_db import connection
+    with connection() as db:
+        row = db.execute(
+            "SELECT s3_key FROM recordings WHERE id=? AND camera_id=? AND status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+    if not row:
+        return None
+    return _presigned_recording_url(row["s3_key"])
+
+
+def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
+    """Shared authorization check for the two bounded-Playback API
+    routes below -- reuses _customer_playback_cameras() exactly, the
+    same function the Playback page itself already trusts for which
+    cameras an identity may see, so this is never a second scoping
+    rule that could drift from the page's own."""
+    cameras = _customer_playback_cameras(request)
+    if cameras is None:
+        return False
+    return camera_id in {camera["id"] for camera in cameras}
+
+
+@app.get("/api/customer/recordings/{camera_id}")
+def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, near: str | None = None, limit: int = 50) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    limit = max(1, min(200, limit))
+    return {"clips": _customer_recording_rows(camera_id, limit=limit, before=before, near=near)}
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/url")
+def customer_recording_url(camera_id: str, recording_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    url = _customer_recording_url(camera_id, recording_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Recording not found or not yet available.")
+    return {"url": url}
+
+
 def _customer_camera_recordings(camera_id: str) -> list[dict]:
     """Recorded clips available for one customer camera (by cameras.id),
     each shaped {"start", "end", "url", "name"} -- the exact shape the
@@ -137227,20 +137372,32 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     """Renders the customer Playback page for an already-scoped camera
     list (see _customer_playback_cameras()). Never shows live video --
     the video element only ever receives a recorded clip's own URL.
-    _customer_camera_recordings() now queries R2's real catalog (R4),
-    but still returns [] in practice today: the catalog is empty until
-    R3's appliance uploader is enabled, and even a populated catalog
-    entry is skipped rather than shown until R4's own read-role
-    (docs/r4-recording-read-iam.md) is applied in AWS -- so this page
-    still honestly shows "No recordings available yet" exactly as
-    before, for real reasons rather than a hardcoded stub.
 
-    The timeline's event markers reuse _customer_detection_events()
+    Bounded initial load (fixes a real production incident: this page
+    used to embed every recording, fully presigned, for every camera
+    on the account -- 5MB+ and 8+ seconds for a real customer, which
+    real browser requests were being canceled before completing). Only
+    the initially-selected camera's most recent CUSTOMER_PLAYBACK_
+    INITIAL_LIMIT recordings are embedded, as bare metadata (id/start/
+    end/name, no URL). A recording is presigned only once a customer
+    actually selects it, via GET /api/customer/recordings/{camera_id}/
+    {recording_id}/url. Switching cameras, paging to older recordings,
+    and event-to-playback deep links (even to a recording outside the
+    initial page) all go through GET /api/customer/recordings/
+    {camera_id} on demand -- see that route and _customer_recording_
+    rows() for the near-timestamp/pagination contract. Nothing about
+    which recordings exist, their retention, or the catalog itself
+    changes -- this only changes how much of it one page load embeds.
+
+    The timeline's event markers still reuse _customer_detection_events()
     (the exact same real, tenant-scoped detection_events rows the
-    Events page and /api/analytics/events already read) -- grouped
-    here by camera_number, then re-keyed to each camera's own internal
-    id to match how recordings_by_camera is already keyed. No new
-    analytics query, no duplicated data model."""
+    Events page and /api/analytics/events already read), but bounded to
+    today's calendar date here -- the timeline itself is a single 24h
+    axis (see timelinePercent()'s own hour-of-day-only math below), so
+    an event from a different day was never meaningfully plottable on
+    it anyway; embedding a customer's entire event history (thousands
+    of rows) to show a one-day axis was the same unbounded-payload
+    mistake as the recordings list, just for a second dataset."""
     if not cameras:
         content = (
             '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
@@ -137255,8 +137412,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     # moment they already know happened -- ?camera picks the initial
     # tile (falling back to the first camera exactly as before when
     # absent/invalid/not owned by this identity), ?t is handed to the
-    # client to try to land on a covering/nearby recording via the
-    # SAME findClipNear() the timeline's own markers already use.
+    # client, which always resolves it via a fresh near= API lookup
+    # (see the module docstring above) rather than assuming it falls
+    # within whatever happens to be in the initially-embedded page.
     requested_camera_id = request.query_params.get("camera")
     valid_camera_ids = {camera["id"] for camera in cameras}
     initial_camera_id = requested_camera_id if requested_camera_id in valid_camera_ids else cameras[0]["id"]
@@ -137268,11 +137426,14 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         for camera in cameras
     )
     recordings_by_camera = {
-        camera["id"]: _customer_camera_recordings(camera["id"])
+        camera["id"]: (_customer_recording_rows(camera["id"], limit=CUSTOMER_PLAYBACK_INITIAL_LIMIT) if camera["id"] == initial_camera_id else [])
         for camera in cameras
     }
+    today = datetime.now().strftime("%Y-%m-%d")
     events_by_camera_number: dict = {}
     for event in (_customer_detection_events(request) or []):
+        if not str(event.get("timestamp") or "").startswith(today):
+            continue
         events_by_camera_number.setdefault(event.get("camera"), []).append(event)
     analytics_by_camera = {
         camera["id"]: events_by_camera_number.get(camera.get("camera_number"), [])
@@ -137356,12 +137517,14 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<section class="panel" id="playback-clip-panel" hidden style="margin-top:14px">'
         '<div class="panel-head"><div><h2>Recordings</h2><div class="health-detail">Select a point on the timeline, or browse below.</div></div></div>'
         '<div id="playback-clip-list" class="settings-list"></div>'
+        '<button id="playback-load-older" type="button" class="ghost-button" style="margin-top:8px" hidden>Load older recordings</button>'
         '</section>'
     )
 
     scripts = f'''<script>
 (function(){{
   const recordingsByCamera={json.dumps(recordings_by_camera)};
+  const recordingsLoaded=new Set([{json.dumps(first_camera_id)}]);
   const analyticsByCamera={json.dumps(analytics_by_camera)};
   const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
@@ -137390,6 +137553,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const clipList=document.getElementById('playback-clip-list');
   const clipPanel=document.getElementById('playback-clip-panel');
   const browseButton=document.getElementById('browse-recordings');
+  const loadOlderButton=document.getElementById('playback-load-older');
   const viewFrame=document.getElementById('playback-view-frame');
 
   let selectedCameraId={json.dumps(first_camera_id)};
@@ -137398,13 +137562,41 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   function revealClipPanel(){{clipPanel.hidden=false}}
   browseButton.addEventListener('click',()=>{{clipPanel.hidden=!clipPanel.hidden}});
 
+  // Bounded-load fetch helpers: every recording in recordingsByCamera
+  // is metadata only (id/start/end/name) -- see this route's own
+  // Python docstring (_render_customer_playback) for why. A URL is
+  // only ever requested for the one recording actually selected.
+  async function fetchClipsMetadata(cameraId,params){{
+    const query=new URLSearchParams(params||{{}});
+    try{{
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}?${{query}}`);
+      if(!response.ok)return [];
+      const data=await response.json();
+      return Array.isArray(data.clips)?data.clips:[];
+    }}catch(error){{
+      debugLog(`metadata fetch failed: ${{error && error.message}}`);
+      return [];
+    }}
+  }}
+  async function fetchClipUrl(cameraId,recordingId){{
+    try{{
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(recordingId)}}/url`);
+      if(!response.ok)return null;
+      const data=await response.json();
+      return data.url||null;
+    }}catch(error){{
+      debugLog(`url fetch failed: ${{error && error.message}}`);
+      return null;
+    }}
+  }}
+
   cameraTiles.forEach(tile=>{{
-    tile.addEventListener('click',()=>{{
+    tile.addEventListener('click',async()=>{{
       cameraTiles.forEach(item=>item.classList.remove('active'));
       tile.classList.add('active');
       selectedCameraId=tile.dataset.cameraId;
       clipPanel.hidden=true;
-      renderCamera();
+      await renderCamera();
     }});
   }});
 
@@ -137422,10 +137614,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const timelineLane=document.getElementById('playback-timeline-lane');
   const timelineEmpty=document.getElementById('playback-timeline-empty');
 
-  function playClip(clip){{
+  async function playClip(cameraId,clip){{
     placeholder.hidden=true;
-    debugLog(`camera=${{selectedCameraId}} recording=${{clip.name}} srcAssigned=true`);
-    video.src=clip.url;
+    debugLog(`camera=${{cameraId}} recording=${{clip.name}} fetching url...`);
+    const url=await fetchClipUrl(cameraId,clip.id);
+    if(!url){{debugLog(`camera=${{cameraId}} recording=${{clip.name}} no playable url (not yet available)`);status.textContent='This recording is not available right now.';return}}
+    debugLog(`camera=${{cameraId}} recording=${{clip.name}} srcAssigned=true`);
+    video.src=url;
     video.play().catch(error=>debugLog(`play() rejected (often normal without a prior click): ${{error && error.name}}`));
     revealClipPanel();
   }}
@@ -137452,8 +137647,12 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
   // A clip actually covering the event's own timestamp is preferred;
   // failing that, the closest clip within 5 minutes is still a useful
-  // jump-off point. No fabricated recording is ever offered -- if
-  // nothing is close enough, the caller is told plainly.
+  // jump-off point. Only ever searches the currently-loaded page of
+  // clips -- a marker for a moment outside that page (rare: the
+  // timeline only plots today's events, and today's events should
+  // already be covered by the initially-loaded recent recordings) has
+  // nothing to search client-side, matching the honest "nothing close
+  // enough" behavior this already had.
   function findClipNear(clips,timestamp){{
     const target=new Date(timestamp).getTime();
     if(Number.isNaN(target))return null;
@@ -137470,7 +137669,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
   const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
-  function renderTimeline(clips,events){{
+  function renderTimeline(cameraId,clips,events){{
     timelineLane.innerHTML='';
     if(!clips.length&&!events.length){{timelineEmpty.hidden=false;return}}
     timelineEmpty.hidden=true;
@@ -137483,7 +137682,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       segment.style.width=(endPct-startPct)+'%';
       segment.style.background='#e8eef6';
       segment.title=new Date(clip.start).toLocaleString();
-      segment.addEventListener('click',()=>playClip(clip));
+      segment.addEventListener('click',()=>playClip(cameraId,clip));
       timelineLane.appendChild(segment);
     }});
     events.forEach(event=>{{
@@ -137497,23 +137696,16 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';
       const label=(event.event_type||'event').replaceAll('_',' ');
       marker.title=`${{label}} · ${{new Date(event.timestamp).toLocaleString()}}`;
-      marker.addEventListener('click',()=>{{
-        const nearby=findClipNear(clips,event.timestamp);
-        if(nearby){{playClip(nearby)}}
+      marker.addEventListener('click',async()=>{{
+        const nearby=findClipNear(clips,event.timestamp)||(await fetchClipsMetadata(cameraId,{{near:event.timestamp}}))[0];
+        if(nearby){{playClip(cameraId,nearby)}}
         else if(typeof showToast==='function'){{showToast('No recording available for this time yet.')}}
       }});
       timelineLane.appendChild(marker);
     }});
   }}
 
-  function renderCamera(seekTimestamp){{
-    const clips=recordingsByCamera[selectedCameraId]||[];
-    const events=analyticsByCamera[selectedCameraId]||[];
-    video.pause();
-    video.removeAttribute('src');
-    video.load();
-    placeholder.hidden=false;
-    status.textContent=clips.length?'Select a recording to play.':'No recordings available yet.';
+  function renderClipList(cameraId,clips){{
     clipList.innerHTML=clips.length?'':'<div class="empty">No recordings available yet for this camera.</div>';
     clips.forEach(clip=>{{
       const row=document.createElement('button');
@@ -137521,35 +137713,73 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       row.className='setting-link';
       row.style.cssText='width:100%;text-align:left;border:0;cursor:pointer';
       const durationMin=Math.max(1,Math.round((new Date(clip.end)-new Date(clip.start))/60000));row.innerHTML=`<div><strong>${{new Date(clip.start).toLocaleString()}}</strong><div class="health-detail">${{durationMin}} min recording</div></div><span>Play →</span>`;
-      row.addEventListener('click',()=>playClip(clip));
+      row.addEventListener('click',()=>playClip(cameraId,clip));
       clipList.appendChild(row);
     }});
-    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===selectedCameraId);
+    loadOlderButton.hidden=clips.length===0;
+  }}
+
+  loadOlderButton.addEventListener('click',async()=>{{
+    const clips=recordingsByCamera[selectedCameraId]||[];
+    const oldest=clips[0];
+    if(!oldest)return;
+    loadOlderButton.disabled=true;
+    loadOlderButton.textContent='Loading…';
+    const older=await fetchClipsMetadata(selectedCameraId,{{before:oldest.start,limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}});
+    loadOlderButton.disabled=false;
+    loadOlderButton.textContent='Load older recordings';
+    if(!older.length){{loadOlderButton.hidden=true;return}}
+    recordingsByCamera[selectedCameraId]=[...older,...clips];
+    renderClipList(selectedCameraId,recordingsByCamera[selectedCameraId]);
+    // Deliberately not re-rendering the timeline for older pages: the
+    // timeline is a single day's 0-24h axis (see timelinePercent()),
+    // so a recording from a previous day has no meaningful position on
+    // it -- Browse recordings' own list, extended here, is the correct
+    // place for older history, exactly as the task called for.
+  }});
+
+  async function ensureClipsLoaded(cameraId){{
+    if(recordingsLoaded.has(cameraId))return recordingsByCamera[cameraId]||[];
+    const clips=await fetchClipsMetadata(cameraId,{{limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}});
+    recordingsByCamera[cameraId]=clips;
+    recordingsLoaded.add(cameraId);
+    return clips;
+  }}
+
+  async function renderCamera(seekTimestamp){{
+    const cameraId=selectedCameraId;
+    const clips=await ensureClipsLoaded(cameraId);
+    if(cameraId!==selectedCameraId)return;  // camera changed again while this fetch was in flight
+    const events=analyticsByCamera[cameraId]||[];
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    placeholder.hidden=false;
+    status.textContent=clips.length?'Select a recording to play.':'No recordings available yet.';
+    renderClipList(cameraId,clips);
+    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
     timelineLabel.textContent=activeTile?activeTile.textContent:'—';
-    renderTimeline(clips,events);
+    renderTimeline(cameraId,clips,events);
     // Deep-link landing: arrived here with a specific moment in mind
     // (e.g. from the focused Live View's own recent-activity list) --
-    // jump straight to a covering/nearby recording exactly like
-    // clicking that same event's marker on the timeline would, or say
-    // plainly that nothing is available yet rather than leaving the
-    // customer to guess why nothing happened.
+    // always resolved via a fresh near= lookup against the database,
+    // never just the currently-loaded page of clips, so a deep link
+    // to a recording older than the initial page still lands
+    // correctly -- see _customer_recording_rows()'s own near=
+    // contract.
     //
-    // No deep-link timestamp (the ordinary case: a customer just opened
-    // Playback) used to leave the player sitting at a permanently black
-    // 0:00 until a segment/row/marker was clicked -- correct in that
-    // clicking genuinely did work, but from the customer's chair a
-    // populated timeline with nothing playing reads as broken, not as
-    // "waiting for a click". Auto-loading the single most recent clip
-    // (clips is already ordered oldest-to-newest by the SQL query, so
-    // the last entry is the newest) gives an immediate, real first
-    // frame without changing anything about how clicking a different
-    // segment, row, or marker behaves afterward.
+    // No deep-link timestamp (the ordinary case: a customer just
+    // opened Playback) auto-loads the single most recent clip (clips
+    // is oldest-first, so the last entry is the newest) instead of
+    // leaving the player at a permanently black 0:00 until something
+    // is clicked.
     if(seekTimestamp){{
-      const nearby=findClipNear(clips,seekTimestamp);
-      if(nearby){{playClip(nearby)}}
+      const nearby=findClipNear(clips,seekTimestamp)||(await fetchClipsMetadata(cameraId,{{near:seekTimestamp}}))[0];
+      if(cameraId!==selectedCameraId)return;
+      if(nearby){{playClip(cameraId,nearby)}}
       else{{status.textContent='No recording available for this time yet.'}}
     }}else if(clips.length){{
-      playClip(clips[clips.length-1]);
+      playClip(cameraId,clips[clips.length-1]);
     }}
   }}
 
@@ -137563,7 +137793,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         activeFilters.add(button.dataset.filter);
       }}
       filterButtons.forEach(item=>item.classList.toggle('active',item.dataset.filter==='all'?activeFilters.size===6:activeFilters.has(item.dataset.filter)));
-      renderCamera();
+      renderTimeline(selectedCameraId,recordingsByCamera[selectedCameraId]||[],analyticsByCamera[selectedCameraId]||[]);
     }});
   }});
 
@@ -137572,16 +137802,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 </script>'''
 
     return page_shell("Playback", "playback", content, scripts)
-
-
-@app.get("/playback", response_class=HTMLResponse)
-
-
-
-
-
-
-
 
 def playback(request: Request) -> str:
 
