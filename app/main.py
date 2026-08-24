@@ -137325,6 +137325,37 @@ def customer_recording_url(camera_id: str, recording_id: str, request: Request) 
     return {"url": url}
 
 
+def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
+    """Timeline event markers for one camera on one calendar date --
+    {event_type, timestamp} only, the exact two fields renderTimeline()'s
+    markers actually read (see filterCategory()/timelinePercent() in
+    _render_customer_playback()'s own JS). A deliberately narrower query
+    than _customer_detection_events() (13 fields, every camera, all
+    time -- built for the Events page's own different needs): that
+    function embedded a real account's entire history into every
+    Playback load (12,000+ rows measured), the same unbounded-payload
+    mistake the recordings list had, just for a second dataset. This
+    queries the database directly, scoped to exactly one camera and one
+    day, instead of fetching everything and filtering in Python."""
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT event_type, event_timestamp FROM detection_events "
+            "WHERE camera_id=? AND event_timestamp>=? AND event_timestamp<? "
+            "ORDER BY event_timestamp",
+            (camera_id, date, date + "T24:00:00"),
+        ).fetchall()
+    return [{"event_type": row["event_type"], "timestamp": row["event_timestamp"]} for row in rows]
+
+
+@app.get("/api/customer/events/{camera_id}")
+def customer_camera_events(camera_id: str, request: Request, date: str | None = None) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    date = date or datetime.now().strftime("%Y-%m-%d")
+    return {"events": _customer_camera_events(camera_id, date)}
+
+
 def _customer_camera_recordings(camera_id: str) -> list[dict]:
     """Recorded clips available for one customer camera (by cameras.id),
     each shaped {"start", "end", "url", "name"} -- the exact shape the
@@ -137430,13 +137461,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         for camera in cameras
     }
     today = datetime.now().strftime("%Y-%m-%d")
-    events_by_camera_number: dict = {}
-    for event in (_customer_detection_events(request) or []):
-        if not str(event.get("timestamp") or "").startswith(today):
-            continue
-        events_by_camera_number.setdefault(event.get("camera"), []).append(event)
+    # Only the initially-selected camera's today's event markers are
+    # embedded -- same bounded-load reasoning as recordings_by_camera
+    # above (see _customer_camera_events()'s own docstring). Other
+    # cameras' markers are fetched on demand via GET /api/customer/
+    # events/{camera_id} when their tile is actually clicked.
     analytics_by_camera = {
-        camera["id"]: events_by_camera_number.get(camera.get("camera_number"), [])
+        camera["id"]: (_customer_camera_events(camera["id"], today) if camera["id"] == initial_camera_id else [])
         for camera in cameras
     }
     first_camera_id = initial_camera_id
@@ -137526,6 +137557,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const recordingsByCamera={json.dumps(recordings_by_camera)};
   const recordingsLoaded=new Set([{json.dumps(first_camera_id)}]);
   const analyticsByCamera={json.dumps(analytics_by_camera)};
+  const analyticsLoaded=new Set([{json.dumps(first_camera_id)}]);
   const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
   const debugLine=document.getElementById('playback-debug');
@@ -137575,6 +137607,17 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       return Array.isArray(data.clips)?data.clips:[];
     }}catch(error){{
       debugLog(`metadata fetch failed: ${{error && error.message}}`);
+      return [];
+    }}
+  }}
+  async function fetchCameraEvents(cameraId){{
+    try{{
+      const response=await fetch(`/api/customer/events/${{encodeURIComponent(cameraId)}}`);
+      if(!response.ok)return [];
+      const data=await response.json();
+      return Array.isArray(data.events)?data.events:[];
+    }}catch(error){{
+      debugLog(`events fetch failed: ${{error && error.message}}`);
       return [];
     }}
   }}
@@ -137746,11 +137789,18 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     return clips;
   }}
 
+  async function ensureEventsLoaded(cameraId){{
+    if(analyticsLoaded.has(cameraId))return analyticsByCamera[cameraId]||[];
+    const events=await fetchCameraEvents(cameraId);
+    analyticsByCamera[cameraId]=events;
+    analyticsLoaded.add(cameraId);
+    return events;
+  }}
+
   async function renderCamera(seekTimestamp){{
     const cameraId=selectedCameraId;
-    const clips=await ensureClipsLoaded(cameraId);
+    const [clips,events]=await Promise.all([ensureClipsLoaded(cameraId),ensureEventsLoaded(cameraId)]);
     if(cameraId!==selectedCameraId)return;  // camera changed again while this fetch was in flight
-    const events=analyticsByCamera[cameraId]||[];
     video.pause();
     video.removeAttribute('src');
     video.load();
@@ -137803,6 +137853,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
     return page_shell("Playback", "playback", content, scripts)
 
+
+@app.get("/playback", response_class=HTMLResponse)
 def playback(request: Request) -> str:
 
 
