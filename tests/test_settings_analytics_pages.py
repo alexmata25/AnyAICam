@@ -94,6 +94,7 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
         namespace = self.execute(
             self.node(ast.FunctionDef, "slugify"),
             self.assignment("SETTINGS_CATEGORIES"),
+            self.assignment("IMPLEMENTED_SETTINGS_CATEGORIES"),
             self.node(ast.FunctionDef, "settings"),
             re=re,
             escape=escape,
@@ -105,8 +106,14 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
 
         status, html = self.http_get(namespace, "/settings")
         self.assertEqual(status, 200)
-        self.assertIn('href="/settings/cameras"', html)
+        # "Events & alerts" is the only category with a real settings_detail()
+        # implementation; it stays a real link. The rest, including
+        # "Cameras", render as a non-navigable "Coming soon" row instead of a
+        # link to a placeholder page -- see test_sidebar_navigation.py for
+        # the full sidebar/navigation audit this encodes.
         self.assertIn('href="/settings/events-alerts"', html)
+        self.assertNotIn('href="/settings/cameras"', html)
+        self.assertIn("Coming soon", html)
 
     def test_analytics_page_renders_feature_links(self):
         namespace = self.execute(
