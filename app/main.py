@@ -39964,7 +39964,23 @@ PUBLIC_PATH_PREFIXES = (
 
     "/customer-login.html",
 
+    "/customer-register",
+
+    "/logout",
+
+    "/partner.html",
+
+    "/customer-forgot-password",
+
+    "/customer-reset-password",
+
+    "/forgot-password",
+
+    "/reset-password",
+
     "/api/partner-login",
+
+    "/api/password-reset/",
 
 
 
@@ -41192,7 +41208,7 @@ def customer_register_page_html(error: str = "", message: str = "") -> str:
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register"><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required></label><button class="action-button" type="submit">Submit customer account request</button></form><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/login">Already approved? Sign in</a></div><div class="auth-footer">Your request remains pending until the master administrator approves it. After approval, signing in sends you directly to your customer VMS portal.</div></section></main></body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register"><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required></label><button class="action-button" type="submit">Submit customer account request</button></form><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-login.html">Already approved? Sign in</a></div><div class="auth-footer">Your request remains pending until the master administrator approves it. After approval, signing in sends you directly to your customer VMS portal.</div></section></main></body></html>"""
 
 
 
@@ -44000,6 +44016,42 @@ def login_submit(
 
 
 
+CUSTOMER_LOGIN_DESTINATION = "/customer-login.html"
+PORTAL_LOGIN_DESTINATION = "/partner.html"
+
+
+def logout_destination(legacy_role: str | None, portal_role: str | None) -> str:
+    """Decides where POST /logout redirects to. This route is reached
+    from the exact same shared sidebar (page_shell()'s logout form,
+    action="/logout") on every page that uses it -- legacy Admin Portal
+    pages, Partner/Admin/Salesperson/Technician pages, and customer
+    portal pages alike -- so it cannot hardcode a single destination;
+    it must look at whichever identity (legacy current_user()/
+    authenticated_user(), Partner Portal partner_identity(), or both)
+    was actually present on this request.
+
+    A customer identity -- on the Partner Portal side (customer_owner/
+    customer_viewer, the real, active customer accounts) or the legacy
+    side (a vestigial customer_owner/customer_viewer row in the old
+    JSON store, if one exists) -- always resolves to the white customer
+    login, even when some other signal on the request is ambiguous:
+    sending a real customer to the blue portal login is the one outcome
+    this function must never produce. administrator/partner_owner/
+    salesperson/technician/admin/support_admin/installer all resolve to
+    the blue portal login. An identity that's absent or unrecognized on
+    both sides also defaults to the customer login, for the same
+    fail-safe reason -- the worse mistake here is a customer landing on
+    the wrong branded page, not a partner landing on the wrong one."""
+    customer_roles = {"customer_owner", "customer_viewer"}
+    if portal_role in customer_roles:
+        return CUSTOMER_LOGIN_DESTINATION
+    if legacy_role in customer_roles:
+        return CUSTOMER_LOGIN_DESTINATION
+    if portal_role or legacy_role:
+        return PORTAL_LOGIN_DESTINATION
+    return CUSTOMER_LOGIN_DESTINATION
+
+
 @app.post("/logout")
 
 
@@ -44026,6 +44078,19 @@ def logout(request: Request):
 
 
 
+
+    from partner_portal import partner_identity, SESSION_COOKIE as PARTNER_SESSION_COOKIE
+    try:
+        portal_identity = partner_identity(request)
+    except Exception:
+        portal_identity = None
+    if portal_identity and portal_identity.get("session_id"):
+        from partner_db import connection as partner_connection
+        with partner_connection() as db:
+            db.execute(
+                "UPDATE user_sessions SET revoked_at=? WHERE id=?",
+                (datetime.now().isoformat(), portal_identity["session_id"]),
+            )
 
     destroy_session(request.cookies.get(SESSION_COOKIE_NAME))
 
@@ -44153,7 +44218,11 @@ def logout(request: Request):
 
 
 
-    response = RedirectResponse("/login", status_code=303)
+    destination = logout_destination(
+        user.get("role") if user else None,
+        portal_identity.get("role") if portal_identity else None,
+    )
+    response = RedirectResponse(destination, status_code=303)
 
 
 
@@ -44163,6 +44232,8 @@ def logout(request: Request):
 
 
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    if portal_identity:
+        response.delete_cookie(PARTNER_SESSION_COOKIE, domain=cloud_settings.cookie_domain or None)
 
 
 

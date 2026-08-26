@@ -2,6 +2,7 @@ import csv
 import io
 import json
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from typing import Callable
 
@@ -85,6 +86,39 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.get('/reset-password',response_class=HTMLResponse)
     def password_reset_page(token: str=''):
         content=f'''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{token}"><label>New password<input id="reset-password" type="password" minlength="12" required></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href='/partner-login',800)})</script>'''; return shell('Reset password','users',content,scripts)
+
+    # /forgot-password and /reset-password above render inside shell() --
+    # the same dark Admin/Partner Portal chrome every /partner.html-side
+    # page uses. Reused for the customer flow, that chrome (and, worse,
+    # /reset-password's own hardcoded post-reset redirect to
+    # /partner-login) is exactly the "redirects to or reuses the
+    # Partner/Admin portal login" bug: a customer clicking "Forgot
+    # password?" from customer-login.html must never leave the customer
+    # experience or land back on the blue portal login. These two routes
+    # are a separate, minimal, customer-branded pair (styled to match
+    # customer-login.html's own card, not shell()) that call the exact
+    # same, already role-agnostic /api/password-reset/request and
+    # /api/password-reset/complete endpoints above -- no new backend
+    # behavior, only a customer-facing frontend for it that stays
+    # customer-branded and redirects back to /customer-login.html.
+    _CUSTOMER_AUTH_STYLE = ':root{--navy:#10162d;--blue:#5360df;--pink:#bd2b90}*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial;background:#eef3f9;color:#17233e}.head{display:flex;align-items:center;padding:14px clamp(16px,5vw,64px);background:#fff}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--navy);font-weight:900}.brand img{width:50px}.auth-wrap{min-height:calc(100vh - 130px);display:grid;place-items:center;padding:32px 16px}.card{width:100%;max-width:420px;background:#fff;color:#17233e;padding:28px;border-radius:20px;box-shadow:0 20px 60px #05091a25}.card form{display:grid;gap:14px;margin-top:6px}.card label{display:grid;gap:5px;font-weight:700}.card input{padding:12px;border:1px solid #aab7ca;border-radius:9px;font:inherit}.submit{border:0;border-radius:999px;padding:12px;background:linear-gradient(135deg,var(--pink),var(--blue));color:#fff;font-weight:900;cursor:pointer}.message{display:none;padding:10px;background:#ffe8ec;color:#8b1730;border-radius:8px}.back-link{display:block;margin-top:16px;text-align:center;font-weight:700;color:var(--blue);text-decoration:none}'
+
+    @app.get('/customer-forgot-password',response_class=HTMLResponse)
+    def customer_forgot_password_page():
+        return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Forgot password | ANY AI CAM</title><style>{_CUSTOMER_AUTH_STYLE}</style></head><body>
+<header class="head"><a class="brand" href="/customer-login.html"><img src="/static/brand-icon.png" alt="AnyAiCam">ANY AI CAM</a></header>
+<main class="auth-wrap"><section class="card"><h2>Forgot your password?</h2><p>Enter the email on your customer account and we'll prepare a reset link.</p><form id="forgot-form"><label>Email<input id="forgot-email" type="email" autocomplete="username" required></label><div id="message" class="message"></div><button class="submit">Send reset link</button></form><a class="back-link" href="/customer-login.html">Back to customer sign in</a></section></main>
+<script>document.getElementById('forgot-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/request',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{email:document.getElementById('forgot-email').value}})}}),r=await response.json(),box=document.getElementById('message');box.textContent=r.message||'If the account exists, a reset message has been prepared.';box.style.display='block'}});</script>
+</body></html>''')
+
+    @app.get('/customer-reset-password',response_class=HTMLResponse)
+    def customer_reset_password_page(token: str=''):
+        safe_token=escape(token,quote=True)
+        return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reset password | ANY AI CAM</title><style>{_CUSTOMER_AUTH_STYLE}</style></head><body>
+<header class="head"><a class="brand" href="/customer-login.html"><img src="/static/brand-icon.png" alt="AnyAiCam">ANY AI CAM</a></header>
+<main class="auth-wrap"><section class="card"><h2>Reset your password</h2><form id="reset-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<input id="reset-password" type="password" minlength="12" autocomplete="new-password" required></label><div id="message" class="message"></div><button class="submit">Update password</button></form><a class="back-link" href="/customer-login.html">Back to customer sign in</a></section></main>
+<script>document.getElementById('reset-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/complete',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value}})}}),r=await response.json(),box=document.getElementById('message');box.textContent=r.message||r.detail;box.style.display='block';if(response.ok)setTimeout(()=>location.href='/customer-login.html',900)}});</script>
+</body></html>''')
 
     @app.get('/api/admin/audit-export')
     def export_audit(request: Request,format: str='csv'):
