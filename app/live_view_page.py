@@ -62,39 +62,154 @@ POLL_TIMEOUT_MS = 45000
 # audibly routed back out to the speakers.
 _TALK_MIC_JS = """
 function wireTalkMic(button, cameraId) {
-  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null, sessionId = null, stopping = false;
+  // Press-and-hold state, keyed by a monotonically increasing generation
+  // token (pressId) rather than a single boolean -- this is what makes
+  // the async pointer lifecycle race-free. start() is async and awaits
+  // three separate things in sequence (the REST /talk/start fetch, its
+  // response.json(), then getUserMedia()); a release (pointerup/
+  // pointercancel/pointerleave/pagehide) can land after any one of
+  // those awaits resumes. Every resume point below re-checks
+  // `myPress === pressId` -- the token captured synchronously at this
+  // press's own pointerdown, before any await ran -- and refuses to
+  // proceed (including refusing to ever construct a WebSocket) once a
+  // release or a newer press has invalidated it. This is what
+  // previously let a stale start() resume after stop() had already
+  // cleared sessionId to null and open a WebSocket at
+  // /sessions/null/audio.
+  let pressId = 0;
+  let held = false;
+  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null;
+  let sessionId = null;   // the REST-created session this press currently owns, if any
+  let wsOpened = false;   // true only once this session's WebSocket has actually finished connecting
 
-  async function stop() {
-    if (stopping) return;
-    stopping = true;
-    button.classList.remove('active');
+  function cleanupOrphanSession(sid) {
+    // Best-effort: releases a REST-created talk session that will never
+    // get a WebSocket (because the press that created it ended, or
+    // permission was denied, before the socket could open), so no
+    // 'requested' row is left behind for talk_sessions.py's own
+    // expiry sweep to have to age out later. Fire-and-forget -- the
+    // stop route is already idempotent server-side, and there is no
+    // UI state left to update for a press that's already over.
+    fetch(`/api/customer/talk/sessions/${sid}/stop`, { method: 'POST' }).catch(() => {});
+  }
+
+  function teardownLocal() {
     if (processor) { try { processor.disconnect() } catch (e) {} }
     if (source) { try { source.disconnect() } catch (e) {} }
     if (silentGain) { try { silentGain.disconnect() } catch (e) {} }
     if (audioCtx) { try { audioCtx.close() } catch (e) {} }
     if (mediaStream) { mediaStream.getTracks().forEach(track => track.stop()) }
     if (ws) { try { ws.close() } catch (e) {} }
-    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null; sessionId = null;
+    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null;
   }
 
-  async function start() {
-    if (button.disabled || ws || stopping === false && sessionId) return;
-    stopping = false;
+  function stop(event) {
+    // event is only present for a real pointerup/pointercancel/
+    // pointerleave -- stop() is also called internally (ws.onclose,
+    // ws.onerror, a stale press's own cleanup) with no event at all,
+    // so every event-only call below is guarded. preventDefault()/
+    // stopPropagation() here are defensive, matching pointerdown's own
+    // handling below; releasePointerCapture() is technically automatic
+    // on pointerup/pointercancel, but calling it explicitly costs
+    // nothing and removes any doubt.
+    if (event) {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      if (event.pointerId !== undefined) {
+        try { button.releasePointerCapture(event.pointerId); } catch (e) {}
+      }
+    }
+    held = false;
+    pressId++;   // invalidates any in-flight start() still awaiting something for the press that just ended
+    button.classList.remove('active');
+    const sid = sessionId;
+    const openedBeforeStop = wsOpened;
+    sessionId = null;
+    wsOpened = false;
+    teardownLocal();
+    if (sid && !openedBeforeStop) {
+      // Released after /talk/start created a session but before the
+      // WebSocket finished opening (still mid-fetch, mid-getUserMedia,
+      // or mid-handshake) -- nothing else will ever clean this session
+      // up, since the WebSocket route (the only other place that marks
+      // it 'stopped') never got a chance to run.
+      cleanupOrphanSession(sid);
+    }
+  }
+
+  async function start(event) {
+    // Mobile press-and-hold on a button that sits near/over a playing
+    // <video> tile is a well-known source of touch-event conflicts --
+    // without these, a sustained touch-hold can be interpreted by the
+    // browser's own default gesture handling as also targeting the
+    // video underneath (observed as the video pausing on press and
+    // resuming on release). preventDefault() stops the browser's
+    // default touch handling for this pointerdown; stopPropagation()
+    // keeps it from reaching any ancestor handler; setPointerCapture()
+    // pins every subsequent pointer event for this exact touch (move,
+    // up, cancel) to this button specifically, so a finger drifting
+    // slightly during the hold can never be reinterpreted as
+    // interacting with whatever is underneath it. touch-action:none in
+    // this button's own CSS is the equivalent instruction at the CSS
+    // layer, for browsers that decide gesture handling before any JS
+    // runs at all. None of this touches press-and-hold semantics --
+    // it only ever runs once, synchronously, at the very top of the
+    // same pointerdown handler that already existed.
+    if (event) {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      try { button.setPointerCapture(event.pointerId); } catch (e) {}
+    }
+    if (button.disabled || held) return;
+    held = true;
+    const myPress = ++pressId;
+
     let response;
     try {
       response = await fetch(`/api/customer/cameras/${cameraId}/talk/start`, { method: 'POST' });
-    } catch (e) { return; }
-    if (!response.ok) { return; }
-    const body = await response.json();
-    sessionId = body.session_id;
-
-    try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      showToast('Microphone permission denied or unavailable.');
-      sessionId = null;
+      if (myPress === pressId) held = false;
       return;
     }
+    if (!response.ok) {
+      if (myPress === pressId) held = false;
+      return;
+    }
+    const body = await response.json();
+    const sid = body && body.session_id;
+    if (!sid) {
+      if (myPress === pressId) held = false;
+      return;
+    }
+
+    if (myPress !== pressId) {
+      // Released (or superseded by a newer press) while /talk/start was
+      // in flight -- stop() already ran and had no sessionId to see yet,
+      // so this press is the only one that knows this session exists.
+      cleanupOrphanSession(sid);
+      return;
+    }
+    sessionId = sid;   // now visible to stop(), which takes over orphan cleanup from here if released
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      if (myPress === pressId) { held = false; sessionId = null; }
+      showToast('Microphone permission denied or unavailable.');
+      cleanupOrphanSession(sid);
+      return;
+    }
+
+    if (myPress !== pressId) {
+      // Released while the permission prompt was pending. stop() already
+      // saw sessionId set and released it itself -- this stream simply
+      // arrived too late to be used; stop its tracks immediately so a
+      // granted-but-unwanted mic stays off.
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    mediaStream = stream;
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     source = audioCtx.createMediaStreamSource(mediaStream);
@@ -102,15 +217,24 @@ function wireTalkMic(button, cameraId) {
     silentGain = audioCtx.createGain();
     silentGain.gain.value = 0;
 
+    // Always built from the local `sid` captured above, never the
+    // shared `sessionId` -- this is the specific guarantee that a
+    // WebSocket can never be constructed with a null/empty session id,
+    // independent of anything stop() may have done concurrently.
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sessionId}/audio?sample_rate=${audioCtx.sampleRate}`);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { button.classList.add('active') };
-    ws.onclose = () => { stop() };
-    ws.onerror = () => { stop() };
+    const socket = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sid}/audio?sample_rate=${audioCtx.sampleRate}`);
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = () => {
+      if (myPress !== pressId) { try { socket.close() } catch (e) {} return; }
+      wsOpened = true;
+      button.classList.add('active');
+    };
+    socket.onclose = () => { if (myPress === pressId) stop(); };
+    socket.onerror = () => { if (myPress === pressId) stop(); };
+    ws = socket;
 
     processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (myPress !== pressId || !ws || ws.readyState !== WebSocket.OPEN) return;
       const input = event.inputBuffer.getChannelData(0);
       const pcm16 = new Int16Array(input.length);
       for (let i = 0; i < input.length; i++) {
@@ -125,9 +249,9 @@ function wireTalkMic(button, cameraId) {
   }
 
   button.addEventListener('pointerdown', start);
-  button.addEventListener('pointerup', () => stop());
-  button.addEventListener('pointercancel', () => stop());
-  button.addEventListener('pointerleave', () => stop());
+  button.addEventListener('pointerup', (event) => stop(event));
+  button.addEventListener('pointercancel', (event) => stop(event));
+  button.addEventListener('pointerleave', (event) => stop(event));
   window.addEventListener('pagehide', () => stop());
 }
 """
@@ -270,7 +394,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                   data-camera-id="{escape(camera['id'], quote=True)}"
                   title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
                   aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                  {'' if camera['enabled'] else 'disabled'}>◖</button>
+                  {'' if camera['enabled'] else 'disabled'}>🎤</button>
                 <a class="ghost-button" href="/customer/cameras/{escape(camera['id'], quote=True)}/live">Full screen</a>
               </div>
             </article>'''
@@ -285,6 +409,14 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.live-grid-tile{{display:grid;gap:8px}}'
             f'.live-grid-tile .camera-view{{aspect-ratio:16/9}}'
             f'.live-grid-tile-head{{display:flex;align-items:center;justify-content:space-between;gap:8px}}'
+            # touch-action:none -- stops the browser's own default
+            # touch-gesture handling for a sustained press-and-hold on
+            # this button, so it can never be interpreted as also
+            # targeting the video tile underneath/nearby (the exact
+            # cause of a real "video pauses on mic press, resumes on
+            # release" mobile bug this pairs with pointerdown's own
+            # preventDefault()/stopPropagation()/setPointerCapture()).
+            f'.talk-mic{{touch-action:none}}'
             f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
             f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
@@ -421,7 +553,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
             f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
             f'<video id="live-view-video" controls muted playsinline></video>'
             f'<div class="camera-placeholder" id="live-view-placeholder">'
@@ -432,7 +564,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-mute" title="Mute">♪</button>'
             f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
             f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
-            f'{"" if talk_state["enabled"] else "disabled"}>◖</button>'
+            f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
             f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot">◉</button>'
             f'<button class="camera-tool" id="live-view-download" title="Download">⬇</button>'
             f'<button class="camera-tool" id="live-view-share" title="Share">↗</button>'

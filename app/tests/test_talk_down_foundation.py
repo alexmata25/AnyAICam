@@ -446,6 +446,41 @@ def test_single_camera_page_renders_capability_state(customer_client, db_path):
     assert "Talk-down capability not verified" in response.text
 
 
+# --------------------------------------------------------- talk-mic icon stays a mic, never becomes a speaker icon
+#
+# Real mobile bug report: the talk-mic button's own glyph (previously
+# the ambiguous "left half circle" character) read as a speaker icon
+# once the .active CSS class's accent-colored background applied,
+# despite there being no actual speaker/playback control on the page
+# it could correspond to. wireTalkMic() itself never mutates the
+# button's textContent/innerHTML at all -- the glyph is set once at
+# render time and only the CSS class (background/color) changes -- so
+# fixing this is purely a matter of using an unambiguous glyph and
+# proving nothing ever swaps it.
+
+def test_talk_mic_glyph_is_the_microphone_emoji_in_both_capability_states():
+    import inspect
+    source = inspect.getsource(live_view_page)
+    # Every rendered talk-mic <button> (both enabled and disabled/
+    # unverified/unsupported capability states -- the glyph itself
+    # never depends on talk_down_state at all) uses the same
+    # microphone emoji, not the old ambiguous half-circle glyph.
+    assert "◖" not in source, "the old ambiguous glyph (U+25D6) must not still be used for the talk-mic button"
+    assert source.count("\U0001F3A4</button>") == 2, "expected exactly two talk-mic <button> glyphs (grid page + single-camera page), both the microphone emoji"
+
+
+def test_wire_talk_mic_never_mutates_the_buttons_text_or_icon():
+    # Structural guarantee, not just a snapshot of current behavior:
+    # wireTalkMic() must never touch textContent/innerHTML/innerText on
+    # the button it's wired to, in either direction (press or release) --
+    # only classList (background/color via CSS) may change. This is
+    # what makes "should not switch to a speaker icon" durable against
+    # a future edit, not just true today.
+    assert "textContent" not in live_view_page._TALK_MIC_JS
+    assert "innerHTML" not in live_view_page._TALK_MIC_JS
+    assert "innerText" not in live_view_page._TALK_MIC_JS
+
+
 def test_pointer_lifecycle_all_wired_to_stop_on_both_pages(customer_client, db_path):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
