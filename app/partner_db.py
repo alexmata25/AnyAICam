@@ -78,6 +78,14 @@ def initialize_database() -> None:
         '''CREATE TABLE IF NOT EXISTS appliance_camera_status(appliance_id TEXT NOT NULL,camera_id TEXT NOT NULL,name TEXT,online INTEGER,recording INTEGER,analytics INTEGER,last_recording_at TEXT,last_error TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(appliance_id,camera_id),FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
         '''CREATE TABLE IF NOT EXISTS appliance_events(appliance_id TEXT NOT NULL,event_id TEXT NOT NULL,event_type TEXT,camera_id TEXT,event_timestamp TEXT,payload_json TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(appliance_id,event_id),FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
         '''CREATE TABLE IF NOT EXISTS appliance_commands(id TEXT PRIMARY KEY,appliance_id TEXT NOT NULL,command TEXT NOT NULL,payload_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT,completed_at TEXT,expires_at TEXT NOT NULL,error TEXT,created_by TEXT,FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
+        # admin_partner_bridge.py: an explicit, revocable link from one
+        # Admin Portal user (admin_user_id, the legacy JSON-store user id)
+        # to one existing Partner Portal user (partner_user_id) -- never a
+        # new partner_users row, never a copied/shared password. See that
+        # module's own docstring for the full design and every
+        # fail-closed check applied on top of this table at resolution
+        # time.
+        '''CREATE TABLE IF NOT EXISTS admin_partner_links(admin_user_id TEXT PRIMARY KEY,admin_email TEXT NOT NULL,partner_user_id TEXT NOT NULL,partner_email TEXT NOT NULL,linked_at TEXT NOT NULL,linked_by TEXT NOT NULL,revoked_at TEXT,FOREIGN KEY(partner_user_id) REFERENCES partner_users(id))''',
     ]
     with database_connect() as db:
         for statement in statements: db.execute(statement)

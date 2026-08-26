@@ -39268,7 +39268,6 @@ async def request_context_middleware(request: Request, call_next):
 
 
 
-
     token = REQUEST_CONTEXT.set(request)
 
 
@@ -39342,7 +39341,6 @@ async def request_context_middleware(request: Request, call_next):
 
 
 async def maintenance_mode_middleware(request: Request, call_next):
-
 
 
 
@@ -46556,16 +46554,24 @@ register_partner_routes(app, page_shell)
 
 
 
+
+
+
+
+
+# Registered before register_partner_workspace_routes() specifically:
+# partner_workspace.py's POST /api/partner/appliances/{appliance_id}/{action}
+# (a wildcard placeholder, its own docstring literally says "hardware
+# execution is not connected yet") was silently shadowing this module's
+# more specific POST /api/partner/appliances/{appliance_id}/commands --
+# Starlette matches routes in registration order, first match wins, so
+# the real, fully-implemented RDM4 command-queue endpoint had never
+# actually been reachable over HTTP, for any identity, direct or
+# bridged, even before this bridge existed. Registering the specific
+# route first fixes that; nothing about either route's own behavior
+# changed.
+register_appliance_cloud_routes(app, page_shell, current_user)
 register_partner_workspace_routes(app, page_shell)
-
-
-
-
-
-
-
-
-register_appliance_cloud_routes(app, page_shell)
 register_live_playlist_routes(app)
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
@@ -49422,22 +49428,76 @@ def operations_rdm_page(request: Request) -> str:
     record_audit(request, "view", "operations:rdm", "Opened remote device management.")
 
     from partner_portal import partner_identity
-    from partner_db import allowed as partner_allowed, rows as partner_rows
+    from partner_db import allowed as partner_allowed, rows as partner_rows, connection as partner_connection
+    from admin_partner_bridge import bridge_partner_identity, get_link
 
-    identity = partner_identity(request)
-    if not identity or identity.get("role") not in {"administrator", "partner_owner", "salesperson", "technician"}:
+    ELIGIBLE_PARTNER_ROLES = {"administrator", "partner_owner", "salesperson", "technician"}
+
+    # Direct Partner Portal session takes priority, completely unchanged
+    # from before this bridge existed. Only when there isn't one (or its
+    # role can't manage appliances) do we fall back to an explicit,
+    # revocable admin_partner_links bridge -- see that module's own
+    # docstring for every check applied before a bridge is ever trusted.
+    direct_identity = partner_identity(request)
+    identity = direct_identity if direct_identity and direct_identity.get("role") in ELIGIBLE_PARTNER_ROLES else None
+    via_bridge = False
+    link_row = None
+    if identity is None:
+        with partner_connection() as db:
+            link_row = get_link(db, admin_user_id=user.get("id", ""))
+            bridged = bridge_partner_identity(db, admin_user=user)
+        if bridged:
+            identity = bridged
+            via_bridge = True
+
+    if identity is None:
+        if direct_identity and direct_identity.get("role") not in ELIGIBLE_PARTNER_ROLES:
+            explanation = "Your Partner Portal account type can't manage appliances."
+        elif link_row and not link_row.get("revoked_at"):
+            explanation = (
+                "Your linked partner account is no longer valid -- it may have been revoked, removed, or its "
+                "role changed. Sign in to the Partner Portal directly to view or manage appliances, then link "
+                "a current account from this page."
+            )
+        else:
+            explanation = (
+                "This appliance data and its restart/reboot actions are served by the Partner Portal's "
+                "already-existing appliance backend. Sign in there to view or manage appliances from this page."
+            )
         content = (
             '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Remote device management</h1></div>'
             '<a class="ghost-button" href="/operations">Back to operations</a></header>'
             '<section class="panel"><div class="panel-head"><h2>Partner Portal sign-in required</h2></div>'
-            '<div class="empty">This appliance data and its restart/reboot actions are served by the Partner '
-            'Portal\'s already-existing appliance backend. Sign in there to view or manage appliances from '
-            'this page.</div><a class="action-button" href="/partner-login" style="margin-top:12px;display:inline-block">'
+            f'<div class="empty">{escape(explanation)}</div>'
+            '<a class="action-button" href="/partner-login" style="margin-top:12px;display:inline-block">'
             'Sign in to Partner Portal</a></section>'
         )
         return page_shell("Remote device management", "operations", content)
 
     can_act = partner_allowed(identity, "appliance.action")
+
+    bridge_banner = ""
+    if via_bridge:
+        bridge_banner = (
+            '<div class="mock-banner">Viewing via your linked partner account '
+            f'({escape(identity.get("email", ""))}). '
+            '<button class="ghost-button" id="unlink-partner-account" type="button">Unlink</button></div>'
+        )
+    else:
+        with partner_connection() as db:
+            existing_link = get_link(db, admin_user_id=user.get("id", ""))
+        already_linked_to_this = bool(
+            existing_link and not existing_link.get("revoked_at")
+            and str(existing_link.get("partner_email", "")).lower() == str(identity.get("email", "")).lower()
+        )
+        if not already_linked_to_this:
+            bridge_banner = (
+                '<section class="panel"><div class="panel-head"><h2>Skip Partner Portal sign-in next time</h2></div>'
+                '<div class="health-detail">Link this Partner Portal account to your Admin Portal login so future '
+                'visits to this page don\'t need a second sign-in.</div>'
+                '<button class="action-button" id="link-partner-account" type="button" style="margin-top:10px">'
+                'Link this account</button></section>'
+            )
 
     clauses = ["1=1"]
     params: list = []
@@ -49505,6 +49565,7 @@ def operations_rdm_page(request: Request) -> str:
     content = (
         '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Remote device management</h1></div>'
         '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+        f'{bridge_banner}'
         f'<div class="account-grid" style="margin-top:18px">{"".join(cards) or "<div class=\'empty\'>No appliances found for this account.</div>"}</div>'
         '<section class="panel" style="margin-top:18px;overflow:auto"><h2>Restart / reboot history</h2>'
         f'<table class="data-table"><thead><tr><th>Appliance</th><th>Command</th><th>Status</th><th>Created</th><th>Error</th></tr></thead>'
@@ -49519,9 +49580,75 @@ def operations_rdm_page(request: Request) -> str:
         "if(!confirm(warning?`${warning} Continue?`:`Queue ${button.textContent} for this appliance?`))return;"
         "const response=await fetch(`/api/partner/appliances/${button.dataset.appliance}/commands`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:button.dataset.command,confirmed:true})}),"
         "r=await response.json();showToast(r.message||r.detail)"
-        "})</script>"
+        "});"
+        "const linkButton=document.getElementById('link-partner-account');"
+        "if(linkButton)linkButton.onclick=async()=>{"
+        "const response=await fetch('/api/operations/rdm/link-partner-account',{method:'POST'}),r=await response.json();"
+        "showToast(r.message||r.detail);if(response.ok)location.reload()"
+        "};"
+        "const unlinkButton=document.getElementById('unlink-partner-account');"
+        "if(unlinkButton)unlinkButton.onclick=async()=>{"
+        "if(!confirm('Unlink this partner account from your Admin Portal login?'))return;"
+        "const response=await fetch('/api/operations/rdm/unlink-partner-account',{method:'POST'}),r=await response.json();"
+        "showToast(r.message||r.detail);if(response.ok)location.reload()"
+        "};"
+        "</script>"
     )
     return page_shell("Remote device management", "operations", content, scripts)
+
+
+@app.post("/api/operations/rdm/link-partner-account")
+def link_partner_account(request: Request) -> dict:
+    """Creates (or replaces) this Admin Portal user's admin_partner_links
+    row -- see admin_partner_bridge.py's own module docstring for the
+    full design. Requires the requesting browser to hold a currently-
+    valid session on *both* systems at this exact moment: current_user()
+    proves who the Admin Portal operator is, partner_identity() proves
+    they *also* control a real, already-existing, eligible Partner
+    Portal account right now -- that simultaneous proof is the entire
+    authorization for creating a link; no password is ever read, copied,
+    or compared, and no partner_users row is ever created or edited.
+    Every creation is audited (record_audit below)."""
+    user = current_user(request)
+    if not has_permission(user, "manage_settings") or user.get("role") not in {"administrator", "admin", "support_admin"}:
+        raise HTTPException(status_code=403, detail="Admin Portal access is required to link an account.")
+    from partner_portal import partner_identity
+    identity = partner_identity(request)
+    if not identity:
+        raise HTTPException(status_code=400, detail="Sign in to the Partner Portal in this same browser before linking.")
+    from admin_partner_bridge import can_create_link, create_link
+    if not can_create_link(str(user.get("role") or ""), str(identity.get("role") or "")):
+        raise HTTPException(status_code=403, detail="This partner account type can't be linked for appliance management.")
+    from partner_db import connection, row as partner_row
+    partner_user = partner_row("SELECT id,email FROM partner_users WHERE lower(email)=lower(?)", (identity.get("email", ""),))
+    if not partner_user:
+        raise HTTPException(status_code=404, detail="Partner account not found.")
+    now = datetime.now().isoformat()
+    with connection() as db:
+        create_link(
+            db,
+            admin_user_id=user["id"],
+            admin_email=user.get("email", ""),
+            partner_user_id=partner_user["id"],
+            partner_email=partner_user["email"],
+            linked_by=user.get("email") or user["id"],
+            now=now,
+        )
+    record_audit(request, "link", "admin_partner_link", "Linked partner account for remote device management.")
+    return {"status": "linked", "message": "Partner account linked. You won't need to sign in there again on this Admin Portal account."}
+
+
+@app.post("/api/operations/rdm/unlink-partner-account")
+def unlink_partner_account(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from admin_partner_bridge import revoke_link
+    from partner_db import connection
+    with connection() as db:
+        revoke_link(db, admin_user_id=user.get("id", ""), now=datetime.now().isoformat())
+    record_audit(request, "unlink", "admin_partner_link", "Unlinked partner account for remote device management.")
+    return {"status": "unlinked", "message": "Partner account unlinked."}
 
 
 

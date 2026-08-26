@@ -77,7 +77,7 @@ def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     return camera
 
 
-def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
+def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: Callable[[Request],dict] | None=None) -> None:
     @app.get('/api/appliance/config')
     def appliance_config() -> dict:
         settings=cloud_settings(); return {'mode':settings['mode'],'base_url':settings['base_url'],'mock_cloud':settings['mock'],'timestamp_window_seconds':300,'camera_credentials_allowed':False}
@@ -555,7 +555,26 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
-        identity=require_partner_access(request); command=str(payload.get('command',''))
+        # A direct Partner Portal session is tried first and is
+        # completely unmodified from before -- a partner-only account's
+        # own behavior here never changes. Only when that fails do we
+        # attempt the admin_partner_bridge (see its own module docstring):
+        # an Admin Portal session with a live, explicit link to an
+        # eligible partner_users row. Any bridge failure (no session, no
+        # link, revoked, role no longer eligible) re-raises the exact
+        # original 403 -- an unauthorized caller, admin or otherwise,
+        # sees precisely the same denial as before this bridge existed.
+        try:
+            identity=require_partner_access(request)
+        except HTTPException:
+            identity=None
+            if current_user is not None:
+                from admin_partner_bridge import bridge_partner_identity
+                with connection() as db:
+                    identity=bridge_partner_identity(db,admin_user=current_user(request))
+            if not identity:
+                raise
+        command=str(payload.get('command',''))
         if not payload.get('confirmed'): raise HTTPException(status_code=400,detail='Explicit command confirmation is required.')
         if command not in ALLOWED_COMMANDS: raise HTTPException(status_code=400,detail='Only approved appliance commands are allowed. Remote shell is not supported.')
         from partner_db import require_permission
