@@ -54,6 +54,9 @@ CREATE INDEX IF NOT EXISTS idx_customer_talk_sessions_camera ON customer_talk_se
     ('20260827_camera_provisioning','''
 CREATE TABLE IF NOT EXISTS camera_credentials(camera_id TEXT PRIMARY KEY,encrypted_blob TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(camera_id) REFERENCES cameras(id));
 '''),
+    ('20260827_camera_analytics_entitlements','''
+CREATE TABLE IF NOT EXISTS camera_analytics_entitlements(camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(camera_id,analytic_key),FOREIGN KEY(camera_id) REFERENCES cameras(id));
+'''),
 ]
 
 

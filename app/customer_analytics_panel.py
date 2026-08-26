@@ -1,13 +1,25 @@
 """Focused Live View's switchable per-camera analytics row.
 
-Pure, DB/FastAPI-free logic (fully unit-testable) for two things
-app/live_view_page.py's new customer-facing routes call:
+Entitlements are per-camera, not per-site: analytics_subscriptions (the
+existing site/customer-scoped table) remains the billing/commercial
+record of what a customer purchased, but camera_analytics_entitlements
+(camera_id, analytic_key) is the new, separate table that actually gates
+what a given camera shows -- a customer with 10 cameras at one site can
+have LPR on exactly 2 of them, People Counting on 4 others, and nothing on
+the rest. Nothing in this module or its caller infers "purchased at the
+site" into "enabled on every camera at that site" -- see
+assign_entitlement()/remove_entitlement() for the only way a camera's row
+in that table changes.
 
-1. Which analytics are enabled for a camera (analytics_subscriptions is
-   keyed by site_id, not per-camera -- every camera at an enabled site
-   shows that analytic; see ANALYTIC_LABELS for the exact set the UI
-   pill row can ever render, so an unrecognized/future subscription key
-   never produces a broken pill).
+Everything here except assign_entitlement()/remove_entitlement() (which
+take an explicit db connection, matching camera_mapping.py's established
+dependency-light pattern in this codebase) is pure, DB/FastAPI-free logic,
+fully unit-testable, for two things app/live_view_page.py's customer-facing
+routes call:
+
+1. Which analytics are enabled for one specific camera (see
+   ANALYTIC_LABELS for the exact set the UI pill row can ever render, so
+   an unrecognized/future entitlement key never produces a broken pill).
 2. Formatting the "most recent useful results" panel for whichever
    analytic pill is selected, from raw detection_events rows.
 """
@@ -35,18 +47,20 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
 ANALYTIC_KEYS = tuple(ANALYTIC_LABELS.keys())
 
 
-def enabled_analytics(subscription_rows: list[dict]) -> list[str]:
-    """subscription_rows: analytics_subscriptions rows (dicts with at
-    least 'analytic_key' and 'status') already scoped to the camera's
-    site/customer by the caller's SQL WHERE clause -- this function only
-    decides which of those *statuses* count as "enabled" and filters to
-    keys the UI actually knows how to render (ANALYTIC_LABELS), in a
-    stable, deterministic order (not insertion order, which can vary by
-    when each addon was purchased) so the pill row doesn't reorder itself
+def enabled_analytics(entitlement_rows: list[dict]) -> list[str]:
+    """entitlement_rows: camera_analytics_entitlements rows (dicts with
+    at least 'analytic_key' and 'status') already scoped to ONE specific
+    camera_id by the caller's SQL WHERE clause -- never a whole site's or
+    customer's rows at once, which is exactly the per-site-not-per-camera
+    behavior this table replaces. This function only decides which of
+    those *statuses* count as "enabled" and filters to keys the UI
+    actually knows how to render (ANALYTIC_LABELS), in a stable,
+    deterministic order (not insertion order, which can vary by when each
+    entitlement was assigned) so the pill row doesn't reorder itself
     between page loads."""
     active_keys = {
         row["analytic_key"]
-        for row in subscription_rows
+        for row in entitlement_rows
         if row.get("status") != "cancelled" and row.get("analytic_key") in ANALYTIC_LABELS
     }
     return [key for key in ANALYTIC_KEYS if key in active_keys]
@@ -63,6 +77,44 @@ def analytics_row_state(subscription_rows: list[dict]) -> list[dict]:
         {"key": key, "label": ANALYTIC_LABELS[key][0], "enabled": key in enabled}
         for key in ANALYTIC_KEYS
     ]
+
+
+def camera_entitlement_rows(db, camera_id: str) -> list[dict]:
+    """The one place that reads camera_analytics_entitlements for a
+    single camera -- callers (both the live_view_page.py route and this
+    module's own tests) get rows already scoped to exactly one camera_id,
+    never a whole site's or customer's entitlements at once."""
+    rows = db.execute(
+        "SELECT analytic_key, status FROM camera_analytics_entitlements WHERE camera_id=?",
+        (camera_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
+    """Turns on one analytic for exactly one camera -- never touches any
+    other camera, even another one at the same site or owned by the same
+    customer. Idempotent: assigning an already-active entitlement just
+    refreshes updated_at."""
+    if analytic_key not in ANALYTIC_LABELS:
+        raise ValueError(f"Unknown analytic_key: {analytic_key!r}")
+    db.execute(
+        "INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
+        "VALUES(?,?,'active',?,?) "
+        "ON CONFLICT(camera_id,analytic_key) DO UPDATE SET status='active',updated_at=excluded.updated_at",
+        (camera_id, analytic_key, now, now),
+    )
+
+
+def remove_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
+    """Turns off one analytic for exactly one camera. Soft-remove (status
+    set to 'cancelled', row kept) rather than DELETE, matching
+    analytics_subscriptions' own convention elsewhere in this codebase --
+    enabled_analytics() already treats status='cancelled' as not enabled."""
+    db.execute(
+        "UPDATE camera_analytics_entitlements SET status='cancelled',updated_at=? WHERE camera_id=? AND analytic_key=?",
+        (now, camera_id, analytic_key),
+    )
 
 
 UPGRADE_CARD_CONTENT: dict[str, dict] = {

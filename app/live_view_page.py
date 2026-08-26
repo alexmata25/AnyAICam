@@ -37,7 +37,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from partner_db import connection
 from partner_portal import partner_identity
-from customer_analytics_panel import analytics_row_state, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT
+from customer_analytics_panel import analytics_row_state, camera_entitlement_rows, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT
 
 POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
@@ -555,11 +555,13 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             return RedirectResponse('/partner-login', status_code=303)
         with connection() as db:
             camera = _authorized_camera(db, camera_id, identity)
-            subscriptions = db.execute(
-                'SELECT analytic_key, status FROM analytics_subscriptions WHERE customer_id=? AND (site_id=? OR site_id IS NULL)',
-                (identity['customer_id'], camera.get('site_id')),
-            ).fetchall()
-        analytics = analytics_row_state([dict(row) for row in subscriptions])
+            # Per-camera entitlements (camera_analytics_entitlements), not
+            # the site-level analytics_subscriptions billing record -- a
+            # customer with 10 cameras at one site can have LPR on 2 of
+            # them and nothing on the rest. See
+            # customer_analytics_panel's module docstring.
+            entitlements = camera_entitlement_rows(db, camera_id)
+        analytics = analytics_row_state(entitlements)
         for item in analytics:
             item['upgrade'] = UPGRADE_CARD_CONTENT[item['key']]
         return {'analytics': analytics}
