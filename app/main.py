@@ -40318,6 +40318,24 @@ CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer"}
 ADMIN_PORTAL_ROLES = {"administrator", "support_admin", "admin"}
 
 
+# Sidebar nav keys whose route is gated by partner_identity()/
+# require_partner_access() -- the newer partner/customer identity system --
+# rather than by has_permission()/current_user(), the legacy VMS identity
+# that every ADMIN_PORTAL_ROLES account (including the bootstrapped
+# admin@local) actually uses. An administrator was never given a
+# partner_identity() record, so these routes always bounce it to
+# /partner-login or /admin-portal regardless of its own broad permissions.
+# Advertising them in the sidebar just sent admin@local into a confusing
+# dead end; navigation_keys_for_role() hides exactly these for
+# ADMIN_PORTAL_ROLES instead of guessing a full allowlist, so every other
+# admin-appropriate item (including anything added later) stays visible.
+PARTNER_IDENTITY_ONLY_NAV_KEYS = {
+    "live", "appliances", "partner",
+    "partner-sales", "partner-quotes", "partner-install", "partner-performance",
+    "setup", "subscription", "pricing",
+}
+
+
 
 
 
@@ -45553,7 +45571,10 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-        return None  # Administrators see every navigation item.
+        # Broad access, but not to the handful of items that require a
+        # partner/customer identity record an administrator doesn't have --
+        # see PARTNER_IDENTITY_ONLY_NAV_KEYS. Every other item stays visible.
+        return {key for key, _url, _icon, _label in NAV_ITEMS} - PARTNER_IDENTITY_ONLY_NAV_KEYS
 
 
 
@@ -83260,7 +83281,7 @@ def evidence_integrity_page(request: Request) -> str:
 
 
 
-        return permission_denied_page("Evidence integrity", "cases", "view_analytics")
+        return permission_denied_page("Evidence integrity", "evidence", "view_analytics")
 
 
 
@@ -83665,7 +83686,7 @@ def evidence_integrity_page(request: Request) -> str:
 
 
 
-    return page_shell("Evidence integrity", "cases", content, scripts)
+    return page_shell("Evidence integrity", "evidence", content, scripts)
 
 
 
@@ -127316,6 +127337,14 @@ SETTINGS_CATEGORIES = [
 ]
 
 
+# Only these SETTINGS_CATEGORIES names have a real settings_detail()
+# implementation today (see the events-alerts branch below); every other
+# category renders an honest "coming soon" placeholder there. Hiding the
+# unimplemented ones from the clickable /settings list (see settings())
+# keeps the sidebar from presenting a dead end as if it were a working page.
+IMPLEMENTED_SETTINGS_CATEGORIES = {"Events & alerts"}
+
+
 
 
 
@@ -127403,7 +127432,11 @@ def settings(request: Request) -> str:
 
 
 
-        f'<a class="setting-link" href="/settings/{slugify(name)}"><div><strong>{escape(name)}</strong><div class="health-detail">{escape(description)}</div></div><span>›</span></a>'
+        (
+            f'<a class="setting-link" href="/settings/{slugify(name)}"><div><strong>{escape(name)}</strong><div class="health-detail">{escape(description)}</div></div><span>›</span></a>'
+            if name in IMPLEMENTED_SETTINGS_CATEGORIES else
+            f'<div class="setting-link" aria-disabled="true" title="Coming soon"><div><strong>{escape(name)}</strong><div class="health-detail">{escape(description)}</div></div><span class="pill wait">Coming soon</span></div>'
+        )
 
 
 
