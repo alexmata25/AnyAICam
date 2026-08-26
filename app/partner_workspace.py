@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from partner_portal import partner_identity, require_partner_access
 from pricing_config import calculate_partner_quote, calculate_quote, load_pricing
+from appliance_protocol import encrypt_camera_credentials
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
 from email_service import get_email_service
 
@@ -204,13 +205,22 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             "SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated'",
             (customer['id'],)
         )
-        if identity['role']=='customer_owner' and not activated:
+        # An activated appliance is necessary but not sufficient: a
+        # customer can have a linked, activated appliance and still
+        # have zero real cameras (nothing discovered/confirmed yet) --
+        # that customer belongs in Setup too, not looking at an empty
+        # or placeholder-only camera list on their own account page.
+        commissioned_camera=row(
+            'SELECT id FROM cameras WHERE customer_id=? AND (cameras.status=? OR EXISTS(SELECT 1 FROM recordings r WHERE r.camera_id=cameras.id)) LIMIT 1',
+            (customer['id'],'configured')
+        )
+        if identity['role']=='customer_owner' and not (activated and commissioned_camera):
             return RedirectResponse('/customer/setup',status_code=303)
 
         cameras=rows(
             'SELECT id,name,camera_number,status FROM cameras '
-            'WHERE customer_id=? ORDER BY camera_number',
-            (customer['id'],)
+            'WHERE customer_id=? AND (cameras.status=? OR EXISTS(SELECT 1 FROM recordings r WHERE r.camera_id=cameras.id)) ORDER BY camera_number',
+            (customer['id'],'configured')
         )
 
         camera_cards=''.join(
@@ -287,6 +297,36 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         with connection() as db: db.execute("UPDATE appliances SET activation_status='linked' WHERE id=?",(appliance['id'],))
         audit(identity,'appliance.linked','appliance',appliance['id']); return {'message':'Appliance linked to customer account.','appliance_id':appliance['id']}
 
+    # Real state lifecycle for a scan job -- a customer must always get
+    # honest feedback, never an indefinite silent "queued". Terminal
+    # states never move again; timed_out is applied lazily on read (see
+    # _maybe_time_out_scan_job()) rather than via a separate scheduled
+    # sweep, since every real read already has the row in hand and
+    # nothing else needs to scan this table proactively.
+    # Canonical vocabulary: 'queued'/'waiting_for_appliance' (customer
+    # request) -> 'running' (appliance accepted, see appliance_cloud.py's
+    # secure_scan_jobs()) -> 'complete'/'error' (see secure_scan_results()).
+    # Previously this set said 'completed'/'failed'/'scanning', which never
+    # matched what the only real appliance-side poller
+    # (appliance-agent/anyaicam_agent/service.py, via appliance_cloud.py)
+    # actually writes -- a job that legitimately finished as 'complete'
+    # was never recognized as terminal here and got force-timed-out ~180s
+    # later. Fixed to match the one canonical lifecycle.
+    CAMERA_SCAN_TERMINAL_STATES={'complete','error','timed_out','cancelled'}
+    CAMERA_SCAN_QUEUE_TIMEOUT_SECONDS=600   # queued/waiting_for_appliance, never picked up
+    CAMERA_SCAN_ACTIVE_TIMEOUT_SECONDS=180  # running, appliance accepted but never finished
+
+    def _maybe_time_out_scan_job(job: dict) -> dict:
+        if job['status'] in CAMERA_SCAN_TERMINAL_STATES: return job
+        try: updated=datetime.fromisoformat(job['updated_at'])
+        except (KeyError,TypeError,ValueError): return job
+        limit=CAMERA_SCAN_ACTIVE_TIMEOUT_SECONDS if job['status']=='running' else CAMERA_SCAN_QUEUE_TIMEOUT_SECONDS
+        if (datetime.now()-updated).total_seconds()<=limit: return job
+        message='Discovery timed out: the appliance accepted this job but never finished.' if job['status']=='running' else 'Discovery timed out: the appliance never picked up this request in time.'
+        now=datetime.now().isoformat()
+        with connection() as db: db.execute("UPDATE camera_scan_jobs SET status='timed_out',message=?,updated_at=? WHERE id=? AND status=?",(message,now,job['id'],job['status']))
+        job['status']='timed_out'; job['message']=message; job['updated_at']=now; return job
+
     @app.post('/api/customer/appliances/{appliance_id}/scan')
     def request_camera_scan(request: Request,appliance_id: str) -> dict:
         identity=customer_owner(request); appliance=row('SELECT * FROM appliances WHERE id=? AND customer_id=?',(appliance_id,identity['customer_id']))
@@ -295,37 +335,102 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         with connection() as db: db.execute('INSERT INTO camera_scan_jobs(id,customer_id,appliance_id,status,progress,results_json,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',(job_id,identity['customer_id'],appliance_id,status,0,'[]',message,now,now))
         audit(identity,'camera.discovery_requested','appliance',appliance_id,{'job_id':job_id}); return {'job_id':job_id,'status':status,'progress':0,'message':message}
 
+    @app.post('/api/customer/camera-scans/{job_id}/cancel')
+    def cancel_camera_scan(request: Request,job_id: str) -> dict:
+        identity=customer_owner(request); job=row('SELECT * FROM camera_scan_jobs WHERE id=? AND customer_id=?',(job_id,identity['customer_id']))
+        if not job: raise HTTPException(status_code=404,detail='Camera discovery job not found.')
+        if job['status'] in CAMERA_SCAN_TERMINAL_STATES: return {'message':'Job already finished.','status':job['status']}
+        now=datetime.now().isoformat()
+        with connection() as db: db.execute("UPDATE camera_scan_jobs SET status='cancelled',message='Cancelled by customer.',updated_at=? WHERE id=?",(now,job_id))
+        audit(identity,'camera.discovery_cancelled','appliance',job['appliance_id'],{'job_id':job_id}); return {'message':'Discovery cancelled.','status':'cancelled'}
+
     @app.get('/api/customer/camera-scans/{job_id}')
     def camera_scan_status(request: Request,job_id: str) -> dict:
         identity=customer_owner(request); job=row('SELECT * FROM camera_scan_jobs WHERE id=? AND customer_id=?',(job_id,identity['customer_id']))
         if not job: raise HTTPException(status_code=404,detail='Camera discovery job not found.')
+        job=_maybe_time_out_scan_job(job)
         job['results']=json.loads(job.pop('results_json')); return job
 
-    def appliance_agent(request: Request,cloud_id: str) -> dict:
-        authorization=request.headers.get('authorization',''); token=authorization.removeprefix('Bearer ').strip(); appliance=row('SELECT * FROM appliances WHERE cloud_id=?',(cloud_id.upper(),))
-        if not appliance or not token or not verify_password(token,appliance.get('activation_token_hash') or ''): raise HTTPException(status_code=403,detail='Invalid appliance credentials.')
-        with connection() as db: db.execute("UPDATE appliances SET online_status='online',last_check_in=? WHERE id=?",(datetime.now().isoformat(),appliance['id']))
-        return appliance
+    # NOTE: appliance-facing scan-job polling/submission (previously
+    # appliance_agent() + the two /api/appliance-legacy/{cloud_id}/scan-jobs
+    # routes here) has been removed. It was dead code with no caller --
+    # the only real appliance-side poller (appliance-agent's service.py)
+    # has always called appliance_cloud.py's /api/appliance/{cloud_id}/
+    # scan-jobs routes (authenticate_appliance(), not a bearer-vs-
+    # activation-token check) -- and kept the two implementations racing
+    # on the same camera_scan_jobs table with two different status
+    # vocabularies. See docs/AI_HANDOFF.md for the Stage 2 auth-hardening
+    # note. Camera-provisioning's appliance-facing routes are similarly
+    # re-homed to appliance_cloud.py below (not deleted -- provisioning
+    # had no working caller yet, so nothing regresses).
 
-    @app.get('/api/appliance-legacy/{cloud_id}/scan-jobs',include_in_schema=False)
-    def appliance_scan_jobs(request: Request,cloud_id: str) -> dict:
-        appliance=appliance_agent(request,cloud_id); jobs=rows("SELECT id,status,created_at FROM camera_scan_jobs WHERE appliance_id=? AND status IN ('queued','waiting_for_appliance') ORDER BY created_at",(appliance['id'],))
-        if jobs:
-            with connection() as db:
-                for job in jobs: db.execute("UPDATE camera_scan_jobs SET status='running',progress=5,message='Appliance accepted discovery job.',updated_at=? WHERE id=?",(datetime.now().isoformat(),job['id']))
-        return {'jobs':jobs}
+    # ---- Camera provisioning: turns one selected, discovered device
+    # into a real, commissioned camera. Credentials (when the camera
+    # needs them) are encrypted at rest for the short window between
+    # the customer submitting them and the appliance's next poll, and
+    # the ciphertext is cleared the instant the appliance retrieves it
+    # -- never retained longer than that wait, never logged, never
+    # echoed back to the browser. See ANYAICAM_CAMERA_CREDENTIAL_KEY's
+    # own comment for the encryption details.
+    CAMERA_PROVISIONING_TERMINAL_STATES={'provisioned','failed'}
+    CAMERA_PROVISIONING_TIMEOUT_SECONDS=300
 
-    @app.post('/api/appliance-legacy/{cloud_id}/scan-jobs/{job_id}',include_in_schema=False)
-    def appliance_submit_scan(request: Request,cloud_id: str,job_id: str,payload: dict) -> dict:
-        appliance=appliance_agent(request,cloud_id); job=row('SELECT * FROM camera_scan_jobs WHERE id=? AND appliance_id=?',(job_id,appliance['id']))
-        if not job: raise HTTPException(status_code=404,detail='Discovery job not found.')
-        status=str(payload.get('status','running')); progress=max(0,min(100,int(payload.get('progress',0)))); results=payload.get('results',[]); message=str(payload.get('message','Appliance discovery update received.'))
-        if status not in {'running','complete','error'}: raise HTTPException(status_code=400,detail='Unsupported discovery status.')
+    # Encryption itself now lives in appliance_protocol.py, shared with
+    # appliance_cloud.py's decrypt-on-poll (see the import at the top of
+    # this file) -- one source of truth for ANYAICAM_CAMERA_CREDENTIAL_KEY
+    # instead of a duplicate copy on each side.
+
+    def _maybe_time_out_provisioning_job(job: dict) -> dict:
+        if job['status'] in CAMERA_PROVISIONING_TERMINAL_STATES: return job
+        try: updated=datetime.fromisoformat(job['updated_at'])
+        except (KeyError,TypeError,ValueError): return job
+        if (datetime.now()-updated).total_seconds()<=CAMERA_PROVISIONING_TIMEOUT_SECONDS: return job
+        message='Provisioning timed out: the appliance never confirmed this camera in time.'
+        now=datetime.now().isoformat()
+        with connection() as db: db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,updated_at=? WHERE id=? AND status=?",(message,now,job['id'],job['status']))
+        job['status']='failed'; job['message']=message; job['updated_at']=now; return job
+
+    @app.post('/api/customer/cameras/provision')
+    def request_camera_provisioning(request: Request,payload: dict) -> dict:
+        identity=customer_owner(request)
+        try: require_permission(identity,'camera.self.configure')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        appliance_id=str(payload.get('appliance_id','')); device_key=str(payload.get('device_key','')).strip(); name=str(payload.get('name','')).strip() or 'Camera'
+        if not appliance_id or not device_key: raise HTTPException(status_code=400,detail='appliance_id and device_key are required.')
+        appliance=row('SELECT * FROM appliances WHERE id=? AND customer_id=?',(appliance_id,identity['customer_id']))
+        if not appliance: raise HTTPException(status_code=404,detail='Appliance not found.')
+        site_id=str(payload.get('site_id') or appliance['site_id'])
+        site=row('SELECT id FROM sites WHERE id=? AND customer_id=?',(site_id,identity['customer_id']))
+        if not site: raise HTTPException(status_code=404,detail='Site not found on this customer account.')
+        username=payload.get('username'); password=payload.get('password'); encrypted=None
+        if username or password:
+            encrypted=encrypt_camera_credentials(str(username or ''),str(password or ''))
+            if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured on this deployment yet. Contact support before adding a credentialed camera.')
+        job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
-            db.execute('UPDATE camera_scan_jobs SET status=?,progress=?,results_json=?,message=?,updated_at=? WHERE id=?',(status,progress,json.dumps(results),message,datetime.now().isoformat(),job_id))
-            if status=='complete':
-                for index,item in enumerate(results,1): db.execute('INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,name,resolution,status,created_at) VALUES(?,?,?,?,?,?,?,?)',(str(item.get('id') or secrets.token_hex(5)),job['customer_id'],appliance['site_id'],appliance['id'],item.get('name') or f'Discovered Camera {index}',item.get('resolution','2mp'),'discovered',datetime.now().isoformat()))
-        return {'message':'Discovery update saved.'}
+            db.execute(
+                'INSERT INTO camera_provisioning_requests(id,customer_id,appliance_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials,status,message,created_at,updated_at) '
+                'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (job_id,identity['customer_id'],appliance_id,site_id,device_key,name,str(payload.get('recording_mode') or 'motion'),json.dumps(payload.get('analytics') or []),encrypted,'queued','Provisioning request queued for the appliance.',now,now),
+            )
+        # Curated detail only -- never the raw payload, which may hold
+        # username/password. audit() must never see those fields.
+        audit(identity,'camera.provisioning_requested','appliance',appliance_id,{'job_id':job_id,'device_key':device_key,'name':name})
+        return {'job_id':job_id,'status':'queued','message':'Provisioning request queued for the appliance.'}
+
+    @app.get('/api/customer/camera-provisioning/{job_id}')
+    def camera_provisioning_status(request: Request,job_id: str) -> dict:
+        identity=customer_owner(request)
+        job=row('SELECT id,status,camera_id,message,created_at,updated_at FROM camera_provisioning_requests WHERE id=? AND customer_id=?',(job_id,identity['customer_id']))
+        if not job: raise HTTPException(status_code=404,detail='Provisioning job not found.')
+        return _maybe_time_out_provisioning_job(job)
+
+    # Appliance-facing provisioning-jobs routes (GET/POST) now live in
+    # appliance_cloud.py, authenticated via authenticate_appliance()
+    # instead of the removed appliance_agent() bearer-vs-activation-token
+    # check -- see appliance_provisioning_jobs()/appliance_submit_provisioning()
+    # there. Nothing previously depended on the old -legacy path (no
+    # appliance-side caller existed yet), so this is a pure move.
 
     @app.put('/api/customer/cameras')
     def configure_customer_cameras(request: Request,payload: dict) -> dict:

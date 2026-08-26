@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import ipaddress
 import json
 import re
@@ -42,7 +43,13 @@ def _onvif_probe(timeout=2):
         sock.sendto(message,('239.255.255.250',3702)); end=__import__('time').time()+timeout
         while __import__('time').time()<end:
             try:
-                data,address=sock.recvfrom(65535); text=data.decode(errors='ignore'); scopes=' '.join(re.findall(r'<[^>]*Scopes[^>]*>(.*?)</',text,re.I)); found[address[0]]=scopes
+                data,address=sock.recvfrom(65535); text=data.decode(errors='ignore'); scopes=' '.join(re.findall(r'<[^>]*Scopes[^>]*>(.*?)</',text,re.I))
+                # The device's own ONVIF endpoint reference (urn:uuid:...)
+                # is stable across reboots and IP/DHCP changes -- unlike
+                # the IP address, it's a real device identity. Kept
+                # alongside scopes so scan() can use it as device_key.
+                endpoint=re.search(r'<[^>]*Address[^>]*>\s*(urn:uuid:[^\s<]+)',text,re.I)
+                found[address[0]]={'scopes':scopes,'endpoint':endpoint.group(1) if endpoint else None}
             except socket.timeout: continue
     except OSError: pass
     finally: sock.close()
@@ -60,9 +67,24 @@ def scan(networks=None,max_hosts=1024):
         if len(addresses)>=max_hosts: break
     addresses=list({str(item) for item in addresses}|set(onvif)); results=[]
     def inspect(ip):
-        rtsp=_port(ip,554) or _port(ip,8554); scopes=onvif.get(ip,''); onvif_supported=bool(scopes) or _port(ip,80) or _port(ip,8000)
+        rtsp=_port(ip,554) or _port(ip,8554); onvif_info=onvif.get(ip,{}); scopes=onvif_info.get('scopes',''); onvif_supported=bool(scopes) or _port(ip,80) or _port(ip,8000)
         if not rtsp and not scopes: return None
-        return {'id':'camera-'+ip.replace('.','-'),'name':'Camera '+ip,'ip':ip,'manufacturer':_scope_value(scopes,'manufacturer'),'model':_scope_value(scopes,'model'),'mac_address':arp.get(ip,'Unknown'),'onvif_support':onvif_supported,'rtsp_support':rtsp,'connection_status':'reachable','online':True,'recording':False,'analytics':False,'last_recording_at':None,'last_error':None}
+        mac=arp.get(ip,'Unknown')
+        # Stable device identity, preferred in this order: the device's
+        # own ONVIF endpoint UUID (survives reboot/DHCP renewal, and is
+        # already a protocol-visible identifier, not raw LAN topology)
+        # > a hash of its MAC address (tied to the NIC, not the lease --
+        # stable across DHCP renewal -- but the raw MAC itself must
+        # never leave the LAN, matching every other 'mac'/'mac_address'
+        # field this same module already treats as forbidden once
+        # results reach the cloud, so only its hash crosses that
+        # boundary) > a hash of its current IP (last resort -- doesn't
+        # survive a DHCP renewal since the input itself changes, but
+        # still never sends a raw IP to the cloud).
+        if onvif_info.get('endpoint'): device_key=onvif_info['endpoint']
+        elif mac!='Unknown': device_key='mac-'+hashlib.sha256(mac.lower().encode()).hexdigest()[:32]
+        else: device_key='ip-'+hashlib.sha256(ip.encode()).hexdigest()[:32]
+        return {'id':'camera-'+ip.replace('.','-'),'device_key':device_key,'name':'Camera '+ip,'ip':ip,'manufacturer':_scope_value(scopes,'manufacturer'),'model':_scope_value(scopes,'model'),'mac_address':mac,'onvif_support':onvif_supported,'rtsp_support':rtsp,'connection_status':'reachable','online':True,'recording':False,'analytics':False,'last_recording_at':None,'last_error':None}
     with concurrent.futures.ThreadPoolExecutor(max_workers=48) as pool:
         for item in pool.map(inspect,addresses):
             if item: results.append(item)

@@ -45,6 +45,30 @@ def sanitize_discovery_results(value) -> list[dict]:
     return results
 
 
+def camera_credential_key() -> bytes | None:
+    """Shared by partner_workspace.py (customer-side: encrypts on submit)
+    and appliance_cloud.py (appliance-side: decrypts on poll). A single
+    source of truth for the env var so both sides fail closed the same
+    way when it's unset -- see ANYAICAM_CAMERA_CREDENTIAL_KEY."""
+    raw = os.environ.get('ANYAICAM_CAMERA_CREDENTIAL_KEY', '').strip()
+    return raw.encode() if raw else None
+
+
+def encrypt_camera_credentials(username: str, password: str):
+    key = camera_credential_key()
+    if not key: return None
+    from cryptography.fernet import Fernet
+    return Fernet(key).encrypt(json.dumps({'username': username, 'password': password}).encode())
+
+
+def decrypt_camera_credentials(token):
+    key = camera_credential_key()
+    if not key or not token: return None
+    from cryptography.fernet import Fernet
+    try: return json.loads(Fernet(key).decrypt(bytes(token)))
+    except Exception: return None
+
+
 def health_state(payload: dict) -> tuple[str,list[str]]:
     warnings=[]
     if float(payload.get('disk_capacity',0)) and float(payload.get('disk_used',0))/float(payload['disk_capacity']) >= .9: warnings.append('low_disk')

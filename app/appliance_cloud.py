@@ -12,7 +12,7 @@ from typing import Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
+from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, decrypt_camera_credentials, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
 from live_manifest import LiveManifestStore
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
@@ -107,10 +107,35 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
     @app.post('/api/appliance/heartbeat')
     def heartbeat(request: Request,payload: dict) -> dict:
         appliance=authenticate_appliance(request); safe=sanitize_appliance_payload(payload); state,warnings=health_state(safe); now=datetime.now().isoformat()
+        new_uptime=int(safe.get('uptime_seconds',0))
+        # A restart is inferred, never self-reported: uptime_seconds resetting
+        # to a value meaningfully lower than what this same appliance last
+        # reported is the one signal a heartbeat payload can't omit or get
+        # wrong, since it comes straight from /proc/uptime every cycle
+        # regardless of agent version. A 30s tolerance absorbs ordinary
+        # measurement jitter between consecutive heartbeats without ever
+        # miscounting a real restart as jitter -- a genuine restart drops
+        # uptime by minutes at least.
+        previous_uptime=int(appliance.get('uptime_seconds') or 0); restarted=new_uptime<previous_uptime-30
         with connection() as db:
-            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=? WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),int(safe.get('uptime_seconds',0)),float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),appliance['id']))
+            if restarted: db.execute('UPDATE appliances SET restart_count=COALESCE(restart_count,0)+1 WHERE id=?',(appliance['id'],))
+            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=? WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),appliance['id']))
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
-        return {'status':'accepted','state':state,'warnings':warnings,'server_time':int(time.time())}
+        return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time())}
+
+    @app.post('/api/appliance/recordings/backlog')
+    def recordings_backlog(request: Request,payload: dict) -> dict:
+        """Fleet-visible summary of the edge-side recording_uploader.py
+        backlog -- see upload_pending_count's own column comment in
+        db_migrations.py. Reported by the appliance itself once per
+        upload-worker scan cycle; deliberately separate from heartbeat()
+        (a different, existing worker with its own independent cadence and
+        failure domain -- this must keep working even if the heartbeat
+        agent process is unhealthy, and vice versa)."""
+        appliance=authenticate_appliance(request); safe=sanitize_appliance_payload(payload); now=datetime.now().isoformat()
+        pending=max(0,int(safe.get('pending_count',0))); quarantined=max(0,int(safe.get('quarantined_count',0)))
+        with connection() as db: db.execute('UPDATE appliances SET upload_pending_count=?,upload_quarantined_count=?,upload_backlog_reported_at=? WHERE id=?',(pending,quarantined,now,appliance['id']))
+        return {'status':'accepted'}
 
     @app.post('/api/appliance/health')
     def health(request: Request,payload: dict) -> dict:
@@ -151,7 +176,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     @app.post('/api/appliance/events')
     def events(request: Request,payload: dict) -> dict:
@@ -371,6 +396,72 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             db.execute('UPDATE camera_scan_jobs SET status=?,progress=?,results_json=?,message=?,updated_at=? WHERE id=?',(status,progress,json.dumps(results),str(payload.get('message','Discovery update received.'))[:500],datetime.now().isoformat(),job_id))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.discovery_result','camera_scan_job',job_id,{'status':status,'count':len(results)}); return {'message':'Discovery result accepted; no camera records created until explicit binding.'}
 
+    # ---- Camera provisioning (appliance side). Re-homed here from the
+    # weaker "-legacy" appliance_agent() bearer-vs-activation-token check
+    # onto authenticate_appliance() -- the same bearer+nonce+timestamp+
+    # replay-table mechanism every other appliance route on this file
+    # uses -- plus an explicit tenancy check on the job row itself, the
+    # same defense-in-depth shape as _authorized_camera(). Credentials
+    # are still encrypted at rest by the customer-facing route in
+    # partner_workspace.py and decrypted here only once, at the instant
+    # of delivery to the one already-authenticated appliance they were
+    # queued for -- see appliance_protocol.encrypt/decrypt_camera_credentials.
+    @app.get('/api/appliance/{cloud_id}/provisioning-jobs')
+    def appliance_provisioning_jobs(request: Request,cloud_id: str) -> dict:
+        appliance=authenticate_appliance(request)
+        if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
+        jobs=rows("SELECT id,customer_id,site_id,device_key,camera_name,recording_mode,analytics_json,encrypted_credentials FROM camera_provisioning_requests WHERE appliance_id=? AND status='queued' ORDER BY created_at",(appliance['id'],))
+        delivered=[]; now=datetime.now().isoformat()
+        with connection() as db:
+            for job in jobs:
+                # Tenancy defense-in-depth: the job's own customer_id/
+                # site_id must match the authenticated appliance's --
+                # on top of the appliance_id filter above, mirroring
+                # _authorized_camera()'s pattern. A job that somehow
+                # carries a mismatched tenant is skipped, not delivered.
+                if job['customer_id']!=appliance['customer_id'] or job['site_id']!=appliance['site_id']: continue
+                credentials=decrypt_camera_credentials(job.pop('encrypted_credentials'))
+                delivered.append({'id':job['id'],'device_key':job['device_key'],'camera_name':job['camera_name'],'recording_mode':job['recording_mode'],'analytics':json.loads(job['analytics_json']),'credentials':credentials})
+                # Single-delivery: cleared from storage the instant it is
+                # handed to this specific, already-authenticated
+                # appliance -- never retained at rest any longer than
+                # the queue wait itself required.
+                db.execute("UPDATE camera_provisioning_requests SET status='verifying',encrypted_credentials=NULL,updated_at=? WHERE id=?",(now,job['id']))
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.provisioning_jobs_delivered','appliance',appliance['id'],{'count':len(delivered)})
+        return {'jobs':delivered}
+
+    @app.post('/api/appliance/{cloud_id}/provisioning-jobs/{job_id}')
+    def appliance_submit_provisioning(request: Request,cloud_id: str,job_id: str,payload: dict) -> dict:
+        appliance=authenticate_appliance(request)
+        if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
+        job=row('SELECT * FROM camera_provisioning_requests WHERE id=? AND appliance_id=?',(job_id,appliance['id']))
+        if not job: raise HTTPException(status_code=404,detail='Provisioning job not found.')
+        if job['customer_id']!=appliance['customer_id'] or job['site_id']!=appliance['site_id']:
+            raise HTTPException(status_code=403,detail='Provisioning job does not belong to this appliance.')
+        success=bool(payload.get('success')); message=str(payload.get('message',''))[:500]
+        now=datetime.now().isoformat(); camera_id=None
+        with connection() as db:
+            if success:
+                # device_key is scoped to this one appliance, matching the
+                # tenancy every other camera-facing route already enforces
+                # -- a discovered device from one customer's appliance can
+                # never collide with or attach to another tenant's camera.
+                existing=db.execute('SELECT id FROM cameras WHERE appliance_id=? AND device_key=?',(appliance['id'],job['device_key'])).fetchone()
+                if existing:
+                    camera_id=existing['id']
+                    db.execute("UPDATE cameras SET name=?,status='configured' WHERE id=?",(job['camera_name'],camera_id))
+                else:
+                    camera_id=secrets.token_hex(5)
+                    db.execute(
+                        'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                        (camera_id,job['customer_id'],job['site_id'],appliance['id'],job['device_key'],job['camera_name'],'configured',now),
+                    )
+                db.execute("UPDATE camera_provisioning_requests SET status='provisioned',camera_id=?,message=?,updated_at=? WHERE id=?",(camera_id,message or 'Camera provisioned.',now,job_id))
+            else:
+                db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,updated_at=? WHERE id=?",(message or 'Provisioning failed.',now,job_id))
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.provisioning_result','camera_provisioning_request',job_id,{'success':success,'camera_id':camera_id})
+        return {'message':'Provisioning result saved.'}
+
     @app.get('/api/appliance/commands')
     def appliance_commands(request: Request) -> dict:
         appliance=authenticate_appliance(request); now=datetime.now().isoformat()
@@ -412,6 +503,56 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         audit(identity,'appliance.live_relay_pilot_changed','appliance',appliance_id,{'enabled':bool(enabled)})
         return {'appliance_id':appliance_id,'live_relay_pilot':bool(enabled)}
 
+    @app.post('/api/admin/cameras/{camera_id}/cloud-recording-mode')
+    def set_cloud_recording_mode(request: Request,camera_id: str,payload: dict) -> dict:
+        # No hidden default, by design (see db_migrations.py's own comment
+        # on this column): only these three explicit values are ever
+        # accepted, or null to clear back to "not set" (== continuous
+        # behavior everywhere it's read). Anything else is a 400, never
+        # silently coerced to one side or the other.
+        #
+        # 'disabled' (added for the per-camera cloud-recording-upload gate):
+        # the master ANYAICAM_RECORDING_UPLOAD_ENABLED flag in
+        # recording_uploader.py is only ever the appliance-wide permission
+        # switch -- this is the per-camera authorization it was always
+        # meant to be paired with, reusing this same existing column/route
+        # rather than adding a second control surface. Unlike 'motion'
+        # (upload only motion-overlapping segments) and 'continuous'/null
+        # (upload everything), 'disabled' means this camera's recordings
+        # are never uploaded or cataloged at all -- local recording and
+        # retention are completely unaffected either way, exactly like the
+        # other two values.
+        identity=require_partner_access(request,{'administrator'})
+        mode=payload.get('cloud_recording_mode')
+        if mode is not None and mode not in ('motion','continuous','disabled'):
+            raise HTTPException(status_code=400,detail="cloud_recording_mode must be 'motion', 'continuous', 'disabled', or null.")
+        with connection() as db:
+            cursor=db.execute('UPDATE cameras SET cloud_recording_mode=? WHERE id=?',(mode,camera_id))
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
+        audit(identity,'camera.cloud_recording_mode_changed','camera',camera_id,{'cloud_recording_mode':mode})
+        return {'camera_id':camera_id,'cloud_recording_mode':mode}
+
+    @app.post('/api/admin/cameras/{camera_id}/people-counting')
+    def set_people_counting_enabled(request: Request,camera_id: str,payload: dict) -> dict:
+        # Same no-hidden-default convention as cloud_recording_mode above
+        # (see db_migrations.py's own comment on this column): only an
+        # explicit true/false is ever accepted -- never coerced from a
+        # billing/add-on selection automatically, since that automatic
+        # link is exactly the analytics-entitlement disconnect this
+        # column exists to start correcting. Enabling this here is a
+        # necessary but not sufficient condition for the appliance to
+        # actually run People Counting on this camera -- the appliance
+        # also needs a configured counting-line rule for the same camera
+        # (see people_counting.py, edge lineage) and its own
+        # PEOPLE_COUNTING_ENABLED master flag turned on.
+        identity=require_partner_access(request,{'administrator'})
+        enabled=1 if payload.get('people_counting_enabled') else 0
+        with connection() as db:
+            cursor=db.execute('UPDATE cameras SET people_counting_enabled=? WHERE id=?',(enabled,camera_id))
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
+        audit(identity,'camera.people_counting_enabled_changed','camera',camera_id,{'people_counting_enabled':bool(enabled)})
+        return {'camera_id':camera_id,'people_counting_enabled':bool(enabled)}
+
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
         identity=require_partner_access(request); command=str(payload.get('command',''))
@@ -420,6 +561,14 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
         from partner_db import require_permission
         try: require_permission(identity,'appliance.action')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        # De-dup guard: an identical command already pending or delivered
+        # (not yet completed/failed/expired) for this appliance is returned
+        # as-is instead of queuing a second copy -- a partner double-
+        # clicking "Restart service", or a dashboard auto-refresh replaying
+        # the same request, must never queue N redundant restarts/reboots
+        # for one appliance to work through.
+        existing=row("SELECT id FROM appliance_commands WHERE appliance_id=? AND command=? AND status IN ('pending','delivered') ORDER BY created_at LIMIT 1",(appliance_id,command))
+        if existing: return {'id':existing['id'],'status':'pending','message':'An identical command is already queued for this appliance; not queuing a duplicate.'}
         command_id=secrets.token_hex(7); now=datetime.now(); expires=now+timedelta(minutes=max(5,min(1440,int(payload.get('expires_minutes',60)))))
         with connection() as db: db.execute('INSERT INTO appliance_commands(id,appliance_id,command,payload_json,status,created_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?,?)',(command_id,appliance_id,command,json.dumps(sanitize_appliance_payload(payload.get('payload',{}))),'pending',now.isoformat(),expires.isoformat(),identity['email']))
         if command=='install_update':
@@ -445,7 +594,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable) -> None:
             if float(item.get('cpu') or 0)>=90: warnings.append('High CPU')
             if any(not c['online'] for c in camera_status): warnings.append('Camera offline')
             if any(c['online'] and not c['recording'] for c in camera_status): warnings.append('Recording stopped')
-            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('install_update','Install update')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
+            pending_count=item.get('upload_pending_count'); quarantined_count=item.get('upload_quarantined_count')
+            backlog_text=f'{pending_count} pending · {quarantined_count} quarantined' if pending_count is not None else 'Not yet reported'
+            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('install_update','Install update')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
         command_rows=rows('SELECT c.*,a.cloud_id FROM appliance_commands c JOIN appliances a ON a.id=c.appliance_id ORDER BY c.created_at DESC LIMIT 50')
         command_table=''.join(f'<tr><td>{escape(item["cloud_id"])}</td><td>{escape(item["command"].replace("_"," "))}</td><td><span class="pill">{escape(item["status"])}</span></td><td>{escape(item["created_at"])}</td><td>{escape(item.get("error") or "")}</td></tr>' for item in command_rows) or '<tr><td colspan="5">No remote actions have been queued.</td></tr>'
         content=f'''<header class="topbar"><div><p class="eyebrow">Secure appliance fleet</p><h1>Appliance dashboard</h1></div></header><form class="panel clip-form" method="get"><label>Partner<input name="partner" value="{escape(partner,quote=True)}"></label><label>Customer<input name="customer" value="{escape(customer,quote=True)}"></label><label>Site<input name="site" value="{escape(site,quote=True)}"></label><label>Status<select name="status"><option value="">All</option>{''.join(f'<option {"selected" if status==s else ""}>{s}</option>' for s in ['online','degraded','offline','updating','revoked'])}</select></label><label>Version<input name="version" value="{escape(version,quote=True)}"></label><button class="action-button">Filter</button></form><div class="account-grid" style="margin-top:18px">{''.join(cards) or '<div class="empty">No appliances match these filters.</div>'}</div><section class="panel" style="margin-top:18px;overflow:auto"><h2>Remote action history</h2><table class="data-table"><thead><tr><th>Appliance</th><th>Command</th><th>Status</th><th>Created</th><th>Error</th></tr></thead><tbody>{command_table}</tbody></table></section>'''

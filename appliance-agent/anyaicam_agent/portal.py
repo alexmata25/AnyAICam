@@ -4,7 +4,7 @@ import time
 import urllib.error
 import urllib.request
 
-FORBIDDEN={'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
+FORBIDDEN={'username','password','camera_username','camera_password','rtsp_url','rtsp_urls','stream_url','stream_urls','credentials','secret','ip','ip_address','host','mac','mac_address','onvif_xaddrs'}
 
 
 def sanitize(value):
@@ -13,7 +13,20 @@ def sanitize(value):
     return value
 
 
-class PortalError(RuntimeError): pass
+class PortalError(RuntimeError):
+    # RDM-2 Group 2E: status_code is additive and backward-compatible --
+    # every existing raise site/caller that only ever passed a message
+    # positionally keeps working unchanged (defaults to None). It lets a
+    # caller distinguish HTTP response classes (e.g. 404 vs 409 vs a
+    # generic network failure) without this module growing any new
+    # exception types -- still exactly one error type for "the portal
+    # request failed", just with an optional extra fact attached. None
+    # means "no HTTP response was ever received" (a network-level
+    # failure, or the pre-flight 'not activated' check below), not
+    # "unknown HTTP status".
+    def __init__(self,message,status_code=None):
+        super().__init__(message)
+        self.status_code=status_code
 
 
 class PortalClient:
@@ -29,7 +42,7 @@ class PortalClient:
         except urllib.error.HTTPError as error:
             try: detail=json.loads(error.read().decode()).get('detail',str(error))
             except Exception: detail=str(error)
-            raise PortalError(detail) from error
+            raise PortalError(detail,status_code=error.code) from error
         except (urllib.error.URLError,TimeoutError,OSError,json.JSONDecodeError) as error: raise PortalError(str(error)) from error
     def test(self): return self.request('GET','/api/appliance/config',authenticated=False)
     def activate(self,cloud_id,token): return self.request('POST','/api/appliance/activate',{'cloud_id':cloud_id,'activation_token':token},authenticated=False)
