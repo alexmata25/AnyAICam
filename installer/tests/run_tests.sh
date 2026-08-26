@@ -43,6 +43,9 @@ reset_fixture() {
     DOCKER_IMAGE_MOCK_EXIT=1
     DOCKER_COMPOSE_BUILD_MARKER="$FIXTURE_ROOT/.docker-compose-build-called"
     rm -f "$DOCKER_COMPOSE_BUILD_MARKER"
+    export APT_PYTHON_VENV_MARKER="$FIXTURE_ROOT/.apt-python3.12-venv-installed"
+    export FAKE_AGENT_INSTALL_MARKER="$FIXTURE_ROOT/.fake-agent-install-ran"
+    rm -f "$APT_PYTHON_VENV_MARKER" "$FAKE_AGENT_INSTALL_MARKER"
     DF_AVAIL_GB=999999
     DF_TOTAL_GB=999999
 }
@@ -57,6 +60,22 @@ make_fake_repo_root() {
     echo 'FROM python:3.12-slim AS production' > "$REPO_ROOT/Dockerfile.production"
     echo 'services: {}' > "$REPO_ROOT/docker-compose.yml"
     echo 'fastapi' > "$REPO_ROOT/requirements.txt"
+    # A fake stand-in for the reused appliance-agent/scripts/install.sh
+    # -- deliberately fails unless the python3.12-venv prerequisite was
+    # already installed first, so the test both proves install_agent()
+    # installs it AND proves the ordering (prereq before the wrapped
+    # script runs), without ever touching a real venv/pip/network.
+    mkdir -p "$REPO_ROOT/appliance-agent/scripts"
+    cat > "$REPO_ROOT/appliance-agent/scripts/install.sh" <<'FAKE_AGENT_INSTALL'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ! -f "$APT_PYTHON_VENV_MARKER" ]]; then
+    echo "python3.12-venv prerequisite missing -- would fail for real here" >&2
+    exit 1
+fi
+touch "$FAKE_AGENT_INSTALL_MARKER"
+FAKE_AGENT_INSTALL
+    chmod 755 "$REPO_ROOT/appliance-agent/scripts/install.sh"
 }
 
 # Shadow the three external commands the functions under test call.
@@ -83,6 +102,19 @@ docker() {
     fi
     command docker "$@"
 }
+apt-get() {
+    if [[ "$1" == "update" ]]; then
+        return 0
+    fi
+    if [[ "$1" == "install" ]]; then
+        shift
+        for arg in "$@"; do
+            [[ "$arg" == "python3.12-venv" ]] && touch "$APT_PYTHON_VENV_MARKER"
+        done
+        return 0
+    fi
+    command apt-get "$@"
+}
 df() {
     # Only the two exact invocations storage_preflight() makes are
     # mocked; anything else falls through to the real df.
@@ -105,6 +137,8 @@ source "$INSTALLER_DIR/03-detect-install.sh"
 source "$INSTALLER_DIR/02-storage-check.sh"
 # shellcheck source=../06-deploy-vms.sh
 source "$INSTALLER_DIR/06-deploy-vms.sh"
+# shellcheck source=../07-install-agent.sh
+source "$INSTALLER_DIR/07-install-agent.sh"
 
 assert_eq() {
     local description="$1" expected="$2" actual="$3"
@@ -256,6 +290,24 @@ assert_exit "plain Dockerfile is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_I
 assert_exit "Dockerfile.production is also copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile.production"
 assert_exit "requirements.txt is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/requirements.txt"
 assert_exit "docker compose build was invoked" 0 test -f "$DOCKER_COMPOSE_BUILD_MARKER"
+
+echo
+echo "== install_agent() =="
+
+# 17. Regression test for the fourth clean-install release blocker
+#     found in live Phase 4 validation: `python3 -m venv` inside the
+#     reused appliance-agent/scripts/install.sh fails on a fresh Ubuntu
+#     24.04 host because python3.12-venv (which provides ensurepip)
+#     isn't installed by default. install_agent() must apt-get install
+#     it BEFORE invoking the wrapped script -- the fake wrapped script
+#     in make_fake_repo_root() itself fails unless that ordering held,
+#     so this proves both "installed" and "installed first" in one
+#     assertion.
+reset_fixture
+make_fake_repo_root
+assert_exit "install_agent succeeds (prereq installed before the wrapped script ran)" 0 install_agent clean
+assert_exit "python3.12-venv was apt-get installed" 0 test -f "$APT_PYTHON_VENV_MARKER"
+assert_exit "the wrapped appliance-agent install.sh ran" 0 test -f "$FAKE_AGENT_INSTALL_MARKER"
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="
