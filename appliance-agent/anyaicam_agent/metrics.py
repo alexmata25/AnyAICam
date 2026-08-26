@@ -26,6 +26,13 @@ def local_ip():
     finally: sock.close()
 
 
-def collect(config,cameras):
+def disk_summary(config):
+    # Factored out of collect() (RDM4) so run_diagnostics' on-demand
+    # snapshot uses the exact same disk-accounting logic as the regular
+    # heartbeat, instead of a second, potentially-drifting copy of it.
     disk=shutil.disk_usage('/'); recording=shutil.disk_usage(config.recording_path) if Path(config.recording_path).exists() else disk
-    return {'software_version':config.software_version,'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),'disk_capacity':round(disk.total/1073741824,2),'disk_used':round(disk.used/1073741824,2),'recording_used':round(recording.used/1073741824,2),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}
+    return {'disk_capacity':round(disk.total/1073741824,2),'disk_used':round(disk.used/1073741824,2),'recording_used':round(recording.used/1073741824,2)}
+
+
+def collect(config,cameras):
+    return {'software_version':config.software_version,'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}

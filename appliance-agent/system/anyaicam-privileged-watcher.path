@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for AnyAiCam privileged action requests (reboot/VMS restart)
+
+[Path]
+# Fires whenever the agent-writable pending_actions directory goes from
+# empty to non-empty -- i.e. whenever commands.py's _queue_privileged_action()
+# writes a marker. The watched directory is created and owned by the
+# anyaicam-agent process (see AgentConfig.pending_actions_dir); this
+# unit only needs to see it, never write to it.
+DirectoryNotEmpty=/var/lib/anyaicam/pending_actions
+Unit=anyaicam-privileged-watcher.service
+
+[Install]
+WantedBy=multi-user.target

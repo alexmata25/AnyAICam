@@ -4,16 +4,91 @@ import json
 import os
 import platform
 import subprocess
-from datetime import datetime
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .camera_binding import atomic_write_json
 from .discovery import scan
+from .metrics import _cpu_percent, _memory_percent, disk_summary
 
-ALLOWED={'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay'}
+ALLOWED={'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay','reboot_appliance','restart_vms'}
+
+# RDM4 diagnostics: only these keys ever leave the appliance in the
+# per-camera summary -- an explicit allowlist, not a "strip the bad
+# keys" denylist, so a future field added to cameras.json (which
+# already went through camera_binding.py's own LOCAL_ONLY_KEYS
+# redaction once) can never leak here just by existing. No id/name/
+# mac/ip is included; camera_number is the local FFmpeg slot number,
+# not a physical identifier.
+_CAMERA_SUMMARY_KEYS={'camera_number','online','recording','analytics','last_error'}
+
+
+def _vms_health(config,timeout=3):
+    # RDM4: reads the VMS app's own /health signal directly over the
+    # loopback interface -- no Docker socket access, none needed, and
+    # none available to this sandboxed process (see pending_actions_dir's
+    # docstring in config.py). Verified reachable from the real agent
+    # systemd sandbox (NoNewPrivileges/ProtectSystem=strict/
+    # CapabilityBoundingSet=CAP_NET_RAW) before this was wired in.
+    try:
+        with urllib.request.urlopen(config.vms_local_health_url,timeout=timeout) as response:
+            return json.loads(response.read().decode() or '{}')
+    except (urllib.error.URLError,TimeoutError,OSError,json.JSONDecodeError,ValueError) as error:
+        return {'status':'unreachable','error':error.__class__.__name__}
+
+
+def _camera_summary(config):
+    try:
+        cameras=json.loads(config.cameras_file.read_text(encoding='utf-8'))
+    except (OSError,json.JSONDecodeError):
+        return []
+    if not isinstance(cameras,list): return []
+    return [{key:camera.get(key) for key in _CAMERA_SUMMARY_KEYS if key in camera} for camera in cameras if isinstance(camera,dict)]
 
 
 def diagnostics(config,queue_count=0):
-    return {'timestamp':datetime.now().isoformat(),'hostname':platform.node(),'platform':platform.platform(),'python':platform.python_version(),'portal_url':config.portal_url,'mode':config.mode,'queue_depth':queue_count,'config_file_exists':(Path(config.config_dir)/'agent.json').exists(),'credential_exists':config.credential_file.exists()}
+    return {'timestamp':datetime.now().isoformat(),'hostname':platform.node(),'platform':platform.platform(),'python':platform.python_version(),'portal_url':config.portal_url,'mode':config.mode,'queue_depth':queue_count,'config_file_exists':(Path(config.config_dir)/'agent.json').exists(),'credential_exists':config.credential_file.exists(),
+            # RDM4 additions below -- agent health is implicit (this code
+            # is running); everything else reuses existing, already-tested
+            # logic (metrics.py's CPU/memory/disk, camera_binding.py's
+            # already-redacted cameras.json) rather than a second copy of
+            # it. restart_count/upload_pending_count/upload_quarantined_count
+            # are intentionally NOT duplicated here -- they're already
+            # computed/reported through the separate, existing RDM3
+            # heartbeat/upload-worker pipeline (see app/appliance_cloud.py),
+            # and re-deriving a second, possibly-stale copy of the same
+            # facts on every on-demand diagnostics call would just be a
+            # second source of truth to keep in sync for no benefit.
+            'agent_service':'active','vms_health':_vms_health(config),'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),'cameras':_camera_summary(config)}
+
+
+def _queue_privileged_action(config,action_type,payload):
+    # RDM4 (reboot_appliance/restart_vms): the ONLY thing this process
+    # ever does for either command -- write a small atomic marker naming
+    # a known action TYPE plus a correlation id, nothing executable.
+    # This agent has no privilege to reboot the host or touch Docker and
+    # is not attempting to acquire any (NoNewPrivileges=true on its own
+    # systemd unit makes that structurally impossible regardless); a
+    # separate, root-owned watcher -- outside this process entirely --
+    # is what actually acts, via a fixed, hardcoded dispatch table that
+    # never reads a command, path, or container name out of this marker.
+    #
+    # confirmed=true is already enforced by the cloud's queue_command()
+    # before this command is ever queued for delivery -- this check is
+    # defense in depth, not the only gate, matching every other
+    # confirmation-required command's own local re-check pattern.
+    if not isinstance(payload,dict) or not payload.get('confirmed'):
+        return 'failed',{},'Confirmation is required for this action.'
+    marker_id=uuid.uuid4().hex
+    marker={'type':action_type,'command_id':marker_id,'requested_at':datetime.now(timezone.utc).isoformat()}
+    try:
+        atomic_write_json(config.pending_actions_dir/f'{action_type}.json',marker)
+    except OSError as error:
+        return 'failed',{},f'Could not record the {action_type} request due to a local storage error: {error}'
+    return 'completed',{'requested':True,'marker_id':marker_id},''
 
 
 def _validate_relay_camera_number(value):
@@ -153,6 +228,8 @@ def execute(command,payload,config,stop_event=None,*,state_machine=None,update_r
     if command=='restart_service':
         if stop_event: stop_event.set()
         return 'completed',{'restart_requested':True},''
+    if command=='reboot_appliance': return _queue_privileged_action(config,'reboot',payload)
+    if command=='restart_vms': return _queue_privileged_action(config,'restart_vms',payload)
     if command=='install_update':
         # RDM-2 Group 2C: the startup/update interlock is checked BEFORE
         # any payload parsing -- cheaper, and it means a malformed

@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay'}
+ALLOWED_COMMANDS = {'restart_service','refresh_cameras','run_diagnostics','install_update','start_live_relay','stop_live_relay','reboot_appliance','restart_vms'}
 FORBIDDEN_KEYS = {'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
 DISCOVERY_FORBIDDEN_KEYS = FORBIDDEN_KEYS | {'rtsp_urls','stream_url','stream_urls','ip','ip_address','host','mac','mac_address','onvif_xaddrs'}
 LIVE_RELAY_SESSION_DURATION_SECONDS = 900

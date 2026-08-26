@@ -44,6 +44,17 @@ class AgentConfig:
     # frequency as routine operational polling.
     update_check_interval_seconds: int=900
 
+    # RDM4 (remote device management -- diagnostics): the VMS app's own
+    # local health endpoint. Deliberately a plain loopback URL, not
+    # portal_url (that's the CLOUD-facing address) -- diagnostics reads
+    # the VMS's own signal directly, the same "trust the service's own
+    # output, not an external inference" philosophy camera_binding.py's
+    # LocalVmsStatusReader already uses for per-camera status. Verified
+    # reachable from this agent's actual systemd sandbox (NoNewPrivileges,
+    # ProtectSystem=strict, CapabilityBoundingSet=CAP_NET_RAW) before this
+    # was wired in -- see the diagnostics tests.
+    vms_local_health_url: str='http://127.0.0.1:8000/health'
+
     def __post_init__(self): self.discovery_networks=self.discovery_networks or []
 
     @property
@@ -58,6 +69,20 @@ class AgentConfig:
     def camera_bindings_file(self): return Path(self.state_dir)/'camera_bindings.json'
     @property
     def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
+
+    # RDM4 (remote device management -- privileged actions): the ONLY
+    # channel by which this unprivileged agent process can ever request
+    # a reboot or a VMS-container restart. It writes an atomic marker
+    # file here (a known type + a correlation id, never a command or
+    # path) and a separate, root-owned watcher -- outside this process,
+    # outside this Python package, not installed by this commit -- acts
+    # on it via a fixed, hardcoded dispatch table. This agent never
+    # gains, and never attempts to gain, the privilege to reboot or
+    # touch Docker itself; NoNewPrivileges=true on its own systemd unit
+    # makes that structurally impossible regardless of what this code
+    # does, by design.
+    @property
+    def pending_actions_dir(self): return Path(self.state_dir)/'pending_actions'
 
     # RDM-1 (Remote Device Management): additive-only properties, same style
     # as the ones above. Update state lives under state_dir (mutable
@@ -83,7 +108,7 @@ class AgentConfig:
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
         if path.exists(): data=json.loads(path.read_text(encoding='utf-8'))
-        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','vms_hls_path':'ANYAICAM_VMS_HLS_PATH','vms_recordings_path':'ANYAICAM_VMS_RECORDINGS_PATH','vms_status_freshness_seconds':'ANYAICAM_VMS_STATUS_FRESHNESS_SECONDS','vms_recording_freshness_seconds':'ANYAICAM_VMS_RECORDING_FRESHNESS_SECONDS','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS'}
+        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','vms_hls_path':'ANYAICAM_VMS_HLS_PATH','vms_recordings_path':'ANYAICAM_VMS_RECORDINGS_PATH','vms_status_freshness_seconds':'ANYAICAM_VMS_STATUS_FRESHNESS_SECONDS','vms_recording_freshness_seconds':'ANYAICAM_VMS_RECORDING_FRESHNESS_SECONDS','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS','vms_local_health_url':'ANYAICAM_VMS_LOCAL_HEALTH_URL'}
         for key,environment in aliases.items():
             if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','vms_status_freshness_seconds','vms_recording_freshness_seconds','update_check_interval_seconds'} else os.environ[environment]
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})

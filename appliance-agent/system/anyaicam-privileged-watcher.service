@@ -1,0 +1,13 @@
+[Unit]
+Description=AnyAiCam privileged action watcher (reboot/VMS restart)
+# Deliberately NOT started by multi-user.target directly -- only ever
+# triggered by anyaicam-privileged-watcher.path, and only does anything
+# when a marker file is actually present (privileged_watcher.py exits
+# immediately otherwise). Runs as root: this is the one piece of the
+# whole RDM4 remote-management design with real privilege, which is
+# exactly why its own input is reduced to "does a known marker type
+# exist" and nothing else -- see privileged_watcher.py's own docstring.
+
+[Service]
+Type=oneshot
+ExecStart=/opt/anyaicam-agent/privileged/watcher.py
