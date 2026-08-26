@@ -17769,15 +17769,6 @@ ONBOARDING_STEPS = [
 
 
 
-    "cameras",
-
-
-
-
-
-
-
-
     "cloud_recording",
 
 
@@ -45135,15 +45126,6 @@ NAV_ITEMS = [
 
 
     ("payment-setup", "/payment-setup", "¢", "Payments"),
-
-
-
-
-
-
-
-
-    ("customer-onboarding", "/customer-onboarding", "→", "Onboarding"),
 
 
 
@@ -105612,15 +105594,6 @@ def administrator_activation_operations_page(request: Request) -> str:
 
 
             ("Deployment", "deployment" in completed),
-
-
-
-
-
-
-
-
-            ("Cameras", "cameras" in completed),
 
 
 
