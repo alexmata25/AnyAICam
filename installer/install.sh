@@ -24,7 +24,16 @@ CONFIG_DIR=/etc/anyaicam
 VMS_SERVICE_FILE=/etc/systemd/system/anyaicam-vms.service
 VERSION_MARKER="$CONFIG_DIR/installed_version"
 IDENTITY_FILE="$CONFIG_DIR/appliance_identity.json"
-QUARANTINE_DIR=/var/lib/anyaicam/vms/recordings/quarantine
+# VMS persistent/runtime state tree (see 06-deploy-vms.sh and
+# docker-compose.yml): recordings and data-config hold protected
+# customer/config data that must survive a default uninstall; hls
+# holds regenerable streaming output that just needs to live outside
+# the replaceable $VMS_INSTALL_ROOT software directory.
+VMS_RECORDINGS_DIR=/var/lib/anyaicam/vms/recordings
+VMS_DATA_CONFIG_DIR=/var/lib/anyaicam/vms/data-config
+VMS_HLS_DIR=/var/lib/anyaicam/vms/hls
+VMS_ENV_FILE="$CONFIG_DIR/vms.env"
+QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 

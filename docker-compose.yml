@@ -5,11 +5,12 @@ services:
     ports:
     - 8000:8000
     env_file:
-    - .env
+    - /etc/anyaicam/vms.env
     volumes:
     - ./app:/app
-    - ./recordings:/app/recordings
-    - ./data/config:/opt/anyaicam/data/config
+    - /var/lib/anyaicam/vms/recordings:/app/recordings
+    - /var/lib/anyaicam/vms/hls:/app/static/hls
+    - /var/lib/anyaicam/vms/data-config:/opt/anyaicam/data/config
     restart: unless-stopped
     healthcheck:
       test:
