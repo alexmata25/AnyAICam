@@ -122,7 +122,7 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
             self.node(ast.FunctionDef, "analytics"),
             re=re,
             escape=escape,
-            CAMERA_COUNT=4,
+            get_camera_numbers=lambda: [1, 2, 3, 4],
             page_shell=lambda _title, _active, content, _scripts="": content,
         )
 
