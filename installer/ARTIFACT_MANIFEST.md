@@ -11,7 +11,7 @@ standing instruction).
 
 - Filename: `anyaicam-installer-reconstructed-1.0.0.tar.gz`
 - **Canonical SHA256 (deterministic build, see below):**
-  `301db2d353d161fb047afb86edf690c701be2e6b2e6ddfd82d1c2cb327e05522`
+  `8c0c50b48815f7b375e0cb686c905aa9c78c2b0345608a0ebd4b91a4eede94ec`
 - Not committed to git: this is a build output, not source. If a durable
   copy is wanted, attach it to a GitHub Release or S3 rather than
   committing the binary.
@@ -45,19 +45,19 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$MTIME_EPOCH" \
     uninstall.sh README.md tests/run_tests.sh
 ```
 
-**Verified reproducible:** for commit `7c203148ea54e114d2adea8e1782197df97643dd`
-(`MTIME_EPOCH=1787728672`), two independent runs of this command from two
+**Verified reproducible:** for commit `e9bc3633f11b3d1b3fa486ece5e0adb51e92ad88`
+(`MTIME_EPOCH=1787729345`), two independent runs of this command from two
 separate clean `git archive` extractions produced byte-identical
 archives (`cmp` reported no differences) and identical SHA256
-(`301db2d353d161fb047afb86edf690c701be2e6b2e6ddfd82d1c2cb327e05522`
+(`8c0c50b48815f7b375e0cb686c905aa9c78c2b0345608a0ebd4b91a4eede94ec`
 both times). Per-file SHA256 of the extracted source in both builds
 also matched the table below exactly.
 
-(The same reproducibility method was verified once already for the
-prior commit `077e7f5294a7318976aca9e84655db4922d4c369`, hash
-`cffa43406cd5aa51179b3eac6070eefea308c0491dcf36e84b5e05576a635e98` --
-superseded here only because the source itself changed, see the
-Dockerfile-copy fix below, not because the method stopped working.)
+(The same reproducibility method was verified twice already, for
+commits `077e7f5294a7318976aca9e84655db4922d4c369` and
+`7c203148ea54e114d2adea8e1782197df97643dd` -- superseded here only
+because the source itself changed again, see the requirements.txt fix
+below, not because the method stopped working.)
 
 **Authoritative integrity check:** the per-file SHA256 table below is
 the source-of-truth for verifying installer content; the tarball hash
@@ -74,14 +74,14 @@ only meaningful when built with the exact command above.
 | 03-detect-install.sh | `a309339fb758eaaadfc4c2a0339b65762fb05d126bc4d47413d1700ea5c57cf3` | bash -n pass, LF-only, mode 0755; clean/existing/partial branches covered by 5 mocked tests |
 | 04-docker-setup.sh | `401b14d772e021c4ed123144d921ff53ebe6fee6d0b3f9e0128671cbc6ba18bb` | bash -n pass, LF-only, mode 0755 |
 | 05-provision-users-dirs.sh | `658a3ed34732b68789d872468e28d6fcbd660dbd9924248d0aa5dbe9b578da62` | bash -n pass, LF-only, mode 0755 |
-| 06-deploy-vms.sh | `b14397eac2e5406674e35531cc3d82d04570ae8e6810296f77aef738b8390991` | bash -n pass, LF-only, mode 0755; now copies both Dockerfile and Dockerfile.production (Phase 4 clean-install blocker fix) |
+| 06-deploy-vms.sh | `11fcac9fd57cc60050098d2705be5023000f44091ba48e4862d4376bfe2d3496` | bash -n pass, LF-only, mode 0755; copies Dockerfile, Dockerfile.production, and requirements.txt (two Phase 4 clean-install blocker fixes) |
 | 07-install-agent.sh | `be0c52fceb4ce960c4172e0421489f98bc47d4169217ae2208d0e9906a3111cb` | bash -n pass, LF-only, mode 0755 |
 | 08-systemd-setup.sh | `c452fbcb150bd0881a388cf1ec53fb6f90f232d6011c41decb8e26137483ebb8` | bash -n pass, LF-only, mode 0755 |
 | 09-identity.sh | `723d6cb54c384f77f6fd74a8db8285674e0c261411471a6ba3e9f28607312d95` | bash -n pass, LF-only, mode 0755 |
 | validate.sh | `b2ff7d070e04cf14fd71b3082a258d304a520829106eb4e601f0e7507915904f` | bash -n pass, LF-only, mode 0755 |
 | uninstall.sh | `c3f8635b645803b8bd6dae066f4871587f95310ac586f294d652013a1a3c0631` | bash -n pass, LF-only, mode 0755 |
 | README.md | `e5148b0f5ed278bfc80796c2dafe88f3cf678b1294f414af7515ba62a125ea11` | reconstruction/spec documentation, not a script |
-| tests/run_tests.sh | `55b32e1d809fc51458823a6e976d413ee5fef04115f4f57a29e8172f1bafdde2` | bash -n pass, LF-only, mode 0755; 17/17 assertions pass |
+| tests/run_tests.sh | `f808453ad07f3daf424de7e6f274d19914b55898a02ee7b490bdcbe9fcf50389` | bash -n pass, LF-only, mode 0755; 18/18 assertions pass |
 
 All 14 checksums above were verified identical between the local
 reconstruction and the copies committed to this repo, and again
@@ -105,7 +105,7 @@ constant (`$CONFIG_DIR`, `$VMS_INSTALL_ROOT`, `$VERSION_MARKER`,
 `storage_preflight()`, and `deploy_vms()` from `03-detect-install.sh` /
 `02-storage-check.sh` / `06-deploy-vms.sh` -- no test-only
 reimplementation of the decision logic. Run on the real Ubuntu 24.04
-EC2 repo host: 17/17 assertions passed.
+EC2 repo host: 18/18 assertions passed.
 
 - `detect_install_state()`: 0/5, 5/5, 2/5, 1/5, and 4/5 marker-presence
   scenarios all resolve to the correct one of clean/existing/partial,
@@ -120,11 +120,11 @@ EC2 repo host: 17/17 assertions passed.
   and the no-recorded-baseline case skipping the capacity-floor check
   while still enforcing working space.
 - `deploy_vms()`: against a fake minimal `REPO_ROOT` fixture (Docker
-  mocked, no real image build), asserts both `Dockerfile` and
-  `Dockerfile.production` land in `VMS_INSTALL_ROOT` and that the
-  `docker compose build` step is invoked -- regression coverage for
-  the clean-install release blocker found and fixed in Phase 4
-  validation (see below).
+  mocked, no real image build), asserts `Dockerfile`,
+  `Dockerfile.production`, and `requirements.txt` all land in
+  `VMS_INSTALL_ROOT` and that the `docker compose build` step is
+  invoked -- regression coverage for the two clean-install release
+  blockers found and fixed in Phase 4 validation (see below).
 
 ## Preservation behavior (verified by code inspection, not yet by a live install/reinstall run)
 
@@ -146,9 +146,9 @@ EC2 repo host: 17/17 assertions passed.
 
 ## Known fixes found and applied during live disposable-host validation
 
-- **Clean-install blocker (found in Phase 4 clean-install validation on
-  a genuine, disposable Ubuntu 24.04 host):** `docker-compose.yml` uses
-  `build: .`, which Compose resolves to a file literally named
+- **Clean-install blocker #1 (found in Phase 4 clean-install validation
+  on a genuine, disposable Ubuntu 24.04 host):** `docker-compose.yml`
+  uses `build: .`, which Compose resolves to a file literally named
   `Dockerfile`, but `06-deploy-vms.sh` originally only copied
   `Dockerfile.production`. A from-fresh clean install had nothing for
   `docker compose build` to read and failed outright. Fixed by also
@@ -156,11 +156,20 @@ EC2 repo host: 17/17 assertions passed.
   production instance, where both files already exist side by side and
   the plain `Dockerfile` is the one actually built from. No change to
   `docker-compose.yml`.
+- **Clean-install blocker #2 (found on re-validation with fix #1
+  applied):** the plain `Dockerfile` does
+  `COPY requirements.txt /tmp/requirements.txt`, and that file is
+  tracked only at repo root, not under `app/`. `06-deploy-vms.sh` did
+  not copy it, so the build failed on that `COPY` step. Fixed by also
+  copying `requirements.txt` -- confirmed the plain Dockerfile
+  references no other repo-root files before making this change, and
+  confirmed `/opt/anyaicam/requirements.txt` exists in production too.
 
 ## Not yet done (requires the next approval)
 
 - Not yet installed/run end-to-end to a *successful* completion on a
-  disposable Ubuntu 24.04 host -- the first attempt hit the blocker
-  above; re-validation with the fix is the next step.
+  disposable Ubuntu 24.04 host -- the first two attempts hit the
+  blockers above in sequence; re-validation with both fixes applied is
+  the next step.
 - Live reinstall/repair/uninstall preservation behavior not yet
   exercised against a real filesystem (see above).
