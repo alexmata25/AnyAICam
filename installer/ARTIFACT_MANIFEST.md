@@ -11,7 +11,7 @@ standing instruction).
 
 - Filename: `anyaicam-installer-reconstructed-1.0.0.tar.gz`
 - **Canonical SHA256 (deterministic build, see below):**
-  `8c0c50b48815f7b375e0cb686c905aa9c78c2b0345608a0ebd4b91a4eede94ec`
+  `2b3df7d3a7883b09e80931ef6fbb7ca6b235e90e5b3bb65dd80d34521c809a0e`
 - Not committed to git: this is a build output, not source. If a durable
   copy is wanted, attach it to a GitHub Release or S3 rather than
   committing the binary.
@@ -45,18 +45,19 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$MTIME_EPOCH" \
     uninstall.sh README.md tests/run_tests.sh
 ```
 
-**Verified reproducible:** for commit `e9bc3633f11b3d1b3fa486ece5e0adb51e92ad88`
-(`MTIME_EPOCH=1787729345`), two independent runs of this command from two
+**Verified reproducible:** for commit `3d2864d25a9dc0e1c2da38add22516d18b0bc335`
+(`MTIME_EPOCH=1787731359`), two independent runs of this command from two
 separate clean `git archive` extractions produced byte-identical
 archives (`cmp` reported no differences) and identical SHA256
-(`8c0c50b48815f7b375e0cb686c905aa9c78c2b0345608a0ebd4b91a4eede94ec`
+(`2b3df7d3a7883b09e80931ef6fbb7ca6b235e90e5b3bb65dd80d34521c809a0e`
 both times). Per-file SHA256 of the extracted source in both builds
 also matched the table below exactly.
 
-(The same reproducibility method was verified twice already, for
-commits `077e7f5294a7318976aca9e84655db4922d4c369` and
-`7c203148ea54e114d2adea8e1782197df97643dd` -- superseded here only
-because the source itself changed again, see the requirements.txt fix
+(The same reproducibility method was verified three times already, for
+commits `077e7f5294a7318976aca9e84655db4922d4c369`,
+`7c203148ea54e114d2adea8e1782197df97643dd`, and
+`e9bc3633f11b3d1b3fa486ece5e0adb51e92ad88` -- superseded here only
+because the source itself changed again, see the python3.12-venv fix
 below, not because the method stopped working.)
 
 **Authoritative integrity check:** the per-file SHA256 table below is
@@ -75,13 +76,13 @@ only meaningful when built with the exact command above.
 | 04-docker-setup.sh | `401b14d772e021c4ed123144d921ff53ebe6fee6d0b3f9e0128671cbc6ba18bb` | bash -n pass, LF-only, mode 0755 |
 | 05-provision-users-dirs.sh | `658a3ed34732b68789d872468e28d6fcbd660dbd9924248d0aa5dbe9b578da62` | bash -n pass, LF-only, mode 0755 |
 | 06-deploy-vms.sh | `11fcac9fd57cc60050098d2705be5023000f44091ba48e4862d4376bfe2d3496` | bash -n pass, LF-only, mode 0755; copies Dockerfile, Dockerfile.production, and requirements.txt (two Phase 4 clean-install blocker fixes) |
-| 07-install-agent.sh | `be0c52fceb4ce960c4172e0421489f98bc47d4169217ae2208d0e9906a3111cb` | bash -n pass, LF-only, mode 0755 |
+| 07-install-agent.sh | `741cd11a5d0d6aabdf09006f8d65357023a0c047e8f43f9158fed6db9f2df619` | bash -n pass, LF-only, mode 0755; installs python3.12-venv prerequisite before the wrapped agent installer (Phase 4 clean-install blocker fix) |
 | 08-systemd-setup.sh | `c452fbcb150bd0881a388cf1ec53fb6f90f232d6011c41decb8e26137483ebb8` | bash -n pass, LF-only, mode 0755 |
 | 09-identity.sh | `723d6cb54c384f77f6fd74a8db8285674e0c261411471a6ba3e9f28607312d95` | bash -n pass, LF-only, mode 0755 |
 | validate.sh | `b2ff7d070e04cf14fd71b3082a258d304a520829106eb4e601f0e7507915904f` | bash -n pass, LF-only, mode 0755 |
 | uninstall.sh | `c3f8635b645803b8bd6dae066f4871587f95310ac586f294d652013a1a3c0631` | bash -n pass, LF-only, mode 0755 |
 | README.md | `e5148b0f5ed278bfc80796c2dafe88f3cf678b1294f414af7515ba62a125ea11` | reconstruction/spec documentation, not a script |
-| tests/run_tests.sh | `f808453ad07f3daf424de7e6f274d19914b55898a02ee7b490bdcbe9fcf50389` | bash -n pass, LF-only, mode 0755; 18/18 assertions pass |
+| tests/run_tests.sh | `f41775dc456e061983faa0e7a3802df63c374d86ac5d877a218e14c1fe2a1c87` | bash -n pass, LF-only, mode 0755; 21/21 assertions pass |
 
 All 14 checksums above were verified identical between the local
 reconstruction and the copies committed to this repo, and again
@@ -98,14 +99,15 @@ reproduced on the EC2 host directly.
 
 ## Local/mocked test results (installer/tests/run_tests.sh)
 
-Mocks `id`, `docker`, and `df` as shell functions; redirects every path
-constant (`$CONFIG_DIR`, `$VMS_INSTALL_ROOT`, `$VERSION_MARKER`,
-`$VMS_SERVICE_FILE`, `$IDENTITY_FILE`, `$REPO_ROOT`) into a disposable
-`mktemp -d` tree. Sources the real, unmodified `detect_install_state()`,
-`storage_preflight()`, and `deploy_vms()` from `03-detect-install.sh` /
-`02-storage-check.sh` / `06-deploy-vms.sh` -- no test-only
+Mocks `id`, `docker`, `df`, and `apt-get` as shell functions; redirects
+every path constant (`$CONFIG_DIR`, `$VMS_INSTALL_ROOT`,
+`$VERSION_MARKER`, `$VMS_SERVICE_FILE`, `$IDENTITY_FILE`, `$REPO_ROOT`)
+into a disposable `mktemp -d` tree. Sources the real, unmodified
+`detect_install_state()`, `storage_preflight()`, `deploy_vms()`, and
+`install_agent()` from `03-detect-install.sh` / `02-storage-check.sh` /
+`06-deploy-vms.sh` / `07-install-agent.sh` -- no test-only
 reimplementation of the decision logic. Run on the real Ubuntu 24.04
-EC2 repo host: 18/18 assertions passed.
+EC2 repo host: 21/21 assertions passed.
 
 - `detect_install_state()`: 0/5, 5/5, 2/5, 1/5, and 4/5 marker-presence
   scenarios all resolve to the correct one of clean/existing/partial,
@@ -123,8 +125,14 @@ EC2 repo host: 18/18 assertions passed.
   mocked, no real image build), asserts `Dockerfile`,
   `Dockerfile.production`, and `requirements.txt` all land in
   `VMS_INSTALL_ROOT` and that the `docker compose build` step is
-  invoked -- regression coverage for the two clean-install release
+  invoked -- regression coverage for two of the clean-install release
   blockers found and fixed in Phase 4 validation (see below).
+- `install_agent()`: against a fake stand-in for the reused
+  `appliance-agent/scripts/install.sh` that deliberately fails unless
+  a python3.12-venv marker was already written, asserts the
+  prerequisite is apt-get installed AND that it's installed *before*
+  the wrapped script runs -- regression coverage for the third
+  clean-install release blocker found and fixed in Phase 4 validation.
 
 ## Preservation behavior (verified by code inspection, not yet by a live install/reinstall run)
 
@@ -164,12 +172,45 @@ EC2 repo host: 18/18 assertions passed.
   copying `requirements.txt` -- confirmed the plain Dockerfile
   references no other repo-root files before making this change, and
   confirmed `/opt/anyaicam/requirements.txt` exists in production too.
+- **Clean-install blocker #3 (found on re-validation with fixes #1-#2
+  applied -- the VMS image build succeeded for the first time here):**
+  the reused `appliance-agent/scripts/install.sh` runs
+  `python3 -m venv`, which fails on a fresh Ubuntu 24.04 host with
+  "ensurepip is not available" because `python3.12-venv` is not
+  installed by default. Read that script end-to-end before fixing:
+  its only other OS-level touchpoints (`useradd`, `install`, `chmod`,
+  `chown`, pip, `systemctl`) are all present on any base Ubuntu
+  install. Fixed by installing `python3.12-venv` in the reconstructed
+  `07-install-agent.sh` wrapper, before it invokes the reused script
+  -- not by patching the reused script itself.
+
+## Known issue found and reported, not yet fixed (outside this branch's scope)
+
+- `appliance-agent/pyproject.toml` declares `dependencies = []`, but
+  `updater/verify.py` unconditionally imports `cryptography`
+  (`from cryptography.exceptions import ...`,
+  `from cryptography.hazmat.primitives import ...`). Traced the import
+  chain: the `anyaicam-agent` systemd service's actual entrypoint
+  (`anyaicam_agent.service:main`) unconditionally imports
+  `updater.factory`, which unconditionally imports `updater.verify` --
+  so this import is reached the moment the agent service process
+  starts, not just during an update. `pip install` (inside
+  `appliance-agent/scripts/install.sh`) will not install `cryptography`
+  since it isn't declared, and the venv has no
+  `--system-site-packages`. This will very likely surface as a
+  `ModuleNotFoundError` the first time the agent service is actually
+  started. This is a bug in a pre-existing repo file
+  (`appliance-agent/pyproject.toml`), not in any of the 12
+  reconstructed installer scripts, and reported to the user ahead of
+  time rather than discovered blind during a live validation run. Not
+  fixed here -- awaiting a decision on whether/how to address it.
 
 ## Not yet done (requires the next approval)
 
 - Not yet installed/run end-to-end to a *successful* completion on a
-  disposable Ubuntu 24.04 host -- the first two attempts hit the
-  blockers above in sequence; re-validation with both fixes applied is
-  the next step.
+  disposable Ubuntu 24.04 host -- the first three attempts hit the
+  blockers above in sequence; re-validation with all three fixes
+  applied is the next step. The `cryptography` issue above may surface
+  as a fourth blocker once the agent service is actually started.
 - Live reinstall/repair/uninstall preservation behavior not yet
   exercised against a real filesystem (see above).
