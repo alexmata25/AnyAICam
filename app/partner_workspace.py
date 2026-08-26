@@ -14,6 +14,7 @@ from pricing_config import calculate_partner_quote, calculate_quote, load_pricin
 from appliance_protocol import encrypt_camera_credentials
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
 from email_service import get_email_service
+from provisioning_service import get_provisioning_backend, ProvisioningBackendUnavailable
 
 CUSTOMERS_FILE = Path('/app/recordings/partner_customers.json')
 ACCOUNT_FILE = Path('/app/recordings/account_management.json')
@@ -85,8 +86,30 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             db.execute('INSERT INTO customers(id,partner_id,name,company,email,phone,status,trial_status,billing_status,source,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(customer_id,partner_id,payload.get('name',''),payload.get('company',''),email,payload.get('phone',''),status,'eligible','placeholder','real',now,identity['email']))
             for site_data in sites:
                 site_id=secrets.token_hex(5); db.execute('INSERT INTO sites(id,customer_id,name,address,site_type,created_at) VALUES(?,?,?,?,?,?)',(site_id,customer_id,site_data.get('name','Site'),site_data.get('address',''),site_data.get('site_type','Customer site'),now))
-                cloud_id='AIC-'+secrets.token_hex(4).upper(); activation=secrets.token_urlsafe(24); activation_tokens.append({'site':site_data.get('name','Site'),'cloud_id':cloud_id,'activation_token':activation})
-                appliance_id=secrets.token_hex(5); db.execute('INSERT INTO appliances(id,customer_id,site_id,cloud_id,appliance_type,serial_number,software_version,last_check_in,online_status,ip_address,cpu,memory,disk,camera_capacity,activation_token_hash,activation_token_created_at,shipping_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(appliance_id,customer_id,site_id,cloud_id,payload.get('appliance_type','AnyAiCam mini PC'),payload.get('serial_number','Pending'),'Not installed',None,'offline','Not connected',0,0,0,max(16,quote['quantity']),password_hash(activation),now,'not_ordered',now))
+                # AWS-authoritative onboarding rework, Phase 1: Cloud ID and
+                # activation token are no longer minted here with secrets.token_hex()/
+                # secrets.token_urlsafe() -- they come from the provisioning backend
+                # (AWS in production, MockProvisioningBackend for dev/test; see
+                # provisioning_service.py). idempotency_key is scoped to this
+                # customer+site pair so a retried provisioning call for the same
+                # pair returns the same Cloud ID instead of minting a second one.
+                order={
+                    'customer_id':customer_id,'site_id':site_id,
+                    'customer_name':payload.get('name',''),'company':payload.get('company',''),
+                    'email':email,'phone':payload.get('phone',''),'status':status,
+                    'site_name':site_data.get('name','Site'),
+                    'appliance_type':payload.get('appliance_type','AnyAiCam mini PC'),
+                    'camera_count':quote['quantity'],'resolution':quote['resolution'],
+                    'recording_mode':quote['recording'],'retention_days':quote['retention_days'],
+                    'analytics_addons':quote['addons'],
+                    'deployment_mode':payload.get('deployment_mode','local'),
+                    'order_reference':quote_id,
+                }
+                try: provisioning=get_provisioning_backend().provision(order,idempotency_key=f'onboarding:{customer_id}:{site_id}')
+                except ProvisioningBackendUnavailable as error: raise HTTPException(status_code=503,detail='Provisioning service is temporarily unavailable; the customer was not created. Try again shortly.') from error
+                cloud_id=provisioning['cloud_id']; activation=provisioning['activation_token']; appliance_id=provisioning['appliance_id']
+                activation_tokens.append({'site':site_data.get('name','Site'),'cloud_id':cloud_id,'activation_token':activation,'provisioning_qr_payload':provisioning['provisioning_qr_payload']})
+                db.execute('INSERT INTO appliances(id,customer_id,site_id,cloud_id,appliance_type,serial_number,software_version,last_check_in,online_status,ip_address,cpu,memory,disk,camera_capacity,activation_token_hash,activation_token_created_at,shipping_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(appliance_id,customer_id,site_id,cloud_id,payload.get('appliance_type','AnyAiCam mini PC'),payload.get('serial_number','Pending'),'Not installed',None,'offline','Not connected',0,0,0,max(16,quote['quantity']),password_hash(activation),now,'not_ordered',now))
                 db.execute('INSERT INTO appliance_activation_tokens(id,appliance_id,token_hash,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?)',(secrets.token_hex(6),appliance_id,password_hash(activation),(datetime.now()+timedelta(hours=24)).isoformat(),now,identity['email']))
                 created_sites.append({'id':site_id,'name':site_data.get('name','Site'),'appliance_id':appliance_id})
             primary_site=created_sites[0]
@@ -278,7 +301,21 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get('/api/customer/setup/status')
     def customer_setup_status(request: Request) -> dict:
-        identity=customer_owner(request); customer_id=identity['customer_id']; appliances=rows('SELECT id,cloud_id,serial_number,software_version,last_check_in,online_status,ip_address,site_id,activation_status FROM appliances WHERE customer_id=?',(customer_id,)); draft=row('SELECT * FROM customer_setup_drafts WHERE customer_id=?',(customer_id,)); return {'customer_id':customer_id,'appliances':appliances,'draft':draft}
+        identity=customer_owner(request); customer_id=identity['customer_id']; appliances=rows('SELECT id,cloud_id,serial_number,software_version,last_check_in,online_status,ip_address,site_id,activation_status FROM appliances WHERE customer_id=?',(customer_id,))
+        # AWS-authoritative onboarding rework, Phase 1: refresh each
+        # appliance's cloud-reported fields from the provisioning backend --
+        # the local `appliances` row is a cache the app can still read from
+        # (and falls back to) if the backend is temporarily unreachable, not
+        # the source of truth for online/offline, software version, or
+        # check-in time.
+        backend=get_provisioning_backend()
+        for appliance in appliances:
+            try: status=backend.get_status(appliance['cloud_id'])
+            except ProvisioningBackendUnavailable: continue
+            if not status: continue
+            appliance['online_status']=status['online_status']; appliance['software_version']=status['software_version']; appliance['last_check_in']=status['last_check_in']; appliance['entitlement']=status['entitlement']
+            with connection() as db: db.execute('UPDATE appliances SET online_status=?,software_version=?,last_check_in=? WHERE id=?',(status['online_status'],status['software_version'],status['last_check_in'],appliance['id']))
+        draft=row('SELECT * FROM customer_setup_drafts WHERE customer_id=?',(customer_id,)); return {'customer_id':customer_id,'appliances':appliances,'draft':draft}
 
     @app.post('/api/customer/setup/progress')
     def save_customer_setup(request: Request,payload: dict) -> dict:
@@ -291,10 +328,18 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         identity=customer_owner(request)
         try: require_permission(identity,'appliance.self.link')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        cloud_id=str(payload.get('cloud_id','')).strip().upper(); token=str(payload.get('activation_token','')).strip(); appliance=row('SELECT * FROM appliances WHERE cloud_id=? AND customer_id=?',(cloud_id,identity['customer_id']))
+        cloud_id=str(payload.get('cloud_id','')).strip().upper(); token=str(payload.get('activation_token','')).strip()
+        # AWS-authoritative onboarding rework, Phase 1: the provisioning
+        # backend (AWS in production, MockProvisioningBackend for dev/test) is
+        # the source of truth for whether this cloud_id/token pair is valid --
+        # not the local activation_token_hash column, which is now only a
+        # local cache of what the backend already confirmed at provision time.
+        try: verification=get_provisioning_backend().verify_link(cloud_id,token)
+        except ProvisioningBackendUnavailable as error: raise HTTPException(status_code=503,detail='Provisioning service is temporarily unavailable; try again shortly.') from error
+        if not verification: raise HTTPException(status_code=403,detail='Activation token is invalid.')
+        appliance=row('SELECT * FROM appliances WHERE cloud_id=? AND customer_id=?',(cloud_id,identity['customer_id']))
         if not appliance: raise HTTPException(status_code=404,detail='Cloud ID was not found on this customer account.')
-        if not token or not verify_password(token,appliance.get('activation_token_hash') or ''): raise HTTPException(status_code=403,detail='Activation token is invalid.')
-        with connection() as db: db.execute("UPDATE appliances SET activation_status='linked' WHERE id=?",(appliance['id'],))
+        with connection() as db: db.execute("UPDATE appliances SET activation_status='linked',online_status=?,software_version=?,last_check_in=? WHERE id=?",(verification.get('online_status','offline'),verification.get('software_version',appliance.get('software_version')),verification.get('last_check_in'),appliance['id']))
         audit(identity,'appliance.linked','appliance',appliance['id']); return {'message':'Appliance linked to customer account.','appliance_id':appliance['id']}
 
     # Real state lifecycle for a scan job -- a customer must always get
