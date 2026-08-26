@@ -86,6 +86,33 @@ def initialize_database() -> None:
         # fail-closed check applied on top of this table at resolution
         # time.
         '''CREATE TABLE IF NOT EXISTS admin_partner_links(admin_user_id TEXT PRIMARY KEY,admin_email TEXT NOT NULL,partner_user_id TEXT NOT NULL,partner_email TEXT NOT NULL,linked_at TEXT NOT NULL,linked_by TEXT NOT NULL,revoked_at TEXT,FOREIGN KEY(partner_user_id) REFERENCES partner_users(id))''',
+        # notification_preferences.py: one row per portal user -- Email/
+        # SMS contact info + channel toggles + verification timestamps +
+        # quiet hours + delivery mode. event_types_json/camera_scope
+        # decide WHAT and WHERE; the actual authorized-cameras check
+        # happens at save time (see save_preferences()'s own docstring),
+        # never trusted from this table alone at read time either.
+        #
+        # Named customer_notification_channels, NOT notification_
+        # preferences: db_migrations.py already defines a *different*
+        # table under that exact name (one row per user/customer/site/
+        # camera/event_type, with in_app/email/web_push/sms channel
+        # booleans -- the admin-managed per-event-type rule set
+        # notification_engine.fanout_appliance_event() actually reads
+        # for real delivery decisions, surfaced via /api/notification-
+        # rules). This table is deliberately a separate, additive
+        # concept -- WHERE to send (an actual email address/phone
+        # number, plus verification state) -- neither of which that
+        # existing rule table stores anywhere. It is not yet wired into
+        # that live fanout path; see notification_settings_page.py's
+        # own module docstring and this session's Notifications
+        # milestone report for that follow-up.
+        '''CREATE TABLE IF NOT EXISTS customer_notification_channels(user_id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,email_address TEXT,email_enabled INTEGER NOT NULL DEFAULT 0,email_verified_at TEXT,phone_number TEXT,sms_enabled INTEGER NOT NULL DEFAULT 0,phone_verified_at TEXT,event_types_json TEXT NOT NULL DEFAULT '[]',camera_scope TEXT NOT NULL DEFAULT 'all',quiet_hours_enabled INTEGER NOT NULL DEFAULT 0,quiet_start TEXT NOT NULL DEFAULT '22:00',quiet_end TEXT NOT NULL DEFAULT '07:00',delivery_mode TEXT NOT NULL DEFAULT 'immediate',updated_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES partner_users(id))''',
+        # Only populated when camera_scope='selected' -- deliberately
+        # empty (not a frozen snapshot) when camera_scope='all', so a
+        # camera added to the account later is automatically included
+        # without the customer having to re-save anything.
+        '''CREATE TABLE IF NOT EXISTS customer_notification_channel_cameras(user_id TEXT NOT NULL,camera_id TEXT NOT NULL,PRIMARY KEY(user_id,camera_id),FOREIGN KEY(user_id) REFERENCES partner_users(id),FOREIGN KEY(camera_id) REFERENCES cameras(id))''',
     ]
     with database_connect() as db:
         for statement in statements: db.execute(statement)

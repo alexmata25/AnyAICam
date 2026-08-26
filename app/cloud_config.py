@@ -129,6 +129,20 @@ class Settings:
     smtp_username: str = os.getenv("ANYAICAM_SMTP_USERNAME", "")
     smtp_password: str = os.getenv("ANYAICAM_SMTP_PASSWORD", "")
     email_from: str = os.getenv("ANYAICAM_EMAIL_FROM", "no-reply@localhost")
+    # Notifications settings page (Email + SMS channels) -- sms_backend
+    # mirrors email_backend's own "preview" default exactly (never a
+    # live send until explicitly configured). Every credential here is
+    # read from the environment at call time by sms_service.py, never a
+    # literal in source; twilio_auth_token is intentionally not logged
+    # or echoed anywhere this dataclass's other fields might be.
+    sms_backend: str = os.getenv("ANYAICAM_SMS_BACKEND", "preview").lower()
+    sms_preview_dir: str = os.getenv(
+        "ANYAICAM_SMS_PREVIEW_DIR",
+        "/app/recordings/sms-preview",
+    )
+    twilio_account_sid: str = os.getenv("ANYAICAM_TWILIO_ACCOUNT_SID", "")
+    twilio_auth_token: str = os.getenv("ANYAICAM_TWILIO_AUTH_TOKEN", "")
+    twilio_from_number: str = os.getenv("ANYAICAM_TWILIO_FROM_NUMBER", "")
     log_level: str = os.getenv("ANYAICAM_LOG_LEVEL", "INFO").upper()
     log_format: str = os.getenv("ANYAICAM_LOG_FORMAT", "text").lower()
     https_only: bool = _bool("ANYAICAM_HTTPS_ONLY", False)

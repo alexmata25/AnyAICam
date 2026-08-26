@@ -39978,6 +39978,8 @@ PUBLIC_PATH_PREFIXES = (
 
     "/reset-password",
 
+    "/settings/notifications",
+
     "/api/partner-login",
 
     "/api/password-reset/",
@@ -46531,6 +46533,7 @@ from partner_workspace import register_partner_workspace_routes, render_partner_
 
 
 from appliance_cloud import register_appliance_cloud_routes
+from notification_settings_page import register_notification_settings_routes
 from live_playlist import register_live_playlist_routes
 from live_view_sessions import register_live_view_session_routes
 from live_view_page import register_live_view_page_routes
@@ -46642,6 +46645,14 @@ register_partner_routes(app, page_shell)
 # route first fixes that; nothing about either route's own behavior
 # changed.
 register_appliance_cloud_routes(app, page_shell, current_user)
+# Registered before register_partner_workspace_routes() runs the
+# generic @app.get("/settings/{settings_slug}") catch-all it (or later
+# code in this file) may match against -- see that route's own handling
+# of unknown/not-yet-implemented slugs. /settings/notifications is a
+# specific path; registering it first means it is never shadowed,
+# following the exact route-ordering lesson this session's earlier
+# appliance-commands fix already established for this codebase.
+register_notification_settings_routes(app, page_shell)
 register_partner_workspace_routes(app, page_shell)
 register_live_playlist_routes(app)
 register_live_view_session_routes(app)

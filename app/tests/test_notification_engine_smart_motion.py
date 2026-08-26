@@ -12,11 +12,32 @@ override_target() before that import, matching
 test_appliance_cloud_analytics_events.py's own documented pattern.
 """
 
-from database_backend import override_target
+import pytest
 
-with override_target(sqlite_path="/tmp/test_notification_engine_smart_motion.db"):
+from database_backend import override_target
+from partner_db import initialize_database
+
+with override_target(sqlite_path="/tmp/test_notification_engine_smart_motion_import.db"):
     import notification_engine
     from partner_db import connection
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path):
+    # The import-time override above (matching this file's own
+    # documented pattern) only ever scoped module import, not actual
+    # test execution -- every test function's own connection() call ran
+    # against whatever ANYAICAM_PARTNER_DB/the process-default target
+    # actually was, a real, persistent file that accumulates rows
+    # across every pytest invocation rather than a fresh one per run.
+    # Each test below uses a fixed, unique-looking customer_id (e.g.
+    # 'cust-default'), so a second run against that same accumulated
+    # file eventually collides on a UNIQUE constraint -- not a bug in
+    # notification_engine.py itself, purely this test file's own
+    # isolation gap. A fresh tmp_path-backed db per test closes it.
+    with override_target(sqlite_path=tmp_path / "test_notification_engine_smart_motion.db"):
+        initialize_database()
+        yield
 
 
 def _seed_customer_owner(db, *, customer_id="cust-1", camera_id="cam-1"):

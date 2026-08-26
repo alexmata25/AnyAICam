@@ -8,7 +8,7 @@ from pathlib import Path
 
 from cloud_config import settings
 
-EMAIL_TYPES={'invitation','password_reset','onboarding','appliance_alert','quote_delivery'}
+EMAIL_TYPES={'invitation','password_reset','onboarding','appliance_alert','quote_delivery','notification_test'}
 
 
 class EmailBackend(ABC):
