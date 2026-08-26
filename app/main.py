@@ -45688,7 +45688,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "dashboard",
+            "live", "events", "alerts", "playback", "investigate", "dashboard",
 
 
 
@@ -55934,6 +55934,49 @@ def natural_analytics_search(request: NaturalSearchModel) -> dict:
 
 
 
+def _customer_authorized_event_id(request: Request, event_id: str) -> bool:
+    """True only when the caller isn't a portal customer_owner/
+    customer_viewer identity at all (the legacy/admin path below keeps
+    its own separate check), OR when it is one and event_id names a
+    detection_events row this identity is actually authorized to see --
+    same customer_id scoping as _customer_detection_events(), and the
+    same can_playback-gated camera restriction for customer_viewer, so
+    a viewer can never bookmark an event on a camera they were never
+    granted. Prevents a customer-portal caller from writing a review
+    for an event_id belonging to another customer (or, for a viewer,
+    to a camera on their own account they don't have access to) just
+    by guessing/enumerating ids -- this PUT route has no other camera
+    scoping of its own."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return True
+    from partner_db import connection
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            row = db.execute(
+                "SELECT 1 FROM detection_events WHERE id=? AND customer_id=?",
+                (event_id, identity["customer_id"]),
+            ).fetchone()
+        else:
+            user = db.execute(
+                "SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return False
+            row = db.execute(
+                "SELECT 1 FROM detection_events de "
+                "JOIN customer_camera_permissions p ON p.camera_id=de.camera_id AND p.user_id=? "
+                "WHERE de.id=? AND de.customer_id=? AND p.can_playback=1",
+                (user["id"], event_id, identity["customer_id"]),
+            ).fetchone()
+    return row is not None
+
+
 @app.put("/api/analytics/events/{event_id}/review")
 
 
@@ -55943,9 +55986,9 @@ def natural_analytics_search(request: NaturalSearchModel) -> dict:
 
 
 
-def review_analytics_event(event_id: str, review: EventReviewModel) -> dict:
-
-
+def review_analytics_event(event_id: str, review: EventReviewModel, request: Request) -> dict:
+    if not _customer_authorized_event_id(request, event_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this event.")
 
 
 
@@ -56654,10 +56697,21 @@ async def build_manual_clip(
 
 
 
-async def create_clip(request: ClipRequest) -> dict:
-
-
-
+async def create_clip(request: ClipRequest, http_request: Request) -> dict:
+    # This job-based manual-clip tool predates the multi-tenant cloud
+    # customer/camera.id split (its camera field is still the legacy,
+    # single-appliance camera_number -- see ClipRequest) and has no
+    # customer-portal caller today; it had no authorization check of
+    # any kind, so any direct POST -- authenticated or not -- could
+    # queue a clip job for any camera_number on this appliance. Gated
+    # the same way the rest of the legacy VMS pages are: an
+    # authenticated identity with view_analytics, restricted to the
+    # cameras that identity is actually allowed to see.
+    caller = current_user(http_request)
+    if not has_permission(caller, "view_analytics"):
+        raise HTTPException(status_code=403, detail="Analytics permission is required.")
+    if request.camera not in set(user_camera_ids(caller)):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
 
 
@@ -78166,6 +78220,186 @@ def smart_search_page() -> str:
 
 
 
+def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
+    """Customer-portal Investigate: same page shape as the legacy/admin
+    Investigate below, but every input is re-derived from the
+    already-authorized customer identity instead of the legacy
+    current_user()/user_camera_ids()/load_motion_events()+
+    analytics_events() path.
+
+    cameras is the caller's own already-scoped list from
+    _customer_playback_cameras() (full fleet for customer_owner, only
+    can_playback-granted cameras for customer_viewer -- the exact same
+    authorization Playback and Live already trust). Events come from
+    _customer_detection_events(), the exact same tenant-scoped,
+    per-camera-permissioned detection_events rows the Events page and
+    /api/analytics/events already serve -- Investigate is deliberately
+    NOT given its own separate query here, so there is only ever one
+    place that decides which of a customer's events exist to see.
+
+    No admin/partner data ever reaches this function: cameras and
+    events are both pre-filtered to this one identity's own customer_id
+    (and, for customer_viewer, further to their own granted cameras)
+    before this function is ever called.
+
+    "Create case" is intentionally omitted here -- case management
+    (/api/investigation-cases and friends) remains an
+    administrator/installer-only workflow with no per-tenant scoping
+    yet; see that route's own docstring. Bookmarking a single event via
+    PUT /api/analytics/events/{id}/review is kept (it stays scoped to
+    events this identity was already shown), and evidence export stays
+    a pure client-side JSON download of the same already-authorized
+    events -- neither call touches another customer's data."""
+    events = _customer_detection_events(request) or []
+
+    camera_options = "".join(
+        f'<option value="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</option>'
+        for camera in cameras
+    )
+
+    normalized = []
+    for event in events:
+        camera_id = event.get("camera_id")
+        timestamp = str(event.get("timestamp") or "")
+        normalized.append({
+            "id": event["id"],
+            "camera_id": camera_id,
+            "camera": event.get("camera_name") or f'Camera {event.get("camera")}',
+            "site": event.get("site") or "",
+            "timestamp": timestamp,
+            "end_time": timestamp,
+            "event_type": str(event.get("event_type") or "motion").lower(),
+            "thumbnail": event.get("thumbnail") or "",
+            "recording": f"/playback?camera={quote(str(camera_id))}&t={quote(timestamp)}" if camera_id else "",
+            "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
+            "confidence": event.get("confidence"),
+            "plate": event.get("plate_number") or "",
+            "color": event.get("vehicle_color") or "",
+            "rule": event.get("rule_name") or "",
+            "review": load_json_file(EVENT_REVIEWS_FILE, {}).get(event["id"], {}),
+        })
+    normalized.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+    investigation_data = json.dumps(normalized[:500], default=str)
+
+    if not cameras:
+        content = (
+            '<header class="topbar"><div><p class="eyebrow">AI event investigation</p><h1>Investigate</h1></div>'
+            '<a class="ghost-button" href="/customer-account">Account</a></header>'
+            '<section class="panel"><div class="empty">No cameras are available for investigation on this account.</div></section>'
+        )
+        return page_shell("Investigate", "investigate", content)
+
+    content = f"""<header class="topbar"><div><p class="eyebrow">AI event investigation</p><h1>Investigate</h1></div><a class="ghost-button" href="/customer-account">Account</a></header>
+    <section class="investigation-shell">
+      <aside class="investigation-filters">
+        <h2>Search evidence</h2>
+        <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
+        <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select></label>
+        <label>Camera<select id="investigation-camera"><option value="">All cameras</option>{camera_options}</select></label>
+        <label>Vehicle or clothing color<input id="investigation-color" placeholder="red, blue, silver"></label>
+        <label>License plate<input id="investigation-plate" placeholder="Plate text"></label>
+        <label>From<input id="investigation-from" type="datetime-local"></label>
+        <label>To<input id="investigation-to" type="datetime-local"></label>
+        <div class="investigation-actions"><button class="action-button" id="run-investigation" type="button">Search</button><button class="ghost-button" id="clear-investigation" type="button">Clear</button></div>
+      </aside>
+      <div>
+        <section class="investigation-summary">
+          <div class="stat"><span class="stat-label">Results</span><span class="stat-value" id="investigation-result-count">0</span></div>
+          <div class="stat"><span class="stat-label">People</span><span class="stat-value" id="investigation-people-count">0</span></div>
+          <div class="stat"><span class="stat-label">Vehicles</span><span class="stat-value" id="investigation-vehicle-count">0</span></div>
+          <div class="stat"><span class="stat-label">Bookmarked</span><span class="stat-value" id="investigation-bookmark-count">0</span></div>
+        </section>
+        <div class="investigation-grid" id="investigation-grid"></div>
+        <section class="evidence-panel">
+          <div class="panel-head"><div><h2>Evidence export</h2><div class="health-detail">Select results and export a JSON evidence manifest. Video export continues to use existing playback tools.</div></div></div>
+          <div class="investigation-actions"><button id="select-visible-evidence" type="button">Select visible results</button><button id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Export manifest</button></div>
+        </section>
+      </div>
+    </section>"""
+
+    scripts = f"""<script>
+    const investigationEvents={investigation_data};
+    const selectedEvidence=new Set();
+    const queryInput=document.getElementById('investigation-query');
+    const typeInput=document.getElementById('investigation-type');
+    const cameraInput=document.getElementById('investigation-camera');
+    const colorInput=document.getElementById('investigation-color');
+    const plateInput=document.getElementById('investigation-plate');
+    const fromInput=document.getElementById('investigation-from');
+    const toInput=document.getElementById('investigation-to');
+    const grid=document.getElementById('investigation-grid');
+    function isVehicle(type){{return ['car','truck','bus','motorcycle','bicycle','vehicle'].includes(type)}}
+    function naturalMatches(event,query){{
+      if(!query)return true;
+      const combined=[event.event_type,event.camera,event.site,event.color,event.plate,event.rule,event.timestamp,event.review?.notes,(event.review?.tags||[]).join(' ')].join(' ').toLowerCase();
+      return query.toLowerCase().split(/\\s+/).filter(Boolean).every(token=>combined.includes(token));
+    }}
+    function visibleEvents(){{
+      const from=fromInput.value?new Date(fromInput.value):null;
+      const to=toInput.value?new Date(toInput.value):null;
+      return investigationEvents.filter(event=>{{
+        const stamp=event.timestamp?new Date(event.timestamp):null;
+        const requested=typeInput.value;
+        return (!requested||event.event_type===requested||(requested==='vehicle'&&isVehicle(event.event_type)))
+          &&(!cameraInput.value||String(event.camera_id)===cameraInput.value)
+          &&(!colorInput.value||String(event.color||'').toLowerCase().includes(colorInput.value.toLowerCase()))
+          &&(!plateInput.value||String(event.plate||'').toLowerCase().includes(plateInput.value.toLowerCase()))
+          &&(!from||!stamp||stamp>=from)
+          &&(!to||!stamp||stamp<=to)
+          &&naturalMatches(event,queryInput.value.trim());
+      }});
+    }}
+    function card(event){{
+      const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
+      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      return `<article class="investigation-card" data-event-id="${{event.id}}">
+        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{event.event_type.replaceAll('_',' ')}}</span></div>
+        <div class="investigation-body">
+          <div class="investigation-title"><h3>${{event.event_type.replaceAll('_',' ')}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
+          <div class="investigation-meta">${{event.camera}} · ${{String(event.timestamp||'').replace('T',' ').slice(0,19)}}<br>Confidence ${{confidence}}${{event.color?` · ${{event.color}}`:''}}${{event.plate?` · ${{event.plate}}`:''}}</div>
+          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.live?`<a href="${{event.live}}">Live camera</a>`:''}}</div>
+        </div>
+      </article>`;
+    }}
+    function render(){{
+      const results=visibleEvents();
+      grid.innerHTML=results.map(card).join('')||'<div class="investigation-empty">No events matched this investigation.</div>';
+      document.getElementById('investigation-result-count').textContent=results.length;
+      document.getElementById('investigation-people-count').textContent=results.filter(event=>event.event_type==='person').length;
+      document.getElementById('investigation-vehicle-count').textContent=results.filter(event=>isVehicle(event.event_type)).length;
+      document.getElementById('investigation-bookmark-count').textContent=results.filter(event=>event.review?.bookmarked).length;
+      grid.querySelectorAll('.investigation-card').forEach(cardElement=>{{
+        const event=investigationEvents.find(item=>item.id===cardElement.dataset.eventId);
+        cardElement.querySelector('.evidence-checkbox').addEventListener('change',change=>{{
+          if(change.target.checked)selectedEvidence.add(event.id);else selectedEvidence.delete(event.id);
+        }});
+        cardElement.querySelector('.bookmark-investigation').addEventListener('click',async click=>{{
+          const payload={{event_id:event.id,acknowledged:Boolean(event.review?.acknowledged),bookmarked:true,false_positive:Boolean(event.review?.false_positive),tags:event.review?.tags||[],notes:event.review?.notes||''}};
+          const response=await fetch(`/api/analytics/events/${{event.id}}/review`,{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
+          const result=await response.json();
+          if(!response.ok||result.status!=='complete')return showToast(result.message||'Bookmark failed.');
+          event.review=result.review;click.currentTarget.textContent='Bookmarked';render();showToast('Event bookmarked.');
+        }});
+      }});
+    }}
+    function clearFilters(){{[queryInput,typeInput,cameraInput,colorInput,plateInput,fromInput,toInput].forEach(input=>input.value='');render()}}
+    document.getElementById('run-investigation').addEventListener('click',render);
+    document.getElementById('clear-investigation').addEventListener('click',clearFilters);
+    queryInput.addEventListener('keydown',event=>{{if(event.key==='Enter')render()}});
+    document.getElementById('select-visible-evidence').addEventListener('click',()=>{{visibleEvents().forEach(event=>selectedEvidence.add(event.id));render()}});
+    document.getElementById('clear-evidence-selection').addEventListener('click',()=>{{selectedEvidence.clear();render()}});
+    document.getElementById('export-evidence').addEventListener('click',()=>{{
+      const selected=investigationEvents.filter(event=>selectedEvidence.has(event.id));
+      if(!selected.length)return showToast('Select at least one event first.');
+      const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,color:colorInput.value,plate:plateInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
+      const blob=new Blob([JSON.stringify(manifest,null,2)],{{type:'application/json'}});
+      const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='anyaicam_evidence_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(link.href);
+    }});
+    render();
+    </script>"""
+    return page_shell("Investigate", "investigate", content, scripts)
+
+
 @app.get("/investigate", response_class=HTMLResponse)
 
 
@@ -78176,6 +78410,18 @@ def smart_search_page() -> str:
 
 
 def investigation_page(request: Request) -> str:
+
+    # Customer-portal identity, if any, gets its own tenant-scoped,
+    # per-camera-permissioned Investigate experience -- the same
+    # partner_identity()/customer_camera_permissions boundary Live,
+    # Playback, Events and Smart Alerts already enforce (see
+    # _customer_playback_cameras()/_customer_detection_events()).
+    # Mirrors playback()'s own dual-mode dispatch below: everyone else
+    # (administrator/support_admin/installer -- the legacy VMS identity)
+    # falls through to the existing behavior, completely unchanged.
+    _customer_cameras = _customer_playback_cameras(request)
+    if _customer_cameras is not None:
+        return _render_customer_investigate(_customer_cameras, request)
 
 
 
