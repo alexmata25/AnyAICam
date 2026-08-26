@@ -10,17 +10,53 @@ standing instruction).
 ## Tarball
 
 - Filename: `anyaicam-installer-reconstructed-1.0.0.tar.gz`
-- SHA256 (built from this exact repo working tree on the EC2 host):
-  `3bd42682126e9ebe6f59c3ab61af6b52a35e977589be23b1759538cade58e028`
-- Not committed to git: this is a build output, not source. Rebuild it
-  at any time with `tar --sort=name --owner=0 --group=0 --numeric-owner
-  -czf anyaicam-installer-reconstructed-1.0.0.tar.gz install.sh
-  01-preflight.sh 02-storage-check.sh 03-detect-install.sh
-  04-docker-setup.sh 05-provision-users-dirs.sh 06-deploy-vms.sh
-  07-install-agent.sh 08-systemd-setup.sh 09-identity.sh validate.sh
-  uninstall.sh README.md tests/run_tests.sh` from `installer/`. If a
-  durable copy is wanted, attach it to a GitHub Release or S3 rather
-  than committing the binary.
+- **Canonical SHA256 (deterministic build, see below):**
+  `cffa43406cd5aa51179b3eac6070eefea308c0491dcf36e84b5e05576a635e98`
+- Not committed to git: this is a build output, not source. If a durable
+  copy is wanted, attach it to a GitHub Release or S3 rather than
+  committing the binary.
+
+### Deterministic rebuild command
+
+`tar` embeds each packaged file's mtime, and a plain `git checkout`/
+working-tree copy does not reproduce a fixed mtime across runs -- two
+honest rebuilds of byte-identical source could previously produce
+byte-different tarballs (and therefore different SHA256s), even though
+nothing in the source had changed. Fixed by building only from a clean
+`git archive` extraction (never the working tree) and pinning `tar`'s
+mtime to the source commit's own timestamp, so the archive depends only
+on the commit being built, not on when or how many times it's rebuilt:
+
+```
+COMMIT=<commit to build>
+MTIME_EPOCH="$(git show -s --format=%ct "$COMMIT")"
+rm -rf /tmp/installer-build && mkdir -p /tmp/installer-build
+git archive "$COMMIT" -- installer | tar -x -C /tmp/installer-build
+cd /tmp/installer-build/installer
+chmod 755 install.sh 01-preflight.sh 02-storage-check.sh 03-detect-install.sh \
+    04-docker-setup.sh 05-provision-users-dirs.sh 06-deploy-vms.sh \
+    07-install-agent.sh 08-systemd-setup.sh 09-identity.sh validate.sh \
+    uninstall.sh tests/run_tests.sh
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$MTIME_EPOCH" \
+    -czf anyaicam-installer-reconstructed-1.0.0.tar.gz \
+    install.sh 01-preflight.sh 02-storage-check.sh 03-detect-install.sh \
+    04-docker-setup.sh 05-provision-users-dirs.sh 06-deploy-vms.sh \
+    07-install-agent.sh 08-systemd-setup.sh 09-identity.sh validate.sh \
+    uninstall.sh README.md tests/run_tests.sh
+```
+
+**Verified reproducible:** for commit `077e7f5294a7318976aca9e84655db4922d4c369`
+(`MTIME_EPOCH=1787723950`), two independent runs of this command from two
+separate clean `git archive` extractions produced byte-identical
+archives (`cmp` reported no differences) and identical SHA256
+(`cffa43406cd5aa51179b3eac6070eefea308c0491dcf36e84b5e05576a635e98`
+both times). Per-file SHA256 of the extracted source in both builds
+also matched the table below exactly.
+
+**Authoritative integrity check:** the per-file SHA256 table below is
+the source-of-truth for verifying installer content; the tarball hash
+above is a convenience for verifying a specific packaged build and is
+only meaningful when built with the exact command above.
 
 ## Per-file SHA256 (of the 14 files packaged into the tarball)
 
