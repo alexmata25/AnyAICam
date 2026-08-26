@@ -679,6 +679,30 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             ).fetchall()
         return summarize(analytic_key, [dict(row) for row in rows])
 
+    @app.get('/api/customer/cameras/{camera_id}/status')
+    def customer_camera_status(request: Request, camera_id: str) -> dict:
+        """Honest state for the Live placeholder, checked BEFORE starting
+        a session -- never lets the UI sit on a generic 'Connecting...'
+        for a camera that was never provisioned or whose appliance is
+        known offline. 'unknown' means the camera and appliance both look
+        fine at the DB level; the client's own HLS/manifest polling
+        (already real, not a cached/stale frame -- see
+        camera_status()/get_camera_numbers() in main.py) is what actually
+        confirms a live stream is flowing."""
+        identity = partner_identity(request)
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+            return RedirectResponse('/partner-login', status_code=303)
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+            if camera.get('camera_number') is None:
+                return {'state': 'not_configured', 'message': 'This camera has not been provisioned yet.'}
+            appliance = db.execute(
+                'SELECT online_status FROM appliances WHERE id=?', (camera.get('appliance_id'),)
+            ).fetchone()
+            if appliance and appliance['online_status'] != 'online':
+                return {'state': 'appliance_offline', 'message': 'The appliance for this camera is offline.'}
+        return {'state': 'unknown'}
+
     @app.get('/customer/cameras/{camera_id}/live', response_class=HTMLResponse)
     def live_view_page(request: Request, camera_id: str):
         identity = partner_identity(request)
@@ -919,7 +943,19 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }}catch(e){{}}
   }}
 
-  startSession();
+  async function checkCameraStatusThenStart(){{
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/status`);
+      if(response.ok){{
+        const {{state,message}}=await response.json();
+        if(state==='not_configured'){{setStatus(message||'Not configured');placeholder.hidden=false;return}}
+        if(state==='appliance_offline'){{setStatus(message||'Appliance offline');placeholder.hidden=false;return}}
+      }}
+    }}catch(e){{}}
+    startSession();
+  }}
+
+  checkCameraStatusThenStart();
   loadEnabledAnalytics();
 }})();
 </script>'''

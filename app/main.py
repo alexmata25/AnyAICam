@@ -2558,6 +2558,20 @@ MOTION_THRESHOLD = float(os.environ.get("MOTION_THRESHOLD", "12"))
 
 
 
+# Punch-list item 5 (false motion filtering), safe default: a real
+# person/vehicle essentially never covers this much of a wide-angle
+# camera's frame at once. A changed_ratio this high is almost always
+# a global lighting/exposure shift, not an object -- rejecting it does
+# not weaken real person/vehicle detection (see the punch-list report
+# for why finer tree/shadow-specific tuning still needs real footage).
+MOTION_MAX_CHANGED_RATIO = float(os.environ.get("MOTION_MAX_CHANGED_RATIO", "0.85"))
+
+
+
+
+
+
+
 
 MOTION_COOLDOWN_SECONDS = int(os.environ.get("MOTION_COOLDOWN_SECONDS", "15"))
 
@@ -35064,7 +35078,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        motion_score >= effective_threshold and changed_ratio >= 0.08
+                        motion_score >= effective_threshold and 0.08 <= changed_ratio <= MOTION_MAX_CHANGED_RATIO
 
 
 
@@ -41117,7 +41131,7 @@ def login_page_html(error: str = "", next_url: str = "/", message: str = "") -> 
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Sign in</h1><p class="auth-subtitle">Secure customer, salesperson, installer, and administrator portal access</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/login" id="login-form"><input type="hidden" name="next_url" value="{escape(next_url)}"><input type="hidden" name="csrf_token" value=""><label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><label class="auth-remember"><input name="remember_me" type="checkbox" value="true"><span>Keep me signed in for 30 days</span></label><button class="action-button" type="submit">Sign in</button></form><script>document.getElementById('login-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-register">Create customer account</a></div><div class="auth-footer">New accounts remain pending until the master administrator approves them.</div></section></main></body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Sign in</h1><p class="auth-subtitle">Secure customer, salesperson, installer, and administrator portal access</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/login" id="login-form"><input type="hidden" name="next_url" value="{escape(next_url)}"><input type="hidden" name="csrf_token" value=""><label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><label>Password<span style="position:relative;display:block"><input name="password" type="password" autocomplete="current-password" required id="login-password" style="padding-right:52px;box-sizing:border-box;width:100%"><button type="button" id="login-password-toggle" aria-label="Show password" aria-pressed="false" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);border:none;background:none;cursor:pointer;font-size:13px;color:inherit;padding:4px">Show</button></span></label><label class="auth-remember"><input name="remember_me" type="checkbox" value="true"><span>Keep me signed in for 30 days</span></label><button class="action-button" type="submit">Sign in</button></form><script>document.getElementById('login-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});document.getElementById('login-password-toggle').addEventListener('click',function(){{var f=document.getElementById('login-password');var hidden=f.type==='password';f.type=hidden?'text':'password';this.setAttribute('aria-pressed',hidden?'true':'false');this.setAttribute('aria-label',hidden?'Hide password':'Show password');this.textContent=hidden?'Hide':'Show';}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-register">Create customer account</a></div><div class="auth-footer">New accounts remain pending until the master administrator approves them.</div></section></main></body></html>"""
 
 
 
@@ -137586,6 +137600,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<div id="playback-debug" style="font:11px/1.5 monospace;color:#8a93a3;padding:6px 2px;word-break:break-all"></div>'
         '</div></div>'
         '</section>'
+        '<style>@media (max-width:640px){.monitor-timeline{display:none}.mobile-recent-events{display:block}}@media (min-width:641px){.mobile-recent-events{display:none}}</style>'
+        '<section class="panel mobile-recent-events" style="margin-top:14px">'
+        '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
+        '<div id="mobile-recent-events-list" class="health-list"></div>'
+        '</section>'
         '<section class="monitor-timeline" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Timeline</h2></div></div>'
         '<div class="monitor-toolbar">'
@@ -137794,7 +137813,39 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
   const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
+  function renderMobileRecentEvents(cameraId,clips,events){{
+    const mobileList=document.getElementById('mobile-recent-events-list');
+    if(!mobileList)return;
+    // Mobile playback (punch-list item: no desktop scrub/timeline on
+    // phones): the same clips/events data, as a plain tappable list --
+    // most recent first -- instead of a ruler-based scrubber. Tapping a
+    // row plays that clip; the existing play/download/share/create-clip
+    // toolbar above already acts on whichever clip is selected.
+    const rows=[...clips].reverse().slice(0,15).map(clip=>
+      `<div class="health-row" data-mobile-clip role="button" tabindex="0"><span class="health-name">${{new Date(clip.start).toLocaleString()}}</span><span class="health-detail">Clip</span></div>`
+    ).join('');
+    const eventRows=[...events].reverse().slice(0,15).map(event=>{{
+      const category=filterCategory(event.event_type);
+      const label=(event.event_type||'event').replaceAll('_',' ');
+      return `<div class="health-row" data-mobile-event="${{event.timestamp}}" role="button" tabindex="0"><span class="health-name">${{label}}</span><span class="health-detail">${{new Date(event.timestamp).toLocaleString()}}</span></div>`;
+    }}).join('');
+    mobileList.innerHTML=(rows+eventRows)||'<div class="empty">No recent activity for this camera.</div>';
+    [...clips].reverse().slice(0,15).forEach((clip,index)=>{{
+      const row=mobileList.querySelectorAll('[data-mobile-clip]')[index];
+      if(row)row.addEventListener('click',()=>playClip(cameraId,clip));
+    }});
+    mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
+      row.addEventListener('click',async()=>{{
+        const timestamp=row.dataset.mobileEvent;
+        const nearby=findClipNear(clips,timestamp)||(await fetchClipsMetadata(cameraId,{{near:timestamp}}))[0];
+        if(nearby){{playClip(cameraId,nearby)}}
+        else if(typeof showToast==='function'){{showToast('No recording available for this time yet.')}}
+      }});
+    }});
+  }}
+
   function renderTimeline(cameraId,clips,events){{
+    renderMobileRecentEvents(cameraId,clips,events);
     timelineLane.innerHTML='';
     if(!clips.length&&!events.length){{timelineEmpty.hidden=false;return}}
     timelineEmpty.hidden=true;
