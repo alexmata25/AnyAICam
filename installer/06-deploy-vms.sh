@@ -16,6 +16,13 @@
 # Dockerfile.production (the original reconstruction's mistake) left
 # `docker compose build` with nothing to read and failed a from-fresh
 # clean install outright.
+#
+# requirements.txt must also be copied: the plain Dockerfile does
+# `COPY requirements.txt /tmp/requirements.txt`, and that file is
+# tracked only at repo root (not under app/). Inspecting the Dockerfile
+# confirms it references exactly two build-context paths beyond itself
+# -- requirements.txt and ./app -- nothing else, so this is the last
+# file this deploy step was missing.
 
 deploy_vms() {
     local state="$1"
@@ -29,7 +36,8 @@ deploy_vms() {
     rsync -a --update \
         --exclude '.git' --exclude '__pycache__' --exclude '*.pyc' \
         --exclude 'recordings' --exclude '*.pre-*' --exclude '*.db' \
-        "$REPO_ROOT/app" "$REPO_ROOT/Dockerfile" "$REPO_ROOT/Dockerfile.production" "$REPO_ROOT/docker-compose.yml" \
+        "$REPO_ROOT/app" "$REPO_ROOT/Dockerfile" "$REPO_ROOT/Dockerfile.production" \
+        "$REPO_ROOT/docker-compose.yml" "$REPO_ROOT/requirements.txt" \
         "$VMS_INSTALL_ROOT/"
 
     if [[ ! -f "$VMS_INSTALL_ROOT/.env" ]]; then

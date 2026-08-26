@@ -56,6 +56,7 @@ make_fake_repo_root() {
     echo 'FROM python:3.12-slim' > "$REPO_ROOT/Dockerfile"
     echo 'FROM python:3.12-slim AS production' > "$REPO_ROOT/Dockerfile.production"
     echo 'services: {}' > "$REPO_ROOT/docker-compose.yml"
+    echo 'fastapi' > "$REPO_ROOT/requirements.txt"
 }
 
 # Shadow the three external commands the functions under test call.
@@ -236,17 +237,24 @@ assert_exit "existing install, no recorded baseline -> capacity-floor check skip
 echo
 echo "== deploy_vms() =="
 
-# 14. Regression test for the clean-install release blocker found in
-#     Phase 4 validation: docker-compose.yml's `build: .` resolves to a
-#     file literally named Dockerfile, but the original deploy_vms()
-#     only copied Dockerfile.production, leaving nothing for
-#     `docker compose build` to read on a genuinely fresh install.
-#     Both files must land in VMS_INSTALL_ROOT.
+# 14-16. Regression tests for the two clean-install release blockers
+#     found in live Phase 4 validation: (1) docker-compose.yml's
+#     `build: .` resolves to a file literally named Dockerfile, but the
+#     original deploy_vms() only copied Dockerfile.production, leaving
+#     nothing for `docker compose build` to read on a genuinely fresh
+#     install; (2) the plain Dockerfile does
+#     `COPY requirements.txt /tmp/requirements.txt`, and that file is
+#     tracked only at repo root, not under app/. All of Dockerfile,
+#     Dockerfile.production, and requirements.txt must land in
+#     VMS_INSTALL_ROOT -- every build-context path the plain Dockerfile
+#     actually references (confirmed by inspecting its content: exactly
+#     requirements.txt and ./app beyond itself).
 reset_fixture
 make_fake_repo_root
 deploy_vms clean >/dev/null 2>&1
 assert_exit "plain Dockerfile is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile"
 assert_exit "Dockerfile.production is also copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile.production"
+assert_exit "requirements.txt is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/requirements.txt"
 assert_exit "docker compose build was invoked" 0 test -f "$DOCKER_COMPOSE_BUILD_MARKER"
 
 echo
