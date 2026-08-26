@@ -48220,6 +48220,7 @@ def operations_page(request: Request) -> str:
             <a class="ghost-button" href="/ready" target="_blank">Readiness JSON</a>
 
 
+            <a class="ghost-button" href="/operations/rdm">Remote device management</a>
 
 
 
@@ -49388,6 +49389,139 @@ def operations_page(request: Request) -> str:
 
 
     return page_shell("Operations", "operations", content, scripts)
+
+
+@app.get("/operations/rdm", response_class=HTMLResponse)
+def operations_rdm_page(request: Request) -> str:
+    """Admin Portal view onto the existing RDM4 appliance-command backend
+    (appliance_protocol.ALLOWED_COMMANDS / appliance_cloud.py's
+    POST /api/partner/appliances/{id}/commands, already shipped and used
+    today by /partner/appliance-dashboard) -- this page invents no new
+    backend behavior of its own: it reads the same appliances/
+    appliance_health_history/appliance_camera_status tables and, for the
+    two destructive actions, submits to the exact same command-queue
+    endpoint with the exact same confirmation-dialog contract that page
+    already uses, so a click here goes through the identical de-dup,
+    validation (ALLOWED_COMMANDS), and require_permission(identity,
+    'appliance.action') enforcement that endpoint already had.
+
+    Gated by two identities, both required, neither weakened:
+    - Admin Portal access (manage_settings, the legacy current_user()
+      identity every /operations page already requires) controls
+      whether this page renders at all.
+    - The actual appliance data and the two action buttons additionally
+      require a real partner_identity() session with appliance.action
+      permission -- the same authorization the existing command endpoint
+      already independently re-checks server-side on every submit. An
+      admin-portal identity with no partner-portal session sees an
+      honest explanation and a link to sign in, never a silent failure,
+      invented data, or an automatic redirect."""
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page("Remote device management", "operations", "manage_settings")
+    record_audit(request, "view", "operations:rdm", "Opened remote device management.")
+
+    from partner_portal import partner_identity
+    from partner_db import allowed as partner_allowed, rows as partner_rows
+
+    identity = partner_identity(request)
+    if not identity or identity.get("role") not in {"administrator", "partner_owner", "salesperson", "technician"}:
+        content = (
+            '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Remote device management</h1></div>'
+            '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+            '<section class="panel"><div class="panel-head"><h2>Partner Portal sign-in required</h2></div>'
+            '<div class="empty">This appliance data and its restart/reboot actions are served by the Partner '
+            'Portal\'s already-existing appliance backend. Sign in there to view or manage appliances from '
+            'this page.</div><a class="action-button" href="/partner-login" style="margin-top:12px;display:inline-block">'
+            'Sign in to Partner Portal</a></section>'
+        )
+        return page_shell("Remote device management", "operations", content)
+
+    can_act = partner_allowed(identity, "appliance.action")
+
+    clauses = ["1=1"]
+    params: list = []
+    if identity["role"] != "administrator":
+        clauses.append("a.partner_id=?")
+        params.append(identity.get("partner_id") or "anyaicam-primary")
+    appliances = partner_rows(
+        "SELECT a.*, c.name customer_name, s.name site_name FROM appliances a "
+        "LEFT JOIN customers c ON c.id=a.customer_id LEFT JOIN sites s ON s.id=a.site_id "
+        "WHERE " + " AND ".join(clauses) + " ORDER BY a.last_check_in DESC",
+        params,
+    )
+
+    cards = []
+    for item in appliances:
+        history = partner_rows(
+            "SELECT * FROM appliance_health_history WHERE appliance_id=? ORDER BY created_at DESC LIMIT 5",
+            (item["id"],),
+        )
+        camera_status = partner_rows(
+            "SELECT * FROM appliance_camera_status WHERE appliance_id=?", (item["id"],)
+        )
+        online_cameras = sum(1 for c in camera_status if c.get("online"))
+        recording_cameras = sum(1 for c in camera_status if c.get("online") and c.get("recording"))
+        actions = ""
+        if can_act:
+            actions = (
+                '<div class="library-toolbar">'
+                f'<button class="filter queue-command" data-appliance="{escape(item["id"], quote=True)}" data-command="restart_vms">Restart VMS</button>'
+                f'<button class="filter queue-command danger" data-appliance="{escape(item["id"], quote=True)}" data-command="reboot_appliance">Reboot appliance</button>'
+                '</div>'
+            )
+        else:
+            actions = '<div class="health-detail">Your Partner Portal role can view this appliance but not act on it (appliance.action permission required).</div>'
+        cards.append(
+            '<article class="panel">'
+            f'<div class="panel-head"><div><h2>{escape(item.get("cloud_id") or item["id"])}</h2>'
+            f'<div class="health-detail">{escape(item.get("customer_name") or "Unassigned")} · {escape(item.get("site_name") or "No site")} · {escape(item.get("software_version") or "Unknown version")}</div></div>'
+            f'<span class="pill">{escape(item.get("state") or item.get("online_status") or "offline")}</span></div>'
+            f'<div class="health-row"><span>Last check-in</span><strong>{escape(item.get("last_check_in") or "Never")}</strong></div>'
+            f'<div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get("cpu") or 0}% / {item.get("memory") or 0}% / {item.get("disk") or 0} GB</strong></div>'
+            f'<div class="health-row"><span>Cameras online / recording</span><strong>{online_cameras}/{len(camera_status)} · {recording_cameras} recording</strong></div>'
+            f'<div class="health-row"><span>IP address</span><strong>{escape(item.get("ip_address") or "Unknown")}</strong></div>'
+            f'{actions}'
+            f'<details style="margin-top:10px"><summary>Recent diagnostics ({len(history)})</summary>'
+            + "".join(
+                f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h.get("cpu") or 0}% · '
+                f'Mem {h.get("memory") or 0}% · Disk {h.get("disk_used") or 0}/{h.get("disk_capacity") or 0} GB'
+                + (f' · {escape(h["last_error"])}' if h.get("last_error") else '') + '</p>'
+                for h in history
+            ) + '</details></article>'
+        )
+
+    command_rows = partner_rows(
+        "SELECT c.*, a.cloud_id FROM appliance_commands c JOIN appliances a ON a.id=c.appliance_id "
+        "WHERE c.command IN ('restart_vms','reboot_appliance') ORDER BY c.created_at DESC LIMIT 20"
+    )
+    command_table = "".join(
+        f'<tr><td>{escape(item["cloud_id"])}</td><td>{escape(item["command"].replace("_", " "))}</td>'
+        f'<td><span class="pill">{escape(item["status"])}</span></td><td>{escape(item["created_at"])}</td>'
+        f'<td>{escape(item.get("error") or "")}</td></tr>'
+        for item in command_rows
+    ) or '<tr><td colspan="5">No restart/reboot actions have been queued.</td></tr>'
+
+    content = (
+        '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Remote device management</h1></div>'
+        '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+        f'<div class="account-grid" style="margin-top:18px">{"".join(cards) or "<div class=\'empty\'>No appliances found for this account.</div>"}</div>'
+        '<section class="panel" style="margin-top:18px;overflow:auto"><h2>Restart / reboot history</h2>'
+        f'<table class="data-table"><thead><tr><th>Appliance</th><th>Command</th><th>Status</th><th>Created</th><th>Error</th></tr></thead>'
+        f'<tbody>{command_table}</tbody></table></section>'
+    )
+    scripts = (
+        "<script>"
+        "const DISRUPTIVE_COMMAND_WARNINGS={reboot_appliance:'This reboots the physical appliance. All cameras and recording will be briefly interrupted.',"
+        "restart_vms:'This restarts the AnyAiCam VMS service on this appliance. Live view and recording will be briefly interrupted.'};"
+        "document.querySelectorAll('.queue-command').forEach(button=>button.onclick=async()=>{"
+        "const warning=DISRUPTIVE_COMMAND_WARNINGS[button.dataset.command];"
+        "if(!confirm(warning?`${warning} Continue?`:`Queue ${button.textContent} for this appliance?`))return;"
+        "const response=await fetch(`/api/partner/appliances/${button.dataset.appliance}/commands`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:button.dataset.command,confirmed:true})}),"
+        "r=await response.json();showToast(r.message||r.detail)"
+        "})</script>"
+    )
+    return page_shell("Remote device management", "operations", content, scripts)
 
 
 
