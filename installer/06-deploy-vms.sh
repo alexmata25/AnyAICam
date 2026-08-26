@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # VMS app source placement, Docker image build, compose config. Reuses
-# Dockerfile.production / docker-compose.yml from this repo rather
-# than reinventing the build. Deploys to a canonical customer install
-# path ($VMS_INSTALL_ROOT, /opt/anyaicam) instead of assuming a
-# developer's home directory -- unlike the current Ryzen's ad hoc
-# git-checkout-in-home-dir layout, which this installer intentionally
-# does not replicate.
+# Dockerfile / Dockerfile.production / docker-compose.yml from this
+# repo rather than reinventing the build. Deploys to a canonical
+# customer install path ($VMS_INSTALL_ROOT, /opt/anyaicam) instead of
+# assuming a developer's home directory -- unlike the current Ryzen's
+# ad hoc git-checkout-in-home-dir layout, which this installer
+# intentionally does not replicate.
+#
+# Both Dockerfile and Dockerfile.production must be copied: the
+# committed docker-compose.yml uses `build: .`, which Compose resolves
+# to a file literally named Dockerfile regardless of any other
+# .production-suffixed file present -- confirmed against the real
+# production layout, where both files exist side by side and the
+# plain Dockerfile is the one actually built from. Deploying only
+# Dockerfile.production (the original reconstruction's mistake) left
+# `docker compose build` with nothing to read and failed a from-fresh
+# clean install outright.
 
 deploy_vms() {
     local state="$1"
@@ -19,7 +29,7 @@ deploy_vms() {
     rsync -a --update \
         --exclude '.git' --exclude '__pycache__' --exclude '*.pyc' \
         --exclude 'recordings' --exclude '*.pre-*' --exclude '*.db' \
-        "$REPO_ROOT/app" "$REPO_ROOT/Dockerfile.production" "$REPO_ROOT/docker-compose.yml" \
+        "$REPO_ROOT/app" "$REPO_ROOT/Dockerfile" "$REPO_ROOT/Dockerfile.production" "$REPO_ROOT/docker-compose.yml" \
         "$VMS_INSTALL_ROOT/"
 
     if [[ ! -f "$VMS_INSTALL_ROOT/.env" ]]; then

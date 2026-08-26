@@ -2,16 +2,17 @@
 # Local, non-destructive, non-root test harness for the installer's
 # decision logic: detect_install_state() and storage_preflight().
 #
-# This sources the REAL production functions from ../03-detect-install.sh
-# and ../02-storage-check.sh unmodified -- no duplicated/rewritten logic
-# that could drift from what actually ships. Everything these functions
-# touch is redirected into a disposable tmpdir via the same path
-# constants install.sh already defines ($CONFIG_DIR, $VMS_INSTALL_ROOT,
-# $VERSION_MARKER, $VMS_SERVICE_FILE) -- nothing under the real /etc,
-# /opt, or /var is read or written. `id`, `docker`, and `df` (the three
-# external commands these two functions call) are shadowed with shell
-# functions of the same name so each scenario can fake their output
-# without root and without a real Docker/systemd present.
+# This sources the REAL production functions from ../03-detect-install.sh,
+# ../02-storage-check.sh, and ../06-deploy-vms.sh unmodified -- no
+# duplicated/rewritten logic that could drift from what actually ships.
+# Everything these functions touch is redirected into a disposable
+# tmpdir via the same path constants install.sh already defines
+# ($CONFIG_DIR, $VMS_INSTALL_ROOT, $VERSION_MARKER, $VMS_SERVICE_FILE)
+# -- nothing under the real /etc, /opt, or /var is read or written.
+# `id`, `docker`, and `df` (the external commands these functions call)
+# are shadowed with shell functions of the same name so each scenario
+# can fake their output without root and without a real Docker/systemd
+# present.
 #
 # Usage: bash installer/tests/run_tests.sh
 set -uo pipefail
@@ -40,8 +41,21 @@ reset_fixture() {
     # id/docker mocks default to "absent" until a test overrides them.
     ID_MOCK_EXIT=1
     DOCKER_IMAGE_MOCK_EXIT=1
+    DOCKER_COMPOSE_BUILD_MARKER="$FIXTURE_ROOT/.docker-compose-build-called"
+    rm -f "$DOCKER_COMPOSE_BUILD_MARKER"
     DF_AVAIL_GB=999999
     DF_TOTAL_GB=999999
+}
+
+# A minimal fake source tree for deploy_vms() to sync from -- just
+# enough for the regression test below, not a real app checkout.
+make_fake_repo_root() {
+    REPO_ROOT="$FIXTURE_ROOT/fake-repo"
+    mkdir -p "$REPO_ROOT/app"
+    echo 'print("fake app")' > "$REPO_ROOT/app/main.py"
+    echo 'FROM python:3.12-slim' > "$REPO_ROOT/Dockerfile"
+    echo 'FROM python:3.12-slim AS production' > "$REPO_ROOT/Dockerfile.production"
+    echo 'services: {}' > "$REPO_ROOT/docker-compose.yml"
 }
 
 # Shadow the three external commands the functions under test call.
@@ -55,6 +69,16 @@ id() {
 docker() {
     if [[ "$1" == "image" && "$2" == "inspect" ]]; then
         return "$DOCKER_IMAGE_MOCK_EXIT"
+    fi
+    if [[ "$1" == "compose" && "$2" == "build" ]]; then
+        # deploy_vms() only needs to know the build step ran; the
+        # actual image build is exercised for real in Phase 4 on a
+        # genuine Ubuntu host, not here. deploy_vms() invokes this
+        # inside a `( cd ... && docker compose build )` subshell, so a
+        # plain variable assignment here would not survive back to the
+        # caller -- a marker file is used instead.
+        touch "$DOCKER_COMPOSE_BUILD_MARKER"
+        return 0
     fi
     command docker "$@"
 }
@@ -78,6 +102,8 @@ log() { :; } # silence log() output during tests; assertions do the talking
 source "$INSTALLER_DIR/03-detect-install.sh"
 # shellcheck source=../02-storage-check.sh
 source "$INSTALLER_DIR/02-storage-check.sh"
+# shellcheck source=../06-deploy-vms.sh
+source "$INSTALLER_DIR/06-deploy-vms.sh"
 
 assert_eq() {
     local description="$1" expected="$2" actual="$3"
@@ -206,6 +232,22 @@ reset_fixture
 DF_AVAIL_GB=50
 DF_TOTAL_GB=200
 assert_exit "existing install, no recorded baseline -> capacity-floor check skipped, passes on working space alone" 0 storage_preflight existing
+
+echo
+echo "== deploy_vms() =="
+
+# 14. Regression test for the clean-install release blocker found in
+#     Phase 4 validation: docker-compose.yml's `build: .` resolves to a
+#     file literally named Dockerfile, but the original deploy_vms()
+#     only copied Dockerfile.production, leaving nothing for
+#     `docker compose build` to read on a genuinely fresh install.
+#     Both files must land in VMS_INSTALL_ROOT.
+reset_fixture
+make_fake_repo_root
+deploy_vms clean >/dev/null 2>&1
+assert_exit "plain Dockerfile is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile"
+assert_exit "Dockerfile.production is also copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile.production"
+assert_exit "docker compose build was invoked" 0 test -f "$DOCKER_COMPOSE_BUILD_MARKER"
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="
