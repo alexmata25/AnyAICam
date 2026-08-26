@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from partner_portal import partner_identity, require_partner_access
+from camera_install_state import camera_is_installed, camera_status_label
 from pricing_config import calculate_partner_quote, calculate_quote, load_pricing
 from appliance_protocol import encrypt_camera_credentials
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
@@ -228,29 +229,54 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             "SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated'",
             (customer['id'],)
         )
+        # "Installed/configured" reflects real appliance-reported state
+        # (appliance_camera_status, written by the appliance's own live
+        # heartbeat -- POST /api/appliance/cameras), not only whether the
+        # customer manually completed /customer/setup's "Save camera
+        # setup" step (the only thing that ever sets cameras.status to
+        # 'configured'). See camera_install_state.py's own module
+        # docstring for the full trace: an installer-provisioned
+        # customer, whose appliance and cameras were set up by a
+        # partner/technician rather than the customer's own self-service
+        # wizard, has real, online, recording cameras that must show as
+        # installed without ever touching that wizard.
+        all_customer_cameras=rows(
+            'SELECT c.id,c.name,c.camera_number,c.status,'
+            'MAX(COALESCE(acs.online,0)) AS appliance_online,'
+            'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
+            'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
+            'WHERE c.customer_id=? GROUP BY c.id,c.name,c.camera_number,c.status ORDER BY c.camera_number',
+            (customer['id'],)
+        )
+        for camera in all_customer_cameras:
+            camera['has_recording']=bool(row('SELECT 1 FROM recordings WHERE camera_id=?',(camera['id'],)))
+            camera['installed']=camera_is_installed(
+                camera_status=camera['status'],
+                appliance_reported_online=bool(camera['appliance_online']),
+                appliance_reported_recording=bool(camera['appliance_recording']),
+                has_cloud_recording=camera['has_recording'],
+            )
+        cameras=[camera for camera in all_customer_cameras if camera['installed']]
+
         # An activated appliance is necessary but not sufficient: a
         # customer can have a linked, activated appliance and still
-        # have zero real cameras (nothing discovered/confirmed yet) --
-        # that customer belongs in Setup too, not looking at an empty
-        # or placeholder-only camera list on their own account page.
-        commissioned_camera=row(
-            'SELECT id FROM cameras WHERE customer_id=? AND (cameras.status=? OR EXISTS(SELECT 1 FROM recordings r WHERE r.camera_id=cameras.id)) LIMIT 1',
-            (customer['id'],'configured')
-        )
-        if identity['role']=='customer_owner' and not (activated and commissioned_camera):
+        # have zero real cameras (nothing discovered/confirmed, and
+        # never reported in by the appliance either) -- that customer
+        # belongs in Setup too, not looking at an empty or
+        # placeholder-only camera list on their own account page.
+        if identity['role']=='customer_owner' and not (activated and cameras):
             return RedirectResponse('/customer/setup',status_code=303)
-
-        cameras=rows(
-            'SELECT id,name,camera_number,status FROM cameras '
-            'WHERE customer_id=? AND (cameras.status=? OR EXISTS(SELECT 1 FROM recordings r WHERE r.camera_id=cameras.id)) ORDER BY camera_number',
-            (customer['id'],'configured')
-        )
 
         camera_cards=''.join(
             f'''<article class="feature-card">
                 <div class="feature-icon">▣</div>
                 <h2>{escape(camera.get("name") or f"Camera {camera.get('camera_number') or ''}")}</h2>
-                <p>{escape(camera.get("status") or "configured")}</p>
+                <p>{escape(camera_status_label(
+                    camera_status=camera['status'],
+                    appliance_reported_online=bool(camera['appliance_online']),
+                    appliance_reported_recording=bool(camera['appliance_recording']),
+                    has_cloud_recording=camera['has_recording'],
+                ))}</p>
                 <a class="action-button" href="/customer/cameras/{escape(camera['id'],quote=True)}/live">Live view</a>
             </article>'''
             for camera in cameras
