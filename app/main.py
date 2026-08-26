@@ -32003,69 +32003,34 @@ def get_alert_rule(camera_number: int) -> AlertRuleModel:
 
 
 
-def linked_recording_for(camera_number: int, event_time: datetime) -> str | None:
+def linked_recording_for(
+    camera_number: int, event_time: datetime, event_end_time: datetime | None = None
+) -> str | None:
+    """Punch-list item 4: a customer's event clip link must be windowed
+    to pre-roll + the real event duration + post-roll (see
+    event_clips.compute_clip_window()) -- not the full raw multi-minute
+    recording segment. event_end_time defaults to event_time for a
+    zero-duration/instant detection (motion events currently only carry a
+    single timestamp -- see store_motion_event()'s call site).
 
+    This still links into the same underlying segment file (real, separate-
+    file clip extraction -- reusing the existing create_clip()/
+    build_manual_clip() job -- is follow-up work, not done here; see the
+    punch-list report) but bounds playback to the computed window via the
+    HTML5 Media Fragments #t=start,end syntax, which browsers honor by
+    stopping playback at the end offset -- so the duration a customer
+    actually sees is correct even before real extraction lands.
+    """
+    from event_clips import compute_clip_window
 
-
-
-
-
-
-
+    window = compute_clip_window(event_time, event_end_time or event_time)
     camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
-
-
-
-
-
-
-
-
     for source in sorted(camera_folder.glob("*.mkv"), reverse=True):
-
-
-
-
-
-
-
-
         source_start = recording_start(source, camera_number)
-
-
-
-
-
-
-
-
         if source_start and source_start <= event_time < source_start + timedelta(minutes=5):
-
-
-
-
-
-
-
-
-            offset = max(0, int((event_time - source_start).total_seconds()))
-
-
-
-
-
-
-
-
-            return f"/recordings/camera{camera_number}/{quote(source.name)}#t={offset}"
-
-
-
-
-
-
-
-
+            start_offset = max(0, (window.start - source_start).total_seconds())
+            end_offset = max(start_offset, (window.end - source_start).total_seconds())
+            return f"/recordings/camera{camera_number}/{quote(source.name)}#t={start_offset:.1f},{end_offset:.1f}"
     return None
 
 
@@ -34316,7 +34281,7 @@ async def store_motion_event(
 
 
 
-        linked_recording=linked_recording_for(camera_number, start_time),
+        linked_recording=linked_recording_for(camera_number, start_time, end_time),
 
 
 
