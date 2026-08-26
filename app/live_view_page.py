@@ -37,6 +37,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from partner_db import connection
 from partner_portal import partner_identity
+from customer_analytics_panel import analytics_row_state, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT
 
 POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
@@ -380,7 +381,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         camera_ids = [camera['id'] for camera in cameras]
 
         tiles = ''.join(
-            f'''<article class="live-grid-tile">
+            f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
               <div class="camera-view" style="border-radius:10px">
                 <video id="live-grid-video-{escape(camera['id'], quote=True)}" muted playsinline></video>
                 <div class="camera-placeholder" id="live-grid-placeholder-{escape(camera['id'], quote=True)}">
@@ -427,6 +428,22 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
+
+  // Punch-list item 1: double-click (desktop) / double-tap (mobile) a
+  // grid tile opens the Focused Live View for that camera. Full screen
+  // navigation already existed via the explicit button above; this adds
+  // the same destination as a faster gesture without replacing it.
+  document.querySelectorAll('.live-grid-tile').forEach(tile=>{{
+    const openFocused=()=>{{location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`}};
+    tile.addEventListener('dblclick',openFocused);
+    let lastTap=0;
+    tile.addEventListener('touchend',()=>{{
+      const now=Date.now();
+      if(now-lastTap<350)openFocused();
+      lastTap=now;
+    }});
+  }});
+
   const pollIntervalMs={POLL_INTERVAL_MS};
   const pollTimeoutMs={POLL_TIMEOUT_MS};
   const tiles={{}};
@@ -525,6 +542,52 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
         return page_shell('Live view', 'live', content, scripts)
 
+    @app.get('/api/customer/cameras/{camera_id}/analytics')
+    def customer_camera_analytics_enabled(request: Request, camera_id: str) -> dict:
+        """Every analytic the Focused Live View's row can ever show for
+        this camera, each flagged enabled (real results) or not (an
+        upgrade-opportunity card) -- the row is never empty, even for a
+        camera with nothing purchased yet. See
+        customer_analytics_panel.analytics_row_state()'s docstring for the
+        site-level subscription scoping."""
+        identity = partner_identity(request)
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+            return RedirectResponse('/partner-login', status_code=303)
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+            subscriptions = db.execute(
+                'SELECT analytic_key, status FROM analytics_subscriptions WHERE customer_id=? AND (site_id=? OR site_id IS NULL)',
+                (identity['customer_id'], camera.get('site_id')),
+            ).fetchall()
+        analytics = analytics_row_state([dict(row) for row in subscriptions])
+        for item in analytics:
+            item['upgrade'] = UPGRADE_CARD_CONTENT[item['key']]
+        return {'analytics': analytics}
+
+    @app.get('/api/customer/cameras/{camera_id}/analytics/{analytic_key}/summary')
+    def customer_camera_analytics_summary(request: Request, camera_id: str, analytic_key: str) -> dict:
+        """Most-recent-useful-results for one selected analytic pill --
+        never the underlying long recording, never every historical
+        detection, just what customer_analytics_panel.summarize() decides
+        is relevant for that analytic type."""
+        identity = partner_identity(request)
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+            return RedirectResponse('/partner-login', status_code=303)
+        try:
+            event_types = event_types_for_analytic(analytic_key)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail='Unknown analytic.') from error
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+            placeholders = ','.join('?' for _ in event_types)
+            rows = db.execute(
+                f'SELECT event_type, confidence, object_count, detections_json, event_timestamp '
+                f'FROM detection_events WHERE camera_id=? AND customer_id=? AND event_type IN ({placeholders}) '
+                f'ORDER BY event_timestamp DESC LIMIT 20',
+                (camera_id, identity['customer_id'], *event_types),
+            ).fetchall()
+        return summarize(analytic_key, [dict(row) for row in rows])
+
     @app.get('/customer/cameras/{camera_id}/live', response_class=HTMLResponse)
     def live_view_page(request: Request, camera_id: str):
         identity = partner_identity(request)
@@ -574,21 +637,16 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-stop" title="Stop">◼</button>'
             f'<button class="camera-tool" id="live-view-retry" title="Retry" hidden>↻</button>'
             f'</div></section>'
-            f'<section class="panel" style="margin-top:16px">'
-            f'<div class="panel-head"><div><h2>Live analytics</h2>'
-            f'<div class="health-detail">No analytics events recorded yet for this camera.</div></div></div>'
-            f'<div class="health-list">'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-motion" style="display:inline-block;margin-right:8px"></i>Motion</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-person" style="display:inline-block;margin-right:8px"></i>Person</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-vehicle" style="display:inline-block;margin-right:8px"></i>Vehicle</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-lpr" style="display:inline-block;margin-right:8px"></i>License plate</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-people_counting" style="display:inline-block;margin-right:8px"></i>People count</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-intrusion" style="display:inline-block;margin-right:8px"></i>Intrusion</span><span class="health-detail">No detections yet</span></div>'
-            f'</div></section>'
+            f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
+            f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
+            f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
+            f'<div id="live-analytics-panel" class="health-list"></div>'
+            f'</section>'
         )
 
         scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
 (function(){{
+  const cameraId={json.dumps(camera_id)};
   const startUrl={json.dumps(start_url)};
   const playlistUrl={json.dumps(playlist_url)};
   const pollIntervalMs={POLL_INTERVAL_MS};
@@ -686,7 +744,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   }});
   downloadButton.addEventListener('click',()=>comingSoon('Download applies to recorded clips in Playback'));
   shareButton.addEventListener('click',()=>comingSoon('Share'));
-  analyticsButton.addEventListener('click',()=>comingSoon('Live analytics'));
+  analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
   bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
   stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
@@ -702,7 +760,76 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   window.addEventListener('pagehide',()=>{{stopSession(true)}});
 
+  // Focused Live View's switchable analytics row (punch-list item 1).
+  // The video itself is never paused/reloaded by any of this -- switching
+  // pills only swaps the summary panel below it.
+  const analyticsSection=document.getElementById('live-analytics-section');
+  const analyticsPills=document.getElementById('live-analytics-pills');
+  const analyticsPanel=document.getElementById('live-analytics-panel');
+  let activeAnalytic=null;
+  let analyticsByKey={{}};
+
+  function renderUpgradeCard(key){{
+    const info=analyticsByKey[key].upgrade;
+    const benefits=info.benefits.map(item=>`<li>${{item}}</li>`).join('');
+    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{info.description}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><button class="action-button" id="upgrade-request-${{key}}">Request Upgrade</button><button class="ghost-button" id="upgrade-add-${{key}}">Add to This Camera</button><button class="ghost-button" id="upgrade-learn-${{key}}">Learn More</button></div></div>`;
+    document.getElementById(`upgrade-request-${{key}}`).addEventListener('click',()=>comingSoon('Upgrade requests are coming soon -- contact your partner for now.'));
+    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',()=>comingSoon('Adding analytics directly from Live View is coming soon.'));
+    document.getElementById(`upgrade-learn-${{key}}`).addEventListener('click',()=>comingSoon(analyticsByKey[key].label+': '+info.description));
+  }}
+
+  function renderAnalyticsSummary(key,data){{
+    if(key==='lpr'){{
+      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest plate</span><span class="health-detail">${{data.latest_plate||'No plates read yet'}}</span></div><div class="health-row"><span class="health-name">Confidence</span><span class="health-detail">${{data.latest_confidence!=null?data.latest_confidence+'%':'—'}}</span></div><div class="health-row"><span class="health-name">Recent</span><span class="health-detail">${{data.recent.length}} recent detection(s)</span></div>`;
+    }}else if(key==='people_counting'){{
+      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest count</span><span class="health-detail">${{data.latest_count!=null?data.latest_count:'No counts yet'}}</span></div><div class="health-row"><span class="health-name">Entries / exits</span><span class="health-detail">${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}</span></div>`;
+    }}else if(key==='ppe'){{
+      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest status</span><span class="health-detail">${{data.latest_status||'No PPE events yet'}}</span></div><div class="health-row"><span class="health-name">As of</span><span class="health-detail">${{data.latest_timestamp||'—'}}</span></div>`;
+    }}else{{
+      const rows=data.recent.map(item=>`<div class="health-row"><span class="health-name">${{item.event_type||'motion'}}</span><span class="health-detail">${{item.timestamp||''}}</span></div>`).join('')||'<div class="health-row"><span class="health-detail">No motion/person/vehicle events yet</span></div>';
+      analyticsPanel.innerHTML=rows;
+    }}
+  }}
+
+  async function selectAnalytic(key){{
+    activeAnalytic=key;
+    [...analyticsPills.children].forEach(pill=>{{
+      const isActive=pill.dataset.key===key;
+      pill.classList.toggle('active',isActive);
+      pill.setAttribute('aria-selected',isActive?'true':'false');
+    }});
+    if(!analyticsByKey[key].enabled){{renderUpgradeCard(key);return}}
+    analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Loading…</span></div>';
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics/${{key}}/summary`);
+      if(!response.ok)throw new Error('summary request failed');
+      renderAnalyticsSummary(key,await response.json());
+    }}catch(e){{
+      analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Analytics data is temporarily unavailable.</span></div>';
+    }}
+  }}
+
+  async function loadEnabledAnalytics(){{
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics`);
+      if(!response.ok)return;
+      const {{analytics}}=await response.json();
+      if(!analytics.length)return;
+      analyticsByKey={{}};
+      analytics.forEach(item=>{{analyticsByKey[item.key]=item}});
+      // Every analytic always gets a pill -- enabled ones show real
+      // results, disabled ones show an upgrade card (punch-list:
+      // "no dead space, never leave the analytics section blank").
+      analyticsPills.innerHTML=analytics.map(item=>`<button type="button" class="filter" role="tab" data-key="${{item.key}}">${{item.label}}${{item.enabled?'':' <span class='pill wait' style='margin-left:4px'>Upgrade</span>'}}</button>`).join('');
+      [...analyticsPills.children].forEach(pill=>pill.addEventListener('click',()=>selectAnalytic(pill.dataset.key)));
+      analyticsSection.hidden=false;
+      const firstEnabled=analytics.find(item=>item.enabled);
+      selectAnalytic((firstEnabled||analytics[0]).key);  // one panel active at a time, default to the first real analytic if any is enabled
+    }}catch(e){{}}
+  }}
+
   startSession();
+  loadEnabledAnalytics();
 }})();
 </script>'''
 
