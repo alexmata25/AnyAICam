@@ -1,17 +1,17 @@
 # Installer Artifact Manifest
 
 Branch: `feature/customer-ready-appliance-installer`
-Reconstruction status: source, tests, and packaging complete and verified
-on the real Ubuntu 24.04 EC2 repo host (`/opt/anyaicam`,
-ec2-54-210-36-151.compute-1.amazonaws.com). Not yet installed/run
-end-to-end (no disposable validation EC2 has been launched for that, per
-standing instruction).
+Reconstruction status: clean install (Phase 4), idempotent reinstall
+(Phase 5), and repair (Phase 6) all verified end-to-end on real,
+disposable Ubuntu 24.04 EC2 hosts. Phase 7 (default uninstall +
+preservation) found and this branch fixed a real data-loss bug (see
+below); a corrected Phase 7 re-run is the immediate next step.
 
 ## Tarball
 
 - Filename: `anyaicam-installer-reconstructed-1.0.0.tar.gz`
 - **Canonical SHA256 (deterministic build, see below):**
-  `2b3df7d3a7883b09e80931ef6fbb7ca6b235e90e5b3bb65dd80d34521c809a0e`
+  `b87e1b38b3f70023c3f3779cd050a682a26503ef2e46cf1daaac25ced4847b73`
 - Not committed to git: this is a build output, not source. If a durable
   copy is wanted, attach it to a GitHub Release or S3 rather than
   committing the binary.
@@ -45,19 +45,20 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$MTIME_EPOCH" \
     uninstall.sh README.md tests/run_tests.sh
 ```
 
-**Verified reproducible:** for commit `3d2864d25a9dc0e1c2da38add22516d18b0bc335`
-(`MTIME_EPOCH=1787731359`), two independent runs of this command from two
+**Verified reproducible:** for commit `78ad8ffd2e201e114c189c5a54b1458dcb789f28`
+(`MTIME_EPOCH=1787736474`), two independent runs of this command from two
 separate clean `git archive` extractions produced byte-identical
 archives (`cmp` reported no differences) and identical SHA256
-(`2b3df7d3a7883b09e80931ef6fbb7ca6b235e90e5b3bb65dd80d34521c809a0e`
+(`b87e1b38b3f70023c3f3779cd050a682a26503ef2e46cf1daaac25ced4847b73`
 both times). Per-file SHA256 of the extracted source in both builds
 also matched the table below exactly.
 
-(The same reproducibility method was verified three times already, for
+(The same reproducibility method was verified four times already, for
 commits `077e7f5294a7318976aca9e84655db4922d4c369`,
-`7c203148ea54e114d2adea8e1782197df97643dd`, and
-`e9bc3633f11b3d1b3fa486ece5e0adb51e92ad88` -- superseded here only
-because the source itself changed again, see the python3.12-venv fix
+`7c203148ea54e114d2adea8e1782197df97643dd`,
+`e9bc3633f11b3d1b3fa486ece5e0adb51e92ad88`, and
+`3d2864d25a9dc0e1c2da38add22516d18b0bc335` -- superseded here only
+because the source itself changed again, see the persistent-layout fix
 below, not because the method stopped working.)
 
 **Authoritative integrity check:** the per-file SHA256 table below is
@@ -69,20 +70,20 @@ only meaningful when built with the exact command above.
 
 | File | SHA256 | Validation status |
 |---|---|---|
-| install.sh | `2aab22c7319081d1a284c7a68fea116bddf0cd2f8edf516328cb068f0fc810a2` | bash -n pass, LF-only, mode 0755 |
+| install.sh | `aee3dfbd7167c1e71ec85671c6a4fc9c959d974ef6fea958d58279c0621eee25` | bash -n pass, LF-only, mode 0755; adds VMS_RECORDINGS_DIR/VMS_DATA_CONFIG_DIR/VMS_HLS_DIR/VMS_ENV_FILE constants (Phase 7 persistent-layout fix) |
 | 01-preflight.sh | `45e1b0d474f734a8fde43910e7496399f0bc5abaef5652591627175d318ef1d1` | bash -n pass, LF-only, mode 0755 |
 | 02-storage-check.sh | `a5446151c5ee9118a188ecc263e535e51aa1e3ec2d94888c429841b67469faa9` | bash -n pass, LF-only, mode 0755; storage-preflight branches covered by 9 mocked tests |
 | 03-detect-install.sh | `a309339fb758eaaadfc4c2a0339b65762fb05d126bc4d47413d1700ea5c57cf3` | bash -n pass, LF-only, mode 0755; clean/existing/partial branches covered by 5 mocked tests |
 | 04-docker-setup.sh | `401b14d772e021c4ed123144d921ff53ebe6fee6d0b3f9e0128671cbc6ba18bb` | bash -n pass, LF-only, mode 0755 |
-| 05-provision-users-dirs.sh | `658a3ed34732b68789d872468e28d6fcbd660dbd9924248d0aa5dbe9b578da62` | bash -n pass, LF-only, mode 0755 |
-| 06-deploy-vms.sh | `11fcac9fd57cc60050098d2705be5023000f44091ba48e4862d4376bfe2d3496` | bash -n pass, LF-only, mode 0755; copies Dockerfile, Dockerfile.production, and requirements.txt (two Phase 4 clean-install blocker fixes) |
+| 05-provision-users-dirs.sh | `b875e2e46b3c41a5bc1aa171618ad2c88da39c47457d64e0b957d38aa1639870` | bash -n pass, LF-only, mode 0755; provisions VMS_DATA_CONFIG_DIR (Phase 7 persistent-layout fix) |
+| 06-deploy-vms.sh | `41d80c122ca7919ad8bedc62bd89f9e5f71df8d68d663d485462900ab03159b6` | bash -n pass, LF-only, mode 0755; copies Dockerfile/Dockerfile.production/requirements.txt, migrates legacy persistent data out of $VMS_INSTALL_ROOT before every deploy (Phase 7 persistent-layout fix) |
 | 07-install-agent.sh | `741cd11a5d0d6aabdf09006f8d65357023a0c047e8f43f9158fed6db9f2df619` | bash -n pass, LF-only, mode 0755; installs python3.12-venv prerequisite before the wrapped agent installer (Phase 4 clean-install blocker fix) |
 | 08-systemd-setup.sh | `c452fbcb150bd0881a388cf1ec53fb6f90f232d6011c41decb8e26137483ebb8` | bash -n pass, LF-only, mode 0755 |
 | 09-identity.sh | `723d6cb54c384f77f6fd74a8db8285674e0c261411471a6ba3e9f28607312d95` | bash -n pass, LF-only, mode 0755 |
 | validate.sh | `b2ff7d070e04cf14fd71b3082a258d304a520829106eb4e601f0e7507915904f` | bash -n pass, LF-only, mode 0755 |
-| uninstall.sh | `c3f8635b645803b8bd6dae066f4871587f95310ac586f294d652013a1a3c0631` | bash -n pass, LF-only, mode 0755 |
+| uninstall.sh | `88c0e1bccf066d03106d9b73d74696d82222ae32cb4815145d780bcd609656f5` | bash -n pass, LF-only, mode 0755; refactored into a callable run_uninstall() (no behavior change for direct execution) so it's testable |
 | README.md | `e5148b0f5ed278bfc80796c2dafe88f3cf678b1294f414af7515ba62a125ea11` | reconstruction/spec documentation, not a script |
-| tests/run_tests.sh | `f41775dc456e061983faa0e7a3802df63c374d86ac5d877a218e14c1fe2a1c87` | bash -n pass, LF-only, mode 0755; 21/21 assertions pass |
+| tests/run_tests.sh | `3c41862fd9927f9b327c5d1af0b6ebde8184bf5d722e0c4dd39ba372bdd80de2` | bash -n pass, LF-only, mode 0755; 42/42 assertions pass |
 
 All 14 checksums above were verified identical between the local
 reconstruction and the copies committed to this repo, and again
@@ -99,15 +100,17 @@ reproduced on the EC2 host directly.
 
 ## Local/mocked test results (installer/tests/run_tests.sh)
 
-Mocks `id`, `docker`, `df`, and `apt-get` as shell functions; redirects
-every path constant (`$CONFIG_DIR`, `$VMS_INSTALL_ROOT`,
-`$VERSION_MARKER`, `$VMS_SERVICE_FILE`, `$IDENTITY_FILE`, `$REPO_ROOT`)
-into a disposable `mktemp -d` tree. Sources the real, unmodified
-`detect_install_state()`, `storage_preflight()`, `deploy_vms()`, and
-`install_agent()` from `03-detect-install.sh` / `02-storage-check.sh` /
-`06-deploy-vms.sh` / `07-install-agent.sh` -- no test-only
-reimplementation of the decision logic. Run on the real Ubuntu 24.04
-EC2 repo host: 21/21 assertions passed.
+Mocks `id`, `docker`, `df`, `apt-get`, and `systemctl` as shell
+functions; redirects every path constant (`$CONFIG_DIR`,
+`$VMS_INSTALL_ROOT`, `$VERSION_MARKER`, `$VMS_SERVICE_FILE`,
+`$IDENTITY_FILE`, `$REPO_ROOT`, `$VMS_RECORDINGS_DIR`,
+`$VMS_DATA_CONFIG_DIR`, `$VMS_ENV_FILE`) into a disposable `mktemp -d`
+tree. Sources the real, unmodified `detect_install_state()`,
+`storage_preflight()`, `deploy_vms()`, `install_agent()`, and
+`run_uninstall()` from `03-detect-install.sh` / `02-storage-check.sh` /
+`06-deploy-vms.sh` / `07-install-agent.sh` / `uninstall.sh` -- no
+test-only reimplementation of the decision logic. Run on the real
+Ubuntu 24.04 EC2 repo host: 42/42 assertions passed.
 
 - `detect_install_state()`: 0/5, 5/5, 2/5, 1/5, and 4/5 marker-presence
   scenarios all resolve to the correct one of clean/existing/partial,
@@ -133,24 +136,54 @@ EC2 repo host: 21/21 assertions passed.
   prerequisite is apt-get installed AND that it's installed *before*
   the wrapped script runs -- regression coverage for the third
   clean-install release blocker found and fixed in Phase 4 validation.
+- `migrate_legacy_persistent_data()` / `migrate_legacy_persistent_file()`:
+  moves and verifies legacy data byte-exact into a not-yet-existing
+  destination and removes the legacy copy only after that; never
+  overwrites data already present at the destination and retains the
+  unresolved legacy file rather than dropping it; idempotent on a
+  second run (no-op once the legacy source is gone); same three
+  guarantees covered separately for the single-file (`.env`) case --
+  regression coverage for the Phase 7 persistent-layout fix.
+- `run_uninstall()` (default, no `--purge-all`): against a fixture with
+  both replaceable software (`$VMS_INSTALL_ROOT`) and persistent data
+  (`$VMS_RECORDINGS_DIR`, `$VMS_DATA_CONFIG_DIR`, `$IDENTITY_FILE`)
+  populated, asserts the software is removed, the wrapped
+  appliance-agent uninstall script ran, and every persistent path
+  survives byte-identical -- regression coverage for the Phase 7
+  release blocker (default uninstall previously destroyed real
+  customer recordings).
 
-## Preservation behavior (verified by code inspection, not yet by a live install/reinstall run)
+## Preservation behavior
 
 - Identity (`09-identity.sh`): `identity_provision()` returns
   immediately, logging the existing file's sha256, whenever
-  `$IDENTITY_FILE` already exists -- never regenerated on reinstall/repair.
-- Config/version marker: same file, same rule.
-- Credentials, camera bindings, recordings, customer state
-  (`06-deploy-vms.sh`): `rsync -a --update` never overwrites a
+  `$IDENTITY_FILE` already exists -- never regenerated on
+  reinstall/repair. **Verified live**: identical appliance ID and
+  identity-file hash across a clean install, an idempotent reinstall
+  (Phase 5), a repair (Phase 6), and a default uninstall (Phase 7).
+- Config/version marker: same file, same rule. Verified live alongside
+  identity in the same phases.
+- VMS recordings, database, and application state
+  (`$VMS_RECORDINGS_DIR`, `/var/lib/anyaicam/vms/recordings`) and VMS
+  data-config (`$VMS_DATA_CONFIG_DIR`): as of the Phase 7
+  persistent-layout fix, these live outside `$VMS_INSTALL_ROOT`
+  entirely, so `uninstall.sh`'s default `rm -rf "$VMS_INSTALL_ROOT"`
+  cannot touch them. Pre-fix, this was a confirmed real bug (see
+  below) -- default uninstall destroyed live VMS recordings and the
+  application's own SQLite database despite its own log message
+  claiming they were preserved.
+- VMS environment config (`$VMS_ENV_FILE`, `/etc/anyaicam/vms.env`):
+  same category, same fix.
+- HLS output (`$VMS_HLS_DIR`, `/var/lib/anyaicam/vms/hls`):
+  intentionally NOT given the same preservation guarantee -- classified
+  as regenerable runtime streaming state, just needed to stop living
+  unsafely inside the replaceable software directory.
+- `06-deploy-vms.sh`: `rsync -a --update` never overwrites a
   newer-or-equal destination file and never touches destination-only
-  files; `.env` is created only if absent, never overwritten.
+  files; `.env`/`vms.env` is created only if absent, never overwritten.
 - `uninstall.sh`: defaults to preserving `$CONFIG_DIR` (`/etc/anyaicam`),
   `/var/lib/anyaicam`, and `/var/log/anyaicam`; only `--purge-all`
   removes them.
-- This behavior has not yet been exercised end-to-end against a real
-  install/reinstall cycle -- that requires an actual host to install
-  onto, which is explicitly deferred (no disposable validation EC2
-  launched yet).
 
 ## Known fixes found and applied during live disposable-host validation
 
@@ -183,34 +216,51 @@ EC2 repo host: 21/21 assertions passed.
   install. Fixed by installing `python3.12-venv` in the reconstructed
   `07-install-agent.sh` wrapper, before it invokes the reused script
   -- not by patching the reused script itself.
-
-## Known issue found and reported, not yet fixed (outside this branch's scope)
-
-- `appliance-agent/pyproject.toml` declares `dependencies = []`, but
-  `updater/verify.py` unconditionally imports `cryptography`
-  (`from cryptography.exceptions import ...`,
-  `from cryptography.hazmat.primitives import ...`). Traced the import
-  chain: the `anyaicam-agent` systemd service's actual entrypoint
-  (`anyaicam_agent.service:main`) unconditionally imports
-  `updater.factory`, which unconditionally imports `updater.verify` --
-  so this import is reached the moment the agent service process
-  starts, not just during an update. `pip install` (inside
-  `appliance-agent/scripts/install.sh`) will not install `cryptography`
-  since it isn't declared, and the venv has no
-  `--system-site-packages`. This will very likely surface as a
-  `ModuleNotFoundError` the first time the agent service is actually
-  started. This is a bug in a pre-existing repo file
-  (`appliance-agent/pyproject.toml`), not in any of the 12
-  reconstructed installer scripts, and reported to the user ahead of
-  time rather than discovered blind during a live validation run. Not
-  fixed here -- awaiting a decision on whether/how to address it.
+- **Clean-install blocker #4 (found on re-validation with fixes #1-#3
+  applied, `install.sh` reached exit 0 for the first time here):**
+  `appliance-agent/pyproject.toml` declared `dependencies = []`, but
+  `updater/verify.py` unconditionally imports `cryptography`, and that
+  import is reachable from the `anyaicam-agent` service entrypoint at
+  process start (`service.py` -> `updater.factory` ->
+  `updater.state_machine` -> `updater.verify`). Confirmed via a real
+  `ModuleNotFoundError: No module named 'cryptography'` when the
+  service was explicitly started (not just checked "enabled") on a
+  genuine Ubuntu 24.04 host. Before fixing, inventoried every import
+  statement in the whole `appliance-agent` package (all indentation
+  levels, plus dynamic `__import__()` calls) and confirmed
+  `cryptography` is the only undeclared third-party dependency
+  anywhere in it. Fixed by adding it to `pyproject.toml`'s
+  `dependencies` -- the package manifest, not a workaround in
+  `updater/verify.py`. Re-verified live: `ModuleNotFoundError` is gone;
+  the agent now reaches real application logic and correctly reports
+  `RuntimeError: Appliance is not activated. Run anyaicam-setup first.`
+  when started unenrolled -- expected behavior for a clean install with
+  no customer enrollment performed, not a failure.
+- **Phase 7 blocker (found in live default-uninstall validation, after
+  a genuinely clean install + idempotent reinstall + repair all passed
+  clean):** `docker-compose.yml` bind-mounted VMS recordings
+  (`./recordings`), data-config (`./data/config`), and env (`.env`)
+  from paths relative to `$VMS_INSTALL_ROOT`. `uninstall.sh`'s default
+  (non-`--purge-all`) path does `rm -rf "$VMS_INSTALL_ROOT"`
+  unconditionally -- this silently destroyed a live VMS-recordings
+  sentinel file and the real `partner_portal.db` (confirmed by hash
+  comparison: present before, `sha256sum: No such file or directory`
+  after) despite the uninstall's own log message claiming recordings
+  were preserved. Inventoried every runtime-writable/persistent path
+  under `/opt/anyaicam` before fixing (see the "Persistent-layout fix"
+  section above and the commit history) and confirmed the full list:
+  VMS recordings/database/application-state (all children of one
+  `RECORDINGS_FOLDER` constant), `data/config` (confirmed unused by
+  current app code), `.env`, and HLS output (classified separately as
+  regenerable, not protected). Fixed by pointing `docker-compose.yml`
+  at absolute paths under `/var/lib/anyaicam/vms/` and `/etc/anyaicam/`
+  instead, with an idempotent, verify-before-delete migration path for
+  installs that predate the fix.
 
 ## Not yet done (requires the next approval)
 
-- Not yet installed/run end-to-end to a *successful* completion on a
-  disposable Ubuntu 24.04 host -- the first three attempts hit the
-  blockers above in sequence; re-validation with all three fixes
-  applied is the next step. The `cryptography` issue above may surface
-  as a fourth blocker once the agent service is actually started.
-- Live reinstall/repair/uninstall preservation behavior not yet
-  exercised against a real filesystem (see above).
+- Corrected Phase 7 (default uninstall + reinstall-after-uninstall,
+  with the persistent-layout fix applied) not yet re-run on a fresh
+  disposable host -- next step.
+- Phases 8+ (reboot, network-disconnect, synthetic enrollment,
+  `--purge-all`) not yet attempted.
