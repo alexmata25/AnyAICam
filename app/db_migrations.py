@@ -51,6 +51,9 @@ CREATE INDEX IF NOT EXISTS idx_detection_events_camera_timestamp ON detection_ev
 CREATE TABLE IF NOT EXISTS customer_talk_sessions(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,site_id TEXT NOT NULL,camera_id TEXT NOT NULL,user_id TEXT,requested_by TEXT NOT NULL,role TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'requested',requested_at TEXT NOT NULL,ended_at TEXT,expires_at TEXT NOT NULL,FOREIGN KEY(customer_id) REFERENCES customers(id),FOREIGN KEY(site_id) REFERENCES sites(id),FOREIGN KEY(camera_id) REFERENCES cameras(id));
 CREATE INDEX IF NOT EXISTS idx_customer_talk_sessions_camera ON customer_talk_sessions(camera_id,state);
 '''),
+    ('20260827_camera_provisioning','''
+CREATE TABLE IF NOT EXISTS camera_credentials(camera_id TEXT PRIMARY KEY,encrypted_blob TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(camera_id) REFERENCES cameras(id));
+'''),
 ]
 
 
@@ -97,6 +100,16 @@ def apply_migrations():
         if 'talk_down_supported' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_supported INTEGER')
         if 'talk_down_metadata' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_metadata TEXT')
         if 'talk_down_verified_at' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_verified_at TEXT')
+        # Phase 3 (dynamic camera provisioning): device_key is the ONVIF
+        # endpoint reference UUID -- stable across reboot/DHCP/IP changes,
+        # unlike ip_address -- and is how rediscovering an already-
+        # provisioned camera updates its existing row instead of creating a
+        # duplicate. ip_address/onvif_endpoint/manufacturer/model are non-
+        # secret device metadata; camera credentials never live in this
+        # table -- see camera_credentials (encrypted) instead.
+        for name,definition in (('device_key','TEXT'),('ip_address','TEXT'),('onvif_endpoint','TEXT'),('manufacturer','TEXT'),('model','TEXT')):
+            if name not in camera_columns: db.execute(f'ALTER TABLE cameras ADD COLUMN {name} {definition}')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_customer_device_key ON cameras(customer_id,device_key) WHERE device_key IS NOT NULL')
 
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else

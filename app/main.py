@@ -213,7 +213,7 @@ from pathlib import Path
 
 
 
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 
 
@@ -1821,7 +1821,70 @@ def structured_log(event: str, level: str = "info", **fields) -> None:
 
 
 
-CAMERA_COUNT = 4
+LEGACY_DEFAULT_CAMERA_COUNT = 4  # fallback slot count -- see get_camera_numbers()
+CAMERA_SUPERVISOR_HEADROOM = 4   # extra idle supervisor slots beyond what's
+CAMERA_NOT_CONFIGURED_POLL_SECONDS = 15  # how often an idle/unprovisioned supervisor slot re-checks camera_url()
+                                 # provisioned at startup, so a customer can
+                                 # add a few more cameras later without a
+                                 # VMS restart -- see get_supervisor_slot_count()
+
+
+class CameraNotConfiguredError(Exception):
+    """Raised by camera_url() when a camera_number has neither a
+    provisioned record (cameras/camera_credentials tables) nor the legacy
+    CAMERA{n}_HOST/USERNAME/PASSWORD env vars. Deliberately NOT a subclass
+    of OSError/KeyError: process_supervisor() must treat this as a normal,
+    expected, indefinitely-retryable "nothing to connect to yet" state --
+    never an unhandled exception that silently kills the task. See the
+    Phase 3 Samsung incident this fixes: an unset env var previously threw
+    a bare KeyError here, which process_supervisor() only caught OSError
+    for, so the task died once, silently, and never retried -- live view
+    and recording never started and nothing in the logs said why."""
+
+
+def get_camera_numbers() -> list[int]:
+    """The real, currently-provisioned set of camera_number slots this
+    appliance's FFmpeg/HLS/recording/analytics pipeline should run --
+    sourced from the same multi-tenant `cameras` table Wizard A/B
+    provisioning writes to (see camera_mapping.py for camera_number
+    assignment), not a hardcoded get_camera_count(). A single edge appliance's
+    local database holds exactly one customer's rows, so no further
+    appliance_id/customer_id scoping is needed here; see the Phase 3
+    report for this documented limitation in a future multi-appliance
+    "combined" deployment.
+
+    Falls back to the legacy 1..LEGACY_DEFAULT_CAMERA_COUNT slot set
+    (today's exact pre-Phase-3 behavior) only if the database has never
+    been reached or genuinely has no camera rows at all -- e.g. a fresh
+    install that has provisioned nothing yet, including one still relying
+    entirely on the CAMERA<n>_HOST/USERNAME/PASSWORD env-var scheme
+    camera_url() still supports as a fallback."""
+    try:
+        from partner_db import connection
+        with connection() as db:
+            assigned = db.execute(
+                "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
+            ).fetchall()
+    except Exception:
+        assigned = []
+    numbers = [int(item["camera_number"]) for item in assigned]
+    return numbers if numbers else list(range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1))
+
+
+def get_camera_count() -> int:
+    return len(get_camera_numbers())
+
+
+def get_supervisor_slot_count() -> int:
+    """How many camera_number supervisor tasks to start at boot -- always
+    at least LEGACY_DEFAULT_CAMERA_COUNT (so a from-scratch install has
+    slots 1..4 sitting in the "not configured" state, ready the instant
+    they're provisioned) and always CAMERA_SUPERVISOR_HEADROOM above
+    whatever is already provisioned (so a customer with 5 cameras already
+    provisioned at startup can add a few more without a VMS restart).
+    Provisioning a camera_number beyond this computed ceiling still needs
+    a restart to get a supervisor task -- see the Phase 3 report."""
+    return max(LEGACY_DEFAULT_CAMERA_COUNT, get_camera_count() + CAMERA_SUPERVISOR_HEADROOM)
 
 
 
@@ -1893,7 +1956,7 @@ DEFAULT_LICENSE_CAMERA_LIMIT = max(
 
 
 
-    int(os.environ.get("ANYAICAM_LICENSE_CAMERA_LIMIT", str(CAMERA_COUNT))),
+    int(os.environ.get("ANYAICAM_LICENSE_CAMERA_LIMIT", str(get_camera_count()))),
 
 
 
@@ -2672,7 +2735,7 @@ camera_process_state = {
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1)
+    for camera_number in range(1, get_supervisor_slot_count() + 1)
 
 
 
@@ -2690,7 +2753,7 @@ camera_process_state = {
 
 
 
-camera_reconnect_counts = {camera_number: 0 for camera_number in range(1, CAMERA_COUNT + 1)}
+camera_reconnect_counts = {camera_number: 0 for camera_number in range(1, get_supervisor_slot_count() + 1)}
 
 
 
@@ -2802,7 +2865,7 @@ ai_detection_state = {
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1)
+    for camera_number in get_camera_numbers()
 
 
 
@@ -2829,7 +2892,7 @@ ai_person_last_event = {
 
 
 
-    camera_number: 0.0 for camera_number in range(1, CAMERA_COUNT + 1)
+    camera_number: 0.0 for camera_number in get_camera_numbers()
 
 
 
@@ -4350,7 +4413,7 @@ class EventSettingsModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -4431,7 +4494,7 @@ class AlertRuleModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -5331,7 +5394,7 @@ class AnalyticsRuleModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -7887,7 +7950,7 @@ class SnapshotRequest(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -7941,7 +8004,7 @@ class ClipRequest(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -8805,7 +8868,7 @@ def default_users() -> list[dict]:
 
 
 
-            camera_ids=list(range(1, CAMERA_COUNT + 1)),
+            camera_ids=list(get_camera_numbers()),
 
 
 
@@ -10668,7 +10731,7 @@ def user_camera_ids(user: dict) -> list[int]:
 
 
 
-        return list(range(1, CAMERA_COUNT + 1))
+        return list(get_camera_numbers())
 
 
 
@@ -10740,7 +10803,7 @@ def user_camera_ids(user: dict) -> list[int]:
 
 
 
-        if 1 <= camera_number <= CAMERA_COUNT:
+        if camera_number in get_camera_numbers():
 
 
 
@@ -11550,7 +11613,7 @@ def configuration_issues() -> list[dict]:
 
 
 
-    for camera in range(1, CAMERA_COUNT + 1):
+    for camera in get_camera_numbers():
 
 
 
@@ -12873,7 +12936,7 @@ def cloud_recording_camera_number(path: Path) -> int | None:
 
 
 
-    return number if 1 <= number <= CAMERA_COUNT else None
+    return number if number in get_camera_numbers() else None
 
 
 
@@ -15186,7 +15249,7 @@ def readiness_snapshot() -> dict:
 
 
 
-        "cameras_total": CAMERA_COUNT,
+        "cameras_total": get_camera_count(),
 
 
 
@@ -15303,7 +15366,7 @@ def backup_manifest() -> dict:
 
 
 
-        "camera_count": CAMERA_COUNT,
+        "camera_count": get_camera_count(),
 
 
 
@@ -15987,69 +16050,75 @@ def diagnostics_snapshot() -> dict:
 
 
 
+def _provisioned_camera_stream(camera_number: int) -> dict | None:
+    """Real, provisioned-camera source for camera_url(): looks up the
+    cameras row assigned this camera_number (see camera_mapping.py) plus
+    its encrypted credentials, and returns {rtsp_url, username, password}
+    -- or None if this slot has no provisioned camera at all (a normal,
+    expected state for an idle supervisor slot, not an error)."""
+    try:
+        from partner_db import connection
+        from appliance_protocol import decrypt_camera_credentials
+        with connection() as db:
+            camera = db.execute(
+                "SELECT id, onvif_endpoint, ip_address FROM cameras WHERE camera_number=?",
+                (camera_number,),
+            ).fetchone()
+            if not camera:
+                return None
+            credential_row = db.execute(
+                "SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchone()
+    except Exception:
+        return None
+    if not credential_row:
+        return None
+    credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
+    if not credentials:
+        return None
+    rtsp_url = camera["onvif_endpoint"] or ""
+    if not rtsp_url.startswith("rtsp://"):
+        return None
+    return {
+        "rtsp_url": rtsp_url,
+        "username": credentials.get("username", ""),
+        "password": credentials.get("password", ""),
+    }
+
+
+def credentialed_rtsp_url(rtsp_url: str, username: str, password: str) -> str:
+    """Builds the real, credentialed RTSP URL for local FFmpeg use only --
+    never for display/logging. Percent-encodes the credentials themselves."""
+    parsed = urlsplit(rtsp_url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    if username or password:
+        userinfo = quote(username, safe="") + (":" + quote(password, safe="") if password else "")
+        netloc = f"{userinfo}@{netloc}"
+    return urlunsplit((parsed.scheme or "rtsp", netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 def camera_url(camera_number: int) -> str:
+    """Real, provisioned-camera source first (dynamic camera registry --
+    see _provisioned_camera_stream()); falls back to the legacy
+    CAMERA{n}_HOST/USERNAME/PASSWORD/PATH env vars for backward
+    compatibility with an existing installation that configured cameras
+    that way. Raises CameraNotConfiguredError (never a bare KeyError) when
+    neither source has anything for this camera_number -- see that
+    exception's docstring for why process_supervisor() depends on this
+    distinction."""
+    provisioned = _provisioned_camera_stream(camera_number)
+    if provisioned:
+        return credentialed_rtsp_url(provisioned["rtsp_url"], provisioned["username"], provisioned["password"])
 
-
-
-
-
-
-
-
-    host = os.environ[f"CAMERA{camera_number}_HOST"]
-
-
-
-
-
-
-
-
-    username = quote(os.environ[f"CAMERA{camera_number}_USERNAME"], safe="")
-
-
-
-
-
-
-
-
-    password = quote(os.environ[f"CAMERA{camera_number}_PASSWORD"], safe="")
-
-
-
-
-
-
-
-
-    path = os.environ.get(
-
-
-
-
-
-
-
-
-        f"CAMERA{camera_number}_PATH", "/Streaming/Channels/101"
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
+    host = os.environ.get(f"CAMERA{camera_number}_HOST")
+    if not host:
+        raise CameraNotConfiguredError(f"Camera {camera_number} has no provisioned record and no CAMERA{camera_number}_HOST env var.")
+    username = quote(os.environ.get(f"CAMERA{camera_number}_USERNAME", ""), safe="")
+    password = quote(os.environ.get(f"CAMERA{camera_number}_PASSWORD", ""), safe="")
+    path = os.environ.get(f"CAMERA{camera_number}_PATH", "/Streaming/Channels/101")
     return f"rtsp://{username}:{password}@{host}:554{path}"
 
 
@@ -16780,6 +16849,23 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
         try:
             process = starter(camera_number)
+        except CameraNotConfiguredError:
+            # Not an error: this slot has no camera provisioned yet (a
+            # fresh install, or a not-yet-configured supervisor headroom
+            # slot -- see get_supervisor_slot_count()). Report a clear
+            # "not_configured" state instead of "retrying" so Live/
+            # Recording UI can show that honestly instead of implying a
+            # connection is being attempted and failing, and keep polling
+            # indefinitely at a slower cadence -- no restart is needed
+            # once the camera is provisioned; the very next iteration of
+            # this loop calls camera_url() again and will succeed.
+            camera_process_state[camera_number][mode] = "not_configured"
+            if mode == "live":
+                camera_process_state[camera_number]["last_exit_code"] = None
+                camera_process_state[camera_number]["last_error"] = None
+                camera_process_state[camera_number]["last_error_at"] = None
+            await asyncio.sleep(CAMERA_NOT_CONFIGURED_POLL_SECONDS)
+            continue
         except OSError as error:
             error_text = _redact_camera_stream_error(
                 str(error)
@@ -22800,7 +22886,7 @@ def customer_cloud_usage_snapshot(user: dict) -> dict:
 
 
 
-        "configured_cameras": CAMERA_COUNT,
+        "configured_cameras": get_camera_count(),
 
 
 
@@ -23871,7 +23957,7 @@ def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
 
 
 
-    current_camera_count = CAMERA_COUNT if camera_count is None else max(0, int(camera_count))
+    current_camera_count = get_camera_count() if camera_count is None else max(0, int(camera_count))
 
 
 
@@ -38439,7 +38525,7 @@ async def lifespan(app: FastAPI):
 
 
 
-        for camera_number in range(1, CAMERA_COUNT + 1):
+        for camera_number in range(1, get_supervisor_slot_count() + 1):  # see CAMERA_SUPERVISOR_HEADROOM
 
 
 
@@ -38529,7 +38615,7 @@ async def lifespan(app: FastAPI):
 
 
 
-                for camera_number in range(1, CAMERA_COUNT + 1)
+                for camera_number in get_camera_numbers()
 
 
 
@@ -38574,7 +38660,7 @@ async def lifespan(app: FastAPI):
 
 
 
-                for camera_number in range(1, CAMERA_COUNT + 1)
+                for camera_number in get_camera_numbers()
 
 
 
@@ -46684,7 +46770,7 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    if camera_number < 1 or camera_number > CAMERA_COUNT:
+    if camera_number not in get_camera_numbers():
 
 
 
@@ -49364,7 +49450,7 @@ def camera_status() -> dict:
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1):
+    for camera_number in get_camera_numbers():
 
 
 
@@ -50651,7 +50737,7 @@ def read_event_settings(camera_number: int) -> dict:
 
 
 
-    if not 1 <= camera_number <= CAMERA_COUNT:
+    if camera_number not in get_camera_numbers():
 
 
 
@@ -50831,7 +50917,7 @@ def read_alert_rule(camera_number: int) -> dict:
 
 
 
-    if not 1 <= camera_number <= CAMERA_COUNT:
+    if camera_number not in get_camera_numbers():
 
 
 
@@ -51884,7 +51970,7 @@ def _build_analytics_summary(events: list[dict], mock_data: bool) -> dict:
     recent_7 = [(event, stamp) for event, stamp in valid_events if stamp >= last_7_start]
 
     type_counts: dict[str, int] = {}
-    camera_counts = {str(camera): 0 for camera in range(1, CAMERA_COUNT + 1)}
+    camera_counts = {str(camera): 0 for camera in get_camera_numbers()}
     confidence_values: list[float] = []
     for event, _ in recent_7:
         event_type = str(event.get("event_type", "unknown"))
@@ -52337,7 +52423,7 @@ def ai_detection_status() -> dict:
 
 
 
-            for camera_number in range(1, CAMERA_COUNT + 1)
+            for camera_number in get_camera_numbers()
 
 
 
@@ -52544,7 +52630,7 @@ def ai_detection_page(request: Request) -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -68556,7 +68642,7 @@ def home() -> str:
 
 
 
-        for n in range(1, CAMERA_COUNT + 1)
+        for n in get_camera_numbers()
 
 
 
@@ -69133,7 +69219,7 @@ def dashboard_intelligence_api() -> dict:
 
 
 
-    camera_counts = {camera_number: 0 for camera_number in range(1, CAMERA_COUNT + 1)}
+    camera_counts = {camera_number: 0 for camera_number in get_camera_numbers()}
 
 
 
@@ -69778,7 +69864,7 @@ def camera_health_page() -> str:
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1):
+    for camera_number in get_camera_numbers():
 
 
 
@@ -70293,7 +70379,7 @@ def camera_health_page() -> str:
 
 
 
-    const CAMERA_COUNT=__CAMERA_COUNT__;
+    const get_camera_count()=__CAMERA_COUNT__;
 
 
 
@@ -70943,7 +71029,7 @@ def camera_health_page() -> str:
 
 
 
-        document.getElementById('health-online-count').textContent=`${onlineCount}/${cameras.length||CAMERA_COUNT}`;
+        document.getElementById('health-online-count').textContent=`${onlineCount}/${cameras.length||get_camera_count()}`;
 
 
 
@@ -70952,7 +71038,7 @@ def camera_health_page() -> str:
 
 
 
-        document.getElementById('health-recording-count').textContent=`${recordingCount}/${cameras.length||CAMERA_COUNT}`;
+        document.getElementById('health-recording-count').textContent=`${recordingCount}/${cameras.length||get_camera_count()}`;
 
 
 
@@ -71132,7 +71218,7 @@ def camera_health_page() -> str:
 
 
 
-    """.replace("__CAMERA_COUNT__", str(CAMERA_COUNT))
+    """.replace("__CAMERA_COUNT__", str(get_camera_count()))
 
 
 
@@ -71483,7 +71569,7 @@ def dashboard() -> str:
 
 
 
-        for camera_number in range(1, CAMERA_COUNT + 1)
+        for camera_number in get_camera_numbers()
 
 
 
@@ -74822,7 +74908,7 @@ def analytics() -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -75596,7 +75682,7 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 
 
-    camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in range(1, CAMERA_COUNT + 1))
+    camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in get_camera_numbers())
 
 
 
@@ -75677,7 +75763,7 @@ def lpr_analytics_page() -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Modular analytic</p><h1>License plate recognition</h1></div></header><div class="mock-banner">Mock detection data: plate-search storage and filtering are functional; live OCR requires an installed LPR model.</div><section class="panel"><div class="library-toolbar"><input class="portal-search" id="plate-search" placeholder="Search full or partial plate"><select class="date-filter" id="plate-camera"><option value="">All cameras</option>{''.join(f'<option value="{n}">Camera {n}</option>' for n in range(1,CAMERA_COUNT+1))}</select><input class="date-filter" id="plate-from" type="date"><input class="date-filter" id="plate-to" type="date"></div><table class="data-table"><thead><tr><th>Time</th><th>Plate</th><th>Vehicle</th><th>Confidence</th><th>Camera</th><th>Clip</th></tr></thead><tbody>{rows or '<tr><td colspan="6">No plate records.</td></tr>'}</tbody></table></section>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Modular analytic</p><h1>License plate recognition</h1></div></header><div class="mock-banner">Mock detection data: plate-search storage and filtering are functional; live OCR requires an installed LPR model.</div><section class="panel"><div class="library-toolbar"><input class="portal-search" id="plate-search" placeholder="Search full or partial plate"><select class="date-filter" id="plate-camera"><option value="">All cameras</option>{''.join(f'<option value="{n}">Camera {n}</option>' for n in get_camera_numbers())}</select><input class="date-filter" id="plate-from" type="date"><input class="date-filter" id="plate-to" type="date"></div><table class="data-table"><thead><tr><th>Time</th><th>Plate</th><th>Vehicle</th><th>Confidence</th><th>Camera</th><th>Clip</th></tr></thead><tbody>{rows or '<tr><td colspan="6">No plate records.</td></tr>'}</tbody></table></section>"""
 
 
 
@@ -75749,7 +75835,7 @@ def people_analytics_page(title: str) -> str:
 
 
 
-    summaries = "".join(f'<article class="stat"><span class="stat-label">Camera {n}</span><span class="stat-value">{(n*7)+3} entries</span><div class="health-detail">{n*4+1} exits · {n+2} current</div></article>' for n in range(1,CAMERA_COUNT+1))
+    summaries = "".join(f'<article class="stat"><span class="stat-label">Camera {n}</span><span class="stat-value">{(n*7)+3} entries</span><div class="health-detail">{n*4+1} exits · {n+2} current</div></article>' for n in get_camera_numbers())
 
 
 
@@ -76469,7 +76555,7 @@ def smart_search_page() -> str:
 
 
 
-        for n in range(1, CAMERA_COUNT + 1)
+        for n in get_camera_numbers()
 
 
 
@@ -86414,7 +86500,7 @@ def create_notification_rule(payload: NotificationRuleCreateModel, request: Requ
 
 
 
-        "camera_ids": sorted(set(int(item) for item in payload.camera_ids if 1 <= int(item) <= CAMERA_COUNT)),
+        "camera_ids": sorted(set(int(item) for item in payload.camera_ids if int(item) in get_camera_numbers())),
 
 
 
@@ -86756,7 +86842,7 @@ def update_notification_rule(rule_id: str, payload: NotificationRuleUpdateModel,
 
 
 
-            value = sorted(set(int(item) for item in value if 1 <= int(item) <= CAMERA_COUNT))
+            value = sorted(set(int(item) for item in value if int(item) in get_camera_numbers()))
 
 
 
@@ -87161,7 +87247,7 @@ def enterprise_notifications_page(request: Request) -> str:
 
 
 
-    camera_options = "".join(f'<option value="{camera}">Camera {camera}</option>' for camera in range(1,CAMERA_COUNT+1))
+    camera_options = "".join(f'<option value="{camera}">Camera {camera}</option>' for camera in get_camera_numbers())
 
 
 
@@ -117409,7 +117495,7 @@ def alerts(request: Request) -> str:
 
 
 
-    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in range(1, CAMERA_COUNT + 1))
+    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in get_camera_numbers())
 
 
 
@@ -117520,7 +117606,7 @@ def alerts(request: Request) -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div><div><button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({CAMERA_COUNT})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion alerts</h2><span class="pill">{len(events)} event(s)</span></div><div class="feature-grid">{alert_body}</div></section></div>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div><div><button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion alerts</h2><span class="pill">{len(events)} event(s)</span></div><div class="feature-grid">{alert_body}</div></section></div>"""
 
 
 
@@ -117579,7 +117665,7 @@ def events(request: Request) -> str:
 
 
 
-    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in range(1, CAMERA_COUNT + 1))
+    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in get_camera_numbers())
 
 
 
@@ -117723,7 +117809,7 @@ def events(request: Request) -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div><div><span class="pill">Motion detection: {detector_status}</span></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({CAMERA_COUNT})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion</h2><span class="health-detail">{len(recent_events)} event(s)</span></div><table class="data-table"><thead><tr><th>Start time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead><tbody>{event_body}</tbody></table></section></div>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div><div><span class="pill">Motion detection: {detector_status}</span></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion</h2><span class="health-detail">{len(recent_events)} event(s)</span></div><table class="data-table"><thead><tr><th>Start time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead><tbody>{event_body}</tbody></table></section></div>"""
 
 
 
@@ -123204,7 +123290,7 @@ def users_page(request: Request) -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -125409,7 +125495,7 @@ def site_monitoring_summary() -> dict:
 
 
 
-            "status": "online" if online_cameras == CAMERA_COUNT else "warning",
+            "status": "online" if online_cameras == get_camera_count() else "warning",
 
 
 
@@ -125418,7 +125504,7 @@ def site_monitoring_summary() -> dict:
 
 
 
-            "camera_count": CAMERA_COUNT,
+            "camera_count": get_camera_count(),
 
 
 
@@ -125688,7 +125774,7 @@ def site_monitoring_summary() -> dict:
 
 
 
-        "camera_count": CAMERA_COUNT,
+        "camera_count": get_camera_count(),
 
 
 
@@ -125868,7 +125954,7 @@ def sites() -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -125940,7 +126026,7 @@ def sites() -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -127443,7 +127529,7 @@ def settings_detail(settings_slug: str, request: Request) -> str:
 
 
 
-        camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in range(1, CAMERA_COUNT + 1))
+        camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in get_camera_numbers())
 
 
 
@@ -137866,7 +137952,7 @@ def playback(request: Request) -> str:
     if _customer_cameras is not None:
         return _render_customer_playback(_customer_cameras, request)
 
-    camera_numbers = list(range(1, CAMERA_COUNT + 1))
+    camera_numbers = list(get_camera_numbers())
 
 
 
@@ -142356,7 +142442,7 @@ def _phase6e_load(path: Path, default):
 
 def phase6e_operational_snapshot() -> dict:
     now = datetime.now()
-    total_cameras = max(1, CAMERA_COUNT)
+    total_cameras = max(1, get_camera_count())
     online_cameras = sum(
         1 for camera in camera_process_state.values()
         if camera.get("live") in {"online", "running", "healthy"}
