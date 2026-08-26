@@ -15,10 +15,12 @@ sys.path.insert(0, str(ROOT / "app"))
 
 from customer_analytics_panel import (  # noqa: E402
     ANALYTIC_KEYS,
+    LicenseLimitExceeded,
     analytics_row_state,
     assign_entitlement,
     camera_entitlement_rows,
     enabled_analytics,
+    licensed_quantity_exceeded,
     remove_entitlement,
 )
 
@@ -26,7 +28,7 @@ SCHEMA = """
 CREATE TABLE customers(id TEXT PRIMARY KEY);
 CREATE TABLE sites(id TEXT PRIMARY KEY, customer_id TEXT);
 CREATE TABLE cameras(id TEXT PRIMARY KEY, customer_id TEXT, site_id TEXT, name TEXT);
-CREATE TABLE analytics_subscriptions(id TEXT PRIMARY KEY, customer_id TEXT, site_id TEXT, analytic_key TEXT, status TEXT);
+CREATE TABLE analytics_subscriptions(id TEXT PRIMARY KEY, customer_id TEXT, site_id TEXT, analytic_key TEXT, status TEXT, licensed_quantity INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE camera_analytics_entitlements(
     camera_id TEXT NOT NULL, analytic_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -50,6 +52,13 @@ def make_cameras(db, n):
     db.commit()
 
 
+def license(db, analytic_key, quantity, *, sub_id="sub-auto"):
+    db.execute(
+        "INSERT INTO analytics_subscriptions VALUES(?,?,?,?,?,?)",
+        (sub_id, "cust-1", "site-1", analytic_key, "active", quantity),
+    )
+
+
 class TenCameraMixedAssignmentTests(unittest.TestCase):
     """The exact scenario from the requirement: one site, 10 cameras,
     LPR on 2, People Counting on 4 (overlapping with one LPR camera),
@@ -58,6 +67,10 @@ class TenCameraMixedAssignmentTests(unittest.TestCase):
     def setUp(self):
         self.db = fresh_db()
         make_cameras(self.db, 10)
+        license(self.db, "lpr", 2, sub_id="sub-lpr")
+        license(self.db, "people_counting", 4, sub_id="sub-pc")
+        license(self.db, "ppe", 1, sub_id="sub-ppe")
+        self.db.commit()
         now = "2026-01-01T00:00:00"
         assign_entitlement(self.db, "cam-1", "lpr", now=now)
         assign_entitlement(self.db, "cam-2", "lpr", now=now)
@@ -115,6 +128,8 @@ class EntitlementRemovalTests(unittest.TestCase):
     def test_removing_an_entitlement_disables_it_for_that_camera_only(self):
         db = fresh_db()
         make_cameras(db, 2)
+        license(db, "lpr", 5)
+        db.commit()
         now = "2026-01-01T00:00:00"
         assign_entitlement(db, "cam-1", "lpr", now=now)
         assign_entitlement(db, "cam-2", "lpr", now=now)
@@ -130,6 +145,8 @@ class EntitlementRemovalTests(unittest.TestCase):
     def test_removal_is_a_soft_status_change_the_row_still_exists(self):
         db = fresh_db()
         make_cameras(db, 1)
+        license(db, "ppe", 5)
+        db.commit()
         assign_entitlement(db, "cam-1", "ppe", now="2026-01-01T00:00:00")
         remove_entitlement(db, "cam-1", "ppe", now="2026-01-02T00:00:00")
         db.commit()
@@ -140,6 +157,8 @@ class EntitlementRemovalTests(unittest.TestCase):
     def test_reassigning_after_removal_re_enables_it(self):
         db = fresh_db()
         make_cameras(db, 1)
+        license(db, "smart_motion", 5)
+        db.commit()
         assign_entitlement(db, "cam-1", "smart_motion", now="2026-01-01T00:00:00")
         remove_entitlement(db, "cam-1", "smart_motion", now="2026-01-02T00:00:00")
         assign_entitlement(db, "cam-1", "smart_motion", now="2026-01-03T00:00:00")
@@ -157,6 +176,8 @@ class AssignEntitlementValidationTests(unittest.TestCase):
     def test_assigning_the_same_entitlement_twice_is_idempotent(self):
         db = fresh_db()
         make_cameras(db, 1)
+        license(db, "lpr", 5)
+        db.commit()
         assign_entitlement(db, "cam-1", "lpr", now="2026-01-01T00:00:00")
         assign_entitlement(db, "cam-1", "lpr", now="2026-01-02T00:00:00")
         db.commit()
@@ -171,9 +192,7 @@ class SiteLevelSubscriptionDoesNotLeakToUnentitledCamerasTests(unittest.TestCase
     def test_a_site_level_purchase_alone_enables_nothing_on_any_camera(self):
         db = fresh_db()
         make_cameras(db, 3)
-        db.execute(
-            "INSERT INTO analytics_subscriptions VALUES('sub-1','cust-1','site-1','lpr','active')"
-        )
+        license(db, "lpr", 5)
         db.commit()
         # No camera_analytics_entitlements row was ever created for any
         # camera -- the site-level subscription by itself must not turn
@@ -189,6 +208,69 @@ class ZeroAnalyticsCameraTests(unittest.TestCase):
         state = analytics_row_state(camera_entitlement_rows(db, "cam-1"))
         self.assertEqual(len(state), len(ANALYTIC_KEYS))
         self.assertTrue(all(item["enabled"] is False for item in state))
+
+
+class LicensedQuantityLimitTests(unittest.TestCase):
+    """Billing authority: assign_entitlement() must never let a camera-
+    level entitlement exceed what analytics_subscriptions says was
+    actually purchased. subscription = what they bought; camera
+    entitlement = where they use it."""
+
+    def test_licensed_quantity_exceeded_pure_logic(self):
+        self.assertFalse(licensed_quantity_exceeded(licensed_quantity=2, currently_entitled_count=1, already_entitled=False))
+        self.assertTrue(licensed_quantity_exceeded(licensed_quantity=2, currently_entitled_count=2, already_entitled=False))
+        # re-assigning a camera that already has it never counts against the limit
+        self.assertFalse(licensed_quantity_exceeded(licensed_quantity=2, currently_entitled_count=2, already_entitled=True))
+
+    def test_two_purchased_lpr_licenses_allow_exactly_two_cameras(self):
+        db = fresh_db()
+        make_cameras(db, 3)
+        license(db, "lpr", 2)
+        db.commit()
+        now = "2026-01-01T00:00:00"
+        assign_entitlement(db, "cam-1", "lpr", now=now)
+        assign_entitlement(db, "cam-2", "lpr", now=now)
+        db.commit()
+        with self.assertRaises(LicenseLimitExceeded):
+            assign_entitlement(db, "cam-3", "lpr", now=now)
+        self.assertNotIn("lpr", enabled_analytics(camera_entitlement_rows(db, "cam-3")))
+
+    def test_no_subscription_at_all_means_zero_licensed_seats(self):
+        db = fresh_db()
+        make_cameras(db, 1)
+        db.commit()
+        with self.assertRaises(LicenseLimitExceeded):
+            assign_entitlement(db, "cam-1", "lpr", now="2026-01-01T00:00:00")
+
+    def test_freeing_a_seat_by_removal_allows_a_different_camera_to_use_it(self):
+        db = fresh_db()
+        make_cameras(db, 3)
+        license(db, "lpr", 1)
+        db.commit()
+        now = "2026-01-01T00:00:00"
+        assign_entitlement(db, "cam-1", "lpr", now=now)
+        db.commit()
+        with self.assertRaises(LicenseLimitExceeded):
+            assign_entitlement(db, "cam-2", "lpr", now=now)
+
+        remove_entitlement(db, "cam-1", "lpr", now="2026-01-02T00:00:00")
+        db.commit()
+        assign_entitlement(db, "cam-2", "lpr", now="2026-01-03T00:00:00")  # no longer raises
+        db.commit()
+        self.assertIn("lpr", enabled_analytics(camera_entitlement_rows(db, "cam-2")))
+
+    def test_direct_db_state_cannot_create_analytics_the_customer_did_not_purchase(self):
+        # assign_entitlement() is the only supported path, and it always
+        # checks the subscription record -- there is no way through this
+        # function to grant an analytic with zero purchased (non-
+        # cancelled) seats.
+        db = fresh_db()
+        make_cameras(db, 1)
+        license(db, "ppe", 5, sub_id="cancelled-sub")
+        db.execute("UPDATE analytics_subscriptions SET status='cancelled' WHERE id='cancelled-sub'")
+        db.commit()
+        with self.assertRaises(LicenseLimitExceeded):
+            assign_entitlement(db, "cam-1", "ppe", now="2026-01-01T00:00:00")
 
 
 if __name__ == "__main__":

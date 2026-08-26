@@ -91,13 +91,71 @@ def camera_entitlement_rows(db, camera_id: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+class LicenseLimitExceeded(Exception):
+    """Raised by assign_entitlement() when the site has not purchased
+    enough camera-seats of this analytic (analytics_subscriptions.
+    licensed_quantity) to cover one more camera. Billing authority always
+    wins: direct DB state must never let a camera entitlement exist beyond
+    what was actually purchased."""
+
+
+def licensed_quantity_exceeded(*, licensed_quantity: int, currently_entitled_count: int, already_entitled: bool) -> bool:
+    """Pure limit check: True if assigning would exceed the purchased
+    seat count. already_entitled=True (re-assigning/refreshing a camera
+    that already has this analytic) never counts against the limit --
+    only a genuinely NEW camera-seat does."""
+    if already_entitled:
+        return False
+    return currently_entitled_count >= licensed_quantity
+
+
 def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
     """Turns on one analytic for exactly one camera -- never touches any
     other camera, even another one at the same site or owned by the same
     customer. Idempotent: assigning an already-active entitlement just
-    refreshes updated_at."""
+    refreshes updated_at.
+
+    Enforces the billing/subscription record as the authority on capacity
+    (see LicenseLimitExceeded): a site that purchased 2 LPR licenses can
+    never have LPR enabled on a 3rd camera through this function, no
+    matter how it's called."""
     if analytic_key not in ANALYTIC_LABELS:
         raise ValueError(f"Unknown analytic_key: {analytic_key!r}")
+
+    camera = db.execute("SELECT site_id, customer_id FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    if not camera:
+        raise LookupError(f"Camera not found: {camera_id!r}")
+    site_id, customer_id = camera["site_id"], camera["customer_id"]
+
+    subscription = db.execute(
+        "SELECT licensed_quantity FROM analytics_subscriptions "
+        "WHERE customer_id=? AND (site_id=? OR site_id IS NULL) AND analytic_key=? AND status!='cancelled' "
+        "ORDER BY site_id IS NULL LIMIT 1",
+        (customer_id, site_id, analytic_key),
+    ).fetchone()
+    licensed_quantity = subscription["licensed_quantity"] if subscription else 0
+
+    already_entitled = db.execute(
+        "SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=? AND status='active'",
+        (camera_id, analytic_key),
+    ).fetchone() is not None
+
+    currently_entitled_count = db.execute(
+        "SELECT COUNT(*) AS n FROM camera_analytics_entitlements e JOIN cameras c ON c.id=e.camera_id "
+        "WHERE c.site_id=? AND e.analytic_key=? AND e.status='active'",
+        (site_id, analytic_key),
+    ).fetchone()["n"]
+
+    if licensed_quantity_exceeded(
+        licensed_quantity=licensed_quantity,
+        currently_entitled_count=currently_entitled_count,
+        already_entitled=already_entitled,
+    ):
+        raise LicenseLimitExceeded(
+            f"{ANALYTIC_LABELS[analytic_key][0]} is licensed for {licensed_quantity} camera(s) at this site; "
+            f"that limit is already in use."
+        )
+
     db.execute(
         "INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
         "VALUES(?,?,'active',?,?) "

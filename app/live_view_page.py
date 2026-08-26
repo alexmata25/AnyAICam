@@ -29,6 +29,7 @@ already-reviewed, unchanged routes.
 """
 
 import json
+from datetime import datetime
 from html import escape
 from typing import Callable
 
@@ -37,7 +38,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from partner_db import connection
 from partner_portal import partner_identity
-from customer_analytics_panel import analytics_row_state, camera_entitlement_rows, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT
+from customer_analytics_panel import analytics_row_state, camera_entitlement_rows, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT, assign_entitlement, remove_entitlement, LicenseLimitExceeded
+from camera_access import is_camera_authorized, set_camera_access, remove_camera_access, ACCESS_MODES
 
 POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
@@ -343,19 +345,24 @@ def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
         raise HTTPException(status_code=404, detail='Camera not found.')
 
     user = db.execute(
-        'SELECT id FROM partner_users WHERE email=?',
+        'SELECT id, camera_access_mode FROM partner_users WHERE email=?',
         (identity['email'],),
     ).fetchone()
     if not user:
         raise HTTPException(status_code=403, detail='Customer owner permission required.')
 
-    if identity.get('role') != 'customer_owner':
-        permission = db.execute(
-            'SELECT can_live FROM customer_camera_permissions WHERE user_id=? AND camera_id=?',
-            (user['id'], camera_id),
-        ).fetchone()
-        if not permission or not permission['can_live']:
-            raise HTTPException(status_code=403, detail='Not authorized to view this camera live.')
+    permitted_camera_ids = {
+        row['camera_id'] for row in db.execute(
+            'SELECT camera_id FROM customer_camera_permissions WHERE user_id=? AND can_live=1', (user['id'],)
+        ).fetchall()
+    }
+    if not is_camera_authorized(
+        camera_id,
+        role=identity.get('role', ''),
+        access_mode=user['camera_access_mode'] or 'selected',
+        permitted_camera_ids=permitted_camera_ids,
+    ):
+        raise HTTPException(status_code=403, detail='Not authorized to view this camera live.')
 
     return dict(camera)
 
@@ -541,6 +548,88 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 </script>'''
 
         return page_shell('Live view', 'live', content, scripts)
+
+    def _require_customer_owner(request: Request) -> dict:
+        identity = partner_identity(request)
+        if not identity or identity.get('role') != 'customer_owner':
+            raise HTTPException(status_code=403, detail='Customer owner permission required.')
+        return identity
+
+    @app.post('/api/customer/users/{user_id}/camera-access')
+    def set_user_camera_access(request: Request, user_id: str, payload: dict) -> dict:
+        """Customer-owner-only: grants a restricted user (customer_viewer)
+        'all' cameras or an explicit 'selected' list. Takes effect
+        immediately (set_camera_access() deletes and replaces the row set
+        in one call) and never crosses into another customer's users or
+        cameras -- both are re-scoped to identity['customer_id'] here."""
+        identity = _require_customer_owner(request)
+        mode = str(payload.get('mode', '')).strip()
+        if mode not in ACCESS_MODES:
+            raise HTTPException(status_code=400, detail=f"mode must be one of {ACCESS_MODES}.")
+        camera_ids = [str(item) for item in payload.get('camera_ids', [])]
+        with connection() as db:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE id=? AND customer_id=?',
+                (user_id, identity['customer_id']),
+            ).fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail='User not found.')
+            if camera_ids:
+                owned = {row['id'] for row in db.execute(
+                    'SELECT id FROM cameras WHERE customer_id=?', (identity['customer_id'],)
+                ).fetchall()}
+                if not set(camera_ids) <= owned:
+                    raise HTTPException(status_code=400, detail='One or more camera_ids do not belong to this customer.')
+            set_camera_access(db, user_id=user_id, access_mode=mode, camera_ids=camera_ids, now=datetime.now().isoformat())
+        return {'message': 'Camera access updated.', 'mode': mode, 'camera_ids': camera_ids if mode == 'selected' else []}
+
+    @app.delete('/api/customer/users/{user_id}/camera-access/{camera_id}')
+    def remove_user_camera_access(request: Request, user_id: str, camera_id: str) -> dict:
+        identity = _require_customer_owner(request)
+        with connection() as db:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE id=? AND customer_id=?',
+                (user_id, identity['customer_id']),
+            ).fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail='User not found.')
+            remove_camera_access(db, user_id=user_id, camera_id=camera_id)
+        return {'message': 'Camera access removed.'}
+
+    @app.post('/api/customer/cameras/{camera_id}/analytics/{analytic_key}')
+    def assign_camera_analytic(request: Request, camera_id: str, analytic_key: str) -> dict:
+        """Customer-owner-only camera-level entitlement assignment.
+        assign_entitlement() itself enforces the licensed_quantity cap
+        against analytics_subscriptions (see LicenseLimitExceeded) --
+        billing is always the authority on how many camera-seats exist."""
+        identity = _require_customer_owner(request)
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+                (camera_id, identity['customer_id']),
+            ).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail='Camera not found.')
+            try:
+                assign_entitlement(db, camera_id, analytic_key, now=datetime.now().isoformat())
+            except ValueError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+            except LicenseLimitExceeded as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        return {'message': 'Analytic enabled for this camera.'}
+
+    @app.delete('/api/customer/cameras/{camera_id}/analytics/{analytic_key}')
+    def remove_camera_analytic(request: Request, camera_id: str, analytic_key: str) -> dict:
+        identity = _require_customer_owner(request)
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+                (camera_id, identity['customer_id']),
+            ).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail='Camera not found.')
+            remove_entitlement(db, camera_id, analytic_key, now=datetime.now().isoformat())
+        return {'message': 'Analytic removed from this camera.'}
 
     @app.get('/api/customer/cameras/{camera_id}/analytics')
     def customer_camera_analytics_enabled(request: Request, camera_id: str) -> dict:

@@ -79,6 +79,10 @@ def apply_migrations():
             ('account_status',"TEXT NOT NULL DEFAULT 'active'"),
             ('must_change_password','INTEGER NOT NULL DEFAULT 0'),
             ('terms_accepted_at','TEXT'),
+            # Per-camera user permissions: 'selected' (default, fail-closed --
+            # see camera_access.py's DEFAULT_ACCESS_MODE/is_camera_authorized())
+            # or 'all' (every camera under this user's own customer_id).
+            ('camera_access_mode',"TEXT NOT NULL DEFAULT 'selected'"),
         ):
             if name not in user_columns: db.execute(f'ALTER TABLE partner_users ADD COLUMN {name} {definition}')
         permission_columns=({item['name'] for item in db.execute('PRAGMA table_info(customer_camera_permissions)').fetchall()}
@@ -113,6 +117,18 @@ def apply_migrations():
         for name,definition in (('device_key','TEXT'),('ip_address','TEXT'),('onvif_endpoint','TEXT'),('manufacturer','TEXT'),('model','TEXT')):
             if name not in camera_columns: db.execute(f'ALTER TABLE cameras ADD COLUMN {name} {definition}')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_customer_device_key ON cameras(customer_id,device_key) WHERE device_key IS NOT NULL')
+
+        # Billing authority for camera-level analytics entitlements:
+        # how many camera-seats of this analytic the customer/site
+        # actually purchased. assign_entitlement() in
+        # customer_analytics_panel.py must refuse to enable an analytic
+        # on more cameras than licensed_quantity allows -- subscription
+        # = what they bought, camera entitlement = where they use it,
+        # and the latter can never exceed the former.
+        subscription_columns=({item['name'] for item in db.execute('PRAGMA table_info(analytics_subscriptions)').fetchall()}
+                              if backend()=='sqlite' else
+                              {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='analytics_subscriptions'").fetchall()})
+        if 'licensed_quantity' not in subscription_columns: db.execute('ALTER TABLE analytics_subscriptions ADD COLUMN licensed_quantity INTEGER NOT NULL DEFAULT 1')
 
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else
