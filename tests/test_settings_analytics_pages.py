@@ -116,6 +116,13 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
         self.assertIn("Coming soon", html)
 
     def test_analytics_page_renders_feature_links(self):
+        # analytics() now takes request and gates on current_user()/
+        # has_permission() before rendering anything -- the Samsung
+        # walkthrough finding that this route had no identity check at
+        # all -- so this isolated-execution namespace needs the same
+        # current_user/has_permission/permission_denied_page mocks
+        # test_settings_page_renders_category_links already established
+        # for /settings's identical gate.
         namespace = self.execute(
             self.assignment("ANALYTICS_FEATURES"),
             self.node(ast.FunctionDef, "slugify"),
@@ -123,6 +130,9 @@ class SettingsAnalyticsPageTests(unittest.TestCase):
             re=re,
             escape=escape,
             get_camera_numbers=lambda: [1, 2, 3, 4],
+            current_user=lambda _request: {"role": "administrator"},
+            has_permission=lambda _user, _permission: True,
+            permission_denied_page=lambda _title, _active, _permission: "denied",
             page_shell=lambda _title, _active, content, _scripts="": content,
         )
 

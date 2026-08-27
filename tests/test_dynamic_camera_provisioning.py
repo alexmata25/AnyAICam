@@ -254,10 +254,21 @@ class NotConfiguredSafetyFixTests(unittest.TestCase):
         self.assertIn("def get_supervisor_slot_count() -> int:", MAIN_SOURCE)
         self.assertIn("CAMERA_SUPERVISOR_HEADROOM", MAIN_SOURCE)
 
-    def test_zero_configured_cameras_still_gets_the_legacy_default_slot_count(self):
+    def test_zero_configured_cameras_and_zero_legacy_env_vars_gets_an_empty_list(self):
+        # Superseded by the Samsung camera-count audit (see main.py's
+        # legacy_camera_numbers_in_use()): the unconditional
+        # `list(range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1))` fallback this
+        # test used to assert made a fresh dynamic-provisioning install
+        # with zero cameras and zero legacy env vars report cameras_total:
+        # 4 and show four fake "Camera 1"-"Camera 4" selectors in
+        # Investigate. The fallback is now conditional on
+        # legacy_camera_numbers_in_use() -- only a genuine legacy
+        # installation (actual CAMERA1_* etc. configured) still gets its
+        # slot numbers back; see app/tests/test_camera_numbers_phantom_
+        # fallback.py for the full behavioral coverage of both cases.
         get_numbers_start = MAIN_SOURCE.index("def get_camera_numbers() -> list[int]:")
-        body = MAIN_SOURCE[get_numbers_start:get_numbers_start + 1500]
-        self.assertIn("return numbers if numbers else list(range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1))", body)
+        body = MAIN_SOURCE[get_numbers_start:get_numbers_start + 2200]
+        self.assertIn("return numbers if numbers else legacy_camera_numbers_in_use()", body)
 
 
 class CameraCountRemovalTests(unittest.TestCase):

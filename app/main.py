@@ -1842,6 +1842,21 @@ class CameraNotConfiguredError(Exception):
     and recording never started and nothing in the logs said why."""
 
 
+def legacy_camera_numbers_in_use() -> list[int]:
+    """Which of the 1..LEGACY_DEFAULT_CAMERA_COUNT legacy slots actually
+    have at least one CAMERA{n}_HOST/USERNAME/PASSWORD env var set --
+    i.e. a real legacy installation genuinely relying on that scheme,
+    not merely the ABSENCE of dynamic provisioning. get_camera_numbers()
+    is the only caller; configuration_issues() (the readiness validator)
+    has its own similar-looking but distinct partial-vs-fully-configured
+    scan and is intentionally left as its own logic, not merged with
+    this one."""
+    return [
+        camera for camera in range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1)
+        if any(os.environ.get(f"CAMERA{camera}_{suffix}", "").strip() for suffix in ("HOST", "USERNAME", "PASSWORD"))
+    ]
+
+
 def get_camera_numbers() -> list[int]:
     """The real, currently-provisioned set of camera_number slots this
     appliance's FFmpeg/HLS/recording/analytics pipeline should run --
@@ -1853,12 +1868,19 @@ def get_camera_numbers() -> list[int]:
     report for this documented limitation in a future multi-appliance
     "combined" deployment.
 
-    Falls back to the legacy 1..LEGACY_DEFAULT_CAMERA_COUNT slot set
-    (today's exact pre-Phase-3 behavior) only if the database has never
-    been reached or genuinely has no camera rows at all -- e.g. a fresh
-    install that has provisioned nothing yet, including one still relying
-    entirely on the CAMERA<n>_HOST/USERNAME/PASSWORD env-var scheme
-    camera_url() still supports as a fallback."""
+    Falls back to the legacy CAMERA<n>_HOST/USERNAME/PASSWORD env-var
+    slots ONLY when at least one is genuinely configured (see
+    legacy_camera_numbers_in_use()) -- a fresh dynamic-provisioning
+    install with zero cameras and no legacy env vars returns an empty
+    list, not four phantom slots. This was previously an unconditional
+    `range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1)` fallback whenever the
+    `cameras` table was empty, which made a brand-new install with
+    nothing provisioned yet report cameras_total: 4, show four fake
+    "Camera 1"-"Camera 4" selectors in Investigate, and so on across
+    every one of this function's callers -- see the Samsung camera-
+    count audit this fixes. A real legacy installation (actual
+    CAMERA1_* etc. configuration present) is unaffected: it still gets
+    its configured slot numbers back exactly as before."""
     try:
         from partner_db import connection
         with connection() as db:
@@ -1868,7 +1890,7 @@ def get_camera_numbers() -> list[int]:
     except Exception:
         assigned = []
     numbers = [int(item["camera_number"]) for item in assigned]
-    return numbers if numbers else list(range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1))
+    return numbers if numbers else legacy_camera_numbers_in_use()
 
 
 def get_camera_count() -> int:
@@ -70823,7 +70845,34 @@ def dashboard_intelligence_api() -> dict:
 
 
 
-def camera_health_page() -> str:
+def camera_health_page(request: Request) -> str:
+
+
+
+
+
+
+
+
+    user = current_user(request)
+
+
+
+
+
+
+
+
+    if not has_permission(user, "view_analytics"):
+
+
+
+
+
+
+
+
+        return permission_denied_page("Camera health", "camera-health", "view_analytics")
 
 
 
@@ -71024,6 +71073,15 @@ def camera_health_page() -> str:
 
 
         )
+
+    if not rows:
+        # A fresh dynamic-provisioning appliance with zero cameras --
+        # get_camera_numbers() now honestly returns [] instead of the
+        # old phantom Camera 1-4 fallback (see legacy_camera_numbers_
+        # in_use()) -- must not render an empty table with no
+        # explanation; a real legacy install still populates rows above
+        # and never reaches this branch.
+        rows = ['<tr><td colspan="9" class="empty">No cameras configured yet. Add a camera via Remote Device Management or camera discovery to see its health here.</td></tr>']
 
 
 
@@ -75858,7 +75916,34 @@ def sales_training_resource_file(item_id: str, request: Request) -> Response:
 
 
 
-def analytics() -> str:
+def analytics(request: Request) -> str:
+
+
+
+
+
+
+
+
+    user = current_user(request)
+
+
+
+
+
+
+
+
+    if not has_permission(user, "view_analytics"):
+
+
+
+
+
+
+
+
+        return permission_denied_page("Analytics", "analytics", "view_analytics")
 
 
 

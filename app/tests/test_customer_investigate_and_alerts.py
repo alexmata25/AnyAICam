@@ -503,7 +503,25 @@ def test_create_clip_rejects_unauthenticated_caller(monkeypatch):
 
 
 def test_create_clip_rejects_camera_not_in_callers_own_list(monkeypatch):
-    monkeypatch.setattr(main, "current_user", lambda request: {"role": "admin", "camera_ids": [1, 2], "enabled": True})
+    # role "operator", not "admin" -- user_camera_ids() special-cases
+    # role=="admin" (and super_admin) to always return get_camera_numbers()
+    # regardless of the caller's own camera_ids, which would make this
+    # test actually exercise get_camera_numbers()'s fallback boundary
+    # instead of the caller's own list as the test name claims.
+    #
+    # get_camera_numbers() is also explicitly seeded here with camera 5
+    # (a real provisioned camera on this appliance, just not one this
+    # caller is assigned) -- user_camera_ids() intersects a caller's own
+    # camera_ids against get_camera_numbers() as an extra floor ("can't
+    # be permitted to a camera that doesn't exist"), so leaving
+    # get_camera_numbers() at its post-fix empty default would make
+    # camera 5 fail for that unrelated reason instead of the "not in the
+    # caller's own list" boundary this test is named for. See the
+    # Samsung camera-count audit: before this fix, this test happened to
+    # still pass either way only because get_camera_numbers() phantom-
+    # defaulted to [1,2,3,4], which coincidentally excluded camera 5.
+    monkeypatch.setattr(main, "current_user", lambda request: {"role": "operator", "camera_ids": [1, 2], "enabled": True})
+    monkeypatch.setattr(main, "get_camera_numbers", lambda: [1, 2, 5])
     clip_request = main.ClipRequest(camera=5, start_time=datetime(2026, 8, 21, 0, 0, 0), end_time=datetime(2026, 8, 21, 0, 0, 30))
     with pytest.raises(main.HTTPException) as excinfo:
         asyncio.run(main.create_clip(clip_request, object()))
@@ -511,7 +529,12 @@ def test_create_clip_rejects_camera_not_in_callers_own_list(monkeypatch):
 
 
 def test_create_clip_allows_camera_in_callers_own_list(monkeypatch):
-    monkeypatch.setattr(main, "current_user", lambda request: {"role": "admin", "camera_ids": [1, 2], "enabled": True})
+    # See test_create_clip_rejects_camera_not_in_callers_own_list's
+    # comment -- role "operator" (not "admin"), and get_camera_numbers()
+    # seeded with the caller's own cameras so the post-fix empty default
+    # doesn't mask the "own list" check this test exists to prove.
+    monkeypatch.setattr(main, "current_user", lambda request: {"role": "operator", "camera_ids": [1, 2], "enabled": True})
+    monkeypatch.setattr(main, "get_camera_numbers", lambda: [1, 2])
 
     async def _fake_build_manual_clip(*args, **kwargs):
         return None
