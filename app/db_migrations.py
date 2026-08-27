@@ -134,3 +134,16 @@ def apply_migrations():
                            if backend()=='sqlite' else
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
         if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')
+
+        # Appliance identity contract (see appliance_identity.py):
+        # authorization_version_at_login records the identity's
+        # authorization_version at the moment this session was
+        # established, so a later revocation/role-change/re-grant can be
+        # detected by comparing integers -- see appliance_identity.
+        # sessions_to_revoke(). NULL for a session established before
+        # this column existed, or for a legacy-side (admin@local) login
+        # this concept never applies to.
+        session_columns=({item['name'] for item in db.execute('PRAGMA table_info(user_sessions)').fetchall()}
+                         if backend()=='sqlite' else
+                         {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='user_sessions'").fetchall()})
+        if 'authorization_version_at_login' not in session_columns: db.execute('ALTER TABLE user_sessions ADD COLUMN authorization_version_at_login INTEGER')

@@ -44148,6 +44148,28 @@ def login_submit(
 
 
 
+def own_appliance_identity() -> dict | None:
+    """This running instance's own appliance credentials, for calling
+    the cloud-delegated identity endpoints (appliance_identity.py,
+    POST /api/appliance/{cloud_id}/authenticate-operator) as itself,
+    the same way any other activated appliance would. Not yet wired to
+    the real activation flow (today's POST /api/appliance/activate
+    response goes to whatever called it, not persisted by this
+    process) -- read from env vars for v1 so the delegated contract is
+    fully real, signed, and verified end-to-end without that follow-up
+    wiring. Returns None when any of the three isn't configured, and
+    portal_login_submit() falls back to checking partner_db directly --
+    byte-for-byte the same as before this contract existed. This keeps
+    every deployment that hasn't set these (Samsung today) completely
+    unaffected."""
+    appliance_id = os.environ.get("ANYAICAM_APPLIANCE_ID", "").strip()
+    cloud_id = os.environ.get("ANYAICAM_APPLIANCE_CLOUD_ID", "").strip()
+    credential = os.environ.get("ANYAICAM_APPLIANCE_CREDENTIAL", "").strip()
+    if not (appliance_id and cloud_id and credential):
+        return None
+    return {"appliance_id": appliance_id, "cloud_id": cloud_id, "credential": credential}
+
+
 @app.post("/api/portal-login")
 def portal_login_submit(request: Request, payload: dict):
     """The blue Portal login page's (partner.html) Administrator/Partner/
@@ -44181,14 +44203,62 @@ def portal_login_submit(request: Request, payload: dict):
         if candidate_role in ADMIN_PORTAL_ROLES:
             legacy_role = candidate_role
 
-    from partner_db import authenticate_detailed as partner_authenticate_detailed
-
-    partner_user, _partner_reason = partner_authenticate_detailed(email, password)
+    # Partner/Administrator/Technician password verification delegates to
+    # the cloud-identity contract (appliance_identity.py) once this
+    # instance is configured as an activated appliance -- see
+    # own_appliance_identity(). Until then (Samsung today), this falls
+    # back to checking partner_db directly, byte-for-byte the same as
+    # before that contract existed -- nothing changes for a deployment
+    # that hasn't been wired up to it.
+    own_appliance = own_appliance_identity()
     partner_role: str | None = None
-    if partner_user:
-        candidate_role = str(partner_user.get("role") or "").strip().lower()
-        if candidate_role in {"administrator", "partner_owner", "salesperson", "technician"}:
-            partner_role = candidate_role
+    partner_user: dict | None = None
+    partner_authorization_version: int | None = None
+    if own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS:
+        from appliance_identity import CloudIdentityUnavailable, ManifestError, get_cloud_identity_backend, verify_assertion
+
+        backend = get_cloud_identity_backend()
+        try:
+            result = backend.authenticate_operator(email=email, password=password, portal=selected_portal, cloud_id=own_appliance["cloud_id"])
+        except CloudIdentityUnavailable:
+            # A brand-new login can never be trusted without the cloud --
+            # see CloudIdentityUnavailable's own docstring. An already-
+            # established session is unaffected by this branch entirely;
+            # it keeps working via its own cookie, no cloud call involved.
+            raise HTTPException(
+                status_code=503,
+                detail="Cloud authentication is required and unavailable right now. Try again once connectivity "
+                       "returns, or use local emergency recovery access if you administer this appliance.",
+            )
+        if result.get("status") == "ok":
+            try:
+                verify_assertion(result, expected_cloud_id=own_appliance["cloud_id"], public_keys=backend.public_keys())
+            except ManifestError:
+                result = {"status": "denied", "reason": "invalid_assertion"}
+        if result.get("status") == "ok":
+            assertion = result["assertion"]
+            partner_role = assertion["role"]
+            partner_user = {
+                "id": assertion["user_id"], "email": assertion["email"],
+                "partner_id": assertion["scope_id"] if assertion["scope_type"] == "partner" else None,
+                "customer_id": assertion["scope_id"] if assertion["scope_type"] in {"customer", "site"} else None,
+            }
+            partner_authorization_version = assertion["authorization_version"]
+    elif not own_appliance:
+        from partner_db import authenticate_detailed as partner_authenticate_detailed
+
+        partner_user, _partner_reason = partner_authenticate_detailed(email, password)
+        if partner_user:
+            candidate_role = str(partner_user.get("role") or "").strip().lower()
+            if candidate_role in {"administrator", "partner_owner", "salesperson", "technician"}:
+                partner_role = candidate_role
+            else:
+                partner_user = None
+    # own_appliance is set but no (valid) portal was selected: the
+    # delegated contract requires a portal to check one bucket against
+    # (see authenticate_operator()'s own docstring) -- resolve_portal_
+    # login() below still correctly reports this as "no selection made"
+    # rather than silently guessing.
 
     decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role)
 
@@ -44228,6 +44298,7 @@ def portal_login_submit(request: Request, payload: dict):
 
     return establish_partner_session(
         decision["destination"], request=request, email=email, role=decision["role"], user=partner_user,
+        authorization_version_at_login=partner_authorization_version,
     )
 
 

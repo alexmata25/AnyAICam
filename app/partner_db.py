@@ -113,6 +113,19 @@ def initialize_database() -> None:
         # camera added to the account later is automatically included
         # without the customer having to re-save anything.
         '''CREATE TABLE IF NOT EXISTS customer_notification_channel_cameras(user_id TEXT NOT NULL,camera_id TEXT NOT NULL,PRIMARY KEY(user_id,camera_id),FOREIGN KEY(user_id) REFERENCES partner_users(id),FOREIGN KEY(camera_id) REFERENCES cameras(id))''',
+        # Appliance identity contract (see appliance_identity.py's own
+        # module docstring for the full design): the explicit grant this
+        # whole contract exists to require -- a user is authorized for a
+        # given appliance only if a live (revoked_at IS NULL) row here
+        # resolves to it, never merely because partner_id matches.
+        # scope_type is one of global/partner/customer/site/appliance;
+        # scope_id is NULL only for scope_type='global'.
+        '''CREATE TABLE IF NOT EXISTS identity_grants(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,role TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,granted_at TEXT NOT NULL,granted_by TEXT,revoked_at TEXT,FOREIGN KEY(user_id) REFERENCES partner_users(id))''',
+        # v1/dev only: the manifest-signing keypair lives in this same
+        # database. A real cloud deployment keeps the private key in a
+        # proper KMS/secrets store, never a queryable table -- see
+        # appliance_identity.py's module docstring.
+        '''CREATE TABLE IF NOT EXISTS identity_signing_keys(key_id TEXT PRIMARY KEY,public_key_b64 TEXT NOT NULL,private_key_b64 TEXT NOT NULL,created_at TEXT NOT NULL,revoked_at TEXT)''',
     ]
     with database_connect() as db:
         for statement in statements: db.execute(statement)
@@ -120,6 +133,12 @@ def initialize_database() -> None:
         if 'activation_status' not in appliance_columns: db.execute("ALTER TABLE appliances ADD COLUMN activation_status TEXT NOT NULL DEFAULT 'pending'")
         for column,definition in [('partner_id','TEXT'),('uptime_seconds','INTEGER NOT NULL DEFAULT 0'),('disk_capacity','REAL NOT NULL DEFAULT 0'),('recording_used','REAL NOT NULL DEFAULT 0'),('last_error','TEXT'),('state',"TEXT NOT NULL DEFAULT 'offline'"),('credential_revoked_at','TEXT')]:
             if column not in appliance_columns: db.execute(f'ALTER TABLE appliances ADD COLUMN {column} {definition}')
+        # authorization_version: bumped on any grant/role/enabled change
+        # for this user -- the deterministic (never clock-based) staleness
+        # signal an appliance compares against its cached manifest. See
+        # appliance_identity.py.
+        partner_user_columns={item['name'] for item in db.execute('PRAGMA table_info(partner_users)').fetchall()} if backend()=='sqlite' else {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='partner_users'").fetchall()}
+        if 'authorization_version' not in partner_user_columns: db.execute('ALTER TABLE partner_users ADD COLUMN authorization_version INTEGER NOT NULL DEFAULT 1')
     bootstrap_admin()
     from db_migrations import apply_migrations
     apply_migrations()

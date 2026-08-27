@@ -58,7 +58,7 @@ def _identity(request: Request) -> dict | None:
         return None
 
 
-def establish_partner_session(destination: str, *, request: Request, email: str, role: str, user: dict | None) -> RedirectResponse:
+def establish_partner_session(destination: str, *, request: Request, email: str, role: str, user: dict | None, authorization_version_at_login: int | None = None) -> RedirectResponse:
     """Writes the user_sessions row and sets the signed partner cookie
     for a freshly-authenticated Partner Portal identity, then redirects
     to destination -- the exact same two steps partner_login_submit()
@@ -72,12 +72,13 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
     expiry = now + timedelta(hours=8)
     with connection() as db:
         db.execute(
-            'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent,authorization_version_at_login) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
             (
                 session_id, user.get('id') if user else None, email, role, 'Web browser', 'cookie',
                 now.isoformat(), now.isoformat(), expiry.isoformat(),
                 request.client.host if request.client else None, request.headers.get('user-agent', '')[:500],
+                authorization_version_at_login,
             ),
         )
     response = RedirectResponse(destination, status_code=303)

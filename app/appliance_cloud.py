@@ -178,6 +178,52 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
     def appliance_configuration(request: Request) -> dict:
         appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
+    @app.get('/api/appliance/signing-keys')
+    def identity_signing_keys() -> dict:
+        # Public keys only -- deliberately unauthenticated, matching how
+        # any public-key distribution endpoint works. An appliance calls
+        # this once after activation and again whenever it sees an
+        # unrecognized key_id, so key rotation never requires
+        # re-activation. See appliance_identity.py's module docstring.
+        from appliance_identity import get_cloud_identity_backend
+        return {'keys': get_cloud_identity_backend().public_keys()}
+
+    @app.get('/api/appliance/{cloud_id}/identity-manifest')
+    def identity_manifest(request: Request,cloud_id: str) -> dict:
+        appliance=authenticate_appliance(request)
+        if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
+        from appliance_identity import get_cloud_identity_backend, reconcile_sessions_against_manifest
+        manifest=get_cloud_identity_backend().fetch_manifest(cloud_id=appliance['cloud_id'])
+        # Reconciliation runs on every fetch, not on a separate schedule --
+        # in this mock/dev setup the 'cloud' database the manifest was
+        # just built from and the local session table live in the same
+        # place, so this is the one real, already-wired trigger point.
+        # See appliance_identity.reconcile_sessions_against_manifest()'s
+        # own docstring for what still needs a genuine periodic caller
+        # once the appliance and cloud are actually separate processes.
+        with connection() as db: revoked=reconcile_sessions_against_manifest(db,manifest=manifest)
+        if revoked: audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.sessions_revoked_on_manifest_refresh','appliance',appliance['id'],{'session_count':len(revoked)})
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.identity_manifest_fetched','appliance',appliance['id'],{'identity_count':len(manifest['identities']),'manifest_version':manifest['manifest_version']})
+        return manifest
+
+    @app.post('/api/appliance/{cloud_id}/authenticate-operator')
+    def authenticate_operator_route(request: Request,cloud_id: str,payload: dict) -> dict:
+        # Cloud-delegated login (design doc §3): the appliance forwards a
+        # browser's email/password/portal here using its OWN credential --
+        # the browser's password is never persisted locally, only carried
+        # through in this one request. A correct password alone is never
+        # sufficient; authenticate_operator() also requires a grant that
+        # resolves to this specific appliance (§2) -- same-partner_id is
+        # never enough on its own.
+        appliance=authenticate_appliance(request)
+        if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
+        email=str(payload.get('email','')); password=str(payload.get('password','')); portal=payload.get('portal')
+        from appliance_identity import get_cloud_identity_backend
+        result=get_cloud_identity_backend().authenticate_operator(email=email,password=password,portal=portal,cloud_id=appliance['cloud_id'])
+        outcome='login.delegated_succeeded' if result.get('status')=='ok' else 'login.delegated_denied'
+        audit({'email':email,'role':'appliance'},outcome,'appliance',appliance['id'],{'portal':portal,'reason':result.get('reason')})
+        return result
+
     @app.post('/api/appliance/events')
     def events(request: Request,payload: dict) -> dict:
         appliance=authenticate_appliance(request); safe=sanitize_appliance_payload(payload); inserted=duplicates=0; accepted=[]; now=datetime.now().isoformat()
