@@ -82,9 +82,19 @@ class WizardBStepProgressionTests(unittest.TestCase):
 
 class RoleAccessBoundaryTests(unittest.TestCase):
     def test_onboard_customer_requires_partner_access_and_permissions(self):
+        # _dual_mode_identity() (partner_workspace.py) replaced the direct
+        # require_partner_access(request) call here -- it still enforces
+        # the exact same role check for a direct Partner Portal session
+        # (require_partner_access()'s own contract, unchanged), and
+        # additionally accepts a legacy Admin Portal session with a live,
+        # already-linked admin_partner_links bridge (see
+        # admin_partner_bridge.py) so an authorized administrator can
+        # reuse this same onboarding workflow without a second manual
+        # Partner Portal login. Neither the permission checks below nor
+        # require_partner_access() itself were weakened or bypassed.
         start = PARTNER_WORKSPACE_SOURCE.index("def onboard_customer")
         body = PARTNER_WORKSPACE_SOURCE[start:start + 400]
-        self.assertIn("require_partner_access(request)", body)
+        self.assertIn("_dual_mode_identity(request)", body)
         self.assertIn("require_permission(identity,'customer.create')", body)
 
     def test_customer_setup_page_requires_customer_owner_role(self):

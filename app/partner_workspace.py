@@ -9,7 +9,7 @@ from typing import Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from partner_portal import partner_identity, require_partner_access
+from partner_portal import partner_identity, require_partner_access, PARTNER_ROLES
 from camera_install_state import camera_is_installed, camera_status_label
 from pricing_config import calculate_partner_quote, calculate_quote, load_pricing
 from appliance_protocol import encrypt_camera_credentials
@@ -36,6 +36,37 @@ def _temporary_password() -> str:
     return secrets.token_urlsafe(12)
 
 
+def _dual_mode_identity(request: Request, *, eligible_roles: set[str] = PARTNER_ROLES) -> dict:
+    """Accepts a direct Partner Portal session (require_partner_access()'s
+    own contract, unchanged: role must be in eligible_roles) OR, when
+    there isn't one, a legacy Admin Portal session with a live,
+    already-linked partner bridge -- see admin_partner_bridge.
+    resolve_partner_identity_with_bridge() and main.py's
+    operations_rdm_page() for the same two-step pattern used first for
+    /operations/rdm. This lets an authorized administrator reuse the
+    existing customer/onboarding workflow (Add New Customer) without a
+    second manual Partner Portal login, exactly as the user requested
+    -- it never creates a new identity or a new permission, only
+    supplies one that a prior, explicit link already proved. Raises 403
+    if neither a direct nor a bridged identity applies."""
+    identity = partner_identity(request)
+    if identity and identity.get('role') in eligible_roles:
+        return identity
+    if identity:
+        raise HTTPException(status_code=403, detail='Your Partner Portal account type cannot use this workflow.')
+    from main import current_user  # deferred: main.py imports this module at load time, so importing main.py back at module scope would be circular
+    from admin_partner_bridge import resolve_partner_identity_with_bridge
+    admin_user = current_user(request)
+    bridged = resolve_partner_identity_with_bridge(request, admin_user, eligible_roles=eligible_roles)
+    if not bridged:
+        raise HTTPException(
+            status_code=403,
+            detail='Partner Portal access required. Sign in to the Partner Portal, or link an authorized partner '
+                   'account from Operations > Remote device management.',
+        )
+    return bridged
+
+
 def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
     def customer_owner(request: Request) -> dict:
         identity=partner_identity(request)
@@ -51,7 +82,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.post('/api/partner/onboarding/drafts')
     def save_onboarding_draft(request: Request,payload: dict) -> dict:
-        identity=require_partner_access(request)
+        identity=_dual_mode_identity(request)
         try: require_permission(identity,'customer.create')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
         draft_id=str(payload.get('id') or secrets.token_hex(6)); existing=row('SELECT id FROM onboarding_drafts WHERE id=? AND actor_email=?',(draft_id,identity['email']))
@@ -62,13 +93,13 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get('/api/partner/onboarding/drafts/{draft_id}')
     def get_onboarding_draft(request: Request,draft_id: str) -> dict:
-        identity=require_partner_access(request); draft=row('SELECT * FROM onboarding_drafts WHERE id=? AND actor_email=?',(draft_id,identity['email']))
+        identity=_dual_mode_identity(request); draft=row('SELECT * FROM onboarding_drafts WHERE id=? AND actor_email=?',(draft_id,identity['email']))
         if not draft: raise HTTPException(status_code=404,detail='Onboarding draft not found.')
         draft['data']=json.loads(draft.pop('data_json')); return draft
 
     @app.post('/api/partner/customers/onboard')
     def onboard_customer(request: Request, payload: dict) -> dict:
-        identity=require_partner_access(request)
+        identity=_dual_mode_identity(request)
         try: require_permission(identity,'customer.create'); require_permission(identity,'quote.create')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
         status=str(payload.get('status','pending_installation'))
@@ -80,7 +111,13 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         except ValueError as error: raise HTTPException(status_code=409, detail=str(error)) from error
         email=str(payload.get('email','')).strip().lower()
         if row('SELECT id FROM customers WHERE email=?',(email,)): raise HTTPException(status_code=409,detail='A customer with this email already exists.')
-        now=datetime.now().isoformat(); partner_id=identity.get('partner_id') or 'anyaicam-primary'; customer_id=secrets.token_hex(5); password=_temporary_password(); quote_id=secrets.token_hex(5); invitation_id=secrets.token_hex(5); plan_id=secrets.token_hex(5)
+        now=datetime.now().isoformat()
+        # Administrator = global scope; only an administrator may steer partner_id via the payload.
+        if identity.get('role')=='administrator' and str(payload.get('partner_id') or '').strip():
+            partner_id=str(payload['partner_id']).strip()
+        else:
+            partner_id=identity.get('partner_id') or 'anyaicam-primary'
+        customer_id=secrets.token_hex(5); password=_temporary_password(); quote_id=secrets.token_hex(5); invitation_id=secrets.token_hex(5); plan_id=secrets.token_hex(5)
         email_preview=f'''Subject: Welcome to AnyAiCam\n\nHello {payload.get('name','')},\nYour AnyAiCam account is ready.\nLogin: {email}\nTemporary password: {password}\nPlease change your password after signing in.'''
         created_sites=[]; activation_tokens=[]
         with connection() as db:
@@ -156,6 +193,10 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         identity=require_partner_access(request)
         try: require_permission(identity,'customer.edit')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        target=row('SELECT partner_id FROM customers WHERE id=?',(customer_id,))
+        if not target: raise HTTPException(status_code=404,detail='Customer not found.')
+        if identity.get('role')!='administrator' and target.get('partner_id')!=(identity.get('partner_id') or 'anyaicam-primary'):
+            raise HTTPException(status_code=404,detail='Customer not found.')
         note=str(payload.get('note','')).strip()
         if not note: raise HTTPException(status_code=400,detail='Note is required.')
         with connection() as db: db.execute('INSERT INTO customer_notes(customer_id,note,created_at,created_by) VALUES(?,?,?,?)',(customer_id,note,datetime.now().isoformat(),identity['email']))
@@ -192,8 +233,10 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get('/partner/onboarding',response_class=HTMLResponse)
     def onboarding_page(request: Request):
-        identity=partner_identity(request)
-        if not identity: return RedirectResponse('/partner-login',status_code=303)
+        try:
+            identity=_dual_mode_identity(request)
+        except HTTPException:
+            return RedirectResponse('/partner-login',status_code=303)
         try: require_permission(identity,'customer.create')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
         content='''<header class="topbar"><div><p class="eyebrow">Resumable customer onboarding</p><h1>Add New Customer</h1></div><a class="ghost-button" href="/partner">Back to Partner Portal</a></header><div class="mock-banner">Progress is saved after each step. Partner pricing remains confidential.</div><section class="panel"><p class="health-detail" id="onboarding-outer-step">AnyAiCam customer setup &middot; Step <strong>1</strong> of 7 (Partner portion)</p><div class="workspace-tabs" id="wizard-tabs" data-outer-steps="1,2,3,3,3"><button class="workspace-tab active">1 Customer</button><button class="workspace-tab">2 Sites</button><button class="workspace-tab">3 What you're buying</button><button class="workspace-tab">4 Pricing</button><button class="workspace-tab">5 Review &amp; send to AWS</button></div><form id="onboarding-wizard" class="rule-form"><div class="wizard-step" data-step="1"><h2>Customer and company</h2><label>Customer owner name<input id="w-name" required></label><label>Company<input id="w-company"></label><label>Email<input id="w-email" type="email" required></label><label>Phone<input id="w-phone"></label><label>Status<select id="w-status"><option value="pending_installation">Pending installation</option><option value="trial">Trial</option><option value="active">Active</option></select></label></div><div class="wizard-step" data-step="2" hidden><h2>Sites</h2><label>Site names, one per line<textarea id="w-sites" rows="6" required>Primary site</textarea></label><p class="health-detail">Each line creates a separate site and appliance assignment.</p></div><div class="wizard-step" data-step="3" hidden><h2>Appliance and cameras</h2><label>Computer type<select id="w-appliance"><option>AnyAiCam mini PC</option><option>Customer-owned computer</option></select></label><label>Deployment<select id="w-deployment"><option value="local">Local</option><option value="hybrid">Hybrid</option><option value="cloud">Cloud</option></select></label><label>Camera quantity<input id="w-quantity" type="number" min="1" max="128" value="4"></label><label>Resolution<select id="w-resolution"><option value="2mp">2MP / 1080p</option><option value="4mp">4MP</option><option value="8mp">8MP / 4K</option></select></label><label>Recording<select id="w-recording"><option value="motion">Motion</option><option value="continuous">Continuous</option></select></label><label>Retention<select id="w-retention"><option value="2">2 days</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select></label><fieldset><legend>Analytics</legend><label><input class="w-addon" type="checkbox" value="smart_motion"> Smart Motion</label><label><input class="w-addon" type="checkbox" value="people_counting"> People Counting</label><label><input class="w-addon" type="checkbox" value="lpr"> LPR</label><label><input class="w-addon" type="checkbox" value="ppe"> PPE Monitoring</label></fieldset></div><div class="wizard-step" data-step="4" hidden><h2>Customer price</h2><label>Approved customer selling price per camera<input id="w-selling" type="number" min="0" step="0.01" placeholder="Defaults to retail price"></label><button class="ghost-button" id="calculate-onboarding" type="button">Calculate retail, partner price, and margin</button><div id="wizard-pricing" class="panel"></div></div><div class="wizard-step" data-step="5" hidden><h2>Review and create</h2><div id="wizard-review" class="panel"></div><button class="action-button" type="submit">Generate quote and create customer</button></div><div class="dialog-actions"><button class="ghost-button" id="wizard-back" type="button" hidden>Back</button><button class="action-button" id="wizard-next" type="button">Save and continue</button></div></form><section class="panel" id="wizard-result" hidden></section></section>'''
@@ -202,11 +245,20 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.get('/partner/customers/{customer_id}',response_class=HTMLResponse)
     def customer_detail(request: Request,customer_id: str):
-        identity=require_partner_access(request)
+        identity=_dual_mode_identity(request)
         try: require_permission(identity,'customer.view')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
         customer=row('SELECT * FROM customers WHERE id=?',(customer_id,))
         if not customer: raise HTTPException(status_code=404,detail='Customer not found.')
+        # Administrator = global scope; every other role may only inspect
+        # a customer that actually belongs to their own partner_id -- this
+        # query previously had no such check at all, meaning any
+        # authenticated partner_owner/salesperson/technician could open
+        # another partner's customer record just by knowing or guessing
+        # its id. 404 (not 403) so this never confirms or denies whether
+        # an id exists to a caller who isn't authorized to see it.
+        if identity.get('role')!='administrator' and customer.get('partner_id')!=(identity.get('partner_id') or 'anyaicam-primary'):
+            raise HTTPException(status_code=404,detail='Customer not found.')
         sites=rows('SELECT * FROM sites WHERE customer_id=?',(customer_id,)); appliances=rows('SELECT * FROM appliances WHERE customer_id=?',(customer_id,)); cameras=rows('SELECT * FROM cameras WHERE customer_id=?',(customer_id,)); plans=rows('SELECT * FROM plans WHERE customer_id=? ORDER BY created_at DESC',(customer_id,)); analytics=rows('SELECT * FROM analytics_subscriptions WHERE customer_id=?',(customer_id,)); history=rows('SELECT * FROM service_history WHERE customer_id=? ORDER BY created_at DESC',(customer_id,)); notes=rows('SELECT * FROM customer_notes WHERE customer_id=? ORDER BY created_at DESC',(customer_id,))
         site_cards=''.join(f'<article class="feature-card"><h2>{escape(x["name"])}</h2><p>{escape(x.get("address") or "No address entered")}</p></article>' for x in sites) or '<div class="empty">No sites.</div>'
         appliance_rows=''.join(f'<tr><td>{escape(x["cloud_id"])}</td><td>{escape(x.get("serial_number") or "Pending")}</td><td>{escape(x.get("online_status") or "offline")}</td><td>{escape(x.get("software_version") or "Not installed")}</td><td>{escape(x.get("ip_address") or "Not connected")}</td><td>{x.get("cpu",0)} / {x.get("memory",0)} / {x.get("disk",0)}</td><td><button class="download appliance-action" data-id="{x["id"]}" data-action="restart">Restart</button> · <button class="download appliance-action" data-id="{x["id"]}" data-action="update">Update</button></td></tr>' for x in appliances) or '<tr><td colspan="7">No appliances.</td></tr>'
@@ -618,12 +670,26 @@ def render_partner_workspace(request: Request, shell: Callable):
     identity=partner_identity(request)
     if not identity: return RedirectResponse('/partner-login',status_code=303)
     require_partner_access(request)
-    partner_id=identity.get('partner_id') or 'anyaicam-primary'; customers=rows('SELECT * FROM customers WHERE partner_id=? ORDER BY created_at DESC',(partner_id,)); account=_read(ACCOUNT_FILE,{})
+    partner_id=identity.get('partner_id') or 'anyaicam-primary'
+    # Administrator = global scope: an administrator identity (see
+    # ROLE_PERMISSIONS['administrator'] = {'*'} in partner_db.py) is not
+    # bound to a single partner_id the way every other bridgeable role
+    # is -- they must see customers across every partner, not only
+    # whichever partner_id happens to be on their own partner_users row.
+    # Every other role keeps the exact same partner_id-scoped query as
+    # before this change.
+    is_global = identity.get('role') == 'administrator'
+    if is_global:
+        customers=rows('SELECT * FROM customers ORDER BY created_at DESC')
+    else:
+        customers=rows('SELECT * FROM customers WHERE partner_id=? ORDER BY created_at DESC',(partner_id,))
+    account=_read(ACCOUNT_FILE,{})
     customer_rows=[]
     for customer in customers:
-        searchable=f'{customer.get("name","")} {customer.get("company","")} {customer.get("email","")} {customer.get("id","")}'.lower()
+        searchable=f'{customer.get("name","")} {customer.get("company","")} {customer.get("email","")} {customer.get("id","")} {customer.get("partner_id","")}'.lower()
         site_count=row('SELECT COUNT(*) AS count FROM sites WHERE customer_id=?',(customer['id'],))['count']; plan=row('SELECT camera_quantity FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(customer['id'],)) or {'camera_quantity':0}
-        customer_rows.append(f'''<article class="customer-row" data-customer-status="{escape(customer.get('status','active'))}" data-search="{escape(searchable,quote=True)}"><div><strong>{escape(customer.get('name','Unnamed customer'))}</strong><br><small>{escape(customer.get('company',''))} · {site_count} site(s)</small></div><div>{escape(customer.get('email',''))}<br><small>{plan['camera_quantity']} cameras · {escape(customer.get('trial_status') or 'no trial')}</small></div><div><span class="pill">{escape(customer.get('status','active').replace('_',' ').title())}</span></div><div><a class="download" href="/partner/customers/{customer['id']}">Manage</a></div></article>''')
+        partner_label=f' · partner {escape(customer.get("partner_id",""))}' if is_global else ''
+        customer_rows.append(f'''<article class="customer-row" data-customer-status="{escape(customer.get('status','active'))}" data-search="{escape(searchable,quote=True)}"><div><strong>{escape(customer.get('name','Unnamed customer'))}</strong><br><small>{escape(customer.get('company',''))} · {site_count} site(s){partner_label}</small></div><div>{escape(customer.get('email',''))}<br><small>{plan['camera_quantity']} cameras · {escape(customer.get('trial_status') or 'no trial')}</small></div><div><span class="pill">{escape(customer.get('status','active').replace('_',' ').title())}</span></div><div><a class="download" href="/partner/customers/{customer['id']}">Manage</a></div></article>''')
     customer_body=''.join(customer_rows) if customer_rows else '<div class="empty" id="customer-empty">No real customer records yet.</div>'
     filters=''.join(f'<label><input type="radio" name="customer-status" value="{key}" {"checked" if key=="active" else ""}> {label}</label>' for key,label in [('active','Active'),('pending_installation','Pending installation'),('trial','Trial'),('suspended','Suspended'),('cancelled','Cancelled'),('all','All')])
     tabs=[('getting-started','Getting Started'),('partner-details','Partner Details'),('customers','Customers'),('materials','Materials'),('pricing','Pricing'),('adapters','Cloud Adapters')]
@@ -634,7 +700,10 @@ def render_partner_workspace(request: Request, shell: Callable):
     # writes to -- not the separate account_management.json-backed Appliance
     # model in business_portal.py, which only the older /setup wizard ever
     # populates and which a real Wizard A customer never appears in.
-    appliances=rows('SELECT a.* FROM appliances a JOIN customers c ON c.id=a.customer_id WHERE c.partner_id=? ORDER BY a.created_at DESC',(partner_id,))
+    if is_global:
+        appliances=rows('SELECT a.* FROM appliances a ORDER BY a.created_at DESC')
+    else:
+        appliances=rows('SELECT a.* FROM appliances a JOIN customers c ON c.id=a.customer_id WHERE c.partner_id=? ORDER BY a.created_at DESC',(partner_id,))
     adapter_rows=''.join(f'''<article class="customer-row"><div><strong>{escape(item.get('cloud_id') or 'Unassigned')}</strong><br><small>{escape(item.get('serial_number') or 'Pending serial')}</small></div><div>{escape((item.get('online_status') or 'offline').title())}<br><small>{escape(item.get('software_version') or 'Unknown version')}</small></div><div><span class="pill">{escape((item.get('online_status') or 'offline').title())}</span></div><div><a class="download" href="/partner/appliance-dashboard">Manage</a></div></article>''' for item in appliances) or '<div class="empty">No appliance orders or assignments yet.</div>'
     content=f'''<header class="topbar"><div><p class="eyebrow">Protected partner workspace · {escape(identity['role'])}</p><h1>Partner portal</h1></div><div class="dialog-actions">{admin_link}<form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></div></header><nav class="portal-tabs" aria-label="Partner portal">{tab_buttons}</nav><section class="portal-workspace">
     <div class="portal-panel" data-portal-panel="getting-started" hidden><h2>Partner onboarding</h2><div class="feature-grid" style="margin-top:20px"><article class="feature-card"><div class="feature-icon">1</div><h2>Agreement status</h2><p>Approval and agreement records are managed by AnyAiCam administration.</p><span class="pill">Approved access</span></article><article class="feature-card"><div class="feature-icon">2</div><h2>Training</h2><p>Complete sales, installation, activation, privacy, and support training.</p><span class="coming">Training checklist</span></article><article class="feature-card"><div class="feature-icon">3</div><h2>Support contacts</h2><p>Technical support, sales operations, activation help, and escalation contacts.</p><a class="download" href="/help">Open support</a></article></div><section class="panel" style="margin-top:18px"><h2>Onboarding checklist</h2><ol><li>Partner agreement approved</li><li>Authorized users confirmed</li><li>Training completed</li><li>Territory and tax information reviewed</li><li>Payout details approved</li><li>First customer installation scheduled</li></ol></section></div>

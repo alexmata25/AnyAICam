@@ -116,6 +116,36 @@ def resolve_bridged_identity(*, admin_role: str, link_row: dict | None, live_par
     }
 
 
+def resolve_partner_identity_with_bridge(request, admin_user: dict, *, eligible_roles: set[str]) -> dict | None:
+    """Shared dual-mode resolution for any Admin Portal page that wants
+    to reuse an existing Partner Portal workflow without asking an
+    admin to sign in twice -- the same two-step pattern main.py's
+    operations_rdm_page() established first for /operations/rdm,
+    generalized here so other pages (e.g. the Add New Customer wizard)
+    can reuse it instead of re-deriving it.
+
+    A direct, already-signed-in Partner Portal session
+    (partner_identity()) whose role is in eligible_roles always takes
+    priority, completely unaffected by this function. Only when there
+    isn't one do we fall back to this admin's own explicit, revocable
+    admin_partner_links bridge (bridge_partner_identity()) -- itself
+    re-validated fresh on every call, never a cached/stale grant.
+    Returns None, never invents an identity, if neither applies; the
+    caller decides what to show ("sign in" vs "link an account")."""
+    from partner_portal import partner_identity
+    direct_identity = partner_identity(request)
+    if direct_identity and direct_identity.get("role") in eligible_roles:
+        return direct_identity
+    if direct_identity:
+        return None  # a real but ineligible direct session must not fall through to the bridge
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        bridged = bridge_partner_identity(db, admin_user=admin_user)
+    if bridged and bridged.get("role") in eligible_roles:
+        return bridged
+    return None
+
+
 def get_link(db, *, admin_user_id: str) -> dict | None:
     result = db.execute(
         "SELECT admin_user_id,admin_email,partner_user_id,partner_email,linked_at,linked_by,revoked_at "

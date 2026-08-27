@@ -58,6 +58,37 @@ def _identity(request: Request) -> dict | None:
         return None
 
 
+def establish_partner_session(destination: str, *, request: Request, email: str, role: str, user: dict | None) -> RedirectResponse:
+    """Writes the user_sessions row and sets the signed partner cookie
+    for a freshly-authenticated Partner Portal identity, then redirects
+    to destination -- the exact same two steps partner_login_submit()
+    (POST /api/partner-login) already performed inline. Factored out so
+    a second entry point (main.py's POST /api/portal-login, the blue
+    Portal login page's Administrator/Partner/Technician selector) can
+    establish an identical session without duplicating this
+    security-sensitive cookie-signing logic."""
+    session_id = secrets.token_hex(16)
+    now = datetime.now()
+    expiry = now + timedelta(hours=8)
+    with connection() as db:
+        db.execute(
+            'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            (
+                session_id, user.get('id') if user else None, email, role, 'Web browser', 'cookie',
+                now.isoformat(), now.isoformat(), expiry.isoformat(),
+                request.client.host if request.client else None, request.headers.get('user-agent', '')[:500],
+            ),
+        )
+    response = RedirectResponse(destination, status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE,
+        _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id),
+        httponly=True, samesite='strict', secure=settings.secure_cookies, max_age=28800, domain=settings.cookie_domain or None,
+    )
+    return response
+
+
 def _require(request: Request, roles=PARTNER_ROLES) -> dict:
     identity = _identity(request)
     if not identity or identity['role'] not in roles:
@@ -130,9 +161,7 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         clear_login_failures(email)
         audit(user or {'email':email,'role':role},'login.succeeded','partner_user',user.get('id','') if user else '')
         destination='/change-password' if user and user.get('must_change_password') else ('/customer-portal' if payload.get('customer_only') and role=='administrator' else destination_for_role(role))
-        session_id=secrets.token_hex(16); now=datetime.now(); expiry=now+timedelta(hours=8)
-        with connection() as db: db.execute('INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(session_id,user.get('id') if user else None,email,role,'Web browser','cookie',now.isoformat(),now.isoformat(),expiry.isoformat(),request.client.host if request.client else None,request.headers.get('user-agent','')[:500]))
-        response=RedirectResponse(destination,status_code=303); response.set_cookie(SESSION_COOKIE,_token(email,role,user.get('partner_id') if user else None,user.get('customer_id') if user else None,session_id),httponly=True,samesite='strict',secure=settings.secure_cookies,max_age=28800,domain=settings.cookie_domain or None); return response
+        return establish_partner_session(destination, request=request, email=email, role=role, user=user)
 
     @app.post('/partner-logout')
     def partner_logout(request: Request):

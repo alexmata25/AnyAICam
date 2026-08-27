@@ -11555,7 +11555,29 @@ def configuration_issues() -> list[dict]:
 
 
 
-    required_global = ["ANYAICAM_ADMIN_EMAIL", "ANYAICAM_ADMIN_PASSWORD", "ANYAICAM_PORTAL_SECRET"]
+    # Recommended, not required: all three degrade gracefully today
+    # rather than breaking the VMS, so a fresh install missing them is
+    # not a readiness failure -- see each one's own comment below.
+    # Downgraded from "critical" (session audit: previously made a
+    # freshly-installed, fully-functional VMS report configuration_
+    # valid=False / /ready 503 for a state that was never actually
+    # broken).
+    recommended_global = ["ANYAICAM_ADMIN_EMAIL", "ANYAICAM_ADMIN_PASSWORD", "ANYAICAM_PORTAL_SECRET"]
+    # ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD: bootstrap_admin()
+    # (partner_db.py) already no-ops safely without them -- the app
+    # doesn't crash, it simply skips auto-creating a Partner Portal
+    # administrator account. The legacy Admin Portal identity
+    # (current_user()'s own admin@local bootstrap, a separate system)
+    # still provides working admin access either way. Worth surfacing
+    # (Partner Portal admin login genuinely won't work without them)
+    # but not a readiness-blocking failure.
+    # ANYAICAM_PORTAL_SECRET: already has a real runtime fallback
+    # (secrets.token_urlsafe(48) here; partner_portal.py's own
+    # SESSION_SECRETS chain falls back further to settings.app_secrets
+    # or a random token). The VMS runs correctly without it -- the only
+    # cost is that a random per-process secret means restarting the
+    # container invalidates existing sessions, worth flagging, not
+    # worth failing readiness over.
 
 
 
@@ -11564,7 +11586,7 @@ def configuration_issues() -> list[dict]:
 
 
 
-    for key in required_global:
+    for key in recommended_global:
 
 
 
@@ -11591,7 +11613,7 @@ def configuration_issues() -> list[dict]:
 
 
 
-            issues.append({"key": key, "severity": "critical", "message": f"{key} is missing."})
+            issues.append({"key": key, "severity": "warning", "message": f"{key} is missing."})
 
 
 
@@ -11627,43 +11649,39 @@ def configuration_issues() -> list[dict]:
 
 
 
-    for camera in get_camera_numbers():
+    # Dynamic provisioning is the primary supported path (cameras are
+    # onboarded through the setup wizard/API and stored in the `cameras`
+    # table -- see camera_access.py) and never touches these legacy
+    # CAMERA{n}_HOST/USERNAME/PASSWORD env vars at all, so zero DB
+    # camera rows is a perfectly valid, ready state, not a config
+    # error. The old code iterated get_camera_numbers(), which falls
+    # back to range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1) whenever the
+    # `cameras` table is empty -- so a brand-new install with zero
+    # cameras provisioned was checked against 4 *candidate* legacy
+    # slots as if all 4 were *required*, manufacturing up to 12 fake
+    # "critical" issues out of a state that was actually fine. Iterate
+    # the fixed legacy slot range directly instead (never DB-row-
+    # dependent), and only raise an issue for a slot whose legacy env
+    # vars are partially set -- i.e. the operator is actively using the
+    # legacy scheme for that slot but got it wrong. A slot with none of
+    # its three vars set is simply not in use (dynamic or unprovisioned)
+    # and is skipped entirely.
+    for camera in range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1):
 
+        slot_keys = {suffix: f"CAMERA{camera}_{suffix}" for suffix in ("HOST", "USERNAME", "PASSWORD")}
+        slot_values = {suffix: os.environ.get(key, "") for suffix, key in slot_keys.items()}
+        # Only a partially-configured slot (some but not all three set)
+        # is a real, actionable misconfiguration -- an operator using
+        # the legacy scheme for this slot who got it wrong. A slot with
+        # none of the three set is simply not in use.
+        if not any(value.strip() for value in slot_values.values()):
+            continue
 
+        for suffix, key in slot_keys.items():
 
+            if not slot_values[suffix].strip():
 
-
-
-
-
-        for suffix in ("HOST", "USERNAME", "PASSWORD"):
-
-
-
-
-
-
-
-
-            key = f"CAMERA{camera}_{suffix}"
-
-
-
-
-
-
-
-
-            if not os.environ.get(key, "").strip():
-
-
-
-
-
-
-
-
-                issues.append({"key": key, "severity": "critical", "message": f"{key} is missing."})
+                issues.append({"key": key, "severity": "critical", "message": f"{key} is missing (camera {camera} is partially configured via legacy env vars)."})
 
 
 
@@ -39982,6 +40000,8 @@ PUBLIC_PATH_PREFIXES = (
 
     "/api/partner-login",
 
+    "/api/portal-login",
+
     "/api/password-reset/",
 
 
@@ -40649,6 +40669,88 @@ def portal_destination_for_user(user: dict | None) -> str:
 
 
 
+
+
+PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
+
+
+def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None) -> dict:
+    """Pure decision for POST /api/portal-login -- the blue Portal login
+    page's own selector (Administrator/Partner/Technician), added
+    because this app's two independent identity systems (the legacy
+    Admin Portal's users.json, and the Partner Portal's SQL partner_users)
+    both use the exact role string "administrator" for two different
+    things, and can share the same email: before this function existed,
+    a person with an account in both systems always landed on the
+    Partner Portal no matter which one they meant, because /api/partner-
+    login only ever checked partner_db at all. This function never
+    verifies a password itself -- the route already checked both systems
+    before calling it -- it only decides, from what already validated,
+    which single session (if any) to establish and where it goes. It
+    never guesses when a selection is missing and more than one identity
+    is available, and it never lets a selection grant something that
+    didn't independently validate.
+
+    legacy_role: the caller's legacy Admin Portal role if their
+    submitted password verified there, else None. partner_role: their
+    partner_db role if their submitted password verified there, else
+    None.
+
+    Returns {"system": "legacy"|"partner"|None, "role": str|None,
+    "destination": str|None, "available": [...]}. "available" lists
+    every portal bucket this account could have chosen ("administrator"/
+    "partner"/"technician"), so a rejected or ambiguous request can tell
+    the caller its real options without this function ever guessing on
+    their behalf."""
+    available: list[str] = []
+    if legacy_role in ADMIN_PORTAL_ROLES:
+        available.append("administrator")
+    if partner_role == "administrator" and "administrator" not in available:
+        available.append("administrator")
+    if partner_role in {"partner_owner", "salesperson"}:
+        available.append("partner")
+    if partner_role == "technician":
+        available.append("technician")
+
+    def _for_administrator() -> dict:
+        if legacy_role in ADMIN_PORTAL_ROLES:
+            return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
+        if partner_role == "administrator":
+            return {"system": "partner", "role": "administrator", "destination": "/partner?tab=customers"}
+        return {"system": None, "role": None, "destination": None}
+
+    from customer_policy import role_destination  # partner_db's own role vocabulary/destinations -- portal_destination_for_user() above answers the *legacy* system's, a different mapping
+
+    def _for_partner() -> dict:
+        if partner_role in {"partner_owner", "salesperson"}:
+            return {"system": "partner", "role": partner_role, "destination": role_destination(partner_role)}
+        return {"system": None, "role": None, "destination": None}
+
+    def _for_technician() -> dict:
+        if partner_role == "technician":
+            return {"system": "partner", "role": "technician", "destination": role_destination("technician")}
+        return {"system": None, "role": None, "destination": None}
+
+    resolvers = {"administrator": _for_administrator, "partner": _for_partner, "technician": _for_technician}
+
+    if selected_portal in resolvers:
+        result = resolvers[selected_portal]()
+        result["available"] = available
+        return result
+
+    # No (valid) selection: preserve single-identity behavior for old
+    # clients/tests that don't send one, but never guess between two --
+    # including the one ambiguity "available" can't show on its own:
+    # legacy_role and partner_role=='administrator' both validating at
+    # once collapse into the *same* "administrator" bucket entry (they're
+    # still two different sessions/destinations), so len(available)==1
+    # alone isn't enough to prove there's only one real identity here.
+    administrator_ambiguous = bool(legacy_role in ADMIN_PORTAL_ROLES) and partner_role == "administrator"
+    if len(available) == 1 and not administrator_ambiguous:
+        result = resolvers[available[0]]()
+        result["available"] = available
+        return result
+    return {"system": None, "role": None, "destination": None, "available": available}
 
 
 def safe_login_destination(user: dict, requested_path: str) -> str:
@@ -44033,6 +44135,89 @@ def login_submit(
 
 
 
+
+
+@app.post("/api/portal-login")
+def portal_login_submit(request: Request, payload: dict):
+    """The blue Portal login page's (partner.html) Administrator/Partner/
+    Technician selector. Checks BOTH independent identity systems this
+    app has always had -- the legacy Admin Portal (users.json, checked
+    the same way login_submit()/POST /login already does) and the
+    Partner Portal (partner_db, checked the same way partner_login_submit()/
+    POST /api/partner-login already does) -- against the submitted
+    password, then hands what validated to resolve_portal_login() to
+    decide which single session to establish. Neither system's own
+    password check, rate limiting, or session cookie is touched here in
+    a new way -- this only adds the missing step of consulting both
+    before picking one, instead of only ever consulting one (see
+    resolve_portal_login()'s own docstring for why that mattered)."""
+    email = str(payload.get("email", "")).strip().lower()
+    password = str(payload.get("password", ""))
+    selected_portal = payload.get("portal") or None
+    if selected_portal not in PORTAL_SELECTOR_OPTIONS:
+        selected_portal = None
+
+    from cloud_security import clear_login_failures, login_blocked, record_login_failure
+
+    if login_blocked(email):
+        raise HTTPException(status_code=429, detail="Account is temporarily locked after repeated sign-in failures. Try again later or reset your password.")
+
+    users = load_users()
+    legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
+    legacy_role: str | None = None
+    if legacy_user and legacy_user.get("enabled", True) and verify_password(password, legacy_user.get("password_hash", "")):
+        candidate_role = str(legacy_user.get("role") or "").strip().lower()
+        if candidate_role in ADMIN_PORTAL_ROLES:
+            legacy_role = candidate_role
+
+    from partner_db import authenticate_detailed as partner_authenticate_detailed
+
+    partner_user, _partner_reason = partner_authenticate_detailed(email, password)
+    partner_role: str | None = None
+    if partner_user:
+        candidate_role = str(partner_user.get("role") or "").strip().lower()
+        if candidate_role in {"administrator", "partner_owner", "salesperson", "technician"}:
+            partner_role = candidate_role
+
+    decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role)
+
+    if not decision["system"]:
+        if not legacy_role and not partner_role:
+            record_login_failure(email)
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        labels = {"administrator": "Administrator", "partner": "Partner", "technician": "Technician"}
+        options = ", ".join(labels[key] for key in decision["available"])
+        if selected_portal:
+            detail = f"This account is not authorized for the {labels[selected_portal]} portal." + (f" Available: {options}." if options else "")
+        else:
+            detail = f"This email has more than one portal available ({options}). Choose one from the Portal selector."
+        raise HTTPException(status_code=403, detail=detail)
+
+    clear_login_failures(email)
+
+    if decision["system"] == "legacy":
+        legacy_user["failed_login_attempts"] = 0
+        legacy_user["locked_until"] = None
+        legacy_user["last_login"] = datetime.now().isoformat()
+        save_users(users)
+        token = create_session(legacy_user["id"], False)
+        append_audit_entry(AuditEntryModel(
+            user_id=legacy_user["id"], user_name=legacy_user.get("display_name", email), role=legacy_user.get("role", "viewer"),
+            action="login", resource="session", detail="Signed in via the blue portal login's Administrator selector.",
+            device=request.headers.get("user-agent", "Web browser")[:160], outcome="success",
+        ).model_dump(mode="json"))
+        response = RedirectResponse(decision["destination"], status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
+            httponly=True, secure=SECURE_COOKIES, samesite="lax", path="/",
+        )
+        return response
+
+    from partner_portal import establish_partner_session
+
+    return establish_partner_session(
+        decision["destination"], request=request, email=email, role=decision["role"], user=partner_user,
+    )
 
 
 CUSTOMER_LOGIN_DESTINATION = "/customer-login.html"
@@ -104901,7 +105086,50 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
 
-    content = f'''<header class="topbar"><div><p class="eyebrow">Administrator portal</p><h1>Customer account operations</h1></div><span class="pill">Account data only</span></header>
+    # Real, live customer -> site -> appliance -> camera records
+    # (partner_db's SQL customers/sites/appliances/cameras tables -- the
+    # same data the Partner Portal's /partner?tab=customers and the Add
+    # New Customer wizard already read/write) are a separate data model
+    # from the billing/subscription-request JSON stores this page has
+    # always used below. Rather than duplicate the onboarding workflow
+    # with a second implementation, Add New Customer here opens the
+    # exact same /partner/onboarding wizard the Partner Portal uses --
+    # see partner_workspace.py's _dual_mode_identity(), which accepts
+    # this admin session (via a live admin_partner_links bridge, see
+    # admin_partner_bridge.py) with no second manual Partner Portal
+    # login and no new backend workflow. Global scope for an
+    # administrator identity -- see render_partner_workspace() and
+    # onboard_customer() in partner_workspace.py's own comments -- means
+    # every real customer across every partner appears here, not just
+    # one partner's bucket.
+    from partner_db import rows as _pdb_rows
+
+    _global_customers = _pdb_rows('SELECT * FROM customers ORDER BY created_at DESC')
+    _global_customer_rows = []
+    for _customer in _global_customers:
+        _site_count = len(_pdb_rows('SELECT id FROM sites WHERE customer_id=?', (_customer['id'],)))
+        _appliance_rows = _pdb_rows('SELECT online_status FROM appliances WHERE customer_id=?', (_customer['id'],))
+        _camera_count = len(_pdb_rows('SELECT id FROM cameras WHERE customer_id=?', (_customer['id'],)))
+        _online_count = sum(1 for _a in _appliance_rows if _a.get('online_status') == 'online')
+        _global_customer_rows.append(
+            f'<tr><td>{escape(_customer.get("name") or "Unnamed customer")}</td>'
+            f'<td>{escape(_customer.get("company") or "")}</td>'
+            f'<td>{escape(_customer.get("partner_id") or "")}</td>'
+            f'<td>{escape((_customer.get("status") or "active").replace("_"," ").title())}</td>'
+            f'<td>{_site_count}</td>'
+            f'<td>{len(_appliance_rows)} ({_online_count} online)</td>'
+            f'<td>{_camera_count}</td>'
+            f'<td><a class="download" href="/partner/customers/{_customer["id"]}">Inspect</a></td></tr>'
+        )
+    _global_customers_table = (
+        '<table class="data-table"><thead><tr><th>Customer</th><th>Company</th><th>Partner</th><th>Status</th>'
+        '<th>Sites</th><th>Appliances</th><th>Cameras</th><th></th></tr></thead><tbody>'
+        + (''.join(_global_customer_rows) if _global_customer_rows else '<tr><td colspan="8">No real customer records yet.</td></tr>')
+        + '</tbody></table>'
+    )
+    _global_customers_section = f'<section class="panel" style="overflow:auto;margin-top:18px"><div class="panel-head"><h2>All customers &middot; every partner</h2></div>{_global_customers_table}</section>'
+
+    content = f'''<header class="topbar"><div><p class="eyebrow">Administrator portal</p><h1>Customer account operations</h1></div><div class="dialog-actions"><a class="action-button" href="/partner/onboarding">Add New Customer</a><span class="pill">Account data only</span></div></header>{_global_customers_section}
 
 
 
