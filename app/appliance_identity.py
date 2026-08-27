@@ -355,6 +355,28 @@ def active_public_keys(db) -> dict[str, str]:
     return {row["key_id"]: row["public_key_b64"] for row in rows}
 
 
+def has_global_administrator_grant(db, *, email: str) -> bool:
+    """Live re-check, never a cached claim: does this email currently
+    hold a non-revoked identity_grants row with role='administrator'
+    and scope_type='global'? This is the one check that lets a cloud-
+    delegated Partner Portal session bridge into legacy Admin Portal
+    access (see main.py's cloud_administrator_bridge()) -- deliberately
+    excludes scope_type='partner' (a company-level administrator) so a
+    partner-scoped admin can never silently gain global AnyAiCam reach.
+    Called fresh on every current_user() resolution for a bridged
+    session, so revoking the grant removes Admin Portal access on the
+    very next request, not only after the appliance's own manifest
+    reconciliation cycle."""
+    user = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email.strip().lower(),)).fetchone()
+    if not user:
+        return False
+    grant = db.execute(
+        "SELECT id FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global' AND revoked_at IS NULL",
+        (user["id"],),
+    ).fetchone()
+    return grant is not None
+
+
 def create_grant(db, *, user_id: str, role: str, scope_type: str, scope_id: str | None, granted_by: str, now: str | None = None) -> str:
     if scope_type not in SCOPE_TYPES:
         raise ValueError(f"Unknown scope_type: {scope_type!r}")

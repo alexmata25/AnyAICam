@@ -84,7 +84,13 @@ def test_configured_instance_delegates_administrator_login_through_the_signed_as
 
     response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/partner?tab=customers"
+    # scope_type='global' (this helper's default) -- reaches the real
+    # Admin Portal, not the Partner Portal's customer view. The session
+    # cookie is still the Partner Portal one: this is a cloud-delegated
+    # identity, not a legacy admin@local session -- see
+    # cloud_administrator_bridge() (main.py) for how /admin-portal
+    # itself comes to accept it.
+    assert response.headers["location"] == "/admin-portal"
     assert partner_portal.SESSION_COOKIE in response.cookies
 
     with override_target(sqlite_path=str(db_path)):

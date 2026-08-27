@@ -167,8 +167,18 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
         follow_redirects=False,
     )
     assert admin_login.status_code == 303
+    assert admin_login.headers["location"] == "/admin-portal"  # the fix under test -- not /partner?tab=customers
     assert partner_portal.SESSION_COOKIE in admin_login.cookies
     admin_session_cookie = admin_login.cookies[partner_portal.SESSION_COOKIE]
+
+    # The Admin Portal itself must accept this cloud-delegated session --
+    # cloud_administrator_bridge()/current_user() re-verifying the live
+    # global grant, not just routing/destination.
+    admin_portal_page = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie})
+    assert admin_portal_page.status_code == 200
+
+    # ---- "no local duplicate account is created" ----
+    assert not any(u.get("email", "").lower() == OPERATOR_EMAIL for u in main.load_users())
 
     # ---- Step 9: Partner selection reaches the Partner Portal ----
     partner_login = client.post(
@@ -177,17 +187,8 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
         follow_redirects=False,
     )
     assert partner_login.status_code == 303
+    assert partner_login.headers["location"] == "/partner?tab=customers"
     partner_session_cookie = partner_login.cookies[partner_portal.SESSION_COOKIE]
-
-    # Both destinations legitimately land on the same Partner Portal
-    # customer view today (customer_policy.role_destination() maps both
-    # 'administrator' and 'partner_owner' there) -- what distinguishes
-    # them is the SESSION's own role, not the URL, so verify that
-    # directly against each session's own DB row.
-    with _db(db_path):
-        with connection() as db:
-            admin_role = db.execute("SELECT role FROM user_sessions WHERE email=? ORDER BY created_at DESC LIMIT 1", (OPERATOR_EMAIL,)).fetchone()["role"]
-    assert admin_role in {"administrator", "partner_owner"}  # whichever was most recently established (partner, here)
 
     with _db(db_path):
         with connection() as db:
@@ -218,7 +219,7 @@ def test_full_samsung_readiness_chain_via_real_apis(env):
     assert partner_session_row["revoked_at"] is not None  # Partner authorization invalidated
     assert admin_session_row["revoked_at"] is None         # Administrator remains valid
 
-    # The Administrator session cookie must still work against a real
-    # authenticated page after the Partner-only revocation.
-    still_works = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie})
+    # The Administrator session cookie must still work against the real
+    # Admin Portal after the Partner-only revocation.
+    still_works = client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: admin_session_cookie})
     assert still_works.status_code == 200

@@ -29,6 +29,34 @@ def test_selects_partner_administrator_when_only_partner_validates():
     assert decision["destination"] == "/partner?tab=customers"
 
 
+def test_cloud_delegated_global_administrator_reaches_admin_portal():
+    # The routing half of the Administrator-destination fix: a cloud-
+    # delegated 'administrator' grant scoped 'global' reaches the real
+    # Admin Portal, not the Partner Portal's customer view. The
+    # authorization half (does current_user() actually honor this
+    # session there) is covered separately in
+    # test_cloud_administrator_bridge.py.
+    decision = main.resolve_portal_login(selected_portal="administrator", legacy_role=None, partner_role="administrator", partner_administrator_scope="global")
+    assert decision["system"] == "partner"
+    assert decision["destination"] == "/admin-portal"
+
+
+def test_cloud_delegated_partner_scoped_administrator_stays_on_partner_portal():
+    # A company-level ('partner'-scoped) administrator grant must never
+    # reach /admin-portal -- only a genuinely global grant does.
+    decision = main.resolve_portal_login(selected_portal="administrator", legacy_role=None, partner_role="administrator", partner_administrator_scope="partner")
+    assert decision["system"] == "partner"
+    assert decision["destination"] == "/partner?tab=customers"
+
+
+def test_direct_non_delegated_administrator_login_is_unaffected_by_the_new_parameter():
+    # A direct (non-delegated) partner_db login has no grant/scope
+    # concept at all -- omitting partner_administrator_scope (its
+    # default, None) must keep the exact prior behavior.
+    decision = main.resolve_portal_login(selected_portal="administrator", legacy_role=None, partner_role="administrator")
+    assert decision["destination"] == "/partner?tab=customers"
+
+
 def test_never_guesses_between_legacy_and_partner_administrator_without_a_selection():
     decision = main.resolve_portal_login(selected_portal=None, legacy_role="administrator", partner_role="administrator")
     assert decision["system"] is None

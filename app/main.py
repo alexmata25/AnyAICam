@@ -10547,6 +10547,55 @@ def authenticated_user(request: Request) -> dict | None:
 
 
 
+def cloud_administrator_bridge(request: Request) -> dict | None:
+    """Lets a cloud-delegated Partner Portal session with a LIVE,
+    GLOBAL-scoped 'administrator' grant use the legacy Admin Portal --
+    exactly what "amata@anyaicam.com + Administrator selection ->
+    /admin-portal" requires, without ever creating a legacy users.json
+    row for that person (see this session's own explicit instruction
+    against that). This is the one, single choke point current_user()
+    falls back to when there's no legacy session at all; because nearly
+    every Admin Portal route already calls current_user()/has_permission()
+    without modification, this bridge applies uniformly across the whole
+    Admin Portal rather than needing to be wired into each route.
+
+    Re-verifies against the LIVE identity_grants table on every call
+    (appliance_identity.has_global_administrator_grant()) -- never
+    trusts the partner session cookie's own embedded role claim alone.
+    A revoked grant loses Admin Portal access on this function's very
+    next call, not only after the appliance's own manifest-
+    reconciliation cycle catches up. A partner-scoped administrator
+    (company-level admin, scope_type='partner') is deliberately
+    excluded -- has_global_administrator_grant() only matches
+    scope_type='global' -- so a partner-scoped admin can never silently
+    become a global AnyAiCam administrator through this path. Partner/
+    Technician/Customer roles are excluded outright by the role=='administrator'
+    check below; admin@local's own local-recovery session path
+    (authenticated_user()) is completely separate from and unaffected
+    by this function -- it's only ever consulted when that path found
+    nothing."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        return None
+    if not identity or identity.get("role") != "administrator":
+        return None
+    email = str(identity.get("email") or "").strip()
+    if not email:
+        return None
+    from appliance_identity import has_global_administrator_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        if not has_global_administrator_grant(db, email=email):
+            return None
+    return {
+        "id": f"cloud-administrator:{email}", "display_name": email, "email": email,
+        "role": "administrator", "enabled": True, "site_ids": [], "camera_ids": list(get_camera_numbers()),
+        "via_cloud_administrator_grant": True,
+    }
+
+
 def current_user(request: Request) -> dict:
 
 
@@ -10556,7 +10605,7 @@ def current_user(request: Request) -> dict:
 
 
 
-    return authenticated_user(request) or {
+    return authenticated_user(request) or cloud_administrator_bridge(request) or {
 
 
 
@@ -40674,7 +40723,7 @@ def portal_destination_for_user(user: dict | None) -> str:
 PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
 
 
-def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None) -> dict:
+def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None, partner_administrator_scope: str | None = None) -> dict:
     """Pure decision for POST /api/portal-login -- the blue Portal login
     page's own selector (Administrator/Partner/Technician), added
     because this app's two independent identity systems (the legacy
@@ -40694,7 +40743,19 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
     legacy_role: the caller's legacy Admin Portal role if their
     submitted password verified there, else None. partner_role: their
     partner_db role if their submitted password verified there, else
-    None.
+    None. partner_administrator_scope: when partner_role=='administrator'
+    came from the cloud-delegated grant contract (appliance_identity.py),
+    this is that grant's own scope_type ('global' or 'partner') --
+    None for a direct (non-delegated) partner_db login, which has no
+    grant/scope concept and keeps its existing behavior unchanged.
+    Only a 'global' scope reaches /admin-portal here; a 'partner'
+    (company-level) administrator grant stays on the Partner Portal --
+    it must never silently gain global Admin Portal reach. main.py's
+    current_user() independently re-verifies this same global-scope
+    requirement against live grants before actually honoring an
+    Admin Portal request (see cloud_administrator_bridge()) -- this
+    function only decides where the browser is *sent*, it grants
+    nothing on its own.
 
     Returns {"system": "legacy"|"partner"|None, "role": str|None,
     "destination": str|None, "available": [...]}. "available" lists
@@ -40716,7 +40777,8 @@ def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None
         if legacy_role in ADMIN_PORTAL_ROLES:
             return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
         if partner_role == "administrator":
-            return {"system": "partner", "role": "administrator", "destination": "/partner?tab=customers"}
+            destination = "/admin-portal" if partner_administrator_scope == "global" else "/partner?tab=customers"
+            return {"system": "partner", "role": "administrator", "destination": destination}
         return {"system": None, "role": None, "destination": None}
 
     from customer_policy import role_destination  # partner_db's own role vocabulary/destinations -- portal_destination_for_user() above answers the *legacy* system's, a different mapping
@@ -44232,6 +44294,7 @@ def portal_login_submit(request: Request, payload: dict):
     partner_role: str | None = None
     partner_user: dict | None = None
     partner_authorization_version: int | None = None
+    partner_administrator_scope: str | None = None
     if own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS:
         from appliance_identity import CloudIdentityUnavailable, ManifestError, get_cloud_identity_backend, verify_assertion
 
@@ -44262,6 +44325,8 @@ def portal_login_submit(request: Request, payload: dict):
                 "customer_id": assertion["scope_id"] if assertion["scope_type"] in {"customer", "site"} else None,
             }
             partner_authorization_version = assertion["authorization_version"]
+            if partner_role == "administrator":
+                partner_administrator_scope = assertion["scope_type"]
     elif not own_appliance:
         from partner_db import authenticate_detailed as partner_authenticate_detailed
 
@@ -44278,7 +44343,7 @@ def portal_login_submit(request: Request, payload: dict):
     # login() below still correctly reports this as "no selection made"
     # rather than silently guessing.
 
-    decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role)
+    decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role, partner_administrator_scope=partner_administrator_scope)
 
     if not decision["system"]:
         if not legacy_role and not partner_role:
