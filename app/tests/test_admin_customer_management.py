@@ -366,6 +366,37 @@ def test_same_email_administrator_and_partner_owner_selecting_partner_reaches_pa
     assert main.SESSION_COOKIE_NAME not in response.cookies
 
 
+def test_technician_selecting_technician_portal_reaches_the_appliance_dashboard(http_client):
+    client, db_path = http_client
+    email = "tech-selector@example.test"
+    conn = sqlite3.connect(db_path)
+    _seed_partner_user(conn, "pu-tech", email, "technician", partner_id="partner-4")
+    conn.execute("UPDATE partner_users SET password_hash=? WHERE id='pu-tech'", (partner_portal.password_hash("Sup3rSecret!"),))
+    conn.commit()
+
+    response = client.post(
+        "/api/portal-login", json={"email": email, "password": "Sup3rSecret!", "portal": "technician"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/partner/appliance-dashboard"
+    assert partner_portal.SESSION_COOKIE in response.cookies
+
+
+def test_technician_cannot_select_the_administrator_portal(http_client):
+    client, db_path = http_client
+    email = "tech-selector2@example.test"
+    conn = sqlite3.connect(db_path)
+    _seed_partner_user(conn, "pu-tech2", email, "technician", partner_id="partner-4")
+    conn.execute("UPDATE partner_users SET password_hash=? WHERE id='pu-tech2'", (partner_portal.password_hash("Sup3rSecret!"),))
+    conn.commit()
+
+    response = client.post(
+        "/api/portal-login", json={"email": email, "password": "Sup3rSecret!", "portal": "administrator"},
+    )
+    assert response.status_code == 403
+
+
 def test_same_email_without_a_selection_is_rejected_not_defaulted_to_partner(http_client):
     client, db_path = http_client
     email = "dual3@example.test"
