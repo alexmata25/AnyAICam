@@ -88,6 +88,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         if not activation_limiter.allow(client): raise HTTPException(status_code=429,detail='Activation attempt rate exceeded.')
         cloud_id=str(payload.get('cloud_id','')).strip().upper(); token=str(payload.get('activation_token','')).strip(); appliance=row('SELECT * FROM appliances WHERE cloud_id=?',(cloud_id,))
         if not appliance or not token: raise HTTPException(status_code=403,detail='Invalid activation request.')
+        # Conflict check before the token is touched or a credential is minted -- see appliance_activation.py.
+        from appliance_activation import ActivationConflict, load_persisted_identity
+        existing_identity=load_persisted_identity()
+        if existing_identity and existing_identity['cloud_id']!=cloud_id:
+            raise HTTPException(status_code=409,detail=f"This appliance is already activated as {existing_identity['cloud_id']!r}. Reset the local activation identity before activating as a different appliance.")
         token_rows=rows('SELECT * FROM appliance_activation_tokens WHERE appliance_id=? AND used_at IS NULL AND revoked_at IS NULL ORDER BY created_at DESC',(appliance['id'],)); now=datetime.now(); match=None
         for candidate in token_rows:
             try: valid_time=datetime.fromisoformat(candidate['expires_at'])>now
@@ -101,12 +106,41 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             db.execute('INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)',(credential_id,appliance['id'],password_hash(credential),now_text,'activation'))
             db.execute("UPDATE appliances SET activation_status='activated',state='offline',partner_id=COALESCE(partner_id,(SELECT partner_id FROM customers WHERE id=appliances.customer_id)) WHERE id=?",(appliance['id'],))
         appliance=row('SELECT * FROM appliances WHERE id=?',(appliance['id'],))
+        # Durable persistence (gap #1) -- see appliance_activation.py. Can still raise on a genuine race (two activations at once).
+        try:
+            from appliance_activation import persist_activation
+            persist_activation(appliance_id=appliance['id'],cloud_id=cloud_id,credential=credential,customer_id=appliance['customer_id'],site_id=appliance['site_id'],partner_id=appliance.get('partner_id'))
+        except ActivationConflict as error:
+            raise HTTPException(status_code=409,detail=str(error)) from error
         audit({'email':cloud_id,'role':'appliance'},'appliance.activated','appliance',appliance['id']); logger.info('Appliance activated cloud_id=%s',cloud_id)
         return {'appliance_id':appliance['id'],'cloud_id':cloud_id,'credential':credential,'credential_id':credential_id,'partner_id':appliance.get('partner_id'),'customer_id':appliance['customer_id'],'site_id':appliance['site_id'],'message':'Store this permanent credential securely; it will not be shown again.'}
 
     @app.post('/api/appliance/heartbeat')
     def heartbeat(request: Request,payload: dict) -> dict:
         appliance=authenticate_appliance(request); safe=sanitize_appliance_payload(payload); state,warnings=health_state(safe); now=datetime.now().isoformat()
+        # Identity contract gap #2: the heartbeat ACK carries the
+        # current manifest_version (appliance_identity.
+        # current_manifest_version()) so an appliance can detect
+        # staleness with one integer comparison, no full manifest fetch
+        # needed on every cycle. Only on an actual mismatch -- the
+        # appliance reports what it's cached via cached_manifest_version,
+        # deliberately optional so a heartbeat payload that omits it
+        # (an appliance that's never cached anything, or an older
+        # payload shape) always triggers a refresh rather than silently
+        # skipping one -- do we do the heavier work of reconciling this
+        # appliance's own local sessions against a freshly rebuilt
+        # manifest. No separate polling loop: this reuses heartbeat's
+        # own existing, already-regular cadence instead of adding one.
+        from appliance_identity import build_manifest, current_manifest_version, reconcile_sessions_against_manifest, should_refresh_manifest
+        cached_manifest_version=payload.get('cached_manifest_version')
+        manifest_refreshed=False; revoked_session_count=0
+        with connection() as db:
+            live_version=current_manifest_version(db,cloud_id=appliance['cloud_id'])
+            if should_refresh_manifest(cached_manifest_version,live_version):
+                manifest=build_manifest(db,cloud_id=appliance['cloud_id'])
+                revoked=reconcile_sessions_against_manifest(db,manifest=manifest)
+                manifest_refreshed=True; revoked_session_count=len(revoked)
+        if revoked_session_count: audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.sessions_revoked_on_manifest_refresh','appliance',appliance['id'],{'session_count':revoked_session_count,'trigger':'heartbeat'})
         new_uptime=int(safe.get('uptime_seconds',0))
         # A restart is inferred, never self-reported: uptime_seconds resetting
         # to a value meaningfully lower than what this same appliance last
@@ -121,7 +155,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if restarted: db.execute('UPDATE appliances SET restart_count=COALESCE(restart_count,0)+1 WHERE id=?',(appliance['id'],))
             db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=? WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),appliance['id']))
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
-        return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time())}
+        return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}
 
     @app.post('/api/appliance/recordings/backlog')
     def recordings_backlog(request: Request,payload: dict) -> dict:

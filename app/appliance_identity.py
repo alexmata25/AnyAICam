@@ -129,6 +129,13 @@ def build_manifest_identities(user_rows: list[dict], grants_by_user: dict[str, l
     return identities
 
 
+def should_refresh_manifest(cached_version: int | None, current_version: int) -> bool:
+    """Deterministic (integer comparison, never a timestamp/clock-based
+    guess) staleness check. None (an appliance that has never cached a
+    version -- e.g. right after activation) always refreshes."""
+    return cached_version is None or cached_version != current_version
+
+
 def manifest_version_for(identities: list[dict]) -> int:
     """Derived, not stored -- the highest authorization_version among
     the identities actually included is, by definition, the version at
@@ -315,16 +322,11 @@ def reconcile_sessions_against_manifest(db, *, manifest: dict) -> list[str]:
     return to_revoke
 
 
-def build_manifest(db, *, cloud_id: str, ttl_minutes: int = 60) -> dict:
-    """DB-touching wrapper: resolves the appliance's own scope, loads
-    every non-revoked grant plus its user row, delegates to the pure
-    build_manifest_identities()/manifest_version_for(), and signs the
-    result. Raises ValueError if cloud_id doesn't match a real,
-    activated appliance -- never returns a manifest for one that
-    doesn't exist."""
-    appliance = _appliance_scope(db, cloud_id=cloud_id)
-    if not appliance:
-        raise ValueError(f"No activated appliance with cloud_id={cloud_id!r}.")
+def _load_identities_for_appliance(db, *, appliance: dict) -> list[dict]:
+    """Shared by build_manifest() (needs the full identities array) and
+    current_manifest_version() (needs only their authorization_versions)
+    so the two never compute this from two different queries that could
+    drift out of sync with each other."""
     grants = db.execute("SELECT id,user_id,role,scope_type,scope_id,revoked_at FROM identity_grants").fetchall()
     grants_by_user: dict[str, list[dict]] = {}
     for grant in grants:
@@ -336,10 +338,23 @@ def build_manifest(db, *, cloud_id: str, ttl_minutes: int = 60) -> dict:
         user_rows = [dict(row) for row in db.execute(
             f"SELECT id,email,approved,account_status,authorization_version FROM partner_users WHERE id IN ({placeholders})", user_ids,
         ).fetchall()]
-    identities = build_manifest_identities(
+    return build_manifest_identities(
         user_rows, grants_by_user,
         partner_id=appliance["partner_id"], customer_id=appliance["customer_id"], site_id=appliance["site_id"], cloud_id=appliance["cloud_id"],
     )
+
+
+def build_manifest(db, *, cloud_id: str, ttl_minutes: int = 60) -> dict:
+    """DB-touching wrapper: resolves the appliance's own scope, loads
+    every non-revoked grant plus its user row, delegates to the pure
+    build_manifest_identities()/manifest_version_for(), and signs the
+    result. Raises ValueError if cloud_id doesn't match a real,
+    activated appliance -- never returns a manifest for one that
+    doesn't exist."""
+    appliance = _appliance_scope(db, cloud_id=cloud_id)
+    if not appliance:
+        raise ValueError(f"No activated appliance with cloud_id={cloud_id!r}.")
+    identities = _load_identities_for_appliance(db, appliance=appliance)
     now = datetime.now()
     body = {
         "manifest_version": manifest_version_for(identities),
@@ -351,6 +366,19 @@ def build_manifest(db, *, cloud_id: str, ttl_minutes: int = 60) -> dict:
     key = ensure_signing_key(db)
     body["signature"] = sign_body(body, key_id=key["key_id"], private_key_b64=key["private_key_b64"])
     return body
+
+
+def current_manifest_version(db, *, cloud_id: str) -> int:
+    """Cheap version check -- no signing, no full identities payload --
+    for a heartbeat ACK to carry so the caller can detect staleness
+    without fetching (and an appliance without decrypting/verifying)
+    a full manifest every cycle. Returns 0 for an unknown cloud_id
+    rather than raising -- a heartbeat from an appliance mid-activation
+    should never hard-fail on this."""
+    appliance = _appliance_scope(db, cloud_id=cloud_id)
+    if not appliance:
+        return 0
+    return manifest_version_for(_load_identities_for_appliance(db, appliance=appliance))
 
 
 def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_id: str, ttl_minutes: int = ASSERTION_TTL_MINUTES_DEFAULT) -> dict:

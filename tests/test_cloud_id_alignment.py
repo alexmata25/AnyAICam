@@ -68,20 +68,20 @@ class ActivationRequiresExactMatchTests(unittest.TestCase):
 
     def test_activation_token_must_verify_against_that_specific_appliance_id(self):
         start = APPLIANCE_CLOUD_SOURCE.index("def activate_appliance")
-        body = APPLIANCE_CLOUD_SOURCE[start:start + 1600]
+        body = APPLIANCE_CLOUD_SOURCE[start:start + 2100]
         self.assertIn("SELECT * FROM appliance_activation_tokens WHERE appliance_id=?", body)
         self.assertIn("verify_password(token,candidate['token_hash'])", body)
         self.assertIn("if not match: raise HTTPException(status_code=403", body)
 
     def test_successful_activation_returns_the_same_cloud_id_customer_id_and_site_id(self):
         start = APPLIANCE_CLOUD_SOURCE.index("def activate_appliance")
-        body = APPLIANCE_CLOUD_SOURCE[start:start + 2500]
+        body = APPLIANCE_CLOUD_SOURCE[start:start + 3600]
         self.assertIn("'cloud_id':cloud_id,", body)
         self.assertIn("'customer_id':appliance['customer_id'],'site_id':appliance['site_id']", body)
 
     def test_activation_token_is_single_use(self):
         start = APPLIANCE_CLOUD_SOURCE.index("def activate_appliance")
-        body = APPLIANCE_CLOUD_SOURCE[start:start + 1600]
+        body = APPLIANCE_CLOUD_SOURCE[start:start + 2100]
         self.assertIn("SET used_at=? WHERE id=? AND used_at IS NULL", body)
         self.assertIn("if changed!=1: raise HTTPException(status_code=409", body)
 

@@ -249,6 +249,75 @@ def test_role_removal_force_expires_the_local_session_on_next_manifest_fetch(cli
     assert session["revoked_at"] is not None
 
 
+def _heartbeat_payload(cached_manifest_version=None):
+    payload = {"uptime_seconds": 1000, "cpu": 10, "memory": 20, "camera_count": 0}
+    if cached_manifest_version is not None:
+        payload["cached_manifest_version"] = cached_manifest_version
+    return payload
+
+
+def test_heartbeat_ack_carries_current_manifest_version(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
+            _seed_operator(db, "u1", "amata@anyaicam.com", "Sup3rSecret!")
+            appliance_identity.create_grant(db, user_id="u1", role="administrator", scope_type="global", scope_id=None, granted_by="test")
+
+    response = client.post("/api/appliance/heartbeat", json=_heartbeat_payload(), headers=_auth_headers("appl-1", "cred-1"))
+    assert response.status_code == 200
+    assert response.json()["current_manifest_version"] > 0
+
+
+def test_heartbeat_with_matching_cached_version_does_not_refresh(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
+            _seed_operator(db, "u1", "amata@anyaicam.com", "Sup3rSecret!")
+            appliance_identity.create_grant(db, user_id="u1", role="administrator", scope_type="global", scope_id=None, granted_by="test")
+            live_version = appliance_identity.current_manifest_version(db, cloud_id="AIC-1")
+
+    response = client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=live_version), headers=_auth_headers("appl-1", "cred-1"))
+    assert response.status_code == 200
+    assert response.json()["manifest_refreshed"] is False
+    assert response.json()["current_manifest_version"] == live_version
+
+
+def test_heartbeat_with_stale_cached_version_reconciles_local_sessions_immediately(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
+            _seed_operator(db, "u1", "tech@example.com", "Sup3rSecret!")
+            grant_id = appliance_identity.create_grant(db, user_id="u1", role="technician", scope_type="appliance", scope_id="AIC-1", granted_by="test")
+            manifest = appliance_identity.build_manifest(db, cloud_id="AIC-1")
+            live_identity = next(i for i in manifest["identities"] if i["user_id"] == "u1")
+            stale_version = live_identity["authorization_version"]
+            db.execute(
+                "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("sess-hb-1", "u1", "tech@example.com", "technician", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", stale_version),
+            )
+            appliance_identity.revoke_grant(db, grant_id=grant_id)  # role removed -- session should not survive the next heartbeat
+
+    response = client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=stale_version), headers=_auth_headers("appl-1", "cred-1"))
+    assert response.status_code == 200
+    assert response.json()["manifest_refreshed"] is True
+
+    with _db(db_path):
+        with connection() as db:
+            session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-hb-1'").fetchone()
+    assert session["revoked_at"] is not None
+
+
+def test_heartbeat_with_no_cached_version_always_refreshes(client, db_path):
+    # An appliance that has never cached anything (right after
+    # activation) always refreshes -- never silently skips.
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
+
+    response = client.post("/api/appliance/heartbeat", json=_heartbeat_payload(), headers=_auth_headers("appl-1", "cred-1"))
+    assert response.json()["manifest_refreshed"] is True
+
+
 def test_unrelated_session_is_untouched_by_reconciliation(client, db_path):
     with _db(db_path):
         with connection() as db:

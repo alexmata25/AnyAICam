@@ -250,6 +250,18 @@ def test_disabled_identity_sessions_are_revoked_even_with_a_matching_version():
 # =============================================================== offline grace
 
 
+def test_should_refresh_manifest_on_mismatch():
+    assert ai.should_refresh_manifest(cached_version=3, current_version=4)
+
+
+def test_should_not_refresh_manifest_when_versions_match():
+    assert not ai.should_refresh_manifest(cached_version=4, current_version=4)
+
+
+def test_should_refresh_manifest_when_nothing_was_ever_cached():
+    assert ai.should_refresh_manifest(cached_version=None, current_version=1)
+
+
 def test_session_within_offline_grace_period():
     now = datetime.now()
     assert ai.session_within_offline_grace(last_verified_at=now - timedelta(hours=10), now=now, grace_hours=72)

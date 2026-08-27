@@ -44152,22 +44152,40 @@ def own_appliance_identity() -> dict | None:
     """This running instance's own appliance credentials, for calling
     the cloud-delegated identity endpoints (appliance_identity.py,
     POST /api/appliance/{cloud_id}/authenticate-operator) as itself,
-    the same way any other activated appliance would. Not yet wired to
-    the real activation flow (today's POST /api/appliance/activate
-    response goes to whatever called it, not persisted by this
-    process) -- read from env vars for v1 so the delegated contract is
-    fully real, signed, and verified end-to-end without that follow-up
-    wiring. Returns None when any of the three isn't configured, and
+    the same way any other activated appliance would.
+
+    Two sources, checked in order:
+      1. ANYAICAM_APPLIANCE_ID/CLOUD_ID/CREDENTIAL env vars -- an
+         intentional development/override mechanism only. Not the
+         normal production activation path; if all three are set they
+         win outright, which is exactly what makes them useful for
+         tests and local dev, and exactly why production activation
+         must never depend on them being set by a human.
+      2. The durably persisted local activation identity (appliance_
+         activation.load_persisted_identity()) -- written by POST
+         /api/appliance/activate as its last step (see appliance_cloud.
+         activate_appliance()) and read back here automatically after
+         any restart or reboot, with zero environment configuration
+         required. This is the real, normal path once an appliance has
+         actually been activated.
+
+    Returns None when neither source has a complete identity, and
     portal_login_submit() falls back to checking partner_db directly --
     byte-for-byte the same as before this contract existed. This keeps
-    every deployment that hasn't set these (Samsung today) completely
-    unaffected."""
+    every deployment that hasn't been activated (Samsung today) or
+    hasn't set the override vars completely unaffected."""
     appliance_id = os.environ.get("ANYAICAM_APPLIANCE_ID", "").strip()
     cloud_id = os.environ.get("ANYAICAM_APPLIANCE_CLOUD_ID", "").strip()
     credential = os.environ.get("ANYAICAM_APPLIANCE_CREDENTIAL", "").strip()
-    if not (appliance_id and cloud_id and credential):
-        return None
-    return {"appliance_id": appliance_id, "cloud_id": cloud_id, "credential": credential}
+    if appliance_id and cloud_id and credential:
+        return {"appliance_id": appliance_id, "cloud_id": cloud_id, "credential": credential}
+
+    from appliance_activation import load_persisted_identity
+
+    persisted = load_persisted_identity()
+    if persisted:
+        return {"appliance_id": persisted["appliance_id"], "cloud_id": persisted["cloud_id"], "credential": persisted["credential"]}
+    return None
 
 
 @app.post("/api/portal-login")
@@ -50017,6 +50035,28 @@ def unlink_partner_account(request: Request) -> dict:
         revoke_link(db, admin_user_id=user.get("id", ""), now=datetime.now().isoformat())
     record_audit(request, "unlink", "admin_partner_link", "Unlinked partner account for remote device management.")
     return {"status": "unlinked", "message": "Partner account unlinked."}
+
+
+@app.post("/api/operations/appliance-identity/reset")
+def reset_appliance_activation_identity(request: Request) -> dict:
+    """The explicit re-provisioning path appliance_activation.
+    persist_activation() requires before a different Cloud ID may
+    activate this box -- see that module's own docstring. A destructive,
+    admin-gated, audited local action: this only clears this appliance's
+    OWN durably-persisted identity file (own_appliance_identity()'s
+    source once activated), never anything in the cloud/partner_db --
+    the appliance row, its credentials, and its grants are untouched."""
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from appliance_activation import load_persisted_identity, reset_persisted_identity
+    previous = load_persisted_identity()
+    reset_persisted_identity()
+    record_audit(
+        request, "reset", "appliance_activation_identity",
+        f"Reset local activation identity (was {previous['cloud_id']!r})." if previous else "Reset local activation identity (none was set).",
+    )
+    return {"status": "reset", "message": "Local activation identity cleared. This appliance can now be activated as a different Cloud ID."}
 
 
 
