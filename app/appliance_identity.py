@@ -39,24 +39,98 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
 import secrets
 from datetime import datetime, timedelta
+
+logger = logging.getLogger("anyaicam.identity")
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 
 SCOPE_TYPES = {"global", "partner", "customer", "site", "appliance"}
+GRANTABLE_ROLES = {"administrator", "partner_owner", "salesperson", "technician", "customer_owner", "customer_viewer"}
 PORTAL_BUCKETS = {
     "administrator": {"administrator"},
     "partner": {"partner_owner", "salesperson"},
     "technician": {"technician"},
 }
 
-# Defaults for the TTLs proposed in the design doc; overridable so a
-# deployment can tune them without a code change.
+# The authorization matrix from the reviewed design doc, enforced at
+# grant-creation time (see validate_grant_role_scope()) so an invalid
+# combination -- a technician granted 'global', a customer granted
+# 'partner' -- can never be created via the grant-management API in the
+# first place, not just filtered out later at manifest-build time.
+# 'administrator' is deliberately allowed at both 'global' (true
+# platform-wide reach) and 'partner' (administrator of one company only)
+# -- see grant_resolves()'s own docstring on why that distinction is the
+# whole point of this contract.
+VALID_ROLE_SCOPES = {
+    "administrator": {"global", "partner"},
+    "partner_owner": {"partner"},
+    "salesperson": {"partner"},
+    "technician": {"appliance", "site"},
+    "customer_owner": {"customer"},
+    "customer_viewer": {"customer"},
+}
+
+
+def validate_grant_role_scope(role: str, scope_type: str) -> None:
+    """Raises ValueError for a role/scope_type combination that isn't in
+    VALID_ROLE_SCOPES -- the grant-management API (main.py) and
+    create_grant() both route through this so an invalid grant can never
+    be created by either path."""
+    if role not in GRANTABLE_ROLES:
+        raise ValueError(f"Unknown role: {role!r}. Must be one of {sorted(GRANTABLE_ROLES)}.")
+    if scope_type not in VALID_ROLE_SCOPES[role]:
+        raise ValueError(f"{role!r} cannot be granted at scope_type={scope_type!r}. Valid scopes for this role: {sorted(VALID_ROLE_SCOPES[role])}.")
+
+
+# Defaults for the TTLs proposed in the design doc; overridable via
+# env vars (see get_ttl_config()) so a deployment can tune them without
+# a code change -- but bounded, so a misconfigured value can never
+# create effectively permanent authentication.
 ASSERTION_TTL_MINUTES_DEFAULT = 15
 SESSION_TTL_HOURS_DEFAULT = 8
 OFFLINE_GRACE_HOURS_DEFAULT = 72
+
+# (env var, default, valid inclusive range) -- the range is the actual
+# safety control: an operator can raise or lower these, but never past
+# a bound that would make a credential effectively never expire.
+_TTL_BOUNDS = {
+    "session_ttl_hours": ("ANYAICAM_SESSION_TTL_HOURS", SESSION_TTL_HOURS_DEFAULT, (1, 24 * 7)),        # 1 hour .. 7 days
+    "offline_grace_hours": ("ANYAICAM_OFFLINE_GRACE_HOURS", OFFLINE_GRACE_HOURS_DEFAULT, (1, 24 * 30)),  # 1 hour .. 30 days
+    "assertion_ttl_minutes": ("ANYAICAM_ASSERTION_TTL_MINUTES", ASSERTION_TTL_MINUTES_DEFAULT, (1, 60)), # 1 .. 60 minutes
+}
+
+
+def get_ttl_config() -> dict[str, int]:
+    """Reads the three TTLs from their env vars, falling back to the
+    safe default -- and re-falling-back to it, with a logged warning,
+    for anything unparseable or outside its valid range -- rather than
+    trusting an operator-supplied value that could otherwise make a
+    session/assertion effectively permanent. Called fresh on every use
+    (no caching) so a config change takes effect on the next request,
+    not only at process start."""
+    config: dict[str, int] = {}
+    for key, (env_var, default, (low, high)) in _TTL_BOUNDS.items():
+        raw = os.environ.get(env_var, "").strip()
+        if not raw:
+            config[key] = default
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("%s=%r is not an integer; using default %s.", env_var, raw, default)
+            config[key] = default
+            continue
+        if not (low <= value <= high):
+            logger.warning("%s=%s is outside the valid range [%s, %s]; using default %s.", env_var, value, low, high, default)
+            config[key] = default
+            continue
+        config[key] = value
+    return config
 
 
 class ManifestError(ValueError):
@@ -211,12 +285,24 @@ def verify_assertion(assertion_envelope: dict, *, expected_cloud_id: str, public
 
 def sessions_to_revoke(local_sessions: list[dict], manifest_identities: list[dict]) -> list[str]:
     """Pure: given the appliance's own cached local session records
-    (each {"session_id","user_id","authorization_version"}) and the
-    identities array from a freshly-verified manifest, return the
-    session_ids that must be force-expired immediately -- the user is
-    no longer in the manifest at all (revoked/unassigned/out of scope),
-    no longer enabled, or their authorization_version has moved past
-    what this session was established under."""
+    (each {"session_id","user_id","role","authorization_version"}) and
+    the identities array from a freshly-verified manifest, return the
+    session_ids that must be force-expired immediately.
+
+    A session is revoked when its user has dropped out of the manifest
+    entirely (revoked/unassigned/out of scope for this appliance), is no
+    longer enabled, or -- the specific case that matters once one user
+    can hold more than one simultaneous role-scoped grant, each with its
+    own session -- when THAT SESSION's own role no longer has a live,
+    resolving grant. authorization_version is per-user, not per-grant
+    (see partner_users.authorization_version's own column comment), so
+    comparing it directly would revoke every session a user has the
+    instant *any one* of their grants changes, including a completely
+    unrelated one -- e.g. revoking a Partner grant must never also
+    revoke that same person's still-valid Administrator session. Role
+    presence is the precise signal; authorization_version is only
+    consulted as a fallback for a legacy session that never recorded
+    which role it was established under."""
     by_user = {identity["user_id"]: identity for identity in manifest_identities}
     revoke: list[str] = []
     for session in local_sessions:
@@ -224,12 +310,20 @@ def sessions_to_revoke(local_sessions: list[dict], manifest_identities: list[dic
         if not identity or not identity["enabled"] or identity.get("revoked_at"):
             revoke.append(session["session_id"])
             continue
+        session_role = session.get("role")
+        if session_role is not None:
+            current_roles = {grant["role"] for grant in identity["grants"]}
+            if session_role not in current_roles:
+                revoke.append(session["session_id"])
+            continue
         if int(session.get("authorization_version", -1)) != identity["authorization_version"]:
             revoke.append(session["session_id"])
     return revoke
 
 
-def session_within_offline_grace(*, last_verified_at: datetime, now: datetime, grace_hours: int = OFFLINE_GRACE_HOURS_DEFAULT) -> bool:
+def session_within_offline_grace(*, last_verified_at: datetime, now: datetime, grace_hours: int | None = None) -> bool:
+    if grace_hours is None:
+        grace_hours = get_ttl_config()["offline_grace_hours"]
     return now - last_verified_at <= timedelta(hours=grace_hours)
 
 
@@ -266,6 +360,7 @@ def create_grant(db, *, user_id: str, role: str, scope_type: str, scope_id: str 
         raise ValueError(f"Unknown scope_type: {scope_type!r}")
     if scope_type != "global" and not scope_id:
         raise ValueError(f"scope_id is required for scope_type={scope_type!r}")
+    validate_grant_role_scope(role, scope_type)
     now = now or datetime.now().isoformat()
     grant_id = secrets.token_hex(8)
     db.execute(
@@ -309,9 +404,9 @@ def reconcile_sessions_against_manifest(db, *, manifest: dict) -> list[str]:
     # unassigned) is exactly the case sessions_to_revoke() must catch,
     # and an IN-list built from the manifest's own identities would
     # silently exclude them.
-    open_sessions = db.execute("SELECT id,user_id,authorization_version_at_login FROM user_sessions WHERE revoked_at IS NULL").fetchall()
+    open_sessions = db.execute("SELECT id,user_id,role,authorization_version_at_login FROM user_sessions WHERE revoked_at IS NULL").fetchall()
     local_sessions = [
-        {"session_id": row["id"], "user_id": row["user_id"], "authorization_version": row["authorization_version_at_login"]}
+        {"session_id": row["id"], "user_id": row["user_id"], "role": row["role"], "authorization_version": row["authorization_version_at_login"]}
         for row in open_sessions
     ]
     to_revoke = sessions_to_revoke(local_sessions, identities)
@@ -381,7 +476,7 @@ def current_manifest_version(db, *, cloud_id: str) -> int:
     return manifest_version_for(_load_identities_for_appliance(db, appliance=appliance))
 
 
-def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_id: str, ttl_minutes: int = ASSERTION_TTL_MINUTES_DEFAULT) -> dict:
+def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_id: str, ttl_minutes: int | None = None) -> dict:
     """DB-touching: verifies the password (via partner_db.verify_password,
     imported at call time to avoid a module-load cycle), then requires a
     live grant that BOTH matches the requested portal bucket AND
@@ -389,7 +484,12 @@ def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_i
     alone is never sufficient. Returns a signed assertion envelope on
     success, or {"status":"denied","reason":...} -- never raises for an
     ordinary authentication failure, only for a structurally invalid
-    request (unknown cloud_id)."""
+    request (unknown cloud_id). ttl_minutes defaults to the configured
+    (env-overridable, range-validated) assertion TTL -- see
+    get_ttl_config() -- read fresh on every call, not frozen at import
+    time, so a config change takes effect immediately."""
+    if ttl_minutes is None:
+        ttl_minutes = get_ttl_config()["assertion_ttl_minutes"]
     from partner_db import verify_password
 
     appliance = _appliance_scope(db, cloud_id=cloud_id)

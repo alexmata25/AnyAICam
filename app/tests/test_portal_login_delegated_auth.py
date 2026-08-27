@@ -95,10 +95,15 @@ def test_configured_instance_delegates_administrator_login_through_the_signed_as
 
 def test_configured_instance_rejects_a_grant_that_does_not_resolve_to_this_appliance(http_client, monkeypatch):
     client, db_path = http_client
-    _seed_appliance_and_operator(db_path, scope_type="appliance", scope_id="AIC-SOME-OTHER-BOX")
+    # technician/appliance is a valid role-scope combination (unlike
+    # administrator/appliance, which validate_grant_role_scope() now
+    # rejects outright) -- this test is about scope resolution, not
+    # role-scope validity, so it needs a combination that's valid in
+    # general but simply doesn't resolve to *this* appliance.
+    _seed_appliance_and_operator(db_path, email="tech@example.com", role="technician", scope_type="appliance", scope_id="AIC-SOME-OTHER-BOX")
     _configure_own_appliance(monkeypatch)
 
-    response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"})
+    response = client.post("/api/portal-login", json={"email": "tech@example.com", "password": "Sup3rSecret!", "portal": "technician"})
     assert response.status_code in (401, 403)
 
 

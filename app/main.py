@@ -50059,6 +50059,195 @@ def reset_appliance_activation_identity(request: Request) -> dict:
     return {"status": "reset", "message": "Local activation identity cleared. This appliance can now be activated as a different Cloud ID."}
 
 
+# =============================================================== identity grant management (admin-only, audited)
+#
+# The only sanctioned way to authorize an operator on an appliance --
+# see appliance_identity.py's own module docstring. Grants an EXISTING
+# partner_users identity (never creates one -- see create_identity_
+# grant()'s 404 below); explicit scope only, never inferred from
+# partner_id. authorization_version/manifest_version bump automatically
+# (appliance_identity.create_grant()/revoke_grant() already do this --
+# nothing extra required here).
+
+_GRANT_ROLE_LABELS = {
+    "administrator": "Administrator", "partner_owner": "Partner Owner", "salesperson": "Salesperson",
+    "technician": "Technician", "customer_owner": "Customer Owner", "customer_viewer": "Customer Viewer",
+}
+
+
+@app.get("/api/operations/identity-grants")
+def list_identity_grants(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        grants = db.execute(
+            "SELECT g.id,g.user_id,g.role,g.scope_type,g.scope_id,g.granted_at,g.granted_by,g.revoked_at,"
+            "u.email,u.authorization_version FROM identity_grants g JOIN partner_users u ON u.id=g.user_id "
+            "ORDER BY (g.revoked_at IS NOT NULL),g.granted_at DESC"
+        ).fetchall()
+    return {"grants": [dict(item) for item in grants]}
+
+
+@app.post("/api/operations/identity-grants")
+def create_identity_grant(request: Request, payload: dict) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    email = str(payload.get("email", "")).strip().lower()
+    role = str(payload.get("role", "")).strip()
+    scope_type = str(payload.get("scope_type", "")).strip()
+    scope_id = (str(payload.get("scope_id")).strip() or None) if payload.get("scope_id") else None
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+    from appliance_identity import create_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        target = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email,)).fetchone()
+        if not target:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No existing account for {email!r}. A grant authorizes an existing identity -- it doesn't create one.",
+            )
+        try:
+            grant_id = create_grant(db, user_id=target["id"], role=role, scope_type=scope_type, scope_id=scope_id, granted_by=user.get("email", "admin"))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    scope_label = f"{scope_type}:{scope_id}" if scope_id else scope_type
+    record_audit(request, "grant", "identity_grant", f"Granted {role} ({scope_label}) to {email}.")
+    return {"status": "granted", "grant_id": grant_id}
+
+
+@app.post("/api/operations/identity-grants/{grant_id}/revoke")
+def revoke_identity_grant(request: Request, grant_id: str) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from appliance_identity import revoke_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        existing = db.execute("SELECT id,role,scope_type,scope_id,revoked_at FROM identity_grants WHERE id=?", (grant_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Grant not found.")
+        if existing["revoked_at"]:
+            return {"status": "already_revoked"}
+        revoke_grant(db, grant_id=grant_id)
+    record_audit(request, "revoke", "identity_grant", f"Revoked {existing['role']} ({existing['scope_type']}) grant {grant_id}.")
+    return {"status": "revoked"}
+
+
+@app.get("/operations/identity-grants", response_class=HTMLResponse)
+def identity_grants_page(request: Request) -> str:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page("Identity grants", "operations", "manage_settings")
+    record_audit(request, "view", "operations:identity-grants", "Opened identity grant management.")
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        grants = db.execute(
+            "SELECT g.id,g.role,g.scope_type,g.scope_id,g.granted_at,g.granted_by,g.revoked_at,u.email "
+            "FROM identity_grants g JOIN partner_users u ON u.id=g.user_id ORDER BY (g.revoked_at IS NOT NULL),g.granted_at DESC"
+        ).fetchall()
+    def _grant_row(g: dict) -> str:
+        status_html = '<span class="pill">Revoked</span>' if g["revoked_at"] else '<span class="pill" style="background:#e2f3ec;color:#136a4d">Active</span>'
+        action_html = "" if g["revoked_at"] else f'<button class="ghost-button revoke-grant" data-id="{g["id"]}">Revoke</button>'
+        scope_label = escape(g["scope_type"]) + (":" + escape(g["scope_id"]) if g["scope_id"] else "")
+        return (
+            f'<tr><td>{escape(g["email"])}</td><td>{escape(_GRANT_ROLE_LABELS.get(g["role"], g["role"]))}</td>'
+            f'<td>{scope_label}</td><td>{escape(g["granted_by"] or "")}</td><td>{status_html}</td><td>{action_html}</td></tr>'
+        )
+
+    rows_html = "".join(_grant_row(g) for g in grants) or '<tr><td colspan="6">No grants yet.</td></tr>'
+    role_options = "".join(f'<option value="{key}">{label}</option>' for key, label in _GRANT_ROLE_LABELS.items())
+    content = f'''<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Identity grants</h1></div><a class="ghost-button" href="/operations">Back to operations</a></header>
+<p class="health-detail">Authorizes an existing operator account for a specific scope -- global, one partner, one customer, one site, or one appliance. This never creates an account; the email must already exist as a real identity.</p>
+<section class="panel"><h2>Grant access</h2><form id="grant-form" class="rule-form"><label>Email<input id="grant-email" type="email" required placeholder="operator@example.com"></label><label>Role<select id="grant-role">{role_options}</select></label><label>Scope type<select id="grant-scope-type"><option value="global">Global</option><option value="partner">Partner</option><option value="customer">Customer</option><option value="site">Site</option><option value="appliance">Appliance</option></select></label><label>Scope ID <span class="health-detail">(leave blank for Global)</span><input id="grant-scope-id" placeholder="partner-1 / cust-1 / site-1 / AIC-XXXX"></label><button class="action-button" type="submit">Grant access</button></form><div id="grant-message" class="health-detail"></div></section>
+<section class="panel" style="overflow:auto;margin-top:18px"><h2>Current grants</h2><table class="data-table"><thead><tr><th>Email</th><th>Role</th><th>Scope</th><th>Granted by</th><th>Status</th><th></th></tr></thead><tbody>{rows_html}</tbody></table></section>'''
+    scripts = '''<script>
+document.getElementById('grant-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/operations/identity-grants',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('grant-email').value,role:document.getElementById('grant-role').value,scope_type:document.getElementById('grant-scope-type').value,scope_id:document.getElementById('grant-scope-id').value})}),r=await response.json();document.getElementById('grant-message').textContent=response.ok?'Granted.':(r.detail||'Could not create grant.');if(response.ok)setTimeout(()=>location.reload(),600)});
+document.querySelectorAll('.revoke-grant').forEach(btn=>btn.onclick=async()=>{if(!confirm('Revoke this grant?'))return;await fetch(`/api/operations/identity-grants/${btn.dataset.id}/revoke`,{method:'POST'});location.reload()});
+</script>'''
+    return page_shell("Identity grants", "operations", content, scripts)
+
+
+# =============================================================== appliance activation UX
+#
+# Wraps the existing, real POST /api/appliance/activate (unauthenticated
+# by design -- there is no credential yet) and the durable local
+# identity storage from gap #1. Never displays the permanent appliance
+# credential -- neither route below returns it, and activate_appliance()
+# itself is called directly by this page's own JS, never proxied
+# through a route that could log or echo it back.
+
+
+@app.post("/api/operations/appliance-identity/fetch-manifest")
+def fetch_appliance_identity_manifest(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    identity = own_appliance_identity()
+    if not identity:
+        raise HTTPException(status_code=409, detail="This appliance has not been activated yet.")
+    from appliance_identity import get_cloud_identity_backend
+    try:
+        manifest = get_cloud_identity_backend().fetch_manifest(cloud_id=identity["cloud_id"])
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    record_audit(
+        request, "fetch", "appliance_identity_manifest",
+        f"Fetched identity manifest ({len(manifest['identities'])} identities, version {manifest['manifest_version']}).",
+    )
+    return {"status": "connected", "cloud_id": manifest["appliance"]["cloud_id"], "identity_count": len(manifest["identities"]), "manifest_version": manifest["manifest_version"]}
+
+
+@app.get("/operations/appliance-activation", response_class=HTMLResponse)
+def appliance_activation_page(request: Request) -> str:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page("Appliance activation", "operations", "manage_settings")
+    record_audit(request, "view", "operations:appliance-activation", "Opened appliance activation.")
+    from appliance_activation import load_persisted_identity
+    identity = load_persisted_identity()
+    if identity:
+        status_html = (
+            '<section class="panel"><h2>Activated</h2>'
+            f'<div class="health-row"><span>Cloud ID</span><strong>{escape(identity["cloud_id"])}</strong></div>'
+            f'<div class="health-row"><span>Customer</span><strong>{escape(identity["customer_id"] or "—")}</strong></div>'
+            f'<div class="health-row"><span>Site</span><strong>{escape(identity["site_id"] or "—")}</strong></div>'
+            f'<div class="health-row"><span>Partner</span><strong>{escape(identity["partner_id"] or "—")}</strong></div>'
+            f'<div class="health-row"><span>Activated</span><strong>{escape(identity["activated_at"][:19])}</strong></div>'
+            f'<div class="health-row"><span>Activation version</span><strong>{identity["activation_version"]}</strong></div>'
+            '<p id="cloud-status" class="health-detail">Checking cloud connection…</p>'
+            '<button class="ghost-button" id="reset-activation" style="margin-top:12px">Reset / re-provision</button></section>'
+        )
+    else:
+        status_html = (
+            '<section class="panel"><h2>Not yet activated</h2>'
+            '<form id="activate-form" class="rule-form">'
+            '<label>Cloud ID<input id="activate-cloud-id" required placeholder="AIC-XXXXXXXX"></label>'
+            '<label>Activation token<input id="activate-token" required></label>'
+            '<button class="action-button" type="submit">Activate</button></form>'
+            '<div id="activate-message" class="health-detail"></div></section>'
+        )
+    content = (
+        '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Appliance activation</h1></div>'
+        '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+        '<p class="health-detail">Connects this appliance to its authoritative cloud identity -- customer, site, and '
+        'authorized operators all come from the cloud after this, never a locally recreated account. The permanent '
+        f'credential issued here is never shown.</p>{status_html}'
+    )
+    scripts = '''<script>
+const activateForm=document.getElementById('activate-form');
+if(activateForm)activateForm.addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/appliance/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_id:document.getElementById('activate-cloud-id').value,activation_token:document.getElementById('activate-token').value})}),r=await response.json();if(!response.ok){document.getElementById('activate-message').textContent=r.detail||'Activation failed.';return}document.getElementById('activate-message').textContent='Activated. Connecting to cloud…';setTimeout(()=>location.reload(),400)});
+const cloudStatus=document.getElementById('cloud-status');
+if(cloudStatus)fetch('/api/operations/appliance-identity/fetch-manifest',{method:'POST'}).then(r=>r.json()).then(r=>{cloudStatus.textContent=r.status==='connected'?`Cloud connected -- ${r.identity_count} authorized identit${r.identity_count===1?'y':'ies'} (manifest v${r.manifest_version}).`:'Cloud connection failed.'}).catch(()=>{cloudStatus.textContent='Cloud connection failed.'});
+const resetButton=document.getElementById('reset-activation');
+if(resetButton)resetButton.onclick=async()=>{if(!confirm('Reset local activation identity? This appliance will need to be activated again with a Cloud ID and token.'))return;await fetch('/api/operations/appliance-identity/reset',{method:'POST'});location.reload()};
+</script>'''
+    return page_shell("Appliance activation", "operations", content, scripts)
+
+
 
 
 

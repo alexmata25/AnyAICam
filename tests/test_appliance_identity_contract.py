@@ -262,6 +262,90 @@ def test_should_refresh_manifest_when_nothing_was_ever_cached():
     assert ai.should_refresh_manifest(cached_version=None, current_version=1)
 
 
+# =============================================================== configurable TTLs, range-validated
+
+
+def test_ttl_config_defaults_when_nothing_is_set(monkeypatch):
+    monkeypatch.delenv("ANYAICAM_SESSION_TTL_HOURS", raising=False)
+    monkeypatch.delenv("ANYAICAM_OFFLINE_GRACE_HOURS", raising=False)
+    monkeypatch.delenv("ANYAICAM_ASSERTION_TTL_MINUTES", raising=False)
+    config = ai.get_ttl_config()
+    assert config == {"session_ttl_hours": 8, "offline_grace_hours": 72, "assertion_ttl_minutes": 15}
+
+
+def test_ttl_config_honors_a_valid_override(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_SESSION_TTL_HOURS", "12")
+    config = ai.get_ttl_config()
+    assert config["session_ttl_hours"] == 12
+
+
+def test_ttl_config_rejects_a_value_that_would_be_effectively_permanent(monkeypatch):
+    # Absurdly large -- would make a session/assertion never meaningfully expire.
+    monkeypatch.setenv("ANYAICAM_SESSION_TTL_HOURS", "999999")
+    monkeypatch.setenv("ANYAICAM_OFFLINE_GRACE_HOURS", "999999")
+    monkeypatch.setenv("ANYAICAM_ASSERTION_TTL_MINUTES", "999999")
+    config = ai.get_ttl_config()
+    assert config == {"session_ttl_hours": 8, "offline_grace_hours": 72, "assertion_ttl_minutes": 15}
+
+
+def test_ttl_config_rejects_zero_or_negative(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_ASSERTION_TTL_MINUTES", "0")
+    assert ai.get_ttl_config()["assertion_ttl_minutes"] == 15
+    monkeypatch.setenv("ANYAICAM_ASSERTION_TTL_MINUTES", "-5")
+    assert ai.get_ttl_config()["assertion_ttl_minutes"] == 15
+
+
+def test_ttl_config_rejects_unparseable_values(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_OFFLINE_GRACE_HOURS", "not-a-number")
+    assert ai.get_ttl_config()["offline_grace_hours"] == 72
+
+
+# =============================================================== grant role/scope validation matrix
+
+
+def test_administrator_can_be_granted_global_or_partner_scope():
+    ai.validate_grant_role_scope("administrator", "global")  # does not raise
+    ai.validate_grant_role_scope("administrator", "partner")  # does not raise
+
+
+def test_administrator_cannot_be_granted_appliance_or_site_scope():
+    for scope in ("appliance", "site", "customer"):
+        try:
+            ai.validate_grant_role_scope("administrator", scope)
+            assert False, f"administrator/{scope} should have been rejected"
+        except ValueError:
+            pass
+
+
+def test_technician_can_only_be_granted_appliance_or_site_scope():
+    ai.validate_grant_role_scope("technician", "appliance")
+    ai.validate_grant_role_scope("technician", "site")
+    try:
+        ai.validate_grant_role_scope("technician", "global")
+        assert False
+    except ValueError:
+        pass
+
+
+def test_customer_roles_can_only_be_granted_customer_scope():
+    ai.validate_grant_role_scope("customer_owner", "customer")
+    ai.validate_grant_role_scope("customer_viewer", "customer")
+    for role in ("customer_owner", "customer_viewer"):
+        try:
+            ai.validate_grant_role_scope(role, "partner")
+            assert False
+        except ValueError:
+            pass
+
+
+def test_unknown_role_is_rejected():
+    try:
+        ai.validate_grant_role_scope("superuser", "global")
+        assert False
+    except ValueError:
+        pass
+
+
 def test_session_within_offline_grace_period():
     now = datetime.now()
     assert ai.session_within_offline_grace(last_verified_at=now - timedelta(hours=10), now=now, grace_hours=72)

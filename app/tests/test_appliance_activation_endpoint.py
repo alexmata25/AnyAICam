@@ -42,6 +42,12 @@ def db_path(tmp_path):
 def identity_file(tmp_path, monkeypatch):
     path = tmp_path / "appliance_identity.json"
     monkeypatch.setattr(appliance_activation, "ACTIVATION_IDENTITY_FILE", path)
+    # activation_limiter is a shared module-level singleton, never reset
+    # by database/identity-file isolation -- see test_appliance_
+    # activation_ux.py's matching fixture comment for the full reason
+    # this file resets it too (this file is itself a heavy consumer of
+    # POST /api/appliance/activate and runs before that one alphabetically).
+    appliance_cloud.activation_limiter.events.clear()
     return path
 
 

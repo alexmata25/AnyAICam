@@ -36,8 +36,11 @@ def destination_for_role(role: str) -> str:
     return role_destination(role)
 
 
-def _token(email: str, role: str, partner_id=None, customer_id=None,session_id=None) -> str:
-    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + 28800}, separators=(',', ':')).encode()
+def _token(email: str, role: str, partner_id=None, customer_id=None, session_id=None, ttl_hours: int | None = None) -> str:
+    if ttl_hours is None:
+        from appliance_identity import get_ttl_config
+        ttl_hours = get_ttl_config()['session_ttl_hours']
+    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + ttl_hours * 3600}, separators=(',', ':')).encode()
     encoded = urlsafe_b64encode(payload).decode().rstrip('=')
     signature = hmac.new(SESSION_SECRETS[0].encode(), encoded.encode(), hashlib.sha256).hexdigest()
     return encoded + '.' + signature
@@ -67,9 +70,11 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
     Portal login page's Administrator/Partner/Technician selector) can
     establish an identical session without duplicating this
     security-sensitive cookie-signing logic."""
+    from appliance_identity import get_ttl_config
+    session_ttl_hours = get_ttl_config()['session_ttl_hours']
     session_id = secrets.token_hex(16)
     now = datetime.now()
-    expiry = now + timedelta(hours=8)
+    expiry = now + timedelta(hours=session_ttl_hours)
     with connection() as db:
         db.execute(
             'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent,authorization_version_at_login) '
@@ -84,8 +89,8 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
     response = RedirectResponse(destination, status_code=303)
     response.set_cookie(
         SESSION_COOKIE,
-        _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id),
-        httponly=True, samesite='strict', secure=settings.secure_cookies, max_age=28800, domain=settings.cookie_domain or None,
+        _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id, session_ttl_hours),
+        httponly=True, samesite='strict', secure=settings.secure_cookies, max_age=session_ttl_hours * 3600, domain=settings.cookie_domain or None,
     )
     return response
 
