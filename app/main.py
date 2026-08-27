@@ -40330,6 +40330,23 @@ PARTNER_IDENTITY_ONLY_NAV_KEYS = {
     "setup", "subscription", "pricing",
 }
 
+# Customer video/footage nav items -- Events, Smart alerts, Playback,
+# Media, Dashboard -- that an Administrator Portal identity (current_
+# user()'s legacy JSON-store account) must never see just by virtue of
+# being an administrator. That identity has no camera_access.py-scoped
+# customer_camera_permissions row and no customer_id at all -- unlike
+# PARTNER_IDENTITY_ONLY_NAV_KEYS (items that 404/dead-end for an admin
+# because they need a partner_identity() record), these items DO
+# render for an admin today, they just show real customer footage/
+# event data the admin was never granted -- see camera_access.py's own
+# "customer_owner/administrator: always authorized" rule, which
+# deliberately does not extend to this legacy identity at all. There is
+# currently no "explicit customer-video permission" grant for an
+# Administrator Portal account; until one exists, these stay hidden
+# unconditionally for every ADMIN_PORTAL_ROLES identity -- being an
+# administrator must never be read as customer-video access.
+CUSTOMER_VIDEO_NAV_KEYS = {"events", "alerts", "playback", "media", "dashboard"}
+
 
 
 
@@ -45623,8 +45640,10 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
         # Broad access, but not to the handful of items that require a
         # partner/customer identity record an administrator doesn't have --
-        # see PARTNER_IDENTITY_ONLY_NAV_KEYS. Every other item stays visible.
-        return {key for key, _url, _icon, _label in NAV_ITEMS} - PARTNER_IDENTITY_ONLY_NAV_KEYS
+        # see PARTNER_IDENTITY_ONLY_NAV_KEYS -- and not to customer video/
+        # footage nav items, which being an administrator must never imply
+        # -- see CUSTOMER_VIDEO_NAV_KEYS. Every other item stays visible.
+        return {key for key, _url, _icon, _label in NAV_ITEMS} - PARTNER_IDENTITY_ONLY_NAV_KEYS - CUSTOMER_VIDEO_NAV_KEYS
 
 
 
