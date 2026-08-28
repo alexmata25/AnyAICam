@@ -56,8 +56,12 @@ def _stub_request():
 
 
 @pytest.mark.parametrize("portal_role", ["customer_owner", "customer_viewer"])
-def test_customer_portal_role_always_goes_to_customer_login(portal_role):
-    assert main.logout_destination(None, portal_role) == "/customer-login.html"
+def test_customer_portal_role_goes_to_the_external_marketing_homepage(portal_role):
+    # A real customer_owner/customer_viewer identity logs all the way
+    # out to the public marketing site -- not back to any sign-in page
+    # inside this app. See logout_destination()'s own docstring.
+    assert main.logout_destination(None, portal_role) == "https://anyaicam.com/"
+    assert main.logout_destination(None, portal_role) == main.CUSTOMER_LOGOUT_DESTINATION
 
 
 @pytest.mark.parametrize("portal_role", ["administrator", "partner_owner", "salesperson", "technician"])
@@ -73,21 +77,26 @@ def test_legacy_admin_only_session_goes_to_portal_login(legacy_role):
 @pytest.mark.parametrize("legacy_role", ["customer_owner", "customer_viewer"])
 def test_legacy_customer_role_never_goes_to_portal_login(legacy_role):
     # A vestigial customer_owner/customer_viewer row in the old JSON
-    # store must still never be sent to the blue portal login.
-    assert main.logout_destination(legacy_role, None) == "/customer-login.html"
+    # store must still never be sent to the blue portal login -- and,
+    # like the real Partner Portal customer identity, goes all the way
+    # out to the external marketing homepage now, not a local page.
+    assert main.logout_destination(legacy_role, None) == "https://anyaicam.com/"
 
 
 def test_no_identity_at_all_defaults_to_customer_login_not_portal():
-    # Fail-safe direction: an ambiguous/absent identity must never
-    # default to the blue portal login.
+    # Fail-safe direction for the case nothing meaningful was actually
+    # logged out: local customer sign-in page, never the blue portal
+    # login, and never the external homepage either -- that's reserved
+    # for a real customer identity that was actually present.
     assert main.logout_destination(None, None) == "/customer-login.html"
 
 
 def test_customer_portal_identity_wins_even_if_legacy_side_looks_like_admin():
     # An inconsistent dual-cookie state (shouldn't normally happen, but
     # must still fail toward never leaking a customer to the portal
-    # login) -- the customer signal on either side always wins.
-    assert main.logout_destination("administrator", "customer_owner") == "/customer-login.html"
+    # login) -- the customer signal on either side always wins, sending
+    # them to the external homepage same as any other customer logout.
+    assert main.logout_destination("administrator", "customer_owner") == "https://anyaicam.com/"
 
 
 # =============================================================== real HTTP: POST /logout
@@ -127,15 +136,34 @@ def _admin_session_cookie(admin_id="admin-1", role="administrator"):
     return main.create_session(admin_id)
 
 
-def test_customer_logout_redirects_to_customer_login_and_clears_the_real_cookie(http_client, db_path):
-    token = _seed_partner_session(db_path, email="owner@example.test", role="customer_owner", customer_id="cust-1")
+@pytest.mark.parametrize("role", ["customer_owner", "customer_viewer"])
+def test_customer_logout_redirects_to_the_external_homepage_and_destroys_the_session(http_client, db_path, role):
+    """The exact behavior this task confirmed as intended: customer_owner
+    and customer_viewer both log all the way out (server-side session
+    revoked, not just the cookie dropped client-side) and land on the
+    public https://anyaicam.com/ homepage, never a sign-in page inside
+    this app."""
+    token = _seed_partner_session(db_path, email=f"{role}@example.test", role=role, customer_id="cust-1")
     response = http_client.post("/logout", cookies={partner_portal.SESSION_COOKIE: token})
     assert response.status_code == 303
-    assert response.headers["location"] == "/customer-login.html"
+    assert response.headers["location"] == "https://anyaicam.com/"
+    assert response.headers["location"] == main.CUSTOMER_LOGOUT_DESTINATION
     set_cookie = response.headers.get("set-cookie", "")
     assert partner_portal.SESSION_COOKIE in set_cookie  # the real cookie is actually being cleared
     revoked = sqlite3.connect(db_path).execute("SELECT revoked_at FROM user_sessions WHERE id='sess-1'").fetchone()[0]
     assert revoked is not None  # server-side session revoked, not just the cookie dropped client-side
+
+
+@pytest.mark.parametrize("role", ["customer_owner", "customer_viewer"])
+def test_customer_logout_old_cookie_is_rejected_on_the_very_next_request(http_client, db_path, role):
+    """Belt-and-suspenders on top of the revoked_at check above: the
+    exact cookie just logged out with must be genuinely unusable
+    afterward against a real protected route, not merely marked
+    revoked in a column nothing reads."""
+    token = _seed_partner_session(db_path, email=f"{role}@example.test", role=role, customer_id="cust-1")
+    http_client.post("/logout", cookies={partner_portal.SESSION_COOKIE: token})
+    still_works = http_client.get("/customer-account", cookies={partner_portal.SESSION_COOKIE: token})
+    assert still_works.status_code in (303, 401, 403)  # denied -- the old cookie is genuinely dead, not just redirected home
 
 
 @pytest.mark.parametrize("role", ["administrator", "partner_owner", "salesperson", "technician"])
@@ -158,6 +186,16 @@ def test_logout_with_no_session_at_all_does_not_crash_and_defaults_to_customer_l
     response = http_client.post("/logout")
     assert response.status_code == 303
     assert response.headers["location"] == "/customer-login.html"
+
+
+def test_logout_remains_reachable_through_authentication_middleware():
+    # PUBLIC_PATH_PREFIXES is what authentication_middleware consults
+    # to decide whether a request may proceed without an established
+    # session -- /logout must stay listed so a customer whose session
+    # already expired (or who never had one) can still POST here
+    # without being bounced by the middleware itself before
+    # logout_destination()'s own fail-safe default ever runs.
+    assert "/logout" in main.PUBLIC_PATH_PREFIXES
 
 
 def test_customer_logout_never_touches_partner_role_session_data(http_client, db_path):
@@ -197,11 +235,16 @@ def test_portal_login_page_reachable_unauthenticated_no_bounce(http_client):
     assert response.status_code == 200
 
 
-def test_logout_then_get_customer_login_is_a_single_hop(http_client, db_path):
+def test_customer_logout_destination_is_external_not_a_local_hop(http_client, db_path):
+    # Supersedes the old "single hop" check for the customer case: the
+    # destination is now https://anyaicam.com/, a page this app does
+    # not and should not serve itself -- the only thing to verify here
+    # is that the redirect target really is that absolute external URL
+    # (already asserted in detail above), not something this app could
+    # attempt to GET against its own TestClient.
     token = _seed_partner_session(db_path, email="owner@example.test", role="customer_owner", customer_id="cust-1")
     logout_response = http_client.post("/logout", cookies={partner_portal.SESSION_COOKIE: token})
-    destination = http_client.get(logout_response.headers["location"])
-    assert destination.status_code == 200
+    assert logout_response.headers["location"].startswith("https://anyaicam.com/")
 
 
 def test_logout_then_get_portal_login_is_a_single_hop(http_client, db_path):

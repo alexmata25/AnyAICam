@@ -44446,6 +44446,13 @@ def portal_login_submit(request: Request, payload: dict):
 
 CUSTOMER_LOGIN_DESTINATION = "/customer-login.html"
 PORTAL_LOGIN_DESTINATION = "/partner.html"
+# Where a real customer_owner/customer_viewer identity lands after
+# POST /logout -- the public marketing homepage, not a sign-in page
+# inside this app (see logout_destination()'s own docstring). A
+# literal absolute external URL, deliberately not read from an env
+# var: this is the one production marketing domain, not a per-
+# deployment setting.
+CUSTOMER_LOGOUT_DESTINATION = "https://anyaicam.com/"
 
 
 def logout_destination(legacy_role: str | None, portal_role: str | None) -> str:
@@ -44458,23 +44465,27 @@ def logout_destination(legacy_role: str | None, portal_role: str | None) -> str:
     authenticated_user(), Partner Portal partner_identity(), or both)
     was actually present on this request.
 
-    A customer identity -- on the Partner Portal side (customer_owner/
-    customer_viewer, the real, active customer accounts) or the legacy
+    A real customer identity -- on the Partner Portal side (customer_
+    owner/customer_viewer, the active customer accounts) or the legacy
     side (a vestigial customer_owner/customer_viewer row in the old
-    JSON store, if one exists) -- always resolves to the white customer
-    login, even when some other signal on the request is ambiguous:
-    sending a real customer to the blue portal login is the one outcome
-    this function must never produce. administrator/partner_owner/
-    salesperson/technician/admin/support_admin/installer all resolve to
-    the blue portal login. An identity that's absent or unrecognized on
-    both sides also defaults to the customer login, for the same
-    fail-safe reason -- the worse mistake here is a customer landing on
-    the wrong branded page, not a partner landing on the wrong one."""
+    JSON store, if one exists) -- signs the customer out entirely and
+    sends them to the public marketing homepage (CUSTOMER_LOGOUT_
+    DESTINATION), not back to any sign-in page inside this app: a
+    logged-out customer has nothing left to do here until they choose
+    to sign in again from anyaicam.com itself. administrator/partner_
+    owner/salesperson/technician/admin/support_admin/installer all
+    still resolve to the blue portal login (PORTAL_LOGIN_DESTINATION),
+    unchanged. An identity that's absent or unrecognized on both sides
+    -- nothing meaningful was actually logged out -- falls back to the
+    local customer sign-in page (CUSTOMER_LOGIN_DESTINATION), the same
+    fail-safe default as before: the worse mistake here is a customer
+    landing on the wrong branded page, not a partner landing on the
+    wrong one."""
     customer_roles = {"customer_owner", "customer_viewer"}
     if portal_role in customer_roles:
-        return CUSTOMER_LOGIN_DESTINATION
+        return CUSTOMER_LOGOUT_DESTINATION
     if legacy_role in customer_roles:
-        return CUSTOMER_LOGIN_DESTINATION
+        return CUSTOMER_LOGOUT_DESTINATION
     if portal_role or legacy_role:
         return PORTAL_LOGIN_DESTINATION
     return CUSTOMER_LOGIN_DESTINATION
