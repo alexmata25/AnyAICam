@@ -999,57 +999,27 @@ def test_multiple_null_device_key_cameras_coexist_under_one_customer(db_path):
 
 def _all_routes(path, method):
     """Unlike _route() (first match only), returns every endpoint
-    registered at this exact path+method -- needed here because
-    /api/customer/cameras/provision has TWO functions registered at
-    the identical path (partner_workspace.py lines 519 and 571):
-    request_camera_provisioning (what real HTTP traffic actually
-    reaches, Starlette matching in registration order) and the later,
-    fully shadowed/unreachable provision_customer_camera. That
-    duplicate-route bug is real, pre-existing, and unrelated to this
-    fix -- flagged in the blocker #2 report, not fixed here. This
-    helper exists only so the identity-rule parity this test checks
-    can still be verified directly against provision_customer_camera's
-    own logic, bypassing the routing collision rather than being
-    silently blocked by it.
-    """
+    registered at this exact path+method -- used below to guard against
+    the duplicate-registration bug (two functions once shared this exact
+    path; see test_exactly_one_camera_provision_route_is_registered())
+    ever silently reappearing."""
     return [
         r.endpoint for r in main.app.routes
         if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or {method})
     ]
 
 
-def test_provisioning_callback_and_customer_portal_provisioning_agree_on_identity(db_path, monkeypatch):
-    """Parity check: a camera created through the appliance-callback
-    path (appliance_submit_provisioning) is found and updated -- not
-    duplicated -- by the customer-portal path (provision_customer_
-    camera) for the same customer_id+device_key. Both routes must be
-    reading the exact same identity rule.
-
-    provision_customer_camera is called directly here (see
-    _all_routes()'s own docstring) because it is currently shadowed at
-    its own registered path by an identically-pathed earlier route --
-    a separate, pre-existing bug this test intentionally works around
-    rather than silently accepts as "cannot be tested"."""
-    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
-    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+def test_exactly_one_camera_provision_route_is_registered():
+    """Regression test for a real, previously-shipped bug: a second
+    function (provision_customer_camera) used to be registered at this
+    identical path, immediately after request_camera_provisioning.
+    Starlette matches routes in registration order, so the second
+    registration was permanently unreachable by real HTTP traffic --
+    dead code masquerading as a working feature. It has been deleted
+    (its logic was already fully superseded by the live async path:
+    request_camera_provisioning()'s queued job, completed by
+    appliance_submit_provisioning() in appliance_cloud.py). This test
+    guards against a duplicate registration ever silently returning."""
     matches = _all_routes("/api/customer/cameras/provision", "POST")
-    assert len(matches) == 2, "expected exactly the two known duplicate-path registrations -- update this test if that changes"
-    provision_customer_camera = matches[1]
-    with override_target(sqlite_path=db_path):
-        initialize_database()
-        conn = sqlite3.connect(db_path)
-        _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1")
-        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
-
-        # 1. Appliance-callback path creates the camera first.
-        job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-parity", "name": "Back Gate"})
-        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
-
-        # 2. Customer-portal path, same customer_id+device_key -- must
-        # update the SAME row, not create a second.
-        provision_customer_camera(_fake_request(), {"device_key": "onvif-uuid-parity", "name": "Back Gate Renamed"})
-
-        conn2 = sqlite3.connect(db_path)
-        cameras = conn2.execute("SELECT name FROM cameras WHERE customer_id='cust-1' AND device_key='onvif-uuid-parity'").fetchall()
-    assert len(cameras) == 1
-    assert cameras[0][0] == "Back Gate Renamed"
+    assert len(matches) == 1
+    assert matches[0].__name__ == "request_camera_provisioning"

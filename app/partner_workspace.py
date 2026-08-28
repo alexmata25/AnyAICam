@@ -587,65 +587,18 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         expected=int(plan.get('camera_quantity') or 0)
         return {'cameras':cameras,'expected_camera_count':expected,'configured_camera_count':configured,'onboarding_complete':expected>0 and configured>=expected}
 
-    @app.post('/api/customer/cameras/provision')
-    def provision_customer_camera(request: Request,payload: dict) -> dict:
-        # Binds one discovered ONVIF device (device_key, from the real
-        # appliance-side scan -- see request_camera_scan()/camera_scan_status()
-        # above, backed by anyaicam_agent/discovery.py's real WS-Discovery)
-        # into a persistent camera record. device_key is how rediscovering
-        # the same physical camera updates its existing row instead of
-        # creating a duplicate. Credentials are accepted here once, over
-        # the customer's own authenticated HTTPS session, and are never
-        # returned in this or any other response -- see
-        # appliance_protocol.encrypt_camera_credentials(), the same
-        # mechanism appliance_cloud.py's provisioning-job delivery already
-        # depends on.
-        identity=customer_owner(request)
-        try: require_permission(identity,'camera.self.configure')
-        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        device_key=str(payload.get('device_key','')).strip()
-        if not device_key: raise HTTPException(status_code=400,detail='device_key is required.')
-        name=str(payload.get('name') or 'Camera').strip()[:120] or 'Camera'
-        site_id=str(payload.get('site_id') or '')
-        onvif_endpoint=str(payload.get('onvif_endpoint') or '')
-        ip_address=str(payload.get('ip_address') or '')
-        manufacturer=str(payload.get('manufacturer') or '')
-        model=str(payload.get('model') or '')
-        username=str(payload.get('username') or '')
-        password=str(payload.get('password') or '')
-        encrypted=encrypt_camera_credentials(username,password) if (username or password) else None
-        if (username or password) and encrypted is None:
-            raise HTTPException(status_code=503,detail='Camera credential encryption is not configured; contact support before adding camera credentials.')
-        now=datetime.now().isoformat(); camera_id=None
-        with connection() as db:
-            existing=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(identity['customer_id'],device_key)).fetchone()
-            if existing:
-                camera_id=existing['id']
-                db.execute("UPDATE cameras SET name=?,site_id=COALESCE(NULLIF(?,''),site_id),ip_address=?,onvif_endpoint=?,manufacturer=?,model=?,status='configured' WHERE id=?",(name,site_id,ip_address,onvif_endpoint,manufacturer,model,camera_id))
-            else:
-                placeholder=db.execute("SELECT id FROM cameras WHERE customer_id=? AND device_key IS NULL AND status='pending_installation' ORDER BY created_at LIMIT 1",(identity['customer_id'],)).fetchone()
-                if placeholder:
-                    camera_id=placeholder['id']
-                    db.execute("UPDATE cameras SET name=?,site_id=COALESCE(NULLIF(?,''),site_id),device_key=?,ip_address=?,onvif_endpoint=?,manufacturer=?,model=?,status='configured' WHERE id=?",(name,site_id,device_key,ip_address,onvif_endpoint,manufacturer,model,camera_id))
-                else:
-                    camera_id=secrets.token_hex(5)
-                    appliance=row('SELECT id FROM appliances WHERE customer_id=? ORDER BY created_at LIMIT 1',(identity['customer_id'],))
-                    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,resolution,status,created_at,device_key,ip_address,onvif_endpoint,manufacturer,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(camera_id,identity['customer_id'],site_id or None,appliance['id'] if appliance else None,name,'2mp','configured',now,device_key,ip_address,onvif_endpoint,manufacturer,model))
-            camera_row=db.execute('SELECT camera_number, appliance_id FROM cameras WHERE id=?',(camera_id,)).fetchone()
-            if camera_row and camera_row['camera_number'] is None and camera_row['appliance_id']:
-                used=set(int(item['camera_number']) for item in db.execute('SELECT camera_number FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL',(camera_row['appliance_id'],)).fetchall())
-                candidate=1
-                while candidate in used: candidate+=1
-                try:
-                    from camera_mapping import assign_camera_number
-                    assign_camera_number(db,camera_id,candidate,appliance_id=camera_row['appliance_id'],customer_id=identity['customer_id'])
-                except (LookupError, ValueError):
-                    pass
-            if encrypted is not None:
-                blob=encrypted.decode() if isinstance(encrypted,bytes) else encrypted
-                db.execute('INSERT INTO camera_credentials(camera_id,encrypted_blob,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(camera_id) DO UPDATE SET encrypted_blob=excluded.encrypted_blob,updated_at=excluded.updated_at',(camera_id,blob,now,now))
-        audit(identity,'camera.provisioned','camera',camera_id,{'device_key':device_key})
-        return {'message':'Camera provisioned.','camera_id':camera_id}
+    # NOTE: a second, identically-pathed `provision_customer_camera`
+    # handler used to be registered here. Starlette matches routes in
+    # registration order, so it was permanently shadowed by
+    # request_camera_provisioning() above and could never be reached by
+    # real HTTP traffic -- confirmed dead code, not a second feature.
+    # Its synchronous device_key dedup / camera_number assignment /
+    # credential-storage logic is already done correctly by the live
+    # async path this shadowed route duplicated: appliance_submit_
+    # provisioning() in appliance_cloud.py, reached via request_camera_
+    # provisioning()'s queued job once the appliance confirms it. Removed
+    # rather than fixed-in-place so exactly one canonical implementation
+    # of this route exists -- see test_exactly_one_camera_provision_route_is_registered().
 
     @app.delete('/api/customer/cameras/{camera_id}')
     def remove_customer_camera(request: Request,camera_id: str) -> dict:

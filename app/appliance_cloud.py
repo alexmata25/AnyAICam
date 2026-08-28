@@ -583,16 +583,17 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if success:
                 # device_key identifies the physical camera itself (its
                 # ONVIF endpoint reference UUID), not an appliance-camera
-                # relationship -- scoped to customer_id, matching
-                # partner_workspace.py's provision_customer_camera(),
-                # which this route must stay consistent with (see the
-                # blocker #2 investigation this fixes: the two routes
-                # previously disagreed, and an appliance-scoped duplicate
-                # here could violate idx_cameras_customer_device_key's
-                # UNIQUE constraint outright). A device_key is still never
-                # looked up outside this one customer -- a discovered
-                # device from one customer's appliance can never collide
-                # with or attach to another tenant's camera.
+                # relationship -- scoped to customer_id, never looked up
+                # outside this one customer, so an appliance-scoped
+                # duplicate lookup here could never violate
+                # idx_cameras_customer_device_key's UNIQUE constraint. A
+                # second, differently-scoped implementation of this same
+                # dedup rule (partner_workspace.py's provision_customer_
+                # camera()) used to exist for a synchronous customer-portal
+                # path, but that route was permanently unreachable (a
+                # duplicate-path bug) and has been deleted -- this is now
+                # the only camera-creation implementation, so there is
+                # nothing left to stay consistent with.
                 existing=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
                 if existing:
                     # The same physical camera, rediscovered -- possibly
@@ -619,13 +620,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 # path previously never received a camera_number at all --
                 # confirmed live on Samsung: live-view start requests 409'd
                 # forever because resolve_camera_number() (live_view_
-                # sessions.py) had nothing to return. Mirrors partner_
-                # workspace.py's provision_customer_camera() (the customer
-                # self-service path), which has always done this: assign
-                # the lowest free slot only when camera_number is still
-                # NULL. An existing valid camera_number (e.g. on a
-                # reprovision of an already-bound camera) is never
-                # touched here.
+                # sessions.py) had nothing to return. Assigns the lowest
+                # free slot only when camera_number is still NULL. An
+                # existing valid camera_number (e.g. on a reprovision of
+                # an already-bound camera) is never touched here.
                 camera_row=db.execute('SELECT camera_number FROM cameras WHERE id=?',(camera_id,)).fetchone()
                 if camera_row and camera_row['camera_number'] is None:
                     used=set(int(item['camera_number']) for item in db.execute('SELECT camera_number FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL',(appliance['id'],)).fetchall())

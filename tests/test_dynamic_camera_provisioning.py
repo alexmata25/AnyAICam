@@ -281,17 +281,25 @@ class CameraCountRemovalTests(unittest.TestCase):
 
 
 class CameraCrudRoutesTests(unittest.TestCase):
+    # provision_customer_camera -- a second, identically-pathed handler
+    # that was permanently unreachable by real HTTP traffic (Starlette
+    # matched request_camera_provisioning first) -- was deleted as dead
+    # code (see partner_workspace.py's removal comment and
+    # app/tests/test_camera_discovery_provisioning.py's
+    # test_exactly_one_camera_provision_route_is_registered()). These
+    # tests now check the same properties on the one route real traffic
+    # actually reaches.
     def test_provision_route_exists_and_is_permission_gated(self):
-        start = PARTNER_WORKSPACE_SOURCE.index("def provision_customer_camera")
+        start = PARTNER_WORKSPACE_SOURCE.index("def request_camera_provisioning")
         body = PARTNER_WORKSPACE_SOURCE[start:start + 1300]
         self.assertIn("require_permission(identity,'camera.self.configure')", body)
         self.assertIn("device_key", body)
 
     def test_provision_route_never_returns_username_or_password(self):
-        start = PARTNER_WORKSPACE_SOURCE.index("def provision_customer_camera")
-        end = PARTNER_WORKSPACE_SOURCE.index("@app.delete('/api/customer/cameras/{camera_id}')")
+        start = PARTNER_WORKSPACE_SOURCE.index("def request_camera_provisioning")
+        end = PARTNER_WORKSPACE_SOURCE.index("@app.get('/api/customer/camera-provisioning/{job_id}')")
         body = PARTNER_WORKSPACE_SOURCE[start:end]
-        return_start = body.index("return {'message':'Camera provisioned.'")
+        return_start = body.index("return {'job_id':job_id")
         self.assertNotIn("username", body[return_start:])
         self.assertNotIn("password", body[return_start:])
 
@@ -321,7 +329,7 @@ class CameraCrudRoutesTests(unittest.TestCase):
         self.assertIn("camera.self.configure", owner_line)
 
     def test_no_manage_settings_permission_used_for_customer_camera_routes(self):
-        for fn_name in ("provision_customer_camera", "remove_customer_camera", "list_customer_cameras"):
+        for fn_name in ("request_camera_provisioning", "remove_customer_camera", "list_customer_cameras"):
             start = PARTNER_WORKSPACE_SOURCE.index(f"def {fn_name}")
             body = PARTNER_WORKSPACE_SOURCE[start:start + 800]
             self.assertNotIn("manage_settings", body)
