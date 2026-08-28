@@ -301,7 +301,7 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
     if identity.get('role') == 'customer_owner':
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT id, name, talk_down_supported FROM cameras WHERE customer_id=? '
+                'SELECT id, name, camera_number, talk_down_supported FROM cameras WHERE customer_id=? '
                 'ORDER BY camera_number, id',
                 (identity['customer_id'],),
             ).fetchall()
@@ -316,7 +316,7 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
 
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name, c.talk_down_supported FROM cameras c '
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'WHERE c.customer_id=? AND p.can_live=1 '
                 'ORDER BY c.camera_number, c.id',
@@ -327,6 +327,25 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
     for camera in cameras:
         camera.update(_talk_down_state(camera.pop('talk_down_supported')))
     return cameras
+
+
+def _camera_display_label(camera: dict) -> str:
+    """The friendly-name-or-"Camera N" fallback for a cameras-table row
+    dict that carries name/camera_number -- my own editable-friendly-
+    name system (customer_platform.py) remains the one authoritative
+    place a customer actually renames a camera; this only decides what
+    the grid shows when no name has been set yet, replacing the old
+    raw camera['id'] fallback (a UUID-like string) with something a
+    customer can actually read. Duplicated rather than imported from
+    main.py's own _camera_display_label(), same reasoning as
+    _authorized_camera()'s docstring above: main.py imports this
+    module to register its routes, so importing back from main.py
+    would risk a circular import."""
+    name = (camera.get('name') or '').strip()
+    if name:
+        return name
+    number = camera.get('camera_number')
+    return f'Camera {number}' if number is not None else str(camera.get('id', 'Camera'))
 
 
 def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
@@ -397,7 +416,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 </div>
               </div>
               <div class="live-grid-tile-head">
-                <span>{escape(camera.get('name') or camera['id'])}</span>
+                <span>{escape(_camera_display_label(camera))}</span>
                 <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
                   data-camera-id="{escape(camera['id'], quote=True)}"
                   title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
@@ -721,7 +740,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         with connection() as db:
             camera = _authorized_camera(db, camera_id, identity)
 
-        camera_name = camera.get('name') or camera_id
+        camera_name = _camera_display_label(camera)
         start_url = f'/api/customer/cameras/{camera_id}/live/start'
         playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
         talk_state = _talk_down_state(camera.get('talk_down_supported'))
@@ -731,7 +750,13 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
+            # Camera Hub mobile polish: on a narrow phone screen this
+            # row's ~10 tool buttons no longer force horizontal
+            # scrolling -- they wrap onto additional lines instead,
+            # every tool staying reachable without a sideways swipe.
+            f'@media(max-width:480px){{.camera-tools{{flex-wrap:wrap;overflow-x:visible}}}}'
+            f'</style>'
             f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
             f'<video id="live-view-video" controls muted playsinline></video>'
             f'<div class="camera-placeholder" id="live-view-placeholder">'
@@ -767,6 +792,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const pollIntervalMs={POLL_INTERVAL_MS};
   const pollTimeoutMs={POLL_TIMEOUT_MS};
   const video=document.getElementById('live-view-video');
+  const cameraView=document.querySelector('.camera-view');
   const placeholder=document.getElementById('live-view-placeholder');
   const statusLabel=document.getElementById('live-view-status');
   const muteButton=document.getElementById('live-view-mute');
@@ -863,6 +889,22 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
   stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
+
+  // Real browser fullscreen (double-click on desktop, double-tap on
+  // touch) on the camera-view frame itself -- the grid's own tile
+  // double-click/double-tap navigates here instead of calling
+  // requestFullscreen() directly, so this Focused Live View page is
+  // the one place that capability lives. .catch(()=>{{}}) is
+  // deliberate: a browser that denies or lacks the Fullscreen API
+  // (e.g. iOS Safari on some elements) silently no-ops rather than
+  // surfacing an error -- the video keeps playing normally either way.
+  let lastVideoTap=0;
+  cameraView.addEventListener('dblclick',()=>{{if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}})}});
+  cameraView.addEventListener('touchend',()=>{{
+    const now=Date.now();
+    if(now-lastVideoTap<350&&cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
+    lastVideoTap=now;
+  }});
 
   // Push-to-talk: press-and-hold only, real mic capture, no always-open
   // duplex mode. This button already reflects the server-persisted
