@@ -148,6 +148,44 @@ def apply_migrations():
         if 'talk_down_supported' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_supported INTEGER')
         if 'talk_down_metadata' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_metadata TEXT')
         if 'talk_down_verified_at' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_verified_at TEXT')
+        # cloud_recording_mode has NO hidden default by design: NULL means
+        # "not explicitly set for this camera" and every consumer (the
+        # GET /api/appliance/configuration route, and the appliance's own
+        # recording_uploader.py) must treat NULL exactly like 'continuous'
+        # -- upload everything, today's unchanged behavior -- never like
+        # 'motion'. Only an explicit 'motion' value (set via
+        # POST /api/admin/cameras/{camera_id}/cloud-recording-mode) ever
+        # turns on upload-time motion-gating for that camera. This is the
+        # only plan-mode signal in the system; recording_mode on
+        # AnalyticsRuleModel/quote objects is a separate, unrelated,
+        # sales-quote-only field this column does not read from or write to.
+        # Restored from commit a7300ee (motion-gated-cloud-upload-cloud-
+        # side-20260822 branch), which added the appliance_cloud.py route
+        # and this exact idempotent column-add together, but only the
+        # route half reached this branch during an earlier consolidation
+        # -- the migration hunk was dropped, leaving the route's own SELECT
+        # and UPDATE statements referencing a column that never existed on
+        # any database created from this branch (confirmed: firing on
+        # every Samsung appliance-agent heartbeat as "no such column").
+        if 'cloud_recording_mode' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN cloud_recording_mode TEXT')
+        # people_counting_enabled follows the exact same no-hidden-default
+        # convention as cloud_recording_mode above: NULL/0 means "not
+        # entitled/not configured for People Counting" and every consumer
+        # (GET /api/appliance/configuration, and the appliance's own
+        # people-counting worker) must treat that as "do not run People
+        # Counting on this camera" -- the same appliance-wide detection
+        # loop this camera already runs for plain person/vehicle detection
+        # is completely unaffected either way. Only an explicit 1 (set via
+        # POST /api/admin/cameras/{camera_id}/people-counting) turns this
+        # on for that camera. This is the first camera-level analytics
+        # entitlement flag in the system; see the accompanying report for
+        # how the other named analytics (LPR, PPE, etc.) can adopt this
+        # same per-camera column pattern later instead of remaining
+        # appliance-wide-only toggles.
+        # Restored from commit 87fdfe7 (people-counting-cloud-entitlement-
+        # 20260824 branch) for the same reason as cloud_recording_mode
+        # directly above -- same dropped-migration-hunk gap.
+        if 'people_counting_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN people_counting_enabled INTEGER')
         # Phase 3 (dynamic camera provisioning): device_key is the ONVIF
         # endpoint reference UUID -- stable across reboot/DHCP/IP changes,
         # unlike ip_address -- and is how rediscovering an already-
