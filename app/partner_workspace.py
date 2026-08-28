@@ -155,7 +155,19 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             db.execute('INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,monthly_recurring_profit,annual_total,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(plan_id,customer_id,quote['resolution'],quote['recording'],quote['retention_days'],quote['quantity'],quote['monthly_customer_revenue'],quote['monthly_partner_charge'],quote['monthly_recurring_profit'],quote['annual_total'],'quote',now))
             for analytic in quote['addons']: db.execute('INSERT INTO analytics_subscriptions(id,customer_id,site_id,analytic_key,status,monthly_retail,monthly_partner,created_at) VALUES(?,?,?,?,?,?,?,?)',(secrets.token_hex(5),customer_id,created_sites[0]['id'],analytic,'pending',load_pricing()['addons'][analytic]['price'],None,now))
             db.execute('INSERT INTO quotes(id,customer_id,partner_id,status,selection_json,totals_json,created_at,created_by) VALUES(?,?,?,?,?,?,?,?)',(quote_id,customer_id,partner_id,'estimate',json.dumps(pricing_selection),json.dumps(quote),now,identity['email']))
-            db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,1)',(secrets.token_hex(5),partner_id,email,payload.get('name','Customer'),'customer_owner',password_hash(password),1,customer_id,now))
+            owner_user_id=secrets.token_hex(5)
+            db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,1)',(owner_user_id,partner_id,email,payload.get('name','Customer'),'customer_owner',password_hash(password),1,customer_id,now))
+            # Without this grant, the new owner's password is correct but
+            # the appliance's cloud-delegated login (authenticate_operator()
+            # in appliance_identity.py) has no live identity_grants row
+            # that resolves to this customer's scope, so it denies every
+            # login attempt until someone manually runs the same grant via
+            # POST /api/operations/identity-grants -- see
+            # docs/blockers-before-universal-release.md's "ONVIF-
+            # authorization"-adjacent customer-password blocker entry for
+            # the incident that surfaced this exact manual-insert gap.
+            from appliance_identity import create_grant as _create_identity_grant
+            _create_identity_grant(db,user_id=owner_user_id,role='customer_owner',scope_type='customer',scope_id=customer_id,granted_by=identity['email'],now=now)
             db.execute('INSERT INTO invitations(id,email,role,customer_id,status,temporary_password_hash,email_preview,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)',(invitation_id,email,'customer_owner',customer_id,'preview',password_hash(password),email_preview,None,now,identity['email']))
             db.execute('INSERT INTO service_history(customer_id,event,details,created_at,created_by) VALUES(?,?,?,?,?)',(customer_id,'Customer onboarding created','Quote, login, sites, appliance assignments, and plan created.',now,identity['email']))
             if payload.get('draft_id'): db.execute("UPDATE onboarding_drafts SET status='complete',updated_at=? WHERE id=?",(now,payload['draft_id']))
@@ -214,6 +226,14 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         try:
             with connection() as db:
                 db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,1)',(user_id,identity.get('partner_id') or 'anyaicam-primary',email,payload.get('name',''),role,password_hash(password),1,customer_id,now))
+                if role in ('customer_owner','customer_viewer') and customer_id:
+                    # Same gap, same fix as the main onboarding flow above:
+                    # an invited customer_owner/customer_viewer needs a live
+                    # identity_grants row before the appliance's cloud-
+                    # delegated login will ever recognize them -- see that
+                    # call's own comment for the full incident this closes.
+                    from appliance_identity import create_grant as _create_identity_grant
+                    _create_identity_grant(db,user_id=user_id,role=role,scope_type='customer',scope_id=customer_id,granted_by=identity['email'],now=now)
                 db.execute('INSERT INTO invitations(id,email,role,customer_id,status,temporary_password_hash,email_preview,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)',(invitation_id,email,role,customer_id,'preview',password_hash(password),preview,None,now,identity['email']))
         except Exception as error:
             raise HTTPException(status_code=409,detail='A user with this email may already exist.') from error
