@@ -244,7 +244,20 @@ def file_manifest(root: Path) -> list[dict[str, object]]:
     return rows
 
 
-def write_deterministic_tar(source: Path, output: Path, mtime: int) -> None:
+def write_deterministic_tar(source: Path, output: Path, mtime: int, executable_paths: frozenset[str] = frozenset()) -> None:
+    # Confirmed live: on a Windows build host, os.chmod(path, 0o755) (see
+    # ensure_lf_and_modes()) cannot actually confer a real POSIX
+    # executable bit -- Windows has no such concept, so os.stat() reports
+    # a fabricated mode regardless of what chmod "set". gettarinfo()'s
+    # auto-detected info.mode inherits that fabrication, so a tarball
+    # built on Windows silently shipped every script non-executable
+    # (extraction on the real Ubuntu target left install.sh at 0644,
+    # confirmed live on Samsung: `sudo ./install.sh` -> Permission
+    # denied). Every file's mode is now assigned explicitly here instead
+    # of trusted from the host's own stat() -- this makes the archive's
+    # permissions deterministic and correct regardless of what OS built
+    # it, exactly like uid/gid/mtime/uname/gname immediately below
+    # already were.
     with output.open("wb") as raw:
         with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=mtime) as gz:
             with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tf:
@@ -256,6 +269,10 @@ def write_deterministic_tar(source: Path, output: Path, mtime: int) -> None:
                     info.uname = ""
                     info.gname = ""
                     info.mtime = mtime
+                    if path.is_dir():
+                        info.mode = 0o755
+                    else:
+                        info.mode = 0o755 if rel in executable_paths else 0o644
                     if path.is_file():
                         with path.open("rb") as f:
                             tf.addfile(info, f)
@@ -393,10 +410,24 @@ def main() -> int:
 
         outdir = Path(args.output_dir).resolve()
         outdir.mkdir(parents=True, exist_ok=True)
+        executable_paths = frozenset(name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh"))
         filename = f"anyaicam-appliance-installer-1.1.0-vms-{vms_commit[:12]}.tar.gz"
         output = outdir / filename
-        write_deterministic_tar(package, output, installer_mtime)
+        write_deterministic_tar(package, output, installer_mtime, executable_paths)
         digest = sha256_file(output)
+
+        # Previously this printed "shell_executable=PASS" unconditionally,
+        # with no actual check behind it -- exactly how a Windows-built
+        # artifact shipped every script non-executable while still
+        # claiming to have verified otherwise. This now reads the
+        # archive back and genuinely verifies every executable_paths
+        # entry landed with its exec bit set, the same way a real
+        # extraction on the Ubuntu target would see it.
+        with tarfile.open(output, "r:gz") as verify_tf:
+            modes = {member.name: member.mode for member in verify_tf.getmembers()}
+        not_executable = [name for name in executable_paths if not (modes.get(name, 0) & 0o111)]
+        if not_executable:
+            raise SystemExit(f"Packaged without the executable bit set: {', '.join(sorted(not_executable))}")
 
         print(f"installer_source_commit={installer_commit}")
         print(f"vms_release_commit={vms_commit}")
