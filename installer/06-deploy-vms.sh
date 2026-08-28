@@ -69,8 +69,14 @@ ensure_vms_env() {
 
     grep -q '^ANYAICAM_RUNTIME_ROLE=' "$VMS_ENV_FILE" 2>/dev/null || \
         printf '%s\n' 'ANYAICAM_RUNTIME_ROLE=edge' >> "$VMS_ENV_FILE"
-    grep -q '^ANYAICAM_ENVIRONMENT=' "$VMS_ENV_FILE" 2>/dev/null || \
-        printf '%s\n' 'ANYAICAM_ENVIRONMENT=production' >> "$VMS_ENV_FILE"
+    # Canonical name is ANYAICAM_ENV -- the only variable app/main.py and
+    # app/cloud_config.py actually read (DEPLOYMENT_ENV = os.environ.get
+    # ("ANYAICAM_ENV", "local")). This installer previously wrote
+    # ANYAICAM_ENVIRONMENT here, a different name the app has never read
+    # -- every appliance installed that way silently stayed on the
+    # "local" default forever, regardless of this line ever running.
+    grep -q '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf '%s\n' 'ANYAICAM_ENV=production' >> "$VMS_ENV_FILE"
 
     # These two keys are installer-owned build identity. They are updated on
     # every reinstall/repair while all other customer configuration survives.
