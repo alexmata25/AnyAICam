@@ -14,6 +14,7 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
 from .config import AgentConfig,load_credential
 from .discovery import scan
 from .metrics import collect
+from .onvif_media import resolve_media_uri
 from .portal import PortalClient,PortalError,sanitize
 from .provisioning import verify_device
 from .queue import OfflineQueue
@@ -213,6 +214,43 @@ class ApplianceAgent:
             for item in self.client.request('GET','/api/appliance/commands').get('commands',[]):
                 status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event,state_machine=self.state_machine,update_resume_failed=self.update_resume_failed); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
         except PortalError as error: self.log.debug('Command poll unavailable: %s',error)
+    def resolve_media_uris(self,cloud_cameras):
+        # Closes the last confirmed-live Samsung gap: cameras.onvif_
+        # endpoint (what app/main.py's _provisioned_camera_stream()
+        # actually reads for camera_url()) was never populated by
+        # anything. For each cloud camera that already has a
+        # camera_number and a matching discovered physical device (by
+        # device_key -- never IP/MAC/name) but no onvif_endpoint yet,
+        # runs the read-only ONVIF GetProfiles/GetStreamUri lookup
+        # (onvif_media.py -- this agent, not the cloud/VMS process, has
+        # direct LAN reachability to the camera) and submits a resolved,
+        # already-credential-stripped rtsp:// URI to the cloud. Never
+        # guesses a path, never modifies any camera setting, and never
+        # submits anything at all if the device challenges for
+        # authentication -- that camera is simply skipped and retried
+        # (unchanged) on the next cycle, exactly like an unbound camera
+        # is.
+        discovered_by_device_key={}
+        for camera in self.discovered_store.cameras():
+            device_key=str(camera.get('device_key') or '').strip()
+            if device_key: discovered_by_device_key[device_key]=camera
+        for cloud_camera in cloud_cameras:
+            camera_id=str(cloud_camera.get('id','')).strip()
+            device_key=str(cloud_camera.get('device_key') or '').strip()
+            if not camera_id or not device_key or cloud_camera.get('onvif_endpoint') or cloud_camera.get('camera_number') is None:
+                continue  # already resolved, or nothing to associate a lookup with yet
+            physical=discovered_by_device_key.get(device_key)
+            ip=physical.get('ip') if physical else None
+            if not ip:
+                continue  # not (or not yet) seen on this appliance's own network scan
+            result=resolve_media_uri(ip,device_key)
+            if result['status']!='resolved':
+                self.log.info('onvif_media.not_resolved camera_id=%s status=%s',camera_id,result['status'])
+                continue
+            try:
+                self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':result['rtsp_uri']})
+            except PortalError as error:
+                self.log.debug('onvif_media.submit_failed camera_id=%s error=%s',camera_id,error)
     def sync_configuration(self):
         try:
             configuration=self.client.request('GET','/api/appliance/configuration')
@@ -225,6 +263,7 @@ class ApplianceAgent:
             # auto_bind_discovered_cameras() docstring for the full
             # idempotency contract.
             auto_bind_discovered_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store)
+            self.resolve_media_uris(cloud_cameras)
             merged=reconcile_cloud_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store.bindings(),self.vms_status)
             atomic_write_json(self.config.cameras_file,merged)
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)

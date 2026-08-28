@@ -453,6 +453,150 @@ def test_failed_appliance_provisioning_assigns_no_camera_number(db_path, monkeyp
     assert camera_count == 0  # nothing to assign a slot to -- no camera row was ever created
 
 
+# ------------------------------------------------------- media URI persistence
+#
+# Regression coverage for POST /api/appliance/{cloud_id}/cameras/{camera_id}/
+# media-uri -- how the appliance's read-only ONVIF GetProfiles/GetStreamUri
+# result (anyaicam_agent/onvif_media.py) reaches cameras.onvif_endpoint, the
+# exact field app/main.py's _provisioned_camera_stream() reads for
+# camera_url(). Confirmed-live Samsung gap: this field was NULL and nothing
+# populated it, so camera_url() always fell through to an unset legacy
+# CAMERA{n}_HOST env var and FFmpeg was never attempted.
+
+def _provision_camera(request_camera_provisioning, appliance_submit_provisioning, device_key="onvif-uuid-1", name="Front Door"):
+    job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": device_key, "name": name})
+    appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": True})
+
+
+def test_media_uri_is_persisted_onto_onvif_endpoint(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_uri = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        result = appliance_submit_media_uri(
+            _fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+            {"device_key": "onvif-uuid-1", "rtsp_uri": "rtsp://192.0.2.10:554/Streaming/Channels/101"},
+        )
+        stored = sqlite3.connect(db_path).execute("SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,)).fetchone()[0]
+    assert result["updated"] is True
+    assert stored == "rtsp://192.0.2.10:554/Streaming/Channels/101"
+
+
+def test_retrying_the_same_result_is_idempotent_and_does_not_error(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_uri = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        payload = {"device_key": "onvif-uuid-1", "rtsp_uri": "rtsp://192.0.2.10:554/Streaming/Channels/101"}
+        first = appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id, payload)
+        second = appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id, payload)
+        third = appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id, payload)
+        stored = sqlite3.connect(db_path).execute("SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,)).fetchone()[0]
+    assert first["updated"] is True
+    assert second["updated"] is False
+    assert third["updated"] is False
+    assert stored == "rtsp://192.0.2.10:554/Streaming/Channels/101"
+
+
+def test_does_not_replace_an_already_valid_media_uri(db_path, monkeypatch):
+    """A later, different resolution result (e.g. a stale/rerun agent
+    cycle) must never silently overwrite an already-persisted URI --
+    reprovisioning (a fresh camera row) is the only path back to a
+    blank onvif_endpoint."""
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_uri = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                                    {"device_key": "onvif-uuid-1", "rtsp_uri": "rtsp://192.0.2.10:554/Streaming/Channels/101"})
+        result = appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                                             {"device_key": "onvif-uuid-1", "rtsp_uri": "rtsp://198.51.100.20:554/different/path"})
+        stored = sqlite3.connect(db_path).execute("SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,)).fetchone()[0]
+    assert result["updated"] is False
+    assert stored == "rtsp://192.0.2.10:554/Streaming/Channels/101"
+
+
+def test_device_key_mismatch_is_rejected(db_path, monkeypatch):
+    """Association safety: a media URI can never attach to a camera
+    whose stored device_key doesn't match the one the appliance says it
+    resolved this result for -- even if camera_id happens to be right."""
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_uri = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        with pytest.raises(Exception) as excinfo:
+            appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                                        {"device_key": "onvif-uuid-WRONG", "rtsp_uri": "rtsp://192.0.2.10:554/ch1"})
+        stored = sqlite3.connect(db_path).execute("SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,)).fetchone()[0]
+    assert getattr(excinfo.value, "status_code", None) == 409
+    assert stored is None
+
+
+def test_non_rtsp_uri_is_rejected(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_uri = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        with pytest.raises(Exception) as excinfo:
+            appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                                        {"device_key": "onvif-uuid-1", "rtsp_uri": "http://192.0.2.10/not-a-stream"})
+        stored = sqlite3.connect(db_path).execute("SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,)).fetchone()[0]
+    assert getattr(excinfo.value, "status_code", None) == 400
+    assert stored is None
+
+
+def test_credential_bearing_uri_is_stripped_before_storage(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    appliance_submit_media_uri = _route("/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri", "POST")
+    audit_calls = []
+    monkeypatch.setattr("appliance_cloud.audit", lambda *args, **kwargs: audit_calls.append((args, kwargs)))
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _provision_camera(request_camera_provisioning, appliance_submit_provisioning)
+        camera_id = sqlite3.connect(db_path).execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        appliance_submit_media_uri(_fake_request(_appliance_auth_headers()), "AIC-TEST1", camera_id,
+                                    {"device_key": "onvif-uuid-1", "rtsp_uri": "rtsp://admin:hunter2@192.0.2.10:554/ch1"})
+        stored = sqlite3.connect(db_path).execute("SELECT onvif_endpoint FROM cameras WHERE id=?", (camera_id,)).fetchone()[0]
+    assert stored == "rtsp://192.0.2.10:554/ch1"
+    assert "hunter2" not in stored
+    assert "admin" not in stored
+    assert "hunter2" not in json.dumps(audit_calls)
+
+
 # ---------------------------------------------------------- auth hardening
 
 def test_valid_auth_succeeds(db_path, monkeypatch):

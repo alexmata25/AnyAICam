@@ -210,7 +210,52 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+
+    def _sanitize_rtsp_uri(value: str) -> str | None:
+        # Second, independent layer of defense against a credential-
+        # bearing URI reaching storage -- the appliance-side ONVIF
+        # resolver (anyaicam_agent/onvif_media.py) already strips
+        # embedded userinfo before submitting here, but this endpoint
+        # never trusts that alone, matching this codebase's existing
+        # defense-in-depth precedent (PortalClient.request() stripping
+        # credential-shaped keys as a second layer -- see provisioning.py).
+        if not isinstance(value,str) or not value.strip(): return None
+        from urllib.parse import urlsplit, urlunsplit
+        try: parsed=urlsplit(value.strip())
+        except ValueError: return None
+        if parsed.scheme.lower()!='rtsp' or not parsed.hostname: return None
+        netloc=parsed.hostname+(f':{parsed.port}' if parsed.port else '')
+        return urlunsplit((parsed.scheme,netloc,parsed.path,parsed.query,parsed.fragment))
+
+    @app.post('/api/appliance/{cloud_id}/cameras/{camera_id}/media-uri')
+    def appliance_submit_media_uri(request: Request,cloud_id: str,camera_id: str,payload: dict) -> dict:
+        # Persists the read-only ONVIF GetProfiles/GetStreamUri result
+        # (anyaicam_agent/onvif_media.py -- appliance-side only, this
+        # agent has direct LAN reachability to the camera) into
+        # cameras.onvif_endpoint, the exact field app/main.py's
+        # _provisioned_camera_stream() already reads for camera_url().
+        # Idempotent by construction: an already-populated onvif_endpoint
+        # is never overwritten here -- reprovisioning (which clears the
+        # camera row / device_key association) is the only path that
+        # can make this field eligible for a fresh resolution again.
+        appliance=authenticate_appliance(request)
+        if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
+        camera=_authorized_camera(appliance,camera_id)
+        device_key=str(payload.get('device_key') or '').strip()
+        if not device_key or device_key!=(camera.get('device_key') or ''):
+            raise HTTPException(status_code=409,detail='device_key does not match this camera; refusing to associate the result.')
+        rtsp_uri=_sanitize_rtsp_uri(str(payload.get('rtsp_uri') or ''))
+        if not rtsp_uri:
+            raise HTTPException(status_code=400,detail='A valid rtsp:// media URI is required.')
+        updated=False
+        if not camera.get('onvif_endpoint'):
+            with connection() as db:
+                changed=db.execute('UPDATE cameras SET onvif_endpoint=? WHERE id=? AND appliance_id=? AND (onvif_endpoint IS NULL OR onvif_endpoint=?)',(rtsp_uri,camera_id,appliance['id'],'')).rowcount
+                updated=bool(changed)
+            if updated:
+                audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.media_uri_resolved','camera',camera_id,{'device_key':device_key})
+        return {'message':'Media URI recorded.' if updated else 'Camera already has a media URI; not replaced.','updated':updated}
 
     @app.get('/api/appliance/signing-keys')
     def identity_signing_keys() -> dict:
