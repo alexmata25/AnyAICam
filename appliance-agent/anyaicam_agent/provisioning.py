@@ -37,14 +37,24 @@ def locate_device(device_key, networks=None):
     return None
 
 
-def _rtsp_options(ip, port, path='/', username=None, password=None, digest=None, timeout=3):
-    """Minimal RTSP OPTIONS round-trip -- enough to learn whether the
-    device is present and, when credentials are supplied, whether they
-    are accepted. No media stream is requested or received; this never
-    starts, and cannot be confused with, an actual recording/live
-    connection (those belong to the VMS app's own FFmpeg pipeline)."""
-    lines = [f'OPTIONS rtsp://{ip}:{port}{path} RTSP/1.0', 'CSeq: 1']
-    if digest and username and password:
+def _rtsp_request(method, ip, port, path='/', username=None, password=None, digest=None, timeout=3):
+    """One RTSP request/response round-trip for the given method. No
+    media stream is requested or received regardless of method --
+    DESCRIBE only returns a session description (SDP text), never an
+    actual stream; this never starts, and cannot be confused with, an
+    actual recording/live connection (those belong to the VMS app's own
+    FFmpeg pipeline)."""
+    lines = [f'{method} rtsp://{ip}:{port}{path} RTSP/1.0', 'CSeq: 1']
+    if method == 'DESCRIBE': lines.append('Accept: application/sdp')
+    # digest alone is sufficient -- it's a fully-formed Authorization
+    # value already (see _digest_header()), unlike the basic branch
+    # below which still needs the raw username/password to build one.
+    # Requiring username/password to ALSO be truthy here was a latent
+    # bug: every digest-authenticated retry call site passes only
+    # `digest`, so this condition silently sent the retry with NO
+    # Authorization header at all -- never actually exercised until
+    # classify_rtsp_authentication()'s digest regression test caught it.
+    if digest:
         lines.append('Authorization: ' + digest)
     elif username and password:
         token = base64.b64encode(f'{username}:{password}'.encode()).decode()
@@ -66,6 +76,16 @@ def _rtsp_options(ip, port, path='/', username=None, password=None, digest=None,
     return code, challenge
 
 
+def _rtsp_options(ip, port, path='/', username=None, password=None, digest=None, timeout=3):
+    """Minimal RTSP OPTIONS round-trip -- a capability handshake only,
+    kept for pure reachability probing. Many RTSP servers (confirmed
+    live against a real camera during onboarding validation) accept
+    OPTIONS unauthenticated even when the actual media session requires
+    credentials, so this alone cannot be used to verify a credential --
+    see classify_rtsp_authentication()'s DESCRIBE-based check for that."""
+    return _rtsp_request('OPTIONS', ip, port, path, username, password, digest, timeout)
+
+
 def _digest_header(username, password, realm, nonce, method, uri):
     ha1 = hashlib.md5(f'{username}:{realm}:{password}'.encode()).hexdigest()
     ha2 = hashlib.md5(f'{method}:{uri}'.encode()).hexdigest()
@@ -74,39 +94,83 @@ def _digest_header(username, password, realm, nonce, method, uri):
             f'uri="{uri}", response="{response}"')
 
 
-def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):
-    """Returns (ok, detail); detail is always a secret-free, human-
-    readable string, never the credentials or a raw device response.
-    Tries an unauthenticated OPTIONS first; if the device challenges,
-    retries once with Basic or Digest per its own WWW-Authenticate
-    header. Never reports success without a real device response."""
+# Four distinguishable outcomes classify_rtsp_authentication() can
+# return -- plain string literals, matching this codebase's existing
+# convention for status values (see discovery.py's connection_status,
+# camera_scan_jobs.status, etc.) rather than introducing an enum type
+# not used anywhere else in this module.
+UNREACHABLE = 'unreachable'
+NO_AUTH_REQUIRED = 'no_auth_required'
+AUTH_CORRECT = 'auth_correct'
+AUTH_INCORRECT = 'auth_incorrect'
+
+
+def classify_rtsp_authentication(ip, port, username, password, path='/', timeout=3):
+    """Issues a real RTSP DESCRIBE -- the request that actually asks for
+    the stream's session description, not just a capability handshake
+    like OPTIONS. Confirmed live during Samsung onboarding validation:
+    OPTIONS returned 200 unauthenticated on a camera whose media session
+    still requires credentials, so OPTIONS alone cannot verify a
+    credential is correct, only that *something* is listening.
+
+    Returns (status, detail), distinguishing all four real outcomes:
+      - UNREACHABLE: connection failed, or the device gave a response
+        this client can't interpret as authenticating anything.
+      - NO_AUTH_REQUIRED: DESCRIBE succeeded without ever being
+        challenged -- this device's media session has no credential
+        gate to verify.
+      - AUTH_CORRECT: the device challenged (401 + WWW-Authenticate),
+        and the supplied credentials were accepted on retry.
+      - AUTH_INCORRECT: the device challenged, and the supplied
+        credentials were rejected on retry -- or the device requires
+        auth but none was supplied at all, which is equally "not
+        verified as correct".
+    detail is always a secret-free, human-readable string, never the
+    credentials or a raw device response. Never reports AUTH_CORRECT
+    without a real 200 from the device on the authenticated retry."""
     try:
-        code, challenge = _rtsp_options(ip, port, path, timeout=timeout)
+        code, challenge = _rtsp_request('DESCRIBE', ip, port, path, timeout=timeout)
     except OSError as error:
-        return False, f'Device unreachable: {error.__class__.__name__}'
+        return UNREACHABLE, f'Device unreachable: {error.__class__.__name__}'
     if code == 200:
-        return True, 'Device accepted connection without credentials.'
+        return NO_AUTH_REQUIRED, 'Device accepted DESCRIBE without credentials.'
     if code != 401 or not challenge:
-        return False, f'Unexpected device response (RTSP {code or "no response"}).'
+        return UNREACHABLE, f'Unexpected device response (RTSP {code or "no response"}).'
+    if not username and not password:
+        return AUTH_INCORRECT, 'Device requires authentication but no credentials were provided.'
     if 'digest' in challenge.lower():
         realm_match = re.search(r'realm="([^"]+)"', challenge)
         nonce_match = re.search(r'nonce="([^"]+)"', challenge)
         if not (realm_match and nonce_match):
-            return False, 'Device sent an unparseable Digest challenge.'
+            return UNREACHABLE, 'Device sent an unparseable Digest challenge.'
         uri = f'rtsp://{ip}:{port}{path}'
-        digest = _digest_header(username, password, realm_match.group(1), nonce_match.group(1), 'OPTIONS', uri)
+        digest = _digest_header(username, password, realm_match.group(1), nonce_match.group(1), 'DESCRIBE', uri)
         try:
-            code2, _ = _rtsp_options(ip, port, path, digest=digest, timeout=timeout)
+            code2, _ = _rtsp_request('DESCRIBE', ip, port, path, digest=digest, timeout=timeout)
         except OSError as error:
-            return False, f'Device unreachable on retry: {error.__class__.__name__}'
+            return UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}'
     else:
         try:
-            code2, _ = _rtsp_options(ip, port, path, username=username, password=password, timeout=timeout)
+            code2, _ = _rtsp_request('DESCRIBE', ip, port, path, username=username, password=password, timeout=timeout)
         except OSError as error:
-            return False, f'Device unreachable on retry: {error.__class__.__name__}'
+            return UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}'
     if code2 == 200:
-        return True, 'Credentials verified against the device.'
-    return False, 'Device rejected the provided credentials.'
+        return AUTH_CORRECT, 'Credentials verified against the device via DESCRIBE.'
+    return AUTH_INCORRECT, 'Device rejected the provided credentials.'
+
+
+def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):
+    """Backward-compatible (ok, detail) wrapper around
+    classify_rtsp_authentication() for verify_device()'s existing
+    success/message contract (which appliance_submit_provisioning()'s
+    payload and this module's callers depend on unchanged). ok is True
+    for both NO_AUTH_REQUIRED and AUTH_CORRECT -- either way the device
+    is reachable and accepting this camera's entry, which is everything
+    provisioning itself has ever needed to know; UNREACHABLE and
+    AUTH_INCORRECT are both False. Use classify_rtsp_authentication()
+    directly when the specific state (not just pass/fail) matters."""
+    status, detail = classify_rtsp_authentication(ip, port, username, password, path, timeout)
+    return status in (NO_AUTH_REQUIRED, AUTH_CORRECT), detail
 
 
 def verify_device(device_key, credentials, networks=None):

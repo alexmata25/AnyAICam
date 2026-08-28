@@ -97,9 +97,14 @@ class VerifyDeviceTests(unittest.TestCase):
         verify.assert_called_once_with('192.168.1.5', 554, 'admin', 'hunter2')
 
     def test_message_never_contains_the_credential_values(self):
+        # verify_rtsp_credentials() now issues a real RTSP DESCRIBE (see
+        # classify_rtsp_authentication()) rather than OPTIONS, so the
+        # patch target moved from _rtsp_options to the shared low-level
+        # _rtsp_request() helper both now share -- same interception
+        # point in spirit, same assertion.
         device = {'ip': '192.168.1.5', 'rtsp_support': True}
         with patch.object(provisioning, 'locate_device', return_value=device), \
-             patch.object(provisioning, '_rtsp_options', return_value=(401, 'Basic realm="cam"')):
+             patch.object(provisioning, '_rtsp_request', return_value=(401, 'Basic realm="cam"')):
             success, message = provisioning.verify_device('k', {'username': 'admin', 'password': 'hunter2-secret'})
         self.assertNotIn('hunter2-secret', message)
         self.assertNotIn('admin', message)
