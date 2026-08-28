@@ -35,6 +35,52 @@ def _load_json(path: Path, default):
         return default
 
 
+def _normalized_mac_or_raw(value):
+    """Normalize a MAC when it's a real 12-digit address; otherwise keep
+    the raw value (e.g. 'Unknown', '', None) as metadata rather than
+    raising -- MAC is no longer required to identify a discovery record,
+    only to key legacy records that predate device_key."""
+    try:
+        return normalize_mac(value)
+    except ValueError:
+        return value
+
+
+def _is_missing(value) -> bool:
+    return value is None or value == '' or value == 'Unknown'
+
+
+def _record_key(camera: dict):
+    """The stable identity for one discovered-camera record. device_key
+    (the ONVIF endpoint UUID, or discovery.py's own MAC-hash/IP-hash
+    fallback) is primary and, per discovery.py's scan(), always present
+    on real scan output. MAC is used only as a fallback key for records
+    that genuinely have no device_key at all (pre-device_key legacy
+    entries) -- never as a requirement for saving a candidate. Returns
+    None only when a record can't be identified by either, meaning
+    there is nothing safe to key or merge it by."""
+    device_key = str(camera.get('device_key') or '').strip()
+    if device_key:
+        return ('device_key', device_key)
+    mac = _normalized_mac_or_raw(camera.get('mac_address', ''))
+    if not _is_missing(mac):
+        return ('mac', mac)
+    return None
+
+
+def _merge_camera(existing: dict, incoming: dict) -> dict:
+    """Enrich, never regress: a later scan's freshly-resolved MAC/IP (or
+    any other field) overwrites a previously-unknown value, but a field
+    this scan couldn't resolve (e.g. ARP hadn't caught up yet) doesn't
+    blank out a value an earlier scan already established."""
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if _is_missing(value) and not _is_missing(merged.get(key)):
+            continue
+        merged[key] = value
+    return merged
+
+
 class DiscoveredCameraStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -44,17 +90,41 @@ class DiscoveredCameraStore:
         return payload.get('cameras', []) if isinstance(payload, dict) else []
 
     def save_scan(self, cameras: list[dict]) -> None:
-        by_mac = {}
+        # Keyed primarily by device_key (the ONVIF UUID / discovery.py's
+        # own stable-identity fallback chain), not by MAC -- a candidate
+        # with a real device_key but an ARP-timing "Unknown" MAC must
+        # survive here, not be silently dropped. MAC/IP are optional
+        # metadata: present when resolved, carried through as-is
+        # (including the 'Unknown' sentinel) when not, and enriched in
+        # place by a later scan via _merge_camera() rather than ever
+        # creating a second record for the same device_key. Falling back
+        # to MAC-as-key only covers records with no device_key at all
+        # (pre-device_key legacy entries already on disk) -- never
+        # required for a fresh scan result, since discovery.py's scan()
+        # always emits one.
+        by_key = {}
+        order = []
+        for camera in self.cameras():
+            key = _record_key(camera)
+            if key is None:
+                continue  # cannot identify this stored record at all -- nothing to merge onto or re-key
+            if key not in by_key:
+                order.append(key)
+            by_key[key] = {**camera, 'mac_address': _normalized_mac_or_raw(camera.get('mac_address', ''))}
         for camera in cameras:
-            try:
-                mac = normalize_mac(camera.get('mac_address', ''))
-            except ValueError:
-                continue
-            by_mac[mac] = {**camera, 'mac_address': mac}
+            key = _record_key(camera)
+            if key is None:
+                continue  # neither a device_key nor a resolvable MAC -- no safe identity to store this candidate under
+            candidate = {**camera, 'mac_address': _normalized_mac_or_raw(camera.get('mac_address', ''))}
+            if key in by_key:
+                by_key[key] = _merge_camera(by_key[key], candidate)
+            else:
+                by_key[key] = candidate
+                order.append(key)
         atomic_write_json(self.path, {
             'version': 1,
             'updated_at': datetime.now(timezone.utc).isoformat(),
-            'cameras': list(by_mac.values()),
+            'cameras': [by_key[key] for key in order],
         })
 
 
