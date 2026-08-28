@@ -64,7 +64,20 @@ SECRET_CONTENT_PATTERNS = (
 
 
 def run_git(repo: Path, *args: str, capture: bool = True) -> bytes:
-    cmd = ["git", "-C", str(repo), *args]
+    # -c core.autocrlf=false is an in-process override for THIS git
+    # invocation only -- it never reads or writes the repo's own
+    # .git/config, so this build must never depend on the operator
+    # having (or remembering to set) any particular autocrlf value.
+    # Without it, `git archive` on a Windows host with the very common
+    # core.autocrlf=true setting silently re-introduces CRLF into every
+    # exported shell script -- confirmed live: 0 CR bytes via `git
+    # show`/`git archive` from a plain shell, but 121 CR bytes when the
+    # exact same `git archive` is invoked via Python's subprocess on
+    # such a host -- even though the committed blobs are correctly
+    # LF-only. ensure_lf_and_modes() below still independently verifies
+    # every shipped script is LF-only; this is what makes that check
+    # pass deterministically on every host, not a replacement for it.
+    cmd = ["git", "-c", "core.autocrlf=false", "-C", str(repo), *args]
     result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE if capture else None)
     return result.stdout if capture else b""
 
