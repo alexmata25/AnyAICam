@@ -414,15 +414,17 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                   <span class="signal">◉</span>
                   <strong id="live-grid-status-{escape(camera['id'], quote=True)}">Starting live view…</strong>
                 </div>
-              </div>
-              <div class="live-grid-tile-head">
-                <span>{escape(_camera_display_label(camera))}</span>
-                <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
-                  data-camera-id="{escape(camera['id'], quote=True)}"
-                  title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                  aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                  {'' if camera['enabled'] else 'disabled'}>🎤</button>
-                <a class="ghost-button" href="/customer/cameras/{escape(camera['id'], quote=True)}/live">Full screen</a>
+                <div class="tile-name-overlay">{escape(_camera_display_label(camera))}</div>
+                <div class="tile-controls-overlay">
+                  <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
+                    data-camera-id="{escape(camera['id'], quote=True)}"
+                    title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
+                    aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
+                    {'' if camera['enabled'] else 'disabled'}>🎤</button>
+                  <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
+                    title="Camera tools (mute, snapshot, download, share, analytics, bookmark, stop)"
+                    aria-label="Open camera tools">⚙</a>
+                </div>
               </div>
             </article>'''
             for camera in cameras
@@ -433,9 +435,24 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<a class="ghost-button" href="/customer-account">Account</a></header>'
             f'<style>'
             f'.live-grid{{display:grid;grid-template-columns:repeat({columns},minmax(0,1fr));gap:16px}}'
-            f'.live-grid-tile{{display:grid;gap:8px}}'
-            f'.live-grid-tile .camera-view{{aspect-ratio:16/9}}'
-            f'.live-grid-tile-head{{display:flex;align-items:center;justify-content:space-between;gap:8px}}'
+            f'.live-grid-tile{{display:grid;gap:0}}'
+            f'.live-grid-tile .camera-view{{aspect-ratio:16/9;position:relative;overflow:hidden}}'
+            # Friendly name: a small, unobtrusive footer overlay inside
+            # the video frame itself -- tight/flush tiles, no separate
+            # always-visible row outside the image shrinking it.
+            f'.tile-name-overlay{{position:absolute;left:8px;bottom:8px;padding:3px 9px;'
+            f'border-radius:999px;background:rgba(7,12,20,.62);color:#fff;font-size:12px;'
+            f'font-weight:650;letter-spacing:.01em;pointer-events:none;max-width:calc(100% - 60px);'
+            f'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:2}}'
+            # Mic/tools controls: overlaid, hidden until hover/focus
+            # (desktop) or a tap on the tile (touch) -- fades back out
+            # on its own (see the touchend handler below).
+            f'.tile-controls-overlay{{position:absolute;top:8px;right:8px;z-index:3;display:flex;gap:6px;'
+            f'opacity:0;transition:opacity .18s ease;pointer-events:none}}'
+            f'.live-grid-tile:hover .tile-controls-overlay,'
+            f'.live-grid-tile:focus-within .tile-controls-overlay,'
+            f'.live-grid-tile.controls-visible .tile-controls-overlay'
+            f'{{opacity:1;pointer-events:auto}}'
             # touch-action:none -- stops the browser's own default
             # touch-gesture handling for a sustained press-and-hold on
             # this button, so it can never be interpreted as also
@@ -455,18 +472,31 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
 
-  // Punch-list item 1: double-click (desktop) / double-tap (mobile) a
-  // grid tile opens the Focused Live View for that camera. Full screen
-  // navigation already existed via the explicit button above; this adds
-  // the same destination as a faster gesture without replacing it.
+  // Double-click (desktop) or double-tap (touch) opens the focused
+  // camera view (/customer/cameras/{{id}}/live) instead of calling
+  // requestFullscreen() locally on the tile -- that page itself
+  // decides, from this identity's own real entitlements, whether to
+  // stay a simple large view or additionally show the real analytics
+  // row underneath. A single tap on touch just reveals/fades the
+  // overlaid mic/tools controls -- desktop gets the same reveal via
+  // :hover/:focus-within in CSS, no JS needed there.
   document.querySelectorAll('.live-grid-tile').forEach(tile=>{{
-    const openFocused=()=>{{location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`}};
-    tile.addEventListener('dblclick',openFocused);
-    let lastTap=0;
-    tile.addEventListener('touchend',()=>{{
+    tile.addEventListener('dblclick',()=>{{
+      window.location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`;
+    }});
+    let lastTap=0,fadeTimer=null;
+    tile.addEventListener('touchend',event=>{{
       const now=Date.now();
-      if(now-lastTap<350)openFocused();
+      if(now-lastTap<350){{
+        window.location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`;
+        lastTap=0;
+        return;
+      }}
       lastTap=now;
+      if(event.target.closest('.camera-tool'))return;
+      tile.classList.add('controls-visible');
+      clearTimeout(fadeTimer);
+      fadeTimer=setTimeout(()=>tile.classList.remove('controls-visible'),3000);
     }});
   }});
 

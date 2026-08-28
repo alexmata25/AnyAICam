@@ -186,9 +186,20 @@ class FocusedLiveViewWiringTests(unittest.TestCase):
         self.assertNotIn("hls.", body)
 
     def test_double_click_and_double_tap_open_focused_view_from_the_grid(self):
-        self.assertIn("tile.addEventListener('dblclick',openFocused);", LIVE_VIEW_SOURCE)
-        self.assertIn("tile.addEventListener('touchend',()=>{{", LIVE_VIEW_SOURCE)
-        self.assertIn("if(now-lastTap<350)openFocused();", LIVE_VIEW_SOURCE)
+        # Updated for the Camera Hub grid redesign (tight/flush tiles,
+        # controls overlaid and hidden until hover/tap instead of an
+        # always-visible row below the video): double-click/double-tap
+        # still opens the focused view, now via an inline arrow function
+        # (matching window.location.href= -- see test_customer_
+        # analytics_integration.py's own test_grid_double_click_
+        # navigates_instead_of_calling_fullscreen_locally) rather than
+        # the old named openFocused() -- the touchend handler also now
+        # takes an `event` parameter so a tap that lands on one of the
+        # overlay's own camera-tool buttons doesn't also trigger the
+        # tile's fade-in-controls toggle.
+        self.assertIn("window.location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`;", LIVE_VIEW_SOURCE)
+        self.assertIn("tile.addEventListener('touchend',event=>{{", LIVE_VIEW_SOURCE)
+        self.assertIn("if(now-lastTap<350){{", LIVE_VIEW_SOURCE)
 
     def test_analytics_routes_are_permission_scoped_to_customer_roles(self):
         for fn_name in ("customer_camera_analytics_enabled", "customer_camera_analytics_summary"):
