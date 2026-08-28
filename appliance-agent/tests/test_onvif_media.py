@@ -177,6 +177,70 @@ class ResolveMediaUriTests(unittest.TestCase):
         self.assertNotIn('hunter2', serialized)
 
 
+class AuthenticatedRetryTests(unittest.TestCase):
+    """resolve_media_uri(..., username=..., password=...) -- the path
+    service.py's poll_provisioning() uses with the exact transient,
+    in-memory credentials verify_device() already used. Every request
+    body actually sent over the wire is captured here to prove
+    unauthenticated-first ordering and that the plaintext password
+    never appears on the wire, not just in the returned result."""
+
+    def setUp(self):
+        patcher = patch.object(onvif_media, '_probe_xaddr', return_value=None)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        self.sent_bodies: list[bytes] = []
+
+    def _resolve_capturing(self, responses, username=None, password=None):
+        def _urlopen(request, timeout=None):
+            self.sent_bodies.append(request.data)
+            item = responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        with patch('urllib.request.urlopen', side_effect=_urlopen):
+            return onvif_media.resolve_media_uri('192.0.2.10', 'urn:uuid:test-device', username=username, password=password)
+
+    def test_first_attempt_is_always_unauthenticated_even_with_credentials_in_hand(self):
+        responses = [_FakeResponse(CAPABILITIES_OK), _FakeResponse(PROFILES_SINGLE_UNNAMED), _FakeResponse(STREAM_URI_CLEAN)]
+        self._resolve_capturing(responses, username='admin', password='hunter2')
+        self.assertNotIn(b'<Security', self.sent_bodies[0], 'a device that never challenged must never receive a credential')
+
+    def test_auth_challenge_is_retried_once_with_ws_security_and_succeeds(self):
+        responses = [_http_error(401), _FakeResponse(CAPABILITIES_OK), _FakeResponse(PROFILES_SINGLE_UNNAMED), _FakeResponse(STREAM_URI_CLEAN)]
+        result = self._resolve_capturing(responses, username='admin', password='hunter2')
+        self.assertEqual(result['status'], 'resolved')
+        self.assertIn(b'<Security', self.sent_bodies[1])
+        self.assertIn(b'<Username>admin</Username>', self.sent_bodies[1])
+        self.assertIn(b'PasswordDigest', self.sent_bodies[1])
+
+    def test_plaintext_password_never_appears_in_any_request_body(self):
+        responses = [_http_error(401), _FakeResponse(CAPABILITIES_OK), _FakeResponse(PROFILES_SINGLE_UNNAMED), _FakeResponse(STREAM_URI_CLEAN)]
+        self._resolve_capturing(responses, username='admin', password='hunter2')
+        for body in self.sent_bodies:
+            self.assertNotIn(b'hunter2', body)
+
+    def test_auth_challenge_with_no_credentials_available_is_not_retried(self):
+        responses = [_http_error(401)]
+        result = self._resolve_capturing(responses, username=None, password=None)
+        self.assertEqual(result['status'], 'auth_required')
+        self.assertEqual(len(self.sent_bodies), 1, 'no credentials to retry with -- exactly one attempt, never a second')
+
+    def test_wrong_credentials_still_reports_auth_required_after_one_retry_only(self):
+        responses = [_http_error(401), _http_error(401)]
+        result = self._resolve_capturing(responses, username='admin', password='wrong-password')
+        self.assertEqual(result['status'], 'auth_required')
+        self.assertEqual(len(self.sent_bodies), 2, 'exactly one authenticated retry -- never a third attempt, never a guess at a different credential')
+
+    def test_result_never_contains_username_password_or_digest(self):
+        responses = [_http_error(401), _FakeResponse(CAPABILITIES_OK), _FakeResponse(PROFILES_SINGLE_UNNAMED), _FakeResponse(STREAM_URI_CLEAN)]
+        result = self._resolve_capturing(responses, username='admin', password='hunter2')
+        serialized = repr(result)
+        self.assertNotIn('admin', serialized)
+        self.assertNotIn('hunter2', serialized)
+        self.assertNotIn('Security', serialized)
+
+
 class SanitizeRtspUriTests(unittest.TestCase):
     def test_strips_username_and_password(self):
         clean, had_credentials = onvif_media.sanitize_rtsp_uri('rtsp://admin:hunter2@192.0.2.10:554/ch1')

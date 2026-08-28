@@ -24,19 +24,37 @@ included in a return value, a log line, or an exception message --
 resolve_media_uri()'s result dict is safe to log/print/send to the
 cloud as-is.
 
+Authentication: every call is attempted unauthenticated FIRST, always
+-- credentials are never sent to a device that never asked for them.
+Only when a call is challenged (401/403, or an auth-shaped SOAP fault)
+AND a caller-supplied username/password is available does this retry
+the SAME request once, this time with a standard WS-Security
+UsernameToken (PasswordDigest -- the password itself is never put on
+the wire, only a one-way SHA-1 digest of nonce+created+password). This
+module never stores, caches, or re-fetches a credential itself -- see
+service.py's poll_provisioning(), the only caller that ever passes one
+through, using the exact same transient, in-memory value
+verify_device() already used for RTSP verification. No second
+secret-distribution mechanism exists or is needed.
+
 Deliberately stdlib-only (urllib + xml.etree), matching this package's
 existing style (discovery.py, provisioning.py) -- no new dependency for
 a handful of small SOAP calls.
 """
 
+import base64
+import hashlib
 import re
+import secrets
 import socket
 import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree
+from xml.sax.saxutils import escape as _xml_escape
 
 DEFAULT_TIMEOUT = 5
 DISCOVERY_TIMEOUT = 2
@@ -75,14 +93,39 @@ def _find_all(root, local_name):
     return [element for element in root.iter() if _local_name(element.tag) == local_name]
 
 
-def _soap_envelope(body_xml: str) -> str:
+def _soap_envelope(body_xml: str, header_xml: str = '') -> str:
+    header = f'<s:Header>{header_xml}</s:Header>' if header_xml else ''
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
         'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
         'xmlns:trt="http://www.onvif.org/ver10/media/wsdl" '
         'xmlns:tt="http://www.onvif.org/ver10/schema">'
-        f'<s:Body>{body_xml}</s:Body></s:Envelope>'
+        f'{header}<s:Body>{body_xml}</s:Body></s:Envelope>'
+    )
+
+
+def _ws_security_header(username: str, password: str) -> str:
+    """A standard WS-Security UsernameToken with PasswordDigest -- the
+    ONVIF-mandated authentication mechanism (WS-Security Username Token
+    Profile 1.0). The plaintext password is used only locally to
+    compute a one-way SHA-1 digest of nonce+created+password; it is
+    never itself transmitted, logged, or included in any exception."""
+    created = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    nonce = secrets.token_bytes(16)
+    digest = hashlib.sha1(nonce + created.encode('utf-8') + password.encode('utf-8')).digest()
+    return (
+        '<Security s:mustUnderstand="1" '
+        'xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" '
+        'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+        '<UsernameToken>'
+        f'<Username>{_xml_escape(username)}</Username>'
+        '<Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{base64.b64encode(digest).decode()}</Password>'
+        '<Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+        f'{base64.b64encode(nonce).decode()}</Nonce>'
+        f'<wsu:Created>{created}</wsu:Created>'
+        '</UsernameToken></Security>'
     )
 
 
@@ -116,15 +159,15 @@ def _looks_like_auth_fault(reason: str | None) -> bool:
     return any(marker in lowered for marker in ('notauthorized', 'not authorized', 'authenticationfailed', 'unauthorized'))
 
 
-def _soap_post(url: str, body_xml: str, timeout: float) -> ElementTree.Element:
-    """One unauthenticated SOAP request/response round-trip. Raises
+def _soap_post(url: str, body_xml: str, timeout: float, header_xml: str = '') -> ElementTree.Element:
+    """One SOAP request/response round-trip, optionally with a WS-
+    Security header already built by the caller. Raises
     OnvifAuthRequired on a 401/403 or an auth-shaped SOAP fault,
     OnvifRequestError on anything else that prevents getting a usable
-    response. Never sends or logs a credential -- this module never
-    even has one to send; see the module docstring for why an
-    authentication challenge here means "stop", not "retry with
-    credentials"."""
-    envelope = _soap_envelope(body_xml)
+    response. Never logs a credential -- this function never even sees
+    a plaintext one; header_xml already carries only a one-way digest
+    (see _ws_security_header())."""
+    envelope = _soap_envelope(body_xml, header_xml)
     request = urllib.request.Request(
         url,
         data=envelope.encode('utf-8'),
@@ -159,6 +202,23 @@ def _soap_post(url: str, body_xml: str, timeout: float) -> ElementTree.Element:
             raise OnvifAuthRequired(reason or 'soap_fault')
         raise OnvifRequestError(reason or 'soap_fault')
     return root
+
+
+def _soap_call(url: str, body_xml: str, timeout: float, username: str | None, password: str | None) -> ElementTree.Element:
+    """Always tries unauthenticated first -- a device that doesn't
+    require credentials is never sent any, even if this caller happens
+    to have some in hand. Only on an auth challenge, and only if both
+    username and password were supplied, does this retry the exact
+    same call once more with a WS-Security UsernameToken. A second
+    auth challenge (wrong/rejected credentials) propagates as
+    OnvifAuthRequired exactly like the no-credentials case -- this
+    module never guesses a different credential to try."""
+    try:
+        return _soap_post(url, body_xml, timeout)
+    except OnvifAuthRequired:
+        if not username or not password:
+            raise
+        return _soap_post(url, body_xml, timeout, header_xml=_ws_security_header(username, password))
 
 
 # --------------------------------------------------------------- discovery
@@ -225,16 +285,16 @@ def _probe_xaddr(ip: str, device_key: str, timeout: float = DISCOVERY_TIMEOUT) -
 
 # ------------------------------------------------------------- SOAP calls
 
-def get_media_service_url(device_url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
-    root = _soap_post(device_url, '<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>', timeout)
+def get_media_service_url(device_url: str, timeout: float = DEFAULT_TIMEOUT, username: str | None = None, password: str | None = None) -> str:
+    root = _soap_call(device_url, '<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>', timeout, username, password)
     media = _find(root, 'Media', 'XAddr')
     if media is None or not (media.text or '').strip():
         raise OnvifRequestError('no_media_service_advertised')
     return media.text.strip()
 
 
-def get_profiles(media_url: str, timeout: float = DEFAULT_TIMEOUT) -> list[dict]:
-    root = _soap_post(media_url, '<trt:GetProfiles/>', timeout)
+def get_profiles(media_url: str, timeout: float = DEFAULT_TIMEOUT, username: str | None = None, password: str | None = None) -> list[dict]:
+    root = _soap_call(media_url, '<trt:GetProfiles/>', timeout, username, password)
     profiles = []
     for element in _find_all(root, 'Profiles'):
         token = element.get('token') or element.get('Token')
@@ -265,14 +325,14 @@ def select_profile(profiles: list[dict]) -> dict | None:
     return profiles[0]
 
 
-def get_stream_uri(media_url: str, profile_token: str, timeout: float = DEFAULT_TIMEOUT) -> str | None:
+def get_stream_uri(media_url: str, profile_token: str, timeout: float = DEFAULT_TIMEOUT, username: str | None = None, password: str | None = None) -> str | None:
     body = (
         '<trt:GetStreamUri>'
         '<trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream>'
         '<tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup>'
         f'<trt:ProfileToken>{profile_token}</trt:ProfileToken></trt:GetStreamUri>'
     )
-    root = _soap_post(media_url, body, timeout)
+    root = _soap_call(media_url, body, timeout, username, password)
     uri = _find(root, 'MediaUri', 'Uri')
     return uri.text.strip() if uri is not None and uri.text else None
 
@@ -307,11 +367,18 @@ def sanitize_rtsp_uri(uri: str | None) -> tuple[str | None, bool]:
 
 # ------------------------------------------------------------- orchestration
 
-def resolve_media_uri(ip: str, device_key: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
-    """The single entry point the agent's sync cycle calls. Every
-    return path yields a dict that is always safe to log, print, or
-    submit to the cloud as-is -- never a username, password,
-    Authorization header, or credential-bearing URI.
+def resolve_media_uri(ip: str, device_key: str, timeout: float = DEFAULT_TIMEOUT, username: str | None = None, password: str | None = None) -> dict:
+    """The single entry point every caller uses. Every return path
+    yields a dict that is always safe to log, print, or submit to the
+    cloud as-is -- never a username, password, Authorization header, or
+    credential-bearing URI.
+
+    username/password are optional and, when supplied, are used ONLY
+    if and when a call is actually challenged -- see _soap_call(). Pass
+    them only when they are already the exact in-memory value another
+    part of this agent is using for the same device this same cycle
+    (see service.py's poll_provisioning()); this function never fetches
+    or caches a credential of its own.
 
     status values:
       'resolved'       -- rtsp_uri is a real, sanitized rtsp:// URI from
@@ -337,7 +404,7 @@ def resolve_media_uri(ip: str, device_key: str, timeout: float = DEFAULT_TIMEOUT
     xaddr = _probe_xaddr(ip, device_key, timeout=DISCOVERY_TIMEOUT)
     device_url = device_service_url(ip, xaddr)
     try:
-        media_url = get_media_service_url(device_url, timeout=timeout)
+        media_url = get_media_service_url(device_url, timeout=timeout, username=username, password=password)
     except OnvifAuthRequired:
         result.update(status='auth_required', message='Device requires authentication for ONVIF Device service access.')
         return result
@@ -347,7 +414,7 @@ def resolve_media_uri(ip: str, device_key: str, timeout: float = DEFAULT_TIMEOUT
         return result
 
     try:
-        profiles = get_profiles(media_url, timeout=timeout)
+        profiles = get_profiles(media_url, timeout=timeout, username=username, password=password)
     except OnvifAuthRequired:
         result.update(status='auth_required', message='Device requires authentication for ONVIF Media service access.')
         return result
@@ -365,7 +432,7 @@ def resolve_media_uri(ip: str, device_key: str, timeout: float = DEFAULT_TIMEOUT
     result['profile_name'] = profile['name'] or None
 
     try:
-        raw_uri = get_stream_uri(media_url, profile['token'], timeout=timeout)
+        raw_uri = get_stream_uri(media_url, profile['token'], timeout=timeout, username=username, password=password)
     except OnvifAuthRequired:
         result.update(status='auth_required', message='Device requires authentication for ONVIF GetStreamUri.')
         return result

@@ -16,7 +16,7 @@ from .discovery import scan
 from .metrics import collect
 from .onvif_media import resolve_media_uri
 from .portal import PortalClient,PortalError,sanitize
-from .provisioning import verify_device
+from .provisioning import locate_device,verify_device
 from .queue import OfflineQueue
 from .updater.factory import build_update_state_machine
 from .updater.health import make_health_check
@@ -208,7 +208,53 @@ class ApplianceAgent:
             try: success,message=verify_device(job.get('device_key',''),job.get('credentials'),self.config.discovery_networks)
             except Exception:
                 self.log.exception('Provisioning verification error job_id=%s',job_id); success,message=False,'Appliance-side verification error.'
-            self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/provisioning-jobs/{job_id}',{'success':success,'message':message},'provision-'+job_id)
+            submitted=self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/provisioning-jobs/{job_id}',{'success':success,'message':message},'provision-'+job_id)
+            if success and submitted:
+                # Reuses the SAME transient, in-memory credentials
+                # verify_device() just used for this exact job -- see
+                # _resolve_media_uri_after_provisioning()'s own
+                # docstring for why this, not a second fetch/store, is
+                # the only place ONVIF resolution is ever attempted
+                # with a credential.
+                self._resolve_media_uri_after_provisioning(job.get('device_key',''),job.get('credentials'))
+    def _resolve_media_uri_after_provisioning(self,device_key,credentials):
+        # Deliberately the ONLY caller of resolve_media_uri() that ever
+        # passes a username/password -- and only the exact plaintext
+        # values this same job's own verify_device() call already used,
+        # never refetched, never written to disk, never sent anywhere
+        # except (only if the device actually challenges for it) one
+        # ONVIF SOAP call. Extends the existing, already-tested
+        # single-delivery credential path (cloud -> this agent, once)
+        # instead of inventing a second one. The periodic unauthenticated
+        # sweep in resolve_media_uris() below is unaffected -- it remains
+        # the path for cameras that never needed a credential at all.
+        if not device_key:
+            return
+        device=locate_device(device_key,self.config.discovery_networks)
+        if not device or not device.get('ip'):
+            return
+        try:
+            configuration=self.client.request('GET','/api/appliance/configuration')
+        except PortalError:
+            return
+        camera_id=None
+        for camera in configuration.get('cameras',[]):
+            if camera.get('device_key')==device_key:
+                if camera.get('onvif_endpoint'):
+                    return  # already resolved (e.g. an earlier attempt for this same camera) -- nothing to do
+                camera_id=camera.get('id'); break
+        if not camera_id:
+            return
+        username=str((credentials or {}).get('username','')) or None
+        password=str((credentials or {}).get('password','')) or None
+        result=resolve_media_uri(device['ip'],device_key,username=username,password=password)
+        if result['status']!='resolved':
+            self.log.info('onvif_media.not_resolved_during_provisioning device_key=%s status=%s',device_key,result['status'])
+            return
+        try:
+            self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':result['rtsp_uri']})
+        except PortalError as error:
+            self.log.debug('onvif_media.submit_failed_during_provisioning device_key=%s error=%s',device_key,error)
     def poll_commands(self):
         try:
             for item in self.client.request('GET','/api/appliance/commands').get('commands',[]):

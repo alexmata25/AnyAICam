@@ -547,11 +547,25 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 if job['customer_id']!=appliance['customer_id'] or job['site_id']!=appliance['site_id']: continue
                 credentials=decrypt_camera_credentials(job.pop('encrypted_credentials'))
                 delivered.append({'id':job['id'],'device_key':job['device_key'],'camera_name':job['camera_name'],'recording_mode':job['recording_mode'],'analytics':json.loads(job['analytics_json']),'credentials':credentials})
-                # Single-delivery: cleared from storage the instant it is
-                # handed to this specific, already-authenticated
-                # appliance -- never retained at rest any longer than
-                # the queue wait itself required.
-                db.execute("UPDATE camera_provisioning_requests SET status='verifying',encrypted_credentials=NULL,updated_at=? WHERE id=?",(now,job['id']))
+                # Single-delivery is enforced by the queued->verifying
+                # transition alone (the WHERE status='queued' filter
+                # above already makes a second GET call return nothing
+                # for this job, regardless of this column) -- the
+                # at-rest encrypted blob itself is intentionally NOT
+                # cleared here anymore. It stays in place only long
+                # enough for appliance_submit_provisioning() (this same
+                # job's own conclusion, typically seconds away) to copy
+                # it into camera_credentials -- the table
+                # _provisioned_camera_stream() (app/main.py) actually
+                # reads from -- and clear it there. Before this,
+                # nothing ever performed that copy, so a camera
+                # provisioned WITH credentials still had none in
+                # camera_credentials and camera_url() could never
+                # resolve it. Still cleared well within the existing
+                # CAMERA_PROVISIONING_TIMEOUT_SECONDS window either way
+                # (see partner_workspace.py), never retained
+                # indefinitely.
+                db.execute("UPDATE camera_provisioning_requests SET status='verifying',updated_at=? WHERE id=?",(now,job['id']))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.provisioning_jobs_delivered','appliance',appliance['id'],{'count':len(delivered)})
         return {'jobs':delivered}
 
@@ -622,9 +636,38 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         assign_camera_number(db,camera_id,candidate,appliance_id=appliance['id'],customer_id=job['customer_id'])
                     except (LookupError, ValueError):
                         pass
-                db.execute("UPDATE camera_provisioning_requests SET status='provisioned',camera_id=?,message=?,updated_at=? WHERE id=?",(camera_id,message or 'Camera provisioned.',now,job_id))
+                if job['encrypted_credentials']:
+                    # Persists the customer-supplied credentials from
+                    # THIS job into camera_credentials -- the table
+                    # _provisioned_camera_stream() (app/main.py) and
+                    # this route's own POST .../media-uri handler
+                    # actually read from. request_camera_provisioning()
+                    # (partner_workspace.py) already encrypts and stores
+                    # them on camera_provisioning_requests at request
+                    # time; nothing before this fix ever copied them
+                    # across to where the running pipeline looks for
+                    # them. Upsert, not insert-only, so a reprovision
+                    # with corrected credentials updates the existing
+                    # row in place -- same never-delete/recreate,
+                    # never-a-duplicate discipline as the camera row
+                    # reprovision above. A reprovision submitted WITHOUT
+                    # credentials (encrypted_credentials NULL/empty on
+                    # this job) never reaches this branch at all, so it
+                    # can never blank out a previously-good credential.
+                    db.execute(
+                        'INSERT INTO camera_credentials(camera_id,encrypted_blob,created_at,updated_at) VALUES(?,?,?,?) '
+                        'ON CONFLICT(camera_id) DO UPDATE SET encrypted_blob=excluded.encrypted_blob,updated_at=excluded.updated_at',
+                        (camera_id,job['encrypted_credentials'],now,now),
+                    )
+                # Cleared here, at this job's own conclusion, now that
+                # it has done everything it will ever do with it --
+                # copied into camera_credentials above if present. See
+                # appliance_provisioning_jobs()'s own comment for why
+                # this, not the earlier GET/delivery step, is where
+                # retention actually ends.
+                db.execute("UPDATE camera_provisioning_requests SET status='provisioned',camera_id=?,message=?,updated_at=?,encrypted_credentials=NULL WHERE id=?",(camera_id,message or 'Camera provisioned.',now,job_id))
             else:
-                db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,updated_at=? WHERE id=?",(message or 'Provisioning failed.',now,job_id))
+                db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,updated_at=?,encrypted_credentials=NULL WHERE id=?",(message or 'Provisioning failed.',now,job_id))
         audit({'email':appliance['cloud_id'],'role':'appliance'},'camera.provisioning_result','camera_provisioning_request',job_id,{'success':success,'camera_id':camera_id})
         return {'message':'Provisioning result saved.'}
 

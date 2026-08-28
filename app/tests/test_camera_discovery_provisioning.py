@@ -276,12 +276,23 @@ def test_credentials_are_encrypted_at_rest_and_never_plaintext(db_path, monkeypa
     assert decrypted == {"username": "admin", "password": "hunter2"}
 
 
-def test_credentials_cleared_the_instant_appliance_polls_for_them(db_path, monkeypatch):
+def test_credentials_delivered_once_then_cleared_once_the_job_concludes(db_path, monkeypatch):
+    """Single-delivery-to-the-appliance is enforced by the queued->
+    verifying status transition alone -- a second GET call for the same
+    job never returns credentials again, regardless of this column
+    (proven below). The at-rest encrypted blob itself is intentionally
+    no longer wiped at GET time (see appliance_provisioning_jobs()'s own
+    comment): it survives just long enough for
+    appliance_submit_provisioning() -- this same job's own conclusion --
+    to copy it into camera_credentials and clear it there, which is what
+    makes camera_url() able to find it at all. Still cleared well within
+    one job's lifecycle, never retained indefinitely."""
     from cryptography.fernet import Fernet
     key = Fernet.generate_key()
     monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", key.decode())
     request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
     appliance_provisioning_jobs = _route("/api/appliance/{cloud_id}/provisioning-jobs", "GET")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
     with override_target(sqlite_path=db_path):
         initialize_database()
         conn = sqlite3.connect(db_path)
@@ -289,10 +300,135 @@ def test_credentials_cleared_the_instant_appliance_polls_for_them(db_path, monke
         monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
         job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-1", "name": "Front Door", "username": "admin", "password": "hunter2"})
         result = appliance_provisioning_jobs(_fake_request(_appliance_auth_headers()), "AIC-TEST1")
+        # A second GET call must never re-deliver credentials for the
+        # same job, even though the column itself hasn't been cleared
+        # yet -- the queued->verifying status transition alone prevents it.
+        second_result = appliance_provisioning_jobs(_fake_request(_appliance_auth_headers()), "AIC-TEST1")
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": True})
         conn2 = sqlite3.connect(db_path)
         stored_after = conn2.execute("SELECT encrypted_credentials FROM camera_provisioning_requests WHERE id=?", (job["job_id"],)).fetchone()[0]
     assert result["jobs"][0]["credentials"] == {"username": "admin", "password": "hunter2"}
-    assert stored_after is None  # cleared from storage the instant it was delivered
+    assert second_result["jobs"] == []
+    assert stored_after is None  # cleared once this job concluded
+
+
+# --------------------------------- credentials persisted into camera_credentials
+#
+# Regression coverage for the traced end-to-end credential lifecycle gap:
+# request_camera_provisioning() (partner_workspace.py) already encrypts
+# and stores supplied credentials on camera_provisioning_requests;
+# appliance_provisioning_jobs() (GET) already decrypts and delivers them
+# to the appliance once. Nothing, before this fix, ever copied them into
+# camera_credentials -- the table app/main.py's _provisioned_camera_
+# stream() and this module's own POST .../media-uri handler actually
+# read from -- so a camera provisioned WITH credentials still had none
+# there and camera_url() could never resolve it.
+
+def _full_provisioning_cycle(username, password, device_key="onvif-uuid-1", name="Front Door"):
+    """Replays the real end-to-end lifecycle: customer request (with
+    optional credentials) -> appliance GET (decrypts + delivers them
+    once, same as service.py's poll_provisioning()) -> appliance POST
+    success (persists them into camera_credentials, this fix's own new
+    step)."""
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_provisioning_jobs = _route("/api/appliance/{cloud_id}/provisioning-jobs", "GET")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    payload = {"appliance_id": "appl-1", "device_key": device_key, "name": name}
+    if username or password:
+        payload["username"] = username
+        payload["password"] = password
+    job = request_camera_provisioning(_fake_request(), payload)
+    appliance_provisioning_jobs(_fake_request(_appliance_auth_headers()), "AIC-TEST1")
+    appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": True})
+
+
+def test_credentials_supplied_at_provisioning_are_persisted_into_camera_credentials(db_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key()
+    monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", key.decode())
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _full_provisioning_cycle("admin", "hunter2")
+        conn2 = sqlite3.connect(db_path)
+        camera_id = conn2.execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        stored = conn2.execute("SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?", (camera_id,)).fetchone()
+    assert stored is not None
+    assert b"hunter2" not in bytes(stored[0])
+    assert b"admin" not in bytes(stored[0])
+    from appliance_protocol import decrypt_camera_credentials
+    assert decrypt_camera_credentials(stored[0]) == {"username": "admin", "password": "hunter2"}
+
+
+def test_reprovisioning_with_new_credentials_updates_not_duplicates(db_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key()
+    monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", key.decode())
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _full_provisioning_cycle("admin", "hunter2")
+        _full_provisioning_cycle("admin", "correct-horse-battery-staple")  # corrected password, same device_key
+        conn2 = sqlite3.connect(db_path)
+        camera_id = conn2.execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        rows_ = conn2.execute("SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?", (camera_id,)).fetchall()
+    assert len(rows_) == 1, "must update the existing credentials row, never insert a duplicate"
+    from appliance_protocol import decrypt_camera_credentials
+    assert decrypt_camera_credentials(rows_[0][0]) == {"username": "admin", "password": "correct-horse-battery-staple"}
+
+
+def test_reprovisioning_without_credentials_does_not_clear_existing_ones(db_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key()
+    monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", key.decode())
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _full_provisioning_cycle("admin", "hunter2")
+        _full_provisioning_cycle(None, None)  # e.g. a plain rename/rediscovery with no credentials on this job
+        conn2 = sqlite3.connect(db_path)
+        camera_id = conn2.execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        stored = conn2.execute("SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?", (camera_id,)).fetchone()
+    from appliance_protocol import decrypt_camera_credentials
+    assert decrypt_camera_credentials(stored[0]) == {"username": "admin", "password": "hunter2"}
+
+
+def test_provisioning_without_credentials_creates_no_camera_credentials_row(db_path, monkeypatch):
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _full_provisioning_cycle(None, None)
+        conn2 = sqlite3.connect(db_path)
+        camera_id = conn2.execute("SELECT id FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        stored = conn2.execute("SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?", (camera_id,)).fetchone()
+    assert stored is None
+
+
+def test_configuration_response_never_includes_plaintext_credential_fields(db_path, monkeypatch):
+    from cryptography.fernet import Fernet
+    key = Fernet.generate_key()
+    monkeypatch.setenv("ANYAICAM_CAMERA_CREDENTIAL_KEY", key.decode())
+    appliance_configuration = _route("/api/appliance/configuration", "GET")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        _full_provisioning_cycle("admin", "hunter2")
+        result = appliance_configuration(_fake_request(_appliance_auth_headers()))
+    serialized = json.dumps(result)
+    assert "hunter2" not in serialized
+    assert result["camera_credentials_included"] is False
+    for camera in result["cameras"]:
+        assert "username" not in camera and "password" not in camera and "encrypted_blob" not in camera
 
 
 def test_provisioning_audit_never_includes_credential_fields(db_path, monkeypatch):
