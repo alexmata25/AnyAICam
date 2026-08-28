@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Docker Engine + compose plugin install/verify. Idempotent: does
-# nothing but log if Docker is already present and working.
+# Docker Engine + compose plugin + runtime dependency install/verify.
 
 docker_setup() {
+    # rsync is required by exact payload synchronization and is not guaranteed
+    # on a clean Ubuntu 24.04 image. Install base dependencies even when Docker
+    # already exists so repair/reinstall never depends on an incidental package.
+    log "Ensuring installer runtime dependencies are present..."
+    apt-get update -y
+    apt-get install -y ca-certificates curl gnupg rsync
+
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
         log "Docker + compose plugin already present: $(docker --version)"
         return 0
     fi
+
     log "Installing Docker Engine + compose plugin..."
-    apt-get update -y
-    apt-get install -y ca-certificates curl gnupg
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
     chmod a+r /etc/apt/keyrings/docker.asc

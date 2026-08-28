@@ -45,6 +45,23 @@ reset_fixture() {
     VMS_HLS_DIR="$FIXTURE_ROOT/var/lib/anyaicam/vms/hls"
     VMS_ENV_FILE="$CONFIG_DIR/vms.env"
     QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
+    # Release-driven deploy_vms() constants (installer: make VMS payload
+    # release-driven) -- same fixture-redirection pattern as every other
+    # path constant here. VMS_RELEASE_COMMIT is a fixed, fake-but-valid
+    # 40-char lowercase hex value (the SHA-1 of an empty string) so every
+    # test starts from a real, format-valid commit unless it deliberately
+    # overrides it.
+    VMS_PAYLOAD_DIR="$FIXTURE_ROOT/installer-payload/vms"
+    VMS_RELEASE_COMMIT="da39a3ee5e6b4b0d3255bfef95601890afd80709"
+    # Release-driven install_agent()/run_uninstall() constants -- same
+    # release-driven rewrite as VMS_PAYLOAD_DIR above (installer: make
+    # VMS payload release-driven). install_agent() no longer reads
+    # $REPO_ROOT/appliance-agent at all; it requires the agent payload
+    # at $AGENT_PAYLOAD_DIR and installs a self-contained copy under
+    # $AGENT_SOURCE_ROOT (a subdirectory of $AGENT_INSTALL_ROOT).
+    AGENT_PAYLOAD_DIR="$FIXTURE_ROOT/installer-payload/agent"
+    AGENT_INSTALL_ROOT="$FIXTURE_ROOT/opt/anyaicam-agent"
+    AGENT_SOURCE_ROOT="$AGENT_INSTALL_ROOT/source"
     mkdir -p "$(dirname "$VMS_SERVICE_FILE")"
     # id/docker mocks default to "absent" until a test overrides them.
     ID_MOCK_EXIT=1
@@ -59,23 +76,20 @@ reset_fixture() {
     DF_TOTAL_GB=999999
 }
 
-# A minimal fake source tree for deploy_vms() to sync from -- just
-# enough for the regression test below, not a real app checkout.
-make_fake_repo_root() {
-    REPO_ROOT="$FIXTURE_ROOT/fake-repo"
-    mkdir -p "$REPO_ROOT/app"
-    echo 'print("fake app")' > "$REPO_ROOT/app/main.py"
-    echo 'FROM python:3.12-slim' > "$REPO_ROOT/Dockerfile"
-    echo 'FROM python:3.12-slim AS production' > "$REPO_ROOT/Dockerfile.production"
-    echo 'services: {}' > "$REPO_ROOT/docker-compose.yml"
-    echo 'fastapi' > "$REPO_ROOT/requirements.txt"
+# A minimal fake built appliance-agent release payload for
+# install_agent()/run_uninstall() to install/uninstall from --
+# release-driven install_agent() no longer reads
+# $REPO_ROOT/appliance-agent at all (see AGENT_PAYLOAD_DIR/
+# AGENT_SOURCE_ROOT above); this replaces the old make_fake_repo_root(),
+# which built these same fake scripts at a path nothing reads anymore.
+make_fake_agent_payload() {
     # A fake stand-in for the reused appliance-agent/scripts/install.sh
     # -- deliberately fails unless the python3.12-venv prerequisite was
     # already installed first, so the test both proves install_agent()
     # installs it AND proves the ordering (prereq before the wrapped
     # script runs), without ever touching a real venv/pip/network.
-    mkdir -p "$REPO_ROOT/appliance-agent/scripts"
-    cat > "$REPO_ROOT/appliance-agent/scripts/install.sh" <<'FAKE_AGENT_INSTALL'
+    mkdir -p "$AGENT_PAYLOAD_DIR/scripts"
+    cat > "$AGENT_PAYLOAD_DIR/scripts/install.sh" <<'FAKE_AGENT_INSTALL'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ ! -f "$APT_PYTHON_VENV_MARKER" ]]; then
@@ -84,14 +98,30 @@ if [[ ! -f "$APT_PYTHON_VENV_MARKER" ]]; then
 fi
 touch "$FAKE_AGENT_INSTALL_MARKER"
 FAKE_AGENT_INSTALL
-    chmod 755 "$REPO_ROOT/appliance-agent/scripts/install.sh"
+    chmod 755 "$AGENT_PAYLOAD_DIR/scripts/install.sh"
     # A fake stand-in for the reused appliance-agent/scripts/uninstall.sh
     # -- just proves run_uninstall() actually invoked it.
-    cat > "$REPO_ROOT/appliance-agent/scripts/uninstall.sh" <<'FAKE_AGENT_UNINSTALL'
+    cat > "$AGENT_PAYLOAD_DIR/scripts/uninstall.sh" <<'FAKE_AGENT_UNINSTALL'
 #!/usr/bin/env bash
 touch "$FAKE_AGENT_UNINSTALL_MARKER"
 FAKE_AGENT_UNINSTALL
-    chmod 755 "$REPO_ROOT/appliance-agent/scripts/uninstall.sh"
+    chmod 755 "$AGENT_PAYLOAD_DIR/scripts/uninstall.sh"
+}
+
+# A minimal fake built VMS release payload for deploy_vms() to mirror
+# from -- release-driven deploy_vms() no longer reads $REPO_ROOT at all
+# (install_agent()/run_uninstall() had the exact same $REPO_ROOT-\>
+# payload-dir rewrite; see make_fake_agent_payload() above for their
+# side of it). Matches build_release_installer.py's
+# REQUIRED_RELEASE_PATHS exactly: app, requirements.txt, Dockerfile,
+# Dockerfile.production, docker-compose.yml.
+make_fake_vms_payload() {
+    mkdir -p "$VMS_PAYLOAD_DIR/app"
+    echo 'print("fake app")' > "$VMS_PAYLOAD_DIR/app/main.py"
+    echo 'FROM python:3.12-slim' > "$VMS_PAYLOAD_DIR/Dockerfile"
+    echo 'FROM python:3.12-slim AS production' > "$VMS_PAYLOAD_DIR/Dockerfile.production"
+    echo 'services: {}' > "$VMS_PAYLOAD_DIR/docker-compose.yml"
+    echo 'fastapi' > "$VMS_PAYLOAD_DIR/requirements.txt"
 }
 
 # Shadow the three external commands the functions under test call.
@@ -328,12 +358,75 @@ echo "== deploy_vms() =="
 #     actually references (confirmed by inspecting its content: exactly
 #     requirements.txt and ./app beyond itself).
 reset_fixture
-make_fake_repo_root
+make_fake_vms_payload
 deploy_vms clean >/dev/null 2>&1
 assert_exit "plain Dockerfile is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile"
 assert_exit "Dockerfile.production is also copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/Dockerfile.production"
 assert_exit "requirements.txt is copied into VMS_INSTALL_ROOT" 0 test -f "$VMS_INSTALL_ROOT/requirements.txt"
 assert_exit "docker compose build was invoked" 0 test -f "$DOCKER_COMPOSE_BUILD_MARKER"
+
+# 14a. Missing release payload -> deploy_vms fails closed, never silently
+#      proceeds to build/deploy a nonexistent app, and never touches
+#      VMS_INSTALL_ROOT at all.
+reset_fixture
+assert_exit "deploy_vms fails when the built VMS payload is missing" 1 deploy_vms clean
+assert_exit "VMS_INSTALL_ROOT is never created when the payload is missing" 1 test -d "$VMS_INSTALL_ROOT"
+
+# 14b. Exact payload deployment (--delete mirror): a stale file left
+#      over in VMS_INSTALL_ROOT from a previous release, but no longer
+#      part of the current payload, must be removed -- this is the
+#      whole point of switching from `rsync --update` (additive,
+#      never removes) to `rsync --delete` (exact software mirror).
+#      Persistent state that was never part of any payload (recordings,
+#      data/config, .env) must survive untouched regardless.
+reset_fixture
+make_fake_vms_payload
+mkdir -p "$VMS_INSTALL_ROOT"
+echo "leftover from a previous release" > "$VMS_INSTALL_ROOT/stale-removed-file.py"
+mkdir -p "$VMS_RECORDINGS_DIR" "$VMS_DATA_CONFIG_DIR"
+echo "real-recording-data" > "$VMS_RECORDINGS_DIR/clip1.mp4"
+echo "real-data-config" > "$VMS_DATA_CONFIG_DIR/settings.json"
+deploy_vms clean >/dev/null 2>&1
+assert_exit "a file no longer in the release payload is removed from VMS_INSTALL_ROOT (exact mirror, not additive)" 1 test -f "$VMS_INSTALL_ROOT/stale-removed-file.py"
+assert_eq "persistent recordings untouched by the exact-mirror deploy" "real-recording-data" "$(cat "$VMS_RECORDINGS_DIR/clip1.mp4" 2>/dev/null)"
+assert_eq "persistent data-config untouched by the exact-mirror deploy" "real-data-config" "$(cat "$VMS_DATA_CONFIG_DIR/settings.json" 2>/dev/null)"
+
+echo
+echo "== ensure_vms_env() / build-identity stamping =="
+
+# 14c. Canonical ANYAICAM_ENV (not ANYAICAM_ENVIRONMENT) is written on a
+#      fresh env file -- app/main.py and app/cloud_config.py only ever
+#      read ANYAICAM_ENV; a previous version of this installer wrote
+#      ANYAICAM_ENVIRONMENT here, a name the app never reads, so every
+#      appliance installed that way silently stayed on the "local"
+#      default forever regardless of this line having run.
+reset_fixture
+ensure_vms_env >/dev/null 2>&1
+assert_eq "ANYAICAM_ENV=production is written to a fresh env file" "1" "$(grep -c '^ANYAICAM_ENV=production$' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "the old, never-read ANYAICAM_ENVIRONMENT key is never written" "0" "$(grep -c '^ANYAICAM_ENVIRONMENT=' "$VMS_ENV_FILE" 2>/dev/null)"
+
+# 14d. An operator-customized ANYAICAM_ENV (e.g. staging) is never
+#      overwritten by a reinstall/repair -- same never-clobber contract
+#      as ANYAICAM_RUNTIME_ROLE already has.
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_ENV=staging\n' > "$VMS_ENV_FILE"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "an existing, customized ANYAICAM_ENV value is preserved across reinstall" "ANYAICAM_ENV=staging" "$(grep '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null)"
+
+# 14e/14f. ANYAICAM_BUILD_ID and ANYAICAM_VMS_COMMIT are installer-owned
+#      build identity -- unlike ANYAICAM_ENV/RUNTIME_ROLE, these two ARE
+#      meant to be refreshed on every reinstall/repair (a repair with a
+#      newer release commit must update the stamped identity, not keep
+#      pointing at the old one).
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_BUILD_ID=stale-previous-release\nANYAICAM_VMS_COMMIT=stale-previous-release\n' > "$VMS_ENV_FILE"
+VMS_RELEASE_COMMIT="1111111111111111111111111111111111111a"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "ANYAICAM_BUILD_ID is refreshed to the current release commit, not left stale" "ANYAICAM_BUILD_ID=1111111111111111111111111111111111111a" "$(grep '^ANYAICAM_BUILD_ID=' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "ANYAICAM_VMS_COMMIT is refreshed to the current release commit, not left stale" "ANYAICAM_VMS_COMMIT=1111111111111111111111111111111111111a" "$(grep '^ANYAICAM_VMS_COMMIT=' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "exactly one ANYAICAM_BUILD_ID line exists (upsert, not append-a-duplicate)" "1" "$(grep -c '^ANYAICAM_BUILD_ID=' "$VMS_ENV_FILE" 2>/dev/null)"
 
 echo
 echo "== install_agent() =="
@@ -344,11 +437,11 @@ echo "== install_agent() =="
 #     24.04 host because python3.12-venv (which provides ensurepip)
 #     isn't installed by default. install_agent() must apt-get install
 #     it BEFORE invoking the wrapped script -- the fake wrapped script
-#     in make_fake_repo_root() itself fails unless that ordering held,
-#     so this proves both "installed" and "installed first" in one
-#     assertion.
+#     in make_fake_agent_payload() itself fails unless that ordering
+#     held, so this proves both "installed" and "installed first" in
+#     one assertion.
 reset_fixture
-make_fake_repo_root
+make_fake_agent_payload
 assert_exit "install_agent succeeds (prereq installed before the wrapped script ran)" 0 install_agent clean
 assert_exit "python3.12-venv was apt-get installed" 0 test -f "$APT_PYTHON_VENV_MARKER"
 assert_exit "the wrapped appliance-agent install.sh ran" 0 test -f "$FAKE_AGENT_INSTALL_MARKER"
@@ -436,7 +529,7 @@ echo "== run_uninstall() (default, no --purge-all) =="
 #     fix, recordings lived under $VMS_INSTALL_ROOT and were destroyed
 #     by this same `rm -rf`.
 reset_fixture
-make_fake_repo_root
+make_fake_agent_payload
 mkdir -p "$VMS_INSTALL_ROOT/app"
 echo 'print("fake app")' > "$VMS_INSTALL_ROOT/app/main.py"
 mkdir -p "$VMS_RECORDINGS_DIR/camera1" "$VMS_DATA_CONFIG_DIR" "$CONFIG_DIR"
