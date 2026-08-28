@@ -19,6 +19,13 @@ def _int(name, default):
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ANYAICAM_ENV", "development").lower()
+    # Same env var and default ("edge") app/main.py's own RUNTIME_ROLE
+    # constant already uses. The real AWS/cloud deployment explicitly
+    # sets ANYAICAM_RUNTIME_ROLE=cloud (aws.env, ecs-task-definition.json)
+    # -- this default only ever applies to appliances that never set it,
+    # i.e. edge appliances, so it cannot silently relax the real
+    # internet-facing cloud deployment's production requirements.
+    runtime_role: str = os.getenv("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
     app_secrets: list[str] = field(
         default_factory=lambda: [
             item
@@ -167,6 +174,21 @@ class Settings:
         return self.environment in {"staging", "production"}
 
     @property
+    def edge_production(self):
+        """A RUNTIME_ROLE=edge appliance in ANYAICAM_ENV=production is a
+        distinct security PROFILE, not a weaker version of cloud
+        production: it is reached over a private LAN/Tailscale network,
+        never the public internet, so it has no in-scope HTTPS
+        termination boundary to require -- unlike an internet-facing
+        cloud/combined production deployment, where all of that remains
+        mandatory and unchanged (see validate() below: every check this
+        property exempts is skipped ONLY when this is True, and strong/
+        non-default application secrets are never exempted for either
+        profile). Staging is deliberately unaffected by runtime_role --
+        this scopes strictly to production, matching the actual ask."""
+        return self.production and self.runtime_role == "edge"
+
+    @property
     def partner_login_url(self):
         return {
             "local": self.development_partner_url,
@@ -228,7 +250,13 @@ class Settings:
             "customer login": self.customer_login_url,
         }
 
-        if self.deployed:
+        # Internet-facing hardening -- unchanged from before for staging
+        # and for cloud/combined production. edge_production is the only
+        # exemption, and it is scoped exactly to this block: an edge
+        # appliance's LAN/Tailscale reachability has no HTTPS-terminating
+        # boundary in front of it to require secure cookies, CSRF
+        # tokens, or HTTPS-scheme URLs against.
+        if self.deployed and not self.edge_production:
             if not self.secure_cookies or not self.csrf_enabled:
                 errors.append(
                     "Staging and production require secure cookies and CSRF protection."
@@ -248,17 +276,10 @@ class Settings:
                 )
 
         if self.production:
-            if not self.https_only:
-                errors.append("Production requires HTTPS-only mode.")
-
-            if (
-                urlparse(self.partner_login_url).scheme != "https"
-                or urlparse(self.customer_login_url).scheme != "https"
-            ):
-                errors.append(
-                    "Production partner and customer login URLs must use HTTPS."
-                )
-
+            # Strong, non-default application secrets are required in
+            # EVERY production deployment -- deliberately outside the
+            # `not self.edge_production` branch below, so edge can never
+            # exempt itself from this one.
             if any(
                 secret in {
                     "local-development-secret-change-me",
@@ -271,6 +292,18 @@ class Settings:
                 errors.append(
                     "Replace default or short application secrets in production."
                 )
+
+            if not self.edge_production:
+                if not self.https_only:
+                    errors.append("Production requires HTTPS-only mode.")
+
+                if (
+                    urlparse(self.partner_login_url).scheme != "https"
+                    or urlparse(self.customer_login_url).scheme != "https"
+                ):
+                    errors.append(
+                        "Production partner and customer login URLs must use HTTPS."
+                    )
 
         if errors:
             raise RuntimeError("Configuration error: " + " ".join(errors))
