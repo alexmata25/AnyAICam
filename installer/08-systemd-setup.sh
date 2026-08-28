@@ -1,34 +1,16 @@
 #!/usr/bin/env bash
-# systemd unit for the VMS container + boot-before-login wiring. The
-# agent's own unit is already installed by 07-install-agent.sh (via
-# appliance-agent/scripts/install.sh) -- this only adds the VMS side,
-# using the same WantedBy=multi-user.target pattern already proven by
-# anyaicam-agent.service and the RDM4 privileged watcher this session:
-# multi-user.target starts before any desktop session, unlike
-# graphical.target.
+# Install the VMS unit bundled in the exact installer artifact.
 
 systemd_setup() {
+    local unit_source="$RUNTIME_DIR/anyaicam-vms.service"
+    [[ -f "$unit_source" ]] || {
+        echo "[ERROR] Missing bundled VMS systemd unit: $unit_source" >&2
+        return 1
+    }
     log "Installing anyaicam-vms.service..."
-    {
-        echo "[Unit]"
-        echo "Description=AnyAiCam VMS (Docker Compose)"
-        echo "After=docker.service network-online.target"
-        echo "Requires=docker.service"
-        echo "Wants=network-online.target"
-        echo
-        echo "[Service]"
-        echo "Type=oneshot"
-        echo "RemainAfterExit=yes"
-        echo "WorkingDirectory=$VMS_INSTALL_ROOT"
-        echo "ExecStart=/usr/bin/docker compose up -d"
-        echo "ExecStop=/usr/bin/docker compose down"
-        echo "TimeoutStartSec=300"
-        echo
-        echo "[Install]"
-        echo "WantedBy=multi-user.target"
-    } > "$VMS_SERVICE_FILE"
+    install -m 0644 "$unit_source" "$VMS_SERVICE_FILE"
     systemctl daemon-reload
     systemctl enable anyaicam-vms.service
-    systemctl start anyaicam-vms.service
-    log "anyaicam-vms.service enabled (starts at boot, before any desktop login) and started."
+    systemctl restart anyaicam-vms.service
+    log "anyaicam-vms.service enabled for multi-user.target and started."
 }

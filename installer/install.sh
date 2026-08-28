@@ -1,53 +1,81 @@
 #!/usr/bin/env bash
 # AnyAiCam customer-ready appliance installer -- entrypoint/orchestrator.
-#
-# Reconstructed from Codex's handoff notes (the original branch/commit
-# was never pushed before the disposable instance that built it was
-# terminated -- see README.md). Known Ubuntu 24.04 fix baked in below:
-# mawk (the default /usr/bin/awk on 24.04) treats a bare `index` used
-# as a for-loop variable name as shadowing its own builtin index()
-# function, corrupting field parsing -- the loop variable in
-# parse_kv_line() below is deliberately named `field`, never `index`.
+# Runtime installers are built artifacts: VMS payload + release metadata are
+# embedded at build time from one exact approved release commit/archive.
 set -euo pipefail
 
 INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$INSTALLER_DIR/.." && pwd)"
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.1.0"
+PAYLOAD_DIR="$INSTALLER_DIR/payload"
+VMS_PAYLOAD_DIR="$PAYLOAD_DIR/vms"
+AGENT_PAYLOAD_DIR="$PAYLOAD_DIR/agent"
+RUNTIME_DIR="$INSTALLER_DIR/runtime"
+RELEASE_ENV_FILE="$INSTALLER_DIR/release.env"
+
 VMS_INSTALL_ROOT=/opt/anyaicam
-# Path constants defined once, here, and referenced by variable
-# everywhere else in this installer (03-detect-install.sh,
-# 02-storage-check.sh, 05-provision-users-dirs.sh, 08-systemd-setup.sh,
-# validate.sh) -- never re-hardcoded -- so every script agrees on the
-# same literal path and so these can be overridden by a test harness
-# (installer/tests/) without touching real system paths.
+AGENT_INSTALL_ROOT=/opt/anyaicam-agent
+AGENT_SOURCE_ROOT="$AGENT_INSTALL_ROOT/source"
 CONFIG_DIR=/etc/anyaicam
 VMS_SERVICE_FILE=/etc/systemd/system/anyaicam-vms.service
 VERSION_MARKER="$CONFIG_DIR/installed_version"
+VMS_RELEASE_MARKER="$CONFIG_DIR/vms_release.json"
 IDENTITY_FILE="$CONFIG_DIR/appliance_identity.json"
-# VMS persistent/runtime state tree (see 06-deploy-vms.sh and
-# docker-compose.yml): recordings and data-config hold protected
-# customer/config data that must survive a default uninstall; hls
-# holds regenerable streaming output that just needs to live outside
-# the replaceable $VMS_INSTALL_ROOT software directory.
+
 VMS_RECORDINGS_DIR=/var/lib/anyaicam/vms/recordings
 VMS_DATA_CONFIG_DIR=/var/lib/anyaicam/vms/data-config
 VMS_HLS_DIR=/var/lib/anyaicam/vms/hls
 VMS_ENV_FILE="$CONFIG_DIR/vms.env"
 QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
 
+VMS_RELEASE_COMMIT=""
+VMS_RELEASE_SHA256=""
+INSTALLER_SOURCE_COMMIT=""
+
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
-# A tiny, reusable "read the value for KEY from KEY=VALUE lines"
-# helper -- this is the function whose original implementation used
-# `index` as the for-loop variable and broke under mawk. NF and the
-# loop counter are both plain awk builtins; only the *name* of the
-# loop variable was ever the bug.
+# Ubuntu 24.04 mawk fix: the loop variable is deliberately `field`, never
+# `index`, because a bare `index` shadows mawk's index() builtin.
 parse_kv_line() {
     awk -F'=' -v want="$1" '{
         for (field = 1; field <= NF; field++) {
             if ($field ~ "^" want "$") { print $(field + 1); exit }
         }
     }'
+}
+
+load_release_metadata() {
+    if [[ ! -f "$RELEASE_ENV_FILE" ]]; then
+        echo "[ERROR] release.env is missing. Run a built installer artifact; do not install directly from an unbuilt source checkout." >&2
+        return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$RELEASE_ENV_FILE"
+    if [[ ! "${VMS_RELEASE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "[ERROR] VMS_RELEASE_COMMIT must be one exact 40-character lowercase Git commit hash." >&2
+        return 1
+    fi
+    if [[ -n "${VMS_RELEASE_SHA256:-}" && ! "${VMS_RELEASE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "[ERROR] VMS_RELEASE_SHA256 is present but is not a lowercase SHA-256." >&2
+        return 1
+    fi
+    if [[ ! "${INSTALLER_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "[ERROR] INSTALLER_SOURCE_COMMIT must be one exact 40-character lowercase Git commit hash." >&2
+        return 1
+    fi
+    if [[ ! -d "$VMS_PAYLOAD_DIR/app" || ! -f "$VMS_PAYLOAD_DIR/Dockerfile" || \
+          ! -f "$VMS_PAYLOAD_DIR/docker-compose.yml" || ! -f "$VMS_PAYLOAD_DIR/requirements.txt" ]]; then
+        echo "[ERROR] Built VMS payload is incomplete." >&2
+        return 1
+    fi
+    if [[ ! -d "$AGENT_PAYLOAD_DIR" || ! -f "$AGENT_PAYLOAD_DIR/scripts/install.sh" ]]; then
+        echo "[ERROR] Built appliance-agent payload is incomplete." >&2
+        return 1
+    fi
+    if [[ ! -f "$RUNTIME_DIR/anyaicam-vms.service" ]]; then
+        echo "[ERROR] Built VMS systemd unit is missing." >&2
+        return 1
+    fi
+    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT
 }
 
 # shellcheck source=01-preflight.sh
@@ -78,9 +106,10 @@ run_install() {
         esac
     done
 
-    log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode)"
+    load_release_metadata
+    log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode, VMS=$VMS_RELEASE_COMMIT)"
     preflight_checks
-    detect_install_state   # sets INSTALL_STATE=clean|existing|partial
+    detect_install_state
     if [[ "$mode" == "install" && "$INSTALL_STATE" == "partial" ]]; then
         log "Partial installation detected -- treating as repair, never silently as clean."
         mode="repair"
@@ -92,13 +121,10 @@ run_install() {
     install_agent "$INSTALL_STATE"
     systemd_setup
     identity_provision "$INSTALL_STATE"
-    log "Install complete (mode=$mode, detected state=$INSTALL_STATE). Run $INSTALLER_DIR/validate.sh to verify."
+    stamp_release
+    log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."
 }
 
-# Only run when executed directly -- validate.sh and uninstall.sh
-# source this file purely to reuse log()/parse_kv_line()/the shared
-# path constants/detect_install_state(), without triggering a full
-# install run.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     run_install "$@"
 fi
