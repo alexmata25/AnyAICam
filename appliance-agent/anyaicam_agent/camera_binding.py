@@ -163,6 +163,62 @@ class CameraBindingStore:
         return binding
 
 
+def auto_bind_discovered_cameras(cloud_cameras: list[dict], discovered_cameras: list[dict],
+                                  binding_store: 'CameraBindingStore') -> list[str]:
+    """Closes the other half of the camera_not_bound gap: once the cloud
+    has assigned a camera_number to a provisioned camera (see app/
+    appliance_cloud.py's appliance_submit_provisioning()), this creates
+    the local binding automatically from data the appliance already has
+    -- no rediscovery, no re-provisioning, no operator action. device_key
+    is the sole matching key between a cloud camera and a discovered
+    physical candidate (never MAC/IP/name), consistent with every other
+    identity decision in this module.
+
+    Idempotent by construction: bind() itself replaces (never
+    duplicates) any prior binding for the same cloud_camera_id, and the
+    up-front comparison against the current binding skips the write
+    entirely when camera_number and MAC already match, so a binding
+    that's already correct is never rewritten (no churned
+    approved_at timestamp) and a binding for a camera not in
+    cloud_cameras this cycle is never touched at all.
+
+    Returns the list of cloud_camera_ids that were newly bound or
+    re-bound this call, for logging -- never raises on a single
+    camera's conflict (already-claimed MAC or camera_number); that
+    camera is simply skipped and surfaces to the cloud via
+    reconcile_cloud_cameras()'s own last_error instead.
+    """
+    discovered_by_device_key = {}
+    for camera in discovered_cameras:
+        device_key = str(camera.get('device_key') or '').strip()
+        if device_key:
+            discovered_by_device_key[device_key] = camera
+    existing_by_cloud_id = {item.get('cloud_camera_id'): item for item in binding_store.bindings()}
+    bound = []
+    for cloud_camera in cloud_cameras:
+        cloud_id = str(cloud_camera.get('id', '')).strip()
+        camera_number = cloud_camera.get('camera_number')
+        device_key = str(cloud_camera.get('device_key') or '').strip()
+        if not cloud_id or camera_number is None or not device_key:
+            continue  # nothing to bind yet -- no relay slot, or no physical identity to match against
+        physical = discovered_by_device_key.get(device_key)
+        if not physical:
+            continue  # not (or not yet) seen on this appliance's own network scan
+        try:
+            mac_address = normalize_mac(physical.get('mac_address', ''))
+        except ValueError:
+            continue  # discovered record has no resolved MAC yet -- nothing safe to bind
+        existing = existing_by_cloud_id.get(cloud_id)
+        if existing and existing.get('camera_number') == camera_number and existing.get('mac_address') == mac_address:
+            continue  # already correctly bound
+        try:
+            binding_store.bind(cloud_id, camera_number, mac_address)
+            bound.append(cloud_id)
+        except ValueError:
+            continue  # camera_number or MAC already claimed by a different cloud camera's binding
+    return bound
+
+
 class LocalVmsStatusReader:
     """Read camera truth from VMS output files, never from RTSP discovery."""
 

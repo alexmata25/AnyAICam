@@ -370,6 +370,89 @@ def test_reprovisioning_the_same_device_key_updates_not_duplicates(db_path, monk
     assert cameras[0][0] == "Front Door Renamed"
 
 
+# ------------------------------------------------- camera_number assignment
+#
+# Regression coverage for the confirmed-live Samsung gap: this async,
+# appliance-driven provisioning path created the cameras row but never
+# assigned a camera_number, so resolve_camera_number() (live_view_
+# sessions.py) always returned None and every live-view start request
+# 409'd forever. partner_workspace.py's OTHER (customer self-service)
+# provisioning route has always assigned one; this path must now match it.
+
+def test_successful_appliance_provisioning_assigns_camera_number(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-1", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": True})
+        conn2 = sqlite3.connect(db_path)
+        camera = conn2.execute("SELECT camera_number FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()
+    assert camera is not None
+    assert camera[0] is not None, "future appliance-provisioned cameras must automatically receive a relay slot"
+
+
+def test_appliance_provisioning_assigns_the_next_free_slot_not_a_duplicate(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job_a = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-a", "name": "Camera A"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job_a["job_id"], {"success": True})
+        job_b = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-b", "name": "Camera B"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job_b["job_id"], {"success": True})
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+        numbers = {r["device_key"]: r["camera_number"] for r in conn2.execute("SELECT device_key,camera_number FROM cameras")}
+    assert numbers["onvif-uuid-a"] == 1
+    assert numbers["onvif-uuid-b"] == 2, "must land on the next free slot, never collide with another camera on the same appliance"
+
+
+def test_reprovisioning_does_not_change_an_existing_camera_number(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-1", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
+        conn2 = sqlite3.connect(db_path)
+        first_number = conn2.execute("SELECT camera_number FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+        # Re-provision the SAME physical device a second time -- an
+        # already-assigned camera_number must be left exactly as-is,
+        # never reassigned or blanked, even though the row itself
+        # (name, appliance_id, site_id) is updated in place.
+        job2 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-1", "name": "Front Door Renamed"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job2["job_id"], {"success": True})
+        conn3 = sqlite3.connect(db_path)
+        second_number = conn3.execute("SELECT camera_number FROM cameras WHERE device_key='onvif-uuid-1'").fetchone()[0]
+    assert first_number is not None
+    assert second_number == first_number
+
+
+def test_failed_appliance_provisioning_assigns_no_camera_number(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-1", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": False, "message": "Authentication failed."})
+        conn2 = sqlite3.connect(db_path)
+        camera_count = conn2.execute("SELECT count(*) FROM cameras").fetchone()[0]
+    assert camera_count == 0  # nothing to assign a slot to -- no camera row was ever created
+
+
 # ---------------------------------------------------------- auth hardening
 
 def test_valid_auth_succeeds(db_path, monkeypatch):

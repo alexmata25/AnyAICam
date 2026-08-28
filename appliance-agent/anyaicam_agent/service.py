@@ -9,6 +9,7 @@ import uuid
 from .commands import execute
 from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
                              LocalVmsStatusReader,atomic_write_json,
+                             auto_bind_discovered_cameras,
                              reconcile_cloud_cameras,redact_discovery_for_cloud)
 from .config import AgentConfig,load_credential
 from .discovery import scan
@@ -215,7 +216,16 @@ class ApplianceAgent:
     def sync_configuration(self):
         try:
             configuration=self.client.request('GET','/api/appliance/configuration')
-            merged=reconcile_cloud_cameras(configuration.get('cameras',[]),self.discovered_store.cameras(),self.binding_store.bindings(),self.vms_status)
+            cloud_cameras=configuration.get('cameras',[])
+            # Closes the camera_not_bound gap for any camera the cloud has
+            # just assigned a relay slot to: matches it against this
+            # appliance's own already-discovered cameras by device_key
+            # (never MAC/IP/name) and persists the binding locally. No
+            # rediscovery, no re-provisioning -- see camera_binding.py's
+            # auto_bind_discovered_cameras() docstring for the full
+            # idempotency contract.
+            auto_bind_discovered_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store)
+            merged=reconcile_cloud_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store.bindings(),self.vms_status)
             atomic_write_json(self.config.cameras_file,merged)
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
     def cycle(self):

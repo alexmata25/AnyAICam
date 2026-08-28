@@ -210,7 +210,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     @app.get('/api/appliance/signing-keys')
     def identity_signing_keys() -> dict:
@@ -556,6 +556,27 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
                         (camera_id,job['customer_id'],job['site_id'],appliance['id'],job['device_key'],job['camera_name'],'configured',now),
                     )
+                # A camera provisioned through this appliance-driven async
+                # path previously never received a camera_number at all --
+                # confirmed live on Samsung: live-view start requests 409'd
+                # forever because resolve_camera_number() (live_view_
+                # sessions.py) had nothing to return. Mirrors partner_
+                # workspace.py's provision_customer_camera() (the customer
+                # self-service path), which has always done this: assign
+                # the lowest free slot only when camera_number is still
+                # NULL. An existing valid camera_number (e.g. on a
+                # reprovision of an already-bound camera) is never
+                # touched here.
+                camera_row=db.execute('SELECT camera_number FROM cameras WHERE id=?',(camera_id,)).fetchone()
+                if camera_row and camera_row['camera_number'] is None:
+                    used=set(int(item['camera_number']) for item in db.execute('SELECT camera_number FROM cameras WHERE appliance_id=? AND camera_number IS NOT NULL',(appliance['id'],)).fetchall())
+                    candidate=1
+                    while candidate in used: candidate+=1
+                    try:
+                        from camera_mapping import assign_camera_number
+                        assign_camera_number(db,camera_id,candidate,appliance_id=appliance['id'],customer_id=job['customer_id'])
+                    except (LookupError, ValueError):
+                        pass
                 db.execute("UPDATE camera_provisioning_requests SET status='provisioned',camera_id=?,message=?,updated_at=? WHERE id=?",(camera_id,message or 'Camera provisioned.',now,job_id))
             else:
                 db.execute("UPDATE camera_provisioning_requests SET status='failed',message=?,updated_at=? WHERE id=?",(message or 'Provisioning failed.',now,job_id))
