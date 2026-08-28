@@ -51,6 +51,47 @@ CREATE INDEX IF NOT EXISTS idx_detection_events_camera_timestamp ON detection_ev
 CREATE TABLE IF NOT EXISTS customer_talk_sessions(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,site_id TEXT NOT NULL,camera_id TEXT NOT NULL,user_id TEXT,requested_by TEXT NOT NULL,role TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'requested',requested_at TEXT NOT NULL,ended_at TEXT,expires_at TEXT NOT NULL,FOREIGN KEY(customer_id) REFERENCES customers(id),FOREIGN KEY(site_id) REFERENCES sites(id),FOREIGN KEY(camera_id) REFERENCES cameras(id));
 CREATE INDEX IF NOT EXISTS idx_customer_talk_sessions_camera ON customer_talk_sessions(camera_id,state);
 '''),
+    # Restored from the production/AWS deployment's own db_migrations.py
+    # (verified by reading its actual SQL over SSH, not inferred from
+    # the migration ID) -- this branch was missing it entirely, which
+    # is the confirmed root cause of "no such table: camera_
+    # provisioning_requests" (partner_workspace.py's provisioning-job
+    # queue) and all 12 test_camera_discovery_provisioning.py failures.
+    # Production already has this version recorded in its own schema_
+    # migrations table, so apply_migrations() skips re-running it there
+    # entirely (see the `if version in applied: continue` guard below)
+    # -- restoring it here only changes behavior on a database that
+    # never had it: every fresh install (Samsung after a wipe, Ryzen, a
+    # new customer appliance).
+    #
+    # Production's version of this migration also does `ALTER TABLE
+    # cameras ADD COLUMN device_key TEXT` and creates an appliance-
+    # scoped idx_cameras_appliance_device_key index -- deliberately NOT
+    # included here verbatim. This branch already, independently, adds
+    # device_key via apply_migrations()'s own unconditional camera_
+    # columns block above (with its own idempotent existence check) and
+    # creates a DIFFERENT index there -- idx_cameras_customer_device_key,
+    # customer-scoped and UNIQUE-partial, not appliance-scoped and
+    # plain like production's. Running production's raw `ALTER TABLE
+    # ADD COLUMN` here crashes with "duplicate column name: device_key"
+    # on any database (confirmed on this repo's own local dev database)
+    # that already has the column from that other path but never had
+    # this migration version recorded -- true for this branch's own
+    # already-running installations (Samsung, almost certainly), not
+    # just a hypothetical. The column-add is intentionally left to that
+    # existing, already-idempotent mechanism; production's own missing
+    # appliance-scoped index is created there instead (see
+    # idx_cameras_appliance_device_key, added right after idx_cameras_
+    # customer_device_key above) so both indexes still end up existing,
+    # matching production, without the crash. The two indexes'
+    # divergence (unique-partial-customer-scoped vs. plain-appliance-
+    # scoped) is NOT reconciled by this change -- restoring production's
+    # camera_provisioning_requests table is the only thing this
+    # migration is responsible for; the index question stays open.
+    ('20260824_camera_discovery','''
+CREATE TABLE IF NOT EXISTS camera_provisioning_requests(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,appliance_id TEXT NOT NULL,site_id TEXT NOT NULL,device_key TEXT NOT NULL,camera_name TEXT NOT NULL,recording_mode TEXT,analytics_json TEXT NOT NULL DEFAULT '[]',encrypted_credentials BLOB,status TEXT NOT NULL DEFAULT 'queued',camera_id TEXT,message TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(customer_id) REFERENCES customers(id),FOREIGN KEY(appliance_id) REFERENCES appliances(id),FOREIGN KEY(site_id) REFERENCES sites(id));
+CREATE INDEX IF NOT EXISTS idx_camera_provisioning_appliance_status ON camera_provisioning_requests(appliance_id,status);
+'''),
     ('20260827_camera_provisioning','''
 CREATE TABLE IF NOT EXISTS camera_credentials(camera_id TEXT PRIMARY KEY,encrypted_blob TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(camera_id) REFERENCES cameras(id));
 '''),
@@ -117,6 +158,17 @@ def apply_migrations():
         for name,definition in (('device_key','TEXT'),('ip_address','TEXT'),('onvif_endpoint','TEXT'),('manufacturer','TEXT'),('model','TEXT')):
             if name not in camera_columns: db.execute(f'ALTER TABLE cameras ADD COLUMN {name} {definition}')
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_cameras_customer_device_key ON cameras(customer_id,device_key) WHERE device_key IS NOT NULL')
+        # Restored from production's 20260824_camera_discovery migration
+        # (see that migration's own comment below for the full story):
+        # production's appliance-scoped, non-unique index on the same
+        # column, created here instead of in that migration's raw SQL
+        # so it -- and the device_key column add it depends on -- never
+        # collide with this same branch's own, separately pre-existing
+        # device_key handling directly above. Both this index and the
+        # customer-scoped unique one above it coexist by design; see
+        # the migration's own comment for why that divergence is left
+        # unresolved for now.
+        db.execute('CREATE INDEX IF NOT EXISTS idx_cameras_appliance_device_key ON cameras(appliance_id,device_key)')
 
         # Billing authority for camera-level analytics entitlements:
         # how many camera-seats of this analytic the customer/site
