@@ -524,3 +524,169 @@ def test_customer_cannot_request_scan_on_another_customers_appliance(db_path, mo
         with pytest.raises(Exception) as excinfo:
             request_camera_scan(_fake_request(), "appl-2")  # belongs to cust-2
     assert getattr(excinfo.value, "status_code", None) == 404
+
+
+# ---------------------------------------------------------------- blocker #2: customer-scoped device_key identity
+#
+# appliance_submit_provisioning() used to dedup by (appliance_id,
+# device_key) -- inconsistent with provision_customer_camera()'s own
+# (customer_id, device_key) rule, and capable of violating idx_cameras_
+# customer_device_key's UNIQUE constraint outright the first time the
+# same physical camera was rediscovered via a second appliance under
+# the same customer. Fixed to dedup by (customer_id, device_key),
+# reassigning appliance_id/site_id to the job's own values on a match
+# so the camera row never points at a stale appliance after a
+# successful reprovision.
+
+
+def test_camera_moved_to_a_second_appliance_under_the_same_customer_reassigns_not_duplicates(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1")
+        # A second appliance under the SAME customer, at a genuinely
+        # different site -- _seed() itself always reuses site-{customer_id},
+        # so the second site/appliance are inserted directly here to
+        # actually exercise cross-site reassignment, not just cross-
+        # appliance-same-site.
+        conn.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES('site-cust-1-b','cust-1','Warehouse','2026-01-01')")
+        conn.execute(
+            "INSERT INTO appliances(id,customer_id,site_id,cloud_id,activation_status,online_status,created_at) "
+            "VALUES('appl-1b','cust-1','site-cust-1-b','AIC-TEST1B','activated','online','2026-01-01')"
+        )
+        conn.execute(
+            "INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES('cred-appl-1b','appl-1b',?,'2026-01-01')",
+            (password_hash("token-appl-1b"),),
+        )
+        conn.commit()
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+
+        job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-moved", "name": "Loading Dock"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
+
+        # Same physical camera, now discovered via the SECOND appliance
+        # (a different site) -- must reassign, not duplicate, and must
+        # not raise sqlite3.IntegrityError against the customer-scoped
+        # unique index.
+        job2 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1b", "device_key": "onvif-uuid-moved", "name": "Loading Dock"})
+        appliance_submit_provisioning(
+            _fake_request(_appliance_auth_headers(appliance_id="appl-1b", credential="token-appl-1b")),
+            "AIC-TEST1B", job2["job_id"], {"success": True},
+        )
+
+        conn2 = sqlite3.connect(db_path)
+        cameras = conn2.execute("SELECT appliance_id,site_id FROM cameras WHERE customer_id='cust-1' AND device_key='onvif-uuid-moved'").fetchall()
+    assert len(cameras) == 1  # no duplicate row
+    assert cameras[0][0] == "appl-1b"     # appliance_id reassigned to the new appliance
+    assert cameras[0][1] == "site-cust-1-b"  # site_id moved with it
+
+
+def test_same_device_key_under_a_different_customer_is_a_separate_camera(db_path, monkeypatch):
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1")
+        _seed(conn, customer_id="cust-2", appliance_id="appl-2", cloud_id="AIC-TEST2")
+
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity("cust-1"))
+        job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-shared", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
+
+        # A coincidentally-identical device_key under an ENTIRELY
+        # different customer/appliance -- must be allowed as its own
+        # separate camera row, never merged with cust-1's.
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity("cust-2"))
+        job2 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-2", "device_key": "onvif-uuid-shared", "name": "Front Door"})
+        appliance_submit_provisioning(
+            _fake_request(_appliance_auth_headers(appliance_id="appl-2", credential="token-appl-2")),
+            "AIC-TEST2", job2["job_id"], {"success": True},
+        )
+
+        conn2 = sqlite3.connect(db_path)
+        cameras = conn2.execute("SELECT customer_id FROM cameras WHERE device_key='onvif-uuid-shared' ORDER BY customer_id").fetchall()
+    assert [row[0] for row in cameras] == ["cust-1", "cust-2"]  # two real rows, one per customer, no collision
+
+
+def test_multiple_null_device_key_cameras_coexist_under_one_customer(db_path):
+    """The partial unique index (WHERE device_key IS NOT NULL) must
+    keep allowing multiple placeholder/pending cameras with no
+    device_key yet under the same customer -- unaffected by the
+    customer-scoping fix, since NULL never equals NULL in SQL and the
+    index itself is explicitly scoped to exclude NULL."""
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1")
+        conn.execute(
+            "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,device_key) "
+            "VALUES('cam-a','cust-1','site-cust-1','appl-1','Pending A','pending_installation','2026-01-01',NULL)"
+        )
+        conn.execute(
+            "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,device_key) "
+            "VALUES('cam-b','cust-1','site-cust-1','appl-1','Pending B','pending_installation','2026-01-01',NULL)"
+        )
+        conn.commit()  # must not raise -- two NULL device_key rows under the same customer
+        count = conn.execute("SELECT count(*) FROM cameras WHERE customer_id='cust-1' AND device_key IS NULL").fetchone()[0]
+    assert count == 2
+
+
+def _all_routes(path, method):
+    """Unlike _route() (first match only), returns every endpoint
+    registered at this exact path+method -- needed here because
+    /api/customer/cameras/provision has TWO functions registered at
+    the identical path (partner_workspace.py lines 519 and 571):
+    request_camera_provisioning (what real HTTP traffic actually
+    reaches, Starlette matching in registration order) and the later,
+    fully shadowed/unreachable provision_customer_camera. That
+    duplicate-route bug is real, pre-existing, and unrelated to this
+    fix -- flagged in the blocker #2 report, not fixed here. This
+    helper exists only so the identity-rule parity this test checks
+    can still be verified directly against provision_customer_camera's
+    own logic, bypassing the routing collision rather than being
+    silently blocked by it.
+    """
+    return [
+        r.endpoint for r in main.app.routes
+        if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or {method})
+    ]
+
+
+def test_provisioning_callback_and_customer_portal_provisioning_agree_on_identity(db_path, monkeypatch):
+    """Parity check: a camera created through the appliance-callback
+    path (appliance_submit_provisioning) is found and updated -- not
+    duplicated -- by the customer-portal path (provision_customer_
+    camera) for the same customer_id+device_key. Both routes must be
+    reading the exact same identity rule.
+
+    provision_customer_camera is called directly here (see
+    _all_routes()'s own docstring) because it is currently shadowed at
+    its own registered path by an identically-pathed earlier route --
+    a separate, pre-existing bug this test intentionally works around
+    rather than silently accepts as "cannot be tested"."""
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    matches = _all_routes("/api/customer/cameras/provision", "POST")
+    assert len(matches) == 2, "expected exactly the two known duplicate-path registrations -- update this test if that changes"
+    provision_customer_camera = matches[1]
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1")
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+
+        # 1. Appliance-callback path creates the camera first.
+        job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-parity", "name": "Back Gate"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
+
+        # 2. Customer-portal path, same customer_id+device_key -- must
+        # update the SAME row, not create a second.
+        provision_customer_camera(_fake_request(), {"device_key": "onvif-uuid-parity", "name": "Back Gate Renamed"})
+
+        conn2 = sqlite3.connect(db_path)
+        cameras = conn2.execute("SELECT name FROM cameras WHERE customer_id='cust-1' AND device_key='onvif-uuid-parity'").fetchall()
+    assert len(cameras) == 1
+    assert cameras[0][0] == "Back Gate Renamed"

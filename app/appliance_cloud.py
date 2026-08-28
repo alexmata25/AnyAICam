@@ -522,14 +522,34 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         now=datetime.now().isoformat(); camera_id=None
         with connection() as db:
             if success:
-                # device_key is scoped to this one appliance, matching the
-                # tenancy every other camera-facing route already enforces
-                # -- a discovered device from one customer's appliance can
-                # never collide with or attach to another tenant's camera.
-                existing=db.execute('SELECT id FROM cameras WHERE appliance_id=? AND device_key=?',(appliance['id'],job['device_key'])).fetchone()
+                # device_key identifies the physical camera itself (its
+                # ONVIF endpoint reference UUID), not an appliance-camera
+                # relationship -- scoped to customer_id, matching
+                # partner_workspace.py's provision_customer_camera(),
+                # which this route must stay consistent with (see the
+                # blocker #2 investigation this fixes: the two routes
+                # previously disagreed, and an appliance-scoped duplicate
+                # here could violate idx_cameras_customer_device_key's
+                # UNIQUE constraint outright). A device_key is still never
+                # looked up outside this one customer -- a discovered
+                # device from one customer's appliance can never collide
+                # with or attach to another tenant's camera.
+                existing=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
                 if existing:
+                    # The same physical camera, rediscovered -- possibly
+                    # via a different appliance than whichever one last
+                    # provisioned it (moved to a new site, or simply
+                    # re-scanned from a second appliance that can also
+                    # see it). appliance_id and site_id are reassigned to
+                    # this job's own values so the camera row always
+                    # reflects where it was MOST RECENTLY actually seen,
+                    # never left pointing at a stale appliance/site after
+                    # a successful reprovision.
                     camera_id=existing['id']
-                    db.execute("UPDATE cameras SET name=?,status='configured' WHERE id=?",(job['camera_name'],camera_id))
+                    db.execute(
+                        "UPDATE cameras SET name=?,appliance_id=?,site_id=?,status='configured' WHERE id=?",
+                        (job['camera_name'],appliance['id'],job['site_id'],camera_id),
+                    )
                 else:
                     camera_id=secrets.token_hex(5)
                     db.execute(
