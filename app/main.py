@@ -40377,7 +40377,17 @@ async def authentication_middleware(request: Request, call_next):
 
     next_url = quote(path + (f"?{request.url.query}" if request.url.query else ""), safe="/?=&")
 
-
+    # A request whose path belongs to the customer-facing surface
+    # belongs on the customer-facing login page when unauthenticated,
+    # never the legacy local-emergency-recovery /login -- confirmed live
+    # on Samsung: an unauthenticated (or session-revoked) real
+    # customer_owner request to /customer/cameras/{id}/live landed on
+    # /login?next=..., not /customer-login.html. Every non-customer
+    # protected path (admin/partner/legacy/unknown) keeps the exact
+    # prior /login fallback -- this only adds a second, narrower branch,
+    # it never changes who is or isn't authenticated.
+    if path.startswith("/customer"):
+        return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
 
 
 

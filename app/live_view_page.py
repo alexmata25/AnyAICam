@@ -32,6 +32,7 @@ import json
 from datetime import datetime
 from html import escape
 from typing import Callable
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -764,7 +765,26 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         # customer_viewer who reaches this page for a camera they're not
         # granted can_live on gets a real 403 from those routes, not a
         # silently-broken page.
-        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+        #
+        # A genuinely unauthenticated visitor (no identity at all) belongs
+        # on the customer-facing login page, not /partner-login, and never
+        # the legacy local-emergency-recovery /login -- that redirect only
+        # ever comes from authentication_middleware's own fallback in
+        # main.py, which this route reaching its own body at all means it
+        # already passed; this check is this route's own, independent
+        # second guard, not a rescue from that middleware. next preserves
+        # the intended destination for a future customer-login-page
+        # enhancement to honor -- not consumed there yet, but harmless to
+        # carry now. A recognized identity with the WRONG role (partner/
+        # administrator navigating here) keeps the exact prior behavior --
+        # /partner-login bounces them to their own portal via
+        # partner_login()'s own already-authenticated redirect --
+        # deliberately unchanged so admin/partner authorization elsewhere
+        # is never weakened by this fix.
+        if not identity:
+            next_url = quote(f'/customer/cameras/{camera_id}/live', safe='')
+            return RedirectResponse(f'/customer-login.html?next={next_url}', status_code=303)
+        if identity.get('role') not in {'customer_owner', 'customer_viewer'}:
             return RedirectResponse('/partner-login', status_code=303)
 
         with connection() as db:
