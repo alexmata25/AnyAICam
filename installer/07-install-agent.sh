@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
-# Wraps the existing, already-validated appliance-agent installer
-# rather than reimplementing it. That script already handles the
-# anyaicam user, its own venv/package install, and its own
-# create-only-if-absent agent.env -- nothing here duplicates that.
-#
-# One OS-level prerequisite that script assumes but does not itself
-# install: python3.12-venv, which provides the ensurepip support its
-# `python3 -m venv` call needs. Not present on a fresh Ubuntu 24.04
-# cloud image -- confirmed by reading appliance-agent/scripts/install.sh
-# end-to-end: `useradd`, `install`, `chmod`, `chown`, `python3 -m venv`,
-# pip, and `systemctl` are its only OS-level touchpoints, and all but
-# the venv module are already present on any base Ubuntu install.
-# Installed here, in the reconstructed wrapper, rather than patching
-# the reused script.
+# Install the appliance agent from the payload embedded with this installer
+# source commit. No surrounding repository checkout is required.
 
 install_agent() {
     local state="$1"
     log "Installing python3.12-venv prerequisite for the appliance agent..."
     apt-get update -y
-    apt-get install -y python3.12-venv
+    apt-get install -y python3.12-venv rsync
+
+    [[ -f "$AGENT_PAYLOAD_DIR/scripts/install.sh" ]] || {
+        echo "[ERROR] Built appliance-agent payload is missing." >&2
+        return 1
+    }
+
+    # Keep an installed source copy so uninstall/repair remains self-contained
+    # even if the user deletes the downloaded installer archive afterward.
+    install -d -m 0755 -o root -g root "$AGENT_SOURCE_ROOT"
+    rsync -a --delete "$AGENT_PAYLOAD_DIR/" "$AGENT_SOURCE_ROOT/"
+
     log "Installing appliance-agent control-plane package..."
-    bash "$REPO_ROOT/appliance-agent/scripts/install.sh"
+    bash "$AGENT_SOURCE_ROOT/scripts/install.sh"
     if [[ "$state" == "clean" ]]; then
         log "Appliance agent installed (clean install)."
     else
-        log "Appliance agent verified/updated (existing install) -- agent.env untouched (install.sh only ever creates it if absent)."
+        log "Appliance agent verified/updated; agent.env preserved."
     fi
 }
