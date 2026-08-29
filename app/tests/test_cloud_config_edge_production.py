@@ -182,5 +182,54 @@ class EdgeProductionProfileTests(unittest.TestCase):
         _edge_production(app_secrets=[INSTALLER_GENERATED_SECRET]).validate()  # must not raise
 
 
+class EffectiveTrustedHostsTests(unittest.TestCase):
+    """Confirmed live on Samsung: TrustedHostMiddleware (main.py) rejected
+    the appliance's own Tailscale address with "Invalid host header",
+    because ANYAICAM_TRUSTED_HOSTS was never set by the installer and the
+    untouched default (localhost/127.0.0.1/testserver) matches no LAN/
+    Tailscale address an operator actually connects through. No appliance
+    IP appears anywhere below -- the fix is structural, not a Samsung-
+    specific allowlist entry."""
+
+    def test_edge_production_with_untouched_default_disables_host_matching(self):
+        # This is the exact fix: a fresh edge install that never set
+        # ANYAICAM_TRUSTED_HOSTS gets Starlette's own "*" wildcard,
+        # which accepts any Host header -- the appliance's LAN IP,
+        # its Tailscale IP, a .local mDNS name, anything.
+        self.assertEqual(_edge_production().effective_trusted_hosts, ["*"])
+
+    def test_cloud_production_with_untouched_default_is_unaffected(self):
+        # Must stay exactly as strict as before this fix -- cloud has a
+        # single fixed public domain and real Host-header validation
+        # value, unlike an edge appliance.
+        self.assertEqual(
+            _cloud_production().effective_trusted_hosts,
+            ["localhost", "127.0.0.1", "testserver"],
+        )
+
+    def test_edge_production_honors_an_explicit_override(self):
+        # An operator who explicitly configures ANYAICAM_TRUSTED_HOSTS on
+        # an edge appliance (e.g. to lock it down to one known hostname)
+        # is never silently overridden by the wildcard.
+        self.assertEqual(
+            _edge_production(trusted_hosts=["vms.internal.example"]).effective_trusted_hosts,
+            ["vms.internal.example"],
+        )
+
+    def test_cloud_production_honors_an_explicit_override(self):
+        self.assertEqual(
+            _cloud_production(trusted_hosts=["portal.anyaicam.com"]).effective_trusted_hosts,
+            ["portal.anyaicam.com"],
+        )
+
+    def test_staging_is_unaffected_regardless_of_runtime_role(self):
+        # edge_production scopes strictly to production (see its own
+        # docstring) -- staging must never get the wildcard.
+        self.assertEqual(
+            Settings(environment="staging", runtime_role="edge").effective_trusted_hosts,
+            ["localhost", "127.0.0.1", "testserver"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

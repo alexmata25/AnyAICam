@@ -40032,7 +40032,7 @@ if cloud_settings.deployed:
 
 
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=cloud_settings.trusted_hosts)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=cloud_settings.effective_trusted_hosts)
 
 
 

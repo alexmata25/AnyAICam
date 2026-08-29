@@ -16,6 +16,17 @@ def _int(name, default):
         return default
 
 
+# The exact untouched default trusted_hosts resolves to below. Compared
+# by value (never by re-reading os.environ) so Settings.effective_
+# trusted_hosts stays fully driven by constructor arguments in tests,
+# matching every other property on this class -- an operator who
+# explicitly configures ANYAICAM_TRUSTED_HOSTS to this same literal list
+# is indistinguishable from -- and treated identically to -- never having
+# set it at all, which is fine: both mean "no real restriction was ever
+# configured."
+_DEFAULT_TRUSTED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ANYAICAM_ENV", "development").lower()
@@ -187,6 +198,38 @@ class Settings:
         profile). Staging is deliberately unaffected by runtime_role --
         this scopes strictly to production, matching the actual ask."""
         return self.production and self.runtime_role == "edge"
+
+    @property
+    def effective_trusted_hosts(self):
+        """The value actually passed to TrustedHostMiddleware (main.py).
+
+        Cloud/combined production has a single, fixed public domain it is
+        meant to serve exclusively -- Host-header validation there is a
+        real, load-bearing security check and stays completely unchanged,
+        whether trusted_hosts is left at its default or explicitly
+        configured.
+
+        An edge appliance has no such fixed address: it's reached over
+        whatever LAN IP or Tailscale address DHCP/Tailscale happens to
+        assign it, which can't be enumerated at install time the way a
+        cloud domain can. Confirmed live on Samsung: the installer's own
+        ANYAICAM_ENV=production stamp (this session's earlier fix) made
+        TrustedHostMiddleware start rejecting the appliance's real
+        Tailscale address with "Invalid host header", because
+        ANYAICAM_TRUSTED_HOSTS was never set and the default
+        (localhost/127.0.0.1/testserver) matches nothing an operator
+        actually connects through. For edge_production specifically, with
+        trusted_hosts still at that exact untouched default, this returns
+        Starlette's own "*" sentinel, which disables host-header matching
+        entirely -- the same private-LAN/Tailscale trust boundary
+        edge_production already relies on for its other exemptions (see
+        its own docstring above). The moment an operator sets
+        ANYAICAM_TRUSTED_HOSTS to anything else -- on an edge appliance or
+        otherwise -- that explicit value is honored exactly as configured,
+        never silently widened."""
+        if self.edge_production and self.trusted_hosts == _DEFAULT_TRUSTED_HOSTS:
+            return ["*"]
+        return self.trusted_hosts
 
     @property
     def partner_login_url(self):
