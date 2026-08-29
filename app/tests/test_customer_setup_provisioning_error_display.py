@@ -92,11 +92,14 @@ def test_provisioning_failure_shows_a_persistent_error_not_only_a_toast(http_cli
 def test_provisioning_network_or_parse_failure_is_also_surfaced(http_client, db_path):
     """A non-JSON/network-level failure (fetch or response.json() itself
     throwing) must not silently vanish as an unhandled promise
-    rejection -- caught and routed through the same visible error path."""
+    rejection -- caught and routed through the same visible error path.
+    Also resets the button back to a retryable state (see
+    test_customer_setup_provisioning_retry_state.py), matching a later
+    async 'failed' outcome's own recovery behavior."""
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     body = response.text
     assert "try{response=await fetch('/api/customer/cameras/provision'" in body
-    assert "}catch(error){return showProvisioningError(" in body
+    assert "catch(error){button.disabled=false;button.textContent='Add this camera';return showProvisioningError(" in body
 
 
 def test_provisioning_error_message_never_carries_credential_fields(http_client, db_path):
@@ -108,10 +111,16 @@ def test_provisioning_error_message_never_carries_credential_fields(http_client,
     mentions `username`/`password` earlier, when building the request)."""
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     body = response.text
-    error_call_start = body.index("if(!response.ok)return showProvisioningError(")
-    error_call_statement = body[error_call_start:body.index(";", error_call_start)]
-    assert "username" not in error_call_statement
-    assert "password" not in error_call_statement
+    # Asserted as one exact, complete statement (not a truncated slice)
+    # so this test itself is proof the statement contains neither field.
+    expected_statement = (
+        "if(!response.ok){button.disabled=false;button.textContent='Add this camera';"
+        "return showProvisioningError(r.detail||`The camera could not be added "
+        "(error ${response.status}). Try again or contact support.`)}"
+    )
+    assert "username" not in expected_statement
+    assert "password" not in expected_statement
+    assert expected_statement in body
 
 
 def test_successful_provisioning_still_clears_any_prior_error_styling(http_client, db_path):
