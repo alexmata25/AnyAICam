@@ -19,6 +19,7 @@ so even a caller mistake here can't leak them to the cloud.
 import base64
 import hashlib
 import re
+import secrets
 import socket
 
 from .discovery import scan
@@ -86,23 +87,85 @@ def _rtsp_options(ip, port, path='/', username=None, password=None, digest=None,
     return _rtsp_request('OPTIONS', ip, port, path, username, password, digest, timeout)
 
 
-def _digest_header(username, password, realm, nonce, method, uri):
+# RFC 2617 challenge parameters can be quoted (realm="x") or unquoted
+# (algorithm=MD5) -- real camera firmware uses both forms, sometimes in
+# the same challenge. Matches either: a quoted value (group 2) or a
+# bare token up to the next comma/whitespace (group 3).
+_CHALLENGE_PARAM_RE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*(?:"([^"]*)"|([^\s,]+))')
+
+
+def _parse_challenge_params(challenge):
+    """Parses the parameters following the scheme name in a
+    WWW-Authenticate header (realm, nonce, qop, algorithm, opaque, ...)
+    into a plain dict, keyed lower-case. Handles both quoted and
+    unquoted parameter forms safely -- a value that fails to match
+    either form is simply absent from the result, never raises."""
+    params = {}
+    for match in _CHALLENGE_PARAM_RE.finditer(challenge):
+        key = match.group(1).lower()
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        params[key] = value
+    return params
+
+
+def _select_qop(qop_value):
+    """RFC 2617 qop may list multiple space-or-comma-separated options
+    (e.g. `qop="auth,auth-int"`); this client implements only 'auth'
+    (message-integrity/'auth-int' would additionally require hashing
+    the request body, never needed for the bodyless DESCRIBE requests
+    this module ever sends). Returns 'auth' when it's among the
+    offered options, else None -- including when qop_value is falsy,
+    which the caller treats identically to "no qop offered at all"
+    (the legacy, pre-RFC-2617 Digest fallback)."""
+    if not qop_value:
+        return None
+    options = [item.strip().lower() for item in qop_value.replace(',', ' ').split()]
+    return 'auth' if 'auth' in options else None
+
+
+def _digest_header(username, password, realm, nonce, method, uri, qop=None, cnonce=None, nc='00000001'):
+    """Builds a WWW-Authenticate: Digest response. With qop=None,
+    computes the legacy (pre-RFC-2617 / RFC 2069) formula --
+    response=MD5(HA1:nonce:HA2) -- preserved unchanged for older
+    cameras that challenge without a qop parameter at all. With
+    qop='auth' (the only qop this client supports -- see
+    _select_qop()), computes the RFC 2617 qop-aware formula --
+    response=MD5(HA1:nonce:nc:cnonce:qop:HA2) -- and includes qop
+    (unquoted, per RFC 2617), nc, and cnonce in the returned header,
+    which many cameras (including the one that prompted this fix)
+    require and silently reject a response missing them, regardless of
+    whether the password itself is correct."""
     ha1 = hashlib.md5(f'{username}:{realm}:{password}'.encode()).hexdigest()
     ha2 = hashlib.md5(f'{method}:{uri}'.encode()).hexdigest()
+    if qop:
+        response = hashlib.md5(f'{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}'.encode()).hexdigest()
+        return (f'Digest username="{username}", realm="{realm}", nonce="{nonce}", '
+                f'uri="{uri}", qop={qop}, nc={nc}, cnonce="{cnonce}", response="{response}"')
     response = hashlib.md5(f'{ha1}:{nonce}:{ha2}'.encode()).hexdigest()
     return (f'Digest username="{username}", realm="{realm}", nonce="{nonce}", '
             f'uri="{uri}", response="{response}"')
 
 
-# Four distinguishable outcomes classify_rtsp_authentication() can
+# Six distinguishable outcomes classify_rtsp_authentication() can
 # return -- plain string literals, matching this codebase's existing
 # convention for status values (see discovery.py's connection_status,
 # camera_scan_jobs.status, etc.) rather than introducing an enum type
-# not used anywhere else in this module.
+# not used anywhere else in this module. UNSUPPORTED_CHALLENGE and
+# MALFORMED_RESPONSE were split out of what used to be a single
+# overloaded UNREACHABLE bucket -- confirmed live (Samsung, camera
+# device_key ...f6af) that a qop="auth" Digest challenge was being
+# answered with the legacy, qop-less formula, which the camera
+# correctly rejected as an invalid response regardless of the password
+# -- indistinguishable, before this fix, from an actually wrong
+# password. Both new states still count as "not verified as correct"
+# in verify_rtsp_credentials()'s ok/not-ok wrapper (failing closed,
+# same as before) while letting the caller's message explain *why*.
 UNREACHABLE = 'unreachable'
 NO_AUTH_REQUIRED = 'no_auth_required'
 AUTH_CORRECT = 'auth_correct'
 AUTH_INCORRECT = 'auth_incorrect'
+UNSUPPORTED_CHALLENGE = 'unsupported_challenge'
+MALFORMED_RESPONSE = 'malformed_response'
 
 
 def classify_rtsp_authentication(ip, port, username, password, path='/', timeout=3):
@@ -113,50 +176,81 @@ def classify_rtsp_authentication(ip, port, username, password, path='/', timeout
     still requires credentials, so OPTIONS alone cannot verify a
     credential is correct, only that *something* is listening.
 
-    Returns (status, detail), distinguishing all four real outcomes:
-      - UNREACHABLE: connection failed, or the device gave a response
-        this client can't interpret as authenticating anything.
+    Returns (status, detail), distinguishing all six real outcomes:
+      - UNREACHABLE: a real connection/timeout failure (socket-level
+        OSError) talking to the device at all.
       - NO_AUTH_REQUIRED: DESCRIBE succeeded without ever being
         challenged -- this device's media session has no credential
         gate to verify.
       - AUTH_CORRECT: the device challenged (401 + WWW-Authenticate),
-        and the supplied credentials were accepted on retry.
-      - AUTH_INCORRECT: the device challenged, and the supplied
-        credentials were rejected on retry -- or the device requires
-        auth but none was supplied at all, which is equally "not
-        verified as correct".
-    detail is always a secret-free, human-readable string, never the
-    credentials or a raw device response. Never reports AUTH_CORRECT
-    without a real 200 from the device on the authenticated retry."""
+        and the supplied credentials were accepted on retry (a real
+        200 from the device -- never reported without one).
+      - AUTH_INCORRECT: the challenge was fully understood and
+        answered per protocol, but the device still rejected it (401
+        again) on retry -- or the device requires auth but no
+        credentials were supplied at all. This is the only state that
+        should ever be read as "the password is (probably) wrong."
+      - UNSUPPORTED_CHALLENGE: the device's challenge uses a scheme,
+        Digest algorithm, or qop option this client doesn't implement
+        (e.g. Digest with only qop="auth-int" offered, or a non-MD5
+        algorithm) -- fails closed (never verified as correct) without
+        ever claiming the credentials themselves were wrong.
+      - MALFORMED_RESPONSE: the device responded, but with something
+        that can't be interpreted as authenticating anything at all
+        (a 401 with no challenge header, an unparseable Digest missing
+        realm/nonce, or an unexpected status code on either request).
+    detail is always a secret-free, human-readable string -- never a
+    credential, an Authorization header, a nonce/cnonce, or the raw
+    device response. Never reports AUTH_CORRECT without a real 200
+    from the device on the authenticated retry."""
     try:
         code, challenge = _rtsp_request('DESCRIBE', ip, port, path, timeout=timeout)
     except OSError as error:
         return UNREACHABLE, f'Device unreachable: {error.__class__.__name__}'
     if code == 200:
         return NO_AUTH_REQUIRED, 'Device accepted DESCRIBE without credentials.'
-    if code != 401 or not challenge:
-        return UNREACHABLE, f'Unexpected device response (RTSP {code or "no response"}).'
+    if code != 401:
+        return MALFORMED_RESPONSE, f'Unexpected device response (RTSP {code or "no response"}).'
+    if not challenge:
+        return MALFORMED_RESPONSE, 'Device returned 401 without an authentication challenge.'
     if not username and not password:
         return AUTH_INCORRECT, 'Device requires authentication but no credentials were provided.'
-    if 'digest' in challenge.lower():
-        realm_match = re.search(r'realm="([^"]+)"', challenge)
-        nonce_match = re.search(r'nonce="([^"]+)"', challenge)
-        if not (realm_match and nonce_match):
-            return UNREACHABLE, 'Device sent an unparseable Digest challenge.'
+    scheme_word = challenge.split(None, 1)[0] if challenge.split() else ''
+    scheme = scheme_word.lower()
+    if scheme == 'basic':
+        digest = None
+    elif scheme == 'digest':
+        params = _parse_challenge_params(challenge)
+        realm = params.get('realm')
+        nonce = params.get('nonce')
+        if not realm or not nonce:
+            return UNSUPPORTED_CHALLENGE, 'Device sent a Digest challenge missing realm or nonce.'
+        algorithm = (params.get('algorithm') or 'MD5').strip()
+        if algorithm.upper() != 'MD5':
+            return UNSUPPORTED_CHALLENGE, f'Device requires an unsupported Digest algorithm ({algorithm}).'
+        qop_raw = params.get('qop')
+        qop = _select_qop(qop_raw)
+        if qop_raw and qop is None:
+            return UNSUPPORTED_CHALLENGE, 'Device only offers unsupported qop options (no "auth").'
         uri = f'rtsp://{ip}:{port}{path}'
-        digest = _digest_header(username, password, realm_match.group(1), nonce_match.group(1), 'DESCRIBE', uri)
-        try:
-            code2, _ = _rtsp_request('DESCRIBE', ip, port, path, digest=digest, timeout=timeout)
-        except OSError as error:
-            return UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}'
+        if qop:
+            digest = _digest_header(username, password, realm, nonce, 'DESCRIBE', uri, qop=qop, cnonce=secrets.token_hex(8), nc='00000001')
+        else:
+            digest = _digest_header(username, password, realm, nonce, 'DESCRIBE', uri)
     else:
-        try:
+        return UNSUPPORTED_CHALLENGE, f'Device sent an unsupported authentication scheme ({scheme_word or "unknown"}).'
+    try:
+        if digest:
+            code2, _ = _rtsp_request('DESCRIBE', ip, port, path, digest=digest, timeout=timeout)
+        else:
             code2, _ = _rtsp_request('DESCRIBE', ip, port, path, username=username, password=password, timeout=timeout)
-        except OSError as error:
-            return UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}'
+    except OSError as error:
+        return UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}'
     if code2 == 200:
         return AUTH_CORRECT, 'Credentials verified against the device via DESCRIBE.'
-    return AUTH_INCORRECT, 'Device rejected the provided credentials.'
+    if code2 == 401:
+        return AUTH_INCORRECT, 'Device rejected the provided credentials.'
+    return MALFORMED_RESPONSE, f'Unexpected device response on authenticated retry (RTSP {code2 or "no response"}).'
 
 
 def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):
@@ -166,9 +260,15 @@ def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):
     payload and this module's callers depend on unchanged). ok is True
     for both NO_AUTH_REQUIRED and AUTH_CORRECT -- either way the device
     is reachable and accepting this camera's entry, which is everything
-    provisioning itself has ever needed to know; UNREACHABLE and
-    AUTH_INCORRECT are both False. Use classify_rtsp_authentication()
-    directly when the specific state (not just pass/fail) matters."""
+    provisioning itself has ever needed to know; every other state
+    (UNREACHABLE, AUTH_INCORRECT, UNSUPPORTED_CHALLENGE,
+    MALFORMED_RESPONSE) is False -- failing closed the same way
+    regardless of which of those four applies. Use
+    classify_rtsp_authentication() directly when the specific state
+    (not just pass/fail) matters, e.g. to tell a customer their
+    password is probably wrong (AUTH_INCORRECT) apart from a device/
+    protocol-level problem this client can't verify through at all
+    (the other three)."""
     status, detail = classify_rtsp_authentication(ip, port, username, password, path, timeout)
     return status in (NO_AUTH_REQUIRED, AUTH_CORRECT), detail
 
