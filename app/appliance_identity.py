@@ -50,6 +50,21 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from cryptography.exceptions import InvalidSignature
 
 SCOPE_TYPES = {"global", "partner", "customer", "site", "appliance"}
+
+# authenticate_operator() below picks the first entry of its sorted
+# "matching" grants list once more than one grant satisfies the
+# requested portal bucket for the same account -- broadest scope first,
+# so a user who legitimately holds both a broad and a narrower grant for
+# the same role/portal (e.g. a true global administrator who is also
+# explicitly the administrator of one specific partner) always gets
+# their broadest applicable view, never an arbitrary one that happens to
+# depend on identity_grants row insertion order (SQLite makes no
+# ordering guarantee without an explicit ORDER BY). Found live: once
+# bootstrap_admin() (partner_db.py) started creating its own scope_type=
+# 'partner' grant, an account that ALSO held an explicit scope_type=
+# 'global' grant for the same role could be routed to the narrower
+# partner view purely because its grant happened to be inserted first.
+SCOPE_BREADTH_ORDER = {"global": 0, "partner": 1, "customer": 2, "site": 3, "appliance": 4}
 GRANTABLE_ROLES = {"administrator", "partner_owner", "salesperson", "technician", "customer_owner", "customer_viewer"}
 PORTAL_BUCKETS = {
     "administrator": {"administrator"},
@@ -532,11 +547,14 @@ def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_i
     grants = [dict(row) for row in db.execute(
         "SELECT role,scope_type,scope_id FROM identity_grants WHERE user_id=? AND revoked_at IS NULL", (user["id"],),
     ).fetchall()]
-    matching = [
-        grant for grant in grants
-        if portal_bucket_matches(grant["role"], portal)
-        and grant_resolves(scope_type=grant["scope_type"], scope_id=grant.get("scope_id"), partner_id=appliance["partner_id"], customer_id=appliance["customer_id"], site_id=appliance["site_id"], cloud_id=appliance["cloud_id"])
-    ]
+    matching = sorted(
+        (
+            grant for grant in grants
+            if portal_bucket_matches(grant["role"], portal)
+            and grant_resolves(scope_type=grant["scope_type"], scope_id=grant.get("scope_id"), partner_id=appliance["partner_id"], customer_id=appliance["customer_id"], site_id=appliance["site_id"], cloud_id=appliance["cloud_id"])
+        ),
+        key=lambda grant: SCOPE_BREADTH_ORDER.get(grant["scope_type"], len(SCOPE_BREADTH_ORDER)),
+    )
     if not matching:
         # Distinguish "wrong portal for this account" from "no access to
         # this appliance at all" the same way resolve_portal_login()
@@ -545,7 +563,7 @@ def authenticate_operator(db, *, email: str, password: str, portal: str, cloud_i
         any_portal_grant = any(grant_resolves(scope_type=g["scope_type"], scope_id=g.get("scope_id"), partner_id=appliance["partner_id"], customer_id=appliance["customer_id"], site_id=appliance["site_id"], cloud_id=appliance["cloud_id"]) for g in grants)
         return {"status": "denied", "reason": "not_authorized_for_selected_portal" if any_portal_grant else "not_authorized_for_this_appliance"}
 
-    grant = matching[0]
+    grant = matching[0]  # broadest scope first -- see SCOPE_BREADTH_ORDER's own comment
     now = datetime.now()
     assertion = {
         "user_id": user["id"], "email": user["email"], "role": grant["role"],

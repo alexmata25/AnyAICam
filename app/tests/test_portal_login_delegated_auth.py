@@ -132,6 +132,28 @@ def test_configured_instance_technician_selector_reaches_appliance_dashboard(htt
     assert response.headers["location"] == "/partner/appliance-dashboard"
 
 
+def test_broader_grant_wins_regardless_of_which_one_was_created_first(http_client, monkeypatch):
+    # Found live: bootstrap_admin() (partner_db.py) creating its own
+    # scope_type='partner' administrator grant meant an account that
+    # ALSO held an explicit scope_type='global' administrator grant
+    # could be routed to the narrower partner view purely because its
+    # grant happened to be inserted first -- identity_grants carries no
+    # ordering guarantee. authenticate_operator() must always prefer the
+    # broadest applicable grant, not whichever sorts first by insertion.
+    client, db_path = http_client
+    # scope_type='partner' created FIRST (matches the exact regression:
+    # bootstrap_admin() runs before any later explicit grant exists).
+    _seed_appliance_and_operator(db_path, role="administrator", scope_type="partner", scope_id="partner-1")
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            appliance_identity.create_grant(db, user_id="u-self", role="administrator", scope_type="global", scope_id=None, granted_by="test")
+    _configure_own_appliance(monkeypatch)
+
+    response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin-portal"  # the global grant, not /partner?tab=customers
+
+
 # =============================================================== new offline login denied while cloud unavailable
 
 

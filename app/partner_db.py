@@ -156,13 +156,84 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def bootstrap_admin() -> None:
+    """TEMPORARY LOCAL BOOTSTRAP PATH -- validation/emergency-access
+    scaffolding only, not the production onboarding design. The real
+    first-identity flow will come from the website -> AWS -> VMS
+    pipeline; when that lands, this function (and its ANYAICAM_ADMIN_
+    EMAIL/ANYAICAM_ADMIN_PASSWORD env vars) should be removed cleanly
+    rather than left running alongside it as a second, parallel
+    authentication path.
+
+    Confirmed live on Samsung: a bootstrap admin created before this
+    fix could log in fine right up until its own appliance activated --
+    at that exact point POST /api/portal-login (main.py) switches from
+    the simple local password check (partner_db.authenticate_detailed())
+    to the cloud-delegated one (appliance_identity.authenticate_operator()),
+    which requires a live identity_grants row resolving to the activated
+    appliance's scope, not just a correct password. This account never
+    had one, so every login attempt failed with a generic "Invalid email
+    or password" regardless of how many times the password was reset.
+
+    scope_type='partner' is the deliberate, documented broad-reach case
+    in this grant model (see grant_resolves()'s own docstring) -- it
+    resolves to every appliance under this partner_id, which is exactly
+    right for the one primary administrator account and not an over-
+    broad 'global' grant or a fabricated customer/site scope. Checking
+    for an existing live (revoked_at IS NULL) match before creating one
+    makes this idempotent: rerunning bootstrap_admin() (it runs on every
+    initialize_database() call, i.e. every container start) never
+    creates a duplicate grant, and an admin that already has the correct
+    grant is left completely untouched."""
     email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower(); password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
     if not email or not password: return
     now=datetime.now().isoformat(); partner_id='anyaicam-primary'
     with database_connect() as db:
         db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
         existing=db.execute('SELECT id FROM partner_users WHERE email=?',(email,)).fetchone()
-        if not existing: db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(secrets.token_hex(5),partner_id,email,'Administrator','administrator',password_hash(password),now))
+        if existing: user_id=existing['id']
+        else:
+            user_id=secrets.token_hex(5)
+            db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
+        has_grant=db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND scope_id=? AND revoked_at IS NULL",(user_id,partner_id)).fetchone()
+        if not has_grant:
+            from appliance_identity import create_grant
+            create_grant(db,user_id=user_id,role='administrator',scope_type='partner',scope_id=partner_id,granted_by='system:bootstrap_admin',now=now)
+
+
+class FirstAdminAlreadyExists(Exception):
+    """Raised by create_first_admin() when at least one partner_users
+    row already exists. The web setup path (partner_portal.py's
+    GET/POST /setup) is the only caller -- it must never create a
+    second bootstrap admin once any account exists, on a genuinely
+    fresh install (RUNTIME_ROLE=edge, no ANYAICAM_ADMIN_EMAIL/PASSWORD
+    env vars set) where bootstrap_admin() above never ran."""
+
+
+def create_first_admin(email: str, password: str) -> str:
+    """The interactive counterpart to bootstrap_admin() above: the
+    operator enters the email/password themselves, once, through the
+    browser (see partner_portal.py's /setup), instead of an operator
+    having to set ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD in the
+    server environment (which would otherwise be the ONLY way to seed
+    a first identity on a fresh edge appliance -- and would mean the
+    plaintext password sitting in a persistent env file, exactly what
+    this function exists to avoid). password_hash() runs immediately;
+    the plaintext is never written anywhere, not even transiently to a
+    file. The "does an admin already exist" check happens INSIDE this
+    same connection/transaction, immediately before the insert -- not
+    only at the caller's earlier GET-time check -- so this can never
+    create a second admin even under a race between two concurrent
+    attempts hitting the endpoint at once. Raises FirstAdminAlreadyExists
+    (never silently no-ops, and never overwrites anything) if any
+    partner_users row already exists. Returns the new user's id."""
+    now=datetime.now().isoformat(); partner_id='anyaicam-primary'
+    with connection() as db:
+        if db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None:
+            raise FirstAdminAlreadyExists('An administrator account already exists.')
+        db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
+        user_id=secrets.token_hex(5)
+        db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
+    return user_id
 
 
 def authenticate(email: str,password: str):
