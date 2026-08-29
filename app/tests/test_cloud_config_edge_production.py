@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cloud_config import Settings  # noqa: E402
+from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
 
 STRONG_SECRET = "a" * 40  # >=32 chars, not one of the known default/placeholder values
@@ -229,6 +230,64 @@ class EffectiveTrustedHostsTests(unittest.TestCase):
             Settings(environment="staging", runtime_role="edge").effective_trusted_hosts,
             ["localhost", "127.0.0.1", "testserver"],
         )
+
+
+class TrustedHostMiddlewareIntegrationTests(unittest.TestCase):
+    """Exercises the real Starlette TrustedHostMiddleware class -- the same
+    one main.py registers -- against Settings.effective_trusted_hosts,
+    with concrete host strings, rather than just asserting the computed
+    property value in isolation. Confirmed live: both a Tailscale address
+    (100.123.115.65) and the Samsung box's plain LAN address
+    (192.168.0.165) were rejected identically before this fix, proving it
+    was never Tailscale-specific -- neither address is hard-coded into
+    the fix or these tests; they stand in for "any real edge access
+    address", which is the actual thing being fixed."""
+
+    @staticmethod
+    def _make_client(trusted_hosts):
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        async def homepage(request):
+            return PlainTextResponse("ok")
+
+        app = Starlette(routes=[Route("/", homepage)])
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+        return TestClient(app)
+
+    def test_edge_production_accepts_a_lan_ip_host(self):
+        client = self._make_client(_edge_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "192.168.0.165:8000"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_edge_production_accepts_a_tailscale_ip_host(self):
+        client = self._make_client(_edge_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "100.123.115.65:8000"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_edge_production_accepts_an_mdns_local_hostname(self):
+        # A third, unrelated address style -- proves the fix is not
+        # scoped to IP addresses at all, let alone one specific IP.
+        client = self._make_client(_edge_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "anyaicam-appliance.local:8000"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_cloud_production_still_rejects_an_arbitrary_lan_looking_host(self):
+        # The exact regression this fix must never cause: cloud/AWS
+        # production must keep rejecting a host it never configured,
+        # even one that looks like a legitimate edge LAN address.
+        client = self._make_client(_cloud_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "192.168.0.165:8000"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cloud_production_accepts_its_own_configured_domain(self):
+        client = self._make_client(
+            _cloud_production(trusted_hosts=["portal.anyaicam.com"]).effective_trusted_hosts
+        )
+        resp = client.get("/", headers={"Host": "portal.anyaicam.com"})
+        self.assertEqual(resp.status_code, 200)
 
 
 if __name__ == "__main__":
