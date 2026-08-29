@@ -36,6 +36,11 @@ from cloud_config import Settings  # noqa: E402
 STRONG_SECRET = "a" * 40  # >=32 chars, not one of the known default/placeholder values
 WEAK_SECRET = "local-development-secret-change-me"
 
+# Exact shape 06-deploy-vms.sh's ensure_vms_env() actually generates:
+# `head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'` -- 64 lowercase
+# hex characters (32 bytes / 256 bits of entropy).
+INSTALLER_GENERATED_SECRET = "4f" * 32
+
 HTTPS_URL_KWARGS = dict(
     public_portal_url="https://portal.example.test",
     appliance_api_url="https://api.example.test",
@@ -168,6 +173,13 @@ class EdgeProductionProfileTests(unittest.TestCase):
     def test_edge_production_property_is_false_for_cloud_runtime_role(self):
         self.assertFalse(Settings(environment="production", runtime_role="cloud").edge_production)
         self.assertFalse(Settings(environment="production", runtime_role="combined").edge_production)
+
+    def test_edge_production_startup_passes_with_the_installers_own_generated_secret(self):
+        # Bridges the two fixes: the exact secret shape
+        # 06-deploy-vms.sh's ensure_vms_env() now auto-generates must
+        # itself satisfy this validation on a real edge appliance --
+        # not just an arbitrary 40-char string of "a"s.
+        _edge_production(app_secrets=[INSTALLER_GENERATED_SECRET]).validate()  # must not raise
 
 
 if __name__ == "__main__":

@@ -428,6 +428,39 @@ assert_eq "ANYAICAM_BUILD_ID is refreshed to the current release commit, not lef
 assert_eq "ANYAICAM_VMS_COMMIT is refreshed to the current release commit, not left stale" "ANYAICAM_VMS_COMMIT=1111111111111111111111111111111111111a" "$(grep '^ANYAICAM_VMS_COMMIT=' "$VMS_ENV_FILE" 2>/dev/null)"
 assert_eq "exactly one ANYAICAM_BUILD_ID line exists (upsert, not append-a-duplicate)" "1" "$(grep -c '^ANYAICAM_BUILD_ID=' "$VMS_ENV_FILE" 2>/dev/null)"
 
+# 14g. ANYAICAM_APP_SECRETS is generated on a fresh env file: real
+#      release blocker -- cloud_config.py's edge_production profile
+#      still requires a strong, non-default secret (by design), but
+#      nothing ever provisioned one for a fresh edge install before
+#      this fix, so every from-scratch appliance would otherwise hit
+#      that check and refuse to start. At least 32 bytes of entropy
+#      (64 lowercase hex characters from /dev/urandom) -- never derived
+#      from the appliance ID, hostname, MAC, or anything else
+#      predictable.
+reset_fixture
+ensure_vms_env >/dev/null 2>&1
+GENERATED_SECRET="$(grep '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" | cut -d= -f2)"
+assert_eq "a fresh env file gets a 64-hex-character (32-byte) ANYAICAM_APP_SECRETS" "64" "${#GENERATED_SECRET}"
+assert_exit "the generated secret is lowercase hex only" 0 bash -c "[[ '$GENERATED_SECRET' =~ ^[0-9a-f]{64}\$ ]]"
+assert_eq "exactly one ANYAICAM_APP_SECRETS line exists" "1" "$(grep -c '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" 2>/dev/null)"
+
+# 14h. Repair/reinstall preserves the exact same secret -- unlike
+#      ANYAICAM_BUILD_ID/ANYAICAM_VMS_COMMIT above, this must NEVER be
+#      regenerated on a second run: rotating it silently on every
+#      reinstall would instantly invalidate every existing signed
+#      session/cookie.
+ensure_vms_env >/dev/null 2>&1
+SECOND_RUN_SECRET="$(grep '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" | cut -d= -f2)"
+assert_eq "ANYAICAM_APP_SECRETS is unchanged across a second ensure_vms_env() run (repair/reinstall)" "$GENERATED_SECRET" "$SECOND_RUN_SECRET"
+
+# 14i. A pre-existing, customer-set secret is never overwritten.
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_APP_SECRETS=my-existing-custom-secret-value-1234567890\n' > "$VMS_ENV_FILE"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "a pre-existing ANYAICAM_APP_SECRETS value is never overwritten" "ANYAICAM_APP_SECRETS=my-existing-custom-secret-value-1234567890" "$(grep '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE")"
+assert_eq "exactly one ANYAICAM_APP_SECRETS line exists (never appended as a duplicate)" "1" "$(grep -c '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE")"
+
 echo
 echo "== install_agent() =="
 

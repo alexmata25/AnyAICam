@@ -78,6 +78,21 @@ ensure_vms_env() {
     grep -q '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null || \
         printf '%s\n' 'ANYAICAM_ENV=production' >> "$VMS_ENV_FILE"
 
+    # Generated once, per appliance, the first time this file has no
+    # value yet -- and, like ANYAICAM_ENV/ANYAICAM_RUNTIME_ROLE above
+    # (never like the always-refreshed build-identity keys below), NEVER
+    # regenerated once present: rotating it silently on every
+    # reinstall/repair would instantly invalidate every existing signed
+    # session/cookie. 32 raw bytes (256 bits) of /dev/urandom entropy,
+    # hex-encoded with only coreutils (od/tr) -- no new dependency, and
+    # deliberately never derived from the appliance ID, hostname, MAC
+    # address, or anything else an attacker could predict or observe by
+    # other means. Never printed or logged anywhere: the generated value
+    # exists only in this command substitution and the file it's
+    # redirected into.
+    grep -q '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf 'ANYAICAM_APP_SECRETS=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$VMS_ENV_FILE"
+
     # These two keys are installer-owned build identity. They are updated on
     # every reinstall/repair while all other customer configuration survives.
     upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VMS_COMMIT" "$VMS_RELEASE_COMMIT"
