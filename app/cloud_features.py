@@ -60,10 +60,35 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         return FileResponse(path)
 
     @app.post('/api/password-reset/request')
-    def password_reset_request(payload: dict):
+    def password_reset_request(payload: dict,request: Request):
         email=str(payload.get('email','')).strip().lower(); user=row('SELECT id,email FROM partner_users WHERE email=?',(email,))
         if user:
-            raw=create_password_reset(user['id'],email); link=settings.password_reset_url+'?token='+raw
+            raw=create_password_reset(user['id'],email)
+            # Confirmed live on Samsung: settings.password_reset_url defaults
+            # to http://localhost:8000/reset-password, an install-time-fixed
+            # value -- for a cloud deployment with one real public domain
+            # that's exactly right and stays exactly as-is below. An edge
+            # appliance has no such fixed address (LAN IP, Tailscale IP,
+            # mDNS name -- whatever DHCP/Tailscale happens to assign), so a
+            # link built from that fixed default pointed at "localhost" no
+            # matter which real address the requester's own browser was
+            # actually using, forcing error-prone manual URL editing (swap
+            # in the real host, keep the ~43-character token intact by
+            # hand) before every single reset -- the repeated "token
+            # invalid/expired" reports tonight were exactly this, with a
+            # token that was independently confirmed valid, unused, and
+            # unexpired in the database every time. For edge_production,
+            # the link is instead built from this exact request's own Host
+            # header -- already trusted (TrustedHostMiddleware accepts any
+            # host for edge_production, see cloud_config.py's effective_
+            # trusted_hosts), and guaranteed to be the address that will
+            # actually work for whoever just submitted this request.
+            if settings.edge_production:
+                scheme=request.headers.get('x-forwarded-proto',request.url.scheme)
+                host=request.headers.get('host') or request.url.netloc
+                link=f'{scheme}://{host}/reset-password?token={raw}'
+            else:
+                link=settings.password_reset_url+'?token='+raw
             message=get_email_service().send('password_reset',email,'Reset your AnyAiCam password',f'Use this one-hour password reset link:\n{link}',metadata={'expires_minutes':60})
             with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',email,message['status'],settings.email_backend,json.dumps({'expires_minutes':60}),datetime.now().isoformat()))
             audit({'email':email,'role':'account'},'password_reset.requested','partner_user',user['id'],{'provider':settings.email_backend})
@@ -85,7 +110,18 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
 
     @app.get('/reset-password',response_class=HTMLResponse)
     def password_reset_page(token: str=''):
-        content=f'''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{token}"><label>New password<input id="reset-password" type="password" minlength="12" required></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href='/partner-login',800)})</script>'''; return shell('Reset password','users',content,scripts)
+        # escape(...,quote=True): the customer-facing twin of this page
+        # (customer_reset_password_page below) already does this; this one
+        # didn't, reflecting the raw ?token= query value straight into an
+        # HTML attribute -- a real, independent reflected-XSS gap (a
+        # crafted /reset-password?token=x"onmouseover="..." link could
+        # execute script in an admin's browser) found while tracing
+        # tonight's reset-link failures. secrets.token_urlsafe()'s own
+        # alphabet never contains a quote character, so this was never the
+        # cause of those failures (the real cause was the link's host,
+        # fixed separately above) -- but it's a genuine bug on its own.
+        safe_token=escape(token,quote=True)
+        content=f'''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<input id="reset-password" type="password" minlength="12" required></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href='/partner-login',800)})</script>'''; return shell('Reset password','users',content,scripts)
 
     # /forgot-password and /reset-password above render inside shell() --
     # the same dark Admin/Partner Portal chrome every /partner.html-side
