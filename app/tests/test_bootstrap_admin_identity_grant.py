@@ -1,22 +1,36 @@
-"""Regression coverage for the confirmed-live release blocker:
-bootstrap_admin() (partner_db.py, TEMPORARY LOCAL BOOTSTRAP PATH --
-ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD scaffolding, not the
-production onboarding design) created a partner_users row but never a
-matching identity_grants row. That was invisible right up until this
-account's own appliance activated -- POST /api/portal-login then
-switches from the simple local password check (partner_db.
-authenticate_detailed()) to the cloud-delegated one (appliance_identity.
-authenticate_operator()), which additionally requires a live
-identity_grants row resolving to the activated appliance's scope. A
-bootstrap admin with a perfectly correct password was denied with a
-generic "Invalid email or password" the moment its appliance activated,
-no matter how many times the password was reset.
+"""Regression coverage for two confirmed-live release blockers:
 
-bootstrap_admin() now also ensures a scope_type='partner' grant (the
-deliberate broad-reach case in this model -- resolves to every
-appliance under that partner_id, not an over-broad 'global' grant or a
-fabricated customer/site scope) for the bootstrap partner_id
-('anyaicam-primary'), idempotently.
+1. bootstrap_admin() (partner_db.py, TEMPORARY LOCAL BOOTSTRAP PATH --
+   ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD scaffolding, not the
+   production onboarding design) created a partner_users row but never
+   a matching identity_grants row. That was invisible right up until
+   this account's own appliance activated -- POST /api/portal-login
+   then switches from the simple local password check (partner_db.
+   authenticate_detailed()) to the cloud-delegated one (appliance_
+   identity.authenticate_operator()), which additionally requires a
+   live identity_grants row resolving to the activated appliance's
+   scope. A bootstrap admin with a perfectly correct password was
+   denied with a generic "Invalid email or password" the moment its
+   appliance activated, no matter how many times the password was
+   reset.
+
+2. The first fix for #1 used scope_type='partner' for that grant. Login
+   itself started working again, but the Admin Portal was left
+   effectively empty ("Your current role does not include
+   manage_settings"): cloud_administrator_bridge() (main.py) -- the
+   sole path a cloud-delegated session uses to reach the legacy Admin
+   Portal's manage_settings-gated pages -- deliberately only recognizes
+   a scope_type='global' administrator grant, by design excluding a
+   partner-scoped (company-level) administrator from the Admin Portal
+   (see test_cloud_administrator_bridge.py's own test_partner_scoped_
+   administrator_cannot_reach_admin_portal). bootstrap_admin() now uses
+   scope_type='global' (scope_id NULL) instead -- the one, already-
+   documented scope 'administrator' legitimately has for a true
+   top-level operator identity, matching what this account's pre-
+   activation, scope-less local password check effectively granted it.
+
+Both grant creation and idempotency checks below use scope_type='global'
+throughout.
 """
 import pytest
 from fastapi.testclient import TestClient
@@ -114,6 +128,40 @@ def test_bootstrap_admin_can_still_log_in_after_appliance_activation(http_client
         follow_redirects=False,
     )
     assert response.status_code == 303
+    # scope_type='global' -- reaches the real Admin Portal, not the
+    # Partner Portal's customer view (see the module docstring's #2).
+    assert response.headers["location"] == "/admin-portal"
+
+
+def test_admin_portal_manage_settings_pages_are_reachable_after_activation(http_client, db_path, monkeypatch):
+    # The exact second live failure: login succeeding is not enough --
+    # every Admin Portal sidebar page is gated on has_permission(user,
+    # "manage_settings"), which only a scope_type='global' grant
+    # satisfies via cloud_administrator_bridge(). Proves the bootstrap
+    # admin actually reaches manage_settings-gated content, not just a
+    # "your role doesn't include manage_settings" page rendered at 200.
+    _seed_activated_appliance_under_bootstrap_partner(db_path)
+    _configure_own_appliance(monkeypatch)
+
+    login = http_client.post(
+        "/api/portal-login",
+        json={"email": BOOTSTRAP_EMAIL, "password": BOOTSTRAP_PASSWORD, "portal": "administrator"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+    assert login.headers["location"] == "/admin-portal"
+    # partner_portal.SESSION_COOKIE is the actual cookie establish_
+    # partner_session() sets for a cloud-delegated login (matches
+    # test_cloud_administrator_bridge.py's identical pattern).
+    import partner_portal
+    session_cookie = login.cookies[partner_portal.SESSION_COOKIE]
+
+    page = http_client.get("/admin-portal", cookies={partner_portal.SESSION_COOKIE: session_cookie})
+    assert page.status_code == 200
+    # The exact live symptom: "Your current role does not include
+    # manage_settings" rendered at 200 instead of real page content.
+    assert "does not include" not in page.text
+    assert "manage_settings" not in page.text.lower()
 
 
 def test_duplicate_bootstrap_runs_do_not_create_duplicate_grants(http_client, db_path):
@@ -125,8 +173,8 @@ def test_duplicate_bootstrap_runs_do_not_create_duplicate_grants(http_client, db
         with connection() as db:
             user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
             count = db.execute(
-                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND scope_id=?",
-                (user_id, BOOTSTRAP_PARTNER_ID),
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global'",
+                (user_id,),
             ).fetchone()[0]
     assert count == 1
 
@@ -139,13 +187,13 @@ def test_existing_admin_with_the_correct_grant_is_left_unchanged(http_client, db
         with connection() as db:
             user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
             before = dict(db.execute(
-                "SELECT id,granted_at FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner'",
+                "SELECT id,granted_at FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global'",
                 (user_id,),
             ).fetchone())
         bootstrap_admin()
         with connection() as db:
             after = dict(db.execute(
-                "SELECT id,granted_at FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner'",
+                "SELECT id,granted_at FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global'",
                 (user_id,),
             ).fetchone())
     assert before == after
@@ -169,7 +217,7 @@ def test_existing_admin_grant_is_backfilled_without_any_password_env_var(http_cl
         bootstrap_admin()
         with connection() as db:
             count = db.execute(
-                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND revoked_at IS NULL",
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global' AND revoked_at IS NULL",
                 (user_id,),
             ).fetchone()[0]
     assert count == 1
@@ -202,7 +250,7 @@ def test_password_less_backfill_is_also_idempotent(http_client, db_path, monkeyp
         bootstrap_admin()
         with connection() as db:
             count = db.execute(
-                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner'",
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global'",
                 (user_id,),
             ).fetchone()[0]
     assert count == 1
@@ -262,7 +310,7 @@ def test_revoked_grant_is_recreated_by_a_password_less_rerun(http_client, db_pat
         bootstrap_admin()
         with connection() as db:
             live = db.execute(
-                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND revoked_at IS NULL",
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global' AND revoked_at IS NULL",
                 (user_id,),
             ).fetchone()[0]
     assert live == 1
@@ -278,7 +326,7 @@ def test_revoked_grant_is_still_rejected_normally(http_client, db_path, monkeypa
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
-            db.execute("UPDATE identity_grants SET revoked_at=? WHERE user_id=? AND role='administrator' AND scope_type='partner'", ("2026-08-27T00:00:00", user_id))
+            db.execute("UPDATE identity_grants SET revoked_at=? WHERE user_id=? AND role='administrator' AND scope_type='global'", ("2026-08-27T00:00:00", user_id))
 
     response = http_client.post(
         "/api/portal-login",

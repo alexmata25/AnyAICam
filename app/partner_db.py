@@ -174,13 +174,34 @@ def bootstrap_admin() -> None:
     had one, so every login attempt failed with a generic "Invalid email
     or password" regardless of how many times the password was reset.
 
-    scope_type='partner' is the deliberate, documented broad-reach case
-    in this grant model (see grant_resolves()'s own docstring) -- it
-    resolves to every appliance under this partner_id, which is exactly
-    right for the one primary administrator account and not an over-
-    broad 'global' grant or a fabricated customer/site scope. Checking
-    for an existing live (revoked_at IS NULL) match before creating one
-    makes this idempotent: rerunning bootstrap_admin() (it runs on every
+    scope_type='global' -- corrected from an earlier version of this fix
+    that used scope_type='partner'. That first attempt let POST /api/
+    portal-login succeed again, but confirmed live on Samsung it left
+    the Admin Portal itself effectively empty ("Your current role does
+    not include manage_settings"): cloud_administrator_bridge() (main.py)
+    -- the sole path any cloud-delegated session uses to reach the
+    legacy Admin Portal's manage_settings-gated pages -- deliberately
+    only recognizes a scope_type='global' administrator grant
+    (has_global_administrator_grant()), by design excluding a partner-
+    scoped (company-level) administrator from ever silently becoming a
+    true platform administrator (see that function's own docstring, and
+    test_cloud_administrator_bridge.py's test_partner_scoped_
+    administrator_cannot_reach_admin_portal). This bootstrap account
+    represents the one true AnyAiCam operator identity, not a scoped
+    company admin, and needs exactly that reach to match what its
+    pre-activation local-password check granted it (unrestricted
+    access, no scope concept at all) -- so scope_type='global' (scope_id
+    NULL, per the schema's own convention) is the correct, already-
+    documented choice here, not an over-broad one: it is the one
+    designed-in scope 'administrator' role legitimately has for a true
+    top-level operator (see VALID_ROLE_SCOPES's own comment in
+    appliance_identity.py), and grant_resolves() already treats
+    scope_type='global' as authorized for every appliance unconditionally,
+    same as 'partner' was for appliances under one partner_id -- so this
+    correction does not narrow appliance-login access at all, only
+    restores the Admin Portal reach the account needs. Checking for an
+    existing live (revoked_at IS NULL) match before creating one makes
+    this idempotent: rerunning bootstrap_admin() (it runs on every
     initialize_database() call, i.e. every container start) never
     creates a duplicate grant, and an admin that already has the correct
     grant is left completely untouched.
@@ -210,10 +231,10 @@ def bootstrap_admin() -> None:
             db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
             user_id=secrets.token_hex(5)
             db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
-        has_grant=db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND scope_id=? AND revoked_at IS NULL",(user_id,partner_id)).fetchone()
+        has_grant=db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global' AND revoked_at IS NULL",(user_id,)).fetchone()
         if not has_grant:
             from appliance_identity import create_grant
-            create_grant(db,user_id=user_id,role='administrator',scope_type='partner',scope_id=partner_id,granted_by='system:bootstrap_admin',now=now)
+            create_grant(db,user_id=user_id,role='administrator',scope_type='global',scope_id=None,granted_by='system:bootstrap_admin',now=now)
 
 
 class FirstAdminAlreadyExists(Exception):
