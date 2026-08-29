@@ -121,7 +121,20 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         # cause of those failures (the real cause was the link's host,
         # fixed separately above) -- but it's a genuine bug on its own.
         safe_token=escape(token,quote=True)
-        content=f'''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<input id="reset-password" type="password" minlength="12" required></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href='/partner-login',800)})</script>'''; return shell('Reset password','users',content,scripts)
+        # Show/Hide toggle: same markup, classes, and toggle behavior as
+        # the only existing instance of this pattern in the app
+        # (partner.html's own sign-in password field) -- shell()-wrapped
+        # pages like this one don't already carry .password-wrap/.show-
+        # password CSS, so it's inlined here rather than duplicated into
+        # the shared site-wide stylesheet for one field. Purely a display
+        # toggle: it only flips the input's type attribute between
+        # "password" and "text" client-side -- the value, the submit
+        # handler, and what's sent to /api/password-reset/complete are
+        # completely unchanged, so nothing about what's transmitted or
+        # logged is affected. Defaults masked (type="password") on load.
+        # This page has one password field today (no separate confirm
+        # field to mirror it onto).
+        content=f'''<style>.password-wrap{{position:relative}}.password-wrap input{{padding-right:5rem}}.show-password{{position:absolute;right:.4rem;top:.4rem;border:0;background:#edf1fa;border-radius:8px;padding:.48rem;cursor:pointer}}</style><header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<div class="password-wrap"><input id="reset-password" type="password" minlength="12" autocomplete="new-password" required><button id="show-password" class="show-password" type="button">Show</button></div></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('show-password').onclick=()=>{const input=document.getElementById('reset-password'),button=document.getElementById('show-password');input.type=input.type==='password'?'text':'password';button.textContent=input.type==='password'?'Show':'Hide'};document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href='/partner-login',800)})</script>'''; return shell('Reset password','users',content,scripts)
 
     # /forgot-password and /reset-password above render inside shell() --
     # the same dark Admin/Partner Portal chrome every /partner.html-side

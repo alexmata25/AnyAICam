@@ -143,3 +143,17 @@ def test_reset_page_html_escapes_the_token_query_parameter(http_client):
     assert response.status_code == 200
     assert 'onmouseover="alert(1)"' not in response.text
     assert "&quot;" in response.text or "&#34;" in response.text
+
+
+def test_reset_page_has_a_show_hide_password_toggle_defaulting_to_masked(http_client):
+    # UI usability addition, unrelated to the link-host/XSS fixes above:
+    # matches the only existing instance of this pattern in the app
+    # (partner.html's sign-in password field) -- same ids/classes/toggle
+    # behavior, applied to this page's password field.
+    response = http_client.get("/reset-password?token=abc123")
+    assert response.status_code == 200
+    text = response.text
+    assert 'id="reset-password" type="password"' in text  # masked by default
+    assert 'id="show-password" class="show-password" type="button">Show<' in text
+    assert "input.type==='password'?'text':'password'" in text
+    assert "button.textContent=input.type==='password'?'Show':'Hide'" in text
