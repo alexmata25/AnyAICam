@@ -23,6 +23,7 @@ establishment itself.
 """
 import dataclasses
 import sqlite3
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -150,3 +151,26 @@ def test_non_administrator_role_is_unaffected(http_client, db_path, monkeypatch)
     data = response.json()
     assert data["navigation_label"] == "Partner Portal"
     assert data["portal_url"] == "http://100.123.115.65:8000/partner?tab=customers"
+
+
+def test_partner_html_never_overwrites_nav_links_with_an_unauthenticated_error_body():
+    """Separate confirmed-live bug found while diagnosing the
+    Administration link above: /api/website/partner-session returns a
+    401 error body ({"status":"error",...}, no customer_url/partner_url
+    keys) for a truly anonymous visitor -- the endpoint's own code has a
+    graceful anonymous branch, but a global auth-middleware check blocks
+    anonymous callers before ever reaching it (a separate, pre-existing
+    gap, not touched here). partner.html's inline JS used to set
+    #customer-nav/#partner-nav's href unconditionally from that response
+    before checking anything, so a missing customer_url became the
+    literal string "undefined" (JS `undefined` assigned to a DOM .href
+    property) -- clicking "Customer Login" then landed on
+    /login?next=/undefined, the legacy Admin Portal's emergency-recovery
+    sign-in, instead of the real customer login. Fixed by guarding the
+    JS to leave the correct static default hrefs alone whenever the
+    fetched session shape/values aren't actually present -- a pure
+    navigation-target fix; no authentication or session code changed."""
+    source = (Path(__file__).resolve().parents[1] / "partner.html").read_text(encoding="utf-8")
+    assert "typeof session.authenticated==='undefined')return" in source
+    assert "if(session.partner_url)document.getElementById('partner-nav').href=session.partner_url" in source
+    assert "if(session.customer_url)document.getElementById('customer-nav').href=session.customer_url" in source
