@@ -247,6 +247,79 @@ def test_admin_customers_page_lists_customers_across_every_partner(http_client):
     assert 'href="/partner/onboarding"' in response.text  # Add New Customer opens the shared wizard, not a second implementation
 
 
+# =============================================================== cross-role email collision
+#
+# Confirmed live on Samsung: onboarding a test customer using the same
+# email as the already-existing (temporary bootstrap) administrator
+# account reached the INSERT INTO partner_users for the new customer_
+# owner and raised an uncaught sqlite3.IntegrityError (partner_users.
+# email is UNIQUE across every role), returning a raw 500 with no usable
+# detail and silently rolling back everything already inserted in that
+# same transaction (customer, sites, appliance, cameras, plan, quote).
+
+
+def test_administrator_email_cannot_be_reused_as_a_customer_owner_email(http_client):
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner_user(conn, "admin-1", "admin@example.test", "administrator", partner_id="anyaicam-primary")
+    token = partner_portal._token("owner@example.test", "partner_owner", "partner-1", None, None)
+    _seed_partner(conn, "partner-1")
+
+    response = client.post(
+        "/api/partner/customers/onboard", json=_onboard_payload(email="admin@example.test"),
+        cookies={partner_portal.SESSION_COOKIE: token},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "This email is already associated with another account."
+
+
+def test_rejected_email_collision_leaves_no_partial_rows(http_client):
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner_user(conn, "admin-1", "admin@example.test", "administrator", partner_id="anyaicam-primary")
+    token = partner_portal._token("owner@example.test", "partner_owner", "partner-1", None, None)
+    _seed_partner(conn, "partner-1")
+
+    response = client.post(
+        "/api/partner/customers/onboard", json=_onboard_payload(email="admin@example.test"),
+        cookies={partner_portal.SESSION_COOKIE: token},
+    )
+    assert response.status_code == 409
+
+    check = sqlite3.connect(db_path)
+    assert check.execute("SELECT count(*) FROM customers").fetchone()[0] == 0
+    assert check.execute("SELECT count(*) FROM sites").fetchone()[0] == 0
+    assert check.execute("SELECT count(*) FROM appliances").fetchone()[0] == 0
+    assert check.execute("SELECT count(*) FROM quotes").fetchone()[0] == 0
+    assert check.execute("SELECT count(*) FROM cameras").fetchone()[0] == 0
+    assert check.execute("SELECT count(*) FROM plans").fetchone()[0] == 0
+    # The rejection happens before the provisioning backend or any INSERT
+    # runs at all -- the pre-existing administrator row is the only
+    # partner_users row; the check itself must never create a second one.
+    assert check.execute("SELECT count(*) FROM partner_users").fetchone()[0] == 1
+
+
+def test_a_genuinely_new_email_is_still_accepted(http_client):
+    """Guards against an overzealous fix that rejects every onboarding
+    attempt regardless of email."""
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner_user(conn, "admin-1", "admin@example.test", "administrator", partner_id="anyaicam-primary")
+    token = partner_portal._token("owner@example.test", "partner_owner", "partner-1", None, None)
+    _seed_partner(conn, "partner-1")
+
+    response = client.post(
+        "/api/partner/customers/onboard", json=_onboard_payload(email="genuinely-new@example.test"),
+        cookies={partner_portal.SESSION_COOKIE: token},
+    )
+
+    assert response.status_code == 200
+    assert sqlite3.connect(db_path).execute(
+        "SELECT count(*) FROM customers WHERE email='genuinely-new@example.test'"
+    ).fetchone()[0] == 1
+
+
 # =============================================================== technician / customer denial
 
 

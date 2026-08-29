@@ -111,6 +111,18 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         except ValueError as error: raise HTTPException(status_code=409, detail=str(error)) from error
         email=str(payload.get('email','')).strip().lower()
         if row('SELECT id FROM customers WHERE email=?',(email,)): raise HTTPException(status_code=409,detail='A customer with this email already exists.')
+        # partner_users.email is UNIQUE across every role (administrator,
+        # partner staff, customer owners/viewers) -- not just customers.
+        # Without this check, onboarding an email that already belongs to
+        # any other portal account (confirmed live: reusing the Admin
+        # account's own email for a test customer) reached the INSERT INTO
+        # partner_users below and raised an uncaught sqlite3.IntegrityError,
+        # producing a raw 500 with no usable detail instead of a clean,
+        # actionable error -- and rolled back everything already inserted
+        # in this same transaction (customer, sites, appliance, cameras,
+        # plan, quote), leaving nothing behind but also giving the operator
+        # no indication why.
+        if row('SELECT id FROM partner_users WHERE email=?',(email,)): raise HTTPException(status_code=409,detail='This email is already associated with another account.')
         now=datetime.now().isoformat()
         # Administrator = global scope; only an administrator may steer partner_id via the payload.
         if identity.get('role')=='administrator' and str(payload.get('partner_id') or '').strip():
