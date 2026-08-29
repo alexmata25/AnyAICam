@@ -468,6 +468,67 @@ assert_eq "a pre-existing ANYAICAM_APP_SECRETS value is never overwritten" "ANYA
 assert_eq "exactly one ANYAICAM_APP_SECRETS line exists (never appended as a duplicate)" "1" "$(grep -c '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE")"
 
 echo
+echo "== ensure_vms_env() / camera credential encryption key =="
+
+# 14j. ANYAICAM_CAMERA_CREDENTIAL_KEY is generated on a fresh env file:
+#      confirmed live on a real edge appliance -- nothing ever
+#      provisioned this key, so any attempt to add a discovered camera
+#      WITH ONVIF/RTSP credentials failed closed with a 503
+#      (app/appliance_protocol.py's encrypt_camera_credentials() has no
+#      key to encrypt with). Fixed the same way ANYAICAM_APP_SECRETS
+#      already is, one section up. Deliberately never asserts the raw
+#      generated value in any pass/fail message below (assert_eq prints
+#      both sides on a mismatch) -- only its length, its format via a
+#      regex exit code, and content-free line counts, and hashes rather
+#      than raw values wherever two runs must be compared, so this
+#      suite can never leak real key material into test output.
+reset_fixture
+ensure_vms_env >/dev/null 2>&1
+GENERATED_KEY="$(grep '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" | cut -d= -f2-)"
+assert_eq "a fresh env file gets a 44-character ANYAICAM_CAMERA_CREDENTIAL_KEY (32 raw bytes, base64-encoded)" "44" "${#GENERATED_KEY}"
+assert_exit "the generated key is URL-safe base64 (Fernet's required format)" 0 bash -c "[[ '$GENERATED_KEY' =~ ^[A-Za-z0-9_-]{43}=\$ ]]"
+assert_eq "exactly one ANYAICAM_CAMERA_CREDENTIAL_KEY line exists" "1" "$(grep -c '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" 2>/dev/null)"
+
+# 14k. Repair/reinstall preserves the exact same key -- never
+#      regenerated on a second run: rotating it silently would make
+#      every already-stored camera credential permanently
+#      undecryptable, breaking every already-working camera stream.
+#      Compared by hash, never by raw value.
+GENERATED_KEY_HASH="$(printf '%s' "$GENERATED_KEY" | sha256sum | cut -d' ' -f1)"
+ensure_vms_env >/dev/null 2>&1
+SECOND_RUN_KEY="$(grep '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" | cut -d= -f2-)"
+SECOND_RUN_KEY_HASH="$(printf '%s' "$SECOND_RUN_KEY" | sha256sum | cut -d' ' -f1)"
+assert_eq "ANYAICAM_CAMERA_CREDENTIAL_KEY is unchanged across a second ensure_vms_env() run (repair/reinstall)" "$GENERATED_KEY_HASH" "$SECOND_RUN_KEY_HASH"
+
+# 14l. A pre-existing key (e.g. carried over from a prior install, or
+#      set by an operator) is never overwritten -- an upgrade must
+#      backfill a MISSING key, never touch one that's already there.
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+EXISTING_KEY="a-previously-generated-fernet-style-key-value=="
+printf 'ANYAICAM_CAMERA_CREDENTIAL_KEY=%s\n' "$EXISTING_KEY" > "$VMS_ENV_FILE"
+# Hashed via the exact same grep|cut extraction both before and after --
+# not "$EXISTING_KEY" itself -- so a trailing-newline difference between
+# how the shell variable and the file line are read can never produce a
+# false-positive mismatch here.
+BEFORE_KEY_HASH="$(grep '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" | cut -d= -f2- | sha256sum | cut -d' ' -f1)"
+ensure_vms_env >/dev/null 2>&1
+AFTER_KEY_HASH="$(grep '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" | cut -d= -f2- | sha256sum | cut -d' ' -f1)"
+assert_eq "a pre-existing ANYAICAM_CAMERA_CREDENTIAL_KEY value is never overwritten" "$BEFORE_KEY_HASH" "$AFTER_KEY_HASH"
+assert_eq "exactly one ANYAICAM_CAMERA_CREDENTIAL_KEY line exists (never appended as a duplicate)" "1" "$(grep -c '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE")"
+
+# 14m. Upgrade of an existing install missing only this key backfills
+#      it safely, without disturbing any other already-configured value
+#      in the same file (the exact "existing install, key introduced by
+#      a later installer version" scenario).
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_ENV=production\nANYAICAM_APP_SECRETS=already-set-app-secret\n' > "$VMS_ENV_FILE"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "an existing install missing the key gets it backfilled" "1" "$(grep -c '^ANYAICAM_CAMERA_CREDENTIAL_KEY=.' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "backfilling the key does not disturb an already-configured, unrelated value" "ANYAICAM_APP_SECRETS=already-set-app-secret" "$(grep '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE")"
+
+echo
 echo "== install_agent() =="
 
 # 17. Regression test for the fourth clean-install release blocker

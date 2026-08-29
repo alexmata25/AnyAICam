@@ -93,6 +93,30 @@ ensure_vms_env() {
     grep -q '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" 2>/dev/null || \
         printf 'ANYAICAM_APP_SECRETS=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$VMS_ENV_FILE"
 
+    # Camera credential encryption key -- an appliance/installer
+    # requirement, not a Samsung-only fix: confirmed live that a fresh
+    # edge appliance never provisioned this at all, so ANY attempt to
+    # add a discovered camera WITH ONVIF/RTSP credentials failed closed
+    # (app/appliance_protocol.py's encrypt_camera_credentials() returns
+    # nothing without a key, and app/partner_workspace.py's
+    # request_camera_provisioning() 503s rather than ever storing
+    # credentials it can't encrypt). Generated once, exactly like
+    # ANYAICAM_APP_SECRETS above, and for the same reason NEVER
+    # regenerated once present: this key is what every already-stored
+    # camera credential (camera_credentials.encrypted_blob) is encrypted
+    # with -- silently rotating it on a reinstall/repair would make every
+    # existing credential permanently undecryptable, breaking every
+    # already-working camera stream. A valid Fernet key (the format
+    # app/appliance_protocol.py requires) is 32 random bytes, URL-safe
+    # base64-encoded -- reproduced here with only coreutils (head/base64/
+    # tr), the same no-new-dependency approach as ANYAICAM_APP_SECRETS,
+    # since this must generate correctly before the VMS image (which
+    # bundles the `cryptography` package) has even been built yet. Never
+    # printed or logged anywhere: the generated value exists only in this
+    # command substitution and the file it's redirected into.
+    grep -q '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf 'ANYAICAM_CAMERA_CREDENTIAL_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_')" >> "$VMS_ENV_FILE"
+
     # These two keys are installer-owned build identity. They are updated on
     # every reinstall/repair while all other customer configuration survives.
     upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VMS_COMMIT" "$VMS_RELEASE_COMMIT"

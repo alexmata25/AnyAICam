@@ -41,6 +41,10 @@ check "identity file exists" test -f "$IDENTITY_FILE"
 check "VMS release marker exists" test -f "$VMS_RELEASE_MARKER"
 check "installed release marker contains exact approved commit" grep -q "\"vms_release_commit\": \"$VMS_RELEASE_COMMIT\"" "$VMS_RELEASE_MARKER"
 check "VMS env contains exact approved commit" grep -q "^ANYAICAM_VMS_COMMIT=$VMS_RELEASE_COMMIT$" "$VMS_ENV_FILE"
+# Existence/non-emptiness only -- the actual value is never read, printed,
+# or compared here. Without this key, camera provisioning with ONVIF/RTSP
+# credentials fails closed (see 06-deploy-vms.sh's ensure_vms_env()).
+check "camera credential encryption key is configured" grep -q '^ANYAICAM_CAMERA_CREDENTIAL_KEY=.' "$VMS_ENV_FILE"
 check "quarantine directory exists at corrected path ($QUARANTINE_DIR)" test -d "$QUARANTINE_DIR"
 check "quarantine directory is owned by anyaicam" test "$(stat -c %U "$QUARANTINE_DIR" 2>/dev/null)" = "anyaicam"
 check "quarantine directory permissions are protected (0750)" test "$(stat -c %a "$QUARANTINE_DIR" 2>/dev/null)" = "750"
