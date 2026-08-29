@@ -1327,6 +1327,29 @@ CLOUD_UPLOAD_MULTIPART_THRESHOLD_MB = max(8, int(os.environ.get("ANYAICAM_CLOUD_
 
 
 
+def _default_force_https(deployment_env: str, runtime_role: str) -> bool:
+    """The default for ANYAICAM_FORCE_HTTPS when an operator hasn't set it
+    explicitly. Confirmed live on Samsung: this used to be simply
+    `deployment_env == "production"`, so ANYAICAM_ENV=production (this
+    session's own installer fix) made forwarded_https_middleware below
+    307-redirect every plain-HTTP request to https:// -- on an appliance
+    with no TLS listener at all, reached only over a private LAN/
+    Tailscale network, never the public internet. A pure function (not
+    inlined into the FORCE_HTTPS assignment) so it's directly unit-
+    testable without needing to reimport this module under different
+    environment variables.
+
+    Cloud/combined production is completely unchanged: still defaults to
+    True, exactly as before. Staging and development are unaffected
+    regardless of runtime_role, matching cloud_config.Settings.
+    edge_production's own scoping. An operator who explicitly sets
+    ANYAICAM_FORCE_HTTPS (e.g. an edge box with its own real TLS
+    termination in front of it) is always honored -- this function only
+    supplies the default when that env var is absent."""
+    edge_production = deployment_env == "production" and runtime_role == "edge"
+    return deployment_env == "production" and not edge_production
+
+
 FORCE_HTTPS = os.environ.get(
 
 
@@ -1345,7 +1368,7 @@ FORCE_HTTPS = os.environ.get(
 
 
 
-    "true" if DEPLOYMENT_ENV == "production" else "false",
+    "true" if _default_force_https(DEPLOYMENT_ENV, RUNTIME_ROLE) else "false",
 
 
 

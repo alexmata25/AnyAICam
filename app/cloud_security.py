@@ -132,7 +132,14 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'
         if settings.csrf_enabled and not request.cookies.get('anyaicam_csrf'): response.set_cookie('anyaicam_csrf',sign('csrf',28800),secure=settings.secure_cookies,httponly=False,samesite='strict',max_age=28800,domain=settings.cookie_domain or None)
-        if settings.production: response.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
+        # Confirmed live on Samsung: this used to fire for any production
+        # profile, so a plain-HTTP edge appliance (no TLS listener at
+        # all) was telling browsers "only ever connect to this host over
+        # HTTPS" -- a promise the appliance can't keep, and one that
+        # locks a customer's browser out of the LAN/Tailscale address
+        # they actually use. Cloud/combined production is unaffected and
+        # still gets this unconditionally, same as before.
+        if settings.production and not settings.edge_production: response.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
         if settings.staging: response.headers['X-AnyAiCam-Environment']='staging'
         return response
 
