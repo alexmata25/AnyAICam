@@ -50,6 +50,46 @@ the underlying architecture -- the next appliance provisioned, or the
 next password reset on any existing one, will hit the exact same
 divergence until the delegation redesign above is implemented.
 
+## Password-reset tokens are logged in plaintext via GET query strings
+
+**Found:** 2026-08-29, while diagnosing repeated "token invalid/expired"
+reports for an administrator password reset on Samsung.
+
+**Problem:** the reset link built by `POST /api/password-reset/request`
+(`app/cloud_features.py`) carries the raw, single-use token as a `GET`
+query parameter (`/reset-password?token=...` and
+`/customer-reset-password?token=...`). Uvicorn's default access-log
+format logs the full request line for every request, including the
+query string. The token therefore ends up in plaintext in the
+container's log history the moment the reset link is opened -- before
+the token is ever submitted to `POST /api/password-reset/complete`
+(which is a `POST`, and does not appear in access logs with its body).
+
+**Confirmed in practice:** while reading `docker logs anyaicam-vms`
+during this session's own diagnosis of a *different* issue, a
+`GET /reset-password?token=<43-character token>` line appeared with
+the token in plaintext. That specific token had already been consumed
+by the time it was seen and posed no further risk, but the underlying
+logging behavior is unconditional and applies to every reset link,
+for every account, every time.
+
+**Direction for the real fix:** the token must not travel as a `GET`
+query parameter at all, or access logging must be configured to
+redact query strings for these two routes specifically. Options include
+(a) having the reset-password page perform a client-side redirect that
+moves the token from the URL into a `POST` body or a short-lived,
+httponly cookie before rendering the form, so the token is never part
+of a logged `GET` request line, or (b) a custom Uvicorn/Starlette
+access-log formatter that masks `token=` query values for
+`/reset-password` and `/customer-reset-password` specifically. No
+change has been made yet -- this is scoped as its own fix, not bundled
+into unrelated work.
+
+**Explicitly not done:** no logging configuration was changed; no
+token-delivery mechanism was altered. The already-consumed token seen
+during diagnosis was never repeated or written anywhere outside the
+container's own existing log history.
+
 ## Camera dbc5f83343 (Samsung) is blocked at ONVIF authorization, not at credentials or protocol choice
 
 **Found:** 2026-08-28, while resolving `cameras.onvif_endpoint` for
