@@ -233,6 +233,71 @@ def test_administrator_can_create_a_customer_for_an_explicit_partner_id(http_cli
     assert row[0] == "partner-9"
 
 
+# =============================================================== updating an existing customer's camera entitlement
+#
+# Confirmed live on Samsung: a real site had 5 discovered cameras but the
+# customer portal showed "4/4" -- expected_camera_count (partner_
+# workspace.py's list_customer_cameras()) reads plans.camera_quantity,
+# the quote/entitlement value from onboarding, never the count of
+# discovered devices. The normal supported path to correct this without
+# recreating the customer is PUT /api/partner/customers/{id}/plan
+# (change_customer_plan()), which inserts a fresh plans row -- the most
+# recent one is always what list_customer_cameras() reads.
+
+
+def test_updating_plan_quantity_corrects_the_customers_camera_entitlement(http_client):
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner(conn, "partner-1")
+    conn.execute(
+        "INSERT INTO customers(id,partner_id,name,email,status,trial_status,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("cust-1", "partner-1", "Existing Customer", "cust-1@example.test", "active", "eligible", "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("plan-1", "cust-1", "2mp", "motion", 2, 4, 7.99, 6.39, "quote", "2026-01-01"),
+    )
+    conn.commit()
+    admin_token = partner_portal._token("owner@example.test", "partner_owner", "partner-1", None, None)
+
+    response = client.put(
+        "/api/partner/customers/cust-1/plan",
+        json={"resolution": "2mp", "recording": "motion", "retention": 2, "quantity": 5},
+        cookies={partner_portal.SESSION_COOKIE: admin_token},
+    )
+    assert response.status_code == 200
+    assert response.json()["quote"]["quantity"] == 5
+
+    # The actual production read path a real customer portal page hits --
+    # not just a direct query against the plans table.
+    customer_token = partner_portal._token("customer@example.test", "customer_owner", "partner-1", "cust-1", None)
+    cameras_response = client.get("/api/customer/cameras", cookies={partner_portal.SESSION_COOKIE: customer_token})
+    assert cameras_response.status_code == 200
+    assert cameras_response.json()["expected_camera_count"] == 5
+
+
+def test_customer_detail_page_renders_the_camera_entitlement_form_for_this_customer(http_client):
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner(conn, "partner-1")
+    conn.execute(
+        "INSERT INTO customers(id,partner_id,name,email,status,trial_status,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("cust-2", "partner-1", "Existing Customer", "cust-2@example.test", "active", "eligible", "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("plan-2", "cust-2", "2mp", "motion", 2, 4, 7.99, 6.39, "quote", "2026-01-01"),
+    )
+    conn.commit()
+    token = partner_portal._token("owner@example.test", "partner_owner", "partner-1", None, None)
+
+    response = client.get("/partner/customers/cust-2", cookies={partner_portal.SESSION_COOKIE: token})
+    assert response.status_code == 200
+    assert 'id="plan-quantity-form"' in response.text
+    assert 'id="plan-quantity" type="number" min="1" max="128" value="4"' in response.text
+    assert "/api/partner/customers/cust-2/plan" in response.text
+
+
 def test_admin_customers_page_lists_customers_across_every_partner(http_client):
     client, db_path = http_client
     conn = sqlite3.connect(db_path)
