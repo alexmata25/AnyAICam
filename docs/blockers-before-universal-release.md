@@ -148,3 +148,97 @@ persisted `onvif_endpoint` -> `camera_url(1)` -> FFmpeg -> Live View.
 
 **Explicitly not done:** no camera settings, networking, or
 credentials were changed; no RTSP URL was hard-coded as a workaround.
+
+## Camera 1 (Samsung, device_key `urn:uuid:b3464000-5074-11b4-82cc-142ffda2f6af`) is blocked at RTSP-level credential verification -- distinct from the ONVIF authorization blocker above
+
+**Found:** 2026-08-29, provisioning this same physical device (the
+customer-facing counterpart of the `dbc5f83343` ONVIF blocker above)
+through the normal customer Discover -> "Add this camera" flow, after
+two prerequisite fixes landed and were verified working end to end on
+this same day: (1) `ANYAICAM_CAMERA_CREDENTIAL_KEY` is now provisioned
+on every edge appliance (`installer/06-deploy-vms.sh`'s
+`ensure_vms_env()`), and (2) the customer-setup page correctly polls a
+provisioning job's real outcome instead of trusting the initial
+"queued" response (`partner_workspace.py`'s `pollProvisioning()`).
+
+**Confirmed correct going in:** discovery itself was not in question --
+this device was one of 5 real candidates surfaced by completed scan
+job `49508bfcaa18`, with a stable `device_key` distinguishing it from
+the other 4, and the customer selected it deliberately (`name="Front
+Door"`) via the normal Discover -> "Add this camera" flow.
+
+**Problem:** the customer submitted ONVIF/RTSP credentials for this
+device twice, carefully, in two separate attempts roughly an hour
+apart. Both attempts reached the physical camera for real and both
+were rejected identically:
+
+| job_id | queued (UTC) | delivered to appliance | result posted | status | message |
+|---|---|---|---|---|---|
+| `e83e810314d7` | 18:55:23 | 18:55:58 (`count:1`) | 18:56:23 | failed | "Device rejected the provided credentials." |
+| `872fbc99cef8` | 19:52:21 | 19:52:30 (`count:1`) | 19:52:55 | failed | "Device rejected the provided credentials." |
+
+Both failures happened at the same stage: `anyaicam_agent`'s
+`provisioning.py::verify_device()` -> `classify_rtsp_authentication()`,
+a plain RTSP DESCRIBE challenge/retry on port 554 (RFC 2617 Digest or
+Basic, whichever the camera's own `WWW-Authenticate` challenge
+specifies). This runs *before*, and gates, ONVIF resolution --
+`service.py::poll_provisioning()` only calls
+`_resolve_media_uri_after_provisioning()` (the sole caller of
+`onvif_media.py`'s `GetProfiles`/`GetStreamUri` resolution) when
+`verify_device()` returns success. Since it returned failure both
+times, **ONVIF was never contacted on either attempt** -- confirmed by
+`/var/log/anyaicam/agent.log` on the appliance host, which has no
+ONVIF-related line for either job, only "Provisioning job received."
+Neither the exact RTSP response code nor the literal
+`WWW-Authenticate` challenge text is logged or persisted anywhere
+(`classify_rtsp_authentication()` returns only the classification
+string, by design, to keep every log/DB message credential- and
+device-detail-free) -- there is nothing more granular available to
+inspect for either attempt.
+
+This is a **different, earlier gate than the `dbc5f83343` ONVIF
+authorization blocker above**, not a recurrence of it: that blocker is
+specific to the ONVIF SOAP service (`onvif/device_service`), which
+this flow never reaches while RTSP verification keeps failing first.
+The original blocker's own record states RTSP-level DESCRIBE auth was
+already confirmed working against this exact camera with its
+verified-correct credentials (the `36ae0a3` fix) -- two credentialed
+resubmissions since then failing identically at that same,
+previously-working layer is new information that record doesn't
+explain.
+
+**Do not classify this as a VMS/client-code bug unless later evidence
+proves otherwise.** The full pipeline this depends on -- credential
+entry, encryption, single-delivery to the appliance, and RTSP
+verification -- is confirmed working correctly by this same evidence:
+both jobs were genuinely queued, encrypted, delivered exactly once,
+verified against the real device, and reported back accurately within
+seconds, and the customer-setup UI correctly reflected each outcome
+(retryable "Add this camera," not a false "Added"). Nothing in this
+trace points at the client. No alternate/guessed credentials were
+tried, and no camera setting, network configuration, credential, or
+firmware was changed.
+
+**Direction for the real fix:** requires physical/on-LAN access to the
+camera to confirm its actual RTSP-stream account username/password
+(directly on the device's own admin UI, not assumed from an earlier
+session) before the next attempt, since two independent, careful
+submissions have now been rejected at the one layer previously proven
+to accept this camera's correct credentials. While on site, this is
+also the opportunity to finally check the still-open ONVIF-side items
+from the `dbc5f83343` blocker above (ONVIF enabled/disabled, a
+dedicated ONVIF user vs. only an RTSP account, that user's
+permissions, configured ONVIF auth mode) -- if the RTSP credential
+turns out to have simply changed, the ONVIF gap may still exist
+underneath it once RTSP is corrected.
+
+**Confirmed safe failure, both times:** no `cameras` row was ever
+created for this device_key and no `camera_credentials` row exists --
+`camera_provisioning_requests.encrypted_credentials` is cleared to
+`NULL` the instant each job concludes, success or failure, and a
+failed job never reaches the code path that would create either row.
+Nothing was left half-committed by either attempt.
+
+**Explicitly not done:** no camera settings, networking, credentials,
+or firmware were changed; no third resubmission was requested; no
+camera row was manually created.
