@@ -151,6 +151,123 @@ def test_existing_admin_with_the_correct_grant_is_left_unchanged(http_client, db
     assert before == after
 
 
+def test_existing_admin_grant_is_backfilled_without_any_password_env_var(http_client, db_path, monkeypatch):
+    # Simulates the real sequence: the account already exists (created
+    # earlier, with a password, by the http_client fixture's own
+    # initialize_database() call), the password env var has since been
+    # removed from vms.env (never left sitting in a persistent file, per
+    # bootstrap_admin()'s TEMPORARY LOCAL BOOTSTRAP PATH contract), and
+    # bootstrap_admin() runs again on a later container start -- it must
+    # still be able to backfill a missing grant using only the email.
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
+            db.execute("DELETE FROM identity_grants WHERE user_id=?", (user_id,))
+    monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
+
+    with override_target(sqlite_path=str(db_path)):
+        bootstrap_admin()
+        with connection() as db:
+            count = db.execute(
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND revoked_at IS NULL",
+                (user_id,),
+            ).fetchone()[0]
+    assert count == 1
+
+
+def test_backfill_never_touches_the_existing_password_hash(http_client, db_path, monkeypatch):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            row = db.execute("SELECT id,password_hash FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()
+            user_id, original_hash = row["id"], row["password_hash"]
+            db.execute("DELETE FROM identity_grants WHERE user_id=?", (user_id,))
+    monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
+
+    with override_target(sqlite_path=str(db_path)):
+        bootstrap_admin()
+        with connection() as db:
+            new_hash = db.execute("SELECT password_hash FROM partner_users WHERE id=?", (user_id,)).fetchone()["password_hash"]
+    assert new_hash == original_hash
+
+
+def test_password_less_backfill_is_also_idempotent(http_client, db_path, monkeypatch):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
+            db.execute("DELETE FROM identity_grants WHERE user_id=?", (user_id,))
+    monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
+
+    with override_target(sqlite_path=str(db_path)):
+        bootstrap_admin()
+        bootstrap_admin()
+        with connection() as db:
+            count = db.execute(
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner'",
+                (user_id,),
+            ).fetchone()[0]
+    assert count == 1
+
+
+def test_password_less_backfilled_admin_can_log_in_after_activation(http_client, db_path, monkeypatch):
+    # The exact live scenario end to end: password env var gone,
+    # backfill runs on email alone, and the account still authenticates
+    # successfully via the cloud-delegated path once its appliance is
+    # activated -- using the ORIGINAL password from account creation,
+    # never re-supplied.
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
+            db.execute("DELETE FROM identity_grants WHERE user_id=?", (user_id,))
+    monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
+    with override_target(sqlite_path=str(db_path)):
+        bootstrap_admin()
+
+    _seed_activated_appliance_under_bootstrap_partner(db_path)
+    _configure_own_appliance(monkeypatch)
+
+    response = http_client.post(
+        "/api/portal-login",
+        json={"email": BOOTSTRAP_EMAIL, "password": BOOTSTRAP_PASSWORD, "portal": "administrator"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+
+def test_no_new_account_is_created_without_a_password(http_client, db_path, monkeypatch):
+    # The other half of "password required only to create a brand-new
+    # account": an email with no existing partner_users row and no
+    # password must not create anything at all.
+    monkeypatch.setenv("ANYAICAM_ADMIN_EMAIL", "never-created@example.test")
+    monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
+    with override_target(sqlite_path=str(db_path)):
+        bootstrap_admin()
+        with connection() as db:
+            row = db.execute("SELECT id FROM partner_users WHERE email=?", ("never-created@example.test",)).fetchone()
+    assert row is None
+
+
+def test_revoked_grant_is_recreated_by_a_password_less_rerun(http_client, db_path, monkeypatch):
+    # Complements test_revoked_grant_is_still_rejected_normally below
+    # (which proves a revoked grant denies login): this proves the
+    # password-less backfill path still notices a live grant is missing
+    # -- whether it was never created or was revoked -- and restores one,
+    # exactly like the original password-bearing path already did.
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            user_id = db.execute("SELECT id FROM partner_users WHERE email=?", (BOOTSTRAP_EMAIL,)).fetchone()["id"]
+            db.execute("UPDATE identity_grants SET revoked_at=? WHERE user_id=?", ("2026-08-27T00:00:00", user_id))
+    monkeypatch.delenv("ANYAICAM_ADMIN_PASSWORD", raising=False)
+
+    with override_target(sqlite_path=str(db_path)):
+        bootstrap_admin()
+        with connection() as db:
+            live = db.execute(
+                "SELECT count(*) FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND revoked_at IS NULL",
+                (user_id,),
+            ).fetchone()[0]
+    assert live == 1
+
+
 def test_revoked_grant_is_still_rejected_normally(http_client, db_path, monkeypatch):
     # Not a claim about bootstrap_admin() re-granting over a revocation
     # -- this proves the existing, unmodified grant-resolution logic

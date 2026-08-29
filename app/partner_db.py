@@ -183,15 +183,31 @@ def bootstrap_admin() -> None:
     makes this idempotent: rerunning bootstrap_admin() (it runs on every
     initialize_database() call, i.e. every container start) never
     creates a duplicate grant, and an admin that already has the correct
-    grant is left completely untouched."""
-    email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower(); password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
-    if not email or not password: return
+    grant is left completely untouched.
+
+    ANYAICAM_ADMIN_PASSWORD is required ONLY to create a brand-new
+    account -- an already-existing bootstrap admin (found by email
+    alone) never has its password_hash touched here, and no password
+    needs to be present in the environment at all for its missing grant
+    to be backfilled. This matters in exactly the scenario that caused
+    the live failure above: the temporary password env var gets removed
+    from vms.env once the account is confirmed created (never left
+    sitting in a persistent file), but this function keeps running on
+    every container start regardless -- it must be able to backfill a
+    still-missing grant for that already-created account without ever
+    needing a password (real or placeholder) put back into the
+    environment just to reach this code."""
+    email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower()
+    if not email: return
     now=datetime.now().isoformat(); partner_id='anyaicam-primary'
     with database_connect() as db:
-        db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
         existing=db.execute('SELECT id FROM partner_users WHERE email=?',(email,)).fetchone()
-        if existing: user_id=existing['id']
+        if existing:
+            user_id=existing['id']
         else:
+            password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
+            if not password: return
+            db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
             user_id=secrets.token_hex(5)
             db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
         has_grant=db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='partner' AND scope_id=? AND revoked_at IS NULL",(user_id,partner_id)).fetchone()
