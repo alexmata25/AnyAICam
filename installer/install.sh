@@ -120,6 +120,7 @@ run_install() {
     deploy_vms "$INSTALL_STATE"
     install_agent "$INSTALL_STATE"
     systemd_setup
+    disable_system_suspend
     identity_provision "$INSTALL_STATE"
     stamp_release
     log "Install complete (mode=$mode, detected state=$INSTALL_STATE, VMS=$VMS_RELEASE_COMMIT). Run $INSTALLER_DIR/validate.sh to verify."

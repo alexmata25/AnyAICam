@@ -74,6 +74,8 @@ reset_fixture() {
     rm -f "$APT_PYTHON_VENV_MARKER" "$FAKE_AGENT_INSTALL_MARKER" "$FAKE_AGENT_UNINSTALL_MARKER"
     DF_AVAIL_GB=999999
     DF_TOTAL_GB=999999
+    SYSTEMCTL_CALL_LOG="$FIXTURE_ROOT/.systemctl-calls"
+    rm -f "$SYSTEMCTL_CALL_LOG"
 }
 
 # A minimal fake built appliance-agent release payload for
@@ -156,7 +158,11 @@ docker() {
 }
 systemctl() {
     # run_uninstall() only needs these to not fail; no real systemd is
-    # present or should be touched by this harness.
+    # present or should be touched by this harness. Every invocation is
+    # also appended to SYSTEMCTL_CALL_LOG (when set) so a test can assert
+    # on exactly what disable_system_suspend() asked systemd to do,
+    # without needing a real systemd to actually do it.
+    [[ -n "${SYSTEMCTL_CALL_LOG:-}" ]] && printf '%s\n' "$*" >>"$SYSTEMCTL_CALL_LOG"
     return 0
 }
 apt-get() {
@@ -581,6 +587,29 @@ assert_eq "VMS recordings content is byte-identical after default uninstall" "$R
 assert_exit "VMS data-config directory still exists after default uninstall" 0 test -d "$VMS_DATA_CONFIG_DIR"
 assert_exit "appliance identity file still exists after default uninstall" 0 test -f "$IDENTITY_FILE"
 assert_eq "appliance identity is byte-identical after default uninstall" "$IDENTITY_HASH_BEFORE" "$(sha256sum "$IDENTITY_FILE" 2>/dev/null | cut -d' ' -f1)"
+
+echo
+echo "== disable_system_suspend() =="
+
+# Confirmed live on Samsung: a genuinely fresh Ubuntu desktop install
+# suspended itself mid-validation (LAN/SSH/Tailscale/VMS all dropped
+# simultaneously) because of GNOME's own idle-suspend policy -- an
+# appliance meant to run unattended 24/7 must never do this, regardless
+# of which desktop-environment setting is responsible. disable_
+# system_suspend() (08-systemd-setup.sh, sourced transitively via
+# uninstall.sh's own `source install.sh` above) is the fix: masking
+# these four systemd targets is confirmed live to make
+# `systemctl suspend` itself fail ("Access denied") rather than
+# actually sleeping, regardless of what tries to trigger it.
+reset_fixture
+disable_system_suspend >/dev/null 2>&1
+assert_eq "masks exactly the four sleep/suspend/hibernate targets" \
+    "mask sleep.target suspend.target hibernate.target hybrid-sleep.target" \
+    "$(cat "$SYSTEMCTL_CALL_LOG" 2>/dev/null)"
+
+reset_fixture
+disable_system_suspend >/dev/null 2>&1
+assert_exit "running it again (repair/reinstall) is still safe" 0 disable_system_suspend
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="

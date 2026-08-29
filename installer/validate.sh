@@ -24,6 +24,16 @@ version_reports_release() {
     curl -fsS -m 5 http://127.0.0.1:8000/version | grep -Fq "$VMS_RELEASE_COMMIT"
 }
 
+suspend_targets_masked() {
+    # `systemctl is-enabled` exits non-zero for a masked unit (it isn't
+    # "enabled"), so check() can't wrap it directly -- confirm the actual
+    # state string instead.
+    local target
+    for target in sleep.target suspend.target hibernate.target hybrid-sleep.target; do
+        [[ "$(systemctl is-enabled "$target" 2>/dev/null)" == "masked" ]] || return 1
+    done
+}
+
 check "install state is not partial" test "$INSTALL_STATE" != "partial"
 check "anyaicam user exists" id -u anyaicam
 check "config directory exists" test -d "$CONFIG_DIR"
@@ -37,6 +47,7 @@ check "quarantine directory permissions are protected (0750)" test "$(stat -c %a
 check "anyaicam-agent.service is enabled" systemctl is-enabled --quiet anyaicam-agent.service
 check "anyaicam-vms.service is enabled" systemctl is-enabled --quiet anyaicam-vms.service
 check "anyaicam-vms.service is active" systemctl is-active --quiet anyaicam-vms.service
+check "system suspend/hibernate is disabled (appliance must stay online 24/7)" suspend_targets_masked
 check "VMS local health endpoint responds" curl -fsS -m 5 -o /dev/null http://127.0.0.1:8000/health
 check "VMS local ready endpoint responds" curl -fsS -m 5 -o /dev/null http://127.0.0.1:8000/ready
 check "VMS /version reports exact approved commit" version_reports_release
