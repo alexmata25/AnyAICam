@@ -16,6 +16,11 @@ def _int(name, default):
         return default
 
 
+# The exact untouched default allowed_origins resolves to below -- see
+# Settings.effective_allowed_origins.
+_DEFAULT_ALLOWED_ORIGINS = ["http://localhost:8000"]
+
+
 # The exact untouched default trusted_hosts resolves to below. Compared
 # by value (never by re-reading os.environ) so Settings.effective_
 # trusted_hosts stays fully driven by constructor arguments in tests,
@@ -230,6 +235,35 @@ class Settings:
         if self.edge_production and self.trusted_hosts == _DEFAULT_TRUSTED_HOSTS:
             return ["*"]
         return self.trusted_hosts
+
+    @property
+    def effective_allowed_origins(self):
+        """The value cloud_security.ProductionSecurityMiddleware actually
+        checks a browser request's Origin header against, and CORS
+        preflight/state-changing requests are rejected with "Origin is
+        not allowed" for any Origin not in this list.
+
+        Confirmed live on Samsung: the Admin login POST from
+        http://192.168.0.165:8000/partner.html was rejected because
+        ANYAICAM_ALLOWED_ORIGINS was never set and the untouched default
+        (http://localhost:8000) matches no origin a browser actually
+        loads the appliance's own pages from -- the exact same shape of
+        bug as effective_trusted_hosts above, for the same underlying
+        reason: an edge appliance has no fixed address to enumerate in
+        advance, unlike a cloud deployment's single fixed public domain.
+
+        For edge_production specifically, with allowed_origins still at
+        its exact untouched default, this returns ["*"], which
+        cloud_security.py's dispatch() treats as "any origin accepted" --
+        the same private-LAN/Tailscale trust boundary edge_production
+        already relies on for every other exemption on this class (see
+        its own docstring). Cloud/combined production, staging, and any
+        profile where an operator has explicitly configured
+        ANYAICAM_ALLOWED_ORIGINS are all completely unaffected and keep
+        exact current behavior."""
+        if self.edge_production and self.allowed_origins == _DEFAULT_ALLOWED_ORIGINS:
+            return ["*"]
+        return self.allowed_origins
 
     @property
     def partner_login_url(self):

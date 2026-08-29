@@ -80,7 +80,14 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
 
         # Allow ordinary browser page navigation. Enforce the origin allowlist
         # only for CORS preflight and requests that can change server state.
-        if origin and (unsafe_method or preflight) and origin not in settings.allowed_origins:
+        # effective_allowed_origins (cloud_config.py) is settings.allowed_
+        # origins itself for every profile except edge_production with an
+        # untouched default, where it's ["*"] -- an edge appliance has no
+        # fixed address to enumerate in advance, unlike cloud's single
+        # fixed public domain, so "*" here means "any origin accepted",
+        # never a literal Origin header value a browser could send.
+        allowed_origins=settings.effective_allowed_origins
+        if origin and (unsafe_method or preflight) and '*' not in allowed_origins and origin not in allowed_origins:
             return JSONResponse({'detail':'Origin is not allowed.'},status_code=403)
 
         if preflight:
