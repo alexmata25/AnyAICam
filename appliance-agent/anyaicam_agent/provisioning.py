@@ -18,11 +18,14 @@ so even a caller mistake here can't leak them to the cloud.
 
 import base64
 import hashlib
+import logging
 import re
 import secrets
 import socket
 
 from .discovery import scan
+
+_LOG = logging.getLogger('anyaicam.agent')
 
 
 def locate_device(device_key, networks=None):
@@ -168,6 +171,47 @@ UNSUPPORTED_CHALLENGE = 'unsupported_challenge'
 MALFORMED_RESPONSE = 'malformed_response'
 
 
+def _log_rtsp_diagnostic(diag):
+    """TEMPORARY: logs exactly one 'rtsp_auth_diagnostic' line per
+    classify_rtsp_authentication() call, at INFO level via the same
+    'anyaicam.agent' logger service.py already writes to (lands in
+    /var/log/anyaicam/agent.log). Fields, all secret-free:
+      scheme          -- 'basic', 'digest', an unsupported scheme name
+                         reported by the device, or None (never
+                         challenged / connection failed before then).
+      qop_offered     -- True/False/None: whether the Digest challenge
+                         included a qop parameter at all.
+      qop_selected    -- 'auth' if this client selected it, else None
+                         (including when qop_offered is False).
+      path            -- the RTSP request path/URI this attempt used
+                         (e.g. /Streaming/Channels/101) -- a resource
+                         path, never a credential.
+      first_status    -- the initial, unauthenticated DESCRIBE's RTSP
+                         status code.
+      retry_status    -- the authenticated retry's RTSP status code,
+                         or None if no retry was attempted.
+      algorithm       -- the Digest challenge's algorithm parameter
+                         (defaults to 'MD5' when the challenge omits
+                         it), or None for a non-Digest/no challenge.
+      challenge_issue -- a short reason tag when the challenge itself
+                         was malformed or unsupported (e.g.
+                         'unsupported_qop', 'missing_realm_or_nonce'),
+                         else None.
+      outcome         -- the six-way classify_rtsp_authentication()
+                         status this attempt concluded with.
+    Never logs username, password, the Authorization header, a nonce/
+    cnonce, or a computed response hash -- none of those are ever put
+    into `diag` in the first place (see classify_rtsp_authentication()
+    below), so there is nothing to redact here, only to assemble."""
+    _LOG.info(
+        'rtsp_auth_diagnostic scheme=%s qop_offered=%s qop_selected=%s path=%s '
+        'first_status=%s retry_status=%s algorithm=%s challenge_issue=%s outcome=%s',
+        diag.get('scheme'), diag.get('qop_offered'), diag.get('qop_selected'), diag.get('path'),
+        diag.get('first_status'), diag.get('retry_status'), diag.get('algorithm'),
+        diag.get('challenge_issue'), diag.get('outcome'),
+    )
+
+
 def classify_rtsp_authentication(ip, port, username, password, path='/', timeout=3):
     """Issues a real RTSP DESCRIBE -- the request that actually asks for
     the stream's session description, not just a capability handshake
@@ -202,21 +246,45 @@ def classify_rtsp_authentication(ip, port, username, password, path='/', timeout
     detail is always a secret-free, human-readable string -- never a
     credential, an Authorization header, a nonce/cnonce, or the raw
     device response. Never reports AUTH_CORRECT without a real 200
-    from the device on the authenticated retry."""
+    from the device on the authenticated retry.
+
+    TEMPORARY DIAGNOSTIC (remove once the live RTSP incompatibility
+    behind repeated Samsung "Device rejected the provided credentials"
+    results -- even after the qop fix and the /Streaming/Channels/101
+    path fix -- is identified): every return path here logs one
+    'rtsp_auth_diagnostic' line via _log_rtsp_diagnostic(), recording
+    only protocol shape -- scheme, whether/which qop was selected, the
+    request path, both status codes, the Digest algorithm name, and
+    which challenge problem (if any) was hit. Never the username,
+    password, Authorization header, nonce, cnonce, or response hash --
+    see _log_rtsp_diagnostic()'s own docstring for the exact field
+    list."""
+    diag = {'path': path, 'scheme': None, 'qop_offered': None, 'qop_selected': None,
+            'first_status': None, 'retry_status': None, 'algorithm': None, 'challenge_issue': None}
+
+    def done(status, detail):
+        diag['outcome'] = status
+        _log_rtsp_diagnostic(diag)
+        return status, detail
+
     try:
         code, challenge = _rtsp_request('DESCRIBE', ip, port, path, timeout=timeout)
     except OSError as error:
-        return UNREACHABLE, f'Device unreachable: {error.__class__.__name__}'
+        return done(UNREACHABLE, f'Device unreachable: {error.__class__.__name__}')
+    diag['first_status'] = code
     if code == 200:
-        return NO_AUTH_REQUIRED, 'Device accepted DESCRIBE without credentials.'
+        return done(NO_AUTH_REQUIRED, 'Device accepted DESCRIBE without credentials.')
     if code != 401:
-        return MALFORMED_RESPONSE, f'Unexpected device response (RTSP {code or "no response"}).'
+        diag['challenge_issue'] = 'unexpected_first_status'
+        return done(MALFORMED_RESPONSE, f'Unexpected device response (RTSP {code or "no response"}).')
     if not challenge:
-        return MALFORMED_RESPONSE, 'Device returned 401 without an authentication challenge.'
+        diag['challenge_issue'] = 'no_challenge_header'
+        return done(MALFORMED_RESPONSE, 'Device returned 401 without an authentication challenge.')
     if not username and not password:
-        return AUTH_INCORRECT, 'Device requires authentication but no credentials were provided.'
+        return done(AUTH_INCORRECT, 'Device requires authentication but no credentials were provided.')
     scheme_word = challenge.split(None, 1)[0] if challenge.split() else ''
     scheme = scheme_word.lower()
+    diag['scheme'] = scheme or scheme_word or 'unknown'
     if scheme == 'basic':
         digest = None
     elif scheme == 'digest':
@@ -224,33 +292,42 @@ def classify_rtsp_authentication(ip, port, username, password, path='/', timeout
         realm = params.get('realm')
         nonce = params.get('nonce')
         if not realm or not nonce:
-            return UNSUPPORTED_CHALLENGE, 'Device sent a Digest challenge missing realm or nonce.'
+            diag['challenge_issue'] = 'missing_realm_or_nonce'
+            return done(UNSUPPORTED_CHALLENGE, 'Device sent a Digest challenge missing realm or nonce.')
         algorithm = (params.get('algorithm') or 'MD5').strip()
+        diag['algorithm'] = algorithm
         if algorithm.upper() != 'MD5':
-            return UNSUPPORTED_CHALLENGE, f'Device requires an unsupported Digest algorithm ({algorithm}).'
+            diag['challenge_issue'] = 'unsupported_algorithm'
+            return done(UNSUPPORTED_CHALLENGE, f'Device requires an unsupported Digest algorithm ({algorithm}).')
         qop_raw = params.get('qop')
+        diag['qop_offered'] = bool(qop_raw)
         qop = _select_qop(qop_raw)
+        diag['qop_selected'] = qop
         if qop_raw and qop is None:
-            return UNSUPPORTED_CHALLENGE, 'Device only offers unsupported qop options (no "auth").'
+            diag['challenge_issue'] = 'unsupported_qop'
+            return done(UNSUPPORTED_CHALLENGE, 'Device only offers unsupported qop options (no "auth").')
         uri = f'rtsp://{ip}:{port}{path}'
         if qop:
             digest = _digest_header(username, password, realm, nonce, 'DESCRIBE', uri, qop=qop, cnonce=secrets.token_hex(8), nc='00000001')
         else:
             digest = _digest_header(username, password, realm, nonce, 'DESCRIBE', uri)
     else:
-        return UNSUPPORTED_CHALLENGE, f'Device sent an unsupported authentication scheme ({scheme_word or "unknown"}).'
+        diag['challenge_issue'] = 'unsupported_scheme'
+        return done(UNSUPPORTED_CHALLENGE, f'Device sent an unsupported authentication scheme ({scheme_word or "unknown"}).')
     try:
         if digest:
             code2, _ = _rtsp_request('DESCRIBE', ip, port, path, digest=digest, timeout=timeout)
         else:
             code2, _ = _rtsp_request('DESCRIBE', ip, port, path, username=username, password=password, timeout=timeout)
     except OSError as error:
-        return UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}'
+        return done(UNREACHABLE, f'Device unreachable on retry: {error.__class__.__name__}')
+    diag['retry_status'] = code2
     if code2 == 200:
-        return AUTH_CORRECT, 'Credentials verified against the device via DESCRIBE.'
+        return done(AUTH_CORRECT, 'Credentials verified against the device via DESCRIBE.')
     if code2 == 401:
-        return AUTH_INCORRECT, 'Device rejected the provided credentials.'
-    return MALFORMED_RESPONSE, f'Unexpected device response on authenticated retry (RTSP {code2 or "no response"}).'
+        return done(AUTH_INCORRECT, 'Device rejected the provided credentials.')
+    diag['challenge_issue'] = 'unexpected_retry_status'
+    return done(MALFORMED_RESPONSE, f'Unexpected device response on authenticated retry (RTSP {code2 or "no response"}).')
 
 
 def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):

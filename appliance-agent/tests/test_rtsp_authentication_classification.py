@@ -555,3 +555,103 @@ def test_default_stream_path_matches_the_known_working_ryzen_and_camera_url_defa
     appliance's own CAMERA{n}_PATH default), confirmed correct for
     this exact camera via FFmpeg on Ryzen."""
     assert provisioning.DEFAULT_RTSP_STREAM_PATH == '/Streaming/Channels/101'
+
+
+# ------------------------------------------- temporary rtsp_auth_diagnostic
+#
+# TEMPORARY: coverage for the secret-safe diagnostic added to identify
+# the RTSP incompatibility that survived both the qop/Digest fix and
+# the /Streaming/Channels/101 path fix on the real Samsung camera.
+# Remove this section together with _log_rtsp_diagnostic() and its call
+# sites once that incompatibility is identified and fixed.
+
+import logging
+
+
+def test_diagnostic_logs_scheme_qop_path_and_statuses_for_a_qop_success(caplog):
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        with _FakeRtspCamera('digest-qop', username='admin', password='correct-pass', qop_offer='auth') as camera:
+            provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass', path='/Streaming/Channels/101')
+    records = [r for r in caplog.records if r.getMessage().startswith('rtsp_auth_diagnostic')]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert 'scheme=digest' in message
+    assert 'qop_offered=True' in message
+    assert 'qop_selected=auth' in message
+    assert 'path=/Streaming/Channels/101' in message
+    assert 'first_status=401' in message
+    assert 'retry_status=200' in message
+    assert 'algorithm=MD5' in message
+    assert 'challenge_issue=None' in message
+    assert f'outcome={provisioning.AUTH_CORRECT}' in message
+
+
+def test_diagnostic_records_qop_offered_false_for_legacy_digest(caplog):
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        with _FakeRtspCamera('digest', username='admin', password='correct-pass') as camera:
+            provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    message = next(r.getMessage() for r in caplog.records if r.getMessage().startswith('rtsp_auth_diagnostic'))
+    assert 'qop_offered=False' in message
+    assert 'qop_selected=None' in message
+
+
+def test_diagnostic_records_challenge_issue_for_unsupported_qop(caplog):
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        with _FakeRtspCamera('digest-qop', username='admin', password='correct-pass', qop_offer='auth-int') as camera:
+            provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    message = next(r.getMessage() for r in caplog.records if r.getMessage().startswith('rtsp_auth_diagnostic'))
+    assert 'challenge_issue=unsupported_qop' in message
+    assert f'outcome={provisioning.UNSUPPORTED_CHALLENGE}' in message
+    # No retry is ever attempted once the challenge is rejected as
+    # unsupported -- retry_status stays None.
+    assert 'retry_status=None' in message
+
+
+def test_diagnostic_records_scheme_for_basic_auth(caplog):
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        with _FakeRtspCamera('basic', username='admin', password='correct-pass') as camera:
+            provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    message = next(r.getMessage() for r in caplog.records if r.getMessage().startswith('rtsp_auth_diagnostic'))
+    assert 'scheme=basic' in message
+    assert 'algorithm=None' in message
+
+
+def test_diagnostic_logs_exactly_once_even_for_unreachable(caplog):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(('127.0.0.1', 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        provisioning.classify_rtsp_authentication('127.0.0.1', port, 'admin', 'pass', timeout=1)
+    records = [r for r in caplog.records if r.getMessage().startswith('rtsp_auth_diagnostic')]
+    assert len(records) == 1
+    assert f'outcome={provisioning.UNREACHABLE}' in records[0].getMessage()
+    assert 'scheme=None' in records[0].getMessage()
+
+
+def test_diagnostic_never_logs_credential_material_across_every_outcome(caplog):
+    """Sweeps every distinguishable outcome with a distinctive,
+    unmistakable password and asserts it (and the username, and the
+    fake camera's own nonce/realm, standing in for anything
+    challenge-derived) never appears in ANY log record produced during
+    that attempt -- not just the one rtsp_auth_diagnostic line."""
+    secret_password = 'unmistakable-diagnostic-canary-pw'
+    scenarios = [
+        _FakeRtspCamera('basic', username='admin', password=secret_password),
+        _FakeRtspCamera('digest', username='admin', password=secret_password),
+        _FakeRtspCamera('digest-qop', username='admin', password=secret_password, qop_offer='auth'),
+        _FakeRtspCamera('digest-qop', username='admin', password=secret_password, qop_offer='auth-int'),
+        _FakeRtspCamera('digest-bad-algorithm', username='admin', password=secret_password, algorithm='SHA-256'),
+        _FakeRtspCamera('malformed-401', username='admin', password=secret_password),
+        _FakeRtspCamera('unsupported-scheme', username='admin', password=secret_password, scheme='NTLM'),
+    ]
+    for camera in scenarios:
+        with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+            with camera:
+                provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', secret_password)
+        all_log_text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'admin' not in all_log_text
+        assert secret_password not in all_log_text
+        assert camera.NONCE not in all_log_text
+        assert camera.REALM not in all_log_text
+        caplog.clear()
