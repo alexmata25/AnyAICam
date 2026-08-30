@@ -89,12 +89,26 @@ class VerifyDeviceTests(unittest.TestCase):
         verify.assert_not_called()
 
     def test_credentials_supplied_delegates_to_rtsp_check(self):
+        # path is now DEFAULT_RTSP_STREAM_PATH, not omitted (which used
+        # to silently default to verify_rtsp_credentials()'s own bare-
+        # root '/') -- see test_rtsp_authentication_classification.py's
+        # own dedicated coverage of this fix for the live bug this
+        # closes (Samsung, camera device_key ...f6af: every real-camera
+        # check was authenticating against '/' instead of the actual
+        # stream resource).
         device = {'ip': '192.168.1.5', 'rtsp_support': True}
         with patch.object(provisioning, 'locate_device', return_value=device), \
              patch.object(provisioning, 'verify_rtsp_credentials', return_value=(True, 'ok')) as verify:
             success, message = provisioning.verify_device('k', {'username': 'admin', 'password': 'hunter2'})
         self.assertTrue(success)
-        verify.assert_called_once_with('192.168.1.5', 554, 'admin', 'hunter2')
+        verify.assert_called_once_with('192.168.1.5', 554, 'admin', 'hunter2', path=provisioning.DEFAULT_RTSP_STREAM_PATH)
+
+    def test_a_per_device_discovered_path_is_used_instead_of_the_default(self):
+        device = {'ip': '192.168.1.5', 'rtsp_support': True, 'rtsp_path': '/live/ch00_1'}
+        with patch.object(provisioning, 'locate_device', return_value=device), \
+             patch.object(provisioning, 'verify_rtsp_credentials', return_value=(True, 'ok')) as verify:
+            provisioning.verify_device('k', {'username': 'admin', 'password': 'hunter2'})
+        verify.assert_called_once_with('192.168.1.5', 554, 'admin', 'hunter2', path='/live/ch00_1')
 
     def test_message_never_contains_the_credential_values(self):
         # verify_rtsp_credentials() now issues a real RTSP DESCRIBE (see

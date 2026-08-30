@@ -273,6 +273,29 @@ def verify_rtsp_credentials(ip, port, username, password, path='/', timeout=3):
     return status in (NO_AUTH_REQUIRED, AUTH_CORRECT), detail
 
 
+# Confirmed live (Samsung, camera device_key ...f6af, verified read-only
+# against the codebase's own conventions before this fix): verify_device()
+# never passed a `path` to verify_rtsp_credentials() at all, so every
+# real-camera verification silently tested authentication against the
+# RTSP server's bare root ('/', verify_rtsp_credentials()'s own generic
+# default for a caller that only wants a reachability probe) instead of
+# an actual stream resource. RFC 2617's HA2=MD5(method:uri) binds the
+# Digest response to the specific request URI, and many camera RTSP
+# stacks additionally scope authorization per-resource -- a
+# mathematically correct response for '/' can still be rejected because
+# '/' was never the resource the account is authorized for, independent
+# of the qop fix above. discovery.py's candidate records carry no
+# per-device stream path at all (nothing upstream has ever resolved
+# one), so there is no "discovered" path to use yet -- this reuses the
+# exact same default this codebase already assumes everywhere else a
+# path isn't independently known (main.py's camera_url() legacy
+# fallback, and the Ryzen appliance's own CAMERA{n}_PATH default),
+# confirmed correct for this exact camera via FFmpeg on Ryzen. A real,
+# per-device discovered path (once one exists) should take priority
+# over this default, not replace it as the fallback.
+DEFAULT_RTSP_STREAM_PATH = '/Streaming/Channels/101'
+
+
 def verify_device(device_key, credentials, networks=None):
     """Top-level entry point used by the provisioning poller
     (service.py's poll_provisioning()). Returns (success, message);
@@ -289,4 +312,7 @@ def verify_device(device_key, credentials, networks=None):
     password = str((credentials or {}).get('password', ''))
     if not username and not password:
         return True, 'Device is reachable; no credentials were provided to verify.'
-    return verify_rtsp_credentials(device['ip'], 554, username, password)
+    # A per-device discovered path always wins once discovery.py can
+    # supply one; falls back to the fleet's known-good default above.
+    path = device.get('rtsp_path') or DEFAULT_RTSP_STREAM_PATH
+    return verify_rtsp_credentials(device['ip'], 554, username, password, path=path)

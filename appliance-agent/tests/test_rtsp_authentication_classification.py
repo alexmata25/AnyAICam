@@ -83,6 +83,7 @@ class _FakeRtspCamera:
         self.scheme = scheme
         self.status = status
         self.last_auth_header = None
+        self.last_describe_uri = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.bind(('127.0.0.1', 0))
         self.sock.listen(1)
@@ -114,6 +115,9 @@ class _FakeRtspCamera:
                 conn.settimeout(5)
                 data = conn.recv(4096).decode(errors='ignore')
                 self.requests_seen += 1
+                for line in data.splitlines():
+                    if line.startswith('DESCRIBE '):
+                        self.last_describe_uri = line.split(' ')[1]
                 conn.sendall(self._response_for(data).encode())
             finally:
                 conn.close()
@@ -504,3 +508,50 @@ def test_verify_device_end_to_end_succeeds_against_a_qop_auth_camera(monkeypatch
         success, message = provisioning.verify_device('k', {'username': 'admin', 'password': 'correct-pass'})
     assert success is True
     assert 'admin' not in message and 'correct-pass' not in message
+
+
+# ------------------------------------------- verify_device()'s RTSP path (the fix)
+#
+# Confirmed by code inspection (Samsung, camera device_key ...f6af):
+# verify_device() never passed a `path` to verify_rtsp_credentials() at
+# all, so every real-camera check silently authenticated against the
+# bare RTSP root ('/') instead of an actual stream resource -- never
+# the /Streaming/Channels/101 path Ryzen's own known-working config
+# uses for this exact camera. These monkeypatch verify_rtsp_credentials
+# forwarding the real `path` kwarg through (unlike the two tests above,
+# which don't care what path was used) specifically so the fake
+# camera's captured request line proves which URI was actually sent.
+
+def test_verify_device_uses_the_default_stream_path_not_bare_root(monkeypatch):
+    original_verify = provisioning.verify_rtsp_credentials
+    with _FakeRtspCamera('basic', username='admin', password='correct-pass') as camera:
+        device = {'ip': '127.0.0.1', 'rtsp_support': True, 'device_key': 'k'}
+        monkeypatch.setattr(provisioning, 'locate_device', lambda *a, **k: device)
+        monkeypatch.setattr(provisioning, 'verify_rtsp_credentials',
+                             lambda ip, port, u, p, path='/', **kw: original_verify('127.0.0.1', camera.port, u, p, path=path))
+        provisioning.verify_device('k', {'username': 'admin', 'password': 'correct-pass'})
+    assert camera.last_describe_uri == f'rtsp://127.0.0.1:{camera.port}{provisioning.DEFAULT_RTSP_STREAM_PATH}'
+    assert camera.last_describe_uri != f'rtsp://127.0.0.1:{camera.port}/'
+
+
+def test_verify_device_prefers_a_per_device_discovered_path_over_the_default(monkeypatch):
+    """A real, per-device discovered path (once discovery.py can supply
+    one) must take priority over the fleet-wide default -- the default
+    exists only because nothing upstream resolves one yet."""
+    original_verify = provisioning.verify_rtsp_credentials
+    with _FakeRtspCamera('basic', username='admin', password='correct-pass') as camera:
+        device = {'ip': '127.0.0.1', 'rtsp_support': True, 'device_key': 'k', 'rtsp_path': '/live/ch00_1'}
+        monkeypatch.setattr(provisioning, 'locate_device', lambda *a, **k: device)
+        monkeypatch.setattr(provisioning, 'verify_rtsp_credentials',
+                             lambda ip, port, u, p, path='/', **kw: original_verify('127.0.0.1', camera.port, u, p, path=path))
+        provisioning.verify_device('k', {'username': 'admin', 'password': 'correct-pass'})
+    assert camera.last_describe_uri == f'rtsp://127.0.0.1:{camera.port}/live/ch00_1'
+
+
+def test_default_stream_path_matches_the_known_working_ryzen_and_camera_url_default():
+    """Not an arbitrary new default -- pinned to the exact value this
+    codebase already uses everywhere else a path isn't independently
+    known (main.py's camera_url() legacy fallback; the Ryzen
+    appliance's own CAMERA{n}_PATH default), confirmed correct for
+    this exact camera via FFmpeg on Ryzen."""
+    assert provisioning.DEFAULT_RTSP_STREAM_PATH == '/Streaming/Channels/101'
