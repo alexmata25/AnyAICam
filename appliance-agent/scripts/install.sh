@@ -15,4 +15,16 @@ fi
 chown -R anyaicam:anyaicam /etc/anyaicam /var/lib/anyaicam /var/log/anyaicam
 systemctl daemon-reload
 systemctl enable anyaicam-agent.service
-echo "Installed. Run: sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup"
+# Confirmed live on Samsung: this used to only `enable` the service, never
+# start or restart it -- a fresh install left it enabled-but-not-running
+# until the next reboot, and a repair/update installed a new package
+# version into the venv while the OLD version kept running in memory
+# indefinitely (every RTSP-authentication fix this session required a
+# separate, manual `systemctl restart anyaicam-agent.service` afterward
+# for the new code to actually take effect). `restart`, not `start`, so
+# this is safe and idempotent on both a fresh install (starts it for the
+# first time) and a repair (picks up whatever was just pip-installed
+# above) -- exactly the same pattern installer/08-systemd-setup.sh already
+# uses for anyaicam-vms.service.
+systemctl restart anyaicam-agent.service
+echo "Installed and running. Run: sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup"
