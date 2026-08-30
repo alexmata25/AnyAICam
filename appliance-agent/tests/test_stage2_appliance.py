@@ -111,14 +111,27 @@ class VerifyDeviceTests(unittest.TestCase):
         verify.assert_called_once_with('192.168.1.5', 554, 'admin', 'hunter2', path='/live/ch00_1')
 
     def test_message_never_contains_the_credential_values(self):
-        # verify_rtsp_credentials() now issues a real RTSP DESCRIBE (see
-        # classify_rtsp_authentication()) rather than OPTIONS, so the
-        # patch target moved from _rtsp_options to the shared low-level
-        # _rtsp_request() helper both now share -- same interception
-        # point in spirit, same assertion.
+        # verify_rtsp_credentials() now opens one persistent
+        # _RtspSession spanning OPTIONS + both DESCRIBEs (see
+        # classify_rtsp_authentication()) instead of a socket per
+        # request -- the whole class is faked here so no real
+        # connection is attempted; same assertion as before, moved
+        # interception point.
+        class _FakeSession:
+            def __init__(self, ip, port, timeout=3):
+                pass
+
+            def request(self, method, uri, extra_headers=None):
+                if method == 'OPTIONS':
+                    return 200, {}
+                return 401, {'www-authenticate': 'Basic realm="cam"'}
+
+            def close(self):
+                pass
+
         device = {'ip': '192.168.1.5', 'rtsp_support': True}
         with patch.object(provisioning, 'locate_device', return_value=device), \
-             patch.object(provisioning, '_rtsp_request', return_value=(401, 'Basic realm="cam"')):
+             patch.object(provisioning, '_RtspSession', _FakeSession):
             success, message = provisioning.verify_device('k', {'username': 'admin', 'password': 'hunter2-secret'})
         self.assertNotIn('hunter2-secret', message)
         self.assertNotIn('admin', message)

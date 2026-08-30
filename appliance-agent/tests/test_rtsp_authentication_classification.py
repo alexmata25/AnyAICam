@@ -45,12 +45,21 @@ from anyaicam_agent import provisioning
 
 
 class _FakeRtspCamera:
-    """Listens on 127.0.0.1:<ephemeral>, accepts exactly one connection
-    per handled request, and replies according to `mode`:
+    """Listens on 127.0.0.1:<ephemeral>, accepts exactly ONE persistent
+    TCP connection -- matching the real client's _RtspSession, which
+    now keeps a single connection open across the whole OPTIONS ->
+    unauthenticated DESCRIBE -> authenticated DESCRIBE [-> stale-nonce
+    retry] exchange, rather than a fresh connection per request -- and
+    replies to each request read off that one connection in turn.
+    OPTIONS is always answered 200 unconditionally, regardless of
+    `mode`, and never counts toward the DESCRIBE-based challenge/verify
+    sequence below (matching classify_rtsp_authentication()'s own
+    "OPTIONS never gates anything" behavior).
+
+    `mode` selects the DESCRIBE challenge/verification behavior:
       - 'open': 200 to any DESCRIBE, no challenge ever issued.
-      - 'basic': challenges with WWW-Authenticate: Basic on the first
-        DESCRIBE, then checks the retry's Basic token against
-        (username, password) and replies 200 or 401 accordingly.
+      - 'basic': challenges with WWW-Authenticate: Basic, then checks
+        the retry's Basic token against (username, password).
       - 'digest': legacy (no qop) Digest challenge/response check,
         recomputing the expected response the same pre-RFC-2617 way a
         real older camera would.
@@ -69,12 +78,24 @@ class _FakeRtspCamera:
       - 'weird-status': returns an RTSP status this client can't
         interpret as authenticating anything (default 500), on the
         very first DESCRIBE -- no challenge, no retry.
+    `stale_once`, when True (digest/digest-qop modes only): the first
+    authenticated DESCRIBE is rejected with a fresh stale="true"
+    re-challenge (a new nonce); the SECOND authenticated DESCRIBE,
+    built against that new nonce, is verified normally. Never sent
+    more than once, matching classify_rtsp_authentication()'s own
+    single-retry contract.
+    `challenge_algorithm`/`challenge_opaque`, when set (digest/
+    digest-qop modes): included in every challenge issued, and
+    verified to have been echoed back correctly in the client's
+    response.
     """
 
     REALM = 'test-camera'
     NONCE = 'deadbeefcafefeed0123456789abcdef'
+    STALE_NONCE = 'freshnonceafterstalerechallenge0011'
 
-    def __init__(self, mode, username=None, password=None, qop_offer='auth', algorithm='SHA-256', scheme='NTLM', status=500):
+    def __init__(self, mode, username=None, password=None, qop_offer='auth', algorithm='SHA-256', scheme='NTLM',
+                 status=500, stale_once=False, challenge_algorithm=None, challenge_opaque=None):
         self.mode = mode
         self.username = username
         self.password = password
@@ -82,8 +103,14 @@ class _FakeRtspCamera:
         self.algorithm = algorithm
         self.scheme = scheme
         self.status = status
+        self.stale_once = stale_once
+        self.challenge_algorithm = challenge_algorithm
+        self.challenge_opaque = challenge_opaque
         self.last_auth_header = None
         self.last_describe_uri = None
+        self.cseqs_seen = []
+        self.connections_accepted = 0
+        self._stale_already_sent = False
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.bind(('127.0.0.1', 0))
         self.sock.listen(1)
@@ -102,31 +129,53 @@ class _FakeRtspCamera:
             pass
 
     def _serve(self):
-        # Handles up to two sequential connections (initial probe +
-        # authenticated retry) on the same ephemeral port, matching
-        # classify_rtsp_authentication()'s real two-request flow.
-        for _ in range(2):
-            try:
-                self.sock.settimeout(5)
-                conn, _addr = self.sock.accept()
-            except OSError:
-                return
-            try:
-                conn.settimeout(5)
-                data = conn.recv(4096).decode(errors='ignore')
-                self.requests_seen += 1
-                for line in data.splitlines():
-                    if line.startswith('DESCRIBE '):
-                        self.last_describe_uri = line.split(' ')[1]
-                conn.sendall(self._response_for(data).encode())
-            finally:
-                conn.close()
+        # Accepts exactly ONE connection, then handles every request
+        # read off it in sequence -- proving (by construction: listen
+        # backlog of 1, only ever accepted once) that the real client
+        # never opens a second connection mid-exchange.
+        try:
+            self.sock.settimeout(5)
+            conn, _addr = self.sock.accept()
+        except OSError:
+            return
+        self.connections_accepted += 1
+        try:
+            conn.settimeout(5)
+            buffer = ''
+            while True:
+                chunk = conn.recv(4096).decode(errors='ignore')
+                if not chunk:
+                    return
+                buffer += chunk
+                while '\r\n\r\n' in buffer:
+                    request_text, buffer = buffer.split('\r\n\r\n', 1)
+                    self.requests_seen += 1
+                    response = self._handle(request_text)
+                    conn.sendall(response.encode())
+        except OSError:
+            return
+        finally:
+            conn.close()
 
-    def _response_for(self, request_text):
+    def _handle(self, request_text):
+        lines = request_text.split('\r\n')
+        method = lines[0].split(' ')[0] if lines and lines[0] else ''
+        cseq_line = next((line for line in lines if line.lower().startswith('cseq:')), None)
+        if cseq_line:
+            self.cseqs_seen.append(cseq_line.split(':', 1)[1].strip())
+        if method == 'OPTIONS':
+            # Never gates anything -- always 200, regardless of `mode`.
+            return 'RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS, DESCRIBE\r\n\r\n'
+        for line in lines:
+            if line.startswith('DESCRIBE '):
+                self.last_describe_uri = line.split(' ')[1]
         auth_header = None
-        for line in request_text.splitlines():
+        for line in lines:
             if line.lower().startswith('authorization:'):
                 auth_header = line.split(':', 1)[1].strip()
+        return self._response_for(request_text, auth_header)
+
+    def _response_for(self, request_text, auth_header):
         if self.mode == 'open':
             return 'RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n'
         if self.mode == 'weird-status':
@@ -134,29 +183,41 @@ class _FakeRtspCamera:
         if self.mode == 'malformed-401':
             return 'RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\n\r\n'
         if auth_header is None:
-            challenge = self._challenge()
+            challenge = self._challenge(self.NONCE)
             return f'RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: {challenge}\r\n\r\n'
         self.last_auth_header = auth_header
-        ok = self._credential_accepted(auth_header, request_text)
+        if self.stale_once and not self._stale_already_sent and self.mode in ('digest', 'digest-qop'):
+            self._stale_already_sent = True
+            stale_challenge = self._challenge(self.STALE_NONCE, stale=True)
+            return f'RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: {stale_challenge}\r\n\r\n'
+        nonce_used = self.STALE_NONCE if (self.stale_once and self._stale_already_sent) else self.NONCE
+        ok = self._credential_accepted(auth_header, request_text, nonce_used)
         return ('RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n' if ok else
                 'RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\n\r\n')
 
-    def _challenge(self):
+    def _challenge(self, nonce, stale=False):
+        extras = ''
+        if self.challenge_algorithm and self.mode in ('digest', 'digest-qop'):
+            extras += f', algorithm={self.challenge_algorithm}'
+        if self.challenge_opaque and self.mode in ('digest', 'digest-qop'):
+            extras += f', opaque="{self.challenge_opaque}"'
+        if stale:
+            extras += ', stale=true'
         if self.mode == 'basic':
             return f'Basic realm="{self.REALM}"'
         if self.mode == 'digest':
-            return f'Digest realm="{self.REALM}", nonce="{self.NONCE}"'
+            return f'Digest realm="{self.REALM}", nonce="{nonce}"{extras}'
         if self.mode == 'digest-qop':
-            return f'Digest realm="{self.REALM}", nonce="{self.NONCE}", qop="{self.qop_offer}"'
+            return f'Digest realm="{self.REALM}", nonce="{nonce}", qop="{self.qop_offer}"{extras}'
         if self.mode == 'digest-bad-algorithm':
-            return f'Digest realm="{self.REALM}", nonce="{self.NONCE}", algorithm={self.algorithm}'
+            return f'Digest realm="{self.REALM}", nonce="{nonce}", algorithm={self.algorithm}'
         if self.mode == 'digest-missing-nonce':
             return f'Digest realm="{self.REALM}"'
         if self.mode == 'unsupported-scheme':
             return f'{self.scheme} realm="{self.REALM}"'
         raise AssertionError(f'no challenge defined for mode {self.mode!r}')
 
-    def _credential_accepted(self, auth_header, request_text):
+    def _credential_accepted(self, auth_header, request_text, nonce):
         if self.mode == 'basic':
             token = base64.b64encode(f'{self.username}:{self.password}'.encode()).decode()
             return auth_header == f'Basic {token}'
@@ -165,20 +226,26 @@ class _FakeRtspCamera:
         # (unknown ahead of time; extracted from the header itself, same
         # as a real verifier would) for the qop-aware formula.
         uri_match = None
-        for line in request_text.splitlines():
+        for line in request_text.split('\r\n'):
             if line.startswith('DESCRIBE '):
                 uri_match = line.split(' ')[1]
         ha1 = hashlib.md5(f'{self.username}:{self.REALM}:{self.password}'.encode()).hexdigest()
         ha2 = hashlib.md5(f'DESCRIBE:{uri_match}'.encode()).hexdigest()
+        if self.challenge_algorithm and self.mode in ('digest', 'digest-qop'):
+            if _digest_field(auth_header, 'algorithm') != self.challenge_algorithm:
+                return False  # must be echoed back exactly as challenged
+        if self.challenge_opaque and self.mode in ('digest', 'digest-qop'):
+            if _digest_field(auth_header, 'opaque') != self.challenge_opaque:
+                return False  # must be echoed back exactly as challenged
         if self.mode == 'digest-qop':
             nc = _digest_field(auth_header, 'nc')
             cnonce = _digest_field(auth_header, 'cnonce')
             qop_used = _digest_field(auth_header, 'qop')
             if not (nc and cnonce and qop_used):
                 return False  # a compliant qop=auth response must include all three
-            expected = hashlib.md5(f'{ha1}:{self.NONCE}:{nc}:{cnonce}:{qop_used}:{ha2}'.encode()).hexdigest()
+            expected = hashlib.md5(f'{ha1}:{nonce}:{nc}:{cnonce}:{qop_used}:{ha2}'.encode()).hexdigest()
             return f'response="{expected}"' in auth_header and nc == '00000001'
-        expected = hashlib.md5(f'{ha1}:{self.NONCE}:{ha2}'.encode()).hexdigest()
+        expected = hashlib.md5(f'{ha1}:{nonce}:{ha2}'.encode()).hexdigest()
         return f'response="{expected}"' in auth_header
 
 
@@ -581,8 +648,12 @@ def test_diagnostic_logs_scheme_qop_path_and_statuses_for_a_qop_success(caplog):
     assert 'path=/Streaming/Channels/101' in message
     assert 'first_status=401' in message
     assert 'retry_status=200' in message
-    assert 'algorithm=MD5' in message
+    # This challenge never included an algorithm parameter -- the
+    # diagnostic reports exactly what the challenge specified (None
+    # here), never a default the challenge itself never asked for.
+    assert 'algorithm=None' in message
     assert 'challenge_issue=None' in message
+    assert 'stale_retry=False' in message
     assert f'outcome={provisioning.AUTH_CORRECT}' in message
 
 
@@ -655,3 +726,127 @@ def test_diagnostic_never_logs_credential_material_across_every_outcome(caplog):
         assert camera.NONCE not in all_log_text
         assert camera.REALM not in all_log_text
         caplog.clear()
+
+
+# ------------------------------------------- session/protocol compatibility
+#
+# Coverage for the fixes made after directly comparing this client
+# against the known-working Ryzen/FFmpeg RTSP exchange for the same
+# camera and path (192.168.0.38, /Streaming/Channels/101): a single
+# persistent TCP connection, an incrementing CSeq, a normal
+# User-Agent, an OPTIONS preflight, echoing algorithm/opaque when the
+# challenge specifies them, and supporting one stale-nonce
+# re-challenge -- none of which the original per-request-socket client
+# did.
+
+def test_options_and_both_describes_use_one_persistent_connection():
+    with _FakeRtspCamera('digest-qop', username='admin', password='correct-pass', qop_offer='auth') as camera:
+        status, _ = provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    assert status == provisioning.AUTH_CORRECT
+    assert camera.connections_accepted == 1, 'OPTIONS + both DESCRIBEs must share one TCP connection, not reconnect per request'
+    assert camera.requests_seen == 3  # OPTIONS, unauthenticated DESCRIBE, authenticated DESCRIBE
+
+
+def test_cseq_increments_across_the_session():
+    with _FakeRtspCamera('digest', username='admin', password='correct-pass') as camera:
+        provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    assert camera.cseqs_seen == ['1', '2', '3']
+
+
+def test_options_is_sent_before_describe():
+    with _FakeRtspCamera('open') as camera:
+        provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    # 'open' mode's very first non-OPTIONS request already gets 200
+    # (NO_AUTH_REQUIRED) -- two total requests were seen, and the CSeq
+    # sequence proves OPTIONS was first.
+    assert camera.requests_seen == 2
+    assert camera.cseqs_seen == ['1', '2']
+
+
+def test_user_agent_and_accept_headers_are_sent(monkeypatch):
+    """Structural proof the real wire request carries both headers --
+    not inferred from a successful outcome alone."""
+    seen_requests = []
+    real_sock_class = socket.socket
+
+    class _RecordingSocket(real_sock_class):
+        def sendall(self, data, *a, **kw):
+            seen_requests.append(data.decode(errors='ignore'))
+            return super().sendall(data, *a, **kw)
+
+    monkeypatch.setattr(provisioning.socket, 'socket', lambda *a, **k: _RecordingSocket(*a, **k))
+    with _FakeRtspCamera('open') as camera:
+        provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    assert any('User-Agent: AnyAiCamAgent' in r for r in seen_requests)
+    describe_requests = [r for r in seen_requests if r.startswith('DESCRIBE ')]
+    assert describe_requests and all('Accept: application/sdp' in r for r in describe_requests)
+
+
+def test_algorithm_and_opaque_are_echoed_when_challenge_specifies_them():
+    with _FakeRtspCamera('digest', username='admin', password='correct-pass',
+                          challenge_algorithm='MD5', challenge_opaque='5ccc069c403ebaf9f0171e9517f40e41') as camera:
+        status, detail = provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+        auth_header = camera.last_auth_header
+    assert status == provisioning.AUTH_CORRECT
+    assert _digest_field(auth_header, 'algorithm') == 'MD5'
+    assert _digest_field(auth_header, 'opaque') == '5ccc069c403ebaf9f0171e9517f40e41'
+
+
+def test_algorithm_and_opaque_are_never_invented_when_challenge_omits_them():
+    with _FakeRtspCamera('digest', username='admin', password='correct-pass') as camera:
+        provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+        auth_header = camera.last_auth_header
+    assert 'algorithm=' not in auth_header
+    assert 'opaque=' not in auth_header
+
+
+def test_stale_nonce_retry_succeeds_once_with_the_new_nonce():
+    with _FakeRtspCamera('digest', username='admin', password='correct-pass', stale_once=True) as camera:
+        status, detail = provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    assert status == provisioning.AUTH_CORRECT
+    assert 'admin' not in detail and 'correct-pass' not in detail
+    # OPTIONS, unauth DESCRIBE, first auth DESCRIBE (rejected as stale),
+    # second auth DESCRIBE (accepted against the new nonce).
+    assert camera.requests_seen == 4
+    assert camera.connections_accepted == 1
+
+
+def test_stale_nonce_retry_works_for_qop_auth_too():
+    with _FakeRtspCamera('digest-qop', username='admin', password='correct-pass', qop_offer='auth', stale_once=True) as camera:
+        status, _ = provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    assert status == provisioning.AUTH_CORRECT
+
+
+def test_stale_retry_is_attempted_only_once_not_looped(caplog):
+    """Confirms the diagnostic's own stale_retry/stale_retry_status
+    fields reflect exactly one retry -- not a loop -- and that a
+    second stale challenge (were a misbehaving camera to send one)
+    would surface as AUTH_INCORRECT rather than retrying forever.
+    Verified here via the recorded diagnostic rather than a third
+    camera-side stale challenge, since this client's own contract is
+    "one retry, then stop" regardless of what the device does next."""
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        with _FakeRtspCamera('digest', username='admin', password='correct-pass', stale_once=True) as camera:
+            provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'correct-pass')
+    message = next(r.getMessage() for r in caplog.records if r.getMessage().startswith('rtsp_auth_diagnostic'))
+    assert 'stale_retry=True' in message
+    assert 'stale_retry_status=200' in message
+
+
+def test_stale_retry_still_fails_closed_on_wrong_credentials():
+    with _FakeRtspCamera('digest', username='admin', password='correct-pass', stale_once=True) as camera:
+        status, detail = provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', 'wrong-pass')
+    assert status == provisioning.AUTH_INCORRECT
+
+
+def test_no_secrets_leak_across_the_full_session_including_stale_retry(caplog):
+    secret_password = 'unmistakable-session-canary-pw'
+    with caplog.at_level(logging.INFO, logger='anyaicam.agent'):
+        with _FakeRtspCamera('digest', username='admin', password=secret_password, stale_once=True,
+                              challenge_algorithm='MD5', challenge_opaque='opaque-canary-value') as camera:
+            provisioning.classify_rtsp_authentication('127.0.0.1', camera.port, 'admin', secret_password)
+    all_log_text = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'admin' not in all_log_text
+    assert secret_password not in all_log_text
+    assert camera.NONCE not in all_log_text
+    assert camera.STALE_NONCE not in all_log_text
