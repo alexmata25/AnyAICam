@@ -655,7 +655,20 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         cameras=rows("SELECT id,name,site_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? ORDER BY created_at",(identity['customer_id'],))
         for camera in cameras: camera['credentials_configured']=bool(row('SELECT 1 FROM camera_credentials WHERE camera_id=?',(camera['id'],)))
         plan=row('SELECT camera_quantity FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(identity['customer_id'],)) or {}
-        configured=len([c for c in cameras if c['status']=='configured'])
+        # Confirmed live: counting by status=='configured' alone let an
+        # onboarding placeholder (device_key=NULL, never a real discovered
+        # device) count as "configured" the instant its name was saved
+        # through Step 5's "Save camera setup" -- the same click that
+        # correctly marks a REAL provisioned camera configured, with no way
+        # to tell the two apart from status alone. A real, provisioned
+        # camera always has a device_key (see appliance_cloud.py's
+        # appliance_submit_provisioning(), the only code path that ever
+        # creates a cameras row from a confirmed device) and a real
+        # camera_number (camera_mapping.py's assign_camera_number(),
+        # called from that same path); a placeholder has neither. Counting
+        # by device_key here -- not status -- so a customer's progress
+        # reflects real, working cameras, never a renamed placeholder.
+        configured=len([c for c in cameras if c.get('device_key')])
         expected=int(plan.get('camera_quantity') or 0)
         return {'cameras':cameras,'expected_camera_count':expected,'configured_camera_count':configured,'onboarding_complete':expected>0 and configured>=expected}
 
