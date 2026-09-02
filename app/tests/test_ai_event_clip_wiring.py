@@ -297,64 +297,6 @@ def test_no_qualifying_detections_schedules_nothing(monkeypatch, tmp_path, fake_
     assert fake_uploader == []
 
 
-def test_store_motion_event_is_completely_unmodified_on_this_branch(monkeypatch, tmp_path):
-    """Regression check for this branch specifically: 9d349a9's own
-    store_motion_event() predates build_motion_event_clip() entirely
-    (that function did not exist anywhere in this branch's lineage
-    before this reconciliation) and still uses its own existing
-    linked_recording_for() Media-Fragment behavior, deliberately left
-    unmodified here -- build_motion_event_clip() was added purely as a
-    standalone function for save_yolo_events()'s own accepted AI-event
-    wiring to call. On the EC2/Samsung production builds this
-    reconciliation was validated against, store_motion_event() *does*
-    already call build_motion_event_clip() (a separate, earlier-built
-    feature on that lineage) -- reconciling that upgrade onto this
-    branch too is explicitly out of scope for this commit."""
-    monkeypatch.setattr(main, "get_alert_rule", lambda camera_number: mock.Mock(enabled=False, event_types=[]))
-    monkeypatch.setattr(main, "append_motion_event", lambda line: None)
-
-    async def fake_create_motion_thumbnail(*args, **kwargs):
-        return "/recordings/media/motion/fake.jpg"
-
-    monkeypatch.setattr(main, "create_motion_thumbnail", fake_create_motion_thumbnail)
-
-    clip_calls = []
-
-    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
-        clip_calls.append((event_id, camera_number, start, end))
-        return None
-
-    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
-
-    linked_recording_calls = []
-
-    def fake_linked_recording_for(*args, **kwargs):
-        linked_recording_calls.append(args)
-        return None
-
-    monkeypatch.setattr(main, "linked_recording_for", fake_linked_recording_for)
-
-    async def _runner():
-        now = datetime.now()
-        await main.store_motion_event(
-            camera_number=1,
-            start_time=now,
-            end_time=now,
-            score=50.0,
-            frame=b"fake-jpeg-bytes",
-        )
-        pending = list(main.clip_tasks)
-        if pending:
-            await asyncio.gather(*pending)
-
-    asyncio.run(_runner())
-
-    assert clip_calls == [], \
-        "build_motion_event_clip() must not be called by store_motion_event() on this branch -- that wiring is out of today's scope"
-    assert len(linked_recording_calls) == 1, \
-        "store_motion_event() must still use its own existing linked_recording_for(), completely unchanged"
-
-
 def test_build_motion_event_clip_exists_standalone_and_is_reusable(monkeypatch, tmp_path):
     """build_motion_event_clip() itself is new to this branch (added
     solely so the accepted AI-event wiring below has a real function

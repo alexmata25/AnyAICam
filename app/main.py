@@ -34611,7 +34611,7 @@ async def store_motion_event(
 
 
 
-        linked_recording=linked_recording_for(camera_number, start_time, end_time),
+        linked_recording=f"/recordings/clips/motion/motion_{event_id}.mp4",
 
 
 
@@ -34628,6 +34628,21 @@ async def store_motion_event(
 
 
 
+
+    # Basic Motion is also a first-class analytics-history event.
+    # Keep the legacy motion_events.jsonl write below for compatibility,
+    # while mirroring the minimal event into analytics_events.json so the
+    # existing appliance -> cloud analytics sync can index it for mobile
+    # Playback.
+    append_analytics_event({
+        "id": event.id,
+        "camera": camera_number,
+        "event_type": "motion",
+        "timestamp": start_time.isoformat(),
+        "confidence": event.confidence,
+        "object_count": 1,
+        "detections": [],
+    })
 
     line = event.model_dump_json() + "\n"
 
@@ -34648,6 +34663,48 @@ async def store_motion_event(
 
 
         await asyncio.to_thread(append_motion_event, line)
+
+        # Build the standalone customer event clip independently of event
+        # persistence/notifications. The builder waits until the configured
+        # 5-second post-roll exists, then extracts:
+        # 5s pre-roll + full event duration + 5s post-roll. Reconciled from
+        # the accepted, live-tested (EC2 and Samsung production) real-clip
+        # + cloud-upload pipeline -- traced directly from the working
+        # Samsung appliance's own store_motion_event(), not invented.
+        async def build_and_upload_event_media() -> None:
+            clip_url = await build_motion_event_clip(
+                event_id,
+                camera_number,
+                start_time,
+                end_time,
+            )
+
+            if not clip_url:
+                return
+
+            try:
+                from event_media_uploader import upload_motion_event_media
+
+                await asyncio.to_thread(
+                    upload_motion_event_media,
+                    event_id=event_id,
+                    camera_number=camera_number,
+                    event_start=start_time,
+                    event_end=end_time,
+                    clip_url=clip_url,
+                    thumbnail_url=thumbnail,
+                )
+            except Exception as error:
+                print(
+                    f"Motion event {event_id}: media upload failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+        clip_task = asyncio.create_task(
+            build_and_upload_event_media()
+        )
+        clip_tasks.add(clip_task)
+        clip_task.add_done_callback(clip_tasks.discard)
 
 
 
