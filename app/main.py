@@ -8166,6 +8166,42 @@ clip_tasks: set[asyncio.Task] = set()
 motion_event_lock = asyncio.Lock()
 
 
+# Per-camera dedup for AI-classification event clips (2026-09-02): a
+# single scene often produces several near-simultaneous detections --
+# multiple object classes in one frame (save_yolo_events()'s own
+# grouped-by-class-name loop below), or the same person walking
+# through several consecutive detection scans -- and none of those
+# should trigger its own separate clip extraction+upload covering
+# nearly-identical footage. Tracks the most recently built (or
+# in-flight) clip window per camera; a new detection whose window
+# event_clips.should_merge()s with it is treated as the same real
+# event and skipped -- exactly the rule event_clips.py's own
+# docstring already describes ("a burst of near-simultaneous or
+# rapidly repeated detections produces one clip, not several"), just
+# not previously wired into this detection path.
+ai_event_clip_windows: dict[int, tuple] = {}
+ai_event_clip_windows_lock = threading.Lock()
+
+# The main application event loop, captured lazily on ai_person_detector()'s
+# own first run (see that function's own opening lines) -- confirmed live
+# on the Samsung appliance that save_yolo_events() actually executes via
+# `await asyncio.to_thread(save_yolo_events, ...)`, a worker thread with no
+# event loop of its own. asyncio.ensure_future()/asyncio.create_task() only
+# ever schedule onto "the current thread's running loop" -- called from
+# that worker thread, there isn't one, so an earlier version of this fix's
+# ensure_future() call always raised RuntimeError and was silently
+# swallowed, meaning no AI-classification clip was ever actually built,
+# despite compiling and testing cleanly (every automated test scheduled
+# from the main thread, exactly the one case that already worked).
+# asyncio.run_coroutine_threadsafe(coro, loop) is the correct primitive for
+# scheduling from a different thread onto a specific, already-running loop
+# -- ai_person_detector() is itself created via asyncio.create_task() on
+# the real main loop (see the lifespan() startup block), so capturing it
+# there, once, is sufficient for every later save_yolo_events() call for
+# any camera.
+_ai_event_media_loop: "asyncio.AbstractEventLoop | None" = None
+
+
 
 
 
@@ -34300,6 +34336,137 @@ async def create_motion_thumbnail(
 
 
 
+async def build_motion_event_clip(
+    event_id: str,
+    camera_number: int,
+    event_start: datetime,
+    event_end: datetime,
+) -> str | None:
+    """Create a standalone MP4 covering 5s pre-roll + event + 5s post-roll.
+
+    Reconciled from the accepted, live-tested (production EC2 25a25d3a
+    build, and the Samsung appliance's own production build) real-clip
+    extraction pipeline -- 9d349a9's own store_motion_event() below
+    still uses the older linked_recording_for() Media-Fragment stopgap
+    and is deliberately left unmodified here (a separate, pre-existing
+    behavior on this branch, not part of today's reconciliation scope).
+    This function exists on this branch solely so save_yolo_events()'s
+    own accepted AI-classification clip/upload wiring (below) has a
+    real function to call -- it did not exist anywhere in 9d349a9's
+    lineage before this commit."""
+    from event_clips import compute_clip_window
+
+    window = compute_clip_window(event_start, event_end)
+
+    # Do not try to extract post-roll before that footage exists. Add a
+    # small completion margin so the active recording segment has flushed.
+    wait_seconds = max(
+        0.0,
+        (window.end - datetime.now()).total_seconds(),
+    ) + 3.0
+    if wait_seconds:
+        await asyncio.sleep(wait_seconds)
+
+    camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+    candidates: list[tuple[datetime, Path]] = []
+
+    for source in sorted(camera_folder.glob("*.mkv")):
+        source_start = recording_start(source, camera_number)
+        if (
+            source_start
+            and source_start < window.end
+            and source_start + timedelta(minutes=5) > window.start
+        ):
+            candidates.append((source_start, source))
+
+    if not candidates:
+        print(
+            f"Motion event {event_id}: no completed recordings cover "
+            f"camera {camera_number} event window."
+        )
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    first_start = candidates[0][0]
+    offset_seconds = max(0.0, (window.start - first_start).total_seconds())
+    duration_seconds = (window.end - window.start).total_seconds()
+
+    event_folder = CLIPS_FOLDER / "motion"
+    event_folder.mkdir(parents=True, exist_ok=True)
+
+    list_file = event_folder / f".{event_id}.txt"
+    output_path = event_folder / f"motion_{event_id}.mp4"
+    temp_path = event_folder / f".{event_id}.mp4"
+
+    try:
+        list_file.write_text(
+            "".join(
+                f"file '{source.as_posix()}'\n"
+                for _, source in candidates
+            ),
+            encoding="utf-8",
+        )
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-ss", str(offset_seconds),
+            "-t", str(duration_seconds),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-movflags", "+faststart",
+            str(temp_path),
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            error_text = stderr.decode(
+                "utf-8", errors="replace"
+            )[-600:]
+            raise RuntimeError(
+                f"Motion event clip processing failed: {error_text}"
+            )
+
+        temp_path.replace(output_path)
+
+        print(
+            f"Motion event {event_id}: created clip "
+            f"{output_path.name} ({duration_seconds:.1f}s)."
+        )
+
+        return f"/recordings/clips/motion/{quote(output_path.name)}"
+
+    except Exception as error:
+        print(
+            f"Motion event {event_id}: clip creation failed: "
+            f"{type(error).__name__}: {error}"
+        )
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    finally:
+        try:
+            list_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 async def store_motion_event(
 
 
@@ -36741,6 +36908,15 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
     }
 
+    # Every class this function draws a box for and writes an
+    # analytics event for (i.e. every key above) is eligible for the
+    # same real short clip motion events already get -- reusing
+    # class_colors' own key set rather than a second, possibly-
+    # drifting list. "smart_motion" is a distinct event_type produced
+    # elsewhere, not by this function, and is not covered here.
+    AI_CLIP_EVENT_TYPES = frozenset(class_colors.keys())
+
+
 
 
 
@@ -37101,6 +37277,120 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         grouped.setdefault(detection["class_name"], []).append(detection)
 
+    # Real short clip + cloud upload for qualifying AI-classification
+    # detections (2026-09-02): reuses build_motion_event_clip(),
+    # compute_clip_window(), and -- traced live on the Samsung
+    # appliance, not guessed -- event_media_uploader.upload_motion_
+    # event_media() exactly as store_motion_event() already wires them
+    # together on the live production build, in the same nested-build-
+    # then-upload-task shape, using the same recording_uploader.py
+    # S3/session machinery that function already reuses. No second
+    # uploader.
+    #
+    # upload_motion_event_media() looks its event up in
+    # ANALYTICS_EVENTS_FILE by exact id match before it will register
+    # media (see _ensure_detection_event_synced() in event_media_
+    # uploader.py) -- so the clip's event_id must be the SAME id as
+    # one real local analytics event, not a separate group id. A scan
+    # can still produce several per-class analytics events (person AND
+    # car in one frame keep their own existing, independent ids/
+    # records, unchanged) but only ONE of them -- the first qualifying
+    # class, "primary_class_name" -- owns event_group_id, the clip,
+    # and the upload; detection_event_media.detection_event_id is
+    # UNIQUE in the cloud schema, so only one event could ever own a
+    # given clip's registration anyway. The others' event_clip stays
+    # None, exactly as an analytics-only event's already does.
+    #
+    # One clip per scan, not one per detected class -- every class in
+    # this scan shares event_group_id's window, and
+    # ai_event_clip_windows/should_merge() below skips a new
+    # extraction+upload entirely when this scan's window merges with
+    # the camera's most recently built one (a burst of repeated
+    # detections of the same real event), matching event_clips.py's
+    # own documented merge rule.
+    event_clip_path: str | None = None
+    primary_class_name: str | None = None
+    qualifying_detections = [
+        detection for detection in detections
+        if detection["class_name"] in AI_CLIP_EVENT_TYPES
+    ]
+    if qualifying_detections:
+        from event_clips import compute_clip_window, should_merge
+
+        window = compute_clip_window(now, now)
+        with ai_event_clip_windows_lock:
+            previous_window = ai_event_clip_windows.get(camera_number)
+            is_duplicate = (
+                previous_window is not None
+                and should_merge(previous_window.end, window.start)
+            )
+            ai_event_clip_windows[camera_number] = window
+
+        if not is_duplicate:
+            primary_class_name = qualifying_detections[0]["class_name"]
+            # Optimistic path, matching store_motion_event()'s own
+            # convention: extraction/upload run in the background (the
+            # extractor waits out the post-roll first), so this is the
+            # location the clip will exist at once that finishes, not
+            # a confirmation it already has or that upload succeeded.
+            event_clip_path = (
+                f"/recordings/clips/motion/motion_{event_group_id}.mp4"
+            )
+
+            async def build_and_upload_ai_event_media() -> None:
+                clip_url = await build_motion_event_clip(
+                    event_group_id, camera_number, now, now
+                )
+                if not clip_url:
+                    return
+                try:
+                    from event_media_uploader import upload_motion_event_media
+                    await asyncio.to_thread(
+                        upload_motion_event_media,
+                        event_id=event_group_id,
+                        camera_number=camera_number,
+                        event_start=now,
+                        event_end=now,
+                        clip_url=clip_url,
+                        thumbnail_url=thumbnail_url,
+                    )
+                except Exception as error:
+                    print(
+                        f"AI event {event_group_id}: media upload failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+            # save_yolo_events() executes via await asyncio.to_thread(...)
+            # (confirmed live on the Samsung appliance) -- a worker thread
+            # with no event loop of its own, so asyncio.ensure_future()/
+            # asyncio.create_task() cannot be used here (each only
+            # schedules onto "the current thread's running loop"; called
+            # from a thread with none, they raise RuntimeError).
+            # asyncio.run_coroutine_threadsafe(coro, loop) is the correct
+            # cross-thread primitive: it hands the coroutine to a specific,
+            # already-running loop -- _ai_event_media_loop, captured once
+            # on ai_person_detector()'s own first run (see that function's
+            # own opening lines) -- regardless of which thread is doing
+            # the scheduling.
+            if _ai_event_media_loop is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        build_and_upload_ai_event_media(), _ai_event_media_loop
+                    )
+                except RuntimeError as error:
+                    # Fail open -- the analytics event itself and its
+                    # existing linked_recording fallback are unaffected --
+                    # but LOGGED, not silently swallowed.
+                    print(
+                        f"AI event {event_group_id}: could not schedule "
+                        f"clip build/upload: {type(error).__name__}: {error}"
+                    )
+            else:
+                print(
+                    f"AI event {event_group_id}: could not schedule clip "
+                    f"build/upload: no main event loop captured yet."
+                )
+
 
 
 
@@ -37162,7 +37452,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-            id=uuid.uuid4().hex[:12],
+            id=(event_group_id if class_name == primary_class_name else uuid.uuid4().hex[:12]),
 
 
 
@@ -37272,6 +37562,17 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         event["detections"] = class_detections
 
+        # New, additive field -- only the one primary_class_name event
+        # this scan actually owns the clip/upload for gets a path; a
+        # secondary class detected in the same frame (e.g. person AND
+        # car) keeps its own independent analytics-history record but
+        # None here, exactly like an analytics-only event already had
+        # -- detection_event_media.detection_event_id is UNIQUE in the
+        # cloud schema, so only one event could ever own this clip's
+        # registration anyway. Existing "linked_recording" above is
+        # untouched, so nothing that already reads it changes behavior.
+        event["event_clip"] = event_clip_path if class_name == primary_class_name else None
+
 
 
 
@@ -37334,6 +37635,18 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 async def ai_person_detector(camera_number: int) -> None:
+    # Captured once, lazily, on whichever camera's detector task happens
+    # to start first -- this coroutine is itself created via
+    # asyncio.create_task() on the real main event loop (see lifespan()'s
+    # own startup block), so this is a reliable, one-time way to obtain
+    # that loop for save_yolo_events()'s own cross-thread scheduling
+    # (that function runs via asyncio.to_thread(), a worker thread with
+    # no running loop of its own -- see _ai_event_media_loop's own
+    # module-level comment).
+    global _ai_event_media_loop
+    if _ai_event_media_loop is None:
+        _ai_event_media_loop = asyncio.get_running_loop()
+
 
 
 
