@@ -52854,10 +52854,13 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
     from partner_db import connection
     select = (
         'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
-        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+        'CASE WHEN dem.id IS NOT NULL THEN 1 ELSE 0 END AS has_event_clip, '
+        'dem.thumbnail_s3_key AS thumbnail_s3_key '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
         'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
     )
     with connection() as db:
         if identity.get("role") == "customer_owner":
@@ -52889,8 +52892,12 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
             "direction": None,
             "timestamp": row["event_timestamp"],
             "confidence": row["confidence"],
-            "thumbnail": None,
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
             "linked_recording": None,
+            "has_event_clip": bool(row["has_event_clip"]),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
@@ -118699,20 +118706,73 @@ def _event_confidence_percent(confidence) -> str:
     return f"{percent:.1f}%"
 
 
-def _customer_event_actions(camera_id) -> str:
+def _naive_utc_timestamp_to_epoch_ms(raw_timestamp) -> int | None:
+    """Converts one of this system's naive-UTC event/recording
+    timestamp strings into an unambiguous epoch-millisecond integer for
+    embedding in a URL -- see _customer_event_actions()'s own docstring
+    for why. The naive string is explicitly labeled UTC (matching every
+    other place in this codebase that has confirmed these values are
+    UTC -- see _customer_camera_events()'s own docstring), then
+    converted; no ambiguous, timezone-less string is ever handed to a
+    browser's Date parser for this value. Returns None (never raises)
+    for anything that doesn't parse, so a caller can fail open to a
+    plain, non-deep-linked href."""
+    try:
+        text = str(raw_timestamp)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
     """The same two useful actions on every real customer event/alert
-    row: jump to that camera's live view, or to Playback. Playback
-    isn't deep-linkable to a specific camera/time yet (see
-    _render_customer_playback()'s own docstring on the recording
-    catalog still being empty in practice) -- linking to /playback
-    generally is still strictly more useful than no playback link at
-    all, and becomes a real deep link the moment that catalog is
-    populated, with no change needed here."""
+    row: jump to that camera's live view, or to Playback.
+
+    Root cause (2026-09-02, "playable events depend on a nearby
+    continuous recording" bug): the prior fix here correctly routed
+    Playback to the event's own camera, but always via ?t=<event time>
+    -> renderCamera()'s findClipNear() against catalog *recordings* --
+    i.e. "find whatever 5-minute recording happens to cover this
+    moment", never the event's own short clip. For any event whose
+    moment falls in a real gap between recordings (not rare -- see the
+    per-camera gap data in this project's earlier timeline
+    investigation), findClipNear() legitimately finds nothing,
+    playClip() is never called, and the event silently "does not
+    play" even though a real, playable, already-authorized event clip
+    exists at the object detection pipeline's own
+    detection_event_media/{event_id}. Deliberately not widening the
+    near= match window to paper over this -- that would risk playing
+    unrelated footage instead of fixing the actual mismatch.
+
+    Fix: for an event with a real clip (has_event_clip and a real
+    event_id), the link now carries the event's own id
+    (?event=<event_id>) instead of a timestamp, and
+    _render_customer_playback()'s renderCamera() uses it to call the
+    existing, already-authorized, already-working
+    /api/customer/events/{camera_id}/{event_id}/media/url route
+    directly -- the same route event-marker/mobile-event clicks on the
+    Playback timeline have always used, completely bypassing
+    findClipNear()/the recordings catalog. Analytics-only events (no
+    clip) keep the prior ?t=<epoch-ms>&autoplay=event / nearby-
+    recording behavior unchanged -- that path was never the bug."""
     live_link = (
         f'<a class="download" href="/customer/cameras/{escape(str(camera_id), quote=True)}/live">Live view</a> '
         if camera_id else ''
     )
-    return f'{live_link}<a class="download" href="/playback">Playback</a>'
+    if camera_id:
+        playback_href = f'/playback?camera={escape(str(camera_id), quote=True)}'
+        if has_event_clip and event_id:
+            playback_href += f'&event={escape(str(event_id), quote=True)}&autoplay=event'
+        elif timestamp:
+            epoch_ms = _naive_utc_timestamp_to_epoch_ms(timestamp)
+            if epoch_ms is not None:
+                playback_href += f'&t={epoch_ms}&autoplay=event'
+    else:
+        playback_href = '/playback'
+    return f'{live_link}<a class="download" href="{playback_href}">Playback</a>'
 
 
 def _render_customer_events(request: Request) -> str:
@@ -118739,14 +118799,57 @@ def _render_customer_events(request: Request) -> str:
     for event in events_list[:200]:
         raw_timestamp = str(event.get("timestamp") or "")
         try:
-            occurred_at = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+            # Root cause (2026-09-02, five-hour timestamp offset --
+            # Events-table portion): event.get("timestamp") is the same
+            # naive-UTC event_timestamp column _customer_camera_events()
+            # already documents as UTC (see that function's own
+            # docstring and APPLIANCE_TIMEZONE's). This table's "Time"
+            # column was formatting that value directly with strftime()
+            # -- no conversion at all -- displaying the raw UTC clock
+            # digits as if already Central, ~5-6 hours (DST-dependent)
+            # ahead of the customer's real local time. Label the naive
+            # value as UTC, then convert to APPLIANCE_TIMEZONE exactly
+            # once for display, the same "one correct conversion" this
+            # investigation already applied on the Playback page's own
+            # timeline/tooltips (playbackDate()).
+            occurred_at_utc = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            if occurred_at_utc.tzinfo is None:
+                occurred_at_utc = occurred_at_utc.replace(tzinfo=timezone.utc)
+            occurred_at = occurred_at_utc.astimezone(APPLIANCE_TIMEZONE)
             timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
         except ValueError:
             timestamp_label = raw_timestamp or "Unknown time"
-        thumbnail = (
-            f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover">'
+        thumb_img = (
+            f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">'
             if event.get("thumbnail") else "—"
         )
+        # Inline event-clip player (2026-09-02): a same-page thumbnail
+        # click is a genuine, synchronous user gesture -- browsers give
+        # that the best real chance of allowing audible autoplay, unlike
+        # a cross-page navigation to /playback?event=..., where activation
+        # does not reliably carry over to the freshly-loaded document
+        # (see playEventClipDeepLink()'s own docstring on the Playback
+        # page). Reuses the exact same authorized
+        # /api/customer/events/{camera_id}/{event_id}/media/url route --
+        # no second media API, no change to that route's authorization.
+        # Analytics-only events (no has_event_clip) get no wrapper here
+        # at all -- their thumbnail stays exactly the plain, non-
+        # interactive image it already was; they keep using the
+        # existing nearby-recording Playback link in the Action column,
+        # unchanged.
+        camera_id_val = event.get("camera_id")
+        event_id_val = event.get("id")
+        if event.get("has_event_clip") and camera_id_val and event_id_val:
+            thumbnail = (
+                f'<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" '
+                f'data-camera-id="{escape(str(camera_id_val), quote=True)}" '
+                f'data-event-id="{escape(str(event_id_val), quote=True)}" '
+                f'data-thumb-html="{escape(thumb_img, quote=True)}">'
+                f'{thumb_img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span>'
+                f'</div>'
+            )
+        else:
+            thumbnail = thumb_img
         type_label = str(event.get("event_type") or "event").replace("_", " ").title()
         camera_number = event.get("camera")
         rows.append(
@@ -118756,14 +118859,22 @@ def _render_customer_events(request: Request) -> str:
             f'<td>{thumbnail}</td>'
             f'<td><span class="pill">{escape(type_label)}</span></td>'
             f'<td>{_event_confidence_percent(event.get("confidence"))}</td>'
-            f'<td>{_customer_event_actions(event.get("camera_id"))}</td></tr>'
+            f'<td>{_customer_event_actions(event.get("camera_id"), raw_timestamp, event.get("id"), event.get("has_event_clip"))}</td></tr>'
         )
     event_body = "".join(rows) or (
         '<tr><td colspan="6"><div class="empty-stage">No analytics events yet.<br>'
         'Events appear here as soon as your cameras detect real activity.</div></td></tr>'
     )
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
+    content = f"""<style>
+.event-thumb-player{{position:relative;width:96px;cursor:pointer;border-radius:4px;overflow:hidden}}
+.event-thumb-player:focus-visible{{outline:2px solid var(--accent,#47d7ac);outline-offset:2px}}
+.event-thumb-play-badge{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,10,14,.35);color:#fff;font-size:20px;pointer-events:none}}
+.event-thumb-player.playing .event-thumb-play-badge{{display:none}}
+.event-thumb-player video{{width:96px;aspect-ratio:16/9;object-fit:cover;background:#000;display:block}}
+.event-thumb-loading{{width:96px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
+</style>
+<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
 <div><span class="pill">{len(events_list)} event(s)</span></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
@@ -118788,6 +118899,72 @@ def _render_customer_events(request: Request) -> str:
   }
   filters.addEventListener('change',apply);
   search.addEventListener('input',apply);
+
+  // Inline event-clip player -- see this row's own Python docstring
+  // (the has_event_clip branch building .event-thumb-player) for why
+  // this exists: a same-page click carries real user activation, the
+  // best real chance of audible autoplay, unlike the cross-page
+  // /playback?event= deep link (kept working as a secondary path,
+  // untouched here). Reuses the exact same authorized
+  // /api/customer/events/{camera_id}/{event_id}/media/url route --
+  // no second media API.
+  let currentlyPlaying=null;
+
+  function revertToThumbnail(container){
+    const video=container.querySelector('video');
+    if(video){video.pause();video.removeAttribute('src');video.load()}
+    container.innerHTML=(container.dataset.thumbHtml||'—')+'<span class="event-thumb-play-badge" aria-hidden="true">▶</span>';
+    container.classList.remove('playing');
+  }
+
+  function playEventClipInline(container){
+    // Single-player rule: starting a new inline clip always stops
+    // whatever else was playing first -- never two at once.
+    if(currentlyPlaying&&currentlyPlaying!==container){
+      revertToThumbnail(currentlyPlaying);
+    }
+    currentlyPlaying=container;
+    const cameraId=container.dataset.cameraId;
+    const eventId=container.dataset.eventId;
+    container.innerHTML='<div class="event-thumb-loading">Loading…</div>';
+    fetch(`/api/customer/events/${encodeURIComponent(cameraId)}/${encodeURIComponent(eventId)}/media/url`,{credentials:'same-origin'})
+      .then(response=>response.ok?response.json():Promise.reject(response.status))
+      .then(payload=>{
+        if(!payload.url)return Promise.reject('no url');
+        if(currentlyPlaying!==container)return;  // a different card was clicked while this was loading
+        container.innerHTML='<video controls playsinline></video>';
+        const video=container.querySelector('video');
+        video.src=payload.url;
+        video.addEventListener('ended',()=>{
+          revertToThumbnail(container);
+          if(currentlyPlaying===container)currentlyPlaying=null;
+        });
+        container.classList.add('playing');
+        // Attempted immediately, from the same click that triggered
+        // this whole chain -- the browser's own best chance to allow
+        // audible autoplay. If it's rejected, the clip stays loaded
+        // and selected with its native controls (play/pause, mute,
+        // fullscreen) already visible and usable -- never a forced
+        // mute, never a fallback to unrelated footage.
+        video.play().catch(()=>{});
+      })
+      .catch(()=>{
+        if(currentlyPlaying===container){
+          container.innerHTML='<span class="health-detail">No recording is available for this event.</span>';
+          currentlyPlaying=null;
+        }
+      });
+  }
+
+  document.querySelectorAll('.event-thumb-player').forEach(container=>{
+    container.addEventListener('click',()=>playEventClipInline(container));
+    container.addEventListener('keydown',event=>{
+      if(event.key==='Enter'||event.key===' '){
+        event.preventDefault();
+        playEventClipInline(container);
+      }
+    });
+  });
 })();
 </script>"""
 
@@ -138654,6 +138831,19 @@ def _presigned_recording_url(s3_key: str) -> str | None:
 # "Load older recordings" pagination and event-to-playback deep links,
 # both of which query past this limit on demand instead of it ever
 # being a hard ceiling on what a customer can reach.
+#
+# 200 (this route's own hard cap -- see the limit clamp in
+# customer_recordings_metadata() below) rather than the original 50:
+# traced 2026-09-02 against real production recording history, this
+# camera's actual cadence is ~85-87% back-to-back 5-minute segments,
+# roughly up to ~120 real recordings on a normal day for the busiest
+# camera observed. At 50, the Playback timeline (which renders every
+# loaded clip -- see renderTimeline()) never saw enough of a day's
+# real, already-recorded history to show it, making genuinely
+# continuous recording look sparse/gapped. Metadata-only rows are ~100
+# bytes each (id/start/end/name, no presigned URL), so even 200 of
+# them is a trivial payload -- nothing like the fully-presigned-URL
+# incident that originally motivated a low initial limit here.
 # Every recording/detection-event timestamp in this system is a naive
 # string with no timezone marker, written by the appliance's own local
 # clock (recording_uploader.py's own "naive local-time throughout"
@@ -138673,7 +138863,7 @@ def _presigned_recording_url(s3_key: str) -> str | None:
 # future customer is in Central time.
 APPLIANCE_TIMEZONE = ZoneInfo("America/Chicago")
 
-CUSTOMER_PLAYBACK_INITIAL_LIMIT = 50
+CUSTOMER_PLAYBACK_INITIAL_LIMIT = 200
 
 
 def _row_to_recording_metadata(row: dict) -> dict:
@@ -138812,27 +139002,464 @@ def customer_recording_url(camera_id: str, recording_id: str, request: Request) 
     return {"url": url}
 
 
-def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
-    """Timeline event markers for one camera on one calendar date --
-    {event_type, timestamp} only, the exact two fields renderTimeline()'s
-    markers actually read (see filterCategory()/timelinePercent() in
-    _render_customer_playback()'s own JS). A deliberately narrower query
-    than _customer_detection_events() (13 fields, every camera, all
-    time -- built for the Events page's own different needs): that
-    function embedded a real account's entire history into every
-    Playback load (12,000+ rows measured), the same unbounded-payload
-    mistake the recordings list had, just for a second dataset. This
-    queries the database directly, scoped to exactly one camera and one
-    day, instead of fetching everything and filtering in Python."""
+def _customer_event_media_url(camera_id: str, event_id: str) -> str | None:
     from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.s3_key "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return _presigned_recording_url(row["s3_key"])
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/media/url")
+def customer_event_media_url(camera_id: str, event_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    url = _customer_event_media_url(camera_id, event_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+
+    return {"url": url}
+
+
+def _customer_event_thumbnail_url(camera_id: str, event_id: str) -> str | None:
+    """Presigns the still-frame preview captured alongside one event's
+    own clip (detection_event_media.thumbnail_s3_key) -- generated by
+    the same ingestion pipeline that writes s3_key (see
+    _customer_event_media_url() above), but never previously read by
+    any customer-facing code: _customer_detection_events() always
+    reported thumbnail=None regardless of whether a real preview
+    image existed, so every Events row rendered the same "--"
+    placeholder and the only visible difference between a row with a
+    real clip and one without was the clickable has_event_clip
+    wrapper itself. Re-scopes by camera_id in the same query as
+    _customer_event_media_url(), for the same reason: an event_id must
+    never resolve media for a camera other than the one the caller
+    was already authorized against."""
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.thumbnail_s3_key "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+
+    if not row or not row["thumbnail_s3_key"]:
+        return None
+
+    return _presigned_recording_url(row["thumbnail_s3_key"])
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/thumbnail")
+def customer_event_thumbnail(camera_id: str, event_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    url = _customer_event_thumbnail_url(camera_id, event_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Event thumbnail not available.")
+
+    return RedirectResponse(url=url, status_code=302)
+
+
+_recording_media_cache_locks: dict = {}
+_recording_media_cache_locks_guard = threading.Lock()
+
+
+def _recording_media_cache_lock(recording_id: str) -> threading.Lock:
+    with _recording_media_cache_locks_guard:
+        lock = _recording_media_cache_locks.get(recording_id)
+        if lock is None:
+            lock = threading.Lock()
+            _recording_media_cache_locks[recording_id] = lock
+        return lock
+
+
+RECORDING_MEDIA_CACHE_FOLDER = RECORDINGS_FOLDER / "_media_cache"
+RECORDING_MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB soft cap -- oldest cached remuxes evicted first
+
+
+def _evict_recording_media_cache_if_full() -> None:
+    try:
+        entries = sorted(RECORDING_MEDIA_CACHE_FOLDER.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    except FileNotFoundError:
+        return
+    total = sum(p.stat().st_size for p in entries)
+    i = 0
+    while total > RECORDING_MEDIA_CACHE_MAX_BYTES and i < len(entries):
+        try:
+            total -= entries[i].stat().st_size
+            entries[i].unlink()
+        except OSError:
+            pass
+        i += 1
+
+
+def _download_recording_object(s3_key: str, dest_path: Path) -> bool:
+    """Downloads one archived recording object using the same read-only,
+    GetObject-scoped assumed role _presigned_recording_url() already signs
+    with -- see that function's docstring for why a dedicated STS role is
+    required here rather than the instance's own (deliberately S3-less)
+    IAM identity."""
+    role_arn = os.getenv('ANYAICAM_RECORDING_READ_ROLE_ARN', '').strip()
+    bucket = os.getenv('ANYAICAM_RECORDING_S3_BUCKET', '').strip()
+    region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', '')).strip()
+    if not role_arn or not bucket or not region:
+        return False
+    try:
+        import boto3
+    except ImportError:
+        return False
+    try:
+        creds = _recording_read_credentials(role_arn, region)
+        if not creds:
+            return False
+        s3 = boto3.client(
+            's3', region_name=region,
+            aws_access_key_id=creds['access_key_id'],
+            aws_secret_access_key=creds['secret_access_key'],
+            aws_session_token=creds['session_token'],
+        )
+        s3.download_file(bucket, s3_key, str(dest_path))
+        return dest_path.is_file() and dest_path.stat().st_size > 0
+    except Exception:
+        logging.getLogger('anyaicam.recording_read').exception('recording_read.download_failed')
+        return False
+
+
+def _fix_cloud_recording_audio_for_playback(recording_id: str, s3_key: str) -> Path | None:
+    """Root cause of the 2026-09-01 continuous-Playback freeze: every
+    cloud recording's AAC audio track is 8kHz mono and starts ~0.05-0.1s
+    after the video track (confirmed with ffprobe against live production
+    recordings -- clean, monotonic PTS/DTS on both streams end to end,
+    so the archived file itself is not corrupt). Chrome's <video> element
+    adopts the audio track as its playback clock once one is present;
+    with this specific low-sample-rate/late-start combination, Chrome's
+    audio renderer never begins advancing that clock even though
+    readyState reaches 4 and data is buffered -- video presentation,
+    gated on the same clock, freezes at/near currentTime=0 with no
+    error and no console signal. Forcibly muting the element made the
+    freeze disappear during diagnosis, proving the audio path was the
+    blocker (muting is not shipped -- see customer_recording_media()
+    below and the product requirement that audio must work).
+
+    Fix: a fast, video-stream-copy remux that re-encodes only the tiny
+    8kHz mono audio track to 48kHz and aligns its first sample to t=0.
+    Every video frame byte is copied, not re-encoded -- no quality loss,
+    no risk to the already-proven-correct H.264 stream. Runs once per
+    recording, lazily, on first request; the result is cached on local
+    disk keyed by recording_id, so replay/Download/Share after the
+    first play are a plain cached-file read, not a re-remux."""
+    RECORDING_MEDIA_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+    cache_path = RECORDING_MEDIA_CACHE_FOLDER / f"{recording_id}.mp4"
+    if cache_path.is_file() and cache_path.stat().st_size > 0:
+        return cache_path
+
+    with _recording_media_cache_lock(recording_id):
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path
+
+        tmp_source = cache_path.with_name(cache_path.name + ".src.tmp")
+        tmp_out = cache_path.with_name(cache_path.name + ".tmp")
+        try:
+            if not _download_recording_object(s3_key, tmp_source):
+                return None
+
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-i", str(tmp_source),
+                    "-c:v", "copy",
+                    "-c:a", "aac", "-ar", "48000",
+                    "-af", "aresample=async=1:first_pts=0",
+                    "-movflags", "+faststart",
+                    "-f", "mp4",
+                    str(tmp_out),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                logging.getLogger("anyaicam.recording_media").error(
+                    "recording_media.remux_failed recording_id=%s stderr=%s",
+                    recording_id, result.stderr.decode("utf-8", "replace")[-2000:],
+                )
+                return None
+
+            os.replace(tmp_out, cache_path)
+            _evict_recording_media_cache_if_full()
+            return cache_path
+        except Exception:
+            logging.getLogger("anyaicam.recording_media").exception(
+                "recording_media.remux_error recording_id=%s", recording_id
+            )
+            return None
+        finally:
+            for tmp in (tmp_source, tmp_out):
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/media")
+def customer_recording_media(camera_id: str, recording_id: str, request: Request):
+    """Serves a browser-safe copy of a customer recording for the
+    continuous-Playback player -- see _fix_cloud_recording_audio_for_
+    playback()'s docstring for the root cause this exists to work
+    around. Authorization is checked exactly like every other bounded-
+    Playback route (_customer_authorized_camera_id(), reusing
+    _customer_playback_cameras()) before anything else, unchanged.
+
+    Cloud recordings (.mp4 in the recordings bucket) are lazily
+    remuxed and served directly so the browser's <video> element
+    receives a locally-fixed file instead of a raw redirect straight
+    to the archived, audio-clock-freezing original. Local-appliance
+    (.mkv) recordings are unaffected by this bug and keep the original
+    same-origin redirect to /local exactly as before. If the remux
+    path fails for any reason (network blip, ffmpeg error, role/bucket
+    not configured), this fails open to the original redirect-to-
+    presigned-URL behavior rather than returning a dead player."""
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+
+    if row and row["s3_key"] and str(row["s3_key"]).lower().endswith(".mp4"):
+        fixed_path = _fix_cloud_recording_audio_for_playback(recording_id, row["s3_key"])
+        if fixed_path is not None:
+            return FileResponse(
+                fixed_path,
+                media_type="video/mp4",
+                filename=f"{recording_id}.mp4",
+                content_disposition_type="inline",
+            )
+        # Remux failed -- fail open to the original passthrough
+        # redirect rather than a dead player.
+
+    url = _customer_recording_url(camera_id, recording_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Recording not found or not yet available.")
+    return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/local")
+def customer_recording_local(camera_id: str, recording_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+
+    if not row or row["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    camera_number = row["camera_number"]
+    filename = Path(row["s3_key"]).name
+
+    if (
+        not filename.endswith(".mkv")
+        or filename != Path(filename).name
+        or not filename.startswith(f"camera{camera_number}_")
+    ):
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not local_path.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    return FileResponse(
+        local_path,
+        media_type="video/x-matroska",
+        filename=filename,
+        content_disposition_type="inline",
+    )
+
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/thumbnail")
+def customer_recording_thumbnail(camera_id: str, recording_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+
+    if not row or row["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    camera_number = int(row["camera_number"])
+    s3_key = str(row["s3_key"] or "")
+    filename = Path(s3_key).name
+
+    if (
+        filename != Path(filename).name
+        or not filename.startswith(f"camera{camera_number}_")
+    ):
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    # Cloud recording pipeline:
+    #
+    # Samsung uploads:
+    #   cameraN_timestamp.mp4
+    #   cameraN_timestamp.jpg
+    #
+    # beside each other under the same S3 prefix. Reuse the existing
+    # recording read-role presigner rather than proxying image bytes
+    # through EC2.
+    if filename.lower().endswith(".mp4"):
+        thumbnail_key = s3_key.rsplit(".", 1)[0] + ".jpg"
+        thumbnail_url = _presigned_recording_url(thumbnail_key)
+
+        if not thumbnail_url:
+            raise HTTPException(
+                status_code=404,
+                detail="Thumbnail not available.",
+            )
+
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(
+            url=thumbnail_url,
+            status_code=302,
+        )
+
+    # Preserve the original edge/local MKV behavior.
+    if not filename.lower().endswith(".mkv"):
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    recording_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not recording_path.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    thumbnail_dir = RECORDINGS_FOLDER / "thumbnails" / f"camera{camera_number}"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+
+    thumbnail_path = thumbnail_dir / f"{Path(filename).stem}.jpg"
+
+    if not thumbnail_path.is_file():
+        import subprocess
+
+        temporary_path = thumbnail_path.with_suffix(".tmp.jpg")
+
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-ss", "3",
+                "-i", str(recording_path),
+                "-frames:v", "1",
+                "-vf", "scale=320:-2",
+                "-q:v", "4",
+                "-y",
+                str(temporary_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+
+        if result.returncode != 0 or not temporary_path.is_file():
+            temporary_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=404,
+                detail="Thumbnail not available.",
+            )
+
+        temporary_path.replace(thumbnail_path)
+
+    return FileResponse(
+        thumbnail_path,
+        media_type="image/jpeg",
+        filename=thumbnail_path.name,
+        content_disposition_type="inline",
+    )
+
+
+def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
+    """Timeline events for one customer-local calendar date.
+
+    Detection-event timestamps currently arrive from the appliance as
+    naive UTC strings. Playback displays those values as UTC and converts
+    them in the browser, so the database query must use the UTC interval
+    corresponding to the requested America/Chicago calendar day.
+    """
+    from partner_db import connection
+
+    local_start = datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=APPLIANCE_TIMEZONE
+    )
+    local_end = local_start + timedelta(days=1)
+
+    utc_zone = ZoneInfo("UTC")
+    query_start = (
+        local_start.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    query_end = (
+        local_end.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+
     with connection() as db:
         rows = db.execute(
-            "SELECT event_type, event_timestamp FROM detection_events "
-            "WHERE camera_id=? AND event_timestamp>=? AND event_timestamp<? "
-            "ORDER BY event_timestamp",
-            (camera_id, date, date + "T24:00:00"),
+            "SELECT de.id, de.event_type, de.event_timestamp, "
+            "CASE WHEN dem.id IS NOT NULL THEN 1 ELSE 0 END AS has_event_clip "
+            "FROM detection_events de "
+            "LEFT JOIN detection_event_media dem ON dem.detection_event_id=de.id "
+            "WHERE de.camera_id=? AND de.event_timestamp>=? AND de.event_timestamp<? "
+            "ORDER BY de.event_timestamp",
+            (camera_id, query_start, query_end),
         ).fetchall()
-    return [{"event_type": row["event_type"], "timestamp": row["event_timestamp"]} for row in rows]
+    return [
+        {
+            "id": row["id"],
+            "event_type": row["event_type"],
+            "timestamp": row["event_timestamp"],
+            "has_event_clip": bool(row["has_event_clip"]),
+        }
+        for row in rows
+    ]
 
 
 @app.get("/api/customer/events/{camera_id}")
@@ -138939,6 +139566,21 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     valid_camera_ids = {camera["id"] for camera in cameras}
     initial_camera_id = requested_camera_id if requested_camera_id in valid_camera_ids else cameras[0]["id"]
     initial_timestamp = request.query_params.get("t") or None
+    # An event with its own real clip (see _customer_event_actions())
+    # -- takes priority over initial_timestamp below: renderCamera()
+    # loads this directly via the existing authorized event-media
+    # route, never via findClipNear()/the recordings catalog, so an
+    # event whose moment falls in a real gap between recordings still
+    # plays its own clip instead of silently finding nothing.
+    initial_event_id = request.query_params.get("event") or None
+    # Explicit, narrow autoplay signal -- see _customer_event_actions()'s
+    # own docstring for why this exists. Only ever "event" today (the
+    # one place that sets it), checked exactly, never inferred from the
+    # mere presence of ?t=/?event= -- an ordinary/future deep link that
+    # carries one of those without this exact marker still gets the
+    # safe select-only behavior, matching "ordinary Playback never
+    # autoplays".
+    autoplay_from_event = request.query_params.get("autoplay") == "event"
 
     camera_tiles = "".join(
         f'<button type="button" class="playback-camera-tile{" active" if camera["id"] == initial_camera_id else ""}" '
@@ -138993,10 +139635,10 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
-        '<div id="playback-debug" style="font:11px/1.5 monospace;color:#8a93a3;padding:6px 2px;word-break:break-all"></div>'
-        '</div></div>'
+        '</div>'
+        '</div>'
         '</section>'
-        '<style>@media (max-width:640px){.monitor-timeline{display:none}.mobile-recent-events{display:block}}@media (min-width:641px){.mobile-recent-events{display:none}}</style>'
+        '<style>@media (max-width:900px){.monitor-timeline{display:none!important}.mobile-recent-events{display:block!important}}@media (min-width:901px){.mobile-recent-events{display:none!important}.monitor-timeline{display:block}}</style>'
         '<section class="panel mobile-recent-events" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
         '<div id="mobile-recent-events-list" class="health-list"></div>'
@@ -139013,7 +139655,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<button id="download-selected" type="button" disabled>Download</button>'
         '<button id="share-selected" type="button" disabled>Share</button>'
         '<button id="create-clip" type="button" disabled>Create clip</button>'
-        '<button id="bookmark-selected" type="button" disabled>Bookmark</button>'
+        '<button id="bookmark-selected" type="button" disabled title="Bookmarking from Playback is not available yet.">Bookmark</button>'
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
@@ -139060,20 +139702,76 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const debugLine=document.getElementById('playback-debug');
   // TEMPORARY, safe playback diagnostics -- no secrets, no full signed
   // URLs (only the recording filename), removed once real-browser proof
-  // is captured. Surfaces exactly what the customer's own player is
-  // doing: which camera/recording is selected, whether a source was
-  // actually assigned, and which of loadedmetadata/canplay/playing/error
-  // the browser itself fires for that source -- console.log for anyone
-  // with devtools open, plus the same text in a small on-page line so it
-  // doesn't require devtools at all.
-  function debugLog(message){{console.log('[playback-debug]',message);if(debugLine)debugLine.textContent=message}}
-  ['loadedmetadata','canplay','playing','error'].forEach(eventName=>{{
+  // is captured for the event-autoplay investigation (2026-09-02).
+  // Accumulates every entry with an elapsed-ms timestamp (relative to
+  // page load) instead of overwriting a single line, specifically so a
+  // multi-stage flow like event-autoplay (autoplayFromEvent -> clip
+  // found -> playClip() called -> src assigned -> loadedmetadata/
+  // canplay -> seek applied -> play()/muted-fallback resolved) can be
+  // read back afterward as one ordered trace, on-page, without
+  // devtools. Also still mirrors to console.log. Capped so a long
+  // session can't grow the panel unboundedly.
+  const debugEntries=[];
+  function debugLog(message){{
+    const elapsedMs=Math.round(performance.now());
+    const line=`+${{elapsedMs}}ms ${{message}}`;
+    console.log('[playback-debug]',line);
+    debugEntries.push(line);
+    if(debugEntries.length>40)debugEntries.shift();
+    if(debugLine){{
+      debugLine.style.display='block';
+      debugLine.textContent=debugEntries.join('\\n');
+      debugLine.scrollTop=debugLine.scrollHeight;
+    }}
+  }}
+  debugLog('[boot] playback script executing');
+  // Reported 2026-09-02: on a real event-autoplay deep link, ZERO
+  // debugLog lines appeared at all (not even this ordinary page-load
+  // one), after 15+ seconds. That is only possible if this script
+  // never ran, or an uncaught exception aborted it before reaching
+  // any debugLog call further down -- and an exception thrown inside
+  // renderCamera() (an async function called bare, with no .catch(),
+  // at the very bottom of this script) would be an invisible,
+  // unhandled promise rejection: no console error banner most users
+  // would notice, no on-page sign anything went wrong. These two
+  // handlers make ANY such failure, anywhere on this page, show up in
+  // the same visible/timestamped log as every other checkpoint,
+  // instead of vanishing silently.
+  window.addEventListener('error',event=>{{
+    debugLog(`[fatal] window error: ${{event.message}} at ${{event.filename}}:${{event.lineno}}:${{event.colno}}`);
+  }});
+  window.addEventListener('unhandledrejection',event=>{{
+    const reason=event.reason;
+    debugLog(`[fatal] unhandled promise rejection: ${{reason && reason.message ? reason.message : reason}}`);
+  }});
+  // Recording-card thumbnails (renderClipList() below): the /thumbnail
+  // route's own auth->S3-key->presign->302 chain has been traced and
+  // proven correct end to end (server logs, S3 HEAD, full redirect
+  // follow) for a real reported failure -- the failure was not
+  // reproducible server-side, which points at a client-side timing
+  // issue (a transient network hiccup on the second, cross-origin S3
+  // hop, or a lazy-load/layout-race on slower mobile rendering) rather
+  // than a data, auth, or CSP defect. This is a global function (not
+  // IIFE-local) because it's wired via an inline onerror="" attribute,
+  // which only resolves identifiers in the global scope. Exactly one
+  // retry, then the existing "Thumbnail unavailable" fallback --
+  // never an infinite loop.
+  window.__anyaicamThumbnailRetry=function(img){{
+    if(img.dataset.thumbRetried){{
+      img.style.display='none';
+      img.parentElement.innerHTML='<span class="health-detail">Thumbnail unavailable</span>';
+      return;
+    }}
+    img.dataset.thumbRetried='1';
+    img.src=img.src.split('?')[0]+'?retry='+Date.now();
+  }};
+  ['loadstart','loadedmetadata','canplay','playing','stalled','waiting','error'].forEach(eventName=>{{
     video.addEventListener(eventName,()=>{{
       if(eventName==='error'){{
         const mediaError=video.error;
-        debugLog(`event=error code=${{mediaError?mediaError.code:'?'}} message=${{mediaError?mediaError.message:'unknown'}}`);
+        debugLog(`[checkpoint 5] event=error code=${{mediaError?mediaError.code:'?'}} message=${{mediaError?mediaError.message:'unknown'}}`);
       }}else{{
-        debugLog(`event=${{eventName}} duration=${{video.duration||0}} currentSrcSet=${{!!video.currentSrc}}`);
+        debugLog(`[checkpoint 5] event=${{eventName}} duration=${{video.duration||0}} currentSrcSet=${{!!video.currentSrc}} readyState=${{video.readyState}}`);
       }}
     }});
   }});
@@ -139084,9 +139782,47 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const browseButton=document.getElementById('browse-recordings');
   const loadOlderButton=document.getElementById('playback-load-older');
   const viewFrame=document.getElementById('playback-view-frame');
+  const skipBackButton=document.getElementById('skip-back');
+  const timelinePlayButton=document.getElementById('timeline-play');
+  const skipForwardButton=document.getElementById('skip-forward');
+  const downloadButton=document.getElementById('download-selected');
+  const shareButton=document.getElementById('share-selected');
+  const createClipButton=document.getElementById('create-clip');
 
+  let selectedClip=null;
   let selectedCameraId={json.dumps(first_camera_id)};
-  const initialTimestamp={json.dumps(initial_timestamp)};
+  // ?t= is now built server-side as an unambiguous UTC epoch-ms integer
+  // (see _customer_event_actions()) -- URL query values always arrive
+  // as strings, so a digit-only one is converted to a real JS number
+  // here, letting playbackDate() take the exact/no-guessing epoch-ms
+  // path below. A non-digit value (an older/legacy naive-ISO ?t=, if
+  // one is ever hit) is left as a string, which playbackDate() still
+  // handles by explicit UTC labeling -- never a raw, timezone-naive
+  // browser parse either way.
+  const initialTimestampRaw={json.dumps(initial_timestamp)};
+  const initialTimestamp=(initialTimestampRaw&&/^\d+$/.test(initialTimestampRaw))
+    ? Number(initialTimestampRaw)
+    : initialTimestampRaw;
+  const autoplayFromEvent={json.dumps(autoplay_from_event)};
+  const initialEventId={json.dumps(initial_event_id)};
+
+  function playbackDate(value){{
+    // VMS timestamps are stored in UTC but older rows are ISO strings
+    // without a Z/offset. Tell the browser they are UTC, then normal
+    // Date formatting automatically converts them to the customer's
+    // local timezone (Central Time in this browser).
+    //
+    // A number is always treated as UTC epoch milliseconds -- the one
+    // genuinely unambiguous representation, and what the event deep
+    // link's ?t= is now built from server-side (see
+    // _customer_event_actions()/its epoch-ms helper) precisely so no
+    // naive-string guess is ever needed for that value.
+    if(value===null||value===undefined||value==='')return new Date(NaN);
+    if(typeof value==='number')return new Date(value);
+    const text=String(value);
+    const hasZone=/Z$|[+-]\d{{2}}:\d{{2}}$/.test(text);
+    return new Date(hasZone?text:text+'Z');
+  }}
 
   function revealClipPanel(){{clipPanel.hidden=false}}
   browseButton.addEventListener('click',()=>{{clipPanel.hidden=!clipPanel.hidden}});
@@ -139118,16 +139854,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       return [];
     }}
   }}
-  async function fetchClipUrl(cameraId,recordingId){{
-    try{{
-      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(recordingId)}}/url`);
-      if(!response.ok)return null;
-      const data=await response.json();
-      return data.url||null;
-    }}catch(error){{
-      debugLog(`url fetch failed: ${{error && error.message}}`);
-      return null;
-    }}
+  function recordingMediaUrl(cameraId,recordingId){{
+    return `/api/customer/recordings/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(recordingId)}}/media`;
   }}
 
   cameraTiles.forEach(tile=>{{
@@ -139135,6 +139863,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       cameraTiles.forEach(item=>item.classList.remove('active'));
       tile.classList.add('active');
       selectedCameraId=tile.dataset.cameraId;
+      visibleRecordingCount=6;
       clipPanel.hidden=true;
       await renderCamera();
     }});
@@ -139154,19 +139883,72 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const timelineLane=document.getElementById('playback-timeline-lane');
   const timelineEmpty=document.getElementById('playback-timeline-empty');
 
-  async function playClip(cameraId,clip){{
+  function playClip(cameraId,clip){{
     placeholder.hidden=true;
-    debugLog(`camera=${{cameraId}} recording=${{clip.name}} fetching url...`);
-    const url=await fetchClipUrl(cameraId,clip.id);
-    if(!url){{debugLog(`camera=${{cameraId}} recording=${{clip.name}} no playable url (not yet available)`);status.textContent='This recording is not available right now.';return}}
-    debugLog(`camera=${{cameraId}} recording=${{clip.name}} srcAssigned=true`);
+    const url=recordingMediaUrl(cameraId,clip.id);
+    debugLog(`[checkpoint 4] playClip() invoked camera=${{cameraId}} recording=${{clip.name}} url=${{url}}`);
+    selectedClip=clip;
+    video.pause();
     video.src=url;
-    video.play().catch(error=>debugLog(`play() rejected (often normal without a prior click): ${{error && error.name}}`));
+    video.load();
+
+    skipBackButton.disabled=false;
+    timelinePlayButton.disabled=false;
+    skipForwardButton.disabled=false;
+    downloadButton.disabled=false;
+    shareButton.disabled=false;
+
+    const isCloudMp4=String(clip.name||'').toLowerCase().endsWith('.mp4');
+
+    createClipButton.disabled=isCloudMp4;
+    createClipButton.title=isCloudMp4
+      ? 'Create clip is not available yet for cloud recordings.'
+      : '';
+
+    // Never silently swallow a rejected play() -- the customer must
+    // always be told what actually happened. First attempt is always
+    // full, audible playback (this is what every plain click-to-play
+    // already relies on and must keep working unchanged). Only if the
+    // browser rejects THAT (typically an autoplay-policy block on the
+    // event-deep-link path, since that's the one case here without a
+    // same-tick user click) do we fall back to a muted start -- which
+    // browsers universally allow -- with the native <video controls>
+    // bar's own speaker icon as the (already-present, no new custom
+    // UI needed) one-tap unmute control, and an explicit status
+    // message pointing at it. This is a temporary, customer-
+    // correctable fallback, never the permanent forced-mute the
+    // original Playback/audio fix explicitly ruled out.
+    debugLog('[checkpoint 7] calling video.play() (unmuted, first attempt)');
+    video.play().then(()=>{{
+      debugLog('[checkpoint 7] video.play() resolved -- unmuted playback started');
+    }}).catch(error=>{{
+      debugLog(`[checkpoint 7] video.play() rejected: ${{error && error.name}} -- retrying muted`);
+      video.muted=true;
+      video.play().then(()=>{{
+        debugLog('[checkpoint 7] muted video.play() resolved -- playback started muted');
+        status.textContent='Audio was blocked by the browser — tap the speaker icon on the player to unmute.';
+      }}).catch(mutedError=>{{
+        debugLog(`[checkpoint 7] muted video.play() ALSO rejected: ${{mutedError && mutedError.name}}`);
+        status.textContent='Autoplay was blocked by the browser — press Play to start.';
+      }});
+    }});
     revealClipPanel();
   }}
 
   function timelinePercent(dateStr){{
-    const d=new Date(dateStr);
+    // Traced 2026-09-02 (five-hour timestamp offset investigation):
+    // clip.start/clip.end/event.timestamp are all naive UTC strings
+    // from the database (no Z/offset -- see playbackDate()'s own
+    // comment). A bare `new Date(dateStr)` on a string with no zone
+    // marker is parsed by the JS Date spec as LOCAL time, not UTC, so
+    // this was silently placing every segment/marker at its raw UTC
+    // clock position on the 00:00-24:00 axis instead of the viewer's
+    // actual local time-of-day -- a ~5-6 hour (DST-dependent) shift,
+    // consistent everywhere but wrong everywhere. playbackDate()
+    // already does the one correct UTC-aware parse used elsewhere on
+    // this page (the mobile events list, the clip list); reusing it
+    // here instead of a second, inconsistent raw parse is the fix.
+    const d=playbackDate(dateStr);
     return (d.getHours()*3600+d.getMinutes()*60+d.getSeconds())/864;
   }}
 
@@ -139194,13 +139976,17 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // nothing to search client-side, matching the honest "nothing close
   // enough" behavior this already had.
   function findClipNear(clips,timestamp){{
-    const target=new Date(timestamp).getTime();
+    // Routed entirely through playbackDate() (epoch-ms numbers handled
+    // exactly, naive strings always explicitly treated as UTC) --
+    // never a bare new Date() on a timezone-naive value anywhere in
+    // this match.
+    const target=playbackDate(timestamp).getTime();
     if(Number.isNaN(target))return null;
-    const covering=clips.find(clip=>target>=new Date(clip.start).getTime()&&target<=new Date(clip.end).getTime());
+    const covering=clips.find(clip=>target>=playbackDate(clip.start).getTime()&&target<=playbackDate(clip.end).getTime());
     if(covering)return covering;
     let closest=null,closestDelta=5*60*1000;
-    clips.forEach(clip=>{{
-      const delta=Math.abs(new Date(clip.start).getTime()-target);
+    [...clips].reverse().slice(0,8).forEach(clip=>{{
+      const delta=Math.abs(playbackDate(clip.start).getTime()-target);
       if(delta<closestDelta){{closest=clip;closestDelta=delta}}
     }});
     return closest;
@@ -139212,30 +139998,138 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   function renderMobileRecentEvents(cameraId,clips,events){{
     const mobileList=document.getElementById('mobile-recent-events-list');
     if(!mobileList)return;
-    // Mobile playback (punch-list item: no desktop scrub/timeline on
-    // phones): the same clips/events data, as a plain tappable list --
-    // most recent first -- instead of a ruler-based scrubber. Tapping a
-    // row plays that clip; the existing play/download/share/create-clip
-    // toolbar above already acts on whichever clip is selected.
-    const rows=[...clips].reverse().slice(0,15).map(clip=>
-      `<div class="health-row" data-mobile-clip role="button" tabindex="0"><span class="health-name">${{new Date(clip.start).toLocaleString()}}</span><span class="health-detail">Clip</span></div>`
+    // Mobile recent activity: recent recording clips (punch-list item --
+    // no desktop scrub/timeline on phones, a plain tappable list instead
+    // of a ruler-based scrubber) followed by recent events. Reconciled
+    // 2026-09-02 from two lineages that each improved a different half
+    // of this same list -- the recording-clip rows below are the
+    // customer-ui-punch-list branch's addition; the event rows keep the
+    // has_event_clip-aware direct event-media fetch (avoids the "event
+    // depends on a nearby recording" bug fixed elsewhere this session)
+    // and playbackDate() (correct local-time display, not raw UTC) from
+    // the Events/Playback checkpoint. Neither side's work is discarded.
+    const clipRows=[...clips].reverse().slice(0,15).map(clip=>
+      `<div class="health-row" data-mobile-clip role="button" tabindex="0"><span class="health-name">${{playbackDate(clip.start).toLocaleString()}}</span><span class="health-detail">Clip</span></div>`
     ).join('');
-    const eventRows=[...events].reverse().slice(0,15).map(event=>{{
-      const category=filterCategory(event.event_type);
-      const label=(event.event_type||'event').replaceAll('_',' ');
-      return `<div class="health-row" data-mobile-event="${{event.timestamp}}" role="button" tabindex="0"><span class="health-name">${{label}}</span><span class="health-detail">${{new Date(event.timestamp).toLocaleString()}}</span></div>`;
+
+    // Each row represents analytics activity and opens the recording
+    // nearest that event when tapped.
+    const recentEvents=[...events]
+      .filter(event=>{{
+        const category=filterCategory(event.event_type);
+        return category && activeFilters.has(category);
+      }})
+      .reverse()
+      .slice(0,20);
+
+    const eventRows=recentEvents.map(event=>{{
+      const category=filterCategory(event.event_type)||'event';
+      const label=(event.event_type||'event')
+        .replaceAll('_',' ')
+        .replace(/\b\w/g,char=>char.toUpperCase());
+      const playable=Boolean(event.has_event_clip&&event.id);
+      const interaction=playable?'role="button" tabindex="0"':'';
+      const availability=playable?'Event clip':'Analytics only';
+
+      const nearby=findClipNear(clips,event.timestamp);
+      const thumbnailUrl=nearby
+        ? `/api/customer/recordings/${{cameraId}}/${{nearby.id}}/thumbnail`
+        : '';
+
+      const preview=thumbnailUrl
+        ? `<div style="width:120px;aspect-ratio:16/9;border-radius:10px;background:#0b1018;overflow:hidden;display:grid;place-items:center;flex:0 0 auto">
+             <img
+               src="${{thumbnailUrl}}"
+               alt="Event thumbnail"
+               loading="lazy"
+               style="width:100%;height:100%;object-fit:cover"
+               onerror="this.style.display='none';this.parentElement.innerHTML='<span class=&quot;health-detail&quot;>No preview</span>'"
+             >
+           </div>`
+        : `<div style="width:120px;aspect-ratio:16/9;border-radius:10px;background:#0b1018;display:grid;place-items:center;flex:0 0 auto">
+             <span class="health-detail">No preview</span>
+           </div>`;
+
+      return `<div class="health-row" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}} style="display:flex;align-items:center;gap:12px;cursor:${{playable?'pointer':'default'}};opacity:${{playable?'1':'0.78'}}">
+        ${{preview}}
+        <div style="min-width:0;flex:1">
+          <span class="health-name">${{label}}</span>
+          <span class="health-detail">${{playbackDate(event.timestamp).toLocaleString()}} · ${{availability}}</span>
+        </div>
+      </div>`;
     }}).join('');
-    mobileList.innerHTML=(rows+eventRows)||'<div class="empty">No recent activity for this camera.</div>';
+
+    mobileList.innerHTML=(clipRows+eventRows)||
+      '<div class="empty">No recent activity for this camera.</div>';
+
     [...clips].reverse().slice(0,15).forEach((clip,index)=>{{
       const row=mobileList.querySelectorAll('[data-mobile-clip]')[index];
       if(row)row.addEventListener('click',()=>playClip(cameraId,clip));
     }});
+
     mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
-      row.addEventListener('click',async()=>{{
+      const hydratePreview=async()=>{{
+        if(row.querySelector('img'))return;
+
         const timestamp=row.dataset.mobileEvent;
-        const nearby=findClipNear(clips,timestamp)||(await fetchClipsMetadata(cameraId,{{near:timestamp}}))[0];
-        if(nearby){{playClip(cameraId,nearby)}}
-        else if(typeof showToast==='function'){{showToast('No recording available for this time yet.')}}
+        const nearby=findClipNear(clips,timestamp)||
+          (await fetchClipsMetadata(cameraId,{{near:timestamp}}))[0];
+
+        if(!nearby)return;
+
+        const preview=row.firstElementChild;
+        if(!preview)return;
+
+        const thumbnailUrl=
+          `/api/customer/recordings/${{cameraId}}/${{nearby.id}}/thumbnail`;
+
+        preview.innerHTML=
+          `<img src="${{thumbnailUrl}}" alt="Event thumbnail" loading="lazy" style="width:100%;height:100%;object-fit:cover" onerror="this.style.display='none';this.parentElement.innerHTML='<span class=&quot;health-detail&quot;>No preview</span>'">`;
+      }};
+
+      hydratePreview();
+
+      // Analytics-only detections remain visible as event details but
+      // are deliberately not presented as playable controls.
+      if(row.dataset.mobileEventClip!=='1'||!row.dataset.mobileEventId)return;
+
+      const openEvent=async()=>{{
+        const eventId=row.dataset.mobileEventId;
+
+        try{{
+          const response=await fetch(
+            `/api/customer/events/${{cameraId}}/${{eventId}}/media/url`,
+            {{credentials:'same-origin'}}
+          );
+
+          if(response.ok){{
+            const payload=await response.json();
+            if(payload.url){{
+              video.pause();
+              video.src=payload.url;
+              video.load();
+              placeholder.hidden=true;
+              status.textContent='Playing event clip';
+              video.play().catch(error=>debugLog(`play() rejected: ${{error && error.name}}`));
+              revealClipPanel();
+              return;
+            }}
+          }}
+        }}catch(error){{
+          debugLog(`event clip lookup failed: ${{error}}`);
+        }}
+
+        if(typeof showToast==='function'){{
+          showToast('Event clip is not available right now.');
+        }}
+      }};
+
+      row.addEventListener('click',openEvent);
+      row.addEventListener('keydown',event=>{{
+        if(event.key==='Enter'||event.key===' '){{
+          event.preventDefault();
+          openEvent();
+        }}
       }});
     }});
   }}
@@ -139245,7 +140139,17 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     timelineLane.innerHTML='';
     if(!clips.length&&!events.length){{timelineEmpty.hidden=false;return}}
     timelineEmpty.hidden=true;
-    clips.forEach(clip=>{{
+    // Every loaded recording gets its own proportional bar -- not just
+    // the 6 most recent. Real recording data (traced 2026-09-02) shows
+    // this camera's clips are ~85-87% back-to-back (near-zero gap) with
+    // only a handful of genuine multi-hour gaps/day; slicing to 6 was
+    // silently dropping the other ~90% of a day's real, playable
+    // recordings from the timeline (though they remained reachable via
+    // the Recordings list below), making a mostly-continuous day look
+    // sparse. Each bar's left/width still comes from the clip's own
+    // real start/end -- true gaps stay visibly empty, nothing here
+    // fabricates continuity.
+    [...clips].reverse().forEach(clip=>{{
       const startPct=timelinePercent(clip.start);
       const endPct=Math.max(startPct+0.3,timelinePercent(clip.end));
       const segment=document.createElement('div');
@@ -139253,7 +140157,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       segment.style.left=startPct+'%';
       segment.style.width=(endPct-startPct)+'%';
       segment.style.background='#e8eef6';
-      segment.title=new Date(clip.start).toLocaleString();
+      segment.title=playbackDate(clip.start).toLocaleString();
       segment.addEventListener('click',()=>playClip(cameraId,clip));
       timelineLane.appendChild(segment);
     }});
@@ -139267,42 +140171,126 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       marker.style.width='0.4%';
       marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';
       const label=(event.event_type||'event').replaceAll('_',' ');
-      marker.title=`${{label}} · ${{new Date(event.timestamp).toLocaleString()}}`;
-      marker.addEventListener('click',async()=>{{
-        const nearby=findClipNear(clips,event.timestamp)||(await fetchClipsMetadata(cameraId,{{near:event.timestamp}}))[0];
-        if(nearby){{playClip(cameraId,nearby)}}
-        else if(typeof showToast==='function'){{showToast('No recording available for this time yet.')}}
-      }});
+      const playable=Boolean(event.has_event_clip&&event.id);
+      marker.style.cursor=playable?'pointer':'default';
+      marker.style.opacity=playable?'1':'0.65';
+      marker.title=`${{label}} · ${{playbackDate(event.timestamp).toLocaleString()}} · ${{playable?'Event clip':'Analytics only'}}`;
+      if(playable){{
+        marker.addEventListener('click',async()=>{{
+          try{{
+            const response=await fetch(
+              `/api/customer/events/${{cameraId}}/${{event.id}}/media/url`,
+              {{credentials:'same-origin'}}
+            );
+
+            if(response.ok){{
+              const payload=await response.json();
+
+              if(payload.url){{
+                video.pause();
+                video.src=payload.url;
+                video.load();
+                placeholder.hidden=true;
+                status.textContent='Playing event clip';
+                video.play().catch(error=>debugLog(
+                  `play() rejected: ${{error && error.name}}`
+                ));
+                revealClipPanel();
+                return;
+              }}
+            }}
+          }}catch(error){{
+            debugLog(`timeline event clip lookup failed: ${{error}}`);
+          }}
+
+          if(typeof showToast==='function'){{
+            showToast('Event clip is not available right now.');
+          }}
+        }});
+      }}
       timelineLane.appendChild(marker);
     }});
   }}
 
+  let visibleRecordingCount=6;
+
   function renderClipList(cameraId,clips){{
     clipList.innerHTML=clips.length?'':'<div class="empty">No recordings available yet for this camera.</div>';
-    clips.forEach(clip=>{{
+
+    const visible=[...clips].reverse().slice(0,visibleRecordingCount);
+
+    visible.forEach(clip=>{{
       const row=document.createElement('button');
       row.type='button';
       row.className='setting-link';
       row.style.cssText='width:100%;text-align:left;border:0;cursor:pointer';
-      const durationMin=Math.max(1,Math.round((new Date(clip.end)-new Date(clip.start))/60000));row.innerHTML=`<div><strong>${{new Date(clip.start).toLocaleString()}}</strong><div class="health-detail">${{durationMin}} min recording</div></div><span>Play →</span>`;
+
+      const durationMin=Math.max(
+        1,
+        Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000)
+      );
+
+      const thumbnailUrl=
+        `/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail`;
+
+      row.innerHTML=`<div style="display:flex;align-items:center;gap:14px;width:100%">
+        <div style="width:160px;height:90px;border-radius:10px;background:#0b1018;flex:0 0 auto;overflow:hidden;display:grid;place-items:center">
+          <img
+            src="${{thumbnailUrl}}"
+            alt="Recording thumbnail"
+            loading="lazy"
+            style="width:100%;height:100%;object-fit:cover"
+            onerror="window.__anyaicamThumbnailRetry(this)"
+          >
+        </div>
+        <div style="min-width:0;flex:1">
+          <strong>${{playbackDate(clip.start).toLocaleString()}}</strong>
+          <div class="health-detail">${{durationMin}} min recording</div>
+        </div>
+        <span style="white-space:nowrap">Play →</span>
+      </div>`;
+
       row.addEventListener('click',()=>playClip(cameraId,clip));
       clipList.appendChild(row);
     }});
+
     loadOlderButton.hidden=clips.length===0;
   }}
 
   loadOlderButton.addEventListener('click',async()=>{{
     const clips=recordingsByCamera[selectedCameraId]||[];
+
+    if(visibleRecordingCount<clips.length){{
+      visibleRecordingCount+=6;
+      renderClipList(selectedCameraId,clips);
+      return;
+    }}
+
     const oldest=clips[0];
     if(!oldest)return;
+
     loadOlderButton.disabled=true;
     loadOlderButton.textContent='Loading…';
-    const older=await fetchClipsMetadata(selectedCameraId,{{before:oldest.start,limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}});
+
+    const older=await fetchClipsMetadata(
+      selectedCameraId,
+      {{before:oldest.start,limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}}
+    );
+
     loadOlderButton.disabled=false;
     loadOlderButton.textContent='Load older recordings';
-    if(!older.length){{loadOlderButton.hidden=true;return}}
+
+    if(!older.length){{
+      loadOlderButton.hidden=true;
+      return;
+    }}
+
     recordingsByCamera[selectedCameraId]=[...older,...clips];
-    renderClipList(selectedCameraId,recordingsByCamera[selectedCameraId]);
+    visibleRecordingCount+=older.length;
+    renderClipList(
+      selectedCameraId,
+      recordingsByCamera[selectedCameraId]
+    );
     // Deliberately not re-rendering the timeline for older pages: the
     // timeline is a single day's 0-24h axis (see timelinePercent()),
     // so a recording from a previous day has no meaningful position on
@@ -139327,18 +140315,29 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   }}
 
   async function renderCamera(seekTimestamp){{
+    debugLog(`[renderCamera] start cameraId=${{selectedCameraId}} seekTimestamp=${{seekTimestamp}}`);
     const cameraId=selectedCameraId;
     const [clips,events]=await Promise.all([ensureClipsLoaded(cameraId),ensureEventsLoaded(cameraId)]);
-    if(cameraId!==selectedCameraId)return;  // camera changed again while this fetch was in flight
+    debugLog(`[renderCamera] clips loaded: ${{clips.length}}, events loaded: ${{events.length}}`);
+    if(cameraId!==selectedCameraId){{debugLog('[renderCamera] aborted: camera changed while loading');return}}  // camera changed again while this fetch was in flight
     video.pause();
     video.removeAttribute('src');
     video.load();
+    selectedClip=null;
+    skipBackButton.disabled=true;
+    timelinePlayButton.disabled=true;
+    skipForwardButton.disabled=true;
+    downloadButton.disabled=true;
+    shareButton.disabled=true;
+    createClipButton.disabled=true;
     placeholder.hidden=false;
     status.textContent=clips.length?'Select a recording to play.':'No recordings available yet.';
     renderClipList(cameraId,clips);
+    debugLog('[renderCamera] renderClipList done');
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
     timelineLabel.textContent=activeTile?activeTile.textContent:'—';
     renderTimeline(cameraId,clips,events);
+    debugLog('[renderCamera] renderTimeline done, entering seekTimestamp branch check');
     // Deep-link landing: arrived here with a specific moment in mind
     // (e.g. from the focused Live View's own recent-activity list) --
     // always resolved via a fresh near= lookup against the database,
@@ -139352,15 +140351,336 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // is oldest-first, so the last entry is the newest) instead of
     // leaving the player at a permanently black 0:00 until something
     // is clicked.
-    if(seekTimestamp){{
-      const nearby=findClipNear(clips,seekTimestamp)||(await fetchClipsMetadata(cameraId,{{near:seekTimestamp}}))[0];
-      if(cameraId!==selectedCameraId)return;
-      if(nearby){{playClip(cameraId,nearby)}}
-      else{{status.textContent='No recording available for this time yet.'}}
+    if(initialEventId){{
+      // Root cause (2026-09-02): an event with its own real clip must
+      // never depend on a nearby *recording* existing -- see
+      // playEventClipDeepLink()'s own docstring. This branch never
+      // touches findClipNear()/the recordings catalog at all.
+      debugLog(`[checkpoint 1] initialEventId=${{initialEventId}} -- event-clip path, no recording lookup`);
+      await playEventClipDeepLink(cameraId,initialEventId);
+    }}else if(seekTimestamp){{
+      debugLog(`[checkpoint 1] seekTimestamp=${{seekTimestamp}} autoplayFromEvent=${{autoplayFromEvent}}`);
+      // Analytics-only event (no clip) or an ordinary timestamp deep
+      // link -- unchanged: look for the recording that actually
+      // covers/is nearest this moment, never widening the existing
+      // near= match threshold just to force a match.
+      //
+      // The server's near= contract is an unchanged naive-UTC string
+      // (see _customer_recording_rows()) -- always rebuilt from the
+      // one correctly-parsed playbackDate(seekTimestamp) rather than
+      // forwarding seekTimestamp itself, since that may now be an
+      // epoch-ms number (see initialTimestamp above) that the server
+      // route was never meant to parse directly.
+      const nearby=findClipNear(clips,seekTimestamp)||(await fetchClipsMetadata(cameraId,{{near:playbackDate(seekTimestamp).toISOString().replace('Z','')}}))[0];
+      if(cameraId!==selectedCameraId){{debugLog('[checkpoint 2] aborted: camera changed while resolving nearby clip');return}}
+      debugLog(`[checkpoint 2] nearby=${{nearby?nearby.id:'null'}}${{nearby?(' start='+nearby.start+' end='+nearby.end):''}}`);
+      if(nearby){{
+        if(autoplayFromEvent){{
+          // Explicit signal set only by a real Events-row "Playback"
+          // click (see _customer_event_actions()) -- seek to that
+          // event's own offset inside the covering recording, then
+          // attempt playback. Ordinary Playback navigation and camera
+          // switching never set this flag, so they always take the
+          // select-only branch below, unchanged. Status text makes
+          // clear this is *recording* footage, not an event clip.
+          const offsetSeconds=(playbackDate(seekTimestamp).getTime()-playbackDate(nearby.start).getTime())/1000;
+          debugLog(`[checkpoint 3] computed offsetSeconds=${{offsetSeconds}}`);
+          if(Number.isFinite(offsetSeconds)&&offsetSeconds>=0){{
+            video.addEventListener('loadedmetadata',()=>{{
+              video.currentTime=offsetSeconds;
+              debugLog(`[checkpoint 6] loadedmetadata fired -- seeked to ${{offsetSeconds}}s, video.currentTime now=${{video.currentTime}}, duration=${{video.duration}}`);
+            }},{{once:true}});
+          }}else{{
+            debugLog(`[checkpoint 6] SKIPPED seek -- offsetSeconds not finite/non-negative`);
+          }}
+          debugLog(`[checkpoint 4] calling playClip(${{cameraId}}, ${{nearby.id}})`);
+          playClip(cameraId,nearby);
+          status.textContent='Recording footage near this event. Playing…';
+        }}else{{
+          selectedClip=nearby;
+          timelinePlayButton.disabled=false;
+          status.textContent='Recording ready. Press Play to begin.';
+        }}
+      }}
+      else{{status.textContent='No recording is available for this event.'}}
     }}else if(clips.length){{
-      playClip(cameraId,clips[clips.length-1]);
+      selectedClip=clips[clips.length-1];
+      timelinePlayButton.disabled=false;
+      status.textContent='Recording ready. Press Play or select a recording.';
     }}
   }}
+
+  async function playEventClipDeepLink(cameraId,eventId){{
+    // Deliberately independent of findClipNear()/the recordings
+    // catalog -- reuses exactly the same authorized event-media
+    // route (and the same fetch/assign pattern) the existing timeline
+    // event-marker/mobile-event-row clicks already use successfully
+    // (see the marker click handler and openEvent() below), so this
+    // is not a new playback mechanism, just a new caller of a proven
+    // one. Cross-camera/cross-customer event ids are rejected there
+    // (403/404) by the same _customer_authorized_camera_id() check
+    // every other bounded-Playback route already uses -- never a
+    // second, weaker authorization path.
+    debugLog(`[checkpoint 2] fetching event media url for event=${{eventId}}`);
+    try{{
+      const response=await fetch(
+        `/api/customer/events/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(eventId)}}/media/url`,
+        {{credentials:'same-origin'}}
+      );
+      if(cameraId!==selectedCameraId){{debugLog('[checkpoint 2] aborted: camera changed while resolving event clip');return}}
+      if(response.ok){{
+        const payload=await response.json();
+        if(payload.url){{
+          debugLog('[checkpoint 3] event media url resolved -- assigning to player (event-clip mode, no recording selected)');
+          placeholder.hidden=true;
+          selectedClip=null;  // this is an event clip, not a catalog recording -- Download/Share/Create-clip stay exactly as disabled as they already were for the existing marker-click event-clip flow, never repurposed for a stale recording's metadata.
+          video.pause();
+          video.src=payload.url;
+          video.load();
+          status.textContent='Playing event clip';
+          timelinePlayButton.disabled=false;
+          skipBackButton.disabled=false;
+          skipForwardButton.disabled=false;
+          debugLog('[checkpoint 4] event clip assigned, buttons enabled');
+          if(autoplayFromEvent){{
+            debugLog('[checkpoint 7] attempting video.play() for event clip');
+            video.play().then(()=>{{
+              debugLog('[checkpoint 7] event clip play() resolved');
+            }}).catch(error=>{{
+              // Cross-page navigation does not reliably carry user
+              // activation -- if the browser rejects this, the clip
+              // stays loaded and selected (never a forced-mute retry,
+              // never a fallback to an unrelated recording): the
+              // customer's own explicit press of the same Play button
+              // every other clip already uses (timelinePlayButton,
+              // now enabled above) starts it, same as always.
+              debugLog(`[checkpoint 7] event clip play() rejected: ${{error && error.name}} -- leaving it loaded, ready for an explicit Play`);
+              status.textContent='Event clip ready — press Play to start.';
+            }});
+          }}
+          revealClipPanel();
+          return;
+        }}
+      }}
+      debugLog(`[checkpoint 3] event media url not available (http ${{response.status}})`);
+    }}catch(error){{
+      debugLog(`[checkpoint 3] event media url fetch failed: ${{error}}`);
+    }}
+    status.textContent='No recording is available for this event.';
+  }}
+
+  skipBackButton.addEventListener('click',()=>{{
+    if(!video.currentSrc)return;
+    video.currentTime=Math.max(0,video.currentTime-10);
+  }});
+
+  skipForwardButton.addEventListener('click',()=>{{
+    if(!video.currentSrc)return;
+    const end=Number.isFinite(video.duration)?video.duration:video.currentTime+10;
+    video.currentTime=Math.min(end,video.currentTime+10);
+  }});
+
+  timelinePlayButton.addEventListener('click',()=>{{
+    if(!video.currentSrc){{
+      if(selectedClip)playClip(selectedCameraId,selectedClip);
+      return;
+    }}
+    if(video.paused){{
+      video.play().catch(error=>debugLog(`play() rejected: ${{error && error.name}}`));
+    }}else{{
+      video.pause();
+    }}
+  }});
+
+  video.addEventListener('play',()=>{{
+    timelinePlayButton.textContent='Pause';
+  }});
+
+  video.addEventListener('pause',()=>{{
+    timelinePlayButton.textContent='Play';
+  }});
+
+  video.addEventListener('ended',()=>{{
+    timelinePlayButton.textContent='Play';
+  }});
+
+  downloadButton.addEventListener('click',()=>{{
+    if(!video.currentSrc||!selectedClip)return;
+    const link=document.createElement('a');
+    link.href=video.currentSrc;
+    link.download=selectedClip.name||'recording';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }});
+
+  shareButton.addEventListener('click',async()=>{{
+    if(!video.currentSrc||!selectedClip){{
+      if(typeof showToast==='function')showToast('Select a recording first.');
+      return;
+    }}
+
+    const url=video.currentSrc;
+    const title=selectedClip.name||'AnyAiCam recording';
+
+    // Native share first when the browser supports it.
+    if(navigator.share){{
+      try{{
+        await navigator.share({{title,url}});
+        return;
+      }}catch(error){{
+        if(error && error.name==='AbortError')return;
+        debugLog(`native share unavailable: ${{error.message||error}}`);
+      }}
+    }}
+
+    // Modern clipboard works only in a secure context in many browsers.
+    if(navigator.clipboard && window.isSecureContext){{
+      try{{
+        await navigator.clipboard.writeText(url);
+        if(typeof showToast==='function')showToast('Recording link copied.');
+        return;
+      }}catch(error){{
+        debugLog(`clipboard API failed: ${{error.message||error}}`);
+      }}
+    }}
+
+    // HTTP/local-network fallback for browsers where Clipboard API
+    // is blocked because the VMS is not being served over HTTPS.
+    const box=document.createElement('textarea');
+    box.value=url;
+    box.setAttribute('readonly','');
+    box.style.position='fixed';
+    box.style.left='-9999px';
+    box.style.top='0';
+
+    document.body.appendChild(box);
+    box.focus();
+    box.select();
+
+    let copied=false;
+    try{{
+      copied=document.execCommand('copy');
+    }}catch(error){{
+      copied=false;
+    }}
+
+    box.remove();
+
+    if(copied){{
+      if(typeof showToast==='function')showToast('Recording link copied.');
+      return;
+    }}
+
+    // Last-resort fallback: display the URL so it can be copied manually.
+    window.prompt('Copy this recording link:',url);
+  }});
+
+  createClipButton.addEventListener('click',async()=>{{
+    if(!selectedClip||!video.currentSrc)return;
+
+    const clipStart=playbackDate(selectedClip.start);
+    const clipEnd=playbackDate(selectedClip.end);
+
+    if(Number.isNaN(clipStart.getTime())||Number.isNaN(clipEnd.getTime())){{
+      if(typeof showToast==='function')showToast('Unable to determine recording time.');
+      return;
+    }}
+
+    const position=Math.max(0,Number(video.currentTime)||0);
+    const center=new Date(clipStart.getTime()+position*1000);
+
+    const start=new Date(
+      Math.max(
+        clipStart.getTime(),
+        center.getTime()-15000
+      )
+    );
+
+    const end=new Date(
+      Math.min(
+        clipEnd.getTime(),
+        center.getTime()+15000
+      )
+    );
+
+    if(end<=start){{
+      if(typeof showToast==='function')showToast('Not enough recording available for a clip.');
+      return;
+    }}
+
+    createClipButton.disabled=true;
+    createClipButton.textContent='Creating…';
+
+    try{{
+      const response=await fetch('/api/customer/clips',{{
+        method:'POST',
+        headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify({{
+          camera_id:selectedCameraId,
+          start_time:start.toISOString(),
+          end_time:end.toISOString()
+        }})
+      }});
+
+      const job=await response.json();
+
+      if(!response.ok){{
+        throw new Error(job.detail||job.message||'Could not create clip.');
+      }}
+
+      const jobId=job.id;
+
+      for(let attempt=0;attempt<120;attempt++){{
+        await new Promise(resolve=>setTimeout(resolve,1000));
+
+        const statusResponse=await fetch(
+          `/api/customer/clips/${{encodeURIComponent(jobId)}}`
+        );
+
+        const statusData=await statusResponse.json();
+
+        if(!statusResponse.ok){{
+          throw new Error(
+            statusData.detail||
+            statusData.message||
+            'Could not check clip status.'
+          );
+        }}
+
+        if(statusData.status==='complete'){{
+          createClipButton.textContent='Create clip';
+
+          if(statusData.url){{
+            const link=document.createElement('a');
+            link.href=statusData.url;
+            link.download=statusData.filename||'clip.mp4';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+          }}
+
+          if(typeof showToast==='function')showToast('Clip created.');
+          return;
+        }}
+
+        if(statusData.status==='error'){{
+          throw new Error(statusData.message||'Clip creation failed.');
+        }}
+      }}
+
+      throw new Error('Clip creation timed out.');
+
+    }}catch(error){{
+      if(typeof showToast==='function'){{
+        showToast(error.message||'Clip creation failed.');
+      }}
+      debugLog(`clip creation failed: ${{error.message||error}}`);
+    }}finally{{
+      createClipButton.disabled=false;
+      createClipButton.textContent='Create clip';
+    }}
+  }});
 
   filterButtons.forEach(button=>{{
     button.addEventListener('click',()=>{{
@@ -139376,7 +140696,10 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
   }});
 
-  renderCamera(initialTimestamp);
+  debugLog(`[boot] calling renderCamera(initialTimestamp=${{initialTimestamp}})`);
+  renderCamera(initialTimestamp).catch(error=>{{
+    debugLog(`[fatal] renderCamera() threw/rejected: ${{error && error.message ? error.message : error}}`);
+  }});
 }})();
 </script>'''
 
