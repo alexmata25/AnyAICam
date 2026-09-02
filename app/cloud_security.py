@@ -34,6 +34,30 @@ def _media_src_csp() -> str:
     return f"media-src 'self' blob: https://{bucket}.s3.amazonaws.com"
 
 
+def _img_src_csp() -> str:
+    """Allow customer recording/event thumbnails from the same exact
+    recordings bucket used by Playback media, while keeping the image
+    policy otherwise restricted to same-origin/data/blob sources."""
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    if not bucket:
+        return "img-src 'self' data: blob:"
+    return f"img-src 'self' data: blob: https://{bucket}.s3.amazonaws.com"
+
+
+def _connect_src_csp() -> str:
+    """Allow browser/service-worker fetches to the exact recordings
+    bucket used by presigned Playback media and thumbnails."""
+    sources = [
+        "'self'",
+        *settings.allowed_origins,
+        "https://d31cxfv0l904ar.cloudfront.net",
+    ]
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    if bucket:
+        sources.append(f"https://{bucket}.s3.amazonaws.com")
+    return "connect-src " + " ".join(sources)
+
+
 _MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
 
 
@@ -134,7 +158,7 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; "+_media_src_csp()+"; connect-src 'self' "+' '.join(settings.allowed_origins)+" https://d31cxfv0l904ar.cloudfront.net; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp()+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'

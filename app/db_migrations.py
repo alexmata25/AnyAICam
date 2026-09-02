@@ -98,6 +98,26 @@ CREATE TABLE IF NOT EXISTS camera_credentials(camera_id TEXT PRIMARY KEY,encrypt
     ('20260827_camera_analytics_entitlements','''
 CREATE TABLE IF NOT EXISTS camera_analytics_entitlements(camera_id TEXT NOT NULL,analytic_key TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(camera_id,analytic_key),FOREIGN KEY(camera_id) REFERENCES cameras(id));
 '''),
+    ('20260901_detection_event_media','''
+CREATE TABLE IF NOT EXISTS detection_event_media(
+    id TEXT PRIMARY KEY,
+    detection_event_id TEXT NOT NULL UNIQUE,
+    customer_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    s3_key TEXT NOT NULL,
+    thumbnail_s3_key TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    duration_seconds REAL,
+    size_bytes INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(detection_event_id) REFERENCES detection_events(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id)
+);
+CREATE INDEX IF NOT EXISTS idx_detection_event_media_camera
+ON detection_event_media(camera_id,started_at);
+'''),
 ]
 
 

@@ -486,6 +486,124 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 raise HTTPException(status_code=500,detail='Could not record this event.')
         return {'status':'accepted','event_id':event_id}
 
+    @app.post('/api/appliance/analytics/{camera_id}/events/{local_event_id}/media')
+    def analytics_event_media_available(request: Request,camera_id: str,local_event_id: str,payload: dict) -> dict:
+        # Associates one short event clip with an already-synced analytics
+        # event. Media bytes are uploaded directly appliance -> S3 using the
+        # existing camera-scoped recording upload credential; this route only
+        # catalogs the object after upload succeeds.
+        appliance=authenticate_appliance(request)
+        if not ANALYTICS_SYNC_ENABLED:
+            raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
+
+        camera=_authorized_camera(appliance,camera_id)
+        safe=sanitize_appliance_payload(payload)
+
+        local_event_id=str(local_event_id or '').strip()
+        s3_key=str(safe.get('s3_key','')).strip()
+        thumbnail_s3_key=str(safe.get('thumbnail_s3_key','')).strip() or None
+        started_at=str(safe.get('started_at','')).strip()
+        ended_at=str(safe.get('ended_at','')).strip()
+        duration_seconds=safe.get('duration_seconds')
+        size_bytes=safe.get('size_bytes')
+
+        if not local_event_id:
+            raise HTTPException(status_code=400,detail='local_event_id is required.')
+        if not s3_key:
+            raise HTTPException(status_code=400,detail='s3_key is required.')
+        if not started_at or not ended_at:
+            raise HTTPException(status_code=400,detail='started_at and ended_at are required.')
+
+        expected_prefix=recording_s3_prefix(
+            camera['customer_id'],
+            camera['site_id'],
+            appliance['id'],
+            camera_id,
+        )
+
+        if not s3_key.startswith(expected_prefix):
+            raise HTTPException(
+                status_code=403,
+                detail="s3_key is outside this camera's authorized prefix.",
+            )
+
+        if thumbnail_s3_key and not thumbnail_s3_key.startswith(expected_prefix):
+            raise HTTPException(
+                status_code=403,
+                detail="thumbnail_s3_key is outside this camera's authorized prefix.",
+            )
+
+        now=datetime.now().isoformat()
+
+        with connection() as db:
+            event=db.execute(
+                'SELECT id FROM detection_events '
+                'WHERE camera_id=? AND local_event_id=?',
+                (camera_id,local_event_id),
+            ).fetchone()
+
+            if not event:
+                raise HTTPException(
+                    status_code=404,
+                    detail='Detection event has not reached the cloud yet.',
+                )
+
+            existing=db.execute(
+                'SELECT id FROM detection_event_media WHERE detection_event_id=?',
+                (event['id'],),
+            ).fetchone()
+
+            if existing:
+                db.execute(
+                    'UPDATE detection_event_media SET '
+                    's3_key=?,thumbnail_s3_key=?,started_at=?,ended_at=?,'
+                    'duration_seconds=?,size_bytes=? '
+                    'WHERE detection_event_id=?',
+                    (
+                        s3_key,
+                        thumbnail_s3_key,
+                        started_at,
+                        ended_at,
+                        float(duration_seconds) if duration_seconds is not None else None,
+                        int(size_bytes) if size_bytes is not None else None,
+                        event['id'],
+                    ),
+                )
+                return {'status':'duplicate','media_id':existing['id']}
+
+            media_id=secrets.token_hex(12)
+
+            db.execute(
+                'INSERT INTO detection_event_media('
+                'id,detection_event_id,customer_id,camera_id,s3_key,'
+                'thumbnail_s3_key,started_at,ended_at,duration_seconds,'
+                'size_bytes,created_at'
+                ') VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                (
+                    media_id,
+                    event['id'],
+                    camera['customer_id'],
+                    camera_id,
+                    s3_key,
+                    thumbnail_s3_key,
+                    started_at,
+                    ended_at,
+                    float(duration_seconds) if duration_seconds is not None else None,
+                    int(size_bytes) if size_bytes is not None else None,
+                    now,
+                ),
+            )
+
+        audit(
+            {'email':appliance['cloud_id'],'role':'appliance'},
+            'appliance.analytics_event_media_available',
+            'detection_event_media',
+            media_id,
+            {'camera_id':camera_id,'local_event_id':local_event_id,'s3_key':s3_key},
+        )
+
+        return {'status':'accepted','media_id':media_id}
+
     @app.post('/api/appliance/live/{camera_id}/segment-available')
     def live_relay_segment_available(request: Request,camera_id: str,payload: dict) -> dict:
         appliance=authenticate_appliance(request)
