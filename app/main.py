@@ -139245,6 +139245,87 @@ def _row_to_recording_metadata(row: dict) -> dict:
     }
 
 
+def _catalog_local_recordings_for_camera(camera_id: str) -> int:
+    """Backfills the recordings table from local .mkv files still on
+    disk for this camera -- reconciled verbatim from the accepted,
+    live production implementation (EC2/Samsung), not invented.
+    recording_start() (filename parsing) is the sole authoritative
+    timestamp source; filesystem mtime is used only as a safety gate
+    to skip a segment ffmpeg may still be actively writing (a file
+    younger than CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS), never as the
+    recorded time itself. (camera_id, s3_key) is UNIQUE on the
+    recordings table, so this is naturally idempotent -- calling it
+    repeatedly, on every date this camera's Playback is queried for,
+    never creates duplicate rows."""
+    from partner_db import connection
+
+    with connection() as db:
+        camera = db.execute(
+            "SELECT id, customer_id, site_id, appliance_id, camera_number "
+            "FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+
+        if not camera or camera["camera_number"] is None:
+            return 0
+
+        camera_number = int(camera["camera_number"])
+        camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+        if not camera_folder.is_dir():
+            return 0
+
+        cutoff = time.time() - CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS
+        added = 0
+
+        for path in sorted(camera_folder.glob("*.mkv")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+
+            if stat.st_size <= 0 or stat.st_mtime > cutoff:
+                continue
+
+            started = recording_start(path, camera_number)
+            if not started:
+                continue
+
+            ended = started + timedelta(minutes=5)
+            s3_key = cloud_recording_s3_key(path, camera_number)
+
+            existing = db.execute(
+                "SELECT id FROM recordings WHERE camera_id=? AND s3_key=?",
+                (camera_id, s3_key),
+            ).fetchone()
+
+            if existing:
+                continue
+
+            db.execute(
+                "INSERT INTO recordings("
+                "id,customer_id,site_id,appliance_id,camera_id,s3_key,"
+                "started_at,ended_at,duration_seconds,size_bytes,status,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    secrets.token_hex(12),
+                    camera["customer_id"],
+                    camera["site_id"],
+                    camera["appliance_id"],
+                    camera_id,
+                    s3_key,
+                    started.isoformat(),
+                    ended.isoformat(),
+                    300,
+                    stat.st_size,
+                    "available",
+                    datetime.now().isoformat(),
+                ),
+            )
+            added += 1
+
+    return added
+
+
 def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, near: str | None = None) -> list[dict]:
     """Recording METADATA only -- {id, start, end, name}, no presigned
     URL -- the bounded, cheap counterpart _customer_camera_recordings()
@@ -139276,6 +139357,7 @@ def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before
       event-to-playback deep link lands on the same recording whether
       or not it happens to already be in the initially-loaded page.
       Ignores limit/before."""
+    _catalog_local_recordings_for_camera(camera_id)
     from partner_db import connection
     with connection() as db:
         if near:
@@ -139324,6 +139406,109 @@ def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before
     return [_row_to_recording_metadata(row) for row in reversed(rows)]
 
 
+def _local_date_bounds_to_utc(date: str) -> tuple[str, str]:
+    """Converts a customer-local calendar date (YYYY-MM-DD) to the
+    [start, end) naive-UTC ISO bounds covering that local day -- the
+    exact same APPLIANCE_TIMEZONE conversion _customer_camera_events()
+    already uses for the event timeline, reused here rather than a
+    second, possibly-drifting implementation."""
+    local_start = datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=APPLIANCE_TIMEZONE
+    )
+    local_end = local_start + timedelta(days=1)
+
+    utc_zone = ZoneInfo("UTC")
+    query_start = (
+        local_start.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    query_end = (
+        local_end.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    return query_start, query_end
+
+
+def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
+    """All available recordings for one customer camera that overlap a
+    given customer-local calendar date, ordered oldest-first --
+    chronological order so a future continuous-playback phase can
+    chain adjacent segments directly off this list without re-sorting.
+
+    Catalogs local .mkv files for this camera before querying (see
+    _catalog_local_recordings_for_camera()) so a date whose Playback
+    page has never been opened before -- an old retained day -- is
+    still discoverable, without any new always-running background
+    service: the existing per-request catalog call this function
+    already makes (the same one _customer_recording_rows() has always
+    made) is sufficient, since it scans the camera's entire local
+    folder every time, not just recently-modified files.
+
+    Uses an interval-overlap test (started_at < day_end AND ended_at >
+    day_start), not a started_at-only bound -- a recording that starts
+    the previous day and runs past local midnight, or one that starts
+    within this day and runs into the next, must still appear here:
+    it genuinely overlaps this date's footage, even though its own
+    started_at may fall outside [day_start, day_end)."""
+    _catalog_local_recordings_for_camera(camera_id)
+
+    query_start, query_end = _local_date_bounds_to_utc(date)
+
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT id, s3_key, started_at, ended_at FROM recordings "
+            "WHERE camera_id=? AND status='available' "
+            "AND started_at<? AND ended_at>? "
+            "ORDER BY started_at ASC",
+            (camera_id, query_end, query_start),
+        ).fetchall()
+    return [_row_to_recording_metadata(row) for row in rows]
+
+
+def _customer_recording_dates(camera_id: str) -> list[str]:
+    """Every customer-local calendar date (YYYY-MM-DD) this camera has
+    at least one available recording for -- powers the Playback
+    calendar's "which days have footage" indication, without the
+    browser ever scanning video files itself. A recording spanning
+    local midnight contributes both dates it actually overlaps,
+    matching _customer_recordings_for_date()'s own overlap semantics.
+
+    Deliberately computed in Python, not a bare SQL date() extraction
+    on the stored (UTC) started_at column -- a naive UTC-date group-by
+    would misattribute recordings near a UTC-day boundary to the wrong
+    customer-local date. The recordings table is retention-bounded
+    (days to weeks per camera, not an unbounded history), so fetching
+    every row's own two timestamps and converting each in Python is
+    the smallest safe approach -- no second index, no new query
+    complexity for a rarely-called, cheap endpoint."""
+    _catalog_local_recordings_for_camera(camera_id)
+
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT started_at, ended_at FROM recordings "
+            "WHERE camera_id=? AND status='available'",
+            (camera_id,),
+        ).fetchall()
+
+    utc_zone = ZoneInfo("UTC")
+    dates: set[str] = set()
+    for row in rows:
+        try:
+            start = datetime.fromisoformat(row["started_at"]).replace(tzinfo=utc_zone)
+            end = datetime.fromisoformat(row["ended_at"]).replace(tzinfo=utc_zone)
+        except ValueError:
+            continue
+        start_local = start.astimezone(APPLIANCE_TIMEZONE)
+        end_local = end.astimezone(APPLIANCE_TIMEZONE)
+        dates.add(start_local.strftime("%Y-%m-%d"))
+        dates.add(end_local.strftime("%Y-%m-%d"))
+    return sorted(dates)
+
+
 def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
     """Presigns exactly one recording, looked up by its own catalog id
     and re-scoped to camera_id in the same query -- so a recording_id
@@ -139355,11 +139540,31 @@ def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
 
 
 @app.get("/api/customer/recordings/{camera_id}")
-def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, near: str | None = None, limit: int = 50) -> dict:
+def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, near: str | None = None, date: str | None = None, limit: int = 50) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    # date= is a distinct, whole-day query mode -- returns every segment
+    # overlapping that customer-local calendar date, chronologically,
+    # ignoring before/near/limit entirely (a day's worth of 5-minute
+    # segments is already a small, bounded result, unlike the
+    # unbounded-history concern before/limit exist to guard against).
+    # Existing near=/before= pagination behavior is completely
+    # unchanged when date is absent.
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD.")
+        return {"clips": _customer_recordings_for_date(camera_id, date)}
     limit = max(1, min(200, limit))
     return {"clips": _customer_recording_rows(camera_id, limit=limit, before=before, near=near)}
+
+
+@app.get("/api/customer/recordings/{camera_id}/dates")
+def customer_recording_dates(camera_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    return {"dates": _customer_recording_dates(camera_id)}
 
 
 @app.get("/api/customer/recordings/{camera_id}/{recording_id}/url")
@@ -140029,6 +140234,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
+        '<div class="monitor-toolbar-group" id="playback-date-bar" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">'
+        '<label for="playback-date-input" class="health-detail">Date</label>'
+        '<input id="playback-date-input" type="date">'
+        '<button id="playback-date-today" type="button" class="ghost-button">Today</button>'
+        '<span id="playback-selected-date-label" class="health-detail"></span>'
+        '</div>'
+        '<div id="playback-available-dates" class="health-detail" style="margin-top:2px"></div>'
         '<div class="monitor-filters">'
         '<button class="monitor-filter active" data-filter="all" type="button">All</button>'
         '<button class="monitor-filter active" data-filter="motion" type="button">Motion</button>'
@@ -140158,8 +140370,18 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const downloadButton=document.getElementById('download-selected');
   const shareButton=document.getElementById('share-selected');
   const createClipButton=document.getElementById('create-clip');
+  const dateInput=document.getElementById('playback-date-input');
+  const dateTodayButton=document.getElementById('playback-date-today');
+  const selectedDateLabel=document.getElementById('playback-selected-date-label');
+  const availableDatesEl=document.getElementById('playback-available-dates');
+  const datesByCamera={{}};
+  const datesLoaded=new Set();
 
   let selectedClip=null;
+  // null = the existing default/most-recent view (unchanged pagination).
+  // A YYYY-MM-DD string means the customer explicitly picked a
+  // calendar date -- see loadRecordingsForDate()/dateTodayButton below.
+  let viewingDate=null;
   let selectedCameraId={json.dumps(first_camera_id)};
   // ?t= is now built server-side as an unambiguous UTC epoch-ms integer
   // (see _customer_event_actions()) -- URL query values always arrive
@@ -140235,6 +140457,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       selectedCameraId=tile.dataset.cameraId;
       visibleRecordingCount=6;
       clipPanel.hidden=true;
+      viewingDate=null;
+      dateInput.value='';
+      selectedDateLabel.textContent='';
+      loadOlderButton.hidden=false;
+      renderAvailableDates(selectedCameraId).catch(()=>{{}});
       await renderCamera();
     }});
   }});
@@ -140684,6 +140911,136 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     return events;
   }}
 
+  // Local (customer-browser) calendar date of a naive-UTC timestamp,
+  // via the same playbackDate() UTC-aware parse used everywhere else
+  // on this page -- never a second, inconsistent date computation.
+  function localDateStringOf(value){{
+    const d=(value instanceof Date)?value:playbackDate(value);
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,'0');
+    const day=String(d.getDate()).padStart(2,'0');
+    return `${{y}}-${{m}}-${{day}}`;
+  }}
+
+  // The already-loaded event cache is not itself date-scoped (it's the
+  // existing recent-events list), so a date-mode timeline filters it
+  // client-side rather than requesting a second, new events-by-date
+  // endpoint for what is already an in-memory, per-camera list.
+  function eventsForLocalDate(events,date){{
+    return events.filter(event=>localDateStringOf(event.timestamp)===date);
+  }}
+
+  async function ensureDatesLoaded(cameraId){{
+    if(datesLoaded.has(cameraId))return datesByCamera[cameraId]||[];
+    try{{
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}/dates`);
+      const data=response.ok?await response.json():{{dates:[]}};
+      datesByCamera[cameraId]=Array.isArray(data.dates)?data.dates:[];
+    }}catch(error){{
+      debugLog(`dates fetch failed: ${{error && error.message}}`);
+      datesByCamera[cameraId]=[];
+    }}
+    datesLoaded.add(cameraId);
+    return datesByCamera[cameraId];
+  }}
+
+  // Lightweight recorded-date availability indicator -- deliberately a
+  // capped, most-recent-first strip of clickable date chips, not a
+  // full calendar widget: the browser never scans video files itself
+  // to determine this (see _customer_recording_dates()'s own
+  // docstring), and any older retained date not shown here is still
+  // directly reachable via the date input above.
+  async function renderAvailableDates(cameraId){{
+    const dates=await ensureDatesLoaded(cameraId);
+    if(cameraId!==selectedCameraId)return;
+    availableDatesEl.innerHTML='';
+    if(!dates.length){{
+      availableDatesEl.textContent='No retained recordings found yet for this camera.';
+      return;
+    }}
+    const label=document.createElement('span');
+    label.textContent='Dates with recordings: ';
+    availableDatesEl.appendChild(label);
+    [...dates].reverse().slice(0,14).forEach(date=>{{
+      const chip=document.createElement('button');
+      chip.type='button';
+      chip.className='ghost-button';
+      chip.style.cssText='padding:3px 8px;margin:2px;font-size:12px';
+      chip.textContent=date;
+      if(date===viewingDate)chip.style.fontWeight='700';
+      chip.addEventListener('click',()=>{{
+        loadRecordingsForDate(cameraId,date).catch(error=>{{
+          debugLog(`loadRecordingsForDate failed: ${{error && error.message}}`);
+        }});
+      }});
+      availableDatesEl.appendChild(chip);
+    }});
+  }}
+
+  // Selecting a date reloads the timeline for that date (a fresh
+  // date=-scoped fetch, replacing what's shown) rather than merely
+  // paginating backward through recordingsByCamera's own cached list
+  // -- that existing cache/pagination (ensureClipsLoaded/loadOlderButton)
+  // is left completely untouched by date mode, and resumes exactly as
+  // before once dateTodayButton is pressed.
+  async function loadRecordingsForDate(cameraId,date){{
+    if(cameraId!==selectedCameraId)return;
+    viewingDate=date;
+    dateInput.value=date;
+    selectedDateLabel.textContent=`Showing recordings for ${{date}}`;
+    clipPanel.hidden=false;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    selectedClip=null;
+    skipBackButton.disabled=true;
+    timelinePlayButton.disabled=true;
+    skipForwardButton.disabled=true;
+    downloadButton.disabled=true;
+    shareButton.disabled=true;
+    createClipButton.disabled=true;
+    placeholder.hidden=false;
+    status.textContent=`Loading recordings for ${{date}}\u2026`;
+    const clips=await fetchClipsMetadata(cameraId,{{date}});
+    if(cameraId!==selectedCameraId||date!==viewingDate){{
+      debugLog('[date-mode] aborted: camera or date changed while loading');
+      return;
+    }}
+    // A whole day's worth of fixed 5-minute segments is already a
+    // small, bounded result (see the date= route's own docstring) --
+    // show every returned segment, not just the default page size.
+    visibleRecordingCount=clips.length||6;
+    renderClipList(cameraId,clips);
+    // A date query already returns every overlapping segment for that
+    // day -- older-page pagination has nothing left to add here.
+    loadOlderButton.hidden=true;
+    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
+    timelineLabel.textContent=(activeTile?activeTile.textContent:'\u2014')+` \u2014 ${{date}}`;
+    renderTimeline(cameraId,clips,eventsForLocalDate(analyticsByCamera[cameraId]||[],date));
+    status.textContent=clips.length
+      ?`${{clips.length}} recording(s) found for ${{date}}. Select one, or a point on the timeline, to play.`
+      :`No recordings are available for ${{date}}.`;
+    renderAvailableDates(cameraId).catch(()=>{{}});
+  }}
+
+  dateInput.addEventListener('change',()=>{{
+    if(!dateInput.value)return;
+    loadRecordingsForDate(selectedCameraId,dateInput.value).catch(error=>{{
+      debugLog(`loadRecordingsForDate failed: ${{error && error.message}}`);
+    }});
+  }});
+
+  dateTodayButton.addEventListener('click',()=>{{
+    viewingDate=null;
+    dateInput.value='';
+    selectedDateLabel.textContent='';
+    visibleRecordingCount=6;
+    loadOlderButton.hidden=false;
+    renderCamera().catch(error=>{{
+      debugLog(`renderCamera (today) failed: ${{error && error.message}}`);
+    }});
+  }});
+
   async function renderCamera(seekTimestamp){{
     debugLog(`[renderCamera] start cameraId=${{selectedCameraId}} seekTimestamp=${{seekTimestamp}}`);
     const cameraId=selectedCameraId;
@@ -141064,6 +141421,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       filterButtons.forEach(item=>item.classList.toggle('active',item.dataset.filter==='all'?activeFilters.size===6:activeFilters.has(item.dataset.filter)));
       renderTimeline(selectedCameraId,recordingsByCamera[selectedCameraId]||[],analyticsByCamera[selectedCameraId]||[]);
     }});
+  }});
+
+  dateInput.max=localDateStringOf(new Date());
+  renderAvailableDates(selectedCameraId).catch(error=>{{
+    debugLog(`available dates fetch failed: ${{error && error.message}}`);
   }});
 
   debugLog(`[boot] calling renderCamera(initialTimestamp=${{initialTimestamp}})`);
