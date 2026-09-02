@@ -193,6 +193,56 @@ def test_local_date_bounds_use_the_same_convention_as_customer_camera_events():
     assert query_end == expected_end
 
 
+def test_local_date_bounds_spans_only_23_hours_on_the_spring_forward_transition_day():
+    """2026-03-08 is the US spring-forward day in America/Chicago (clocks
+    jump 2:00am -> 3:00am CDT) -- that local calendar day is genuinely
+    only 23 hours long in real elapsed/UTC time. A naive "local midnight
+    + 24 hours" bound would silently include one extra real hour that
+    actually belongs to the next local day."""
+    query_start, query_end = main._local_date_bounds_to_utc("2026-03-08")
+    assert query_start == "2026-03-08T06:00:00"  # still CST (UTC-6) at local midnight
+    assert query_end == "2026-03-09T05:00:00"  # already CDT (UTC-5) by the next local midnight
+    span_hours = (
+        datetime.fromisoformat(query_end) - datetime.fromisoformat(query_start)
+    ).total_seconds() / 3600
+    assert span_hours == 23
+
+
+def test_local_date_bounds_spans_25_hours_on_the_fall_back_transition_day():
+    """2026-11-01 is the US fall-back day in America/Chicago (clocks fall
+    2:00am CDT -> 1:00am CST) -- that local calendar day is genuinely 25
+    hours long in real elapsed/UTC time."""
+    query_start, query_end = main._local_date_bounds_to_utc("2026-11-01")
+    assert query_start == "2026-11-01T05:00:00"  # still CDT (UTC-5) at local midnight
+    assert query_end == "2026-11-02T06:00:00"  # already CST (UTC-6) by the next local midnight
+    span_hours = (
+        datetime.fromisoformat(query_end) - datetime.fromisoformat(query_start)
+    ).total_seconds() / 3600
+    assert span_hours == 25
+
+
+def test_a_recording_spanning_the_spring_forward_transition_is_still_returned_for_that_date(db_path, tmp_path, monkeypatch):
+    """A real, continuous recording that happens to be running across the
+    2:00am -> 3:00am jump must still be found when querying that local
+    date -- computed here purely from real elapsed UTC time (started_at/
+    ended_at are always naive UTC), so the wall-clock skip itself never
+    enters the query."""
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_base_tenant(conn)
+        # UTC 07:55-08:00 on 2026-03-08 is local 01:55-02:00 CST, right
+        # up against the jump to 03:00 CDT -- still entirely within the
+        # local calendar day of 2026-03-08 either way.
+        _seed_recording(conn, "cam-1", "seg-transition.mkv", "2026-03-08T07:55:00", "2026-03-08T08:00:00")
+
+        result = main._customer_recordings_for_date("cam-1", "2026-03-08")
+
+    assert [row["name"] for row in result] == ["seg-transition.mkv"]
+
+
 # --------------------------------------------------------- Phase 2: recording crossing midnight
 
 

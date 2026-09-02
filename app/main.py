@@ -140378,6 +140378,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const datesLoaded=new Set();
 
   let selectedClip=null;
+  // Whichever clips array the timeline/clip-list are currently
+  // showing -- the default (most-recent-page) view or a date-mode
+  // view -- kept in sync at each renderTimeline() call site below,
+  // so the ruler click-to-exact-time handler (see timelineLane's
+  // own listener further down) always searches the right set
+  // regardless of which mode is active.
+  let currentClips=[];
   // null = the existing default/most-recent view (unchanged pagination).
   // A YYYY-MM-DD string means the customer explicitly picked a
   // calendar date -- see loadRecordingsForDate()/dateTodayButton below.
@@ -141016,6 +141023,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     loadOlderButton.hidden=true;
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
     timelineLabel.textContent=(activeTile?activeTile.textContent:'\u2014')+` \u2014 ${{date}}`;
+    currentClips=clips;
     renderTimeline(cameraId,clips,eventsForLocalDate(analyticsByCamera[cameraId]||[],date));
     status.textContent=clips.length
       ?`${{clips.length}} recording(s) found for ${{date}}. Select one, or a point on the timeline, to play.`
@@ -141041,6 +141049,39 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
   }});
 
+  // Jump to an exact time on the currently shown date: a click
+  // anywhere on the empty ruler (event.target===timelineLane --
+  // an existing segment/event marker's own click never bubbles up
+  // as that exact target, so their own more specific handlers above
+  // are completely unaffected) is converted back from its pixel
+  // fraction of the ruler's width into a wall-clock time-of-day on
+  // the shown date, using the same LOCAL-hours/minutes/seconds axis
+  // timelinePercent() itself already plots clips onto. Reuses
+  // findClipNear()'s existing covering-else-nearest-within-5-minutes
+  // contract and the same seek-once-loadedmetadata-fires pattern the
+  // event-autoplay deep link already uses in renderCamera() below.
+  timelineLane.addEventListener('click',(event)=>{{
+    if(event.target!==timelineLane)return;
+    const rect=timelineLane.getBoundingClientRect();
+    if(rect.width<=0)return;
+    const fraction=Math.min(1,Math.max(0,(event.clientX-rect.left)/rect.width));
+    const dayString=viewingDate||localDateStringOf(new Date());
+    const [y,m,d]=dayString.split('-').map(Number);
+    const target=new Date(y,m-1,d,0,0,0,0);
+    target.setTime(target.getTime()+Math.round(fraction*86400000));
+    const nearby=findClipNear(currentClips,target.getTime());
+    if(!nearby){{
+      if(typeof showToast==='function')showToast('No recording available at that time.');
+      return;
+    }}
+    const offsetSeconds=(target.getTime()-playbackDate(nearby.start).getTime())/1000;
+    const clipDurationSeconds=(playbackDate(nearby.end).getTime()-playbackDate(nearby.start).getTime())/1000;
+    playClip(selectedCameraId,nearby);
+    if(Number.isFinite(offsetSeconds)&&offsetSeconds>=0&&offsetSeconds<=clipDurationSeconds){{
+      video.addEventListener('loadedmetadata',()=>{{video.currentTime=offsetSeconds;}},{{once:true}});
+    }}
+  }});
+
   async function renderCamera(seekTimestamp){{
     debugLog(`[renderCamera] start cameraId=${{selectedCameraId}} seekTimestamp=${{seekTimestamp}}`);
     const cameraId=selectedCameraId;
@@ -141063,6 +141104,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     debugLog('[renderCamera] renderClipList done');
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
     timelineLabel.textContent=activeTile?activeTile.textContent:'—';
+    currentClips=clips;
     renderTimeline(cameraId,clips,events);
     debugLog('[renderCamera] renderTimeline done, entering seekTimestamp branch check');
     // Deep-link landing: arrived here with a specific moment in mind
