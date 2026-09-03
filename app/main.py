@@ -16926,7 +16926,7 @@ async def retention_worker() -> None:
 
 
 
-        delete_expired_recordings()
+        await asyncio.to_thread(delete_expired_recordings)
 
 
 
