@@ -1,4 +1,24 @@
+"""Real short-clip + thumbnail cloud delivery for a single qualifying
+motion/AI detection event (store_motion_event()/save_yolo_events()'s own
+per-event build-then-upload background task) -- distinct from, and
+unrelated to, recording_uploader.py's own periodic bulk recording sync
+and analytics_sync.py's own periodic bulk analytics-event sync.
+
+This module's own cloud calls (an STS-credentialed S3 PutObject for the
+clip and thumbnail, then two control-plane POSTs to register the
+detection event and its media in EC2) are gated by their own explicit
+flag, ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED (EVENT_MEDIA_UPLOAD_ENABLED
+below) -- deliberately NOT by ANYAICAM_RECORDING_UPLOAD_ENABLED or
+ANYAICAM_ANALYTICS_SYNC_ENABLED, whose own meaning is unchanged by this
+module and stays scoped to gating recording_uploader.py's and
+analytics_sync.py's own periodic background workers only, exactly as
+before. Local event creation, local clip creation (build_motion_event_
+clip()), and local thumbnail creation all happen upstream of this
+module's own entry point and are never affected by this flag either
+way -- only the outbound network calls below are."""
+
 import logging
+import os
 import subprocess
 import time
 from datetime import datetime
@@ -8,6 +28,17 @@ import recording_uploader as recording_upload
 from event_clips import compute_clip_window
 
 logger = logging.getLogger("anyaicam.event_media_uploader")
+
+# Default false: matches the same safe-by-default convention every other
+# appliance -> cloud call in this codebase already uses (recording_
+# uploader.RECORDING_UPLOAD_ENABLED, analytics_sync.ANALYTICS_SYNC_
+# ENABLED, and analytics_sync.py's own ANALYTICS_SYNC_NOTIFY_ENABLED --
+# all default "false"). Before this flag existed, this module's calls
+# ran unconditionally; a fresh or already-deployed appliance that never
+# sets ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED now gets the same off-by-
+# default posture as every sibling cloud-call flag, not a silent
+# continuation of the previous always-on behavior.
+EVENT_MEDIA_UPLOAD_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED", "false").strip().lower() == "true"
 
 
 def _local_path_from_recording_url(value: str | None) -> Path | None:
@@ -118,6 +149,20 @@ def upload_motion_event_media(
     clip_url: str,
     thumbnail_url: str | None,
 ) -> bool:
+    # Checked first, before any local file/network work below: local
+    # event/clip/thumbnail creation (all upstream of this function) is
+    # never affected either way -- only the STS credential request, the
+    # S3 clip/thumbnail upload, and the two control-plane POSTs
+    # (_ensure_detection_event_synced()'s event registration and this
+    # function's own /events/{id}/media registration) are skipped.
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        logger.info(
+            "event_media.upload_disabled event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
     clip_path = _local_path_from_recording_url(clip_url)
 
     if clip_path is None:

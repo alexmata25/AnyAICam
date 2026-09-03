@@ -90,8 +90,12 @@ from pathlib import Path
 
 try:
     import boto3
+    from boto3.s3.transfer import TransferConfig
+    from botocore.exceptions import ClientError
 except ImportError:
     boto3 = None
+    TransferConfig = None
+    ClientError = None
 
 logger = logging.getLogger("anyaicam.recording_uploader")
 
@@ -125,14 +129,53 @@ TRANSCODE_THREADS = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_THRE
 TRANSCODE_TIMEOUT_SECONDS = max(60, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_TIMEOUT_SECONDS", "600")))
 TRANSCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_MAX_CONCURRENCY", "1")))
 
+# ExpiredToken/RequestExpired/InvalidToken: AWS's own vocabulary for "this
+# credential set itself is no good any more" -- as opposed to a one-off
+# network blip, a single corrupt file, or an S3 permission/bucket problem,
+# none of which mean every other pending file will also fail the exact
+# same way. Retrying the identical (bad) session against every remaining
+# file in a scan wastes calls and floods logs for no benefit -- see
+# _relay_camera_once()'s own handling below.
+#
+# 2026-09-03 correction: a real ExpiredToken from client.upload_file()
+# (the high-level, multipart-capable method _upload_recording() actually
+# calls) never arrives as a raw ClientError. boto3's own S3Transfer.
+# upload_file() catches it internally and re-raises as
+# boto3.exceptions.S3UploadFailedError(f"Failed to upload {filename} to
+# {bucket}/{key}: {e}") -- a bare `raise NewError(...)` inside the
+# `except ClientError as e:` block, which does NOT inherit from
+# ClientError (MRO: S3UploadFailedError -> Boto3Error -> Exception) but
+# DOES get e attached as __context__ via Python's own implicit exception
+# chaining (no `from e` was used, so __cause__ stays None -- __context__
+# is what's actually set). _classify_credential_error() below is what
+# actually recovers the real code from either shape; CREDENTIAL_ERROR_CODES
+# itself stays just the set of codes to recognize once found.
+CREDENTIAL_ERROR_CODES = frozenset({"ExpiredToken", "RequestExpired", "InvalidToken"})
+RECORDING_UPLOAD_MAX_BACKOFF_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_BACKOFF_SECONDS", "600")))
+# Bounds how many files one camera's scan will actually attempt to
+# codec-detect/remux-or-transcode/upload in a single pass -- a large
+# backlog (uploader off for days, or credentials broken for a while)
+# drains across several scans instead of one scan occupying its
+# asyncio.to_thread() worker for an unbounded amount of time. Nothing is
+# ever dropped: files beyond this cap simply remain pending and are
+# picked up on a later scan, exactly like any other not-yet-uploaded file.
+RECORDING_UPLOAD_MAX_FILES_PER_SCAN = max(1, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_FILES_PER_SCAN", "5")))
+# boto3's own default (10) is never explicitly set anywhere in this file
+# otherwise -- start conservatively; can be raised later once real
+# Samsung/network behavior under load has been measured.
+RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY", "2")))
+
 recording_upload_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None}
 
 _lock = threading.Lock()
 _camera_map: dict[int, dict] = {}          # camera_number -> {"camera_id":..., "site_id":...}, refreshed periodically
 _sessions: dict[int, dict] = {}            # camera_number -> {credentials, bucket, key_prefix, expires_at}
+_clients: dict[int, object] = {}           # camera_number -> cached boto3 S3 client -- always rebuilt together with _sessions' own entry, never reused across a credential refresh
+_camera_backoff: dict[int, dict] = {}      # camera_number -> {"consecutive_failures": int, "next_retry_at": float (time.monotonic())} -- credential-failure backoff only, see _record_credential_failure()
 _uploaded_files: dict[int, list[str]] = {}  # camera_number -> successfully uploaded+notified filenames (bounded)
 _unsupported_codec_files: dict[int, set[str]] = {}  # camera_number -> filenames already logged as unsupported/undetected this process lifetime -- avoids re-probing/re-logging the same permanently-bad file every scan
 _transcode_semaphore = threading.Semaphore(TRANSCODE_MAX_CONCURRENCY)
+_UPLOAD_TRANSFER_CONFIG = TransferConfig(max_concurrency=RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY) if TransferConfig is not None else None
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -295,7 +338,111 @@ def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
         "expires_at": expiration,
     }
     _sessions[camera_number] = session
+    # A freshly (re-)issued session invalidates whatever S3 client was
+    # built from the previous one -- that client has the old credentials
+    # baked in at construction time. _ensure_client() rebuilds on demand.
+    _clients.pop(camera_number, None)
     return session
+
+
+def _ensure_client(camera_number: int, session: dict):
+    """One boto3 S3 client per camera, reused for every file in a scan --
+    rather than the previous per-file construction. Tied 1:1 to the
+    currently cached session: _ensure_session() clears this entry
+    whenever it issues a new session, and _invalidate_session() below
+    clears both together on a credential-class failure, so this can
+    never silently outlive the credentials it was built from."""
+    client = _clients.get(camera_number)
+    if client is not None:
+        return client
+    if boto3 is None:
+        return None
+    creds = session["credentials"]
+    client = boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        aws_access_key_id=creds["access_key_id"],
+        aws_secret_access_key=creds["secret_access_key"],
+        aws_session_token=creds["session_token"],
+    )
+    _clients[camera_number] = client
+    return client
+
+
+def _invalidate_session(camera_number: int) -> None:
+    """Called on a credential-class S3 failure (ExpiredToken/
+    RequestExpired/InvalidToken) -- discards both the cached session and
+    its client together, so the next attempt for this camera is
+    guaranteed to request genuinely fresh credentials rather than
+    trusting the same (apparently wrong) self-reported expiration again."""
+    _sessions.pop(camera_number, None)
+    _clients.pop(camera_number, None)
+
+
+def _credential_error_code(error: object) -> str | None:
+    """The AWS error code if `error` itself is a ClientError, else None.
+    Never raises -- a malformed/missing response dict just yields None,
+    same as "not a credential error", rather than blowing up the caller's
+    own error-handling path."""
+    if isinstance(error, ClientError):
+        return (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
+    return None
+
+
+def _classify_credential_error(error: BaseException) -> str | None:
+    """Returns the AWS error code if `error` is, or wraps, a credential-
+    class ClientError (one of CREDENTIAL_ERROR_CODES) -- else None,
+    including when it wraps some OTHER, non-credential ClientError (e.g.
+    AccessDenied, NoSuchBucket) or isn't ClientError-shaped at all (a
+    corrupt file, a network blip). The membership check against
+    CREDENTIAL_ERROR_CODES lives here, not in the caller, so "is this a
+    credential error" has exactly one answer regardless of which of the
+    two real shapes it arrived in.
+
+    Checks `error` itself first (the direct-ClientError shape a
+    low-level call like put_object() would raise), then one level into
+    __cause__ and __context__ (the wrapped shape client.upload_file()
+    actually raises in production -- see CREDENTIAL_ERROR_CODES's own
+    comment above for exactly why). boto3 never nests more than one
+    level deep here, so this deliberately does not walk further."""
+    for candidate in (error, getattr(error, "__cause__", None), getattr(error, "__context__", None)):
+        code = _credential_error_code(candidate)
+        if code in CREDENTIAL_ERROR_CODES:
+            return code
+    return None
+
+
+def _in_backoff_window(camera_number: int) -> bool:
+    entry = _camera_backoff.get(camera_number)
+    if not entry:
+        return False
+    return time.monotonic() < entry.get("next_retry_at", 0.0)
+
+
+def _record_credential_failure(camera_number: int) -> None:
+    """Bounded exponential backoff, credential failures only -- starts
+    at the normal scan interval, doubles each consecutive failure, caps
+    at RECORDING_UPLOAD_MAX_BACKOFF_SECONDS. This is state, not a sleep:
+    recording_upload_worker()'s own per-camera loop stays a plain,
+    non-blocking sequential scan -- _in_backoff_window() lets a camera
+    still inside its window be skipped in the time it takes to check one
+    dict, so a credential problem on one camera never delays any other
+    camera's own normal scan."""
+    entry = _camera_backoff.setdefault(camera_number, {"consecutive_failures": 0, "next_retry_at": 0.0})
+    entry["consecutive_failures"] += 1
+    delay = min(
+        SCAN_SECONDS * (2 ** (entry["consecutive_failures"] - 1)),
+        RECORDING_UPLOAD_MAX_BACKOFF_SECONDS,
+    )
+    entry["next_retry_at"] = time.monotonic() + delay
+    logger.warning(
+        "recording_upload.credential_backoff camera=%s consecutive_failures=%s next_retry_in_seconds=%.0f",
+        camera_number, entry["consecutive_failures"], delay,
+    )
+
+
+def _record_credential_success(camera_number: int) -> None:
+    _camera_backoff.pop(camera_number, None)
 
 
 def _recording_folder(camera_number: int) -> Path:
@@ -571,20 +718,98 @@ def _remember_uploaded(camera_number: int, filename: str) -> None:
     del uploaded[:-MAX_TRACKED_FILES_PER_CAMERA]
 
 
-def _upload_recording(session: dict, local_path: Path, started_at: datetime) -> str:
-    if boto3 is None:
-        raise RuntimeError("boto3 is not installed.")
-    creds = session["credentials"]
-    client = boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        aws_access_key_id=creds["access_key_id"],
-        aws_secret_access_key=creds["secret_access_key"],
-        aws_session_token=creds["session_token"],
-    )
+def _create_recording_thumbnail(mp4_path: Path, camera_number: int) -> Path | None:
+    """Extract a small JPEG preview from the already-prepared cloud MP4.
+
+    Thumbnail failure never blocks the recording upload. The JPEG is a
+    transient staging artifact and is removed by the caller.
+    """
+    thumbnail_path = mp4_path.with_suffix(".jpg")
+    _cleanup_staged_file(thumbnail_path)
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", "5",
+                "-i", str(mp4_path),
+                "-frames:v", "1",
+                "-vf", "scale=320:-2",
+                "-q:v", "3",
+                str(thumbnail_path),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.warning(
+            "recording_upload.thumbnail_failed camera=%s path=%s error=%s",
+            camera_number, mp4_path, error,
+        )
+        _cleanup_staged_file(thumbnail_path)
+        return None
+
+    try:
+        valid = result.returncode == 0 and thumbnail_path.stat().st_size > 0
+    except OSError:
+        valid = False
+
+    if not valid:
+        logger.warning(
+            "recording_upload.thumbnail_nonzero_or_empty camera=%s path=%s code=%s",
+            camera_number, mp4_path, result.returncode,
+        )
+        _cleanup_staged_file(thumbnail_path)
+        return None
+
+    return thumbnail_path
+
+
+def _upload_recording(
+    client,
+    session: dict,
+    local_path: Path,
+    started_at: datetime,
+    camera_number: int,
+) -> str:
+    # client is caller-provided (one per session, reused across every file
+    # in a scan -- see _ensure_client()) rather than constructed here per
+    # file. Caller guarantees it is not None before calling this.
     date_part = started_at.strftime("%Y/%m/%d")
     recording_key = f"{session['key_prefix']}{date_part}/{local_path.name}"
-    client.upload_file(str(local_path), session["bucket"], recording_key, ExtraArgs={"ContentType": "video/mp4"})
+
+    client.upload_file(
+        str(local_path),
+        session["bucket"],
+        recording_key,
+        ExtraArgs={"ContentType": "video/mp4"},
+        Config=_UPLOAD_TRANSFER_CONFIG,
+    )
+
+    thumbnail_path = _create_recording_thumbnail(local_path, camera_number)
+    if thumbnail_path is not None:
+        thumbnail_key = recording_key.rsplit(".", 1)[0] + ".jpg"
+        try:
+            client.upload_file(
+                str(thumbnail_path),
+                session["bucket"],
+                thumbnail_key,
+                ExtraArgs={"ContentType": "image/jpeg"},
+                Config=_UPLOAD_TRANSFER_CONFIG,
+            )
+            logger.info(
+                "recording_upload.thumbnail_uploaded camera=%s key=%s",
+                camera_number, thumbnail_key,
+            )
+        except Exception as error:
+            logger.warning(
+                "recording_upload.thumbnail_upload_failed camera=%s error=%s",
+                camera_number, error,
+            )
+        finally:
+            _cleanup_staged_file(thumbnail_path)
+
     return recording_key
 
 
@@ -599,12 +824,49 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     de-dup, which never retries or re-logs it, but still never touches
     or deletes the original either). The original MKV is untouched by
     every one of these paths; only the derived MP4 staging file is
-    ever cleaned up, and only after its own upload attempt concludes."""
+    ever cleaned up, and only after its own upload attempt concludes.
+
+    A credential-class S3 failure (ExpiredToken/RequestExpired/
+    InvalidToken -- see CREDENTIAL_ERROR_CODES) is handled differently
+    from every other failure here: the cached session AND its S3 client
+    are both invalidated, this camera enters bounded-exponential backoff
+    (_record_credential_failure()), and the REST of this camera's
+    pending backlog is left untouched for this pass -- retrying every
+    remaining file against the same (already-proven-bad) credentials
+    would only waste calls and flood logs. This is recognized whether
+    the failure arrives as a direct ClientError or -- the shape
+    client.upload_file() actually raises in production -- wrapped in
+    boto3.exceptions.S3UploadFailedError; see _classify_credential_error()
+    for exactly how the wrapped case is unwrapped via __cause__/
+    __context__. Any other exception (a single corrupt file, a transient
+    network error, a bucket/permission problem, or an S3UploadFailedError
+    that turns out to wrap some other, non-credential ClientError) keeps
+    the existing behavior exactly: log, skip just that one file, continue
+    to the next."""
+    if _in_backoff_window(camera_number):
+        return
+
     session = _ensure_session(camera_number, camera_id)
     if not session:
         return
+    client = _ensure_client(camera_number, session)
+    if client is None:
+        return
+
     already = set(_uploaded_files.get(camera_number, []))
-    for local_path in _pending_recording_files(camera_number, already):
+    pending = _pending_recording_files(camera_number, already)
+
+    # Prioritize the newest completed recording so fresh Playback
+    # footage is not trapped behind historical upload backlog.
+    # Remaining recordings continue oldest-first so backlog still drains.
+    if len(pending) > 1:
+        pending = [pending[-1], *pending[:-1]]
+
+    attempted = 0
+    for local_path in pending:
+        if attempted >= RECORDING_UPLOAD_MAX_FILES_PER_SCAN:
+            break  # remainder stays pending -- picked up on a later scan, never dropped
+
         if not local_path.exists():
             continue
         started_at = _recording_started_at(local_path, camera_number)
@@ -618,17 +880,40 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
         ended_at = datetime.fromtimestamp(stat.st_mtime)
         expected_duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
 
+        # Counts toward the per-scan cap here -- this is where real,
+        # potentially expensive work (codec probe, remux/transcode,
+        # upload) actually begins, regardless of how it concludes.
+        attempted += 1
+
         mp4_path = _prepare_cloud_copy(local_path, camera_number, expected_duration_seconds)
         if mp4_path is None:
             continue  # unsupported codec, or remux/transcode failed -- original MKV untouched either way
 
         try:
             size_bytes = mp4_path.stat().st_size
-            recording_key = _upload_recording(session, mp4_path, started_at)
+            recording_key = _upload_recording(client, session, mp4_path, started_at, camera_number)
         except Exception as error:
+            # Single handler for both real shapes a credential-class
+            # failure can arrive in (direct ClientError, or wrapped in
+            # S3UploadFailedError by client.upload_file() -- see
+            # _classify_credential_error()'s own docstring) so "is this
+            # a credential error" is answered identically either way,
+            # instead of only being checked in a ClientError-specific
+            # branch a wrapped failure would never reach.
+            code = _classify_credential_error(error)
+            if code is not None:
+                logger.warning("recording_upload.credential_error camera=%s code=%s", camera_number, code)
+                _invalidate_session(camera_number)
+                _record_credential_failure(camera_number)
+                _cleanup_staged_file(mp4_path)
+                return  # stop this camera's backlog for this pass; other cameras are unaffected
             logger.warning("recording_upload.file_upload_failed camera=%s path=%s error=%s", camera_number, local_path, error)
             _cleanup_staged_file(mp4_path)
             continue
+
+        # A real upload against these credentials just succeeded --
+        # proof the session is genuinely good, not just recently issued.
+        _record_credential_success(camera_number)
 
         response = _control_plane_post(
             f"/api/appliance/recordings/{camera_id}/available",

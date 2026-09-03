@@ -44,6 +44,7 @@ import json
 
 
 import logging
+import numpy as np
 
 
 
@@ -476,6 +477,8 @@ try:
 
     from ultralytics import YOLO
 
+    import torch
+
 
 
 
@@ -502,6 +505,8 @@ except ImportError:
 
 
     YOLO = None
+
+    torch = None
 
 
 
@@ -2676,6 +2681,15 @@ AI_ENABLED = AI_PERSON_DETECTION_ENABLED
 
 
 AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL_SECONDS", "5")))
+# Small per-camera startup delay so all 5 ai_person_detector() tasks --
+# created back-to-back in a single list comprehension, with an identical
+# AI_DETECTION_INTERVAL_SECONDS sleep thereafter -- don't stay in
+# lockstep for the appliance's entire uptime, repeatedly bursting their
+# model-load attempts and inference calls at the same moment every
+# cycle. Complementary to ai_inference_semaphore/yolo_model_lock above,
+# which already make simultaneous starts correct; this just spreads the
+# load out instead of serializing a burst of 5 every cycle.
+AI_DETECTOR_STARTUP_STAGGER_SECONDS = max(0, int(os.environ.get("AI_DETECTOR_STARTUP_STAGGER_SECONDS", "1")))
 
 
 
@@ -3015,7 +3029,13 @@ yolo_model = None
 
 
 
-yolo_model_lock = None
+yolo_model_lock = threading.Lock()
+# Bounds simultaneous YOLO inference (detect_objects_frame()) to 1 at a
+# time -- see ai_person_detector()'s own async with block. Independent
+# of yolo_model_lock above: that lock only ever guards the one-time
+# model construction; this semaphore guards every later inference call
+# too, for the appliance's entire uptime, not just at startup.
+ai_inference_semaphore = asyncio.Semaphore(1)
 
 
 
@@ -17120,7 +17140,68 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         completed = False
+        watchdog_restart = False
         try:
+            if mode == "live":
+                playlist_path = HLS_FOLDER / f"camera{camera_number}.m3u8"
+                watchdog_started = time.monotonic()
+
+                while process.poll() is None:
+                    await asyncio.sleep(5)
+
+                    # Give a newly-started RTSP/HLS pipeline time to connect,
+                    # decode and write its first playlist before judging it.
+                    if time.monotonic() - watchdog_started < 30:
+                        continue
+
+                    try:
+                        playlist_age = time.time() - playlist_path.stat().st_mtime
+                    except OSError:
+                        playlist_age = time.monotonic() - watchdog_started
+
+                    if playlist_age <= 45:
+                        continue
+
+                    watchdog_restart = True
+                    print(
+                        f"Camera {camera_number} live HLS playlist stale "
+                        f"for {playlist_age:.1f}s; restarting worker."
+                    )
+
+                    process.terminate()
+
+                    try:
+                        await asyncio.to_thread(process.wait, timeout=5)
+                    except subprocess.TimeoutExpired:
+                        print(
+                            f"Camera {camera_number} live worker ignored TERM; "
+                            f"sending KILL."
+                        )
+                        process.kill()
+
+                    break
+            else:
+                # "recording" mode: no playlist-staleness watchdog --
+                # recording has no equivalent concept to watch. Just the
+                # same non-blocking poll loop "live" mode already uses
+                # safely above, so this coroutine never ties up one of
+                # Python's ~12 default-executor threads for the entire,
+                # effectively unbounded lifetime of a healthy, still-
+                # running recording process. Confirmed live via py-spy on
+                # this Samsung appliance: this exact gap (previously
+                # `return_code = await asyncio.to_thread(process.wait)`
+                # called immediately, with no polling loop first, against
+                # a process that runs indefinitely) permanently pinned 5
+                # executor threads -- one per camera -- for the
+                # appliance's entire uptime. By the time the loop below
+                # exits, the process has already exited on its own, so
+                # the to_thread(process.wait) call just beneath this
+                # block returns immediately -- it's still needed to reap
+                # the process and obtain its real exit code, just no
+                # longer blocks for any meaningful duration.
+                while process.poll() is None:
+                    await asyncio.sleep(5)
+
             return_code = await asyncio.to_thread(process.wait)
             completed = True
 
@@ -17130,7 +17211,9 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
             if mode == "live":
                 camera_process_state[camera_number]["last_exit_code"] = return_code
                 camera_process_state[camera_number]["last_error"] = (
-                    _bounded_camera_error(stderr_tail)
+                    "HLS playlist stopped advancing; worker restarted automatically."
+                    if watchdog_restart
+                    else _bounded_camera_error(stderr_tail)
                 )
                 camera_process_state[camera_number]["last_error_at"] = (
                     datetime.now().isoformat()
@@ -34336,24 +34419,124 @@ async def create_motion_thumbnail(
 
 
 
+
+
+
+
+
+
+
+
+
+# Mirrors start_recording()'s own `-segment_time 300` -- used only as a
+# conservative margin for shortlisting candidate files by their filename
+# timestamp (recording_start()), never to assume any file's real, probed
+# duration. Doubled below so a shorter-than-nominal segment (e.g. from an
+# ffmpeg restart) or an event whose pre-roll crosses a segment boundary
+# still pulls in the neighboring segment.
+RECORDING_SEGMENT_SECONDS = 300
+
+
+def _probe_motion_clip_candidates(
+    shortlist: list[tuple[datetime, Path]],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[tuple[datetime, datetime, Path]]:
+    """Synchronous: ffprobe each already-shortlisted file and keep the
+    ones whose real [start, end) interval overlaps the event window.
+    Always invoked via asyncio.to_thread() from build_motion_event_clip()
+    below -- never called directly on the event loop. `shortlist` is
+    expected to already be narrowed by filename timestamp (cheap, no
+    subprocess) before this function ever runs, so it stays small
+    (typically 1-3 files) regardless of how many recordings a camera has
+    retained in total."""
+    candidates: list[tuple[datetime, datetime, Path]] = []
+
+    for source_start, source in shortlist:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=nw=1:nk=1",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            duration_text = probe.stdout.strip()
+
+            if duration_text and duration_text.upper() != "N/A":
+                source_duration = float(duration_text)
+
+                if source_duration <= 0:
+                    continue
+
+                source_end = source_start + timedelta(
+                    seconds=source_duration
+                )
+            else:
+                # An actively-written MKV can report duration=N/A.
+                # If it was modified recently, treat it as extending
+                # through the current moment so event extraction can
+                # use the live recording segment.
+                age_seconds = max(
+                    0.0,
+                    time.time() - source.stat().st_mtime,
+                )
+
+                if age_seconds > 30:
+                    continue
+
+                source_end = datetime.now()
+
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            ValueError,
+        ):
+            continue
+
+        if source_start < window_end and source_end > window_start:
+            candidates.append((source_start, source_end, source))
+
+    return candidates
+
+
+# Bounds how many build_motion_event_clip() ffmpeg encodes (libx264,
+# real-time cost) can run simultaneously, appliance-wide -- both the
+# basic-motion and AI paths share this one function/semaphore, matching
+# the same TRANSCODE_MAX_CONCURRENCY pattern recording_uploader.py's own
+# HEVC-transcode path already uses for an equivalent problem. Measured
+# directly on this appliance: a single such encode takes ~2.6s for a
+# real 10s clip when nothing else is competing, but 3 concurrent encodes
+# already stretch to ~4-6s each -- and live AI testing (119 real
+# detections across 5 cameras in 18 minutes, no bound at all) produced
+# 10+ simultaneous encodes, a monotonically climbing load average
+# (13.78 -> 67.99 over 10 minutes, 8-core appliance), and 8 real
+# /health failures. Default 1, mirroring TRANSCODE_MAX_CONCURRENCY's own
+# default -- the most conservative starting point, loosenable later once
+# proven stable. asyncio.Semaphore (not threading.Semaphore): unlike
+# _transcode_hevc_to_h264() (which runs inside asyncio.to_thread()),
+# build_motion_event_clip() is itself an async def running directly on
+# the event loop, dispatching ffmpeg via asyncio.create_subprocess_exec.
+EVENT_CLIP_ENCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_EVENT_CLIP_ENCODE_MAX_CONCURRENCY", "1")))
+event_clip_encode_semaphore = asyncio.Semaphore(EVENT_CLIP_ENCODE_MAX_CONCURRENCY)
+
+
+
+
 async def build_motion_event_clip(
     event_id: str,
     camera_number: int,
     event_start: datetime,
     event_end: datetime,
 ) -> str | None:
-    """Create a standalone MP4 covering 5s pre-roll + event + 5s post-roll.
-
-    Reconciled from the accepted, live-tested (production EC2 25a25d3a
-    build, and the Samsung appliance's own production build) real-clip
-    extraction pipeline -- 9d349a9's own store_motion_event() below
-    still uses the older linked_recording_for() Media-Fragment stopgap
-    and is deliberately left unmodified here (a separate, pre-existing
-    behavior on this branch, not part of today's reconciliation scope).
-    This function exists on this branch solely so save_yolo_events()'s
-    own accepted AI-classification clip/upload wiring (below) has a
-    real function to call -- it did not exist anywhere in 9d349a9's
-    lineage before this commit."""
+    """Create a standalone MP4 covering 5s pre-roll + event + 5s post-roll."""
     from event_clips import compute_clip_window
 
     window = compute_clip_window(event_start, event_end)
@@ -34368,16 +34551,33 @@ async def build_motion_event_clip(
         await asyncio.sleep(wait_seconds)
 
     camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
-    candidates: list[tuple[datetime, Path]] = []
 
+    # Shortlist by filename timestamp only (recording_start() -- cheap,
+    # no subprocess) before ever invoking ffprobe. Without this, every
+    # motion-event clip build ffprobed the camera's ENTIRE retained
+    # recording history (1,000+ files after a few days), each call
+    # blocking the event loop directly -- confirmed live on the Samsung
+    # production appliance to take minutes per event and reproduce the
+    # HTTP outage. A file can only possibly overlap the event window if
+    # it starts no later than the window's end, and no earlier than
+    # 2 * RECORDING_SEGMENT_SECONDS before the window's start.
+    earliest_start = window.start - timedelta(
+        seconds=RECORDING_SEGMENT_SECONDS * 2
+    )
+    shortlist: list[tuple[datetime, Path]] = []
     for source in sorted(camera_folder.glob("*.mkv")):
         source_start = recording_start(source, camera_number)
-        if (
-            source_start
-            and source_start < window.end
-            and source_start + timedelta(minutes=5) > window.start
-        ):
-            candidates.append((source_start, source))
+        if source_start is None:
+            continue
+        if source_start > window.end:
+            continue
+        if source_start < earliest_start:
+            continue
+        shortlist.append((source_start, source))
+
+    candidates = await asyncio.to_thread(
+        _probe_motion_clip_candidates, shortlist, window.start, window.end
+    )
 
     if not candidates:
         print(
@@ -34387,7 +34587,22 @@ async def build_motion_event_clip(
         return None
 
     candidates.sort(key=lambda item: item[0])
-    first_start = candidates[0][0]
+
+    # Prefer one real source file that fully covers the requested event
+    # window. This avoids concat-timeline distortion when a short/restarted
+    # recording exists between otherwise normal five-minute segments.
+    covering = [
+        item for item in candidates
+        if item[0] <= window.start and item[1] >= window.end
+    ]
+
+    if covering:
+        source_start, _, source = covering[-1]
+        candidates = [(source_start, source_start, source)]
+        first_start = source_start
+    else:
+        first_start = candidates[0][0]
+
     offset_seconds = max(0.0, (window.start - first_start).total_seconds())
     duration_seconds = (window.end - window.start).total_seconds()
 
@@ -34402,7 +34617,7 @@ async def build_motion_event_clip(
         list_file.write_text(
             "".join(
                 f"file '{source.as_posix()}'\n"
-                for _, source in candidates
+                for _, _, source in candidates
             ),
             encoding="utf-8",
         )
@@ -34425,12 +34640,20 @@ async def build_motion_event_clip(
             str(temp_path),
         ]
 
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await process.communicate()
+        # Only the actual encode -- never the pre-roll wait above, the
+        # shortlist/ffprobe candidate search above that, or the list-
+        # file write just above -- is gated: those are cheap and never
+        # what saturated the appliance. async with queues indefinitely
+        # (no timeout, never drops a job) and releases on every exit
+        # path -- success, a non-zero ffmpeg exit raising below, or this
+        # task being cancelled mid-encode.
+        async with event_clip_encode_semaphore:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
 
         if process.returncode != 0:
             error_text = stderr.decode(
@@ -34634,15 +34857,25 @@ async def store_motion_event(
     # while mirroring the minimal event into analytics_events.json so the
     # existing appliance -> cloud analytics sync can index it for mobile
     # Playback.
-    append_analytics_event({
-        "id": event.id,
-        "camera": camera_number,
-        "event_type": "motion",
-        "timestamp": start_time.isoformat(),
-        "confidence": event.confidence,
-        "object_count": 1,
-        "detections": [],
-    })
+    # Moved off the event loop via asyncio.to_thread(): this used to call
+    # append_analytics_event() directly and synchronously here, inside an
+    # async def running on the shared FastAPI event loop. That blocking
+    # file read/sort/rewrite (analytics_events.json, up to 5000 events)
+    # stalled every concurrent HTTP handler -- /health, /playback,
+    # /events, and the dashboard -- for the duration of each motion
+    # event, confirmed live via a Samsung production audit.
+    await asyncio.to_thread(
+        append_analytics_event,
+        {
+            "id": event.id,
+            "camera": camera_number,
+            "event_type": "motion",
+            "timestamp": start_time.isoformat(),
+            "confidence": event.confidence,
+            "object_count": 1,
+            "detections": [],
+        },
+    )
 
     line = event.model_dump_json() + "\n"
 
@@ -34667,10 +34900,7 @@ async def store_motion_event(
         # Build the standalone customer event clip independently of event
         # persistence/notifications. The builder waits until the configured
         # 5-second post-roll exists, then extracts:
-        # 5s pre-roll + full event duration + 5s post-roll. Reconciled from
-        # the accepted, live-tested (EC2 and Samsung production) real-clip
-        # + cloud-upload pipeline -- traced directly from the working
-        # Samsung appliance's own store_motion_event(), not invented.
+        # 5s pre-roll + full event duration + 5s post-roll.
         async def build_and_upload_event_media() -> None:
             clip_url = await build_motion_event_clip(
                 event_id,
@@ -34916,6 +35146,77 @@ async def store_motion_event(
 
 
 
+
+
+
+
+# Cache of (zones fingerprint -> precomputed 160x90 boolean zone mask),
+# keyed per camera. Rebuilt only when a camera's configured zones
+# actually change (compared by value, not identity) -- not on every
+# frame. The fingerprint is a tuple of each zone's (x, y, width, height)
+# since those four numbers are the only inputs that affect the mask.
+_motion_zone_mask_cache: dict[int, tuple[tuple, "np.ndarray"]] = {}
+
+
+def _motion_zone_mask(camera_number: int, zones: list) -> "np.ndarray":
+    fingerprint = tuple((zone.x, zone.y, zone.width, zone.height) for zone in zones)
+    cached = _motion_zone_mask_cache.get(camera_number)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+
+    pixel_x = (np.arange(14400) % 160) / 160
+    pixel_y = (np.arange(14400) // 160) / 90
+    mask = np.zeros(14400, dtype=bool)
+    for zone in zones:
+        mask |= (
+            (pixel_x >= zone.x)
+            & (pixel_x <= zone.x + zone.width)
+            & (pixel_y >= zone.y)
+            & (pixel_y <= zone.y + zone.height)
+        )
+
+    _motion_zone_mask_cache[camera_number] = (fingerprint, mask)
+    return mask
+
+
+def _compare_motion_frames(
+    camera_number: int,
+    frame: bytes,
+    previous_frame: bytes,
+    zones: list,
+) -> tuple[int, int, int]:
+    """Synchronous, NumPy-vectorized replacement for the old per-pixel
+    Python `for` loop -- numerically equivalent (same inclusive zone
+    bounds, same |current - previous| difference, same >= 20 changed-
+    pixel threshold), just computed across the whole 160x90 frame at
+    once instead of one Python-level iteration per pixel. Always invoked
+    via asyncio.to_thread() from motion_detector() below -- never called
+    directly on the event loop. Confirmed live on the Samsung production
+    appliance via py-spy: the old loop held the event loop's own
+    MainThread (CPU-bound, GIL-held, no await inside it) for long enough,
+    especially when multiple cameras' frames landed close together, to
+    reproduce the same class of HTTP outage as the earlier
+    build_motion_event_clip() and retention_worker() bugs.
+
+    Returns (total_difference, compared_pixels, changed_pixels), the
+    exact three accumulators the old loop produced -- everything
+    downstream (motion_score, changed_ratio, effective_threshold,
+    cooldown/event-creation state machine) is unchanged."""
+    mask = _motion_zone_mask(camera_number, zones)
+
+    current = np.frombuffer(frame, dtype=np.uint8)
+    previous = np.frombuffer(previous_frame, dtype=np.uint8)
+    # int16 (not the raw uint8 arrays) so the subtraction can't wrap
+    # around -- matches the original Python `abs(current - previous)`,
+    # which never overflowed since Python ints are arbitrary precision.
+    difference = np.abs(current.astype(np.int16) - previous.astype(np.int16))
+
+    in_zone_difference = difference[mask]
+    total_difference = int(in_zone_difference.sum())
+    compared_pixels = int(mask.sum())
+    changed_pixels = int(np.count_nonzero(in_zone_difference >= 20))
+
+    return total_difference, compared_pixels, changed_pixels
 
 
 
@@ -35244,168 +35545,13 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                    total_difference = 0
-
-
-
-
-
-
-
-
-                    changed_pixels = 0
-
-
-
-
-
-
-
-
-                    compared_pixels = 0
-
-
-
-
-
-
-
-
-                    for index, (current, previous) in enumerate(zip(frame, previous_frame)):
-
-
-
-
-
-
-
-
-                        pixel_x = (index % 160) / 160
-
-
-
-
-
-
-
-
-                        pixel_y = (index // 160) / 90
-
-
-
-
-
-
-
-
-                        in_zone = any(
-
-
-
-
-
-
-
-
-                            zone.x <= pixel_x <= zone.x + zone.width
-
-
-
-
-
-
-
-
-                            and zone.y <= pixel_y <= zone.y + zone.height
-
-
-
-
-
-
-
-
-                            for zone in settings.zones
-
-
-
-
-
-
-
-
-                        )
-
-
-
-
-
-
-
-
-                        if not in_zone:
-
-
-
-
-
-
-
-
-                            continue
-
-
-
-
-
-
-
-
-                        difference = abs(current - previous)
-
-
-
-
-
-
-
-
-                        total_difference += difference
-
-
-
-
-
-
-
-
-                        compared_pixels += 1
-
-
-
-
-
-
-
-
-                        if difference >= 20:
-
-
-
-
-
-
-
-
-                            changed_pixels += 1
-
-
-
-
-
-
-
-
+                    total_difference, compared_pixels, changed_pixels = await asyncio.to_thread(
+                        _compare_motion_frames,
+                        camera_number,
+                        frame,
+                        previous_frame,
+                        settings.zones,
+                    )
                     motion_score = total_difference / max(compared_pixels, 1)
 
 
@@ -35433,7 +35579,11 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                    effective_threshold = MOTION_THRESHOLD * (1.5 - settings.sensitivity / 100)
+                    # Calibrated against the detector's actual 160x90,
+                    # 1-fps grayscale feed. Normal person-sized motion in
+                    # wide camera views produces scores around 3-4, while
+                    # the old default required ~10.8 at sensitivity 60.
+                    effective_threshold = 4.0 * (1.5 - settings.sensitivity / 100)
 
 
 
@@ -35451,7 +35601,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        motion_score >= effective_threshold and 0.08 <= changed_ratio <= MOTION_MAX_CHANGED_RATIO
+                        motion_score >= effective_threshold and 0.02 <= changed_ratio <= MOTION_MAX_CHANGED_RATIO
 
 
 
@@ -35883,43 +36033,26 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
+analytics_events_file_lock = threading.Lock()
+
+
 def append_analytics_event(event: dict) -> None:
+    # Concurrency safety: called from multiple worker threads via
+    # asyncio.to_thread() -- the motion-event path (store_motion_event())
+    # and the YOLO/AI detection path (save_yolo_events()) both call this
+    # for cameras 1-5, concurrently. The full read-modify-sort-write
+    # transaction must be serialized with a process-wide lock, or two
+    # concurrent writers can interleave their read/write and silently
+    # drop one caller's event.
+    with analytics_events_file_lock:
 
+        events = load_json_list(ANALYTICS_EVENTS_FILE)
 
+        events.append(event)
 
+        events.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
 
-
-
-
-
-    events = load_json_list(ANALYTICS_EVENTS_FILE)
-
-
-
-
-
-
-
-
-    events.append(event)
-
-
-
-
-
-
-
-
-    events.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
-
-
-
-
-
-
-
-
-    save_json_list(ANALYTICS_EVENTS_FILE, events[:5000])
+        save_json_list(ANALYTICS_EVENTS_FILE, events[:5000])
 
 
 
@@ -35982,25 +36115,32 @@ def get_yolo_model():
 
 
 
-    if yolo_model is None:
+    # Fast path: once loaded, every later call (one per camera, every
+    # AI_DETECTION_INTERVAL_SECONDS, for the appliance's entire uptime)
+    # returns immediately without ever touching yolo_model_lock.
+    if yolo_model is not None:
+        return yolo_model
 
-
-
-
-
-
-
-
-        print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
-
-
-
-
-
-
-
-
-        yolo_model = YOLO(YOLO_MODEL_NAME)
+    # Real threading.Lock(), not asyncio.Lock() -- get_yolo_model() is
+    # called via asyncio.to_thread() from up to 5 different worker
+    # threads (one per camera's ai_person_detector(), all racing here on
+    # their very first run), each with no asyncio event loop of its own
+    # to await an asyncio.Lock() on. Double-checked: the inner
+    # `if yolo_model is None` re-test is what actually prevents a second
+    # thread -- one that was blocked waiting for this lock while the
+    # first thread was still loading -- from loading a second model
+    # instance once it finally acquires the lock.
+    with yolo_model_lock:
+        if yolo_model is None:
+            print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
+            # Once, tied to this same one-time initialization -- caps
+            # PyTorch's own per-call intra-op parallelism so a single
+            # inference pass can't claim every core on an appliance
+            # also running 5 live ffmpeg streams, 5 recorders, and
+            # motion detection.
+            if torch is not None:
+                torch.set_num_threads(2)
+            yolo_model = YOLO(YOLO_MODEL_NAME)
 
 
 
@@ -37692,6 +37832,13 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 async def ai_person_detector(camera_number: int) -> None:
+    # Startup stagger -- see AI_DETECTOR_STARTUP_STAGGER_SECONDS's own
+    # comment. All 5 of these tasks are created back-to-back with no gap
+    # (see the startup list comprehension); this is what actually
+    # separates them in time, camera 1 first, camera 5 last.
+    if AI_DETECTOR_STARTUP_STAGGER_SECONDS:
+        await asyncio.sleep(camera_number * AI_DETECTOR_STARTUP_STAGGER_SECONDS)
+
     # Captured once, lazily, on whichever camera's detector task happens
     # to start first -- this coroutine is itself created via
     # asyncio.create_task() on the real main event loop (see lifespan()'s
@@ -37919,34 +38066,17 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
-            result = await asyncio.to_thread(
-
-
-
-
-
-
-
-
-                detect_objects_frame,
-
-
-
-
-
-
-
-
-                camera_number,
-
-
-
-
-
-
-
-
-            )
+            # At most one camera's inference runs at a time, appliance-
+            # wide -- released automatically on the way out of this
+            # block whether detect_objects_frame() succeeds, raises, or
+            # this task is cancelled while waiting/running (async with's
+            # own __aexit__ guarantee), so a failed or cancelled scan
+            # can never leave the semaphore permanently held.
+            async with ai_inference_semaphore:
+                result = await asyncio.to_thread(
+                    detect_objects_frame,
+                    camera_number,
+                )
 
 
 
@@ -140204,6 +140334,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.legend-dot.event-people_counting{background:#4dcf7a}'
         '.legend-dot.event-intrusion{background:#f0554d}'
         '.event-segment{cursor:pointer}'
+        # 2026-09-03 lane fix: enough height for 7 stacked analytics
+        # lanes (EVENT_LANE_ORDER + one fallback lane -- see the JS
+        # below) plus a separate row for recording coverage, so event
+        # markers of different categories detected close in time never
+        # visually smash into each other or into the recording blocks.
+        # #playback-timeline-lane (ID selector) deliberately overrides
+        # the shared/global .timeline-lane class's own height -- scoped
+        # to this page only, no other page using that class is touched.
+        '#playback-timeline-lane{height:88px}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:14px">'
@@ -140237,7 +140376,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<div class="monitor-toolbar-group" id="playback-date-bar" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">'
         '<label for="playback-date-input" class="health-detail">Date</label>'
         '<input id="playback-date-input" type="date">'
+        '<button id="playback-date-prev" type="button" class="ghost-button" aria-label="Previous day">\u2190 Previous Day</button>'
         '<button id="playback-date-today" type="button" class="ghost-button">Today</button>'
+        '<button id="playback-date-next" type="button" class="ghost-button" aria-label="Next day">Next Day \u2192</button>'
         '<span id="playback-selected-date-label" class="health-detail"></span>'
         '</div>'
         '<div id="playback-available-dates" class="health-detail" style="margin-top:2px"></div>'
@@ -140371,7 +140512,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const shareButton=document.getElementById('share-selected');
   const createClipButton=document.getElementById('create-clip');
   const dateInput=document.getElementById('playback-date-input');
+  const datePrevButton=document.getElementById('playback-date-prev');
   const dateTodayButton=document.getElementById('playback-date-today');
+  const dateNextButton=document.getElementById('playback-date-next');
   const selectedDateLabel=document.getElementById('playback-selected-date-label');
   const availableDatesEl=document.getElementById('playback-available-dates');
   const datesByCamera={{}};
@@ -140462,14 +140605,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       cameraTiles.forEach(item=>item.classList.remove('active'));
       tile.classList.add('active');
       selectedCameraId=tile.dataset.cameraId;
-      visibleRecordingCount=6;
       clipPanel.hidden=true;
-      viewingDate=null;
-      dateInput.value='';
-      selectedDateLabel.textContent='';
-      loadOlderButton.hidden=false;
       renderAvailableDates(selectedCameraId).catch(()=>{{}});
-      await renderCamera();
+      if(viewingDate){{
+        // Preserve the selected date across a camera switch "when
+        // possible" -- i.e. whenever a date was actually active.
+        // loadRecordingsForDate() already handles the no-recordings-
+        // for-this-date case honestly (status text below), so nothing
+        // extra is needed here for that.
+        await loadRecordingsForDate(selectedCameraId,viewingDate).catch(error=>{{
+          debugLog(`loadRecordingsForDate (camera switch) failed: ${{error && error.message}}`);
+        }});
+      }}else{{
+        visibleRecordingCount=6;
+        loadOlderButton.hidden=false;
+        await renderCamera();
+      }}
     }});
   }});
 
@@ -140738,6 +140889,19 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
   }}
 
+  // === LANE_CORE_START ===
+  const EVENT_LANE_ORDER=['motion','person','vehicle','lpr','people_counting','intrusion'];
+  const EVENT_LANE_HEIGHT_PX=8;
+  const EVENT_LANE_GAP_PX=2;
+  const RECORDING_ROW_TOP_PX=74;
+  const RECORDING_ROW_HEIGHT_PX=6;
+  function eventLaneTop(category){{
+    const index=category?EVENT_LANE_ORDER.indexOf(category):-1;
+    const lane=index===-1?EVENT_LANE_ORDER.length:index;
+    return (lane*(EVENT_LANE_HEIGHT_PX+EVENT_LANE_GAP_PX))+'px';
+  }}
+  // === LANE_CORE_END ===
+
   function renderTimeline(cameraId,clips,events){{
     renderMobileRecentEvents(cameraId,clips,events);
     timelineLane.innerHTML='';
@@ -140760,6 +140924,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       segment.className='event-segment';
       segment.style.left=startPct+'%';
       segment.style.width=(endPct-startPct)+'%';
+      segment.style.top=RECORDING_ROW_TOP_PX+'px';
+      segment.style.height=RECORDING_ROW_HEIGHT_PX+'px';
       segment.style.background='#e8eef6';
       segment.title=playbackDate(clip.start).toLocaleString();
       segment.addEventListener('click',()=>playClip(cameraId,clip));
@@ -140773,6 +140939,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       marker.className='event-segment';
       marker.style.left=pct+'%';
       marker.style.width='0.4%';
+      marker.style.top=eventLaneTop(category);
+      marker.style.height=EVENT_LANE_HEIGHT_PX+'px';
       marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';
       const label=(event.event_type||'event').replaceAll('_',' ');
       const playable=Boolean(event.has_event_clip&&event.id);
@@ -141048,6 +141216,45 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       debugLog(`renderCamera (today) failed: ${{error && error.message}}`);
     }});
   }});
+
+  // Previous/Next Day: shift by exactly one LOCAL calendar day from
+  // whichever date is currently in view -- today's own local date if
+  // none is selected yet (the Today button/default view case).
+  // Date's own local-time setDate() is used deliberately instead of
+  // any fixed-24-hour-offset math specifically because it is DST-safe:
+  // it operates on the wall-clock day-of-month field itself, so it
+  // still lands on the correct next/previous calendar date on a
+  // spring-forward (23-hour) or fall-back (25-hour) day, unlike adding
+  // a fixed 86400000ms would. localDateStringOf() is the exact same
+  // formatter dateInput.max and loadRecordingsForDate() already use,
+  // reused here rather than introduced a second time.
+  // === DATE_NAV_CORE_START ===
+  function localDateStringOf_forDateNavCore(value){{
+    const d=(value instanceof Date)?value:new Date(value);
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,'0');
+    const day=String(d.getDate()).padStart(2,'0');
+    return `${{y}}-${{m}}-${{day}}`;
+  }}
+  function shiftedDateString(dateString,deltaDays){{
+    const [y,m,d]=dateString.split('-').map(Number);
+    const shifted=new Date(y,m-1,d);
+    shifted.setDate(shifted.getDate()+deltaDays);
+    return localDateStringOf_forDateNavCore(shifted);
+  }}
+  // === DATE_NAV_CORE_END ===
+
+  function navigateByOneDay(deltaDays){{
+    const base=viewingDate||localDateStringOf(new Date());
+    const target=shiftedDateString(base,deltaDays);
+    if(target>dateInput.max)return;  // never navigate into the future, matching the date input's own existing max=
+    loadRecordingsForDate(selectedCameraId,target).catch(error=>{{
+      debugLog(`loadRecordingsForDate (${{deltaDays>0?'next':'previous'}} day) failed: ${{error && error.message}}`);
+    }});
+  }}
+
+  datePrevButton.addEventListener('click',()=>navigateByOneDay(-1));
+  dateNextButton.addEventListener('click',()=>navigateByOneDay(1));
 
   // Jump to an exact time on the currently shown date: a click
   // anywhere on the empty ruler (event.target===timelineLane --
@@ -141461,7 +141668,12 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         activeFilters.add(button.dataset.filter);
       }}
       filterButtons.forEach(item=>item.classList.toggle('active',item.dataset.filter==='all'?activeFilters.size===6:activeFilters.has(item.dataset.filter)));
-      renderTimeline(selectedCameraId,recordingsByCamera[selectedCameraId]||[],analyticsByCamera[selectedCameraId]||[]);
+      // currentClips, not recordingsByCamera directly -- so toggling a
+      // filter while a date is selected re-renders that date's
+      // timeline instead of silently reverting to the default
+      // most-recent-page view. eventsForLocalDate() mirrors
+      // loadRecordingsForDate()'s own date-scoping of the event markers.
+      renderTimeline(selectedCameraId,currentClips,viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):(analyticsByCamera[selectedCameraId]||[]));
     }});
   }});
 
