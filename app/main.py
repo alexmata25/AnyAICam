@@ -140638,6 +140638,41 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const timelineLane=document.getElementById('playback-timeline-lane');
   const timelineEmpty=document.getElementById('playback-timeline-empty');
 
+  // === CHAIN_CORE_START ===
+  // Real inter-segment gaps on the Samsung appliance were measured
+  // directly (5,835 real transitions across all 5 cameras' full
+  // retained history at the time this was written): 99%+ are within
+  // +/-1s of exact back-to-back, and the full observed jitter tail
+  // (segment-rotation timing noise, container-restart-era overlap
+  // included) never exceeds +/-10s. The one confirmed genuine
+  // recording outage in that same dataset was 286s -- nearly 30x past
+  // the jitter tail. 10s sits safely inside that margin: it swallows
+  // every real-world jitter case observed without ever bridging an
+  // actual outage.
+  const CHAIN_GAP_TOLERANCE_SECONDS=10;
+
+  // Given the clip that just finished playing and the chronologically-
+  // ordered clips currently loaded for this camera/date (currentClips
+  // -- never a fresh API call, chaining only ever walks the already-
+  // loaded page), returns the next clip to chain into, or null if
+  // chaining should stop here: the ended clip wasn't found (stale),
+  // it was already the last loaded segment, or the next segment is
+  // separated by more than CHAIN_GAP_TOLERANCE_SECONDS in either
+  // direction -- a genuine gap (or a restart-era overlapping
+  // duplicate), never silently bridged. Pure and synchronous by
+  // design -- reconciled verbatim from the accepted Samsung
+  // implementation (tests/test_playback_segment_chaining.py/.mjs).
+  function _planNextChainedClip(clips,endedClip){{
+    if(!endedClip)return null;
+    const index=clips.findIndex(clip=>clip.id===endedClip.id);
+    if(index===-1||index+1>=clips.length)return null;
+    const next=clips[index+1];
+    const gapSeconds=(new Date(next.start).getTime()-new Date(endedClip.end).getTime())/1000;
+    if(Math.abs(gapSeconds)>CHAIN_GAP_TOLERANCE_SECONDS)return null;
+    return next;
+  }}
+  // === CHAIN_CORE_END ===
+
   function playClip(cameraId,clip){{
     placeholder.hidden=true;
     const url=recordingMediaUrl(cameraId,clip.id);
@@ -141478,6 +141513,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
   video.addEventListener('ended',()=>{{
     timelinePlayButton.textContent='Play';
+    const next=_planNextChainedClip(currentClips,selectedClip);
+    if(next)playClip(selectedCameraId,next);
   }});
 
   downloadButton.addEventListener('click',()=>{{

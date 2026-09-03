@@ -35,8 +35,6 @@ Playback tests.
 
 from types import SimpleNamespace
 
-import pytest
-
 import main
 
 
@@ -186,25 +184,14 @@ def test_exact_timeline_seek_unaffected_by_date_mode(monkeypatch):
 #    the active video element, not on viewingDate.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(
-    reason=(
-        "Automatic segment chaining (playSequencer/_planNextChainedClip/"
-        "CHAIN_CORE) is not yet reconciled onto this branch -- discovered "
-        "during this reconciliation that git's own playClip() already "
-        "diverges substantially from Samsung's (synchronous, "
-        "recordingMediaUrl()-based, with its own accepted unmuted/muted "
-        "autoplay-fallback and isCloudMp4 handling) from Samsung's "
-        "(async, playSequencer-based). Merging chaining in requires "
-        "reconciling those two playClip() implementations together, not "
-        "a drop-in insertion like every other fix in this round -- "
-        "intentionally deferred to its own follow-up rather than risking "
-        "a rushed merge that silently drops the accepted audio-fallback "
-        "fix. Date-mode's own lack of any dependency on chaining "
-        "internals is exactly why this deferral is safe: nothing in "
-        "loadRecordingsForDate()/navigateByOneDay() calls anything "
-        "chaining-specific."
-    )
-)
+# Automatic segment chaining (_planNextChainedClip()/CHAIN_CORE) was
+# reconciled onto this branch in a follow-up commit -- deliberately
+# narrower than Samsung's own (no playSequencer: this branch's
+# recordingMediaUrl() is synchronous, so there's no async URL-resolution
+# gap for a sequencer to guard). See test_playback_segment_chaining.py
+# for the full reconciliation. This test now runs for real, confirming
+# what its deferral reasoning always claimed: the chain core stays
+# date-mode-agnostic, so reconciling it required no changes here at all.
 def test_segment_chaining_unaffected_by_date_mode(monkeypatch):
     html = _render(monkeypatch)
     assert "// === CHAIN_CORE_START ===" in html
