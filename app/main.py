@@ -16605,302 +16605,92 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 
 
 def delete_expired_recordings() -> None:
+    """Permanent local-recording retention: deletes a local .mkv once
+    it is older than RETENTION_DAYS (an appliance-level environment
+    setting -- this function itself hard-codes no particular value).
+    The camera's newest file (presumed still being actively written)
+    is never considered, matching recording_uploader._completed_
+    recording_files()'s own guarantee. Every deletion also removes the
+    matching local Playback catalog row (recordings table, keyed by
+    cloud_recording_s3_key()), so no row survives pointing at a file
+    that no longer exists.
 
-
-
-
-
-
-
+    Age-only, with no upload-confirmation gate: deletion does not wait
+    for a recording's cloud upload to be confirmed first. Accepted for
+    appliances where local recordings are not the sole durable copy of
+    the footage. A confirmation-gated variant (persisted upload-proof
+    checked before deletion) was designed and validated for appliances
+    holding customer data as the only durable copy, but was not the
+    variant accepted here -- see the retention-fix session history if
+    that stricter behavior is ever needed for a specific deployment."""
+    from partner_db import connection
 
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
-
-
-
-
-
-
-
-
     deleted_count = 0
 
+    with connection() as db:
+        camera_id_by_number = {
+            int(row["camera_number"]): row["id"]
+            for row in db.execute("SELECT id, camera_number FROM cameras WHERE camera_number IS NOT NULL").fetchall()
+        }
 
-
-
-
-
-
-
-    for recording_file in RECORDINGS_FOLDER.rglob("*.mkv"):
-
-
-
-
-
-
-
-
+    for camera_number, camera_id in camera_id_by_number.items():
+        camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+        if not camera_folder.is_dir():
+            continue
         try:
-
-
-
-
-
-
-
-
-            if datetime.fromtimestamp(recording_file.stat().st_mtime) < cutoff:
-
-
-
-
-
-
-
-
-                recording_file.unlink(missing_ok=True)
-
-
-
-
-
-
-
-
-                deleted_count += 1
-
-
-
-
-
-
-
-
+            candidates = sorted(item.name for item in camera_folder.iterdir() if item.is_file() and item.suffix == ".mkv")
         except OSError as error:
+            print(f"Could not list {camera_folder}: {error}")
+            continue
+        # The newest file for this camera is presumed still being
+        # actively written -- never a deletion candidate, matching
+        # recording_uploader._completed_recording_files()'s guarantee.
+        completed = candidates[:-1] if len(candidates) > 1 else []
 
-
-
-
-
-
-
-
-            print(f"Could not inspect or delete {recording_file}: {error}")
-
-
-
-
-
-
-
-
-    if deleted_count:
-
-
-
-
-
-
-
-
-        print(f"Retention cleanup deleted {deleted_count} expired recording(s).")
-
-
-
-
-
-
-
-
-    if MOTION_EVENTS_FILE.exists():
-
-
-
-
-
-
-
-
-        retained_events = []
-
-
-
-
-
-
-
-
-        for event in load_motion_events():
-
-
-
-
-
-
-
-
+        for filename in completed:
+            recording_file = camera_folder / filename
             try:
-
-
-
-
-
-
-
-
-                event_time = event.get("start_time") or event.get("timestamp")
-
-
-
-
-
-
-
-
-                if datetime.fromisoformat(event_time) >= cutoff:
-
-
-
-
-
-
-
-
-                    retained_events.append(json.dumps(event, separators=(",", ":")))
-
-
-
-
-
-
-
-
-            except (KeyError, TypeError, ValueError):
-
-
-
-
-
-
-
-
+                if datetime.fromtimestamp(recording_file.stat().st_mtime) >= cutoff:
+                    continue
+            except OSError as error:
+                print(f"Could not inspect {recording_file}: {error}")
                 continue
 
+            catalog_key = cloud_recording_s3_key(recording_file, camera_number)
+            try:
+                with connection() as db:
+                    db.execute("DELETE FROM recordings WHERE camera_id=? AND s3_key=?", (camera_id, catalog_key))
+                recording_file.unlink(missing_ok=True)
+                deleted_count += 1
+            except OSError as error:
+                print(f"Could not delete {recording_file}: {error}")
 
+    if deleted_count:
+        print(f"Retention cleanup deleted {deleted_count} expired recording(s).")
 
-
-
-
-
-
+    if MOTION_EVENTS_FILE.exists():
+        retained_events = []
+        for event in load_motion_events():
+            try:
+                event_time = event.get("start_time") or event.get("timestamp")
+                if datetime.fromisoformat(event_time) >= cutoff:
+                    retained_events.append(json.dumps(event, separators=(",", ":")))
+            except (KeyError, TypeError, ValueError):
+                continue
         try:
-
-
-
-
-
-
-
-
             MOTION_EVENTS_FILE.write_text(
-
-
-
-
-
-
-
-
                 "\n".join(retained_events) + ("\n" if retained_events else ""),
-
-
-
-
-
-
-
-
                 encoding="utf-8",
-
-
-
-
-
-
-
-
             )
-
-
-
-
-
-
-
-
         except OSError as error:
-
-
-
-
-
-
-
-
             print(f"Could not prune motion events: {error}")
 
-
-
-
-
-
-
-
     for thumbnail in MOTION_THUMBNAILS_FOLDER.rglob("*.jpg"):
-
-
-
-
-
-
-
-
         try:
-
-
-
-
-
-
-
-
             if datetime.fromtimestamp(thumbnail.stat().st_mtime) < cutoff:
-
-
-
-
-
-
-
-
                 thumbnail.unlink(missing_ok=True)
-
-
-
-
-
-
-
-
         except OSError:
-
-
-
-
-
-
-
-
             continue
 
 
