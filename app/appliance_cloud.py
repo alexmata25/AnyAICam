@@ -122,25 +122,41 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # current manifest_version (appliance_identity.
         # current_manifest_version()) so an appliance can detect
         # staleness with one integer comparison, no full manifest fetch
-        # needed on every cycle. Only on an actual mismatch -- the
-        # appliance reports what it's cached via cached_manifest_version,
-        # deliberately optional so a heartbeat payload that omits it
-        # (an appliance that's never cached anything, or an older
-        # payload shape) always triggers a refresh rather than silently
-        # skipping one -- do we do the heavier work of reconciling this
-        # appliance's own local sessions against a freshly rebuilt
-        # manifest. No separate polling loop: this reuses heartbeat's
-        # own existing, already-regular cadence instead of adding one.
-        from appliance_identity import build_manifest, current_manifest_version, reconcile_sessions_against_manifest, should_refresh_manifest
+        # needed on every cycle. manifest_refreshed reports whether the
+        # appliance's own cached_manifest_version (deliberately optional
+        # -- omitted, or an older payload shape, always counts as stale)
+        # is out of date, telling the appliance it should call GET
+        # .../identity-manifest itself to pick up the change.
+        #
+        # TEMPORARY 2026-09-04 mitigation (Option A, see session notes /
+        # AI_HANDOFF): reconcile_sessions_against_manifest() is NOT
+        # called here anymore. Root cause: it queries user_sessions with
+        # no scoping at all (every open session platform-wide, every
+        # customer), then revokes any whose user_id doesn't appear in
+        # THIS ONE appliance's own small identity list -- which is every
+        # unrelated customer's own cloud session, essentially always.
+        # Confirmed live: every customer_owner session was being force-
+        # revoked within 8-74 seconds of login, every single time any
+        # appliance's regular heartbeat landed here. manifest_refreshed/
+        # current_manifest_version are still computed and reported
+        # exactly as before -- an appliance's own manifest caching is
+        # unaffected, only the session-revocation side effect is
+        # disabled. Option B (tracked separately, not yet built): scope
+        # the reconciliation query to only users associated with the
+        # polling appliance's own customer/partner/site before
+        # re-enabling it.
+        from appliance_identity import current_manifest_version, should_refresh_manifest
         cached_manifest_version=payload.get('cached_manifest_version')
-        manifest_refreshed=False; revoked_session_count=0
         with connection() as db:
             live_version=current_manifest_version(db,cloud_id=appliance['cloud_id'])
-            if should_refresh_manifest(cached_manifest_version,live_version):
-                manifest=build_manifest(db,cloud_id=appliance['cloud_id'])
-                revoked=reconcile_sessions_against_manifest(db,manifest=manifest)
-                manifest_refreshed=True; revoked_session_count=len(revoked)
-        if revoked_session_count: audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.sessions_revoked_on_manifest_refresh','appliance',appliance['id'],{'session_count':revoked_session_count,'trigger':'heartbeat'})
+        # build_manifest() is no longer called here -- its only consumer
+        # in this function was the now-disabled reconcile call above;
+        # nothing else in this response used its return value.
+        # manifest_refreshed still reports the same true/false staleness
+        # signal (an appliance decides for itself whether to call GET
+        # .../identity-manifest based on this), just without the wasted
+        # rebuild work.
+        manifest_refreshed=should_refresh_manifest(cached_manifest_version,live_version)
         new_uptime=int(safe.get('uptime_seconds',0))
         # A restart is inferred, never self-reported: uptime_seconds resetting
         # to a value meaningfully lower than what this same appliance last
@@ -271,17 +287,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
     def identity_manifest(request: Request,cloud_id: str) -> dict:
         appliance=authenticate_appliance(request)
         if appliance['cloud_id'].upper()!=cloud_id.upper(): raise HTTPException(status_code=403,detail='Cloud ID does not match authenticated appliance.')
-        from appliance_identity import get_cloud_identity_backend, reconcile_sessions_against_manifest
+        from appliance_identity import get_cloud_identity_backend
         manifest=get_cloud_identity_backend().fetch_manifest(cloud_id=appliance['cloud_id'])
-        # Reconciliation runs on every fetch, not on a separate schedule --
-        # in this mock/dev setup the 'cloud' database the manifest was
-        # just built from and the local session table live in the same
-        # place, so this is the one real, already-wired trigger point.
-        # See appliance_identity.reconcile_sessions_against_manifest()'s
-        # own docstring for what still needs a genuine periodic caller
-        # once the appliance and cloud are actually separate processes.
-        with connection() as db: revoked=reconcile_sessions_against_manifest(db,manifest=manifest)
-        if revoked: audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.sessions_revoked_on_manifest_refresh','appliance',appliance['id'],{'session_count':len(revoked)})
+        # TEMPORARY 2026-09-04 mitigation (Option A -- see the matching,
+        # fuller comment in heartbeat() above for the root cause and
+        # what Option B needs to do before this is safe to re-enable):
+        # reconcile_sessions_against_manifest() is NOT called here
+        # anymore. This route still returns the real, freshly-built
+        # manifest to the appliance unchanged; only the unscoped,
+        # platform-wide session-revocation side effect is disabled.
         audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.identity_manifest_fetched','appliance',appliance['id'],{'identity_count':len(manifest['identities']),'manifest_version':manifest['manifest_version']})
         return manifest
 

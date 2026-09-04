@@ -227,7 +227,23 @@ def test_multi_role_admin_and_partner_selector_behavior(client, db_path):
 # =============================================================== revocation reconciliation
 
 
-def test_role_removal_force_expires_the_local_session_on_next_manifest_fetch(client, db_path):
+def test_role_removal_no_longer_force_expires_the_session_while_option_a_is_active(client, db_path):
+    # TEMPORARY 2026-09-04 (Option A mitigation): this test used to
+    # assert the opposite -- that a role removal force-expired the
+    # session on the next manifest fetch. reconcile_sessions_against_
+    # manifest() queried user_sessions with NO scoping at all (every
+    # open session platform-wide), so in production this same code path
+    # was force-revoking essentially every unrelated customer's own
+    # cloud session too, not just the one whose role was actually
+    # removed (see test_unrelated_session_is_untouched_by_reconciliation
+    # below -- its "unrelated" session was a GLOBAL admin grant, which
+    # legitimately DOES appear in every appliance's manifest, so it
+    # never actually exercised the real gap; a true ungranted customer
+    # session did, live, in production). The call is disabled for now
+    # (see appliance_cloud.py's heartbeat()/identity_manifest()'s own
+    # comments) until Option B properly scopes it. This test now proves
+    # the mitigation: the session survives. Restore the original
+    # assertion (or a properly-scoped equivalent) once Option B ships.
     with _db(db_path):
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
@@ -246,7 +262,7 @@ def test_role_removal_force_expires_the_local_session_on_next_manifest_fetch(cli
     with _db(db_path):
         with connection() as db:
             session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-1'").fetchone()
-    assert session["revoked_at"] is not None
+    assert session["revoked_at"] is None
 
 
 def _heartbeat_payload(cached_manifest_version=None):
@@ -282,7 +298,13 @@ def test_heartbeat_with_matching_cached_version_does_not_refresh(client, db_path
     assert response.json()["current_manifest_version"] == live_version
 
 
-def test_heartbeat_with_stale_cached_version_reconciles_local_sessions_immediately(client, db_path):
+def test_heartbeat_with_stale_cached_version_no_longer_revokes_while_option_a_is_active(client, db_path):
+    # TEMPORARY 2026-09-04 (Option A mitigation) -- see the equivalent
+    # comment on test_role_removal_no_longer_force_expires_the_session_
+    # while_option_a_is_active() above for the full root-cause context.
+    # manifest_refreshed must still correctly report True here (the
+    # appliance's own staleness signal is untouched by this mitigation
+    # -- only the session-revocation side effect is disabled).
     with _db(db_path):
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
@@ -295,7 +317,7 @@ def test_heartbeat_with_stale_cached_version_reconciles_local_sessions_immediate
                 "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 ("sess-hb-1", "u1", "tech@example.com", "technician", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", stale_version),
             )
-            appliance_identity.revoke_grant(db, grant_id=grant_id)  # role removed -- session should not survive the next heartbeat
+            appliance_identity.revoke_grant(db, grant_id=grant_id)  # role removed -- session survives anyway while Option A is active
 
     response = client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=stale_version), headers=_auth_headers("appl-1", "cred-1"))
     assert response.status_code == 200
@@ -304,7 +326,66 @@ def test_heartbeat_with_stale_cached_version_reconciles_local_sessions_immediate
     with _db(db_path):
         with connection() as db:
             session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-hb-1'").fetchone()
-    assert session["revoked_at"] is not None
+    assert session["revoked_at"] is None
+
+
+def test_heartbeat_no_longer_creates_sessions_revoked_audit_entries(client, db_path):
+    # Direct regression guard for the live symptom (47 audit_logs rows
+    # of action='appliance.sessions_revoked_on_manifest_refresh',
+    # trigger='heartbeat' in under a day of production traffic, every
+    # customer_owner session revoked within 8-74s of login) -- proves
+    # the mitigation via the exact signal that was flooding the audit
+    # log, not just via user_sessions.revoked_at.
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
+            _seed_operator(db, "u1", "tech@example.com", "Sup3rSecret!")
+            grant_id = appliance_identity.create_grant(db, user_id="u1", role="technician", scope_type="appliance", scope_id="AIC-1", granted_by="test")
+            manifest = appliance_identity.build_manifest(db, cloud_id="AIC-1")
+            live_identity = next(i for i in manifest["identities"] if i["user_id"] == "u1")
+            stale_version = live_identity["authorization_version"]
+            db.execute(
+                "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("sess-hb-2", "u1", "tech@example.com", "technician", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", stale_version),
+            )
+            appliance_identity.revoke_grant(db, grant_id=grant_id)
+
+    client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=stale_version), headers=_auth_headers("appl-1", "cred-1"))
+    client.get("/api/appliance/AIC-1/identity-manifest", headers=_auth_headers("appl-1", "cred-1"))
+
+    with _db(db_path):
+        with connection() as db:
+            rows = db.execute("SELECT * FROM audit_logs WHERE action='appliance.sessions_revoked_on_manifest_refresh'").fetchall()
+    assert rows == []
+
+
+def test_a_genuinely_unrelated_ungranted_customer_session_survives_both_endpoints(client, db_path):
+    # The real production scenario, not test_unrelated_session_is_
+    # untouched_by_reconciliation()'s global-admin case (which never
+    # exercised the actual gap -- a global grant legitimately appears in
+    # every appliance's own manifest identities regardless of scoping).
+    # This customer has ZERO identity_grants rows at all -- ordinary
+    # cloud customer_owner, ships zero appliance-identity involvement --
+    # exactly the shape of every session that was being force-revoked
+    # live in production by an unrelated appliance's own heartbeat.
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-2','Other Partner','approved','real','2026-08-27T00:00:00')")
+            db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-2','partner-2','Other Customer','cust2@example.test','active','real','2026-08-27T00:00:00')")
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) VALUES('u-cust','partner-2','customer@example.test','Customer Owner','customer_owner',?,1,'cust-2','2026-08-27T00:00:00')", (password_hash("Sup3rSecret!"),))
+            db.execute(
+                "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("sess-cust", "u-cust", "customer@example.test", "customer_owner", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", None),
+            )
+
+    client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=None), headers=_auth_headers("appl-1", "cred-1"))
+    client.get("/api/appliance/AIC-1/identity-manifest", headers=_auth_headers("appl-1", "cred-1"))
+
+    with _db(db_path):
+        with connection() as db:
+            session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-cust'").fetchone()
+    assert session["revoked_at"] is None
 
 
 def test_heartbeat_with_no_cached_version_always_refreshes(client, db_path):
