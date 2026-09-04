@@ -51181,7 +51181,55 @@ if(resetButton)resetButton.onclick=async()=>{if(!confirm('Reset local activation
 
 
 
-def camera_status() -> dict:
+def camera_status(request: Request) -> dict:
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        # Customer-portal identity: scope to only this customer's own
+        # cameras -- never the shared, multi-tenant camera_number
+        # sequence _legacy_camera_status() below iterates -- and source
+        # online/recording from the appliance's own live heartbeat
+        # (appliance_camera_status, keyed by the real camera.id) instead
+        # of the local HLS-manifest/camera_process_state check further
+        # down. That check is edge-appliance-only (correct on
+        # Samsung/Ryzen, where a local relay actually writes those
+        # files); this cloud host runs no local relay for a customer's
+        # cameras at all, so it always reported every camera offline
+        # regardless of the appliance's real, live state.
+        return _customer_camera_status(customer_cameras)
+    return _legacy_camera_status()
+
+
+def _customer_camera_status(customer_cameras: list[dict]) -> dict:
+    from partner_db import connection
+    cameras = []
+    with connection() as db:
+        for camera in customer_cameras:
+            camera_number = camera.get("camera_number")
+            if camera_number is None:
+                continue
+            status_row = db.execute(
+                "SELECT online, recording FROM appliance_camera_status WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchone()
+            online = bool(status_row["online"]) if status_row else False
+            recording_running = bool(status_row["recording"]) if status_row else False
+            cameras.append(
+                {
+                    "camera": camera_number,
+                    "online": online,
+                    "stream": "online" if online else "offline",
+                    "recording": "running" if recording_running else "stopped",
+                    "last_stream_update_seconds": None,
+                    "reconnects": 0,
+                    "last_exit_code": None,
+                    "last_error": None,
+                    "last_error_at": None,
+                }
+            )
+    return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
+
+
+def _legacy_camera_status() -> dict:
 
 
 
@@ -73118,7 +73166,20 @@ def camera_health_page(request: Request) -> str:
 
 
 
-def dashboard() -> str:
+def dashboard(request: Request) -> str:
+    _customer_dashboard_cameras = _customer_playback_cameras(request)
+    if _customer_dashboard_cameras is not None:
+        # Customer-portal identity: only this customer's own camera
+        # numbers -- see camera_status()'s own comment for why the
+        # shared, multi-tenant get_camera_numbers() sequence below must
+        # never be used to build a real customer's Dashboard.
+        _dashboard_camera_numbers = [
+            camera["camera_number"]
+            for camera in _customer_dashboard_cameras
+            if camera.get("camera_number") is not None
+        ]
+    else:
+        _dashboard_camera_numbers = list(get_camera_numbers())
 
 
 
@@ -73424,7 +73485,7 @@ def dashboard() -> str:
 
 
 
-        for camera_number in get_camera_numbers()
+        for camera_number in _dashboard_camera_numbers
 
 
 
