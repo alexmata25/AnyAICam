@@ -187,17 +187,65 @@ def test_marker_click_to_seek_wiring_unchanged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 8. The timeline container is tall enough for the new lanes -- the one
-#    CSS change this fix makes, scoped by ID so no other page sharing the
-#    global .timeline-lane class is affected.
+# 8. The timeline container is tall enough for the lanes, and its CSS
+#    override actually takes effect -- 2026-09-04 fix: the original
+#    #playback-timeline-lane{height:88px} (no !important) was silently
+#    defeated by an older, unrelated global .timeline-lane{...height:
+#    28px!important;...} rule elsewhere in this page's shared stylesheet
+#    (used by e.g. Live View's own Monitor timeline) -- CSS !important
+#    always beats specificity, so the real container rendered at 28px
+#    while content was absolutely-positioned up to ~80px down inside it.
+#    Scoped by ID so no other page sharing the global .timeline-lane
+#    class is affected.
 # ---------------------------------------------------------------------------
 
-def test_timeline_lane_height_increased_via_id_scoped_override(monkeypatch):
+def test_timeline_lane_height_override_carries_important_and_matches_content(monkeypatch):
     html = _render(monkeypatch)
     # The concatenated Python string literals lose their quote marks once
     # rendered -- assert on the actual CSS text that reaches the browser,
-    # not the Python source syntax.
-    assert "#playback-timeline-lane{height:88px}" in html
+    # not the Python source syntax. Must carry !important, or it is
+    # silently defeated by the pre-existing global .timeline-lane rule
+    # exactly as before -- this is the actual regression this fix closes.
+    m = re.search(r"#playback-timeline-lane\{height:(\d+)px!important\}", html)
+    assert m, "the ID-scoped height override must carry !important, or the global .timeline-lane rule wins instead"
+    container_height = int(m.group(1))
+
+    # The container must be tall enough to hold everything the JS below
+    # actually draws into it (RECORDING_ROW_TOP_PX + RECORDING_ROW_HEIGHT_PX) --
+    # re-derived here the same way the JS derives it, so this test fails
+    # if the two are ever allowed to drift apart again like the original
+    # 74/88 pair did.
+    lane_height = int(re.search(r"EVENT_LANE_HEIGHT_PX=(\d+)", html).group(1))
+    lane_gap = int(re.search(r"EVENT_LANE_GAP_PX=(\d+)", html).group(1))
+    recording_gap = int(re.search(r"RECORDING_ROW_GAP_PX=(\d+)", html).group(1))
+    recording_height = int(re.search(r"RECORDING_ROW_HEIGHT_PX=(\d+)", html).group(1))
+    order = ["motion", "person", "vehicle", "lpr", "people_counting", "intrusion"]
+    fallback_lane_top = len(order) * (lane_height + lane_gap)
+    recording_row_top = fallback_lane_top + lane_height + recording_gap
+    content_bottom = recording_row_top + recording_height
+    assert container_height >= content_bottom, (
+        f"container ({container_height}px) must be at least as tall as its content ({content_bottom}px)"
+    )
+    # And genuinely compact, not just "big enough" -- this fix's whole
+    # point was replacing an oversized/broken box with a tight one.
+    assert container_height - content_bottom <= 10, "container should be a snug fit, not padded back out to the old spread"
+
     # Confirm it's genuinely additive: the pre-existing local override
     # (.event-segment{cursor:pointer}) is still there, unchanged.
     assert ".event-segment{cursor:pointer}" in html
+
+
+# ---------------------------------------------------------------------------
+# 9. The outer "Recorded activity / Timeline" section no longer carries a
+#    historical, unconditional 285px min-height floor on Playback -- but
+#    that override is scoped strictly to Playback's own section, not the
+#    bare .monitor-timeline class Live View's Monitor page also uses.
+# ---------------------------------------------------------------------------
+
+def test_monitor_timeline_min_height_floor_is_removed_and_scoped_to_playback_only(monkeypatch):
+    html = _render(monkeypatch)
+    assert "#playback-monitor-timeline{min-height:0!important}" in html
+    # The override must target an id unique to this page's own <section>,
+    # not the shared class -- otherwise it would also strip Live View's
+    # Monitor page's own (intentional, unrelated) use of that floor.
+    assert '<section class="monitor-timeline" id="playback-monitor-timeline"' in html

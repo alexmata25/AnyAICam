@@ -140506,15 +140506,50 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.legend-dot.event-people_counting{background:#4dcf7a}'
         '.legend-dot.event-intrusion{background:#f0554d}'
         '.event-segment{cursor:pointer}'
-        # 2026-09-03 lane fix: enough height for 7 stacked analytics
-        # lanes (EVENT_LANE_ORDER + one fallback lane -- see the JS
-        # below) plus a separate row for recording coverage, so event
-        # markers of different categories detected close in time never
-        # visually smash into each other or into the recording blocks.
-        # #playback-timeline-lane (ID selector) deliberately overrides
-        # the shared/global .timeline-lane class's own height -- scoped
-        # to this page only, no other page using that class is touched.
-        '#playback-timeline-lane{height:88px}'
+        # 2026-09-04 lane fix (v2): the 2026-09-03 attempt above set
+        # #playback-timeline-lane's height to a hand-picked 88px, WITHOUT
+        # !important -- and never actually took effect, because this
+        # page's shared/global stylesheet already has an older, unrelated
+        # rule (.timeline-lane{...height:28px!important;...}, used by
+        # e.g. Live View's own Monitor timeline) that carries !important.
+        # CSS importance always beats specificity regardless of selector,
+        # so that 28px silently won over this ID selector's 88px every
+        # time, no matter how specific -- the real container rendered at
+        # 28px while the JS below still absolutely-positioned content up
+        # to ~80px down inside it (7 stacked analytics lanes +
+        # RECORDING_ROW_TOP_PX/HEIGHT below), spilling past the visible
+        # box (a second, unopposed global rule sets overflow:visible) --
+        # exactly the "markers floating at odd heights, recording
+        # coverage pushed toward the bottom" appearance reported live.
+        # Fixed two ways together: this rule now carries !important too,
+        # so ID-selector-vs-class-selector specificity is the deciding
+        # tiebreak between two equally-!important declarations (ID wins,
+        # correctly, this time) -- and the value itself now matches the
+        # JS's own tightened, derived geometry below (7 stacked lanes at
+        # a smaller EVENT_LANE_HEIGHT_PX/GAP_PX, RECORDING_ROW_TOP_PX
+        # computed from them instead of hardcoded) instead of a second,
+        # independent guess that could again drift out of sync with what
+        # the JS actually draws.
+        '#playback-timeline-lane{height:70px!important}'
+        # The outer "Recorded activity / Timeline" section (.monitor-
+        # timeline) has NINE separately-added rules in this page's
+        # shared stylesheet from different points in this app's history
+        # (Live View's own Monitor page also uses this class). The one
+        # that currently wins the same !important-then-specificity
+        # cascade as above nets out to min-height:285px!important --
+        # an unconditional floor applied regardless of actual content,
+        # which on Playback specifically (now that the lane box above is
+        # a compact ~70px instead of the old broken/spread-out box)
+        # left a large, purposeless gap of dead space below the
+        # timeline. Only min-height is overridden -- height:auto,
+        # max-height:none, and overflow:auto (also part of that same
+        # winning rule) are left exactly as they already were, so the
+        # section still grows to fit real content and still scrolls if
+        # it ever needs to; it just no longer has a padded-out floor.
+        # Scoped to id=playback-monitor-timeline (added to this page's
+        # own <section> below) so Live View's Monitor page, which reuses
+        # the bare .monitor-timeline class, is completely unaffected.
+        '#playback-monitor-timeline{min-height:0!important}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:14px">'
@@ -140529,7 +140564,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
         '<div id="mobile-recent-events-list" class="health-list"></div>'
         '</section>'
-        '<section class="monitor-timeline" style="margin-top:14px">'
+        '<section class="monitor-timeline" id="playback-monitor-timeline" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Timeline</h2></div></div>'
         '<div class="monitor-toolbar">'
         '<div class="monitor-toolbar-group">'
@@ -141098,15 +141133,38 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
   // === LANE_CORE_START ===
   const EVENT_LANE_ORDER=['motion','person','vehicle','lpr','people_counting','intrusion'];
-  const EVENT_LANE_HEIGHT_PX=8;
-  const EVENT_LANE_GAP_PX=2;
-  const RECORDING_ROW_TOP_PX=74;
+  // Tightened 2026-09-04 (was 8/2) for a compact, professional timeline
+  // -- see #playback-timeline-lane's own CSS comment above for the full
+  // story of why the box these are drawn into used to render far
+  // shorter than intended. Purely a size/spacing change: still one
+  // fixed-height row per category (6 lanes) plus the existing fallback
+  // row, same left/width-from-timestamp math (timelinePercent(), a few
+  // lines up), same colors, same click/filter/seek behavior -- nothing
+  // about which events exist or where they sit on the time axis changes.
+  const EVENT_LANE_HEIGHT_PX=7;
+  const EVENT_LANE_GAP_PX=1;
   const RECORDING_ROW_HEIGHT_PX=6;
+  // Gap between the last analytics lane and the recording-coverage row
+  // below it -- kept as its own named constant (rather than folded into
+  // RECORDING_ROW_TOP_PX's math inline) so it reads as the one number
+  // actually meant to be a deliberate design choice, not derived.
+  const RECORDING_ROW_GAP_PX=6;
   function eventLaneTop(category){{
     const index=category?EVENT_LANE_ORDER.indexOf(category):-1;
     const lane=index===-1?EVENT_LANE_ORDER.length:index;
     return (lane*(EVENT_LANE_HEIGHT_PX+EVENT_LANE_GAP_PX))+'px';
   }}
+  // Derived from the lane constants above, not hand-picked -- eventLaneTop
+  // (null) is exactly where the fallback lane (the 7th and last stacked
+  // row) starts, so its own bottom edge plus RECORDING_ROW_GAP_PX is
+  // exactly where the recording-coverage row belongs, however many lanes
+  // there are or however tall each one is. This was the actual source of
+  // the visual bug: a hardcoded 74 here had drifted out of sync with a
+  // separately-hardcoded 88px container height (see the CSS comment
+  // above) -- neither of those two numbers could ever verify itself
+  // against the other. They can't drift apart again because there's now
+  // only one place (this line) that computes where the coverage row goes.
+  const RECORDING_ROW_TOP_PX=Number(eventLaneTop(null).slice(0,-2))+EVENT_LANE_HEIGHT_PX+RECORDING_ROW_GAP_PX;
   // === LANE_CORE_END ===
 
   function renderTimeline(cameraId,clips,events){{

@@ -207,5 +207,14 @@ def test_no_regression_to_date_navigation(monkeypatch):
 def test_no_regression_to_analytics_lanes(monkeypatch):
     html = _render(monkeypatch)
     assert "const EVENT_LANE_ORDER=['motion','person','vehicle','lpr','people_counting','intrusion'];" in html
-    assert "#playback-timeline-lane{height:88px}" in html
-    assert "RECORDING_ROW_TOP_PX=74" in html
+    # 2026-09-04: the container height override must carry !important --
+    # see test_playback_analytics_lanes.py's own test for why (the
+    # original, non-!important 88px override was silently defeated by an
+    # older, unrelated global .timeline-lane{...!important} rule).
+    # RECORDING_ROW_TOP_PX is derived from the lane constants now,
+    # instead of a hardcoded 74 that could (and did) drift out of sync
+    # with the container height -- see that same test for the full
+    # value-level proof; here it's enough to confirm the derivation
+    # itself, not a second hardcoded number, is what's shipping.
+    assert "!important}" in html and "#playback-timeline-lane{height:" in html
+    assert "const RECORDING_ROW_TOP_PX=Number(eventLaneTop(null)" in html
