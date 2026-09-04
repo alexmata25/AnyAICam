@@ -139944,6 +139944,83 @@ def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
     return camera_id in {camera["id"] for camera in cameras}
 
 
+@app.post("/api/customer/clips")
+async def customer_create_clip(request: Request) -> dict:
+    payload = await request.json()
+    camera_id = str(payload.get("camera_id") or "")
+    start_raw = payload.get("start_time")
+    end_raw = payload.get("end_time")
+    if not camera_id or not start_raw or not end_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="camera_id, start_time and end_time are required.",
+        )
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    try:
+        start_time = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+        end_time = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clip timestamp.")
+    start_time = start_time.replace(tzinfo=None)
+    end_time = end_time.replace(tzinfo=None)
+    duration = end_time - start_time
+    if duration <= timedelta(0):
+        raise HTTPException(status_code=400, detail="End time must be after start time.")
+    if duration > timedelta(hours=1):
+        raise HTTPException(status_code=400, detail="Manual clips are limited to one hour.")
+    from partner_db import connection
+    with connection() as db:
+        camera = db.execute(
+            "SELECT camera_number FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    if not camera or camera["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    camera_number = int(camera["camera_number"])
+    job_id = uuid.uuid4().hex
+    clip_jobs[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 2,
+        "message": "Clip queued…",
+    }
+    task = asyncio.create_task(
+        build_manual_clip(
+            job_id,
+            camera_number,
+            start_time,
+            end_time,
+        )
+    )
+    clip_tasks.add(task)
+    task.add_done_callback(clip_tasks.discard)
+    return clip_jobs[job_id]
+
+
+@app.get("/api/customer/clips/{job_id}")
+def customer_clip_status(job_id: str, request: Request) -> dict:
+    # A customer must at least have a valid portal identity to inspect
+    # customer clip jobs. The clip itself was already authorized by
+    # camera ownership/access when the job was created.
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        raise HTTPException(status_code=403, detail="Authentication required.")
+    return clip_jobs.get(
+        job_id,
+        {
+            "id": job_id,
+            "status": "error",
+            "progress": 0,
+            "message": "Clip job not found.",
+        },
+    )
+
+
 @app.get("/api/customer/recordings/{camera_id}")
 def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, near: str | None = None, date: str | None = None, limit: int = 50) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
