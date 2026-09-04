@@ -40740,15 +40740,40 @@ app.mount("/recordings", StaticFiles(directory="/app/recordings"), name="recordi
 
 
 
+# The customer portal's own nav (NAV_ITEMS, filtered by navigation_
+# keys_for_role() for role in CUSTOMER_PORTAL_ROLES) links to a MIX of
+# "/customer"-prefixed paths (already covered below by the plain
+# path.startswith("/customer") branch) and bare top-level paths that
+# were not -- confirmed by reading NAV_ITEMS directly rather than
+# guessing from the URL alone: "/customer-live" and "/customer-app-
+# settings" already had the prefix, but "/dashboard", "/playback",
+# "/events", "/alerts", "/investigate", and "/subscription-portal" did
+# not, so an unauthenticated (or session-expired) customer clicking
+# any of THOSE landed on the local-emergency-recovery /login instead
+# of the customer sign-in page -- reported live on app.anyaicam.com
+# (RUNTIME_ROLE=cloud) as "/dashboard and /playback redirect to
+# /login". ("/mobile-app", NAV_ITEMS' remaining bare-path entry, is
+# deliberately NOT listed here -- it's already in PUBLIC_PATH_PREFIXES
+# below, so authentication_middleware never reaches this branch for it
+# at all; that page currently has no route handler behind it, a real
+# but separate missing-page gap, out of scope for this auth-routing
+# fix.) Only applied when RUNTIME_ROLE == "cloud": on an edge
+# appliance, an unauthenticated visitor to these exact same shared
+# dual-purpose routes (see e.g. playback()'s own _customer_playback_
+# cameras() branch) is the appliance's own local owner, not a cloud
+# customer account, and the existing local-emergency-recovery /login
+# is the correct destination for them -- unchanged here.
+CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
+    "/dashboard",
+    "/playback",
+    "/events",
+    "/alerts",
+    "/investigate",
+    "/subscription-portal",
+)
+
+
 PUBLIC_PATH_PREFIXES = (
-
-
-
-
-
-
-
-
     "/login",
 
     "/customer-login.html",
@@ -41052,10 +41077,17 @@ async def authentication_middleware(request: Request, call_next):
     if path.startswith("/customer"):
         return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
 
-
-
-
-
+    # Cloud-only widening of the same customer-login redirect to the
+    # bare-path half of the customer nav (see CLOUD_CUSTOMER_NAV_PATH_
+    # PREFIXES's own comment for exactly which paths and why). Gated to
+    # RUNTIME_ROLE == "cloud" specifically: these are the same shared
+    # dual-purpose routes an edge appliance's own local owner also
+    # legitimately reaches unauthenticated, and for them /login (this
+    # function's existing, unchanged fallback below) remains correct.
+    if RUNTIME_ROLE == "cloud" and any(
+        path == prefix or path.startswith(prefix + "/") for prefix in CLOUD_CUSTOMER_NAV_PATH_PREFIXES
+    ):
+        return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
 
     return RedirectResponse(f"/login?next={next_url}", status_code=303)
 

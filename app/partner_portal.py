@@ -166,7 +166,31 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=403, detail=messages.get(reason,'The email or password is incorrect.'))
         clear_login_failures(email)
         audit(user or {'email':email,'role':role},'login.succeeded','partner_user',user.get('id','') if user else '')
-        destination='/change-password' if user and user.get('must_change_password') else ('/customer-portal' if payload.get('customer_only') and role=='administrator' else destination_for_role(role))
+        # next: only ever honored for the plain customer_only login path,
+        # and only after the two existing special-case destinations above
+        # it (forced password change, admin-viewing-as-customer) still
+        # win outright -- neither of those should ever be skipped past
+        # just because the customer nav happened to bounce someone here
+        # with a next= attached. Validated as a same-origin relative path
+        # (starts with "/", not "//") before use, same open-redirect
+        # guard as the rest of this app's own next= handling
+        # (authentication_middleware's own next_url is never trusted
+        # further than this either) -- an unauthenticated visit to a
+        # protected customer page (main.py's authentication_middleware,
+        # RUNTIME_ROLE=="cloud") is what actually attaches this in
+        # practice, so a valid value is always exactly one of the
+        # customer nav's own bare paths, never anything external.
+        next_path=payload.get('next')
+        if not(isinstance(next_path,str) and next_path.startswith('/') and not next_path.startswith('//')):
+            next_path=None
+        if user and user.get('must_change_password'):
+            destination='/change-password'
+        elif payload.get('customer_only') and role=='administrator':
+            destination='/customer-portal'
+        elif payload.get('customer_only') and next_path:
+            destination=next_path
+        else:
+            destination=destination_for_role(role)
         return establish_partner_session(destination, request=request, email=email, role=role, user=user)
 
     @app.post('/partner-logout')
