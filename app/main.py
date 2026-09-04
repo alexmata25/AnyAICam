@@ -140602,6 +140602,21 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</div>'
         '</section>'
         '<style>@media (max-width:900px){.monitor-timeline{display:none!important}.mobile-recent-events{display:block!important}}@media (min-width:901px){.mobile-recent-events{display:none!important}.monitor-timeline{display:block}}</style>'
+        # 2026-09-04: video-first mobile cards -- the section's own
+        # container (.mobile-recent-events) is already hidden above
+        # 900px by the media query directly above, so these rules never
+        # need their own breakpoint; desktop's .monitor-timeline markup
+        # is a completely separate tree, untouched by any of this.
+        '<style>'
+        '.mobile-media-card{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#0b1018;margin-bottom:8px}'
+        '.mobile-media-card:last-child{margin-bottom:0}'
+        '.mobile-media-card[role="button"]{cursor:pointer}'
+        '.mobile-media-thumb{width:100%;height:100%;object-fit:cover;display:block}'
+        '.mobile-media-time{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;line-height:1;padding:4px 7px;border-radius:6px;font-weight:600}'
+        '.mobile-media-badge{position:absolute;top:8px;right:36px;color:#fff;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.02em}'
+        '.mobile-media-menu{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;display:flex;align-items:center;justify-content:center;pointer-events:none}'
+        '.mobile-media-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:0 12px;background:#141b26}'
+        '</style>'
         '<section class="panel mobile-recent-events" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
         '<div id="mobile-recent-events-list" class="health-list"></div>'
@@ -141037,22 +141052,48 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   function renderMobileRecentEvents(cameraId,clips,events){{
     const mobileList=document.getElementById('mobile-recent-events-list');
     if(!mobileList)return;
-    // Mobile recent activity: recent recording clips (punch-list item --
-    // no desktop scrub/timeline on phones, a plain tappable list instead
-    // of a ruler-based scrubber) followed by recent events. Reconciled
-    // 2026-09-02 from two lineages that each improved a different half
-    // of this same list -- the recording-clip rows below are the
-    // customer-ui-punch-list branch's addition; the event rows keep the
-    // has_event_clip-aware direct event-media fetch (avoids the "event
-    // depends on a nearby recording" bug fixed elsewhere this session)
-    // and playbackDate() (correct local-time display, not raw UTC) from
-    // the Events/Playback checkpoint. Neither side's work is discarded.
-    const clipRows=[...clips].reverse().slice(0,15).map(clip=>
-      `<div class="health-row" data-mobile-clip role="button" tabindex="0"><span class="health-name">${{playbackDate(clip.start).toLocaleString()}}</span><span class="health-detail">Clip</span></div>`
-    ).join('');
+    // Video-first mobile cards (2026-09-04): one large 16:9 thumbnail
+    // card per row -- timestamp/duration and (for events) a colored
+    // event-type badge overlaid directly on the image, replacing the
+    // old plain-text "Clip"/"No preview" list rows this section used to
+    // render. Tapping a card reuses the existing, unmodified
+    // playClip()/openEvent() playback paths below completely unchanged
+    // -- revealClipPanel() (already called by both) is the existing
+    // "detail screen" Download/Share/Bookmark/Create-clip controls
+    // already live in, so no new action-menu logic is needed: the small
+    // decorative ⋮ glyph on each card (pointer-events:none, see its own
+    // CSS above) is purely a visual affordance for that same existing
+    // tap-to-open behavior, not a second interaction path.
+    //
+    // Root-cause fix, same date: an event's own thumbnail was
+    // previously never read here at all -- findClipNear(clips,event.
+    // timestamp) substituted a *nearby recording's* thumbnail instead,
+    // unrelated to the event's own clip, which frequently found nothing
+    // (recording outside the currently-loaded page, a genuine gap
+    // between the event and the nearest recording, etc.) and showed
+    // "No preview" even for an event correctly flagged has_event_clip
+    // with a real, already-working thumbnail sitting one field away:
+    // event.thumbnail, populated by _customer_detection_events() as
+    // /api/customer/events/{{camera_id}}/{{event_id}}/thumbnail -- the
+    // exact same URL the desktop Events page already uses correctly.
+    // findClipNear() is no longer called anywhere in this function; an
+    // event with no real thumbnail (event.thumbnail is null -- it
+    // genuinely has no captured preview, not a lookup failure) now
+    // renders the compact "<Type> · No clip available" fallback below
+    // instead of a large empty preview box.
+    const clipRows=[...clips].reverse().slice(0,15).map(clip=>{{
+      const durationMin=Math.max(1,Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000));
+      const timeLabel=playbackDate(clip.start).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
+      return `<div class="mobile-media-card" data-mobile-clip role="button" tabindex="0">
+        <img class="mobile-media-thumb" src="/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">
+        <span class="mobile-media-time">${{timeLabel}} · ${{durationMin}} min</span>
+        <span class="mobile-media-menu" aria-hidden="true">⋮</span>
+      </div>`;
+    }}).join('');
 
-    // Each row represents analytics activity and opens the recording
-    // nearest that event when tapped.
+    // Each row represents analytics activity; a row with a real clip
+    // (has_event_clip) opens that event's own clip directly via
+    // openEvent() below -- never a nearby-recording guess.
     const recentEvents=[...events]
       .filter(event=>{{
         const category=filterCategory(event.event_type);
@@ -141068,33 +141109,18 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         .replace(/\b\w/g,char=>char.toUpperCase());
       const playable=Boolean(event.has_event_clip&&event.id);
       const interaction=playable?'role="button" tabindex="0"':'';
-      const availability=playable?'Event clip':'Analytics only';
+      const timeLabel=playbackDate(event.timestamp).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
+      const badge=`<span class="mobile-media-badge" style="background:${{category?EVENT_COLORS[category]:'#6b7785'}}">${{label}}</span>`;
+      const menu=playable?'<span class="mobile-media-menu" aria-hidden="true">⋮</span>':'';
+      const media=event.thumbnail
+        ? `<img class="mobile-media-thumb" src="${{event.thumbnail}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
+        : `<div class="mobile-media-fallback">${{label}} · No clip available</div>`;
 
-      const nearby=findClipNear(clips,event.timestamp);
-      const thumbnailUrl=nearby
-        ? `/api/customer/recordings/${{cameraId}}/${{nearby.id}}/thumbnail`
-        : '';
-
-      const preview=thumbnailUrl
-        ? `<div style="width:120px;aspect-ratio:16/9;border-radius:10px;background:#0b1018;overflow:hidden;display:grid;place-items:center;flex:0 0 auto">
-             <img
-               src="${{thumbnailUrl}}"
-               alt="Event thumbnail"
-               loading="lazy"
-               style="width:100%;height:100%;object-fit:cover"
-               onerror="this.style.display='none';this.parentElement.innerHTML='<span class=&quot;health-detail&quot;>No preview</span>'"
-             >
-           </div>`
-        : `<div style="width:120px;aspect-ratio:16/9;border-radius:10px;background:#0b1018;display:grid;place-items:center;flex:0 0 auto">
-             <span class="health-detail">No preview</span>
-           </div>`;
-
-      return `<div class="health-row" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}} style="display:flex;align-items:center;gap:12px;cursor:${{playable?'pointer':'default'}};opacity:${{playable?'1':'0.78'}}">
-        ${{preview}}
-        <div style="min-width:0;flex:1">
-          <span class="health-name">${{label}}</span>
-          <span class="health-detail">${{playbackDate(event.timestamp).toLocaleString()}} · ${{availability}}</span>
-        </div>
+      return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
+        ${{media}}
+        <span class="mobile-media-time">${{timeLabel}}</span>
+        ${{badge}}
+        ${{menu}}
       </div>`;
     }}).join('');
 
@@ -141107,27 +141133,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
 
     mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
-      const hydratePreview=async()=>{{
-        if(row.querySelector('img'))return;
-
-        const timestamp=row.dataset.mobileEvent;
-        const nearby=findClipNear(clips,timestamp)||
-          (await fetchClipsMetadata(cameraId,{{near:timestamp}}))[0];
-
-        if(!nearby)return;
-
-        const preview=row.firstElementChild;
-        if(!preview)return;
-
-        const thumbnailUrl=
-          `/api/customer/recordings/${{cameraId}}/${{nearby.id}}/thumbnail`;
-
-        preview.innerHTML=
-          `<img src="${{thumbnailUrl}}" alt="Event thumbnail" loading="lazy" style="width:100%;height:100%;object-fit:cover" onerror="this.style.display='none';this.parentElement.innerHTML='<span class=&quot;health-detail&quot;>No preview</span>'">`;
-      }};
-
-      hydratePreview();
-
       // Analytics-only detections remain visible as event details but
       // are deliberately not presented as playable controls.
       if(row.dataset.mobileEventClip!=='1'||!row.dataset.mobileEventId)return;
