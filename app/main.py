@@ -2700,6 +2700,33 @@ AI_DETECTOR_STARTUP_STAGGER_SECONDS = max(0, int(os.environ.get("AI_DETECTOR_STA
 
 AI_PERSON_COOLDOWN_SECONDS = max(5, int(os.environ.get("AI_PERSON_COOLDOWN_SECONDS", "30")))
 
+# People Counting: OFF by default, appliance-wide, no hidden default --
+# matches this session's own established convention (MOTION_DETECTION_
+# ENABLED/AI_PERSON_DETECTION_ENABLED). Even when this master flag is
+# on, a given camera only actually runs People Counting if BOTH (a) the
+# cloud has set cameras.people_counting_enabled=1 for it (read via
+# recording_uploader._camera_identity(), reused rather than duplicated
+# -- appliance_cloud.py, cloud lineage, is the source of truth) AND
+# (b) a real, enabled line_crossing rule exists for that camera in
+# ANALYTICS_RULES_FILE (reused, not a second config system -- see
+# people_counting.py's own module docstring). A faster-than-default
+# polling interval is used deliberately, ONLY for entitled+configured
+# cameras, to make frame-to-frame tracking reliable -- the ordinary
+# 5s AI_DETECTION_INTERVAL_SECONDS is too coarse for a person to be
+# reliably tracked across a line at normal walking speed.
+PEOPLE_COUNTING_ENABLED = os.environ.get("PEOPLE_COUNTING_ENABLED", "false").lower() == "true"
+PEOPLE_COUNTING_INTERVAL_SECONDS = max(0.5, float(os.environ.get("PEOPLE_COUNTING_INTERVAL_SECONDS", "1.5")))
+PEOPLE_COUNTING_STATE_FILE = RECORDINGS_FOLDER / "people_counting_state.json"
+
+# TEMPORARY, walk-test diagnostics only -- intentionally hardcoded, not
+# an env var, so it can't accidentally be left on for every camera in
+# a real deployment. 0 (or any camera number never actually entitled)
+# disables the extra [PeopleCountingDebug] log lines entirely. Remove
+# this constant and its use in people_counting_worker() once real-world
+# walk-test debugging is done -- it is not meant to be a permanent
+# feature of this worker.
+PEOPLE_COUNTING_DEBUG_CAMERA = int(os.environ.get("PEOPLE_COUNTING_DEBUG_CAMERA", "1"))
+
 
 
 
@@ -34914,6 +34941,22 @@ async def store_motion_event(
 
 
     print(f"Motion detected on Camera {camera_number} (confidence {event.confidence:.1f}%).")
+    classification = smart_motion.classify_motion(camera_number)
+    if classification:
+        smart_event = AnalyticsEventModel(
+            camera=camera_number,
+            site="home",
+            rule_name=f"Smart Motion ({classification})",
+            event_type="smart_motion",
+            timestamp=start_time,
+            confidence=event.confidence,
+            thumbnail=thumbnail,
+            linked_recording=event.linked_recording,
+            mock=False,
+        ).model_dump(mode="json")
+        smart_event["triggered_by"] = classification
+        smart_event["motion_event_id"] = event.id
+        await asyncio.to_thread(append_analytics_event, smart_event)
 
 
 
@@ -37568,14 +37611,91 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         append_analytics_event(event)
-
-
-
-
-
-
-
-
+        smart_motion.record_object_detection(camera_number, class_name)
+        if class_name == "person" and ppe.is_camera_enabled(camera_number):
+            for person_detection in class_detections:
+                try:
+                    hx, hy, hw, hh = (
+                        person_detection["x"],
+                        person_detection["y"],
+                        person_detection["width"],
+                        person_detection["height"],
+                    )
+                    person_crop = frame[hy : hy + hh, hx : hx + hw]
+                    ppe_result = ppe.detect_ppe(person_crop, camera_number=camera_number)
+                except Exception as error:
+                    ppe_result = None
+                    print(f"Camera {camera_number} PPE skipped (non-fatal): {error}")
+                if not ppe_result:
+                    continue
+                ppe_event = AnalyticsEventModel(
+                    id=uuid.uuid4().hex[:12],
+                    camera=camera_number,
+                    site="home",
+                    rule_name=(
+                        "PPE compliant"
+                        if ppe_result["hard_hat_present"] and ppe_result["safety_vest_present"]
+                        else "PPE violation"
+                    ),
+                    event_type="ppe",
+                    timestamp=now,
+                    confidence=ppe_result["confidence"],
+                    thumbnail=thumbnail_url,
+                    linked_recording=linked_recording,
+                    mock=False,
+                ).model_dump(mode="json")
+                ppe_event["hard_hat_present"] = ppe_result["hard_hat_present"]
+                ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
+                append_analytics_event(ppe_event)
+                saved_events.append(ppe_event)
+        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number):
+            for vehicle_detection in class_detections:
+                try:
+                    vx, vy, vw, vh = (
+                        vehicle_detection["x"],
+                        vehicle_detection["y"],
+                        vehicle_detection["width"],
+                        vehicle_detection["height"],
+                    )
+                    vehicle_crop = frame[vy : vy + vh, vx : vx + vw]
+                    plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
+                except Exception as error:
+                    plate_result = None
+                    print(f"Camera {camera_number} LPR skipped (non-fatal): {error}")
+                if not plate_result:
+                    continue
+                plate_crop_url = None
+                try:
+                    px, py, pw, ph = plate_result["region"]
+                    plate_crop_image = vehicle_crop[py : py + ph, px : px + pw]
+                    plate_filename = (
+                        f"camera{camera_number}_{now.strftime('%H-%M-%S')}_"
+                        f"plate_{uuid.uuid4().hex[:12]}.jpg"
+                    )
+                    plate_output_path = day_folder / plate_filename
+                    if cv2.imwrite(str(plate_output_path), plate_crop_image):
+                        plate_crop_url = (
+                            f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
+                            f"{quote(plate_filename)}"
+                        )
+                except Exception as error:
+                    print(f"Camera {camera_number} LPR plate-crop save skipped (non-fatal): {error}")
+                plate_event = AnalyticsEventModel(
+                    id=uuid.uuid4().hex[:12],
+                    camera=camera_number,
+                    site="home",
+                    rule_name=f"LPR ({class_name})",
+                    event_type="plate",
+                    timestamp=now,
+                    confidence=round(plate_result["confidence"] / 100, 4),
+                    plate_number=plate_result["plate_number"],
+                    plate_crop=plate_crop_url,
+                    thumbnail=thumbnail_url,
+                    linked_recording=linked_recording,
+                    mock=False,
+                ).model_dump(mode="json")
+                append_analytics_event(plate_event)
+                saved_events.append(plate_event)
         saved_events.append(event)
 
 
@@ -37619,6 +37739,237 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
+
+
+def _load_people_counting_rule(camera_number: int) -> dict | None:
+    """Reuses the EXISTING line_crossing rule-builder/storage (analytics_
+    rules.json) rather than a second, incompatible configuration system,
+    per explicit instruction. Returns the first enabled line_crossing
+    rule for this camera, or None if none exists -- an entitled camera
+    with no configured line simply doesn't run People Counting yet
+    (fail-safe: no crash, no guess at where a line should go)."""
+    rules = load_json_list(ANALYTICS_RULES_FILE)
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("analytic_type") == "line_crossing" and rule.get("camera") == camera_number and rule.get("enabled", True):
+            return rule
+    return None
+
+
+def _people_counting_state_load_all() -> dict:
+    """Fail-safe load: a missing or corrupt state file is treated
+    identically to 'no prior state' (every counter starts fresh at
+    0/0) rather than crashing the worker -- matches this session's
+    established fail-safe convention for every other piece of
+    persisted appliance state."""
+    if not PEOPLE_COUNTING_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(PEOPLE_COUNTING_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _people_counting_state_save(camera_number: int, counter: "people_counting.PeopleCounter") -> None:
+    """Read-modify-write of the shared state file. Known, disclosed
+    limitation for a future multi-camera phase: this isn't cross-thread
+    locked, so two cameras saving state in the same instant could race
+    -- acceptable for this narrow, single-camera validation phase (only
+    one camera's worker is ever actually entitled+configured right now)
+    and flagged explicitly in the report rather than silently accepted."""
+    all_state = _people_counting_state_load_all()
+    saved = counter.state()
+    all_state[str(camera_number)] = {"in_count": saved.in_count, "out_count": saved.out_count, "frame_index": saved.frame_index}
+    PEOPLE_COUNTING_STATE_FILE.write_text(json.dumps(all_state))
+
+
+async def people_counting_worker(camera_number: int) -> None:
+    """One task per camera, spawned only when PEOPLE_COUNTING_ENABLED
+    (the appliance-wide master switch) is on -- mirrors motion_detector/
+    ai_person_detector's own existing startup pattern exactly. Within
+    that, this specific camera only does anything once BOTH the cloud
+    entitlement flag (cameras.people_counting_enabled, read live via
+    recording_uploader._camera_identity() -- reused, not duplicated)
+    AND a configured line_crossing rule are present; otherwise it idles
+    harmlessly, re-checking every cycle so a live entitlement/rule
+    change takes effect without an appliance restart.
+
+    Reuses detect_objects_frame() -- the EXACT SAME YOLO call
+    ai_person_detector() already makes -- for detections; no new model,
+    no separate inference path. Only the polling cadence differs
+    (PEOPLE_COUNTING_INTERVAL_SECONDS, faster than the ordinary
+    AI_DETECTION_INTERVAL_SECONDS) for cameras actually running this
+    feature, since reliable line-crossing tracking needs closer-spaced
+    samples than plain presence detection does.
+
+    Crossing events are appended via append_analytics_event() -- the
+    same function save_yolo_events() already uses -- so they
+    automatically flow through the existing, already-validated
+    analytics_sync.py background sync to AWS with zero new sync code."""
+    counter: "people_counting.PeopleCounter | None" = None
+    configured_line_key = None
+    debug = camera_number == PEOPLE_COUNTING_DEBUG_CAMERA  # TEMPORARY, walk-test diagnostics only -- see PEOPLE_COUNTING_DEBUG_CAMERA's own comment
+    # TEMPORARY reconstruction-diagnostic state, Camera-1-debug-only (see below) --
+    # exists solely to answer "why was the counter rebuilt" and is not otherwise
+    # used for counting logic. worker_session_id changes only if this whole
+    # coroutine is re-entered (a real worker/process/container restart), so
+    # comparing it across log lines distinguishes "this is a genuinely new
+    # worker invocation" from "the same worker rebuilt its counter mid-session".
+    worker_session_id = uuid.uuid4().hex[:8] if debug else None
+    ever_constructed = False
+    last_entitled = None
+    last_rule_id = None
+    if debug:
+        print(f"[PeopleCountingDebug][cam{camera_number}] worker_task_started session={worker_session_id}")
+    while True:
+        try:
+            identity = recording_uploader._camera_identity(camera_number)
+            entitled = bool(identity and identity.get("people_counting_enabled"))
+            rule = _load_people_counting_rule(camera_number) if entitled else None
+            rule_id = rule.get("id") if rule else None
+            config_refresh_at = recording_uploader.recording_upload_state.get("last_config_refresh_at") if debug else None
+
+            if debug:
+                if last_entitled is not None and entitled != last_entitled:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] entitlement_changed session={worker_session_id} {last_entitled} -> {entitled} identity={identity} last_config_refresh_at={config_refresh_at}")
+                if last_rule_id is not None and rule_id != last_rule_id:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] rule_id_changed session={worker_session_id} {last_rule_id} -> {rule_id}")
+                print(f"[PeopleCountingDebug][cam{camera_number}] cycle_start session={worker_session_id} entitled={entitled} rule_loaded={rule is not None} rule_id={rule_id} last_config_refresh_at={config_refresh_at}")
+            last_entitled = entitled
+            last_rule_id = rule_id
+
+            if entitled and rule and len(rule.get("geometry", [])) >= 2:
+                line = people_counting.CountingLine.from_rule_geometry(rule["geometry"], rule.get("direction", "both"))
+                line_key = (tuple((p.get("x"), p.get("y")) for p in rule["geometry"][:2]), rule.get("direction", "both"))
+                if counter is None or line_key != configured_line_key:
+                    # Exact reason code, per explicit instruction: distinguish a
+                    # genuine first-ever construction from "was cleared by a
+                    # de-entitlement/rule-loss cycle and is now being rebuilt"
+                    # from "entitled and rule-having the whole time, but the
+                    # rule's own geometry/direction/id changed under us".
+                    if not ever_constructed:
+                        reconstruction_reason = "first_startup"
+                    elif counter is None:
+                        reconstruction_reason = "counter_cleared_then_reentitled_or_rule_restored"
+                    else:
+                        reconstruction_reason = "line_key_changed"
+                    if debug:
+                        state_file_exists = PEOPLE_COUNTING_STATE_FILE.exists()
+                        state_file_raw = None
+                        state_file_read_error = None
+                        if state_file_exists:
+                            try:
+                                state_file_raw = PEOPLE_COUNTING_STATE_FILE.read_text()
+                            except OSError as read_error:
+                                state_file_read_error = f"{type(read_error).__name__}:{read_error}"
+                        print(
+                            f"[PeopleCountingDebug][cam{camera_number}] reconstruction_triggered session={worker_session_id} "
+                            f"reason={reconstruction_reason} previous_line_key={configured_line_key} new_line_key={line_key} "
+                            f"rule_id={rule_id} state_file_path={PEOPLE_COUNTING_STATE_FILE} state_file_exists={state_file_exists} "
+                            f"state_file_raw_len={len(state_file_raw) if state_file_raw is not None else None} "
+                            f"state_file_read_error={state_file_read_error} last_config_refresh_at={config_refresh_at}"
+                        )
+                    counter = people_counting.PeopleCounter(line)
+                    ever_constructed = True
+                    saved_all = _people_counting_state_load_all()
+                    saved = saved_all.get(str(camera_number))
+                    if saved:
+                        counter.restore(people_counting.CounterState(**saved))
+                    configured_line_key = line_key
+                    if debug:
+                        print(
+                            f"[PeopleCountingDebug][cam{camera_number}] line_loaded session={worker_session_id} "
+                            f"x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction} "
+                            f"restored_from_state={saved is not None} state_file_keys_present={list(saved_all.keys())} "
+                            f"reason={reconstruction_reason}"
+                        )
+                if debug:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] line_in_use x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction}")
+
+                result = await asyncio.to_thread(detect_objects_frame, camera_number)
+                if debug:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] detect_objects_frame ok={result.get('ok')} error={result.get('error')} raw_detections={len(result.get('detections', []))}")
+                if result.get("ok"):
+                    frame = result.get("frame")
+                    centroids = []
+                    if frame is not None:
+                        frame_height, frame_width = frame.shape[0], frame.shape[1]
+                        for detection in result.get("detections", []):
+                            if detection.get("class_name") != "person":
+                                continue
+                            cx = (detection["x"] + detection["width"] / 2) / frame_width
+                            cy = (detection["y"] + detection["height"] / 2) / frame_height
+                            norm_w = detection["width"] / frame_width
+                            norm_h = detection["height"] / frame_height
+                            # foot_x/foot_y: bottom-center of the box (a
+                            # person's ground-contact point), used ONLY
+                            # by people_counting.py's crossing decision,
+                            # not for matching -- see that module's
+                            # update() docstring for why this is the
+                            # physically correct point for a ground-
+                            # plane doorway/walkway line.
+                            foot_x = cx
+                            foot_y = (detection["y"] + detection["height"]) / frame_height
+                            centroids.append({"x": cx, "y": cy, "w": norm_w, "h": norm_h, "foot_x": foot_x, "foot_y": foot_y})
+                    if debug:
+                        print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f},foot_x={c['foot_x']:.4f},foot_y={c['foot_y']:.4f})" for c in centroids))
+                    if debug:
+                        events, debug_entries = counter.update(centroids, debug=True)
+                        for entry in debug_entries:
+                            print(
+                                f"[PeopleCountingDebug][cam{camera_number}] track={entry['track_id']} status={entry['track_status']} "
+                                f"prev_side={entry['prev_side']} new_side={entry['new_side']} crossed={entry['crossed']} "
+                                f"reason={entry['crossing_reason']} raw_cross={entry['raw_cross_value']} "
+                                f"crossing_point={entry.get('crossing_point')} foot_x={entry.get('foot_x')} foot_y={entry.get('foot_y')}"
+                            )
+                        print(f"[PeopleCountingDebug][cam{camera_number}] totals in={counter.in_count} out={counter.out_count} occupancy={counter.occupancy}")
+                    else:
+                        events = counter.update(centroids)
+                    if events:
+                        now = datetime.now()
+                        for event in events:
+                            record = AnalyticsEventModel(
+                                camera=camera_number,
+                                site="home",
+                                rule_name=f"People Counting ({rule.get('name', 'counting line')})",
+                                event_type=f"people_counting_{event.direction}",
+                                direction=event.direction,
+                                confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
+                                thumbnail=None,
+                                linked_recording=linked_recording_for(camera_number, now),
+                                mock=False,
+                            ).model_dump(mode="json")
+                            record["occupancy"] = counter.occupancy
+                            record["in_count"] = counter.in_count
+                            record["out_count"] = counter.out_count
+                            append_analytics_event(record)
+                        await asyncio.to_thread(_people_counting_state_save, camera_number, counter)
+            else:
+                # Not (or no longer) entitled+configured -- drop any
+                # in-progress counter/tracks. Cumulative counts already
+                # saved to PEOPLE_COUNTING_STATE_FILE are untouched and
+                # will be restored if this camera becomes entitled again.
+                if debug and counter is not None:
+                    geometry_len = len(rule.get("geometry", [])) if rule else 0
+                    print(
+                        f"[PeopleCountingDebug][cam{camera_number}] counter_cleared session={worker_session_id} "
+                        f"entitled={entitled} rule_loaded={rule is not None} geometry_len={geometry_len} "
+                        f"prior_line_key={configured_line_key}"
+                    )
+                counter = None
+                configured_line_key = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if debug:
+                print(
+                    f"[PeopleCountingDebug][cam{camera_number}] exception_recovery session={worker_session_id} "
+                    f"counter_alive={counter is not None} configured_line_key={configured_line_key} "
+                    f"error_type={type(error).__name__} error={error}"
+                )
+            print(f"Camera {camera_number} People Counting worker error: {error}")
+        await asyncio.sleep(PEOPLE_COUNTING_INTERVAL_SECONDS)
 
 
 async def ai_person_detector(camera_number: int) -> None:
@@ -38851,6 +39202,11 @@ import live_relay_idle_sweep
 import live_relay_uploader
 import recording_uploader
 import recording_retention_sweep
+import analytics_sync
+import lpr
+import ppe
+import smart_motion
+import people_counting
 
 
 @asynccontextmanager
@@ -39061,32 +39417,21 @@ async def lifespan(app: FastAPI):
 
 
             ai_tasks = [
-
-
-
-
-
-
-
-
                 asyncio.create_task(ai_person_detector(camera_number))
-
-
-
-
-
-
-
-
                 for camera_number in get_camera_numbers()
+            ]
 
-
-
-
-
-
-
-
+        if PEOPLE_COUNTING_ENABLED:
+            # One task spawned per camera, exactly like ai_tasks above --
+            # each task idles harmlessly unless ITS OWN camera is both
+            # cloud-entitled and has a configured counting line (see
+            # people_counting_worker()'s own docstring). This master
+            # flag stays a separate, appliance-wide safety gate on top
+            # of the per-camera entitlement -- both must be true for
+            # anything to actually run.
+            people_counting_tasks = [
+                asyncio.create_task(people_counting_worker(camera_number))
+                for camera_number in get_camera_numbers()
             ]
 
 
@@ -39196,6 +39541,11 @@ async def lifespan(app: FastAPI):
     recording_retention_sweep_task = (
         asyncio.create_task(recording_retention_sweep.recording_retention_sweep_worker())
         if RUNTIME_ROLE in {"cloud", "combined"} and recording_retention_sweep.RETENTION_SWEEP_ENABLED
+        else None
+    )
+    analytics_sync_task = (
+        asyncio.create_task(analytics_sync.analytics_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and analytics_sync.ANALYTICS_SYNC_ENABLED
         else None
     )
 

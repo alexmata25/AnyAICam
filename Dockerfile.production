@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WEB_CONCURRENCY=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg curl ca-certificates \
+    ffmpeg curl ca-certificates tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
