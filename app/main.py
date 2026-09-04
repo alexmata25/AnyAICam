@@ -140391,6 +140391,34 @@ def customer_camera_events(camera_id: str, request: Request, date: str | None = 
     return {"events": _customer_camera_events(camera_id, date)}
 
 
+# P0 #5 (2026-09-04): how many of the most-recent events the Events/
+# Playback page's own media-readiness poll ever needs to reconcile
+# against -- comfortably above what a single screen ever renders, kept
+# small on purpose since this is fetched every few seconds while any
+# row is still processing.
+RECENT_EVENTS_POLL_LIMIT = 30
+
+
+@app.get("/api/customer/events/recent")
+def customer_events_recent(request: Request) -> dict:
+    """Polling endpoint backing the Events/Playback page's own
+    Processing... -> ready reconciliation (P0 #5). Deliberately reuses
+    _customer_detection_events() as-is rather than adding a new
+    per-event lookup: that function is already fully self-scoping from
+    the caller's own session identity (customer_owner sees their whole
+    fleet, customer_viewer only cameras they hold can_playback on) --
+    there is no camera_id/event_id parameter here for an attacker to
+    ever mismatch against a different customer's data, which a
+    per-event "GET .../{camera_id}/{event_id}/media-status" endpoint
+    would have needed to defend against explicitly. No new query: this
+    is the exact same list the page already renders once at load,
+    truncated to RECENT_EVENTS_POLL_LIMIT before being returned."""
+    events = _customer_detection_events(request)
+    if events is None:
+        raise HTTPException(status_code=403, detail="Customer portal sign-in required.")
+    return {"events": events[:RECENT_EVENTS_POLL_LIMIT]}
+
+
 def _customer_camera_recordings(camera_id: str) -> list[dict]:
     """Recorded clips available for one customer camera (by cameras.id),
     each shaped {"start", "end", "url", "name"} -- the exact shape the
@@ -141049,6 +141077,63 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
   const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
+  // P0 #5 (2026-09-04): Processing... -> ready reconciliation for the
+  // mobile Events cards. A fresh event's own clip/thumbnail can now
+  // take single-digit-to-low-double-digit seconds to arrive (was
+  // ~33min before the Samsung stream-copy fix) -- this window narrows
+  // "no thumbnail" down to "no thumbnail, but still plausibly being
+  // processed" so only that case shows Processing... instead of the
+  // same "No clip available" a genuinely clipless event (most
+  // detection types, by design) correctly shows immediately.
+  const MOBILE_EVENT_PENDING_WINDOW_MS=120000;
+  const MOBILE_EVENT_POLL_INTERVAL_MS=4000;
+  const MOBILE_EVENT_POLL_MAX_ATTEMPTS=15; // ~60s ceiling, then settle on whatever's known
+  let mobileEventPollTimer=null;
+  let mobileEventPollAttempts=0;
+
+  function isMobileEventPending(event){{
+    if(event.has_event_clip)return false;
+    const ageMs=Date.now()-playbackDate(event.timestamp).getTime();
+    return ageMs>=0&&ageMs<MOBILE_EVENT_PENDING_WINDOW_MS;
+  }}
+
+  // Deliberately polls /api/customer/events/recent -- the same
+  // customer-scoped, self-authorizing list the page already rendered
+  // once at load -- rather than a per-event endpoint keyed on an id
+  // that may not exist yet for a just-created row. Re-invokes
+  // renderMobileRecentEvents() itself on the merged result instead of
+  // hand-patching DOM nodes: that keeps this reconciliation exactly as
+  // correct as the render path it reuses, and merging fresh rows into
+  // existing ones by id (never appending) is what makes a duplicate
+  // row structurally impossible here.
+  function scheduleMobileEventPoll(cameraId,clips,events){{
+    const stillPending=events.some(isMobileEventPending);
+    if(!stillPending||mobileEventPollAttempts>=MOBILE_EVENT_POLL_MAX_ATTEMPTS){{
+      mobileEventPollTimer=null;
+      mobileEventPollAttempts=0;
+      return;
+    }}
+    if(mobileEventPollTimer)return;
+    mobileEventPollTimer=setTimeout(async()=>{{
+      mobileEventPollTimer=null;
+      mobileEventPollAttempts++;
+      try{{
+        const response=await fetch('/api/customer/events/recent',{{cache:'no-store'}});
+        if(!response.ok)return;
+        const payload=await response.json();
+        const freshEvents=payload.events||[];
+        const byId=new Map();
+        events.forEach(existing=>{{if(existing.id)byId.set(existing.id,existing);}});
+        freshEvents.forEach(fresh=>{{if(fresh.id)byId.set(fresh.id,fresh);}});
+        renderMobileRecentEvents(cameraId,clips,Array.from(byId.values()));
+      }}catch(error){{
+        // Network hiccup -- the next scheduled poll (if anything is
+        // still pending) tries again; nothing to surface to the user
+        // for a transient failure here.
+      }}
+    }},MOBILE_EVENT_POLL_INTERVAL_MS);
+  }}
+
   function renderMobileRecentEvents(cameraId,clips,events){{
     const mobileList=document.getElementById('mobile-recent-events-list');
     if(!mobileList)return;
@@ -141112,9 +141197,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       const timeLabel=playbackDate(event.timestamp).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
       const badge=`<span class="mobile-media-badge" style="background:${{category?EVENT_COLORS[category]:'#6b7785'}}">${{label}}</span>`;
       const menu=playable?'<span class="mobile-media-menu" aria-hidden="true">⋮</span>':'';
+      // P0 #5 (2026-09-04): a genuinely fresh event (Samsung's own
+      // event->media pipeline now takes single-digit-to-low-double-
+      // digit seconds, not the ~33min it used to) can render here
+      // before its clip/thumbnail exists yet -- previously
+      // indistinguishable from an event that will NEVER get one (most
+      // detection types, by design). isMobileEventPending() below
+      // narrows "no thumbnail" to "no thumbnail AND still within the
+      // window this pipeline could plausibly still be working on it",
+      // so only that case gets the Processing state; a genuinely old
+      // clipless event still renders exactly as before.
+      const pending=!event.thumbnail&&isMobileEventPending(event);
       const media=event.thumbnail
         ? `<img class="mobile-media-thumb" src="${{event.thumbnail}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
-        : `<div class="mobile-media-fallback">${{label}} · No clip available</div>`;
+        : pending
+          ? `<div class="mobile-media-fallback mobile-media-fallback--pending">${{label}} · Processing…</div>`
+          : `<div class="mobile-media-fallback">${{label}} · No clip available</div>`;
 
       return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
         ${{media}}
@@ -141131,6 +141229,17 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       const row=mobileList.querySelectorAll('[data-mobile-clip]')[index];
       if(row)row.addEventListener('click',()=>playClip(cameraId,clip));
     }});
+
+    // P0 #5: keep polling the existing, self-authorizing recent-events
+    // API (never a per-event endpoint keyed on an id that may not
+    // exist yet -- see isMobileEventPending()'s own docstring) and
+    // re-run this exact same render function on fresh data for as
+    // long as anything visible is still pending. Re-rendering through
+    // the one already-correct code path above -- rather than hand-
+    // patching individual DOM nodes -- is what guarantees this can
+    // never produce a duplicate row: mobileList.innerHTML is always
+    // fully rebuilt from a deduplicated-by-id merge, never appended to.
+    scheduleMobileEventPoll(cameraId,clips,recentEvents);
 
     mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
       // Analytics-only detections remain visible as event details but
