@@ -498,6 +498,37 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 existing=db.execute('SELECT id FROM detection_events WHERE camera_id=? AND local_event_id=?',(camera_id,local_event_id)).fetchone()
                 if existing: return {'status':'duplicate','event_id':existing['id']}
                 raise HTTPException(status_code=500,detail='Could not record this event.')
+        # 2026-09-04, Smart Alerts fix: this is the currently-active
+        # event-ingestion path (the older POST /api/appliance/events ->
+        # appliance_events route also calls fanout_appliance_event(),
+        # but stopped being called by any real appliance in late August
+        # -- see the session notes for the full root-cause trace) --
+        # notifications had gone to zero because nothing in this route
+        # ever told the existing, unmodified notification engine a new
+        # event had arrived. Reuses that same fanout_appliance_event()
+        # exactly as the old route already did -- no second notification
+        # system, no change to detection_events/Events/Playback/
+        # analytics-sync/event-media behavior above. Only ever reached
+        # on a genuine fresh insert (the duplicate-replay branch above
+        # returns early), so a replayed/retried event can never fan out
+        # twice. fanout_appliance_event() itself already no-ops for any
+        # event_type outside its own SUPPORTED set -- not re-checked
+        # here, to avoid a second, potentially-drifting copy of that
+        # list. customer_id/site_id come from the camera's own
+        # authoritative row (camera['customer_id']/camera['site_id']),
+        # the same source detection_events itself was just stored
+        # under above, not the raw appliance object -- matching this
+        # function's own established "camera's own authoritative site,
+        # never anything else" convention. Never allowed to fail the
+        # actual, already-successful ingestion response below: a
+        # notification-side error is logged and swallowed, not raised.
+        try:
+            fanout_appliance_event(
+                {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
+                {'id': event_id, 'camera_id': camera_id, 'event_type': event_type, 'timestamp': event_timestamp},
+            )
+        except Exception:
+            logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
         return {'status':'accepted','event_id':event_id}
 
     @app.post('/api/appliance/analytics/{camera_id}/events/{local_event_id}/media')
