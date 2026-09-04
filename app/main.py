@@ -1922,7 +1922,7 @@ def legacy_camera_numbers_in_use() -> list[int]:
     ]
 
 
-def get_camera_numbers() -> list[int]:
+def get_camera_numbers(customer_id: str | None = None) -> list[int]:
     """The real, currently-provisioned set of camera_number slots this
     appliance's FFmpeg/HLS/recording/analytics pipeline should run --
     sourced from the same multi-tenant `cameras` table Wizard A/B
@@ -1932,6 +1932,26 @@ def get_camera_numbers() -> list[int]:
     appliance_id/customer_id scoping is needed here; see the Phase 3
     report for this documented limitation in a future multi-appliance
     "combined" deployment.
+
+    2026-09-04: customer_id is a new, optional, additive parameter --
+    every existing edge-role caller (none of which have a customer_id
+    to pass) is completely unaffected, since omitting it reproduces
+    today's exact unscoped query. It exists for the cloud role, where
+    the assumption in the paragraph above is false: EC2's `cameras`
+    table is genuinely multi-tenant, one shared database across every
+    customer, not "exactly one customer's rows". Confirmed live: two
+    unrelated customers each provisioned camera_number 1-5, and the
+    unscoped query summed both -- "10 cameras configured, license
+    permits 5" -- one customer's license being enforced against a
+    total that included a second customer's own, entirely separate
+    cameras. When customer_id is given, it's scoped with AND customer_
+    id=? and the legacy-env-var fallback below is skipped even on a
+    genuine zero-cameras result: that fallback exists for a brand-new
+    *edge* install with nothing provisioned yet, and has no meaning
+    for "this one cloud customer happens to have zero cameras" --
+    falling back to CAMERA<n>_HOST/USERNAME/PASSWORD env-var slots
+    there would just resurrect the same kind of phantom-camera bug
+    this function's own fallback logic was already written to avoid.
 
     Falls back to the legacy CAMERA<n>_HOST/USERNAME/PASSWORD env-var
     slots ONLY when at least one is genuinely configured (see
@@ -1949,17 +1969,25 @@ def get_camera_numbers() -> list[int]:
     try:
         from partner_db import connection
         with connection() as db:
-            assigned = db.execute(
-                "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
-            ).fetchall()
+            if customer_id is not None:
+                assigned = db.execute(
+                    "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL AND customer_id=? ORDER BY camera_number",
+                    (customer_id,),
+                ).fetchall()
+            else:
+                assigned = db.execute(
+                    "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
+                ).fetchall()
     except Exception:
         assigned = []
     numbers = [int(item["camera_number"]) for item in assigned]
-    return numbers if numbers else legacy_camera_numbers_in_use()
+    if numbers or customer_id is not None:
+        return numbers
+    return legacy_camera_numbers_in_use()
 
 
-def get_camera_count() -> int:
-    return len(get_camera_numbers())
+def get_camera_count(customer_id: str | None = None) -> int:
+    return len(get_camera_numbers(customer_id=customer_id))
 
 
 def get_supervisor_slot_count() -> int:
@@ -22985,7 +23013,11 @@ def customer_cloud_usage_snapshot(user: dict) -> dict:
 
 
 
-        "configured_cameras": get_camera_count(),
+        # 2026-09-04: scoped to this customer -- see get_camera_numbers()'s
+        # own comment for the cross-tenant-leak this closes. user.get(
+        # "customer_id") is None for any caller that doesn't have one
+        # (unaffected, matches today's behavior exactly).
+        "configured_cameras": get_camera_count(customer_id=user.get("customer_id")),
 
 
 
@@ -24038,7 +24070,12 @@ def feature_entitlement(feature: str, snapshot: dict | None = None) -> dict:
 
 
 
-def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
+def license_enforcement_snapshot(camera_count: int | None = None, customer_id: str | None = None) -> dict:
+    # 2026-09-04: customer_id is new and optional -- only used to scope
+    # the get_camera_count() fallback below when the caller doesn't
+    # already provide an explicit camera_count of its own. See get_
+    # camera_numbers()'s own comment for the full cross-tenant-leak
+    # root cause this closes.
 
 
 
@@ -24056,7 +24093,7 @@ def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
 
 
 
-    current_camera_count = get_camera_count() if camera_count is None else max(0, int(camera_count))
+    current_camera_count = get_camera_count(customer_id=customer_id) if camera_count is None else max(0, int(camera_count))
 
 
 
@@ -24866,7 +24903,12 @@ def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
 
 
 
-def license_warning_banner() -> str:
+def license_warning_banner(customer_id: str | None = None) -> str:
+    # 2026-09-04: customer_id is new/optional -- see get_camera_numbers()'s
+    # own comment. page_shell() (this function's only caller) now passes
+    # the current page's already-resolved identity's customer_id, so the
+    # banner shown on every customer-facing page (including /alerts) is
+    # scoped to that customer's own cameras, not every tenant's combined.
 
 
 
@@ -24893,7 +24935,7 @@ def license_warning_banner() -> str:
 
 
 
-    snapshot = license_enforcement_snapshot()
+    snapshot = license_enforcement_snapshot(customer_id=customer_id)
 
 
 
@@ -47595,7 +47637,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-    content = license_warning_banner() + content
+    content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
 
 
 

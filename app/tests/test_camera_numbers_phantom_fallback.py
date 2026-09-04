@@ -180,7 +180,12 @@ def test_real_dynamic_cameras_take_precedence_over_stray_legacy_env_vars(tmp_pat
 
 
 def test_readiness_reports_zero_cameras_total_for_a_fresh_appliance(monkeypatch):
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [])
+    # customer_id=None keyword accepted (not just the no-arg call these
+    # monkeypatches used to allow) -- get_camera_count() now always
+    # passes customer_id=... through explicitly, even when it's None,
+    # since 2026-09-04's tenant-scoping fix (see get_camera_numbers()'s
+    # own docstring in main.py).
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [])
     snapshot = main.readiness_snapshot()
     assert snapshot["cameras_total"] == 0
 
@@ -192,7 +197,7 @@ def test_readiness_reports_the_real_count_for_dynamic_cameras(monkeypatch):
     # time and only sized past that floor by the real (import-time)
     # camera count, an unrelated, pre-existing characteristic of the
     # process-supervisor plumbing this task doesn't touch.
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [1, 2])
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2])
     snapshot = main.readiness_snapshot()
     assert snapshot["cameras_total"] == 2
 
@@ -209,7 +214,12 @@ def test_investigate_legacy_branch_shows_no_fake_cameras_when_none_are_configure
 
     monkeypatch.setattr(partner_portal, "partner_identity", lambda request: None)
     monkeypatch.setattr(main, "current_user", lambda request: _administrator())
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [])
+    # customer_id=None keyword accepted (not just the no-arg call these
+    # monkeypatches used to allow) -- get_camera_count() now always
+    # passes customer_id=... through explicitly, even when it's None,
+    # since 2026-09-04's tenant-scoping fix (see get_camera_numbers()'s
+    # own docstring in main.py).
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [])
     result = main.investigation_page(object())
     for camera_number in range(1, main.LEGACY_DEFAULT_CAMERA_COUNT + 1):
         assert f'value="{camera_number}">Camera {camera_number}</option>' not in result
@@ -217,7 +227,12 @@ def test_investigate_legacy_branch_shows_no_fake_cameras_when_none_are_configure
 
 def test_analytics_shows_no_fake_cameras_when_none_are_configured(monkeypatch):
     monkeypatch.setattr(main, "current_user", lambda request: _administrator())
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [])
+    # customer_id=None keyword accepted (not just the no-arg call these
+    # monkeypatches used to allow) -- get_camera_count() now always
+    # passes customer_id=... through explicitly, even when it's None,
+    # since 2026-09-04's tenant-scoping fix (see get_camera_numbers()'s
+    # own docstring in main.py).
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [])
     result = main.analytics(object())
     for camera_number in range(1, main.LEGACY_DEFAULT_CAMERA_COUNT + 1):
         assert f'value="{camera_number}">Camera {camera_number}</option>' not in result
@@ -225,7 +240,12 @@ def test_analytics_shows_no_fake_cameras_when_none_are_configured(monkeypatch):
 
 def test_camera_health_shows_a_clear_no_cameras_configured_state(monkeypatch):
     monkeypatch.setattr(main, "current_user", lambda request: _administrator())
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [])
+    # customer_id=None keyword accepted (not just the no-arg call these
+    # monkeypatches used to allow) -- get_camera_count() now always
+    # passes customer_id=... through explicitly, even when it's None,
+    # since 2026-09-04's tenant-scoping fix (see get_camera_numbers()'s
+    # own docstring in main.py).
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [])
     result = main.camera_health_page(object())
     assert "No cameras configured" in result
     for camera_number in range(1, main.LEGACY_DEFAULT_CAMERA_COUNT + 1):
@@ -234,7 +254,7 @@ def test_camera_health_shows_a_clear_no_cameras_configured_state(monkeypatch):
 
 def test_camera_health_still_lists_real_cameras_when_configured(monkeypatch):
     monkeypatch.setattr(main, "current_user", lambda request: _administrator())
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [1, 2])
+    monkeypatch.setattr(main, "get_camera_numbers", lambda customer_id=None: [1, 2])
     result = main.camera_health_page(object())
     assert "No cameras configured" not in result
     assert 'id="camera-health-row-1"' in result
