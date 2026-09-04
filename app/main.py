@@ -139915,21 +139915,39 @@ def _customer_recording_dates(camera_id: str) -> list[str]:
 
 
 def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
-    """Presigns exactly one recording, looked up by its own catalog id
-    and re-scoped to camera_id in the same query -- so a recording_id
-    can never be used to fetch a URL for a different camera's footage,
-    even if the two happen to belong to the same customer. Callers
-    (the /url route below) must already have verified camera_id itself
-    is one this identity is authorized to see."""
+    """Return a playable URL for one authorized catalog recording.
+    Cloud deployments keep using the existing presigned S3 URL.
+    Edge/local appliances fall back to an authenticated local recording
+    route when the exact cataloged MKV still exists on this appliance.
+    """
     from partner_db import connection
     with connection() as db:
         row = db.execute(
-            "SELECT s3_key FROM recordings WHERE id=? AND camera_id=? AND status='available'",
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
             (recording_id, camera_id),
         ).fetchone()
     if not row:
         return None
-    return _presigned_recording_url(row["s3_key"])
+    cloud_url = _presigned_recording_url(row["s3_key"])
+    if cloud_url:
+        return cloud_url
+    camera_number = row["camera_number"]
+    if camera_number is None:
+        return None
+    filename = Path(row["s3_key"]).name
+    if not filename.endswith(".mkv"):
+        return None
+    if filename != Path(filename).name:
+        return None
+    if not filename.startswith(f"camera{camera_number}_"):
+        return None
+    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not local_path.is_file():
+        return None
+    return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
 
 
 def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
