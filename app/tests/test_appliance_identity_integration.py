@@ -227,23 +227,21 @@ def test_multi_role_admin_and_partner_selector_behavior(client, db_path):
 # =============================================================== revocation reconciliation
 
 
-def test_role_removal_no_longer_force_expires_the_session_while_option_a_is_active(client, db_path):
-    # TEMPORARY 2026-09-04 (Option A mitigation): this test used to
-    # assert the opposite -- that a role removal force-expired the
-    # session on the next manifest fetch. reconcile_sessions_against_
-    # manifest() queried user_sessions with NO scoping at all (every
-    # open session platform-wide), so in production this same code path
-    # was force-revoking essentially every unrelated customer's own
-    # cloud session too, not just the one whose role was actually
-    # removed (see test_unrelated_session_is_untouched_by_reconciliation
-    # below -- its "unrelated" session was a GLOBAL admin grant, which
-    # legitimately DOES appear in every appliance's manifest, so it
-    # never actually exercised the real gap; a true ungranted customer
-    # session did, live, in production). The call is disabled for now
-    # (see appliance_cloud.py's heartbeat()/identity_manifest()'s own
-    # comments) until Option B properly scopes it. This test now proves
-    # the mitigation: the session survives. Restore the original
-    # assertion (or a properly-scoped equivalent) once Option B ships.
+def test_role_removal_still_force_expires_the_session_under_option_b(client, db_path):
+    # 2026-09-04, Option B: restores this test's original assertion.
+    # Option A (shipped first, same day, as the immediate mitigation)
+    # had disabled reconcile_sessions_against_manifest() entirely, so
+    # this test briefly asserted the session survived -- see git
+    # history for that version. That was never the intended end state:
+    # a role removal force-expiring the now-stale session is exactly
+    # the security property this whole mechanism exists for. Option B
+    # (appliance_identity._candidate_session_user_ids_for_appliance())
+    # scopes the underlying query correctly instead of disabling it, so
+    # this genuinely-affected session (the grant that gets revoked
+    # below is scoped directly to THIS appliance) is force-expired
+    # again, while test_a_genuinely_unrelated_ungranted_customer_
+    # session_survives_both_endpoints (below) proves an unrelated one
+    # still never is.
     with _db(db_path):
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
@@ -262,7 +260,7 @@ def test_role_removal_no_longer_force_expires_the_session_while_option_a_is_acti
     with _db(db_path):
         with connection() as db:
             session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-1'").fetchone()
-    assert session["revoked_at"] is None
+    assert session["revoked_at"] is not None
 
 
 def _heartbeat_payload(cached_manifest_version=None):
@@ -298,13 +296,12 @@ def test_heartbeat_with_matching_cached_version_does_not_refresh(client, db_path
     assert response.json()["current_manifest_version"] == live_version
 
 
-def test_heartbeat_with_stale_cached_version_no_longer_revokes_while_option_a_is_active(client, db_path):
-    # TEMPORARY 2026-09-04 (Option A mitigation) -- see the equivalent
-    # comment on test_role_removal_no_longer_force_expires_the_session_
-    # while_option_a_is_active() above for the full root-cause context.
-    # manifest_refreshed must still correctly report True here (the
-    # appliance's own staleness signal is untouched by this mitigation
-    # -- only the session-revocation side effect is disabled).
+def test_heartbeat_with_stale_cached_version_still_revokes_under_option_b(client, db_path):
+    # 2026-09-04, Option B: restores this test's original assertion --
+    # see test_role_removal_still_force_expires_the_session_under_
+    # option_b()'s comment above for the full Option A -> Option B
+    # lineage. manifest_refreshed correctly reports True here exactly
+    # as it always has (untouched by either option).
     with _db(db_path):
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
@@ -317,7 +314,7 @@ def test_heartbeat_with_stale_cached_version_no_longer_revokes_while_option_a_is
                 "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 ("sess-hb-1", "u1", "tech@example.com", "technician", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", stale_version),
             )
-            appliance_identity.revoke_grant(db, grant_id=grant_id)  # role removed -- session survives anyway while Option A is active
+            appliance_identity.revoke_grant(db, grant_id=grant_id)  # role removed -- session should not survive the next heartbeat
 
     response = client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=stale_version), headers=_auth_headers("appl-1", "cred-1"))
     assert response.status_code == 200
@@ -326,16 +323,20 @@ def test_heartbeat_with_stale_cached_version_no_longer_revokes_while_option_a_is
     with _db(db_path):
         with connection() as db:
             session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-hb-1'").fetchone()
-    assert session["revoked_at"] is None
+    assert session["revoked_at"] is not None
 
 
-def test_heartbeat_no_longer_creates_sessions_revoked_audit_entries(client, db_path):
+def test_heartbeat_creates_the_audit_entry_only_for_a_genuinely_affected_session(client, db_path):
     # Direct regression guard for the live symptom (47 audit_logs rows
     # of action='appliance.sessions_revoked_on_manifest_refresh',
     # trigger='heartbeat' in under a day of production traffic, every
     # customer_owner session revoked within 8-74s of login) -- proves
-    # the mitigation via the exact signal that was flooding the audit
-    # log, not just via user_sessions.revoked_at.
+    # the fix via the exact signal that was flooding the audit log, not
+    # just via user_sessions.revoked_at. The genuinely-affected session
+    # (role removed, scoped directly to this appliance) DOES still
+    # produce exactly one audit entry -- the intended behavior,
+    # restored -- while a second, unrelated, ungranted customer session
+    # seeded alongside it produces none.
     with _db(db_path):
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
@@ -349,14 +350,25 @@ def test_heartbeat_no_longer_creates_sessions_revoked_audit_entries(client, db_p
                 ("sess-hb-2", "u1", "tech@example.com", "technician", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", stale_version),
             )
             appliance_identity.revoke_grant(db, grant_id=grant_id)
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES('partner-3','Unrelated Partner','approved','real','2026-08-27T00:00:00')")
+            db.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-3','partner-3','Unrelated Customer','cust3@example.test','active','real','2026-08-27T00:00:00')")
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) VALUES('u-cust3','partner-3','other-customer@example.test','Customer Owner','customer_owner',?,1,'cust-3','2026-08-27T00:00:00')", (password_hash("Sup3rSecret!"),))
+            db.execute(
+                "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("sess-unrelated", "u-cust3", "other-customer@example.test", "customer_owner", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", None),
+            )
 
     client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=stale_version), headers=_auth_headers("appl-1", "cred-1"))
     client.get("/api/appliance/AIC-1/identity-manifest", headers=_auth_headers("appl-1", "cred-1"))
 
     with _db(db_path):
         with connection() as db:
-            rows = db.execute("SELECT * FROM audit_logs WHERE action='appliance.sessions_revoked_on_manifest_refresh'").fetchall()
-    assert rows == []
+            rows = db.execute("SELECT details_json FROM audit_logs WHERE action='appliance.sessions_revoked_on_manifest_refresh'").fetchall()
+            affected = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-hb-2'").fetchone()
+            unrelated = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-unrelated'").fetchone()
+    assert len(rows) >= 1, "the genuinely-affected session must still produce a revocation audit entry"
+    assert affected["revoked_at"] is not None
+    assert unrelated["revoked_at"] is None
 
 
 def test_a_genuinely_unrelated_ungranted_customer_session_survives_both_endpoints(client, db_path):
@@ -368,6 +380,9 @@ def test_a_genuinely_unrelated_ungranted_customer_session_survives_both_endpoint
     # cloud customer_owner, ships zero appliance-identity involvement --
     # exactly the shape of every session that was being force-revoked
     # live in production by an unrelated appliance's own heartbeat.
+    # Proves the FIX (Option B's scoping), not just Option A's
+    # disablement -- reconciliation genuinely runs here, it just
+    # correctly never considers this session a candidate at all.
     with _db(db_path):
         with connection() as db:
             _seed_appliance(db, "appl-1", "AIC-1", "cred-1")
@@ -418,3 +433,168 @@ def test_unrelated_session_is_untouched_by_reconciliation(client, db_path):
         with connection() as db:
             session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-still-good'").fetchone()
     assert session["revoked_at"] is None
+
+
+# =============================================================== Option B: session-reconciliation scoping matrix
+#
+# One test per identity_grants.scope_type, proving _candidate_session_
+# user_ids_for_appliance() draws exactly the same line grant_resolves()
+# already draws for manifest membership -- a session is ever even
+# considered by an appliance's reconciliation if and only if its user
+# holds (or held) a grant whose scope actually reaches that appliance.
+
+
+def test_one_appliance_can_never_revoke_a_session_that_belongs_to_a_different_customers_appliance(client, db_path):
+    # The headline property: two REAL, distinct appliances under two
+    # different customers -- not a single appliance plus a totally
+    # ungranted bystander (that's test_a_genuinely_unrelated_ungranted_
+    # customer_session_survives_both_endpoints, above). AIC-2's own
+    # heartbeat/manifest-fetch, reconciling AIC-2's own sessions, must
+    # never touch a session that belongs entirely to AIC-1's customer.
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1", partner_id="partner-1", customer_id="cust-1", site_id="site-1")
+            _seed_appliance(db, "appl-2", "AIC-2", "cred-2", partner_id="partner-2", customer_id="cust-2", site_id="site-2")
+            # customer_owner is the role VALID_ROLE_SCOPES actually allows
+            # at scope_type='customer' (technician is appliance/site only).
+            _seed_operator(db, "u1", "cust1-owner@example.com", "Sup3rSecret!", partner_id="partner-1")
+            appliance_identity.create_grant(db, user_id="u1", role="customer_owner", scope_type="customer", scope_id="cust-1", granted_by="test")
+            manifest1 = appliance_identity.build_manifest(db, cloud_id="AIC-1")
+            live_identity = next(i for i in manifest1["identities"] if i["user_id"] == "u1")
+            db.execute(
+                "INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,authorization_version_at_login) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("sess-cust1-only", "u1", "cust1-owner@example.com", "customer_owner", "Web browser", "cookie", "2026-08-27T00:00:00", "2026-08-27T00:00:00", "2026-08-27T08:00:00", live_identity["authorization_version"]),
+            )
+
+    # AIC-2 -- a different appliance, different customer entirely --
+    # heartbeats and fetches its own manifest repeatedly.
+    for _ in range(3):
+        client.post("/api/appliance/heartbeat", json=_heartbeat_payload(cached_manifest_version=None), headers=_auth_headers("appl-2", "cred-2"))
+        client.get("/api/appliance/AIC-2/identity-manifest", headers=_auth_headers("appl-2", "cred-2"))
+
+    with _db(db_path):
+        with connection() as db:
+            session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-cust1-only'").fetchone()
+    assert session["revoked_at"] is None, "AIC-2's own reconciliation must never revoke a session scoped entirely to a different customer's appliance"
+
+    # And AIC-1 -- the actually-relevant appliance -- still can, proving
+    # this isn't just reconciliation being broken/no-op'd again.
+    with _db(db_path):
+        with connection() as db:
+            grant = db.execute("SELECT id FROM identity_grants WHERE user_id='u1'").fetchone()
+            appliance_identity.revoke_grant(db, grant_id=grant["id"])
+    client.get("/api/appliance/AIC-1/identity-manifest", headers=_auth_headers("appl-1", "cred-1"))
+    with _db(db_path):
+        with connection() as db:
+            session = db.execute("SELECT revoked_at FROM user_sessions WHERE id='sess-cust1-only'").fetchone()
+    assert session["revoked_at"] is not None, "AIC-1, the appliance this session's grant was actually scoped to, must still be able to revoke it"
+
+
+# NOTE on all six tests below: initialize_database() (via the client
+# fixture) always runs partner_db.bootstrap_admin(), which itself
+# create_grant()s a real scope_type='global' identity_grants row for a
+# seeded bootstrap administrator -- so an empty-database candidate set
+# is never actually empty, and a global grant's own test can't use a
+# fixed cloud_id, since the bootstrap admin is already a candidate for
+# literally every one. Every assertion below is written as a before/
+# after delta against that baseline (captured fresh in each test,
+# before creating the grant under test) rather than an exact-set
+# equality, so these tests exercise exactly the one grant they're
+# named for and stay correct regardless of what bootstrap_admin() does.
+
+
+def test_customer_scoped_grant_is_a_candidate_only_for_appliances_under_that_customer(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            _seed_appliance(db, "appl-1", "AIC-1", "cred-1", customer_id="cust-1")
+            _seed_appliance(db, "appl-2", "AIC-2", "cred-2", customer_id="cust-2")
+            appliance_1 = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-1"}
+            appliance_2 = {"partner_id": "partner-1", "customer_id": "cust-2", "site_id": "site-1", "cloud_id": "AIC-2"}
+            baseline_1 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            baseline_2 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_2)
+            # customer_owner/customer_viewer are the only roles VALID_ROLE_
+            # SCOPES allows at scope_type='customer' -- not technician.
+            _seed_operator(db, "u1", "cust1-owner@example.com", "Sup3rSecret!")
+            appliance_identity.create_grant(db, user_id="u1", role="customer_owner", scope_type="customer", scope_id="cust-1", granted_by="test")
+            candidates_for_1 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            candidates_for_2 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_2)
+    assert candidates_for_1 - baseline_1 == {"u1"}
+    assert candidates_for_2 - baseline_2 == set(), "a customer-scoped grant for cust-1 must not make its holder a candidate for a different customer's appliance"
+
+
+def test_appliance_scoped_grant_is_a_candidate_only_for_that_one_appliance(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            appliance_1 = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-1"}
+            appliance_2 = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-2"}
+            baseline_1 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            baseline_2 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_2)
+            _seed_operator(db, "u1", "appliance-scoped@example.com", "Sup3rSecret!")
+            appliance_identity.create_grant(db, user_id="u1", role="technician", scope_type="appliance", scope_id="AIC-1", granted_by="test")
+            candidates_for_1 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            candidates_for_2 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_2)
+    assert candidates_for_1 - baseline_1 == {"u1"}
+    assert candidates_for_2 - baseline_2 == set(), "an appliance-scoped grant for AIC-1 must not make its holder a candidate for a different appliance, even under the same customer/site"
+
+
+def test_partner_scoped_grant_is_a_candidate_for_every_appliance_under_that_partner_only(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            appliance_same = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-1"}
+            appliance_other = {"partner_id": "partner-2", "customer_id": "cust-2", "site_id": "site-2", "cloud_id": "AIC-2"}
+            baseline_same = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_same)
+            baseline_other = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_other)
+            _seed_operator(db, "u1", "partner-scoped@example.com", "Sup3rSecret!")
+            appliance_identity.create_grant(db, user_id="u1", role="partner_owner", scope_type="partner", scope_id="partner-1", granted_by="test")
+            candidates_same_partner = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_same)
+            candidates_other_partner = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_other)
+    assert candidates_same_partner - baseline_same == {"u1"}
+    assert candidates_other_partner - baseline_other == set()
+
+
+def test_global_grant_is_a_candidate_for_every_appliance(client, db_path):
+    with _db(db_path):
+        with connection() as db:
+            appliance_1 = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-1"}
+            appliance_9 = {"partner_id": "partner-9", "customer_id": "cust-9", "site_id": "site-9", "cloud_id": "AIC-9"}
+            baseline_1 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            baseline_9 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_9)
+            _seed_operator(db, "u1", "global-admin@example.com", "Sup3rSecret!")
+            appliance_identity.create_grant(db, user_id="u1", role="administrator", scope_type="global", scope_id=None, granted_by="test")
+            candidates_1 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            candidates_9 = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_9)
+    assert candidates_1 - baseline_1 == {"u1"}
+    assert candidates_9 - baseline_9 == {"u1"}, "a global grant must be a candidate for every appliance, not just the ones seen so far"
+
+
+def test_a_grant_revoked_at_the_db_level_still_makes_its_holder_a_candidate(client, db_path):
+    # The one deliberate exception to "only current grants count": a
+    # user whose ONLY relevant grant was just revoked must still be a
+    # candidate, or reconcile_sessions_against_manifest() could never
+    # actually catch (and force-expire) the now-stale session -- see
+    # test_role_removal_still_force_expires_the_session_under_option_b.
+    with _db(db_path):
+        with connection() as db:
+            appliance_1 = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-1"}
+            baseline = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            _seed_operator(db, "u1", "just-revoked@example.com", "Sup3rSecret!")
+            grant_id = appliance_identity.create_grant(db, user_id="u1", role="technician", scope_type="appliance", scope_id="AIC-1", granted_by="test")
+            appliance_identity.revoke_grant(db, grant_id=grant_id)
+            candidates = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+    assert candidates - baseline == {"u1"}
+
+
+def test_a_user_with_no_identity_grants_at_all_is_never_a_candidate_for_any_appliance(client, db_path):
+    # The ordinary shape of a plain cloud customer_owner -- confirms
+    # directly at the _candidate_session_user_ids_for_appliance() level
+    # (test_a_genuinely_unrelated_ungranted_customer_session_survives_
+    # both_endpoints, above, confirms it end-to-end through the HTTP
+    # routes).
+    with _db(db_path):
+        with connection() as db:
+            appliance_1 = {"partner_id": "partner-1", "customer_id": "cust-1", "site_id": "site-1", "cloud_id": "AIC-1"}
+            baseline = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+            _seed_operator(db, "u1", "no-grants-at-all@example.com", "Sup3rSecret!")
+            candidates = appliance_identity._candidate_session_user_ids_for_appliance(db, appliance=appliance_1)
+    assert candidates - baseline == set()
+    assert "u1" not in candidates

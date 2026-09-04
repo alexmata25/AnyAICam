@@ -425,23 +425,79 @@ def _appliance_scope(db, *, cloud_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def _candidate_session_user_ids_for_appliance(db, *, appliance: dict) -> set[str]:
+    """Option B fix (2026-09-04) for the platform-wide session-wipe
+    regression Option A (see reconcile_sessions_against_manifest()'s own
+    updated docstring) mitigated by disabling reconciliation entirely.
+    Every user_id that has AT LEAST ONE identity_grants row -- revoked
+    or not -- whose scope COULD resolve to this appliance, using the
+    exact same grant_resolves() choke point build_manifest_identities()
+    itself uses. Deliberately NOT filtered to only non-revoked grants:
+    a user whose ONLY relevant grant was just revoked must still be
+    caught by reconciliation below (that's the actual security property
+    this whole mechanism exists for -- a role removal must still force-
+    expire the now-stale session), so their now-revoked grant row still
+    has to make them a candidate. A user with NO identity_grants row at
+    all for this appliance's partner/customer/site/cloud_id -- the
+    ordinary shape of a ONE cloud customer_owner, who never had any
+    appliance-identity relationship to begin with -- is correctly never
+    a candidate at all, so reconcile_sessions_against_manifest() below
+    never even looks at, let alone touches, their session."""
+    grants = db.execute("SELECT user_id,scope_type,scope_id FROM identity_grants").fetchall()
+    return {
+        grant["user_id"] for grant in grants
+        if grant_resolves(
+            scope_type=grant["scope_type"], scope_id=grant["scope_id"],
+            partner_id=appliance.get("partner_id"), customer_id=appliance.get("customer_id"),
+            site_id=appliance.get("site_id"), cloud_id=appliance.get("cloud_id"),
+        )
+    }
+
+
 def reconcile_sessions_against_manifest(db, *, manifest: dict) -> list[str]:
     """DB-touching wrapper around sessions_to_revoke(): walks every
-    still-open user_sessions row (revoked_at IS NULL) whose user_id
+    still-open user_sessions row (revoked_at IS NULL) belonging to a
+    user who could possibly be relevant to THIS appliance -- see
+    _candidate_session_user_ids_for_appliance() -- and whose user_id
     appears anywhere in this manifest's identities (scoped, by
-    construction, to one appliance's own partner/customer/site), and
+    construction, to one appliance's own partner/customer/site), then
     force-expires (revoked_at=now) any that no longer resolve. Returns
     the list of session ids just revoked, so a caller can log/audit
     them. Call this whenever a fresh, verified manifest is fetched --
     see this module's own docstring on where that's wired today and
-    what's still a manual/follow-up trigger."""
+    what's still a manual/follow-up trigger.
+
+    2026-09-04, Option B: previously queried user_sessions with NO
+    scoping at all -- every open session platform-wide, every customer,
+    every partner -- compared only against this one appliance's own
+    small identity list, so any session whose user wasn't in THAT
+    manifest (essentially every unrelated customer, always) was treated
+    as "dropped out" and force-revoked. Confirmed live in production:
+    every customer_owner session was being force-revoked within 8-74
+    seconds of login by a completely unrelated appliance's own routine
+    heartbeat. Option A (2026-09-04, shipped first as the immediate
+    mitigation) disabled the two call sites entirely; this restores the
+    intended behavior correctly, scoped via
+    _candidate_session_user_ids_for_appliance()."""
     identities = manifest.get("identities", [])
-    # Deliberately not filtered to just this manifest's user_ids: a user
-    # who dropped OUT of the manifest entirely (role removed, revoked,
-    # unassigned) is exactly the case sessions_to_revoke() must catch,
-    # and an IN-list built from the manifest's own identities would
-    # silently exclude them.
-    open_sessions = db.execute("SELECT id,user_id,role,authorization_version_at_login FROM user_sessions WHERE revoked_at IS NULL").fetchall()
+    candidate_user_ids = _candidate_session_user_ids_for_appliance(db, appliance=manifest.get("appliance", {}))
+    if not candidate_user_ids:
+        return []
+    # Deliberately not filtered to just this manifest's (already-
+    # resolving) user_ids: a user who dropped OUT of the manifest
+    # entirely (role removed, revoked, unassigned) is exactly the case
+    # sessions_to_revoke() must catch, and an IN-list built from the
+    # manifest's own identities would silently exclude them. Scoped to
+    # candidate_user_ids instead -- every user with any grant that could
+    # ever resolve to this appliance, whether it currently does or not
+    # -- which is what actually fixes the platform-wide leak above
+    # without losing that same "catch a role that just got removed"
+    # behavior.
+    placeholders = ",".join("?" for _ in candidate_user_ids)
+    open_sessions = db.execute(
+        f"SELECT id,user_id,role,authorization_version_at_login FROM user_sessions WHERE revoked_at IS NULL AND user_id IN ({placeholders})",
+        list(candidate_user_ids),
+    ).fetchall()
     local_sessions = [
         {"session_id": row["id"], "user_id": row["user_id"], "role": row["role"], "authorization_version": row["authorization_version_at_login"]}
         for row in open_sessions
