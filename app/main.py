@@ -140381,16 +140381,6 @@ def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
     ]
 
 
-@app.get("/api/customer/events/{camera_id}")
-def customer_camera_events(camera_id: str, request: Request, date: str | None = None) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
-        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
-    # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
-    # that constant's own comment.
-    date = date or datetime.now(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d")
-    return {"events": _customer_camera_events(camera_id, date)}
-
-
 # P0 #5 (2026-09-04): how many of the most-recent events the Events/
 # Playback page's own media-readiness poll ever needs to reconcile
 # against -- comfortably above what a single screen ever renders, kept
@@ -140412,11 +140402,30 @@ def customer_events_recent(request: Request) -> dict:
     per-event "GET .../{camera_id}/{event_id}/media-status" endpoint
     would have needed to defend against explicitly. No new query: this
     is the exact same list the page already renders once at load,
-    truncated to RECENT_EVENTS_POLL_LIMIT before being returned."""
+    truncated to RECENT_EVENTS_POLL_LIMIT before being returned.
+
+    Registered BEFORE customer_camera_events() below on purpose --
+    Starlette matches routes in registration order, and
+    "/api/customer/events/{camera_id}" is a path-parameter route that
+    would otherwise swallow a literal request for
+    "/api/customer/events/recent", treating "recent" itself as a
+    camera_id and failing authorization for a camera that doesn't
+    exist. Confirmed live in staging before this fix -- see the P0 #5
+    staging report."""
     events = _customer_detection_events(request)
     if events is None:
         raise HTTPException(status_code=403, detail="Customer portal sign-in required.")
     return {"events": events[:RECENT_EVENTS_POLL_LIMIT]}
+
+
+@app.get("/api/customer/events/{camera_id}")
+def customer_camera_events(camera_id: str, request: Request, date: str | None = None) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
+    # that constant's own comment.
+    date = date or datetime.now(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d")
+    return {"events": _customer_camera_events(camera_id, date)}
 
 
 def _customer_camera_recordings(camera_id: str) -> list[dict]:
