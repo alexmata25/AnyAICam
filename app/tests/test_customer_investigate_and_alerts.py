@@ -267,7 +267,8 @@ def test_investigate_deep_links_use_cameras_id_and_the_shared_playback_route(mon
         result = main.investigation_page(object())
     events = _investigation_events(result)
     camera_id = camera_ids[0]
-    assert events[0]["recording"] == f"/playback?camera={camera_id}&t={quote(events[0]['timestamp'])}"
+    expected_epoch_ms = main._naive_utc_timestamp_to_epoch_ms(events[0]["timestamp"])
+    assert events[0]["recording"] == f"/playback?camera={camera_id}&t={expected_epoch_ms}&autoplay=event"
     assert events[0]["live"] == f"/customer/cameras/{camera_id}/live"
 
 

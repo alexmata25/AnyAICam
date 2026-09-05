@@ -80159,7 +80159,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
             "end_time": timestamp,
             "event_type": str(event.get("event_type") or "motion").lower(),
             "thumbnail": event.get("thumbnail") or "",
-            "recording": f"/playback?camera={quote(str(camera_id))}&t={quote(timestamp)}" if camera_id else "",
+            "recording": _customer_event_playback_href(camera_id, timestamp, event.get("id"), bool(event.get("has_event_clip"))),
             "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
             "confidence": event.get("confidence"),
             "plate": event.get("plate_number") or "",
@@ -119502,53 +119502,81 @@ def _naive_utc_timestamp_to_epoch_ms(raw_timestamp) -> int | None:
         return None
 
 
-def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
-    """The same two useful actions on every real customer event/alert
-    row: jump to that camera's live view, or to Playback.
+def _customer_event_playback_href(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
+    """The one canonical Playback deep-link for a customer event --
+    every "jump to Playback" action for an event row builds its href
+    through here, never inline. Two known callers today:
+    _customer_event_actions() (Events page, Alerts) and
+    investigation_page() (Investigate).
 
-    Root cause (2026-09-02, "playable events depend on a nearby
-    continuous recording" bug): the prior fix here correctly routed
-    Playback to the event's own camera, but always via ?t=<event time>
-    -> renderCamera()'s findClipNear() against catalog *recordings* --
-    i.e. "find whatever 5-minute recording happens to cover this
-    moment", never the event's own short clip. For any event whose
-    moment falls in a real gap between recordings (not rare -- see the
-    per-camera gap data in this project's earlier timeline
-    investigation), findClipNear() legitimately finds nothing,
-    playClip() is never called, and the event silently "does not
-    play" even though a real, playable, already-authorized event clip
-    exists at the object detection pipeline's own
+    Root cause history (2026-09-02, "playable events depend on a
+    nearby continuous recording" bug): an earlier version of this
+    logic (formerly inline in _customer_event_actions() only) routed
+    Playback to the event's own camera, but always via ?t=<event
+    time> -> renderCamera()'s findClipNear() against catalog
+    *recordings* -- i.e. "find whatever 5-minute recording happens to
+    cover this moment", never the event's own short clip. For any
+    event whose moment falls in a real gap between recordings (not
+    rare -- see the per-camera gap data in this project's earlier
+    timeline investigation), findClipNear() legitimately finds
+    nothing, playClip() is never called, and the event silently "does
+    not play" even though a real, playable, already-authorized event
+    clip exists at the object detection pipeline's own
     detection_event_media/{event_id}. Deliberately not widening the
     near= match window to paper over this -- that would risk playing
     unrelated footage instead of fixing the actual mismatch.
 
     Fix: for an event with a real clip (has_event_clip and a real
-    event_id), the link now carries the event's own id
-    (?event=<event_id>) instead of a timestamp, and
-    _render_customer_playback()'s renderCamera() uses it to call the
-    existing, already-authorized, already-working
-    /api/customer/events/{camera_id}/{event_id}/media/url route
-    directly -- the same route event-marker/mobile-event clicks on the
-    Playback timeline have always used, completely bypassing
+    event_id), the link carries the event's own id (?event=<event_id>)
+    instead of a timestamp, and _render_customer_playback()'s
+    renderCamera() uses it to call the existing, already-authorized,
+    already-working /api/customer/events/{camera_id}/{event_id}/media/url
+    route directly -- the same route event-marker/mobile-event clicks
+    on the Playback timeline have always used, completely bypassing
     findClipNear()/the recordings catalog. Analytics-only events (no
-    clip) keep the prior ?t=<epoch-ms>&autoplay=event / nearby-
-    recording behavior unchanged -- that path was never the bug."""
+    clip) keep the ?t=<epoch-ms>&autoplay=event / nearby-recording
+    behavior -- t is always a naive-UTC timestamp string converted to
+    an unambiguous epoch-ms integer via _naive_utc_timestamp_to_epoch_
+    ms(), never handed to a browser as a raw ISO string.
+
+    Root cause (2026-09-05, "Investigate -> Playback handoff" bug):
+    investigation_page() built its own separate, outdated inline
+    version of this exact URL -- ?camera=...&t=<raw ISO string>, no
+    event=, no autoplay=event -- so Investigate alone regressed to the
+    original 2026-09-02 bug (and never autoplayed even when a nearby
+    recording did exist) while Events/Alerts had already been fixed.
+    Extracted here so there is exactly one place this logic lives, and
+    investigation_page() now calls it too.
+
+    Returns the bare '/playback' path (no query string) when camera_id
+    is falsy -- a safe, always-valid href, never a broken deep link
+    built from a missing id."""
+    if not camera_id:
+        return '/playback'
+    href = f'/playback?camera={escape(str(camera_id), quote=True)}'
+    if has_event_clip and event_id:
+        href += f'&event={escape(str(event_id), quote=True)}&autoplay=event'
+    elif timestamp:
+        epoch_ms = _naive_utc_timestamp_to_epoch_ms(timestamp)
+        if epoch_ms is not None:
+            href += f'&t={epoch_ms}&autoplay=event'
+    return href
+
+
+def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
+    """The same two useful actions on every real customer event/alert
+    row: jump to that camera's live view, or to Playback. The Playback
+    href itself is built by the shared _customer_event_playback_href()
+    -- see that function's own docstring for the full root-cause
+    history of why its exact shape (event= over t= whenever a real
+    clip exists; t= always as epoch-ms, never a raw ISO string)
+    matters."""
     live_link = (
         f'<a class="download" href="/customer/cameras/{escape(str(camera_id), quote=True)}/live">Live view</a> '
         if camera_id else ''
     )
-    if camera_id:
-        playback_href = f'/playback?camera={escape(str(camera_id), quote=True)}'
-        if has_event_clip and event_id:
-            playback_href += f'&event={escape(str(event_id), quote=True)}&autoplay=event'
-        elif timestamp:
-            epoch_ms = _naive_utc_timestamp_to_epoch_ms(timestamp)
-            if epoch_ms is not None:
-                playback_href += f'&t={epoch_ms}&autoplay=event'
-    else:
-        playback_href = '/playback'
+    playback_href = _customer_event_playback_href(camera_id, timestamp, event_id, has_event_clip)
     return f'{live_link}<a class="download" href="{playback_href}">Playback</a>'
-
 
 def _render_customer_events(request: Request) -> str:
     """Real, tenant-scoped Events page for a portal customer. Reuses
