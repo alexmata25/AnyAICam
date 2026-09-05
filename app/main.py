@@ -119379,18 +119379,33 @@ def _render_customer_events(request: Request) -> str:
   }
   wireEventThumbPlayer(document);
 
-  // P0 #5 remediation round 2 (2026-09-05, Codex second review): same
-  // two fixes as scheduleMobileEventPoll() (see that function's own
-  // docstring for the full rationale) -- EVENT_FETCH_TIMEOUT_MS bounds
-  // a single fetch attempt so a never-responding server cannot stall
-  // this loop forever, and deadlineAt is a real wall-clock deadline
-  // (Date.now()-based) instead of an attempt-count ceiling. No
-  // per-camera session object is needed here (unlike mobile) -- this
-  // table is fleet-wide with no "selected camera" concept, so
-  // eventPollState only ever needs to guard against a second
-  // concurrent timer/fetch, never a camera switch.
+  // P0 #5 remediation round 3 (2026-09-05, real P0 blocker found by
+  // ChatGPT Work QA): round 2 made scheduleEventPoll() exit for good
+  // the moment nothing was processing -- anyDesktopRowStillProcessing()
+  // false meant "clear the timer, forget eventPollState, return" with
+  // nothing left to ever call this function again. A page loaded when
+  // the visible 200 rows happened to have zero rows inside their own
+  // 120s window (the overwhelmingly common case -- most pages load
+  // long after their most recent event) could never discover a brand
+  // new event created after that load, no matter how long the tab
+  // stayed open; only a manual reload could ever show it. Fixed by
+  // never permanently stopping: discovery polling continues
+  // indefinitely at EVENT_SLOW_POLL_INTERVAL_MS while nothing is
+  // processing, and speeds up to EVENT_FAST_POLL_INTERVAL_MS the
+  // moment a poll reconciles a row into "processing" -- switching back
+  // to the slow cadence again once nothing is left processing. Same
+  // two round-2 fixes remain in force (see scheduleMobileEventPoll()'s
+  // own docstring for the full rationale): EVENT_FETCH_TIMEOUT_MS
+  // bounds a single fetch attempt so a never-responding server cannot
+  // stall this loop, and settlement is still driven by real elapsed
+  // time, not an attempt count -- now checked per row (see
+  // settleOverdueDesktopRows() below) against that row's own
+  // data-event-timestamp, since new rows can start their own 120s
+  // window at any moment, not only at whatever instant polling itself
+  // happened to start.
   const EVENT_PENDING_WINDOW_MS=120000;
-  const EVENT_POLL_INTERVAL_MS=4000;
+  const EVENT_FAST_POLL_INTERVAL_MS=4000;
+  const EVENT_SLOW_POLL_INTERVAL_MS=15000;
   const EVENT_FETCH_TIMEOUT_MS=8000;
   let eventPollState=null;
 
@@ -119521,13 +119536,19 @@ def _render_customer_events(request: Request) -> str:
     return row;
   }
 
-  // Round 2 fix: settlement reads each row's own tracked
-  // data-media-state (set exactly once, at render/reconcile time) --
-  // never re-derives "still pending" from timestamp age (see
-  // mediaStateFor()'s own docstring above for exactly why that was the
-  // bug).
-  function settleExpiredDesktopEvents(){
+  // Round 3 fix: settles only the rows whose OWN 120s window (from
+  // their own data-event-timestamp, never a shared page-load-relative
+  // deadline) has actually elapsed -- a row still tracks its explicit
+  // data-media-state (never re-derived from age for the "is anything
+  // still processing" decision, exactly as round 2 fixed), but a
+  // *newly-discovered* processing row starts its own independent
+  // countdown from its own real detection time, since discovery can
+  // now happen at any point after page load, not only once at the
+  // start of a single page-load-scoped session.
+  function settleOverdueDesktopRows(){
     document.querySelectorAll('#events-table tbody tr[data-media-state="processing"]').forEach(row=>{
+      const ageMs=Date.now()-desktopEventDate(row.dataset.eventTimestamp).getTime();
+      if(ageMs<EVENT_PENDING_WINDOW_MS)return;
       row.dataset.mediaState='settled';
       const pendingLabel=row.querySelector('.event-thumbnail-cell .event-thumb-pending');
       if(pendingLabel)pendingLabel.textContent='Not ready yet';
@@ -119540,23 +119561,22 @@ def _render_customer_events(request: Request) -> str:
     return document.querySelector('#events-table tbody tr[data-media-state="processing"]')!==null;
   }
 
+  // Round 3 (2026-09-05, real P0 blocker): never permanently exits.
+  // Discovery keeps running for as long as the page is open, at
+  // EVENT_SLOW_POLL_INTERVAL_MS while nothing is processing (cheap,
+  // infrequent -- just enough to notice a brand new event without a
+  // manual reload) and at EVENT_FAST_POLL_INTERVAL_MS the moment
+  // anyDesktopRowStillProcessing() is true (the existing
+  // Processing…-> ready reconciliation cadence, unchanged). The
+  // eventPollState guard (only one timer ever pending at a time) is
+  // the only thing that can make a second scheduleEventPoll() call a
+  // no-op -- it is never set back to null just because nothing is
+  // currently processing.
   function scheduleEventPoll(){
-    if(!eventPollState){
-      eventPollState={deadlineAt:Date.now()+EVENT_PENDING_WINDOW_MS,timer:null,controller:null};
-    }
+    if(eventPollState&&eventPollState.timer)return;
+    if(!eventPollState)eventPollState={timer:null,controller:null};
     const state=eventPollState;
-    if(!anyDesktopRowStillProcessing()){
-      if(state.timer)clearTimeout(state.timer);
-      eventPollState=null;
-      return;
-    }
-    if(Date.now()>=state.deadlineAt){
-      if(state.timer)clearTimeout(state.timer);
-      settleExpiredDesktopEvents();
-      eventPollState=null;
-      return;
-    }
-    if(state.timer)return;
+    const interval=anyDesktopRowStillProcessing()?EVENT_FAST_POLL_INTERVAL_MS:EVENT_SLOW_POLL_INTERVAL_MS;
     state.timer=setTimeout(async()=>{
       state.timer=null;
       const controller=new AbortController();
@@ -119589,14 +119609,22 @@ def _render_customer_events(request: Request) -> str:
       }catch(error){
         // AbortError (a fetch that exceeded EVENT_FETCH_TIMEOUT_MS) or
         // a genuine transient network failure -- either way, retried
-        // below via finally, never a permanent stop.
+        // below via finally, never a permanent stop. Discovery at the
+        // slow cadence is not interrupted by this either.
       }finally{
         clearTimeout(fetchTimeoutId);
+        // Checked every tick regardless of this attempt's own
+        // success/failure -- a row's own 120s window elapsing is a
+        // real-clock fact independent of whether THIS particular fetch
+        // happened to succeed, so a final failed request landing
+        // exactly at a row's deadline still settles it here rather
+        // than only ever settling on a successful reconcile.
+        settleOverdueDesktopRows();
         if(eventPollState===state){
           scheduleEventPoll();
         }
       }
-    },EVENT_POLL_INTERVAL_MS);
+    },interval);
   }
 
   scheduleEventPoll();

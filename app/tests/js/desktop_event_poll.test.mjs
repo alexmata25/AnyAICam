@@ -1,7 +1,14 @@
 // Real, executed behavioral test of the desktop Events page's
-// scheduleEventPoll()/reconcileDesktopEvent()/settleExpiredDesktopEvents()
-// reconciliation loop (P0 #5 remediation round 2, 2026-09-05, Codex
-// second review). String-content assertions on the rendered HTML can
+// scheduleEventPoll()/reconcileDesktopEvent()/settleOverdueDesktopRows()
+// reconciliation loop (P0 #5 remediation, rounds 2 and 3 -- round 3,
+// 2026-09-05, fixed a real P0 blocker ChatGPT Work's own staging QA
+// found: round 2's scheduleEventPoll() permanently stopped for good
+// the moment nothing was processing, so a page loaded with zero
+// pending rows could never discover an event created afterward without
+// a manual reload. Round 3 adds a slow discovery cadence
+// (EVENT_SLOW_POLL_INTERVAL_MS) that never permanently stops, switching
+// to the existing fast cadence the moment something is actually
+// processing). String-content assertions on the rendered HTML can
 // prove the constants and markup exist, but they cannot exercise the
 // actual async retry/timeout/deadline/DOM-mutation behavior these bugs
 // depended on -- only running the real code with controllable
@@ -389,8 +396,19 @@ function resetFakes() {
 // ---------------------------------------------------------------- load real source
 
 const factory = new Function(
-  `${preludeSource}\n${snippetSource}\nreturn { reconcileDesktopEvent, settleExpiredDesktopEvents, scheduleEventPoll, mediaStateFor, isEventPending };`
+  `${preludeSource}\n${snippetSource}\nreturn { reconcileDesktopEvent, settleOverdueDesktopRows, scheduleEventPoll, mediaStateFor, isEventPending, anyDesktopRowStillProcessing };`
 );
+
+// Round 3: inspects the single currently-pending timer's own delay --
+// EVENT_FAST_POLL_INTERVAL_MS (4000) while something is processing,
+// EVENT_SLOW_POLL_INTERVAL_MS (15000) while settled/idle -- to assert
+// which cadence scheduleEventPoll() actually chose, without needing to
+// export the constants themselves.
+function pendingTimerDelay() {
+  const entries = [...pendingTimers.values()];
+  if (entries.length !== 1) throw new Error(`expected exactly 1 pending timer, found ${entries.length}`);
+  return entries[0].ms;
+}
 
 function freshEvent(id, { hasClip = false, ageMs = 0, camera = "cam-1", confidence = 0.9 } = {}) {
   return {
@@ -579,6 +597,99 @@ test("only one timer/fetch is ever in flight at a time", async () => {
   mod.scheduleEventPoll();
   mod.scheduleEventPoll();
   if (fetchCalls.length !== 1) throw new Error("calling scheduleEventPoll again while a fetch is in flight must not start a second one");
+});
+
+// ------------------------------------------------- round 3: discovery bootstrap (real P0 blocker)
+
+test("a page that starts with zero Processing rows still schedules discovery polling", async () => {
+  resetFakes();
+  buildFixture(); // no addRow() calls -- zero rows, all settled/none
+  const mod = factory();
+  mod.scheduleEventPoll();
+  if (pendingTimers.size !== 1) throw new Error("expected discovery polling to be scheduled even with nothing processing");
+  if (pendingTimerDelay() !== 15000) throw new Error(`expected the slow (15000ms) discovery cadence, got ${pendingTimerDelay()}ms`);
+});
+
+test("settled polling continues indefinitely at the slow cadence -- never permanently stops", async () => {
+  resetFakes();
+  buildFixture();
+  const mod = factory();
+  mod.scheduleEventPoll();
+  for (let i = 0; i < 4; i++) {
+    fetchQueue.push(jsonResponse(200, { events: [] }));
+    const flushed = await flushOneTimer();
+    if (!flushed) throw new Error(`expected discovery polling to still be scheduled after tick ${i + 1}`);
+    if (pendingTimerDelay() !== 15000) throw new Error("expected to remain on the slow cadence with nothing ever discovered");
+  }
+});
+
+test("a new event appearing in the API after page load is inserted automatically, no reload needed", async () => {
+  resetFakes();
+  const { tbody } = buildFixture(); // starts with zero rows
+  const mod = factory();
+  mod.scheduleEventPoll();
+  if (tbody.querySelector('tr[data-event-id="ev-new-discovery"]')) {
+    throw new Error("test setup error: the row must not already exist");
+  }
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-new-discovery", { hasClip: true, ageMs: 3000 })] }));
+  await flushOneTimer();
+  const row = tbody.querySelector('tr[data-event-id="ev-new-discovery"]');
+  if (!row) throw new Error("a newly-discovered event must be inserted into the table automatically");
+  if (row.dataset.mediaState !== "ready") throw new Error("expected the newly-discovered event to reconcile with its real media state");
+});
+
+test("a newly-discovered Processing event switches polling to the fast cadence", async () => {
+  resetFakes();
+  const { tbody } = buildFixture();
+  const mod = factory();
+  mod.scheduleEventPoll();
+  if (pendingTimerDelay() !== 15000) throw new Error("expected to start on the slow cadence");
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-fresh-processing", { hasClip: false, ageMs: 0 })] }));
+  await flushOneTimer();
+  const row = tbody.querySelector('tr[data-event-id="ev-fresh-processing"]');
+  if (!row || row.dataset.mediaState !== "processing") throw new Error("expected the newly-discovered event to be tracked as processing");
+  if (pendingTimerDelay() !== 4000) {
+    throw new Error(`expected polling to switch to the fast (4000ms) cadence once a processing row was discovered, got ${pendingTimerDelay()}ms`);
+  }
+});
+
+test("polling returns to the slow cadence once the discovered event becomes ready", async () => {
+  resetFakes();
+  const { tbody } = buildFixture();
+  const mod = factory();
+  mod.scheduleEventPoll();
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-fresh-2", { hasClip: false, ageMs: 0 })] }));
+  await flushOneTimer(); // discovered as processing -> fast cadence
+  if (pendingTimerDelay() !== 4000) throw new Error("expected the fast cadence while the discovered event is still processing");
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-fresh-2", { hasClip: true, ageMs: 4000 })] }));
+  await flushOneTimer(); // becomes ready
+  const row = tbody.querySelector('tr[data-event-id="ev-fresh-2"]');
+  if (row.dataset.mediaState !== "ready") throw new Error("expected the event to reconcile to ready");
+  if (pendingTimerDelay() !== 15000) {
+    throw new Error(`expected polling to return to the slow (15000ms) cadence once nothing is processing again, got ${pendingTimerDelay()}ms`);
+  }
+});
+
+test("a transient error during settled (slow-cadence) polling does not permanently stop discovery", async () => {
+  resetFakes();
+  buildFixture();
+  const mod = factory();
+  mod.scheduleEventPoll();
+  if (pendingTimerDelay() !== 15000) throw new Error("expected to start on the slow cadence");
+  fetchQueue.push(() => {
+    throw new TypeError("network down during idle discovery polling");
+  });
+  const flushed = await flushOneTimer();
+  if (!flushed) throw new Error("a transient failure while settled must still reschedule discovery polling");
+  if (pendingTimers.size !== 1) throw new Error("expected discovery polling to still be scheduled after the transient failure");
+  if (pendingTimerDelay() !== 15000) throw new Error("expected to remain on the slow cadence after a transient failure with nothing discovered yet");
+  // And discovery genuinely still works afterward -- not just rescheduled and stuck.
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-after-error", { hasClip: true, ageMs: 1000 })] }));
+  await flushOneTimer();
+  const { tbody } = { tbody: document.querySelector("#events-table tbody") };
+  if (!tbody.querySelector('tr[data-event-id="ev-after-error"]')) {
+    throw new Error("discovery must still find a real new event after recovering from a transient error");
+  }
 });
 
 // ---------------------------------------------------------------- runner
