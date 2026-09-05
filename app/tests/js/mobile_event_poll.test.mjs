@@ -1,18 +1,19 @@
 // Real, executed behavioral test of the mobile Playback page's
 // scheduleMobileEventPoll()/isMobileEventPending() state machine (P0 #5
-// remediation, 2026-09-05, Codex review). String-content assertions on
-// the rendered HTML can prove the constants and markup exist, but they
-// cannot exercise the actual async retry/cancellation/deadline timing
-// that the original bugs depended on -- only running the real code with
-// controllable timing can (same rationale as talk_mic_lifecycle.test.mjs,
-// this suite's own sibling).
+// remediation round 2, 2026-09-05, Codex second review). String-content
+// assertions on the rendered HTML can prove the constants and markup
+// exist, but they cannot exercise the actual async retry/cancellation/
+// deadline timing that the original bugs depended on -- only running
+// the real code with controllable timing can (same rationale as
+// talk_mic_lifecycle.test.mjs and desktop_event_poll.test.mjs, this
+// suite's own siblings).
 //
 // This file runs the ACTUAL extracted source (passed in as a file path
 // argv[2], always extracted live from a real _render_customer_playback()
 // render by the pytest wrapper that invokes this -- never a hand-copied
 // duplicate that could drift from what ships) under Node, with a fake
-// fetch/AbortController/setTimeout/playbackDate/renderMobileRecentEvents
-// this file fully controls the timing and observes the calls of.
+// fetch/AbortController/setTimeout/Date.now/playbackDate/
+// renderMobileRecentEvents this file fully controls the timing of.
 //
 // Usage: node mobile_event_poll.test.mjs /path/to/extracted_snippet.js
 // Exit code 0 on all-pass, 1 on any failure (with details on stdout).
@@ -27,17 +28,25 @@ if (!sourcePath) {
 }
 const snippetSource = readFileSync(sourcePath, "utf8");
 
-// ---------------------------------------------------------------- fakes
+// ---------------------------------------------------------------- fake clock
 
-// Deterministic fake timer queue -- no real wall-clock waiting, and each
-// pending timer is flushed one at a time under the test's own control so
-// interleavings (e.g. "switch camera while a fetch is still in flight")
-// are reproducible instead of racy.
+// Round 2 fix (2026-09-05, Codex second review): the fake timer queue
+// now also advances a mocked Date.now() by each flushed timer's own
+// delay -- round 1's fake clock never moved between synchronous
+// flushes, so a deadlineAt = Date.now() + 120000 real elapsed-time
+// deadline could never actually be exercised deterministically (every
+// flush looked instantaneous). Advancing fakeNow in lockstep with
+// which timer fires is what lets a test prove "settles once real
+// elapsed time crosses the deadline" as a genuinely different claim
+// from "settles once N attempts have run".
+let fakeNow = Date.now();
+Date.now = () => fakeNow;
+
 let timerIdSeq = 1;
-let pendingTimers = new Map();
-function fakeSetTimeout(fn) {
+let pendingTimers = new Map(); // id -> { fn, ms }
+function fakeSetTimeout(fn, ms) {
   const id = timerIdSeq++;
-  pendingTimers.set(id, fn);
+  pendingTimers.set(id, { fn, ms: ms || 0 });
   return id;
 }
 function fakeClearTimeout(id) {
@@ -52,12 +61,12 @@ async function settle() {
   // request would be.
   await new Promise((resolve) => realSetImmediate(resolve));
 }
-
 async function flushOneTimer() {
   const entries = [...pendingTimers.entries()];
   if (entries.length === 0) return false;
-  const [id, fn] = entries[0];
+  const [id, { fn, ms }] = entries[0];
   pendingTimers.delete(id);
+  fakeNow += ms;
   // Deliberately not awaited directly: a timer callback whose fetch
   // never resolves (see neverResolves()) must not hang this helper
   // forever -- settle() below drains everything that's actually ready
@@ -123,16 +132,27 @@ globalThis.renderMobileRecentEvents = (cameraId, clips, events, options) => {
   renderCalls.push({ cameraId, clips, events: events.map((e) => ({ ...e })), options });
 };
 
+// The real camera-tile click handler updates this module-level
+// variable AND calls stopMobileEventPoll() immediately, in that order
+// -- see main.py's own click handler. Tests simulate a camera switch
+// by doing exactly the same two things, in the same order, rather than
+// calling scheduleMobileEventPoll() for the new camera directly (which
+// would only exercise scheduleMobileEventPoll()'s own lazy mismatch
+// detection, not the click handler's immediate cancellation this round
+// of fixes actually added).
+globalThis.selectedCameraId = null;
+
 function resetFakes() {
   fetchQueue = [];
   fetchCalls = [];
   renderCalls = [];
   pendingTimers = new Map();
+  globalThis.selectedCameraId = null;
 }
 
 // ---- load the real snippet, exposing what the tests need to drive ----
 const factory = new Function(
-  `${snippetSource}\nreturn { scheduleMobileEventPoll, isMobileEventPending };`
+  `${snippetSource}\nreturn { scheduleMobileEventPoll, stopMobileEventPoll, isMobileEventPending };`
 );
 const mod = factory();
 
@@ -144,6 +164,15 @@ function makeEvent(id, { hasClip = false, ageMs = 0 } = {}) {
   };
 }
 
+function selectCamera(cameraId) {
+  // Mirrors the real camera-tile click handler exactly: update the
+  // page's own selection state, then immediately stop the previous
+  // camera's poll session -- never waiting for scheduleMobileEventPoll()
+  // to notice the mismatch on its own next invocation.
+  globalThis.selectedCameraId = cameraId;
+  mod.stopMobileEventPoll();
+}
+
 // ---------------------------------------------------------------- tests
 
 const tests = [];
@@ -153,6 +182,7 @@ function test(name, fn) {
 
 test("transient fetch exception does not permanently stop polling", async () => {
   resetFakes();
+  selectCamera("cam-1");
   mod.scheduleMobileEventPoll("cam-1", [], [makeEvent("evt-1")]);
   fetchQueue.push(() => { throw new TypeError("network down"); });
   await flushOneTimer();
@@ -167,6 +197,7 @@ test("transient fetch exception does not permanently stop polling", async () => 
 
 test("HTTP 500 is retried, not treated as a permanent stop", async () => {
   resetFakes();
+  selectCamera("cam-2");
   mod.scheduleMobileEventPoll("cam-2", [], [makeEvent("evt-2")]);
   fetchQueue.push(jsonResponse(500, {}));
   await flushOneTimer();
@@ -178,68 +209,101 @@ test("HTTP 500 is retried, not treated as a permanent stop", async () => {
   if (renderCalls.length !== 1) throw new Error("expected a render after recovering from 500");
 });
 
-test("switching cameras aborts the in-flight request for the old one", async () => {
+test("a never-resolving fetch is bounded by its own timeout and retried, not hung forever", async () => {
   resetFakes();
-  mod.scheduleMobileEventPoll("cam-a", [], [makeEvent("evt-a")]);
+  selectCamera("cam-5");
+  mod.scheduleMobileEventPoll("cam-5", [], [makeEvent("evt-5")]);
   fetchQueue.push(neverResolves());
-  await flushOneTimer(); // starts the in-flight fetch for cam-a; it never resolves on its own
-  const staleSignal = fetchCalls[0].signal;
-  if (staleSignal.aborted) throw new Error("test setup error: signal aborted before camera switch");
-  mod.scheduleMobileEventPoll("cam-b", [], [makeEvent("evt-b")]);
-  if (!staleSignal.aborted) {
-    throw new Error("switching cameras must abort the previous camera's in-flight request");
-  }
+  await flushOneTimer(); // starts the fetch; it never resolves on its own
+  if (fetchCalls.length !== 1) throw new Error("expected the fetch to have started");
+  if (renderCalls.length !== 0) throw new Error("must not render while the fetch is still hung");
+  fetchQueue.push(jsonResponse(200, { events: [makeEvent("evt-5", { hasClip: true })] }));
+  const flushedTimeout = await flushOneTimer(); // the fetch's own internal timeout fires, aborting it
+  if (!flushedTimeout) throw new Error("expected the fetch's own timeout to be queued");
+  const flushedRetry = await flushOneTimer(); // finally reschedules
+  if (!flushedRetry) throw new Error("expected a retry to be scheduled after the fetch timeout");
+  if (renderCalls.length !== 1) throw new Error("expected a render after the retry succeeded");
 });
 
-test("a stale response from a superseded camera never repaints the newly selected one", async () => {
+test("camera A's response arriving after switching to camera B must not repaint (immediate cancellation + selectedCameraId guard)", async () => {
   resetFakes();
+  // Camera A poll in flight.
+  selectCamera("cam-a");
   mod.scheduleMobileEventPoll("cam-a", [], [makeEvent("evt-a")]);
-  let resolveStale;
-  fetchQueue.push(() => new Promise((resolve) => { resolveStale = resolve; }));
-  await flushOneTimer();
-  mod.scheduleMobileEventPoll("cam-b", [], [makeEvent("evt-b")]);
-  // The old (aborted) request's underlying promise finally "arrives"
-  // anyway -- a real network response racing the abort is possible,
-  // not just the AbortError path.
-  resolveStale({ ok: true, status: 200, json: async () => ({ events: [makeEvent("evt-a", { hasClip: true })] }) });
+  let resolveA;
+  fetchQueue.push(() => new Promise((resolve) => { resolveA = resolve; }));
+  await flushOneTimer(); // camera A's fetch is now in flight, unresolved
+  const staleSignal = fetchCalls[0].signal;
+  if (staleSignal.aborted) throw new Error("test setup error: camera A's signal aborted too early");
+
+  // -> user clicks camera B. The real click handler updates
+  // selectedCameraId AND calls stopMobileEventPoll() in the same
+  // synchronous step -- immediately, not lazily on the next poll call.
+  selectCamera("cam-b");
+  if (!staleSignal.aborted) {
+    throw new Error("switching to camera B must immediately abort camera A's in-flight request");
+  }
+
+  // -> camera B's own initial load is delayed (e.g. still fetching its
+  // own recordings/date data) -- scheduleMobileEventPoll for cam-b
+  // hasn't been called yet at this point, matching a real slow
+  // renderCamera() for the newly selected camera.
+
+  // -> camera A's original (aborted) response finally arrives anyway --
+  // a real network response racing the abort is possible, not just the
+  // AbortError path, which is exactly why the cameraId!==selectedCameraId
+  // guard exists as a second, independent line of defense.
+  resolveA({ ok: true, status: 200, json: async () => ({ events: [makeEvent("evt-a", { hasClip: true })] }) });
   await settle();
   if (renderCalls.some((c) => c.cameraId === "cam-a")) {
-    throw new Error("a stale response from the old camera must never repaint anything");
+    throw new Error("camera A's response must never repaint the UI after switching to camera B");
   }
 });
 
-test("polling duration is aligned to the full 120s window (30 attempts at a 4s interval)", async () => {
+test("real elapsed-time deadline settles regardless of attempt count (not an attempt-count ceiling)", async () => {
   resetFakes();
-  const events = [makeEvent("evt-3")];
-  mod.scheduleMobileEventPoll("cam-3", [], events);
-  for (let i = 0; i < 30; i++) {
-    fetchQueue.push(jsonResponse(200, { events: [makeEvent("evt-3")] }));
-    const flushed = await flushOneTimer();
-    if (!flushed) throw new Error(`expected attempt ${i + 1}/30 to still be scheduled`);
-    // In production, renderMobileRecentEvents() itself re-invokes
-    // scheduleMobileEventPoll() after every successful render to
-    // continue the chain (see that function's own tail call) -- the
-    // spy standing in for it here doesn't, so the test re-arms it
-    // explicitly, exactly mirroring what the real render path does.
-    mod.scheduleMobileEventPoll("cam-3", [], events);
+  selectCamera("cam-6");
+  // Each re-arm call below passes a freshly-timestamped event (mirroring
+  // what renderMobileRecentEvents()'s real tail call always does with
+  // the latest merged data) -- never a stale array fixed at test start,
+  // which would let the event's OWN age-based pending window and the
+  // poll's deadline race each other at the same elapsed-time mark and
+  // make this test ambiguous about which one actually fired.
+  const freshEvents = () => [makeEvent("evt-6")];
+  mod.scheduleMobileEventPoll("cam-6", [], freshEvents());
+  // 5 attempts that each hang and get timeout-aborted: 5 * (4000
+  // interval + 8000 timeout) = 60000ms of real elapsed time for only 5
+  // attempts -- proving the deadline is driven by elapsed time, not an
+  // attempt counter (which round 1 would have required exactly 30
+  // attempts to reach regardless of how long each one took).
+  for (let i = 0; i < 5; i++) {
+    fetchQueue.push(neverResolves());
+    await flushOneTimer(); // starts the fetch
+    await flushOneTimer(); // its own timeout fires
+    mod.scheduleMobileEventPoll("cam-6", [], freshEvents());
   }
-  // By now 30 attempts (the full 120s/4s window) have already run --
-  // the deadline check inside the call above should have fired a
-  // settled render instead of scheduling attempt 31.
+  // Continue with quick still-pending responses until elapsed time
+  // crosses the 120s deadline -- 60000ms already elapsed, 15 more
+  // attempts at 4000ms each reaches 120000ms, for 20 total attempts,
+  // well under the old 30-attempt ceiling.
+  for (let i = 0; i < 15; i++) {
+    fetchQueue.push(jsonResponse(200, { events: [makeEvent("evt-6")] }));
+    await flushOneTimer();
+    mod.scheduleMobileEventPoll("cam-6", [], freshEvents());
+  }
   const settledCall = renderCalls[renderCalls.length - 1];
   if (!settledCall || !settledCall.options || !settledCall.options.settled) {
-    throw new Error("expected a settled=true render pass once the 120s deadline was reached");
+    throw new Error(`expected settled=true once real elapsed time reached the deadline (used 20 attempts, not 30)`);
   }
 });
 
 test("media arriving between 61s and 120s is still picked up, not cut off at the old 60s ceiling", async () => {
   resetFakes();
+  selectCamera("cam-4");
   const events = [makeEvent("evt-4")];
   mod.scheduleMobileEventPoll("cam-4", [], events);
   // 16 attempts * 4s = 64s -- past the OLD ~60s/15-attempt ceiling,
-  // still well inside the real 120s window. Each iteration re-arms via
-  // scheduleMobileEventPoll() itself, exactly what renderMobileRecentEvents()
-  // does for real after every successful render.
+  // still well inside the real 120s window.
   for (let i = 0; i < 15; i++) {
     fetchQueue.push(jsonResponse(200, { events: [makeEvent("evt-4")] }));
     await flushOneTimer();
@@ -250,6 +314,25 @@ test("media arriving between 61s and 120s is still picked up, not cut off at the
   const readyCall = renderCalls[renderCalls.length - 1];
   if (!readyCall || !readyCall.events[0].has_event_clip) {
     throw new Error("an event that becomes ready after the old 60s ceiling must still be picked up");
+  }
+});
+
+test("a final failed request exactly at the deadline still settles, never leaves Processing… indefinitely", async () => {
+  resetFakes();
+  selectCamera("cam-7");
+  const freshEvents = () => [makeEvent("evt-7")];
+  mod.scheduleMobileEventPoll("cam-7", [], freshEvents());
+  for (let i = 0; i < 29; i++) {
+    fetchQueue.push(jsonResponse(200, { events: [makeEvent("evt-7")] }));
+    await flushOneTimer();
+    mod.scheduleMobileEventPoll("cam-7", [], freshEvents());
+  }
+  fetchQueue.push(() => { throw new TypeError("final failure at the deadline"); });
+  await flushOneTimer();
+  mod.scheduleMobileEventPoll("cam-7", [], freshEvents());
+  const settledCall = renderCalls[renderCalls.length - 1];
+  if (!settledCall || !settledCall.options || !settledCall.options.settled) {
+    throw new Error("a final failure right at the deadline must still settle, never leave Processing… forever");
   }
 });
 

@@ -144,6 +144,12 @@ def test_fresh_pending_event_shows_processing_not_no_clip_available(http_client,
     assert response.status_code == 200
     assert "Processing…" in response.text
     assert "No clip available" not in response.text
+    row_html = _table_body(response.text)
+    # Round 2 (2026-09-05, Codex second review): media_state is tracked
+    # explicitly on the row from first render, not re-derived from
+    # timestamp age at settlement time later -- see
+    # settleExpiredDesktopEvents()'s own docstring in main.py for why.
+    assert 'data-media-state="processing"' in row_html
 
 
 def test_pending_event_offers_live_view_but_not_a_real_playback_link(http_client, db_path):
@@ -174,6 +180,7 @@ def test_ready_event_gets_a_real_enabled_playback_link(http_client, db_path):
     row_html = _table_body(response.text)
     assert "/playback?camera=cam-a1&event=evt-ready&autoplay=event" in row_html
     assert 'event-action-pending' not in row_html
+    assert 'data-media-state="ready"' in row_html
 
 
 def test_old_clipless_event_still_shows_the_em_dash_unchanged(http_client, db_path):
@@ -196,6 +203,7 @@ def test_old_clipless_event_still_shows_the_em_dash_unchanged(http_client, db_pa
     assert '<td class="event-thumbnail-cell">—</td>' in row_html
     assert "Processing…" not in row_html
     assert 'event-thumb-pending' not in row_html
+    assert 'data-media-state="none"' in row_html
 
 
 def test_rows_carry_event_id_and_timestamp_for_client_side_reconciliation(http_client, db_path):
@@ -210,3 +218,22 @@ def test_rows_carry_event_id_and_timestamp_for_client_side_reconciliation(http_c
     assert 'data-event-id="evt-1"' in response.text
     assert 'class="event-thumbnail-cell"' in response.text
     assert 'class="event-action-cell"' in response.text
+
+
+def test_both_event_count_pills_carry_the_class_and_data_count_client_side_reconciliation_needs(http_client, db_path):
+    """Round 2 (2026-09-05, Codex second review): both server-rendered
+    'N event(s)' pill displays (topbar + panel-head) must expose a
+    class/data-count hook so the client's updateVisibleEventCount()
+    can keep them in sync once reconciliation actually adds a new row
+    -- these were static counts with no such hook in round 1."""
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-a")
+    _seed_camera(conn, "cam-a1", customer_id="cust-a", camera_number=1, name="Front Door")
+    _seed_event(conn, "evt-1", customer_id="cust-a", camera_id="cam-a1", timestamp=_utc_now_naive_iso(-5))
+    _seed_event(conn, "evt-2", customer_id="cust-a", camera_id="cam-a1", timestamp=_utc_now_naive_iso(-10))
+    conn.commit()
+    conn.close()
+
+    response = http_client.get("/events", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
+    assert response.text.count('class="pill event-count-pill" data-count="2"') == 1
+    assert response.text.count('class="health-detail event-count-pill" data-count="2"') == 1

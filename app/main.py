@@ -119236,12 +119236,25 @@ def _render_customer_events(request: Request) -> str:
         type_label = str(event.get("event_type") or "event").replace("_", " ").title()
         camera_number = event.get("camera")
         event_id_attr = escape(str(event_id_val or ""), quote=True)
+        # P0 #5 remediation round 2 (2026-09-05, Codex second review):
+        # media_state is this row's own explicit, currently-rendered
+        # state -- tracked once here at render time (and again on the
+        # client at reconcile time, see reconcileDesktopEvent() in the
+        # script below) rather than re-derived from timestamp age at
+        # settlement time. See settleExpiredDesktopEvents()'s own
+        # docstring for exactly why re-deriving it from age was the
+        # bug: by the time the real 120s deadline arrives, every
+        # event's own age has already crossed that same 120s window, so
+        # the age-based predicate is false for everything regardless of
+        # whether a real response was ever received.
+        media_state = "ready" if event.get("has_event_clip") else ("processing" if is_pending else "none")
         rows.append(
             f'<tr data-event-camera="{escape(str(camera_number or ""), quote=True)}" '
             f'data-event-type="{escape(str(event.get("event_type") or ""), quote=True)}" '
             f'data-event-id="{event_id_attr}" '
             f'data-event-timestamp="{escape(raw_timestamp, quote=True)}" '
-            f'data-event-has-clip="{"1" if event.get("has_event_clip") else "0"}">'
+            f'data-event-has-clip="{"1" if event.get("has_event_clip") else "0"}" '
+            f'data-media-state="{media_state}">'
             f'<td>{escape(timestamp_label)}</td>'
             f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
             f'<td class="event-thumbnail-cell">{thumbnail}</td>'
@@ -119265,11 +119278,11 @@ def _render_customer_events(request: Request) -> str:
 .event-action-pending{{opacity:.55;cursor:default;pointer-events:none}}
 </style>
 <header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
-<div><span class="pill">{len(events_list)} event(s)</span></div></header>
+<div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
 <input class="picker-search" id="events-search" type="search" placeholder="Search"><div id="events-camera-filters">{camera_options}</div></aside>
-<section class="work-area"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail">{len(events_list)} event(s)</span></div>
+<section class="work-area"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
 <table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
 <tbody>{event_body}</tbody></table></section></div>"""
 
@@ -119366,22 +119379,20 @@ def _render_customer_events(request: Request) -> str:
   }
   wireEventThumbPlayer(document);
 
-  // P0 #5 Phase 3 (2026-09-05, Codex review): the desktop Events table
-  // gets the same Processing… -> ready reconciliation the mobile
-  // Playback cards already have, via the same SQL-bounded endpoint
-  // (see _customer_recent_events_bounded()'s own docstring) -- fleet-
-  // wide here since this table has no single "selected camera" the way
-  // Playback does. Resilient to the same failure modes: a transient
-  // network error or non-2xx response is retried (never a permanent
-  // stop), and the poll settles to an explicit "Not ready yet" state
-  // if EVENT_POLL_MAX_ATTEMPTS (aligned to the same 120s window) is
-  // reached with rows still pending, rather than leaving "Processing…"
-  // up forever.
+  // P0 #5 remediation round 2 (2026-09-05, Codex second review): same
+  // two fixes as scheduleMobileEventPoll() (see that function's own
+  // docstring for the full rationale) -- EVENT_FETCH_TIMEOUT_MS bounds
+  // a single fetch attempt so a never-responding server cannot stall
+  // this loop forever, and deadlineAt is a real wall-clock deadline
+  // (Date.now()-based) instead of an attempt-count ceiling. No
+  // per-camera session object is needed here (unlike mobile) -- this
+  // table is fleet-wide with no "selected camera" concept, so
+  // eventPollState only ever needs to guard against a second
+  // concurrent timer/fetch, never a camera switch.
   const EVENT_PENDING_WINDOW_MS=120000;
   const EVENT_POLL_INTERVAL_MS=4000;
-  const EVENT_POLL_MAX_ATTEMPTS=Math.ceil(EVENT_PENDING_WINDOW_MS/EVENT_POLL_INTERVAL_MS);
-  let eventPollTimer=null;
-  let eventPollAttempts=0;
+  const EVENT_FETCH_TIMEOUT_MS=8000;
+  let eventPollState=null;
 
   function desktopEventDate(timestamp){
     const text=String(timestamp||'');
@@ -119392,6 +119403,23 @@ def _render_customer_events(request: Request) -> str:
     if(hasClip)return false;
     const ageMs=Date.now()-desktopEventDate(timestamp).getTime();
     return ageMs>=0&&ageMs<EVENT_PENDING_WINDOW_MS;
+  }
+
+  // Round 2 fix: media_state is a row's own explicit, currently-
+  // rendered state ("processing"/"ready"/"none"/"settled") -- computed
+  // from isEventPending() only at the moment a row is first rendered
+  // or reconciled, then tracked on the row itself (data-media-state)
+  // from then on. Settlement below reads that tracked state, never
+  // re-derives it from timestamp age -- age-based re-derivation is
+  // exactly why round 1's settlement could silently never fire: by the
+  // time the real 120s deadline arrives, every event's own age has
+  // already crossed that same 120s window, so isEventPending() is
+  // false for all of them regardless of whether a real response was
+  // ever received, and "is anything still pending" looked false even
+  // while every row was still visibly showing "Processing…".
+  function mediaStateFor(hasClip,timestamp){
+    if(hasClip)return 'ready';
+    return isEventPending(hasClip,timestamp)?'processing':'none';
   }
 
   // JS mirror of _customer_event_playback_href() (main.py) -- same
@@ -119411,15 +119439,15 @@ def _render_customer_events(request: Request) -> str:
     return href;
   }
 
-  function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,pending){
+  function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,mediaState){
     const liveLink=cameraId?`<a class="download" href="/customer/cameras/${encodeURIComponent(cameraId)}/live">Live view</a> `:'';
-    if(pending){
+    if(mediaState==='processing'){
       return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Playback</span>`;
     }
     return `${liveLink}<a class="download" href="${eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip)}">Playback</a>`;
   }
 
-  function eventThumbnailCellHtml(event,pending){
+  function eventThumbnailCellHtml(event,mediaState){
     if(event.thumbnail){
       const img=`<img src="${event.thumbnail}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`;
       if(event.has_event_clip&&event.camera_id&&event.id){
@@ -119428,15 +119456,39 @@ def _render_customer_events(request: Request) -> str:
       }
       return img;
     }
-    return pending?'<span class="event-thumb-pending">Processing…</span>':'—';
+    return mediaState==='processing'?'<span class="event-thumb-pending">Processing…</span>':'—';
   }
 
+  // Round 2 fix: updates both server-rendered "N event(s)" pill
+  // displays (topbar + panel-head, see the Python template's own
+  // event-count-pill class/data-count) -- these were static counts
+  // baked in at page-load in round 1, never updated when reconciliation
+  // actually adds a genuinely new row to the table.
+  function updateVisibleEventCount(delta){
+    document.querySelectorAll('.event-count-pill').forEach(pill=>{
+      const next=Math.max(0,parseInt(pill.dataset.count||'0',10)+delta);
+      pill.dataset.count=String(next);
+      pill.textContent=`${next} event(s)`;
+    });
+  }
+
+  // Reconciles one fresh event against the table: updates an existing
+  // row's thumbnail/action cells and tracked media_state in place, or
+  // returns a new, not-yet-inserted <tr> for a genuinely new event.
+  // Insertion order across a whole batch is the caller's
+  // responsibility (see scheduleEventPoll()'s fetch success handler
+  // below) -- specifically so multiple simultaneously-new events keep
+  // this page's own newest-first order. Round 1 bug: inserting each
+  // new row at tbody.firstChild while iterating a DESC-ordered batch
+  // top-to-bottom reversed their relative order (the batch's own
+  // newest event ended up below its own older siblings).
   function reconcileDesktopEvent(event){
+    if(!event||!event.id)return null;
     const tbody=document.querySelector('#events-table tbody');
-    if(!tbody||!event||!event.id)return;
-    const pending=isEventPending(event.has_event_clip,event.timestamp);
-    const thumbHtml=eventThumbnailCellHtml(event,pending);
-    const actionHtml=eventActionCellHtml(event.camera_id,event.timestamp,event.id,event.has_event_clip,pending);
+    if(!tbody)return null;
+    const mediaState=mediaStateFor(event.has_event_clip,event.timestamp);
+    const thumbHtml=eventThumbnailCellHtml(event,mediaState);
+    const actionHtml=eventActionCellHtml(event.camera_id,event.timestamp,event.id,event.has_event_clip,mediaState);
     const existing=tbody.querySelector(`tr[data-event-id="${CSS.escape(String(event.id))}"]`);
     if(existing){
       const thumbCell=existing.querySelector('.event-thumbnail-cell');
@@ -119444,13 +119496,10 @@ def _render_customer_events(request: Request) -> str:
       if(thumbCell)thumbCell.innerHTML=thumbHtml;
       if(actionCell)actionCell.innerHTML=actionHtml;
       existing.dataset.eventHasClip=event.has_event_clip?'1':'0';
+      existing.dataset.mediaState=mediaState;
       wireEventThumbPlayer(existing);
-      return;
+      return null;
     }
-    // A genuinely new event that wasn't part of the initial page load
-    // -- inserted as a new row (most recent first, matching this
-    // page's own ORDER BY event_timestamp DESC) rather than silently
-    // waiting for the next full page load to ever show it.
     const placeholder=tbody.querySelector('tr td.empty-stage')?.closest('tr');
     if(placeholder)placeholder.remove();
     const row=document.createElement('tr');
@@ -119459,6 +119508,7 @@ def _render_customer_events(request: Request) -> str:
     row.dataset.eventId=String(event.id);
     row.dataset.eventTimestamp=String(event.timestamp||'');
     row.dataset.eventHasClip=event.has_event_clip?'1':'0';
+    row.dataset.mediaState=mediaState;
     const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
     const confidence=event.confidence;
     const confidencePercent=(confidence===null||confidence===undefined)?'—':`${(confidence<=1?confidence*100:confidence).toFixed(1)}%`;
@@ -119468,15 +119518,17 @@ def _render_customer_events(request: Request) -> str:
       `<td><span class="pill">${typeLabel}</span></td>`+
       `<td>${confidencePercent}</td>`+
       `<td class="event-action-cell">${actionHtml}</td>`;
-    tbody.insertBefore(row,tbody.firstChild);
-    wireEventThumbPlayer(row);
-    rows.push(row);
-    apply();
+    return row;
   }
 
+  // Round 2 fix: settlement reads each row's own tracked
+  // data-media-state (set exactly once, at render/reconcile time) --
+  // never re-derives "still pending" from timestamp age (see
+  // mediaStateFor()'s own docstring above for exactly why that was the
+  // bug).
   function settleExpiredDesktopEvents(){
-    document.querySelectorAll('#events-table tbody tr[data-event-id]').forEach(row=>{
-      if(!isEventPending(row.dataset.eventHasClip==='1',row.dataset.eventTimestamp))return;
+    document.querySelectorAll('#events-table tbody tr[data-media-state="processing"]').forEach(row=>{
+      row.dataset.mediaState='settled';
       const pendingLabel=row.querySelector('.event-thumbnail-cell .event-thumb-pending');
       if(pendingLabel)pendingLabel.textContent='Not ready yet';
       const actionPending=row.querySelector('.event-action-cell .event-action-pending');
@@ -119484,33 +119536,65 @@ def _render_customer_events(request: Request) -> str:
     });
   }
 
-  function anyDesktopEventStillPending(){
-    return [...document.querySelectorAll('#events-table tbody tr[data-event-id]')]
-      .some(row=>isEventPending(row.dataset.eventHasClip==='1',row.dataset.eventTimestamp));
+  function anyDesktopRowStillProcessing(){
+    return document.querySelector('#events-table tbody tr[data-media-state="processing"]')!==null;
   }
 
   function scheduleEventPoll(){
-    if(eventPollTimer)return;
-    if(!anyDesktopEventStillPending())return;
-    if(eventPollAttempts>=EVENT_POLL_MAX_ATTEMPTS){
-      settleExpiredDesktopEvents();
+    if(!eventPollState){
+      eventPollState={deadlineAt:Date.now()+EVENT_PENDING_WINDOW_MS,timer:null,controller:null};
+    }
+    const state=eventPollState;
+    if(!anyDesktopRowStillProcessing()){
+      if(state.timer)clearTimeout(state.timer);
+      eventPollState=null;
       return;
     }
-    eventPollTimer=setTimeout(async()=>{
-      eventPollTimer=null;
-      eventPollAttempts++;
+    if(Date.now()>=state.deadlineAt){
+      if(state.timer)clearTimeout(state.timer);
+      settleExpiredDesktopEvents();
+      eventPollState=null;
+      return;
+    }
+    if(state.timer)return;
+    state.timer=setTimeout(async()=>{
+      state.timer=null;
+      const controller=new AbortController();
+      state.controller=controller;
+      const fetchTimeoutId=setTimeout(()=>controller.abort(),EVENT_FETCH_TIMEOUT_MS);
       try{
-        const response=await fetch('/api/customer/events/recent',{cache:'no-store'});
+        const response=await fetch('/api/customer/events/recent',{cache:'no-store',signal:controller.signal});
+        if(eventPollState!==state)return;
         if(response.ok){
           const payload=await response.json();
-          (payload.events||[]).forEach(reconcileDesktopEvent);
+          if(eventPollState!==state)return;
+          const tbody=document.querySelector('#events-table tbody');
+          // Reversed (oldest-of-this-batch first) so consecutive
+          // tbody.insertBefore(firstChild) calls end up in the correct
+          // newest-first visual order -- see reconcileDesktopEvent()'s
+          // own docstring.
+          [...(payload.events||[])].reverse().forEach(event=>{
+            const newRow=reconcileDesktopEvent(event);
+            if(newRow&&tbody){
+              tbody.insertBefore(newRow,tbody.firstChild);
+              wireEventThumbPlayer(newRow);
+              rows.push(newRow);
+              updateVisibleEventCount(1);
+            }
+          });
+          apply();
         }
         // non-2xx: transient, retried below via finally -- never a
         // permanent stop.
       }catch(error){
-        // transient network failure -- retried below via finally.
+        // AbortError (a fetch that exceeded EVENT_FETCH_TIMEOUT_MS) or
+        // a genuine transient network failure -- either way, retried
+        // below via finally, never a permanent stop.
       }finally{
-        scheduleEventPoll();
+        clearTimeout(fetchTimeoutId);
+        if(eventPollState===state){
+          scheduleEventPoll();
+        }
       }
     },EVENT_POLL_INTERVAL_MS);
   }
@@ -140966,6 +141050,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       cameraTiles.forEach(item=>item.classList.remove('active'));
       tile.classList.add('active');
       selectedCameraId=tile.dataset.cameraId;
+      // P0 #5 remediation round 2 (2026-09-05, Codex second review):
+      // stop the OLD camera's poll session (clear its timer, abort its
+      // in-flight request) the instant selectedCameraId changes --
+      // never waiting for scheduleMobileEventPoll()'s own lazy
+      // cameraId-mismatch detection, which only runs the next time it
+      // happens to be called. See scheduleMobileEventPoll()'s own
+      // docstring for the remaining two, independently-redundant
+      // guards against a stale response from this same race.
+      stopMobileEventPoll();
       clipPanel.hidden=true;
       renderAvailableDates(selectedCameraId).catch(()=>{{}});
       if(viewingDate){{
@@ -141146,21 +141239,33 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
   const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
-  // P0 #5 remediation (2026-09-05, Codex review): MOBILE_EVENT_POLL_MAX_
-  // ATTEMPTS is derived from the window/interval themselves (never a
-  // second, independently-hardcoded number) so the poll's own give-up
-  // point can never silently drift shorter than the window it's
-  // supposed to cover.
+  // P0 #5 remediation round 2 (2026-09-05, Codex second review) --
+  // two further gaps in round 1's design: (1) MOBILE_EVENT_FETCH_
+  // TIMEOUT_MS bounds a single fetch attempt -- round 1 had no bound
+  // here at all, so a server that never responds stalled this whole
+  // loop forever (no response -> `finally` never runs -> no retry is
+  // ever scheduled -> the give-up ceiling is never reached either);
+  // (2) deadlineAt is a real wall-clock deadline (Date.now()-based),
+  // replacing round 1's attempt-count ceiling, which assumed every
+  // attempt costs the same ~0 extra time -- a handful of genuinely
+  // slow (not literally hanging) responses could already blow past the
+  // real 120s window while the attempt counter was nowhere near its
+  // limit, or vice versa.
   const MOBILE_EVENT_PENDING_WINDOW_MS=120000;
   const MOBILE_EVENT_POLL_INTERVAL_MS=4000;
-  const MOBILE_EVENT_POLL_MAX_ATTEMPTS=Math.ceil(MOBILE_EVENT_PENDING_WINDOW_MS/MOBILE_EVENT_POLL_INTERVAL_MS);
+  const MOBILE_EVENT_FETCH_TIMEOUT_MS=8000;
   // One mutable "current poll session" object, replaced (never mutated
   // across a camera change) whenever scheduleMobileEventPoll() is asked
-  // to track a different cameraId than the one it's already tracking --
-  // this, plus the AbortController below, is what makes a response that
-  // arrives after the visible camera has already changed structurally
-  // unable to repaint it: the old session's own identity/controller no
-  // longer match anything current by the time that response resolves.
+  // to track a different cameraId than the one it's already tracking.
+  // Three independent, redundant guards against a stale response
+  // repainting the wrong camera: the camera-tile click handler's own
+  // immediate stopMobileEventPoll() call (clears the timer, aborts the
+  // in-flight request the instant selectedCameraId changes -- never
+  // waiting for this object's own lazy mismatch detection below);
+  // this object's own identity check inside the fetch callback; and an
+  // explicit cameraId!==selectedCameraId check there too, reading the
+  // page's own live selection state directly rather than trusting this
+  // object alone.
   let mobileEventPollState=null;
 
   function isMobileEventPending(event){{
@@ -141178,41 +141283,18 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   }}
 
   // Deliberately polls /api/customer/events/recent/<cameraId> -- the
-  // same customer-scoped, self-authorizing, now SQL-bounded-to-this-
-  // camera list the page already rendered once at load -- rather than
-  // a per-event endpoint keyed on an id that may not exist yet. Re-
+  // same customer-scoped, self-authorizing, SQL-bounded-to-this-camera
+  // list the page already rendered once at load -- rather than a
+  // per-event endpoint keyed on an id that may not exist yet. Re-
   // invokes renderMobileRecentEvents() itself on the merged result
   // instead of hand-patching DOM nodes: that keeps this reconciliation
   // exactly as correct as the render path it reuses, and merging fresh
   // rows into existing ones by id (never appending) is what makes a
   // duplicate row structurally impossible here.
-  //
-  // P0 #5 remediation (2026-09-05, Codex review) -- three failure modes
-  // the original version had: (1) a transient network error or non-2xx
-  // response permanently stopped polling -- the catch block did
-  // nothing, and nothing else ever called this function again for that
-  // failed attempt; (2) camera switching didn't cancel the in-flight
-  // request tied to the OLD camera, so a late response could repaint a
-  // camera the customer had already navigated away from; (3) the poll
-  // gave up at MOBILE_EVENT_POLL_INTERVAL_MS*15 (~60s) even though
-  // MOBILE_EVENT_PENDING_WINDOW_MS itself defines events as still-
-  // plausibly-processing for a full 120s, and never rendered any
-  // different state once it did give up -- "Processing…" stayed up
-  // forever with no indication polling had stopped. Fixed by: a
-  // per-camera session object + AbortController (state above, replaced
-  // whenever cameraId changes -- never a bare global timer/counter that
-  // could survive a camera switch); rescheduling from a `finally` block
-  // whenever this attempt did NOT already hand off to a fresh render
-  // pass (which itself continues the chain -- see the end of
-  // renderMobileRecentEvents()); attempts derived from the window
-  // itself (MOBILE_EVENT_POLL_MAX_ATTEMPTS above); and one final
-  // `settled` render pass when the deadline is reached with events
-  // still pending, so the UI settles to an explicit "not ready yet"
-  // state instead of "Processing…" forever.
   function scheduleMobileEventPoll(cameraId,clips,events){{
     if(!mobileEventPollState||mobileEventPollState.cameraId!==cameraId){{
       stopMobileEventPoll();
-      mobileEventPollState={{cameraId,attempts:0,timer:null,controller:null}};
+      mobileEventPollState={{cameraId,deadlineAt:Date.now()+MOBILE_EVENT_PENDING_WINDOW_MS,timer:null,controller:null}};
     }}
     const state=mobileEventPollState;
     const stillPending=events.some(isMobileEventPending);
@@ -141221,31 +141303,35 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       state.timer=null;
       return;
     }}
-    if(state.attempts>=MOBILE_EVENT_POLL_MAX_ATTEMPTS){{
+    if(Date.now()>=state.deadlineAt){{
       if(state.timer)clearTimeout(state.timer);
       state.timer=null;
-      // Deadline reached with events still pending -- one last render
-      // pass settles them to an explicit fallback instead of leaving
-      // "Processing…" up forever with no indication polling stopped.
+      // Real elapsed time has reached the deadline with events still
+      // pending -- one last render pass settles them to an explicit
+      // fallback instead of leaving "Processing…" up forever with no
+      // indication polling stopped.
       renderMobileRecentEvents(cameraId,clips,events,{{settled:true}});
       return;
     }}
     if(state.timer)return;
     state.timer=setTimeout(async()=>{{
       state.timer=null;
-      state.attempts++;
       const controller=new AbortController();
       state.controller=controller;
+      // Bounds this one fetch attempt -- a response that never arrives
+      // must not block scheduling the next attempt (or reaching
+      // settlement) forever.
+      const fetchTimeoutId=setTimeout(()=>controller.abort(),MOBILE_EVENT_FETCH_TIMEOUT_MS);
       let handedOff=false;
       try{{
         const response=await fetch(
           `/api/customer/events/recent/${{encodeURIComponent(cameraId)}}`,
           {{cache:'no-store',signal:controller.signal}}
         );
-        if(mobileEventPollState!==state)return; // superseded by a camera switch mid-flight
+        if(mobileEventPollState!==state||cameraId!==selectedCameraId)return; // superseded by a camera switch mid-flight
         if(!response.ok)return; // non-2xx: transient, retried via finally below
         const payload=await response.json();
-        if(mobileEventPollState!==state)return;
+        if(mobileEventPollState!==state||cameraId!==selectedCameraId)return;
         const freshEvents=payload.events||[];
         const byId=new Map();
         events.forEach(existing=>{{if(existing.id)byId.set(existing.id,existing);}});
@@ -141253,11 +141339,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         handedOff=true;
         renderMobileRecentEvents(cameraId,clips,Array.from(byId.values()));
       }}catch(error){{
-        // AbortError from a superseded camera selection, or a genuine
-        // transient network failure -- either way, fall through to
-        // finally, which retries with the same events/clips this
-        // attempt started with rather than silently giving up.
+        // AbortError (a superseded camera selection, or a fetch that
+        // exceeded MOBILE_EVENT_FETCH_TIMEOUT_MS -- both look
+        // identical here, and both are correctly handled the same way)
+        // or a genuine transient network failure -- either way, fall
+        // through to finally, which retries (if the real deadline
+        // hasn't passed) with the same events/clips this attempt
+        // started with rather than silently giving up.
       }}finally{{
+        clearTimeout(fetchTimeoutId);
         if(!handedOff&&mobileEventPollState===state){{
           scheduleMobileEventPoll(cameraId,clips,events);
         }}
