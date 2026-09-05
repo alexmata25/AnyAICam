@@ -41104,6 +41104,37 @@ PARTNER_PORTAL_ROLES = {"partner_admin", "partner_sales", "installer"}
 
 CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer"}
 
+# Access Control placeholder framework (2026-09-05): future premium
+# add-on feature names, reserved now so the navigation item,
+# /access-control page, and Live View camera-card button can be built
+# and shipped before any real relay hardware integration -- or the
+# standalone/add-on entitlement layer itself -- exists.
+#
+# Deliberately NOT added to LICENSE_PLAN_FEATURES' starter/professional/
+# enterprise arrays: those are real, currently-enforced plan-tier
+# entitlements, and adding a key there would immediately grant it to
+# every existing customer on a plan that happens to already qualify --
+# exactly the "existing customers must not become entitled merely
+# because the keys exist" outcome this milestone must avoid. These two
+# names are reserved for a future standalone/add-on entitlement layer
+# instead, which does not exist yet.
+ACCESS_CONTROL_FEATURE = "access_control"
+REMOTE_RELAY_FEATURE = "remote_relay"
+
+
+def _customer_feature_entitled(customer_id: str | None, feature: str) -> bool:
+    """Whether this customer_id has the given future-feature entitlement
+    (ACCESS_CONTROL_FEATURE, REMOTE_RELAY_FEATURE, ...) enabled. Always
+    False today, for every customer_id, regardless of plan -- no
+    standalone/add-on entitlement layer exists yet, and this must not
+    be wired into LICENSE_PLAN_FEATURES (see this module's own
+    docstring above for why). This is the one seam a future entitlement
+    layer replaces; every caller (the nav badge, the /access-control
+    page, the Live View Access Control button) already calls through
+    here instead of checking anything itself, so turning this on later
+    for real needs no other code change."""
+    return False
+
 
 
 
@@ -45408,7 +45439,7 @@ STYLES = """
 
 
 
-.sidebar{display:flex;flex-direction:column}.nav{flex:1}.sidebar-auth{margin-top:auto;padding:10px 5px 4px}.sidebar-logout{width:100%;min-height:54px;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 6px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:#24292c;color:#fff;font:inherit;font-weight:750;cursor:pointer}.sidebar-logout:hover,.sidebar-logout:focus-visible{background:#343b3f;border-color:var(--brand);outline:none}.sidebar-logout-icon{font-size:18px;line-height:1}.sidebar-build-badge{margin-top:8px;padding:4px 5px 0;color:var(--muted,#8f9baa);font-size:10px;letter-spacing:.02em;text-align:center;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}@media(max-width:760px){.sidebar-auth{display:none}}:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--panel2:#181e28;--line:#27303d;--text:#f4f7fb;--muted:#8f9baa;--accent:#47d7ac;--blue:#70a5ff;--danger:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;border-right:1px solid var(--line);background:#0e1218}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 28px;font-weight:750;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:#07110e;font-size:18px}.nav{display:grid;gap:6px}.nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:650}.nav a:hover{background:var(--panel2);color:var(--text)}.nav a.active{background:#193329;color:#7ee8c7}.sidebar-foot{position:absolute;left:16px;right:16px;bottom:22px;padding:13px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.sidebar-foot strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.content{min-width:0;padding:30px 34px 50px;max-width:1600px;width:100%;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.eyebrow{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,3vw,34px);letter-spacing:-.035em}h2{margin:0;font-size:18px}.clock{color:var(--muted);font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:24px}.stat{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.stat-label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}.stat-value{font-size:18px;font-weight:750}.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(71,215,172,.1)}.section-head{display:flex;align-items:end;justify-content:space-between;margin:0 0 14px}.section-head p{margin:0;color:var(--muted);font-size:13px}.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.camera-card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}.camera-view{position:relative;display:grid;place-items:center;aspect-ratio:16/9;background:#080a0e;overflow:hidden}.camera-view video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}.camera-placeholder{text-align:center;color:var(--muted);padding:20px}.camera-placeholder .signal{display:block;margin:0 auto 12px;font-size:25px}.camera-placeholder strong{display:block;color:#cad2dd;margin-bottom:4px}.live-badge{position:absolute;z-index:2;top:12px;left:12px;padding:6px 9px;border-radius:8px;background:rgba(8,10,14,.78);font-size:11px;font-weight:800;letter-spacing:.08em}.live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--danger)}.camera-meta{display:flex;justify-content:space-between;gap:15px;padding:14px 16px}.camera-name{font-weight:700}.camera-state{color:var(--muted);font-size:12px}.camera-state.ready{color:var(--accent)}.library-toolbar{display:flex;gap:10px;margin-bottom:18px;overflow:auto}.filter{border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);padding:8px 13px;cursor:pointer;white-space:nowrap}.filter.active{background:var(--text);border-color:var(--text);color:#0b0e13}.camera-section{margin-bottom:28px}.recording-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}.clip{overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.clip video{display:block;width:100%;aspect-ratio:16/9;background:#07090c}.clip-body{padding:13px}.clip-time{font-weight:700;font-size:14px}.clip-meta{margin:5px 0 12px;color:var(--muted);font-size:12px}.download{color:var(--blue);text-decoration:none;font-size:13px;font-weight:700}.empty{padding:28px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);text-align:center;background:rgba(18,23,32,.5)}.mobile-nav{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:980px){.recording-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:23px 16px 90px}.clock{display:none}.summary{grid-template-columns:1fr}.camera-grid,.recording-grid{grid-template-columns:1fr}.mobile-nav{position:fixed;z-index:20;display:grid;grid-template-columns:1fr 1fr;left:12px;right:12px;bottom:12px;padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(18,23,32,.94);backdrop-filter:blur(14px)}.mobile-nav a{text-align:center;padding:10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:700;font-size:13px}.mobile-nav a.active{background:#193329;color:#7ee8c7}}
+.sidebar{display:flex;flex-direction:column}.nav{flex:1}.sidebar-auth{margin-top:auto;padding:10px 5px 4px}.sidebar-logout{width:100%;min-height:54px;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 6px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:#24292c;color:#fff;font:inherit;font-weight:750;cursor:pointer}.sidebar-logout:hover,.sidebar-logout:focus-visible{background:#343b3f;border-color:var(--brand);outline:none}.sidebar-logout-icon{font-size:18px;line-height:1}.sidebar-build-badge{margin-top:8px;padding:4px 5px 0;color:var(--muted,#8f9baa);font-size:10px;letter-spacing:.02em;text-align:center;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}@media(max-width:760px){.sidebar-auth{display:none}}:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--panel2:#181e28;--line:#27303d;--text:#f4f7fb;--muted:#8f9baa;--accent:#47d7ac;--blue:#70a5ff;--danger:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;border-right:1px solid var(--line);background:#0e1218}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 28px;font-weight:750;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:#07110e;font-size:18px}.nav{display:grid;gap:6px}.nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:650}.nav a:hover{background:var(--panel2);color:var(--text)}.nav a.active{background:#193329;color:#7ee8c7}.nav-badge{margin-left:auto;padding:2px 7px;border-radius:999px;background:#302a1d;color:#f0ca72;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;white-space:nowrap}.sidebar-foot{position:absolute;left:16px;right:16px;bottom:22px;padding:13px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.sidebar-foot strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.content{min-width:0;padding:30px 34px 50px;max-width:1600px;width:100%;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.eyebrow{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,3vw,34px);letter-spacing:-.035em}h2{margin:0;font-size:18px}.clock{color:var(--muted);font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:24px}.stat{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.stat-label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}.stat-value{font-size:18px;font-weight:750}.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(71,215,172,.1)}.section-head{display:flex;align-items:end;justify-content:space-between;margin:0 0 14px}.section-head p{margin:0;color:var(--muted);font-size:13px}.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.camera-card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}.camera-view{position:relative;display:grid;place-items:center;aspect-ratio:16/9;background:#080a0e;overflow:hidden}.camera-view video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}.camera-placeholder{text-align:center;color:var(--muted);padding:20px}.camera-placeholder .signal{display:block;margin:0 auto 12px;font-size:25px}.camera-placeholder strong{display:block;color:#cad2dd;margin-bottom:4px}.live-badge{position:absolute;z-index:2;top:12px;left:12px;padding:6px 9px;border-radius:8px;background:rgba(8,10,14,.78);font-size:11px;font-weight:800;letter-spacing:.08em}.live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--danger)}.camera-meta{display:flex;justify-content:space-between;gap:15px;padding:14px 16px}.camera-name{font-weight:700}.camera-state{color:var(--muted);font-size:12px}.camera-state.ready{color:var(--accent)}.library-toolbar{display:flex;gap:10px;margin-bottom:18px;overflow:auto}.filter{border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);padding:8px 13px;cursor:pointer;white-space:nowrap}.filter.active{background:var(--text);border-color:var(--text);color:#0b0e13}.camera-section{margin-bottom:28px}.recording-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}.clip{overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.clip video{display:block;width:100%;aspect-ratio:16/9;background:#07090c}.clip-body{padding:13px}.clip-time{font-weight:700;font-size:14px}.clip-meta{margin:5px 0 12px;color:var(--muted);font-size:12px}.download{color:var(--blue);text-decoration:none;font-size:13px;font-weight:700}.empty{padding:28px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);text-align:center;background:rgba(18,23,32,.5)}.mobile-nav{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:980px){.recording-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:23px 16px 90px}.clock{display:none}.summary{grid-template-columns:1fr}.camera-grid,.recording-grid{grid-template-columns:1fr}.mobile-nav{position:fixed;z-index:20;display:grid;grid-template-columns:1fr 1fr;left:12px;right:12px;bottom:12px;padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(18,23,32,.94);backdrop-filter:blur(14px)}.mobile-nav a{text-align:center;padding:10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:700;font-size:13px}.mobile-nav a.active{background:#193329;color:#7ee8c7}}
 
 
 
@@ -46185,6 +46216,15 @@ NAV_ITEMS = [
     ("playback", "/playback", "◴", "Playback"),
 
 
+    # Access Control placeholder (2026-09-05): always listed for a
+    # customer-portal identity (see navigation_keys_for_role() below) --
+    # never hidden -- the "Coming soon" badge below is what actually
+    # communicates entitlement state, per explicit product requirement
+    # ("visible... but must not imply physical relay control is
+    # currently available").
+    ("access-control", "/access-control", "⚿", "Access Control"),
+
+
 
 
 
@@ -46871,7 +46911,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "investigate", "dashboard",
+            "live", "events", "alerts", "playback", "access-control", "investigate", "dashboard",
 
 
 
@@ -47234,7 +47274,16 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-        f'<a class="{"active" if key == active else ""}" href="{url}"><span class="nav-icon">{icon}</span><span>{label}</span></a>'
+        (
+            f'<a class="{"active" if key == active else ""}" href="{url}"><span class="nav-icon">{icon}</span><span>{label}</span>'
+            + (
+                '<span class="nav-badge">Coming soon</span>'
+                if key == "access-control"
+                and not _customer_feature_entitled((shell_user or {}).get("customer_id"), ACCESS_CONTROL_FEATURE)
+                else ""
+            )
+            + "</a>"
+        )
 
 
 
@@ -47948,6 +47997,60 @@ register_mobile_notification_routes(
 
 
 
+
+
+@app.get("/access-control", response_class=HTMLResponse)
+def access_control_page(request: Request) -> str:
+    """Placeholder route for the future Access Control premium add-on
+    (2026-09-05) -- doors, gates, and relay-controlled entry points, a
+    future companion to Live/Playback/Events for a customer's own real
+    access-control hardware. No relay hardware integration, and no
+    standalone/add-on entitlement layer, exists yet anywhere in this
+    codebase; this route exists purely so the navigation item and the
+    Live View camera-card button have somewhere real to link to, and so
+    a customer can see the feature is coming rather than it being
+    invisible -- per explicit product requirement. No operational
+    controls are exposed here.
+
+    Gated exactly like every other real customer-portal page --
+    customer_owner/customer_viewer only, same redirect-to-login for
+    anyone else -- even though its own content is identical for every
+    customer today. _customer_feature_entitled() is still checked and
+    threaded through here (rather than hardcoding "always coming soon")
+    specifically so this exact route becomes the real entitled page
+    later with no routing change -- only the branch below needs new
+    content once a real entitlement layer and real device data exist."""
+    from partner_portal import partner_identity
+    identity = partner_identity(request)
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return RedirectResponse("/partner-login", status_code=303)
+
+    entitled = _customer_feature_entitled(identity.get("customer_id"), ACCESS_CONTROL_FEATURE)
+    if entitled:
+        # No real relay/access-control device data (and no standalone
+        # entitlement layer) exists yet even for an entitled
+        # customer_id -- see the Access Control framework's own design
+        # notes. This branch is reserved for the real doors/gates/relay
+        # list once both exist; until then it deliberately falls
+        # through to the exact same honest "coming soon" copy as an
+        # unentitled customer, rather than claiming a feature is ready
+        # when the underlying hardware integration does not exist yet.
+        pass
+
+    content = (
+        '<header class="topbar"><div><p class="eyebrow">Future add-on</p><h1>Access Control</h1></div></header>'
+        '<section class="panel">'
+        '<div class="empty-stage" style="min-height:280px">'
+        '<div>'
+        '<p style="font-size:16px;color:var(--muted);max-width:440px;margin:0 auto 18px;line-height:1.5">'
+        "Manage doors, gates, relay outputs, and access-controlled entry points from AnyAiCam."
+        "</p>"
+        '<span class="coming">Coming soon</span>'
+        "</div>"
+        "</div>"
+        "</section>"
+    )
+    return page_shell("Access Control", "access-control", content)
 
 
 @app.get("/camera/{camera_number}", response_class=HTMLResponse)

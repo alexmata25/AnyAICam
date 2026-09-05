@@ -407,6 +407,34 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         columns = 1 if len(cameras) == 1 else 2 if len(cameras) <= 4 else 3 if len(cameras) <= 9 else 4
         camera_ids = [camera['id'] for camera in cameras]
 
+        # Video Door Call (2026-09-05): UI/framework placeholder only --
+        # see door-call-tool's click handler below for the full "always
+        # Coming Soon today" contract. These six fields are the future
+        # per-camera door-call data model (Site -> Camera/Entry Point ->
+        # door-call device), not yet backed by any real column on
+        # `cameras` or any other table -- hardcoded to their safe "not
+        # configured" values here so every tile's button is already
+        # camera-aware (carries its own camera_id plus these five future
+        # fields as data-* attributes) without waiting on that
+        # migration. Nothing reads or writes real hardware from these
+        # values today.
+        door_call_enabled = False
+        door_call_device_id = ''
+        door_call_provider = ''
+        entry_point_id = ''
+        two_way_audio_capable = False
+        relay_capable = False
+
+        # Access Control (2026-09-05): same placeholder contract as
+        # Door Call above -- ACCESS_CONTROL_FEATURE is reserved (see
+        # main.py) but deliberately not wired into any real entitlement
+        # layer yet, so this is always False for every customer today,
+        # never inferred per-camera. Local import (not module-level) to
+        # avoid a circular import -- main.py itself imports
+        # register_live_view_page_routes from this module.
+        from main import ACCESS_CONTROL_FEATURE, _customer_feature_entitled
+        access_control_entitled = _customer_feature_entitled(identity.get('customer_id'), ACCESS_CONTROL_FEATURE)
+
         tiles = ''.join(
             f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
               <div class="camera-view" style="border-radius:10px">
@@ -422,6 +450,23 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                     title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
                     aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
                     {'' if camera['enabled'] else 'disabled'}>🎤</button>
+                  <button class="camera-tool door-call-tool" id="door-call-{escape(camera['id'], quote=True)}"
+                    data-camera-id="{escape(camera['id'], quote=True)}"
+                    data-door-call-enabled="{'1' if door_call_enabled else '0'}"
+                    data-door-call-device-id="{escape(door_call_device_id, quote=True)}"
+                    data-door-call-provider="{escape(door_call_provider, quote=True)}"
+                    data-entry-point-id="{escape(entry_point_id, quote=True)}"
+                    data-two-way-audio-capable="{'1' if two_way_audio_capable else '0'}"
+                    data-relay-capable="{'1' if relay_capable else '0'}"
+                    title="Video Door Call" aria-label="Video Door Call">🔔</button>
+                  <button class="camera-tool access-control-tool" id="access-control-{escape(camera['id'], quote=True)}"
+                    data-camera-id="{escape(camera['id'], quote=True)}"
+                    data-access-control-enabled="{'1' if access_control_entitled else '0'}"
+                    data-entry-point-id="{escape(entry_point_id, quote=True)}"
+                    data-relay-device-id=""
+                    data-relay-channel=""
+                    data-allowed-action=""
+                    title="Access Control" aria-label="Access Control">⚿</button>
                   <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
                     title="Camera tools (mute, snapshot, download, share, analytics, bookmark, stop)"
                     aria-label="Open camera tools">⚙</a>
@@ -464,9 +509,44 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.talk-mic{{touch-action:none}}'
             f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
             f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
+            # Video Door Call / Access Control (2026-09-05): one shared
+            # overlay per feature (not one per tile) -- there is only
+            # ever one placeholder panel to show per button type
+            # regardless of which camera's button opened it, since none
+            # of them have any real per-camera content yet.
+            f'.tile-modal{{position:fixed;inset:0;z-index:40;display:flex;'
+            f'align-items:center;justify-content:center;background:rgba(7,12,20,.6)}}'
+            f'.tile-modal[hidden]{{display:none}}'
+            f'.tile-modal-panel{{position:relative;max-width:360px;padding:26px 24px;'
+            f'border-radius:14px;background:var(--panel,#121720);border:1px solid var(--line,#27303d);'
+            f'text-align:center}}'
+            f'.tile-modal-panel h2{{margin:0 0 10px}}'
+            f'.tile-modal-panel p{{margin:0 0 4px;color:var(--muted,#8f9baa);font-size:14px;line-height:1.5}}'
+            f'.tile-modal-close{{position:absolute;top:10px;right:10px;width:28px;height:28px;'
+            f'border:0;border-radius:8px;background:transparent;color:var(--muted,#8f9baa);'
+            f'font-size:18px;line-height:1;cursor:pointer}}'
+            f'.tile-modal-close:hover{{background:var(--panel2,#181e28);color:var(--text,#f4f7fb)}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
             f'</style>'
             f'<section class="live-grid">{tiles}</section>'
+            # Shared placeholder panels -- see the CSS block above and
+            # the JS wiring below for why one of each is enough.
+            f'<div id="door-call-modal" class="tile-modal" hidden aria-hidden="true">'
+            f'<div class="tile-modal-panel" role="dialog" aria-modal="true" aria-labelledby="door-call-modal-title">'
+            f'<button type="button" class="tile-modal-close" aria-label="Close">×</button>'
+            f'<h2 id="door-call-modal-title">Video Door Call</h2>'
+            f'<p>Receive doorbell calls with live video and two-way audio.</p>'
+            f'<span class="coming">Coming soon</span>'
+            f'</div>'
+            f'</div>'
+            f'<div id="access-control-modal" class="tile-modal" hidden aria-hidden="true">'
+            f'<div class="tile-modal-panel" role="dialog" aria-modal="true" aria-labelledby="access-control-modal-title">'
+            f'<button type="button" class="tile-modal-close" aria-label="Close">×</button>'
+            f'<h2 id="access-control-modal-title">Access Control</h2>'
+            f'<p>Control doors, gates, and relay-enabled entry points from AnyAiCam.</p>'
+            f'<span class="coming">Coming soon</span>'
+            f'</div>'
+            f'</div>'
         )
 
         scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
@@ -589,6 +669,52 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   document.querySelectorAll('.talk-mic').forEach(button=>{{
     wireTalkMic(button, button.dataset.cameraId);
   }});
+
+  // Shared "Coming Soon" placeholder wiring for Video Door Call and
+  // Access Control (2026-09-05). Both are UI/framework placeholders
+  // only -- no real doorbell signaling, Talk Down session, relay
+  // trigger, ONVIF/ISAPI call, or camera/recording/event-media
+  // behavior is started here, and neither button makes any network
+  // request. Every button of a given type opens that type's single
+  // shared panel today, since neither door_call_enabled nor
+  // access_control_enabled is a real per-camera/entitled fact
+  // anywhere in this codebase yet (see the Python template above).
+  // Each button's own data-* attributes (camera_id plus the future
+  // door-call/access-control fields) already make it camera-aware for
+  // when that data model exists -- these two click handlers are the
+  // one place that will branch on them instead of always opening the
+  // placeholder panel.
+  function wireTileModal(buttonSelector,modalId){{
+    const modal=document.getElementById(modalId);
+    function open(){{
+      if(!modal)return;
+      modal.hidden=false;
+      modal.setAttribute('aria-hidden','false');
+    }}
+    function close(){{
+      if(!modal)return;
+      modal.hidden=true;
+      modal.setAttribute('aria-hidden','true');
+    }}
+    document.querySelectorAll(buttonSelector).forEach(button=>{{
+      button.addEventListener('click',event=>{{
+        event.stopPropagation();
+        open();
+      }});
+    }});
+    if(modal){{
+      modal.querySelector('.tile-modal-close').addEventListener('click',close);
+      modal.addEventListener('click',event=>{{
+        if(event.target===modal)close();
+      }});
+      document.addEventListener('keydown',event=>{{
+        if(event.key==='Escape')close();
+      }});
+    }}
+  }}
+  wireTileModal('.door-call-tool','door-call-modal');
+  wireTileModal('.access-control-tool','access-control-modal');
+
   window.addEventListener('pagehide',()=>{{
     cameraIds.forEach(id=>stopSession(id,true));
   }});
