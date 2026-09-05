@@ -161,4 +161,9 @@ def test_events_page_row_without_a_thumbnail_still_shows_the_em_dash(monkeypatch
         "thumbnail": None, "has_event_clip": False,
     }])
     html = main._render_customer_events(_fake_request())
-    assert '<td>—</td>' in html
+    # P0 #5 Phase 3 (2026-09-05): the thumbnail <td> gained a
+    # class="event-thumbnail-cell" hook so the desktop poll loop can
+    # patch it in place once media becomes ready -- the em dash itself
+    # is unchanged for an old, genuinely clipless event (well outside
+    # the pending window relative to this fixture's fixed timestamp).
+    assert '<td class="event-thumbnail-cell">—</td>' in html

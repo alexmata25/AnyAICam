@@ -119026,6 +119026,28 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
+def _is_customer_event_pending(event: dict) -> bool:
+    """Server-side mirror of the client-side isMobileEventPending()/
+    isEventPending() check (P0 #5 Phase 3) -- used so the desktop
+    Events page's very first server-rendered paint already shows
+    "Processing…" for a genuinely fresh event instead of "No clip
+    available" for the few seconds before the client's own poll loop
+    would otherwise correct it. Keep the 120-second window in sync
+    with the JS side's own MOBILE_EVENT_PENDING_WINDOW_MS /
+    EVENT_PENDING_WINDOW_MS."""
+    if event.get("has_event_clip") or event.get("thumbnail"):
+        return False
+    raw_timestamp = str(event.get("timestamp") or "")
+    try:
+        occurred_at = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - occurred_at).total_seconds()
+    return 0 <= age_seconds < 120
+
+
 def _event_confidence_percent(confidence) -> str:
     """Same defensive 0-1-vs-0-100 handling the customer analytics
     search results view (renderResults()'s own JS) already uses --
@@ -119173,6 +119195,15 @@ def _render_customer_events(request: Request) -> str:
         # unchanged.
         camera_id_val = event.get("camera_id")
         event_id_val = event.get("id")
+        # P0 #5 Phase 3 (2026-09-05): a genuinely fresh event can render
+        # here before its clip/thumbnail exists yet -- same reasoning as
+        # the mobile Playback cards' own isMobileEventPending() check
+        # (see that function's docstring). is_pending narrows "no
+        # thumbnail" to "no thumbnail AND still within the window this
+        # pipeline could plausibly still be working on it", computed
+        # once and reused for both the thumbnail and action cells so
+        # they never disagree with each other.
+        is_pending = _is_customer_event_pending(event)
         if event.get("has_event_clip") and camera_id_val and event_id_val:
             thumbnail = (
                 f'<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" '
@@ -119182,18 +119213,41 @@ def _render_customer_events(request: Request) -> str:
                 f'{thumb_img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span>'
                 f'</div>'
             )
+        elif is_pending:
+            thumbnail = '<span class="event-thumb-pending">Processing…</span>'
         else:
             thumbnail = thumb_img
+        if is_pending:
+            # "Enable Playback only when ready" (P0 #5 Phase 3): while
+            # still processing, offer Live view (if this event has a
+            # camera at all) but not a Playback link yet -- there is
+            # deliberately no href here to click through to a recording
+            # that may not resolve to anything useful yet.
+            live_link = (
+                f'<a class="download" href="/customer/cameras/{escape(str(camera_id_val), quote=True)}/live">Live view</a> '
+                if camera_id_val else ''
+            )
+            action_html = (
+                f'{live_link}<span class="download event-action-pending" aria-disabled="true" '
+                f'title="Playback will be available once processing completes">Playback</span>'
+            )
+        else:
+            action_html = _customer_event_actions(camera_id_val, raw_timestamp, event_id_val, event.get("has_event_clip"))
         type_label = str(event.get("event_type") or "event").replace("_", " ").title()
         camera_number = event.get("camera")
+        event_id_attr = escape(str(event_id_val or ""), quote=True)
         rows.append(
-            f'<tr data-event-camera="{escape(str(camera_number or ""), quote=True)}" data-event-type="{escape(str(event.get("event_type") or ""), quote=True)}">'
+            f'<tr data-event-camera="{escape(str(camera_number or ""), quote=True)}" '
+            f'data-event-type="{escape(str(event.get("event_type") or ""), quote=True)}" '
+            f'data-event-id="{event_id_attr}" '
+            f'data-event-timestamp="{escape(raw_timestamp, quote=True)}" '
+            f'data-event-has-clip="{"1" if event.get("has_event_clip") else "0"}">'
             f'<td>{escape(timestamp_label)}</td>'
             f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
-            f'<td>{thumbnail}</td>'
+            f'<td class="event-thumbnail-cell">{thumbnail}</td>'
             f'<td><span class="pill">{escape(type_label)}</span></td>'
             f'<td>{_event_confidence_percent(event.get("confidence"))}</td>'
-            f'<td>{_customer_event_actions(event.get("camera_id"), raw_timestamp, event.get("id"), event.get("has_event_clip"))}</td></tr>'
+            f'<td class="event-action-cell">{action_html}</td></tr>'
         )
     event_body = "".join(rows) or (
         '<tr><td colspan="6"><div class="empty-stage">No analytics events yet.<br>'
@@ -119207,6 +119261,8 @@ def _render_customer_events(request: Request) -> str:
 .event-thumb-player.playing .event-thumb-play-badge{{display:none}}
 .event-thumb-player video{{width:96px;aspect-ratio:16/9;object-fit:cover;background:#000;display:block}}
 .event-thumb-loading{{width:96px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
+.event-thumb-pending{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:#e8b93f;font-size:11px;background:#0b1018;border-radius:4px;text-align:center;padding:0 6px}}
+.event-action-pending{{opacity:.55;cursor:default;pointer-events:none}}
 </style>
 <header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
 <div><span class="pill">{len(events_list)} event(s)</span></div></header>
@@ -119222,6 +119278,11 @@ def _render_customer_events(request: Request) -> str:
   const search=document.getElementById('events-search');
   const filters=document.getElementById('events-camera-filters');
   const rows=[...document.querySelectorAll('#events-table tbody tr[data-event-camera]')];
+  // P0 #5 Phase 3 (2026-09-05): tracked in the same mutable array
+  // `apply()` below already filters from -- a newly-inserted row (see
+  // reconcileDesktopEvent()) is pushed onto this array so it
+  // immediately participates in the existing camera/search filters
+  // instead of silently bypassing them until the next full page load.
   function apply(){
     const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));
     const query=(search.value||'').toLowerCase();
@@ -119290,15 +119351,171 @@ def _render_customer_events(request: Request) -> str:
       });
   }
 
-  document.querySelectorAll('.event-thumb-player').forEach(container=>{
-    container.addEventListener('click',()=>playEventClipInline(container));
-    container.addEventListener('keydown',event=>{
-      if(event.key==='Enter'||event.key===' '){
-        event.preventDefault();
-        playEventClipInline(container);
-      }
+  function wireEventThumbPlayer(scope){
+    scope.querySelectorAll('.event-thumb-player').forEach(container=>{
+      if(container.dataset.wired)return;
+      container.dataset.wired='1';
+      container.addEventListener('click',()=>playEventClipInline(container));
+      container.addEventListener('keydown',event=>{
+        if(event.key==='Enter'||event.key===' '){
+          event.preventDefault();
+          playEventClipInline(container);
+        }
+      });
     });
-  });
+  }
+  wireEventThumbPlayer(document);
+
+  // P0 #5 Phase 3 (2026-09-05, Codex review): the desktop Events table
+  // gets the same Processing… -> ready reconciliation the mobile
+  // Playback cards already have, via the same SQL-bounded endpoint
+  // (see _customer_recent_events_bounded()'s own docstring) -- fleet-
+  // wide here since this table has no single "selected camera" the way
+  // Playback does. Resilient to the same failure modes: a transient
+  // network error or non-2xx response is retried (never a permanent
+  // stop), and the poll settles to an explicit "Not ready yet" state
+  // if EVENT_POLL_MAX_ATTEMPTS (aligned to the same 120s window) is
+  // reached with rows still pending, rather than leaving "Processing…"
+  // up forever.
+  const EVENT_PENDING_WINDOW_MS=120000;
+  const EVENT_POLL_INTERVAL_MS=4000;
+  const EVENT_POLL_MAX_ATTEMPTS=Math.ceil(EVENT_PENDING_WINDOW_MS/EVENT_POLL_INTERVAL_MS);
+  let eventPollTimer=null;
+  let eventPollAttempts=0;
+
+  function desktopEventDate(timestamp){
+    const text=String(timestamp||'');
+    return new Date(/Z$|[+-]\d\d:?\d\d$/.test(text)?text:text+'Z');
+  }
+
+  function isEventPending(hasClip,timestamp){
+    if(hasClip)return false;
+    const ageMs=Date.now()-desktopEventDate(timestamp).getTime();
+    return ageMs>=0&&ageMs<EVENT_PENDING_WINDOW_MS;
+  }
+
+  // JS mirror of _customer_event_playback_href() (main.py) -- same
+  // contract: event= whenever a real clip is ready, otherwise a real
+  // timestamp converted to epoch-ms (never a raw ISO string), otherwise
+  // no autoplay at all. Kept in sync with that function deliberately;
+  // this table can't call back into Python mid-poll.
+  function eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip){
+    if(!cameraId)return '/playback';
+    let href=`/playback?camera=${encodeURIComponent(cameraId)}`;
+    if(hasEventClip&&eventId){
+      href+=`&event=${encodeURIComponent(eventId)}&autoplay=event`;
+    }else if(timestamp){
+      const epochMs=desktopEventDate(timestamp).getTime();
+      if(!Number.isNaN(epochMs))href+=`&t=${epochMs}&autoplay=event`;
+    }
+    return href;
+  }
+
+  function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,pending){
+    const liveLink=cameraId?`<a class="download" href="/customer/cameras/${encodeURIComponent(cameraId)}/live">Live view</a> `:'';
+    if(pending){
+      return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Playback</span>`;
+    }
+    return `${liveLink}<a class="download" href="${eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip)}">Playback</a>`;
+  }
+
+  function eventThumbnailCellHtml(event,pending){
+    if(event.thumbnail){
+      const img=`<img src="${event.thumbnail}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`;
+      if(event.has_event_clip&&event.camera_id&&event.id){
+        const escapedImg=img.replace(/"/g,'&quot;');
+        return `<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" data-camera-id="${event.camera_id}" data-event-id="${event.id}" data-thumb-html="${escapedImg}">${img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span></div>`;
+      }
+      return img;
+    }
+    return pending?'<span class="event-thumb-pending">Processing…</span>':'—';
+  }
+
+  function reconcileDesktopEvent(event){
+    const tbody=document.querySelector('#events-table tbody');
+    if(!tbody||!event||!event.id)return;
+    const pending=isEventPending(event.has_event_clip,event.timestamp);
+    const thumbHtml=eventThumbnailCellHtml(event,pending);
+    const actionHtml=eventActionCellHtml(event.camera_id,event.timestamp,event.id,event.has_event_clip,pending);
+    const existing=tbody.querySelector(`tr[data-event-id="${CSS.escape(String(event.id))}"]`);
+    if(existing){
+      const thumbCell=existing.querySelector('.event-thumbnail-cell');
+      const actionCell=existing.querySelector('.event-action-cell');
+      if(thumbCell)thumbCell.innerHTML=thumbHtml;
+      if(actionCell)actionCell.innerHTML=actionHtml;
+      existing.dataset.eventHasClip=event.has_event_clip?'1':'0';
+      wireEventThumbPlayer(existing);
+      return;
+    }
+    // A genuinely new event that wasn't part of the initial page load
+    // -- inserted as a new row (most recent first, matching this
+    // page's own ORDER BY event_timestamp DESC) rather than silently
+    // waiting for the next full page load to ever show it.
+    const placeholder=tbody.querySelector('tr td.empty-stage')?.closest('tr');
+    if(placeholder)placeholder.remove();
+    const row=document.createElement('tr');
+    row.dataset.eventCamera=String(event.camera||'');
+    row.dataset.eventType=String(event.event_type||'');
+    row.dataset.eventId=String(event.id);
+    row.dataset.eventTimestamp=String(event.timestamp||'');
+    row.dataset.eventHasClip=event.has_event_clip?'1':'0';
+    const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+    const confidence=event.confidence;
+    const confidencePercent=(confidence===null||confidence===undefined)?'—':`${(confidence<=1?confidence*100:confidence).toFixed(1)}%`;
+    row.innerHTML=`<td>${desktopEventDate(event.timestamp).toLocaleString()}</td>`+
+      `<td>${event.camera_name||(event.camera?`Camera ${event.camera}`:'—')}</td>`+
+      `<td class="event-thumbnail-cell">${thumbHtml}</td>`+
+      `<td><span class="pill">${typeLabel}</span></td>`+
+      `<td>${confidencePercent}</td>`+
+      `<td class="event-action-cell">${actionHtml}</td>`;
+    tbody.insertBefore(row,tbody.firstChild);
+    wireEventThumbPlayer(row);
+    rows.push(row);
+    apply();
+  }
+
+  function settleExpiredDesktopEvents(){
+    document.querySelectorAll('#events-table tbody tr[data-event-id]').forEach(row=>{
+      if(!isEventPending(row.dataset.eventHasClip==='1',row.dataset.eventTimestamp))return;
+      const pendingLabel=row.querySelector('.event-thumbnail-cell .event-thumb-pending');
+      if(pendingLabel)pendingLabel.textContent='Not ready yet';
+      const actionPending=row.querySelector('.event-action-cell .event-action-pending');
+      if(actionPending)actionPending.title='Still processing -- check back soon';
+    });
+  }
+
+  function anyDesktopEventStillPending(){
+    return [...document.querySelectorAll('#events-table tbody tr[data-event-id]')]
+      .some(row=>isEventPending(row.dataset.eventHasClip==='1',row.dataset.eventTimestamp));
+  }
+
+  function scheduleEventPoll(){
+    if(eventPollTimer)return;
+    if(!anyDesktopEventStillPending())return;
+    if(eventPollAttempts>=EVENT_POLL_MAX_ATTEMPTS){
+      settleExpiredDesktopEvents();
+      return;
+    }
+    eventPollTimer=setTimeout(async()=>{
+      eventPollTimer=null;
+      eventPollAttempts++;
+      try{
+        const response=await fetch('/api/customer/events/recent',{cache:'no-store'});
+        if(response.ok){
+          const payload=await response.json();
+          (payload.events||[]).forEach(reconcileDesktopEvent);
+        }
+        // non-2xx: transient, retried below via finally -- never a
+        // permanent stop.
+      }catch(error){
+        // transient network failure -- retried below via finally.
+      }finally{
+        scheduleEventPoll();
+      }
+    },EVENT_POLL_INTERVAL_MS);
+  }
+
+  scheduleEventPoll();
 })();
 </script>"""
 
@@ -140121,20 +140338,112 @@ def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
 RECENT_EVENTS_POLL_LIMIT = 30
 
 
+def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str | None = None) -> list[dict] | None:
+    """SQL-bounded, tenant-scoped recent-event feed backing the
+    Events/Playback page's own Processing... -> ready polling loop
+    (P0 #5). Reused by both the mobile Playback per-camera poll
+    (camera_id given -- additionally checked against
+    _customer_authorized_camera_id(), the same helper the existing
+    bounded-Playback routes already trust) and the desktop Events
+    page's fleet-wide poll (camera_id=None -- the same identity-scoped
+    fleet _customer_detection_events() already serves for that page's
+    own initial render).
+
+    Root cause this replaces (2026-09-05, Codex review of P0 #5): the
+    original polling endpoint reused _customer_detection_events()
+    as-is -- correct for a one-time page-load render, but that query
+    has no SQL LIMIT at all and returns this customer's *entire* event
+    history across every camera; the polling endpoint only truncated
+    to RECENT_EVENTS_POLL_LIMIT in Python *after* the full unbounded
+    fetch. For a customer with a large real history this meant a full
+    table scan/sort every poll tick (as often as every 4s while
+    anything is processing) for a screen that only ever renders 30
+    rows. This function always carries a real SQL LIMIT and, when
+    camera_id is given, an additional WHERE clause -- a poll tick never
+    pulls more rows, or more cameras, than it can ever use.
+
+    Returns None when the caller isn't a portal customer identity at
+    all, or (camera_id given) isn't authorized for that specific
+    camera -- exactly _customer_detection_events()'s own None-vs-
+    empty-list contract, so a caller can tell "not allowed to ask"
+    apart from "allowed, and there's nothing new". Returns the exact
+    same per-event dict shape _customer_detection_events() already
+    returns -- callers/frontend code don't need to know which query
+    produced it."""
+    if camera_id is not None and not _customer_authorized_camera_id(request, camera_id):
+        return None
+    from partner_portal import partner_identity
+    identity = partner_identity(request)
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    select = (
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+        'CASE WHEN dem.id IS NOT NULL THEN 1 ELSE 0 END AS has_event_clip, '
+        'dem.thumbnail_s3_key AS thumbnail_s3_key '
+        'FROM detection_events de '
+        'JOIN cameras c ON c.id = de.camera_id '
+        'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
+    )
+    camera_clause = 'AND de.camera_id = ? ' if camera_id is not None else ''
+    camera_param = (camera_id,) if camera_id is not None else ()
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            rows = db.execute(
+                select + f'WHERE de.customer_id = ? {camera_clause}ORDER BY de.event_timestamp DESC LIMIT ?',
+                (identity["customer_id"], *camera_param, limit),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            rows = db.execute(
+                select + 'JOIN customer_camera_permissions p ON p.camera_id = de.camera_id AND p.user_id = ? '
+                f'WHERE de.customer_id = ? {camera_clause}AND p.can_playback = 1 '
+                'ORDER BY de.event_timestamp DESC LIMIT ?',
+                (user["id"], identity["customer_id"], *camera_param, limit),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
+            "site": row["site_name"],
+            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "event_type": row["event_type"],
+            "direction": None,
+            "timestamp": row["event_timestamp"],
+            "confidence": row["confidence"],
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
+            "linked_recording": None,
+            "has_event_clip": bool(row["has_event_clip"]),
+            "plate_number": None,
+            "vehicle_color": None,
+            "mock": False,
+        }
+        for row in rows
+    ]
+
+
 @app.get("/api/customer/events/recent")
 def customer_events_recent(request: Request) -> dict:
-    """Polling endpoint backing the Events/Playback page's own
-    Processing... -> ready reconciliation (P0 #5). Deliberately reuses
-    _customer_detection_events() as-is rather than adding a new
-    per-event lookup: that function is already fully self-scoping from
-    the caller's own session identity (customer_owner sees their whole
-    fleet, customer_viewer only cameras they hold can_playback on) --
-    there is no camera_id/event_id parameter here for an attacker to
-    ever mismatch against a different customer's data, which a
-    per-event "GET .../{camera_id}/{event_id}/media-status" endpoint
-    would have needed to defend against explicitly. No new query: this
-    is the exact same list the page already renders once at load,
-    truncated to RECENT_EVENTS_POLL_LIMIT before being returned.
+    """Polling endpoint backing the desktop Events page's own
+    Processing... -> ready reconciliation (P0 #5 Phase 3). Fleet-wide
+    (no camera_id) -- the desktop Events table shows this customer's
+    whole authorized fleet in one list, unlike the mobile Playback
+    view's single selected camera (see customer_events_recent_for_
+    camera() below). SQL-bounded via _customer_recent_events_bounded();
+    see that function's own docstring for why this replaced an
+    unbounded fetch.
 
     Registered BEFORE customer_camera_events() below on purpose --
     Starlette matches routes in registration order, and
@@ -140144,10 +140453,27 @@ def customer_events_recent(request: Request) -> dict:
     camera_id and failing authorization for a camera that doesn't
     exist. Confirmed live in staging before this fix -- see the P0 #5
     staging report."""
-    events = _customer_detection_events(request)
+    events = _customer_recent_events_bounded(request, RECENT_EVENTS_POLL_LIMIT)
     if events is None:
         raise HTTPException(status_code=403, detail="Customer portal sign-in required.")
-    return {"events": events[:RECENT_EVENTS_POLL_LIMIT]}
+    return {"events": events}
+
+
+@app.get("/api/customer/events/recent/{camera_id}")
+def customer_events_recent_for_camera(camera_id: str, request: Request) -> dict:
+    """Polling endpoint backing the mobile Playback view's own
+    Processing... -> ready reconciliation (P0 #5), scoped to exactly
+    the one camera currently selected/visible -- see
+    _customer_recent_events_bounded()'s own docstring for the
+    authorization and bounding contract. Two path segments after
+    /events/ ("recent", then {camera_id}) so this never collides with
+    "/api/customer/events/{camera_id}" below regardless of
+    registration order -- unlike the fleet-wide route above, which
+    does need that ordering."""
+    events = _customer_recent_events_bounded(request, RECENT_EVENTS_POLL_LIMIT, camera_id=camera_id)
+    if events is None:
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    return {"events": events}
 
 
 @app.get("/api/customer/events/{camera_id}")
@@ -140385,6 +140711,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.mobile-media-badge{position:absolute;top:8px;right:36px;color:#fff;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.02em}'
         '.mobile-media-menu{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;display:flex;align-items:center;justify-content:center;pointer-events:none}'
         '.mobile-media-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:0 12px;background:#141b26}'
+        '.mobile-media-fallback--pending{color:#e8b93f}'
+        '.mobile-media-fallback--expired{color:#8f9baa;font-style:italic}'
         '</style>'
         '<section class="panel mobile-recent-events" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
@@ -140818,11 +141146,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
   const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
+  // P0 #5 remediation (2026-09-05, Codex review): MOBILE_EVENT_POLL_MAX_
+  // ATTEMPTS is derived from the window/interval themselves (never a
+  // second, independently-hardcoded number) so the poll's own give-up
+  // point can never silently drift shorter than the window it's
+  // supposed to cover.
   const MOBILE_EVENT_PENDING_WINDOW_MS=120000;
   const MOBILE_EVENT_POLL_INTERVAL_MS=4000;
-  const MOBILE_EVENT_POLL_MAX_ATTEMPTS=15;
-  let mobileEventPollTimer=null;
-  let mobileEventPollAttempts=0;
+  const MOBILE_EVENT_POLL_MAX_ATTEMPTS=Math.ceil(MOBILE_EVENT_PENDING_WINDOW_MS/MOBILE_EVENT_POLL_INTERVAL_MS);
+  // One mutable "current poll session" object, replaced (never mutated
+  // across a camera change) whenever scheduleMobileEventPoll() is asked
+  // to track a different cameraId than the one it's already tracking --
+  // this, plus the AbortController below, is what makes a response that
+  // arrives after the visible camera has already changed structurally
+  // unable to repaint it: the old session's own identity/controller no
+  // longer match anything current by the time that response resolves.
+  let mobileEventPollState=null;
 
   function isMobileEventPending(event){{
     if(event.has_event_clip)return false;
@@ -140830,31 +141169,104 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     return ageMs>=0&&ageMs<MOBILE_EVENT_PENDING_WINDOW_MS;
   }}
 
+  function stopMobileEventPoll(){{
+    if(mobileEventPollState){{
+      if(mobileEventPollState.timer)clearTimeout(mobileEventPollState.timer);
+      if(mobileEventPollState.controller)mobileEventPollState.controller.abort();
+    }}
+    mobileEventPollState=null;
+  }}
+
+  // Deliberately polls /api/customer/events/recent/<cameraId> -- the
+  // same customer-scoped, self-authorizing, now SQL-bounded-to-this-
+  // camera list the page already rendered once at load -- rather than
+  // a per-event endpoint keyed on an id that may not exist yet. Re-
+  // invokes renderMobileRecentEvents() itself on the merged result
+  // instead of hand-patching DOM nodes: that keeps this reconciliation
+  // exactly as correct as the render path it reuses, and merging fresh
+  // rows into existing ones by id (never appending) is what makes a
+  // duplicate row structurally impossible here.
+  //
+  // P0 #5 remediation (2026-09-05, Codex review) -- three failure modes
+  // the original version had: (1) a transient network error or non-2xx
+  // response permanently stopped polling -- the catch block did
+  // nothing, and nothing else ever called this function again for that
+  // failed attempt; (2) camera switching didn't cancel the in-flight
+  // request tied to the OLD camera, so a late response could repaint a
+  // camera the customer had already navigated away from; (3) the poll
+  // gave up at MOBILE_EVENT_POLL_INTERVAL_MS*15 (~60s) even though
+  // MOBILE_EVENT_PENDING_WINDOW_MS itself defines events as still-
+  // plausibly-processing for a full 120s, and never rendered any
+  // different state once it did give up -- "Processing…" stayed up
+  // forever with no indication polling had stopped. Fixed by: a
+  // per-camera session object + AbortController (state above, replaced
+  // whenever cameraId changes -- never a bare global timer/counter that
+  // could survive a camera switch); rescheduling from a `finally` block
+  // whenever this attempt did NOT already hand off to a fresh render
+  // pass (which itself continues the chain -- see the end of
+  // renderMobileRecentEvents()); attempts derived from the window
+  // itself (MOBILE_EVENT_POLL_MAX_ATTEMPTS above); and one final
+  // `settled` render pass when the deadline is reached with events
+  // still pending, so the UI settles to an explicit "not ready yet"
+  // state instead of "Processing…" forever.
   function scheduleMobileEventPoll(cameraId,clips,events){{
+    if(!mobileEventPollState||mobileEventPollState.cameraId!==cameraId){{
+      stopMobileEventPoll();
+      mobileEventPollState={{cameraId,attempts:0,timer:null,controller:null}};
+    }}
+    const state=mobileEventPollState;
     const stillPending=events.some(isMobileEventPending);
-    if(!stillPending||mobileEventPollAttempts>=MOBILE_EVENT_POLL_MAX_ATTEMPTS){{
-      mobileEventPollTimer=null;
-      mobileEventPollAttempts=0;
+    if(!stillPending){{
+      if(state.timer)clearTimeout(state.timer);
+      state.timer=null;
       return;
     }}
-    if(mobileEventPollTimer)return;
-    mobileEventPollTimer=setTimeout(async()=>{{
-      mobileEventPollTimer=null;
-      mobileEventPollAttempts++;
+    if(state.attempts>=MOBILE_EVENT_POLL_MAX_ATTEMPTS){{
+      if(state.timer)clearTimeout(state.timer);
+      state.timer=null;
+      // Deadline reached with events still pending -- one last render
+      // pass settles them to an explicit fallback instead of leaving
+      // "Processing…" up forever with no indication polling stopped.
+      renderMobileRecentEvents(cameraId,clips,events,{{settled:true}});
+      return;
+    }}
+    if(state.timer)return;
+    state.timer=setTimeout(async()=>{{
+      state.timer=null;
+      state.attempts++;
+      const controller=new AbortController();
+      state.controller=controller;
+      let handedOff=false;
       try{{
-        const response=await fetch('/api/customer/events/recent',{{cache:'no-store'}});
-        if(!response.ok)return;
+        const response=await fetch(
+          `/api/customer/events/recent/${{encodeURIComponent(cameraId)}}`,
+          {{cache:'no-store',signal:controller.signal}}
+        );
+        if(mobileEventPollState!==state)return; // superseded by a camera switch mid-flight
+        if(!response.ok)return; // non-2xx: transient, retried via finally below
         const payload=await response.json();
+        if(mobileEventPollState!==state)return;
         const freshEvents=payload.events||[];
         const byId=new Map();
         events.forEach(existing=>{{if(existing.id)byId.set(existing.id,existing);}});
         freshEvents.forEach(fresh=>{{if(fresh.id)byId.set(fresh.id,fresh);}});
+        handedOff=true;
         renderMobileRecentEvents(cameraId,clips,Array.from(byId.values()));
-      }}catch(error){{}}
+      }}catch(error){{
+        // AbortError from a superseded camera selection, or a genuine
+        // transient network failure -- either way, fall through to
+        // finally, which retries with the same events/clips this
+        // attempt started with rather than silently giving up.
+      }}finally{{
+        if(!handedOff&&mobileEventPollState===state){{
+          scheduleMobileEventPoll(cameraId,clips,events);
+        }}
+      }}
     }},MOBILE_EVENT_POLL_INTERVAL_MS);
   }}
 
-  function renderMobileRecentEvents(cameraId,clips,events){{
+  function renderMobileRecentEvents(cameraId,clips,events,options){{
+    const settled=Boolean(options&&options.settled);
     const mobileList=document.getElementById('mobile-recent-events-list');
     if(!mobileList)return;
     // Video-first mobile cards (2026-09-04): one large 16:9 thumbnail
@@ -140927,12 +141339,16 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       // window this pipeline could plausibly still be working on it",
       // so only that case gets the Processing state; a genuinely old
       // clipless event still renders exactly as before.
-      const pending=!event.thumbnail&&isMobileEventPending(event);
+      const stillWatching=!event.thumbnail&&isMobileEventPending(event);
+      const pending=stillWatching&&!settled;
+      const gaveUp=stillWatching&&settled;
       const media=event.thumbnail
         ? `<img class="mobile-media-thumb" src="${{event.thumbnail}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
-        : pending
-          ? `<div class="mobile-media-fallback mobile-media-fallback--pending">${{label}} · Processing…</div>`
-          : `<div class="mobile-media-fallback">${{label}} · No clip available</div>`;
+        : gaveUp
+          ? `<div class="mobile-media-fallback mobile-media-fallback--expired">${{label}} · Not ready yet</div>`
+          : pending
+            ? `<div class="mobile-media-fallback mobile-media-fallback--pending">${{label}} · Processing…</div>`
+            : `<div class="mobile-media-fallback">${{label}} · No clip available</div>`;
 
       return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
         ${{media}}
@@ -140959,7 +141375,12 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // patching individual DOM nodes -- is what guarantees this can
     // never produce a duplicate row: mobileList.innerHTML is always
     // fully rebuilt from a deduplicated-by-id merge, never appended to.
-    scheduleMobileEventPoll(cameraId,clips,recentEvents);
+    // Never re-armed from a `settled` pass (options.settled above) --
+    // that pass exists specifically to stop polling and paint the
+    // final fallback state, not to loop forever.
+    if(!settled){{
+      scheduleMobileEventPoll(cameraId,clips,recentEvents);
+    }}
 
     mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
       // Analytics-only detections remain visible as event details but
