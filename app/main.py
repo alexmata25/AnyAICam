@@ -44,7 +44,6 @@ import json
 
 
 import logging
-import numpy as np
 
 
 
@@ -477,8 +476,6 @@ try:
 
     from ultralytics import YOLO
 
-    import torch
-
 
 
 
@@ -505,8 +502,6 @@ except ImportError:
 
 
     YOLO = None
-
-    torch = None
 
 
 
@@ -2709,15 +2704,6 @@ AI_ENABLED = AI_PERSON_DETECTION_ENABLED
 
 
 AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL_SECONDS", "5")))
-# Small per-camera startup delay so all 5 ai_person_detector() tasks --
-# created back-to-back in a single list comprehension, with an identical
-# AI_DETECTION_INTERVAL_SECONDS sleep thereafter -- don't stay in
-# lockstep for the appliance's entire uptime, repeatedly bursting their
-# model-load attempts and inference calls at the same moment every
-# cycle. Complementary to ai_inference_semaphore/yolo_model_lock above,
-# which already make simultaneous starts correct; this just spreads the
-# load out instead of serializing a burst of 5 every cycle.
-AI_DETECTOR_STARTUP_STAGGER_SECONDS = max(0, int(os.environ.get("AI_DETECTOR_STARTUP_STAGGER_SECONDS", "1")))
 
 
 
@@ -2727,33 +2713,6 @@ AI_DETECTOR_STARTUP_STAGGER_SECONDS = max(0, int(os.environ.get("AI_DETECTOR_STA
 
 
 AI_PERSON_COOLDOWN_SECONDS = max(5, int(os.environ.get("AI_PERSON_COOLDOWN_SECONDS", "30")))
-
-# People Counting: OFF by default, appliance-wide, no hidden default --
-# matches this session's own established convention (MOTION_DETECTION_
-# ENABLED/AI_PERSON_DETECTION_ENABLED). Even when this master flag is
-# on, a given camera only actually runs People Counting if BOTH (a) the
-# cloud has set cameras.people_counting_enabled=1 for it (read via
-# recording_uploader._camera_identity(), reused rather than duplicated
-# -- appliance_cloud.py, cloud lineage, is the source of truth) AND
-# (b) a real, enabled line_crossing rule exists for that camera in
-# ANALYTICS_RULES_FILE (reused, not a second config system -- see
-# people_counting.py's own module docstring). A faster-than-default
-# polling interval is used deliberately, ONLY for entitled+configured
-# cameras, to make frame-to-frame tracking reliable -- the ordinary
-# 5s AI_DETECTION_INTERVAL_SECONDS is too coarse for a person to be
-# reliably tracked across a line at normal walking speed.
-PEOPLE_COUNTING_ENABLED = os.environ.get("PEOPLE_COUNTING_ENABLED", "false").lower() == "true"
-PEOPLE_COUNTING_INTERVAL_SECONDS = max(0.5, float(os.environ.get("PEOPLE_COUNTING_INTERVAL_SECONDS", "1.5")))
-PEOPLE_COUNTING_STATE_FILE = RECORDINGS_FOLDER / "people_counting_state.json"
-
-# TEMPORARY, walk-test diagnostics only -- intentionally hardcoded, not
-# an env var, so it can't accidentally be left on for every camera in
-# a real deployment. 0 (or any camera number never actually entitled)
-# disables the extra [PeopleCountingDebug] log lines entirely. Remove
-# this constant and its use in people_counting_worker() once real-world
-# walk-test debugging is done -- it is not meant to be a permanent
-# feature of this worker.
-PEOPLE_COUNTING_DEBUG_CAMERA = int(os.environ.get("PEOPLE_COUNTING_DEBUG_CAMERA", "1"))
 
 
 
@@ -3084,13 +3043,7 @@ yolo_model = None
 
 
 
-yolo_model_lock = threading.Lock()
-# Bounds simultaneous YOLO inference (detect_objects_frame()) to 1 at a
-# time -- see ai_person_detector()'s own async with block. Independent
-# of yolo_model_lock above: that lock only ever guards the one-time
-# model construction; this semaphore guards every later inference call
-# too, for the appliance's entire uptime, not just at startup.
-ai_inference_semaphore = asyncio.Semaphore(1)
+yolo_model_lock = None
 
 
 
@@ -8239,42 +8192,6 @@ clip_tasks: set[asyncio.Task] = set()
 
 
 motion_event_lock = asyncio.Lock()
-
-
-# Per-camera dedup for AI-classification event clips (2026-09-02): a
-# single scene often produces several near-simultaneous detections --
-# multiple object classes in one frame (save_yolo_events()'s own
-# grouped-by-class-name loop below), or the same person walking
-# through several consecutive detection scans -- and none of those
-# should trigger its own separate clip extraction+upload covering
-# nearly-identical footage. Tracks the most recently built (or
-# in-flight) clip window per camera; a new detection whose window
-# event_clips.should_merge()s with it is treated as the same real
-# event and skipped -- exactly the rule event_clips.py's own
-# docstring already describes ("a burst of near-simultaneous or
-# rapidly repeated detections produces one clip, not several"), just
-# not previously wired into this detection path.
-ai_event_clip_windows: dict[int, tuple] = {}
-ai_event_clip_windows_lock = threading.Lock()
-
-# The main application event loop, captured lazily on ai_person_detector()'s
-# own first run (see that function's own opening lines) -- confirmed live
-# on the Samsung appliance that save_yolo_events() actually executes via
-# `await asyncio.to_thread(save_yolo_events, ...)`, a worker thread with no
-# event loop of its own. asyncio.ensure_future()/asyncio.create_task() only
-# ever schedule onto "the current thread's running loop" -- called from
-# that worker thread, there isn't one, so an earlier version of this fix's
-# ensure_future() call always raised RuntimeError and was silently
-# swallowed, meaning no AI-classification clip was ever actually built,
-# despite compiling and testing cleanly (every automated test scheduled
-# from the main thread, exactly the one case that already worked).
-# asyncio.run_coroutine_threadsafe(coro, loop) is the correct primitive for
-# scheduling from a different thread onto a specific, already-running loop
-# -- ai_person_detector() is itself created via asyncio.create_task() on
-# the real main loop (see the lifespan() startup block), so capturing it
-# there, once, is sufficient for every later save_yolo_events() call for
-# any camera.
-_ai_event_media_loop: "asyncio.AbstractEventLoop | None" = None
 
 
 
@@ -16660,92 +16577,302 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 
 
 def delete_expired_recordings() -> None:
-    """Permanent local-recording retention: deletes a local .mkv once
-    it is older than RETENTION_DAYS (an appliance-level environment
-    setting -- this function itself hard-codes no particular value).
-    The camera's newest file (presumed still being actively written)
-    is never considered, matching recording_uploader._completed_
-    recording_files()'s own guarantee. Every deletion also removes the
-    matching local Playback catalog row (recordings table, keyed by
-    cloud_recording_s3_key()), so no row survives pointing at a file
-    that no longer exists.
 
-    Age-only, with no upload-confirmation gate: deletion does not wait
-    for a recording's cloud upload to be confirmed first. Accepted for
-    appliances where local recordings are not the sole durable copy of
-    the footage. A confirmation-gated variant (persisted upload-proof
-    checked before deletion) was designed and validated for appliances
-    holding customer data as the only durable copy, but was not the
-    variant accepted here -- see the retention-fix session history if
-    that stricter behavior is ever needed for a specific deployment."""
-    from partner_db import connection
+
+
+
+
+
+
 
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
+
+
+
+
+
+
+
+
     deleted_count = 0
 
-    with connection() as db:
-        camera_id_by_number = {
-            int(row["camera_number"]): row["id"]
-            for row in db.execute("SELECT id, camera_number FROM cameras WHERE camera_number IS NOT NULL").fetchall()
-        }
 
-    for camera_number, camera_id in camera_id_by_number.items():
-        camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
-        if not camera_folder.is_dir():
-            continue
+
+
+
+
+
+
+    for recording_file in RECORDINGS_FOLDER.rglob("*.mkv"):
+
+
+
+
+
+
+
+
         try:
-            candidates = sorted(item.name for item in camera_folder.iterdir() if item.is_file() and item.suffix == ".mkv")
-        except OSError as error:
-            print(f"Could not list {camera_folder}: {error}")
-            continue
-        # The newest file for this camera is presumed still being
-        # actively written -- never a deletion candidate, matching
-        # recording_uploader._completed_recording_files()'s guarantee.
-        completed = candidates[:-1] if len(candidates) > 1 else []
 
-        for filename in completed:
-            recording_file = camera_folder / filename
-            try:
-                if datetime.fromtimestamp(recording_file.stat().st_mtime) >= cutoff:
-                    continue
-            except OSError as error:
-                print(f"Could not inspect {recording_file}: {error}")
-                continue
 
-            catalog_key = cloud_recording_s3_key(recording_file, camera_number)
-            try:
-                with connection() as db:
-                    db.execute("DELETE FROM recordings WHERE camera_id=? AND s3_key=?", (camera_id, catalog_key))
+
+
+
+
+
+
+            if datetime.fromtimestamp(recording_file.stat().st_mtime) < cutoff:
+
+
+
+
+
+
+
+
                 recording_file.unlink(missing_ok=True)
+
+
+
+
+
+
+
+
                 deleted_count += 1
-            except OSError as error:
-                print(f"Could not delete {recording_file}: {error}")
+
+
+
+
+
+
+
+
+        except OSError as error:
+
+
+
+
+
+
+
+
+            print(f"Could not inspect or delete {recording_file}: {error}")
+
+
+
+
+
+
+
 
     if deleted_count:
+
+
+
+
+
+
+
+
         print(f"Retention cleanup deleted {deleted_count} expired recording(s).")
 
+
+
+
+
+
+
+
     if MOTION_EVENTS_FILE.exists():
+
+
+
+
+
+
+
+
         retained_events = []
+
+
+
+
+
+
+
+
         for event in load_motion_events():
+
+
+
+
+
+
+
+
             try:
+
+
+
+
+
+
+
+
                 event_time = event.get("start_time") or event.get("timestamp")
+
+
+
+
+
+
+
+
                 if datetime.fromisoformat(event_time) >= cutoff:
+
+
+
+
+
+
+
+
                     retained_events.append(json.dumps(event, separators=(",", ":")))
+
+
+
+
+
+
+
+
             except (KeyError, TypeError, ValueError):
+
+
+
+
+
+
+
+
                 continue
+
+
+
+
+
+
+
+
         try:
+
+
+
+
+
+
+
+
             MOTION_EVENTS_FILE.write_text(
+
+
+
+
+
+
+
+
                 "\n".join(retained_events) + ("\n" if retained_events else ""),
+
+
+
+
+
+
+
+
                 encoding="utf-8",
+
+
+
+
+
+
+
+
             )
+
+
+
+
+
+
+
+
         except OSError as error:
+
+
+
+
+
+
+
+
             print(f"Could not prune motion events: {error}")
 
+
+
+
+
+
+
+
     for thumbnail in MOTION_THUMBNAILS_FOLDER.rglob("*.jpg"):
+
+
+
+
+
+
+
+
         try:
+
+
+
+
+
+
+
+
             if datetime.fromtimestamp(thumbnail.stat().st_mtime) < cutoff:
+
+
+
+
+
+
+
+
                 thumbnail.unlink(missing_ok=True)
+
+
+
+
+
+
+
+
         except OSError:
+
+
+
+
+
+
+
+
             continue
 
 
@@ -16791,7 +16918,7 @@ async def retention_worker() -> None:
 
 
 
-        await asyncio.to_thread(delete_expired_recordings)
+        delete_expired_recordings()
 
 
 
@@ -17025,27 +17152,6 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
                         process.kill()
 
                     break
-            else:
-                # "recording" mode: no playlist-staleness watchdog --
-                # recording has no equivalent concept to watch. Just the
-                # same non-blocking poll loop "live" mode already uses
-                # safely above, so this coroutine never ties up one of
-                # Python's ~12 default-executor threads for the entire,
-                # effectively unbounded lifetime of a healthy, still-
-                # running recording process. Confirmed live via py-spy on
-                # this Samsung appliance: this exact gap (previously
-                # `return_code = await asyncio.to_thread(process.wait)`
-                # called immediately, with no polling loop first, against
-                # a process that runs indefinitely) permanently pinned 5
-                # executor threads -- one per camera -- for the
-                # appliance's entire uptime. By the time the loop below
-                # exits, the process has already exited on its own, so
-                # the to_thread(process.wait) call just beneath this
-                # block returns immediately -- it's still needed to reap
-                # the process and obtain its real exit code, just no
-                # longer blocks for any meaningful duration.
-                while process.poll() is None:
-                    await asyncio.sleep(5)
 
             return_code = await asyncio.to_thread(process.wait)
             completed = True
@@ -34278,117 +34384,6 @@ async def create_motion_thumbnail(
 
 
 
-
-
-
-
-
-
-
-
-
-# Mirrors start_recording()'s own `-segment_time 300` -- used only as a
-# conservative margin for shortlisting candidate files by their filename
-# timestamp (recording_start()), never to assume any file's real, probed
-# duration. Doubled below so a shorter-than-nominal segment (e.g. from an
-# ffmpeg restart) or an event whose pre-roll crosses a segment boundary
-# still pulls in the neighboring segment.
-RECORDING_SEGMENT_SECONDS = 300
-
-
-def _probe_motion_clip_candidates(
-    shortlist: list[tuple[datetime, Path]],
-    window_start: datetime,
-    window_end: datetime,
-) -> list[tuple[datetime, datetime, Path]]:
-    """Synchronous: ffprobe each already-shortlisted file and keep the
-    ones whose real [start, end) interval overlaps the event window.
-    Always invoked via asyncio.to_thread() from build_motion_event_clip()
-    below -- never called directly on the event loop. `shortlist` is
-    expected to already be narrowed by filename timestamp (cheap, no
-    subprocess) before this function ever runs, so it stays small
-    (typically 1-3 files) regardless of how many recordings a camera has
-    retained in total."""
-    candidates: list[tuple[datetime, datetime, Path]] = []
-
-    for source_start, source in shortlist:
-        try:
-            probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=nw=1:nk=1",
-                    str(source),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-
-            duration_text = probe.stdout.strip()
-
-            if duration_text and duration_text.upper() != "N/A":
-                source_duration = float(duration_text)
-
-                if source_duration <= 0:
-                    continue
-
-                source_end = source_start + timedelta(
-                    seconds=source_duration
-                )
-            else:
-                # An actively-written MKV can report duration=N/A.
-                # If it was modified recently, treat it as extending
-                # through the current moment so event extraction can
-                # use the live recording segment.
-                age_seconds = max(
-                    0.0,
-                    time.time() - source.stat().st_mtime,
-                )
-
-                if age_seconds > 30:
-                    continue
-
-                source_end = datetime.now()
-
-        except (
-            OSError,
-            subprocess.TimeoutExpired,
-            ValueError,
-        ):
-            continue
-
-        if source_start < window_end and source_end > window_start:
-            candidates.append((source_start, source_end, source))
-
-    return candidates
-
-
-# Bounds how many build_motion_event_clip() ffmpeg encodes (libx264,
-# real-time cost) can run simultaneously, appliance-wide -- both the
-# basic-motion and AI paths share this one function/semaphore, matching
-# the same TRANSCODE_MAX_CONCURRENCY pattern recording_uploader.py's own
-# HEVC-transcode path already uses for an equivalent problem. Measured
-# directly on this appliance: a single such encode takes ~2.6s for a
-# real 10s clip when nothing else is competing, but 3 concurrent encodes
-# already stretch to ~4-6s each -- and live AI testing (119 real
-# detections across 5 cameras in 18 minutes, no bound at all) produced
-# 10+ simultaneous encodes, a monotonically climbing load average
-# (13.78 -> 67.99 over 10 minutes, 8-core appliance), and 8 real
-# /health failures. Default 1, mirroring TRANSCODE_MAX_CONCURRENCY's own
-# default -- the most conservative starting point, loosenable later once
-# proven stable. asyncio.Semaphore (not threading.Semaphore): unlike
-# _transcode_hevc_to_h264() (which runs inside asyncio.to_thread()),
-# build_motion_event_clip() is itself an async def running directly on
-# the event loop, dispatching ffmpeg via asyncio.create_subprocess_exec.
-EVENT_CLIP_ENCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_EVENT_CLIP_ENCODE_MAX_CONCURRENCY", "1")))
-event_clip_encode_semaphore = asyncio.Semaphore(EVENT_CLIP_ENCODE_MAX_CONCURRENCY)
-
-
-
-
 async def build_motion_event_clip(
     event_id: str,
     camera_number: int,
@@ -34410,33 +34405,16 @@ async def build_motion_event_clip(
         await asyncio.sleep(wait_seconds)
 
     camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+    candidates: list[tuple[datetime, Path]] = []
 
-    # Shortlist by filename timestamp only (recording_start() -- cheap,
-    # no subprocess) before ever invoking ffprobe. Without this, every
-    # motion-event clip build ffprobed the camera's ENTIRE retained
-    # recording history (1,000+ files after a few days), each call
-    # blocking the event loop directly -- confirmed live on the Samsung
-    # production appliance to take minutes per event and reproduce the
-    # HTTP outage. A file can only possibly overlap the event window if
-    # it starts no later than the window's end, and no earlier than
-    # 2 * RECORDING_SEGMENT_SECONDS before the window's start.
-    earliest_start = window.start - timedelta(
-        seconds=RECORDING_SEGMENT_SECONDS * 2
-    )
-    shortlist: list[tuple[datetime, Path]] = []
     for source in sorted(camera_folder.glob("*.mkv")):
         source_start = recording_start(source, camera_number)
-        if source_start is None:
-            continue
-        if source_start > window.end:
-            continue
-        if source_start < earliest_start:
-            continue
-        shortlist.append((source_start, source))
-
-    candidates = await asyncio.to_thread(
-        _probe_motion_clip_candidates, shortlist, window.start, window.end
-    )
+        if (
+            source_start
+            and source_start < window.end
+            and source_start + timedelta(minutes=5) > window.start
+        ):
+            candidates.append((source_start, source))
 
     if not candidates:
         print(
@@ -34446,22 +34424,7 @@ async def build_motion_event_clip(
         return None
 
     candidates.sort(key=lambda item: item[0])
-
-    # Prefer one real source file that fully covers the requested event
-    # window. This avoids concat-timeline distortion when a short/restarted
-    # recording exists between otherwise normal five-minute segments.
-    covering = [
-        item for item in candidates
-        if item[0] <= window.start and item[1] >= window.end
-    ]
-
-    if covering:
-        source_start, _, source = covering[-1]
-        candidates = [(source_start, source_start, source)]
-        first_start = source_start
-    else:
-        first_start = candidates[0][0]
-
+    first_start = candidates[0][0]
     offset_seconds = max(0.0, (window.start - first_start).total_seconds())
     duration_seconds = (window.end - window.start).total_seconds()
 
@@ -34476,7 +34439,7 @@ async def build_motion_event_clip(
         list_file.write_text(
             "".join(
                 f"file '{source.as_posix()}'\n"
-                for _, _, source in candidates
+                for _, source in candidates
             ),
             encoding="utf-8",
         )
@@ -34499,20 +34462,12 @@ async def build_motion_event_clip(
             str(temp_path),
         ]
 
-        # Only the actual encode -- never the pre-roll wait above, the
-        # shortlist/ffprobe candidate search above that, or the list-
-        # file write just above -- is gated: those are cheap and never
-        # what saturated the appliance. async with queues indefinitely
-        # (no timeout, never drops a job) and releases on every exit
-        # path -- success, a non-zero ffmpeg exit raising below, or this
-        # task being cancelled mid-encode.
-        async with event_clip_encode_semaphore:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await process.communicate()
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
 
         if process.returncode != 0:
             error_text = stderr.decode(
@@ -34711,31 +34666,6 @@ async def store_motion_event(
 
 
 
-    # Basic Motion is also a first-class analytics-history event.
-    # Keep the legacy motion_events.jsonl write below for compatibility,
-    # while mirroring the minimal event into analytics_events.json so the
-    # existing appliance -> cloud analytics sync can index it for mobile
-    # Playback.
-    # Moved off the event loop via asyncio.to_thread(): this used to call
-    # append_analytics_event() directly and synchronously here, inside an
-    # async def running on the shared FastAPI event loop. That blocking
-    # file read/sort/rewrite (analytics_events.json, up to 5000 events)
-    # stalled every concurrent HTTP handler -- /health, /playback,
-    # /events, and the dashboard -- for the duration of each motion
-    # event, confirmed live via a Samsung production audit.
-    await asyncio.to_thread(
-        append_analytics_event,
-        {
-            "id": event.id,
-            "camera": camera_number,
-            "event_type": "motion",
-            "timestamp": start_time.isoformat(),
-            "confidence": event.confidence,
-            "object_count": 1,
-            "detections": [],
-        },
-    )
-
     line = event.model_dump_json() + "\n"
 
 
@@ -34760,37 +34690,13 @@ async def store_motion_event(
         # persistence/notifications. The builder waits until the configured
         # 5-second post-roll exists, then extracts:
         # 5s pre-roll + full event duration + 5s post-roll.
-        async def build_and_upload_event_media() -> None:
-            clip_url = await build_motion_event_clip(
+        clip_task = asyncio.create_task(
+            build_motion_event_clip(
                 event_id,
                 camera_number,
                 start_time,
                 end_time,
             )
-
-            if not clip_url:
-                return
-
-            try:
-                from event_media_uploader import upload_motion_event_media
-
-                await asyncio.to_thread(
-                    upload_motion_event_media,
-                    event_id=event_id,
-                    camera_number=camera_number,
-                    event_start=start_time,
-                    event_end=end_time,
-                    clip_url=clip_url,
-                    thumbnail_url=thumbnail,
-                )
-            except Exception as error:
-                print(
-                    f"Motion event {event_id}: media upload failed: "
-                    f"{type(error).__name__}: {error}"
-                )
-
-        clip_task = asyncio.create_task(
-            build_and_upload_event_media()
         )
         clip_tasks.add(clip_task)
         clip_task.add_done_callback(clip_tasks.discard)
@@ -34983,22 +34889,6 @@ async def store_motion_event(
 
 
     print(f"Motion detected on Camera {camera_number} (confidence {event.confidence:.1f}%).")
-    classification = smart_motion.classify_motion(camera_number)
-    if classification:
-        smart_event = AnalyticsEventModel(
-            camera=camera_number,
-            site="home",
-            rule_name=f"Smart Motion ({classification})",
-            event_type="smart_motion",
-            timestamp=start_time,
-            confidence=event.confidence,
-            thumbnail=thumbnail,
-            linked_recording=event.linked_recording,
-            mock=False,
-        ).model_dump(mode="json")
-        smart_event["triggered_by"] = classification
-        smart_event["motion_event_id"] = event.id
-        await asyncio.to_thread(append_analytics_event, smart_event)
 
 
 
@@ -35021,77 +34911,6 @@ async def store_motion_event(
 
 
 
-
-
-
-
-# Cache of (zones fingerprint -> precomputed 160x90 boolean zone mask),
-# keyed per camera. Rebuilt only when a camera's configured zones
-# actually change (compared by value, not identity) -- not on every
-# frame. The fingerprint is a tuple of each zone's (x, y, width, height)
-# since those four numbers are the only inputs that affect the mask.
-_motion_zone_mask_cache: dict[int, tuple[tuple, "np.ndarray"]] = {}
-
-
-def _motion_zone_mask(camera_number: int, zones: list) -> "np.ndarray":
-    fingerprint = tuple((zone.x, zone.y, zone.width, zone.height) for zone in zones)
-    cached = _motion_zone_mask_cache.get(camera_number)
-    if cached is not None and cached[0] == fingerprint:
-        return cached[1]
-
-    pixel_x = (np.arange(14400) % 160) / 160
-    pixel_y = (np.arange(14400) // 160) / 90
-    mask = np.zeros(14400, dtype=bool)
-    for zone in zones:
-        mask |= (
-            (pixel_x >= zone.x)
-            & (pixel_x <= zone.x + zone.width)
-            & (pixel_y >= zone.y)
-            & (pixel_y <= zone.y + zone.height)
-        )
-
-    _motion_zone_mask_cache[camera_number] = (fingerprint, mask)
-    return mask
-
-
-def _compare_motion_frames(
-    camera_number: int,
-    frame: bytes,
-    previous_frame: bytes,
-    zones: list,
-) -> tuple[int, int, int]:
-    """Synchronous, NumPy-vectorized replacement for the old per-pixel
-    Python `for` loop -- numerically equivalent (same inclusive zone
-    bounds, same |current - previous| difference, same >= 20 changed-
-    pixel threshold), just computed across the whole 160x90 frame at
-    once instead of one Python-level iteration per pixel. Always invoked
-    via asyncio.to_thread() from motion_detector() below -- never called
-    directly on the event loop. Confirmed live on the Samsung production
-    appliance via py-spy: the old loop held the event loop's own
-    MainThread (CPU-bound, GIL-held, no await inside it) for long enough,
-    especially when multiple cameras' frames landed close together, to
-    reproduce the same class of HTTP outage as the earlier
-    build_motion_event_clip() and retention_worker() bugs.
-
-    Returns (total_difference, compared_pixels, changed_pixels), the
-    exact three accumulators the old loop produced -- everything
-    downstream (motion_score, changed_ratio, effective_threshold,
-    cooldown/event-creation state machine) is unchanged."""
-    mask = _motion_zone_mask(camera_number, zones)
-
-    current = np.frombuffer(frame, dtype=np.uint8)
-    previous = np.frombuffer(previous_frame, dtype=np.uint8)
-    # int16 (not the raw uint8 arrays) so the subtraction can't wrap
-    # around -- matches the original Python `abs(current - previous)`,
-    # which never overflowed since Python ints are arbitrary precision.
-    difference = np.abs(current.astype(np.int16) - previous.astype(np.int16))
-
-    in_zone_difference = difference[mask]
-    total_difference = int(in_zone_difference.sum())
-    compared_pixels = int(mask.sum())
-    changed_pixels = int(np.count_nonzero(in_zone_difference >= 20))
-
-    return total_difference, compared_pixels, changed_pixels
 
 
 
@@ -35420,13 +35239,168 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                    total_difference, compared_pixels, changed_pixels = await asyncio.to_thread(
-                        _compare_motion_frames,
-                        camera_number,
-                        frame,
-                        previous_frame,
-                        settings.zones,
-                    )
+                    total_difference = 0
+
+
+
+
+
+
+
+
+                    changed_pixels = 0
+
+
+
+
+
+
+
+
+                    compared_pixels = 0
+
+
+
+
+
+
+
+
+                    for index, (current, previous) in enumerate(zip(frame, previous_frame)):
+
+
+
+
+
+
+
+
+                        pixel_x = (index % 160) / 160
+
+
+
+
+
+
+
+
+                        pixel_y = (index // 160) / 90
+
+
+
+
+
+
+
+
+                        in_zone = any(
+
+
+
+
+
+
+
+
+                            zone.x <= pixel_x <= zone.x + zone.width
+
+
+
+
+
+
+
+
+                            and zone.y <= pixel_y <= zone.y + zone.height
+
+
+
+
+
+
+
+
+                            for zone in settings.zones
+
+
+
+
+
+
+
+
+                        )
+
+
+
+
+
+
+
+
+                        if not in_zone:
+
+
+
+
+
+
+
+
+                            continue
+
+
+
+
+
+
+
+
+                        difference = abs(current - previous)
+
+
+
+
+
+
+
+
+                        total_difference += difference
+
+
+
+
+
+
+
+
+                        compared_pixels += 1
+
+
+
+
+
+
+
+
+                        if difference >= 20:
+
+
+
+
+
+
+
+
+                            changed_pixels += 1
+
+
+
+
+
+
+
+
                     motion_score = total_difference / max(compared_pixels, 1)
 
 
@@ -35908,26 +35882,43 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-analytics_events_file_lock = threading.Lock()
-
-
 def append_analytics_event(event: dict) -> None:
-    # Concurrency safety: called from multiple worker threads via
-    # asyncio.to_thread() -- the motion-event path (store_motion_event())
-    # and the YOLO/AI detection path (save_yolo_events()) both call this
-    # for cameras 1-5, concurrently. The full read-modify-sort-write
-    # transaction must be serialized with a process-wide lock, or two
-    # concurrent writers can interleave their read/write and silently
-    # drop one caller's event.
-    with analytics_events_file_lock:
 
-        events = load_json_list(ANALYTICS_EVENTS_FILE)
 
-        events.append(event)
 
-        events.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
 
-        save_json_list(ANALYTICS_EVENTS_FILE, events[:5000])
+
+
+
+
+    events = load_json_list(ANALYTICS_EVENTS_FILE)
+
+
+
+
+
+
+
+
+    events.append(event)
+
+
+
+
+
+
+
+
+    events.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+
+
+
+
+
+
+
+
+    save_json_list(ANALYTICS_EVENTS_FILE, events[:5000])
 
 
 
@@ -35990,32 +35981,25 @@ def get_yolo_model():
 
 
 
-    # Fast path: once loaded, every later call (one per camera, every
-    # AI_DETECTION_INTERVAL_SECONDS, for the appliance's entire uptime)
-    # returns immediately without ever touching yolo_model_lock.
-    if yolo_model is not None:
-        return yolo_model
+    if yolo_model is None:
 
-    # Real threading.Lock(), not asyncio.Lock() -- get_yolo_model() is
-    # called via asyncio.to_thread() from up to 5 different worker
-    # threads (one per camera's ai_person_detector(), all racing here on
-    # their very first run), each with no asyncio event loop of its own
-    # to await an asyncio.Lock() on. Double-checked: the inner
-    # `if yolo_model is None` re-test is what actually prevents a second
-    # thread -- one that was blocked waiting for this lock while the
-    # first thread was still loading -- from loading a second model
-    # instance once it finally acquires the lock.
-    with yolo_model_lock:
-        if yolo_model is None:
-            print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
-            # Once, tied to this same one-time initialization -- caps
-            # PyTorch's own per-call intra-op parallelism so a single
-            # inference pass can't claim every core on an appliance
-            # also running 5 live ffmpeg streams, 5 recorders, and
-            # motion detection.
-            if torch is not None:
-                torch.set_num_threads(2)
-            yolo_model = YOLO(YOLO_MODEL_NAME)
+
+
+
+
+
+
+
+        print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
+
+
+
+
+
+
+
+
+        yolo_model = YOLO(YOLO_MODEL_NAME)
 
 
 
@@ -36980,15 +36964,6 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
     }
 
-    # Every class this function draws a box for and writes an
-    # analytics event for (i.e. every key above) is eligible for the
-    # same real short clip motion events already get -- reusing
-    # class_colors' own key set rather than a second, possibly-
-    # drifting list. "smart_motion" is a distinct event_type produced
-    # elsewhere, not by this function, and is not covered here.
-    AI_CLIP_EVENT_TYPES = frozenset(class_colors.keys())
-
-
 
 
 
@@ -37349,120 +37324,6 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         grouped.setdefault(detection["class_name"], []).append(detection)
 
-    # Real short clip + cloud upload for qualifying AI-classification
-    # detections (2026-09-02): reuses build_motion_event_clip(),
-    # compute_clip_window(), and -- traced live on the Samsung
-    # appliance, not guessed -- event_media_uploader.upload_motion_
-    # event_media() exactly as store_motion_event() already wires them
-    # together on the live production build, in the same nested-build-
-    # then-upload-task shape, using the same recording_uploader.py
-    # S3/session machinery that function already reuses. No second
-    # uploader.
-    #
-    # upload_motion_event_media() looks its event up in
-    # ANALYTICS_EVENTS_FILE by exact id match before it will register
-    # media (see _ensure_detection_event_synced() in event_media_
-    # uploader.py) -- so the clip's event_id must be the SAME id as
-    # one real local analytics event, not a separate group id. A scan
-    # can still produce several per-class analytics events (person AND
-    # car in one frame keep their own existing, independent ids/
-    # records, unchanged) but only ONE of them -- the first qualifying
-    # class, "primary_class_name" -- owns event_group_id, the clip,
-    # and the upload; detection_event_media.detection_event_id is
-    # UNIQUE in the cloud schema, so only one event could ever own a
-    # given clip's registration anyway. The others' event_clip stays
-    # None, exactly as an analytics-only event's already does.
-    #
-    # One clip per scan, not one per detected class -- every class in
-    # this scan shares event_group_id's window, and
-    # ai_event_clip_windows/should_merge() below skips a new
-    # extraction+upload entirely when this scan's window merges with
-    # the camera's most recently built one (a burst of repeated
-    # detections of the same real event), matching event_clips.py's
-    # own documented merge rule.
-    event_clip_path: str | None = None
-    primary_class_name: str | None = None
-    qualifying_detections = [
-        detection for detection in detections
-        if detection["class_name"] in AI_CLIP_EVENT_TYPES
-    ]
-    if qualifying_detections:
-        from event_clips import compute_clip_window, should_merge
-
-        window = compute_clip_window(now, now)
-        with ai_event_clip_windows_lock:
-            previous_window = ai_event_clip_windows.get(camera_number)
-            is_duplicate = (
-                previous_window is not None
-                and should_merge(previous_window.end, window.start)
-            )
-            ai_event_clip_windows[camera_number] = window
-
-        if not is_duplicate:
-            primary_class_name = qualifying_detections[0]["class_name"]
-            # Optimistic path, matching store_motion_event()'s own
-            # convention: extraction/upload run in the background (the
-            # extractor waits out the post-roll first), so this is the
-            # location the clip will exist at once that finishes, not
-            # a confirmation it already has or that upload succeeded.
-            event_clip_path = (
-                f"/recordings/clips/motion/motion_{event_group_id}.mp4"
-            )
-
-            async def build_and_upload_ai_event_media() -> None:
-                clip_url = await build_motion_event_clip(
-                    event_group_id, camera_number, now, now
-                )
-                if not clip_url:
-                    return
-                try:
-                    from event_media_uploader import upload_motion_event_media
-                    await asyncio.to_thread(
-                        upload_motion_event_media,
-                        event_id=event_group_id,
-                        camera_number=camera_number,
-                        event_start=now,
-                        event_end=now,
-                        clip_url=clip_url,
-                        thumbnail_url=thumbnail_url,
-                    )
-                except Exception as error:
-                    print(
-                        f"AI event {event_group_id}: media upload failed: "
-                        f"{type(error).__name__}: {error}"
-                    )
-
-            # save_yolo_events() executes via await asyncio.to_thread(...)
-            # (confirmed live on the Samsung appliance) -- a worker thread
-            # with no event loop of its own, so asyncio.ensure_future()/
-            # asyncio.create_task() cannot be used here (each only
-            # schedules onto "the current thread's running loop"; called
-            # from a thread with none, they raise RuntimeError).
-            # asyncio.run_coroutine_threadsafe(coro, loop) is the correct
-            # cross-thread primitive: it hands the coroutine to a specific,
-            # already-running loop -- _ai_event_media_loop, captured once
-            # on ai_person_detector()'s own first run (see that function's
-            # own opening lines) -- regardless of which thread is doing
-            # the scheduling.
-            if _ai_event_media_loop is not None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        build_and_upload_ai_event_media(), _ai_event_media_loop
-                    )
-                except RuntimeError as error:
-                    # Fail open -- the analytics event itself and its
-                    # existing linked_recording fallback are unaffected --
-                    # but LOGGED, not silently swallowed.
-                    print(
-                        f"AI event {event_group_id}: could not schedule "
-                        f"clip build/upload: {type(error).__name__}: {error}"
-                    )
-            else:
-                print(
-                    f"AI event {event_group_id}: could not schedule clip "
-                    f"build/upload: no main event loop captured yet."
-                )
-
 
 
 
@@ -37524,7 +37385,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-            id=(event_group_id if class_name == primary_class_name else uuid.uuid4().hex[:12]),
+            id=uuid.uuid4().hex[:12],
 
 
 
@@ -37634,17 +37495,6 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         event["detections"] = class_detections
 
-        # New, additive field -- only the one primary_class_name event
-        # this scan actually owns the clip/upload for gets a path; a
-        # secondary class detected in the same frame (e.g. person AND
-        # car) keeps its own independent analytics-history record but
-        # None here, exactly like an analytics-only event already had
-        # -- detection_event_media.detection_event_id is UNIQUE in the
-        # cloud schema, so only one event could ever own this clip's
-        # registration anyway. Existing "linked_recording" above is
-        # untouched, so nothing that already reads it changes behavior.
-        event["event_clip"] = event_clip_path if class_name == primary_class_name else None
-
 
 
 
@@ -37653,91 +37503,14 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         append_analytics_event(event)
-        smart_motion.record_object_detection(camera_number, class_name)
-        if class_name == "person" and ppe.is_camera_enabled(camera_number):
-            for person_detection in class_detections:
-                try:
-                    hx, hy, hw, hh = (
-                        person_detection["x"],
-                        person_detection["y"],
-                        person_detection["width"],
-                        person_detection["height"],
-                    )
-                    person_crop = frame[hy : hy + hh, hx : hx + hw]
-                    ppe_result = ppe.detect_ppe(person_crop, camera_number=camera_number)
-                except Exception as error:
-                    ppe_result = None
-                    print(f"Camera {camera_number} PPE skipped (non-fatal): {error}")
-                if not ppe_result:
-                    continue
-                ppe_event = AnalyticsEventModel(
-                    id=uuid.uuid4().hex[:12],
-                    camera=camera_number,
-                    site="home",
-                    rule_name=(
-                        "PPE compliant"
-                        if ppe_result["hard_hat_present"] and ppe_result["safety_vest_present"]
-                        else "PPE violation"
-                    ),
-                    event_type="ppe",
-                    timestamp=now,
-                    confidence=ppe_result["confidence"],
-                    thumbnail=thumbnail_url,
-                    linked_recording=linked_recording,
-                    mock=False,
-                ).model_dump(mode="json")
-                ppe_event["hard_hat_present"] = ppe_result["hard_hat_present"]
-                ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
-                append_analytics_event(ppe_event)
-                saved_events.append(ppe_event)
-        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number):
-            for vehicle_detection in class_detections:
-                try:
-                    vx, vy, vw, vh = (
-                        vehicle_detection["x"],
-                        vehicle_detection["y"],
-                        vehicle_detection["width"],
-                        vehicle_detection["height"],
-                    )
-                    vehicle_crop = frame[vy : vy + vh, vx : vx + vw]
-                    plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
-                except Exception as error:
-                    plate_result = None
-                    print(f"Camera {camera_number} LPR skipped (non-fatal): {error}")
-                if not plate_result:
-                    continue
-                plate_crop_url = None
-                try:
-                    px, py, pw, ph = plate_result["region"]
-                    plate_crop_image = vehicle_crop[py : py + ph, px : px + pw]
-                    plate_filename = (
-                        f"camera{camera_number}_{now.strftime('%H-%M-%S')}_"
-                        f"plate_{uuid.uuid4().hex[:12]}.jpg"
-                    )
-                    plate_output_path = day_folder / plate_filename
-                    if cv2.imwrite(str(plate_output_path), plate_crop_image):
-                        plate_crop_url = (
-                            f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
-                            f"{quote(plate_filename)}"
-                        )
-                except Exception as error:
-                    print(f"Camera {camera_number} LPR plate-crop save skipped (non-fatal): {error}")
-                plate_event = AnalyticsEventModel(
-                    id=uuid.uuid4().hex[:12],
-                    camera=camera_number,
-                    site="home",
-                    rule_name=f"LPR ({class_name})",
-                    event_type="plate",
-                    timestamp=now,
-                    confidence=round(plate_result["confidence"] / 100, 4),
-                    plate_number=plate_result["plate_number"],
-                    plate_crop=plate_crop_url,
-                    thumbnail=thumbnail_url,
-                    linked_recording=linked_recording,
-                    mock=False,
-                ).model_dump(mode="json")
-                append_analytics_event(plate_event)
-                saved_events.append(plate_event)
+
+
+
+
+
+
+
+
         saved_events.append(event)
 
 
@@ -37783,257 +37556,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-def _load_people_counting_rule(camera_number: int) -> dict | None:
-    """Reuses the EXISTING line_crossing rule-builder/storage (analytics_
-    rules.json) rather than a second, incompatible configuration system,
-    per explicit instruction. Returns the first enabled line_crossing
-    rule for this camera, or None if none exists -- an entitled camera
-    with no configured line simply doesn't run People Counting yet
-    (fail-safe: no crash, no guess at where a line should go)."""
-    rules = load_json_list(ANALYTICS_RULES_FILE)
-    for rule in rules:
-        if not isinstance(rule, dict):
-            continue
-        if rule.get("analytic_type") == "line_crossing" and rule.get("camera") == camera_number and rule.get("enabled", True):
-            return rule
-    return None
-
-
-def _people_counting_state_load_all() -> dict:
-    """Fail-safe load: a missing or corrupt state file is treated
-    identically to 'no prior state' (every counter starts fresh at
-    0/0) rather than crashing the worker -- matches this session's
-    established fail-safe convention for every other piece of
-    persisted appliance state."""
-    if not PEOPLE_COUNTING_STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(PEOPLE_COUNTING_STATE_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _people_counting_state_save(camera_number: int, counter: "people_counting.PeopleCounter") -> None:
-    """Read-modify-write of the shared state file. Known, disclosed
-    limitation for a future multi-camera phase: this isn't cross-thread
-    locked, so two cameras saving state in the same instant could race
-    -- acceptable for this narrow, single-camera validation phase (only
-    one camera's worker is ever actually entitled+configured right now)
-    and flagged explicitly in the report rather than silently accepted."""
-    all_state = _people_counting_state_load_all()
-    saved = counter.state()
-    all_state[str(camera_number)] = {"in_count": saved.in_count, "out_count": saved.out_count, "frame_index": saved.frame_index}
-    PEOPLE_COUNTING_STATE_FILE.write_text(json.dumps(all_state))
-
-
-async def people_counting_worker(camera_number: int) -> None:
-    """One task per camera, spawned only when PEOPLE_COUNTING_ENABLED
-    (the appliance-wide master switch) is on -- mirrors motion_detector/
-    ai_person_detector's own existing startup pattern exactly. Within
-    that, this specific camera only does anything once BOTH the cloud
-    entitlement flag (cameras.people_counting_enabled, read live via
-    recording_uploader._camera_identity() -- reused, not duplicated)
-    AND a configured line_crossing rule are present; otherwise it idles
-    harmlessly, re-checking every cycle so a live entitlement/rule
-    change takes effect without an appliance restart.
-
-    Reuses detect_objects_frame() -- the EXACT SAME YOLO call
-    ai_person_detector() already makes -- for detections; no new model,
-    no separate inference path. Only the polling cadence differs
-    (PEOPLE_COUNTING_INTERVAL_SECONDS, faster than the ordinary
-    AI_DETECTION_INTERVAL_SECONDS) for cameras actually running this
-    feature, since reliable line-crossing tracking needs closer-spaced
-    samples than plain presence detection does.
-
-    Crossing events are appended via append_analytics_event() -- the
-    same function save_yolo_events() already uses -- so they
-    automatically flow through the existing, already-validated
-    analytics_sync.py background sync to AWS with zero new sync code."""
-    counter: "people_counting.PeopleCounter | None" = None
-    configured_line_key = None
-    debug = camera_number == PEOPLE_COUNTING_DEBUG_CAMERA  # TEMPORARY, walk-test diagnostics only -- see PEOPLE_COUNTING_DEBUG_CAMERA's own comment
-    # TEMPORARY reconstruction-diagnostic state, Camera-1-debug-only (see below) --
-    # exists solely to answer "why was the counter rebuilt" and is not otherwise
-    # used for counting logic. worker_session_id changes only if this whole
-    # coroutine is re-entered (a real worker/process/container restart), so
-    # comparing it across log lines distinguishes "this is a genuinely new
-    # worker invocation" from "the same worker rebuilt its counter mid-session".
-    worker_session_id = uuid.uuid4().hex[:8] if debug else None
-    ever_constructed = False
-    last_entitled = None
-    last_rule_id = None
-    if debug:
-        print(f"[PeopleCountingDebug][cam{camera_number}] worker_task_started session={worker_session_id}")
-    while True:
-        try:
-            identity = recording_uploader._camera_identity(camera_number)
-            entitled = bool(identity and identity.get("people_counting_enabled"))
-            rule = _load_people_counting_rule(camera_number) if entitled else None
-            rule_id = rule.get("id") if rule else None
-            config_refresh_at = recording_uploader.recording_upload_state.get("last_config_refresh_at") if debug else None
-
-            if debug:
-                if last_entitled is not None and entitled != last_entitled:
-                    print(f"[PeopleCountingDebug][cam{camera_number}] entitlement_changed session={worker_session_id} {last_entitled} -> {entitled} identity={identity} last_config_refresh_at={config_refresh_at}")
-                if last_rule_id is not None and rule_id != last_rule_id:
-                    print(f"[PeopleCountingDebug][cam{camera_number}] rule_id_changed session={worker_session_id} {last_rule_id} -> {rule_id}")
-                print(f"[PeopleCountingDebug][cam{camera_number}] cycle_start session={worker_session_id} entitled={entitled} rule_loaded={rule is not None} rule_id={rule_id} last_config_refresh_at={config_refresh_at}")
-            last_entitled = entitled
-            last_rule_id = rule_id
-
-            if entitled and rule and len(rule.get("geometry", [])) >= 2:
-                line = people_counting.CountingLine.from_rule_geometry(rule["geometry"], rule.get("direction", "both"))
-                line_key = (tuple((p.get("x"), p.get("y")) for p in rule["geometry"][:2]), rule.get("direction", "both"))
-                if counter is None or line_key != configured_line_key:
-                    # Exact reason code, per explicit instruction: distinguish a
-                    # genuine first-ever construction from "was cleared by a
-                    # de-entitlement/rule-loss cycle and is now being rebuilt"
-                    # from "entitled and rule-having the whole time, but the
-                    # rule's own geometry/direction/id changed under us".
-                    if not ever_constructed:
-                        reconstruction_reason = "first_startup"
-                    elif counter is None:
-                        reconstruction_reason = "counter_cleared_then_reentitled_or_rule_restored"
-                    else:
-                        reconstruction_reason = "line_key_changed"
-                    if debug:
-                        state_file_exists = PEOPLE_COUNTING_STATE_FILE.exists()
-                        state_file_raw = None
-                        state_file_read_error = None
-                        if state_file_exists:
-                            try:
-                                state_file_raw = PEOPLE_COUNTING_STATE_FILE.read_text()
-                            except OSError as read_error:
-                                state_file_read_error = f"{type(read_error).__name__}:{read_error}"
-                        print(
-                            f"[PeopleCountingDebug][cam{camera_number}] reconstruction_triggered session={worker_session_id} "
-                            f"reason={reconstruction_reason} previous_line_key={configured_line_key} new_line_key={line_key} "
-                            f"rule_id={rule_id} state_file_path={PEOPLE_COUNTING_STATE_FILE} state_file_exists={state_file_exists} "
-                            f"state_file_raw_len={len(state_file_raw) if state_file_raw is not None else None} "
-                            f"state_file_read_error={state_file_read_error} last_config_refresh_at={config_refresh_at}"
-                        )
-                    counter = people_counting.PeopleCounter(line)
-                    ever_constructed = True
-                    saved_all = _people_counting_state_load_all()
-                    saved = saved_all.get(str(camera_number))
-                    if saved:
-                        counter.restore(people_counting.CounterState(**saved))
-                    configured_line_key = line_key
-                    if debug:
-                        print(
-                            f"[PeopleCountingDebug][cam{camera_number}] line_loaded session={worker_session_id} "
-                            f"x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction} "
-                            f"restored_from_state={saved is not None} state_file_keys_present={list(saved_all.keys())} "
-                            f"reason={reconstruction_reason}"
-                        )
-                if debug:
-                    print(f"[PeopleCountingDebug][cam{camera_number}] line_in_use x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction}")
-
-                result = await asyncio.to_thread(detect_objects_frame, camera_number)
-                if debug:
-                    print(f"[PeopleCountingDebug][cam{camera_number}] detect_objects_frame ok={result.get('ok')} error={result.get('error')} raw_detections={len(result.get('detections', []))}")
-                if result.get("ok"):
-                    frame = result.get("frame")
-                    centroids = []
-                    if frame is not None:
-                        frame_height, frame_width = frame.shape[0], frame.shape[1]
-                        for detection in result.get("detections", []):
-                            if detection.get("class_name") != "person":
-                                continue
-                            cx = (detection["x"] + detection["width"] / 2) / frame_width
-                            cy = (detection["y"] + detection["height"] / 2) / frame_height
-                            norm_w = detection["width"] / frame_width
-                            norm_h = detection["height"] / frame_height
-                            # foot_x/foot_y: bottom-center of the box (a
-                            # person's ground-contact point), used ONLY
-                            # by people_counting.py's crossing decision,
-                            # not for matching -- see that module's
-                            # update() docstring for why this is the
-                            # physically correct point for a ground-
-                            # plane doorway/walkway line.
-                            foot_x = cx
-                            foot_y = (detection["y"] + detection["height"]) / frame_height
-                            centroids.append({"x": cx, "y": cy, "w": norm_w, "h": norm_h, "foot_x": foot_x, "foot_y": foot_y})
-                    if debug:
-                        print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f},foot_x={c['foot_x']:.4f},foot_y={c['foot_y']:.4f})" for c in centroids))
-                    if debug:
-                        events, debug_entries = counter.update(centroids, debug=True)
-                        for entry in debug_entries:
-                            print(
-                                f"[PeopleCountingDebug][cam{camera_number}] track={entry['track_id']} status={entry['track_status']} "
-                                f"prev_side={entry['prev_side']} new_side={entry['new_side']} crossed={entry['crossed']} "
-                                f"reason={entry['crossing_reason']} raw_cross={entry['raw_cross_value']} "
-                                f"crossing_point={entry.get('crossing_point')} foot_x={entry.get('foot_x')} foot_y={entry.get('foot_y')}"
-                            )
-                        print(f"[PeopleCountingDebug][cam{camera_number}] totals in={counter.in_count} out={counter.out_count} occupancy={counter.occupancy}")
-                    else:
-                        events = counter.update(centroids)
-                    if events:
-                        now = datetime.now()
-                        for event in events:
-                            record = AnalyticsEventModel(
-                                camera=camera_number,
-                                site="home",
-                                rule_name=f"People Counting ({rule.get('name', 'counting line')})",
-                                event_type=f"people_counting_{event.direction}",
-                                direction=event.direction,
-                                confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
-                                thumbnail=None,
-                                linked_recording=linked_recording_for(camera_number, now),
-                                mock=False,
-                            ).model_dump(mode="json")
-                            record["occupancy"] = counter.occupancy
-                            record["in_count"] = counter.in_count
-                            record["out_count"] = counter.out_count
-                            append_analytics_event(record)
-                        await asyncio.to_thread(_people_counting_state_save, camera_number, counter)
-            else:
-                # Not (or no longer) entitled+configured -- drop any
-                # in-progress counter/tracks. Cumulative counts already
-                # saved to PEOPLE_COUNTING_STATE_FILE are untouched and
-                # will be restored if this camera becomes entitled again.
-                if debug and counter is not None:
-                    geometry_len = len(rule.get("geometry", [])) if rule else 0
-                    print(
-                        f"[PeopleCountingDebug][cam{camera_number}] counter_cleared session={worker_session_id} "
-                        f"entitled={entitled} rule_loaded={rule is not None} geometry_len={geometry_len} "
-                        f"prior_line_key={configured_line_key}"
-                    )
-                counter = None
-                configured_line_key = None
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            if debug:
-                print(
-                    f"[PeopleCountingDebug][cam{camera_number}] exception_recovery session={worker_session_id} "
-                    f"counter_alive={counter is not None} configured_line_key={configured_line_key} "
-                    f"error_type={type(error).__name__} error={error}"
-                )
-            print(f"Camera {camera_number} People Counting worker error: {error}")
-        await asyncio.sleep(PEOPLE_COUNTING_INTERVAL_SECONDS)
-
-
 async def ai_person_detector(camera_number: int) -> None:
-    # Startup stagger -- see AI_DETECTOR_STARTUP_STAGGER_SECONDS's own
-    # comment. All 5 of these tasks are created back-to-back with no gap
-    # (see the startup list comprehension); this is what actually
-    # separates them in time, camera 1 first, camera 5 last.
-    if AI_DETECTOR_STARTUP_STAGGER_SECONDS:
-        await asyncio.sleep(camera_number * AI_DETECTOR_STARTUP_STAGGER_SECONDS)
-
-    # Captured once, lazily, on whichever camera's detector task happens
-    # to start first -- this coroutine is itself created via
-    # asyncio.create_task() on the real main event loop (see lifespan()'s
-    # own startup block), so this is a reliable, one-time way to obtain
-    # that loop for save_yolo_events()'s own cross-thread scheduling
-    # (that function runs via asyncio.to_thread(), a worker thread with
-    # no running loop of its own -- see _ai_event_media_loop's own
-    # module-level comment).
-    global _ai_event_media_loop
-    if _ai_event_media_loop is None:
-        _ai_event_media_loop = asyncio.get_running_loop()
-
 
 
 
@@ -38249,17 +37772,34 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
-            # At most one camera's inference runs at a time, appliance-
-            # wide -- released automatically on the way out of this
-            # block whether detect_objects_frame() succeeds, raises, or
-            # this task is cancelled while waiting/running (async with's
-            # own __aexit__ guarantee), so a failed or cancelled scan
-            # can never leave the semaphore permanently held.
-            async with ai_inference_semaphore:
-                result = await asyncio.to_thread(
-                    detect_objects_frame,
-                    camera_number,
-                )
+            result = await asyncio.to_thread(
+
+
+
+
+
+
+
+
+                detect_objects_frame,
+
+
+
+
+
+
+
+
+                camera_number,
+
+
+
+
+
+
+
+
+            )
 
 
 
@@ -39244,11 +38784,6 @@ import live_relay_idle_sweep
 import live_relay_uploader
 import recording_uploader
 import recording_retention_sweep
-import analytics_sync
-import lpr
-import ppe
-import smart_motion
-import people_counting
 
 
 @asynccontextmanager
@@ -39459,21 +38994,32 @@ async def lifespan(app: FastAPI):
 
 
             ai_tasks = [
-                asyncio.create_task(ai_person_detector(camera_number))
-                for camera_number in get_camera_numbers()
-            ]
 
-        if PEOPLE_COUNTING_ENABLED:
-            # One task spawned per camera, exactly like ai_tasks above --
-            # each task idles harmlessly unless ITS OWN camera is both
-            # cloud-entitled and has a configured counting line (see
-            # people_counting_worker()'s own docstring). This master
-            # flag stays a separate, appliance-wide safety gate on top
-            # of the per-camera entitlement -- both must be true for
-            # anything to actually run.
-            people_counting_tasks = [
-                asyncio.create_task(people_counting_worker(camera_number))
+
+
+
+
+
+
+
+                asyncio.create_task(ai_person_detector(camera_number))
+
+
+
+
+
+
+
+
                 for camera_number in get_camera_numbers()
+
+
+
+
+
+
+
+
             ]
 
 
@@ -39583,11 +39129,6 @@ async def lifespan(app: FastAPI):
     recording_retention_sweep_task = (
         asyncio.create_task(recording_retention_sweep.recording_retention_sweep_worker())
         if RUNTIME_ROLE in {"cloud", "combined"} and recording_retention_sweep.RETENTION_SWEEP_ENABLED
-        else None
-    )
-    analytics_sync_task = (
-        asyncio.create_task(analytics_sync.analytics_sync_worker())
-        if RUNTIME_ROLE in {"edge", "combined"} and analytics_sync.ANALYTICS_SYNC_ENABLED
         else None
     )
 
@@ -40790,21 +40331,22 @@ app.mount("/recordings", StaticFiles(directory="/app/recordings"), name="recordi
 # guessing from the URL alone: "/customer-live" and "/customer-app-
 # settings" already had the prefix, but "/dashboard", "/playback",
 # "/events", "/alerts", "/investigate", and "/subscription-portal" did
-# not, so an unauthenticated (or session-expired) customer clicking
-# any of THOSE landed on the local-emergency-recovery /login instead
-# of the customer sign-in page -- reported live on app.anyaicam.com
-# (RUNTIME_ROLE=cloud) as "/dashboard and /playback redirect to
-# /login". ("/mobile-app", NAV_ITEMS' remaining bare-path entry, is
-# deliberately NOT listed here -- it's already in PUBLIC_PATH_PREFIXES
-# below, so authentication_middleware never reaches this branch for it
-# at all; that page currently has no route handler behind it, a real
-# but separate missing-page gap, out of scope for this auth-routing
-# fix.) Only applied when RUNTIME_ROLE == "cloud": on an edge
-# appliance, an unauthenticated visitor to these exact same shared
-# dual-purpose routes (see e.g. playback()'s own _customer_playback_
-# cameras() branch) is the appliance's own local owner, not a cloud
-# customer account, and the existing local-emergency-recovery /login
-# is the correct destination for them -- unchanged here.
+# not, so an unauthenticated (or session-expired)
+# customer clicking any of THOSE landed on the local-emergency-
+# recovery /login instead of the customer sign-in page -- reported
+# live on app.anyaicam.com (RUNTIME_ROLE=cloud) as "/dashboard and
+# /playback redirect to /login". ("/mobile-app", NAV_ITEMS' remaining
+# bare-path entry, is deliberately NOT listed here -- it's already in
+# PUBLIC_PATH_PREFIXES below, so authentication_middleware never
+# reaches this branch for it at all; that page currently has no route
+# handler behind it, a real but separate missing-page gap, out of
+# scope for this auth-routing fix.) Only applied when RUNTIME_ROLE ==
+# "cloud": on an edge appliance, an unauthenticated visitor to these
+# exact same shared dual-purpose routes (see e.g. playback()'s own
+# _customer_playback_cameras() branch) is the appliance's own local
+# owner, not a cloud customer account, and the existing local-
+# emergency-recovery /login is the correct destination for them --
+# unchanged here.
 CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     "/dashboard",
     "/playback",
@@ -40816,6 +40358,14 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
 
 
 PUBLIC_PATH_PREFIXES = (
+
+
+
+
+
+
+
+
     "/login",
 
     "/customer-login.html",
@@ -40829,6 +40379,10 @@ PUBLIC_PATH_PREFIXES = (
     "/customer-forgot-password",
 
     "/customer-reset-password",
+    "/manifest.webmanifest",
+    "/mobile-app",
+    "/service-worker.js",
+    "/offline",
 
     "/forgot-password",
 
@@ -41118,6 +40672,11 @@ async def authentication_middleware(request: Request, call_next):
     # it never changes who is or isn't authenticated.
     if path.startswith("/customer"):
         return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
+
+
+
+
+
 
     # Cloud-only widening of the same customer-login redirect to the
     # bare-path half of the customer nav (see CLOUD_CUSTOMER_NAV_PATH_
@@ -45482,7 +45041,7 @@ STYLES = """
 
 
 
-.sidebar{display:flex;flex-direction:column}.nav{flex:1}.sidebar-auth{margin-top:auto;padding:10px 5px 4px}.sidebar-logout{width:100%;min-height:54px;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 6px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:#24292c;color:#fff;font:inherit;font-weight:750;cursor:pointer}.sidebar-logout:hover,.sidebar-logout:focus-visible{background:#343b3f;border-color:var(--brand);outline:none}.sidebar-logout-icon{font-size:18px;line-height:1}.sidebar-build-badge{margin-top:8px;padding:4px 5px 0;color:var(--muted,#8f9baa);font-size:10px;letter-spacing:.02em;text-align:center;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}@media(max-width:760px){.sidebar-auth{display:none}}:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--panel2:#181e28;--line:#27303d;--text:#f4f7fb;--muted:#8f9baa;--accent:#47d7ac;--blue:#70a5ff;--danger:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;border-right:1px solid var(--line);background:#0e1218}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 28px;font-weight:750;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:#07110e;font-size:18px}.nav{display:grid;gap:6px}.nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:650}.nav a:hover{background:var(--panel2);color:var(--text)}.nav a.active{background:#193329;color:#7ee8c7}.sidebar-foot{position:absolute;left:16px;right:16px;bottom:22px;padding:13px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.sidebar-foot strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.content{min-width:0;padding:30px 34px 50px;max-width:1600px;width:100%;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.eyebrow{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,3vw,34px);letter-spacing:-.035em}h2{margin:0;font-size:18px}.clock{color:var(--muted);font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:24px}.stat{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.stat-label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}.stat-value{font-size:18px;font-weight:750}.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(71,215,172,.1)}.section-head{display:flex;align-items:end;justify-content:space-between;margin:0 0 14px}.section-head p{margin:0;color:var(--muted);font-size:13px}.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.camera-card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}.camera-view{position:relative;display:grid;place-items:center;aspect-ratio:16/9;background:#080a0e;overflow:hidden}.camera-view video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}.camera-placeholder{text-align:center;color:var(--muted);padding:20px}.camera-placeholder .signal{display:block;margin:0 auto 12px;font-size:25px}.camera-placeholder strong{display:block;color:#cad2dd;margin-bottom:4px}.live-badge{position:absolute;z-index:2;top:12px;left:12px;padding:6px 9px;border-radius:8px;background:rgba(8,10,14,.78);font-size:11px;font-weight:800;letter-spacing:.08em}.live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--danger)}.camera-meta{display:flex;justify-content:space-between;gap:15px;padding:14px 16px}.camera-name{font-weight:700}.camera-state{color:var(--muted);font-size:12px}.camera-state.ready{color:var(--accent)}.library-toolbar{display:flex;gap:10px;margin-bottom:18px;overflow:auto}.filter{border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);padding:8px 13px;cursor:pointer;white-space:nowrap}.filter.active{background:var(--text);border-color:var(--text);color:#0b0e13}.camera-section{margin-bottom:28px}.recording-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}.clip{overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.clip video{display:block;width:100%;aspect-ratio:16/9;background:#07090c}.clip-body{padding:13px}.clip-time{font-weight:700;font-size:14px}.clip-meta{margin:5px 0 12px;color:var(--muted);font-size:12px}.download{color:var(--blue);text-decoration:none;font-size:13px;font-weight:700}.empty{padding:28px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);text-align:center;background:rgba(18,23,32,.5)}.mobile-nav{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:980px){.recording-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:23px 16px 90px}.clock{display:none}.summary{grid-template-columns:1fr}.camera-grid,.recording-grid{grid-template-columns:1fr}.mobile-nav{position:fixed;z-index:20;display:grid;grid-template-columns:1fr 1fr;left:12px;right:12px;bottom:12px;padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(18,23,32,.94);backdrop-filter:blur(14px)}.mobile-nav a{text-align:center;padding:10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:700;font-size:13px}.mobile-nav a.active{background:#193329;color:#7ee8c7}}
+.sidebar{display:flex;flex-direction:column}.nav{flex:1}.sidebar-auth{margin-top:auto;padding:10px 5px 4px}.sidebar-logout{width:100%;min-height:54px;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 6px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:#24292c;color:#fff;font:inherit;font-weight:750;cursor:pointer}.sidebar-logout:hover,.sidebar-logout:focus-visible{background:#343b3f;border-color:var(--brand);outline:none}.sidebar-logout-icon{font-size:18px;line-height:1}.sidebar-build-badge{margin-top:8px;padding:4px 5px 0;color:var(--muted,#8f9baa);font-size:10px;letter-spacing:.02em;text-align:center;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}@media(max-width:760px){.sidebar-auth{display:none}}:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--panel2:#181e28;--line:#27303d;--text:#f4f7fb;--muted:#8f9baa;--accent:#47d7ac;--blue:#70a5ff;--danger:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;border-right:1px solid var(--line);background:#0e1218}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 28px;font-weight:750;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:#07110e;font-size:18px}.nav{display:grid;gap:6px}.nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:650}.nav a:hover{background:var(--panel2);color:var(--text)}.nav a.active{background:#193329;color:#7ee8c7}.sidebar-foot{position:absolute;left:16px;right:16px;bottom:22px;padding:13px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.sidebar-foot strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.content{min-width:0;padding:30px 34px 50px;max-width:1600px;width:100%;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.eyebrow{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,3vw,34px);letter-spacing:-.035em}h2{margin:0;font-size:18px}.clock{color:var(--muted);font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:24px}.stat{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.stat-label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}.stat-value{font-size:18px;font-weight:750}.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(71,215,172,.1)}.section-head{display:flex;align-items:end;justify-content:space-between;margin:0 0 14px}.section-head p{margin:0;color:var(--muted);font-size:13px}.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.camera-card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}.camera-view{position:relative;display:grid;place-items:center;aspect-ratio:16/9;background:#080a0e;overflow:hidden}.camera-view video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}.camera-placeholder{text-align:center;color:var(--muted);padding:20px}.camera-placeholder .signal{display:block;margin:0 auto 12px;font-size:25px}.camera-placeholder strong{display:block;color:#cad2dd;margin-bottom:4px}.live-badge{position:absolute;z-index:2;top:12px;left:12px;padding:6px 9px;border-radius:8px;background:rgba(8,10,14,.78);font-size:11px;font-weight:800;letter-spacing:.08em}.live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--danger)}.camera-meta{display:flex;justify-content:space-between;gap:15px;padding:14px 16px}.camera-name{font-weight:700}.camera-state{color:var(--muted);font-size:12px}.camera-state.ready{color:var(--accent)}.library-toolbar{display:flex;gap:10px;margin-bottom:18px;overflow:auto}.filter{border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);padding:8px 13px;cursor:pointer;white-space:nowrap}.filter.active{background:var(--text);border-color:var(--text);color:#0b0e13}.camera-section{margin-bottom:28px}.recording-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}.clip{overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.clip video{display:block;width:100%;aspect-ratio:16/9;background:#07090c}.clip-body{padding:13px}.clip-time{font-weight:700;font-size:14px}.clip-meta{margin:5px 0 12px;color:var(--muted);font-size:12px}.download{color:var(--blue);text-decoration:none;font-size:13px;font-weight:700}.empty{padding:28px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);text-align:center;background:rgba(18,23,32,.5)}.mobile-nav{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:980px){.recording-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:900px){.shell{display:block}.sidebar{display:none}.content{padding:23px 16px 90px}.clock{display:none}.summary{grid-template-columns:1fr}.camera-grid,.recording-grid{grid-template-columns:1fr}.mobile-nav{position:fixed;z-index:20;display:grid;grid-template-columns:1fr 1fr;left:12px;right:12px;bottom:12px;padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(18,23,32,.94);backdrop-filter:blur(14px)}.mobile-nav a{text-align:center;padding:10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:700;font-size:13px}.mobile-nav a.active{background:#193329;color:#7ee8c7}}
 
 
 
@@ -47480,7 +47039,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
         mobile_items = [
-            ("live", "/customer-live", "Cameras"),
+            ("live", "/customer-live", "Live View"),
             ("alerts", "/alerts", "Alerts"),
             ("playback", "/playback", "Playback"),
             ("dashboard", "/customer-portal", "Account"),
@@ -51181,7 +50740,55 @@ if(resetButton)resetButton.onclick=async()=>{if(!confirm('Reset local activation
 
 
 
-def camera_status() -> dict:
+def camera_status(request: Request) -> dict:
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        # Customer-portal identity: scope to only this customer's own
+        # cameras -- never the shared, multi-tenant camera_number
+        # sequence _legacy_camera_status() below iterates -- and source
+        # online/recording from the appliance's own live heartbeat
+        # (appliance_camera_status, keyed by the real camera.id) instead
+        # of the local HLS-manifest/camera_process_state check further
+        # down. That check is edge-appliance-only (correct on
+        # Samsung/Ryzen, where a local relay actually writes those
+        # files); this cloud host runs no local relay for a customer's
+        # cameras at all, so it always reported every camera offline
+        # regardless of the appliance's real, live state.
+        return _customer_camera_status(customer_cameras)
+    return _legacy_camera_status()
+
+
+def _customer_camera_status(customer_cameras: list[dict]) -> dict:
+    from partner_db import connection
+    cameras = []
+    with connection() as db:
+        for camera in customer_cameras:
+            camera_number = camera.get("camera_number")
+            if camera_number is None:
+                continue
+            status_row = db.execute(
+                "SELECT online, recording FROM appliance_camera_status WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchone()
+            online = bool(status_row["online"]) if status_row else False
+            recording_running = bool(status_row["recording"]) if status_row else False
+            cameras.append(
+                {
+                    "camera": camera_number,
+                    "online": online,
+                    "stream": "online" if online else "offline",
+                    "recording": "running" if recording_running else "stopped",
+                    "last_stream_update_seconds": None,
+                    "reconnects": 0,
+                    "last_exit_code": None,
+                    "last_error": None,
+                    "last_error_at": None,
+                }
+            )
+    return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
+
+
+def _legacy_camera_status() -> dict:
 
 
 
@@ -73118,7 +72725,20 @@ def camera_health_page(request: Request) -> str:
 
 
 
-def dashboard() -> str:
+def dashboard(request: Request) -> str:
+    _customer_dashboard_cameras = _customer_playback_cameras(request)
+    if _customer_dashboard_cameras is not None:
+        # Customer-portal identity: only this customer's own camera
+        # numbers -- see camera_status()'s own comment for why the
+        # shared, multi-tenant get_camera_numbers() sequence below must
+        # never be used to build a real customer's Dashboard.
+        _dashboard_camera_numbers = [
+            camera["camera_number"]
+            for camera in _customer_dashboard_cameras
+            if camera.get("camera_number") is not None
+        ]
+    else:
+        _dashboard_camera_numbers = list(get_camera_numbers())
 
 
 
@@ -73424,7 +73044,7 @@ def dashboard() -> str:
 
 
 
-        for camera_number in get_camera_numbers()
+        for camera_number in _dashboard_camera_numbers
 
 
 
@@ -73883,7 +73503,7 @@ def dashboard() -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">System overview</p><h1>Dashboard</h1></div><a class="action-button" href="/">Open live view</a></header>
+    content = f"""<header class="topbar"><div><p class="eyebrow">System overview</p><h1>Dashboard</h1></div></header>
 
 
 
@@ -119466,7 +119086,7 @@ def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_
     (?event=<event_id>) instead of a timestamp, and
     _render_customer_playback()'s renderCamera() uses it to call the
     existing, already-authorized, already-working
-    /api/customer/events/{camera_id}/{event_id}/media/url route
+    /api/customer/events/{{camera_id}}/{{event_id}}/media/url route
     directly -- the same route event-marker/mobile-event clicks on the
     Playback timeline have always used, completely bypassing
     findClipNear()/the recordings catalog. Analytics-only events (no
@@ -139590,17 +139210,6 @@ def _row_to_recording_metadata(row: dict) -> dict:
 
 
 def _catalog_local_recordings_for_camera(camera_id: str) -> int:
-    """Backfills the recordings table from local .mkv files still on
-    disk for this camera -- reconciled verbatim from the accepted,
-    live production implementation (EC2/Samsung), not invented.
-    recording_start() (filename parsing) is the sole authoritative
-    timestamp source; filesystem mtime is used only as a safety gate
-    to skip a segment ffmpeg may still be actively writing (a file
-    younger than CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS), never as the
-    recorded time itself. (camera_id, s3_key) is UNIQUE on the
-    recordings table, so this is naturally idempotent -- calling it
-    repeatedly, on every date this camera's Playback is queried for,
-    never creates duplicate rows."""
     from partner_db import connection
 
     with connection() as db:
@@ -139671,6 +139280,7 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
 
 
 def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, near: str | None = None) -> list[dict]:
+    _catalog_local_recordings_for_camera(camera_id)
     """Recording METADATA only -- {id, start, end, name}, no presigned
     URL -- the bounded, cheap counterpart _customer_camera_recordings()
     never was: that function signs every single matching row up front
@@ -139701,7 +139311,6 @@ def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before
       event-to-playback deep link lands on the same recording whether
       or not it happens to already be in the initially-loaded page.
       Ignores limit/before."""
-    _catalog_local_recordings_for_camera(camera_id)
     from partner_db import connection
     with connection() as db:
         if near:
@@ -139854,21 +139463,47 @@ def _customer_recording_dates(camera_id: str) -> list[str]:
 
 
 def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
-    """Presigns exactly one recording, looked up by its own catalog id
-    and re-scoped to camera_id in the same query -- so a recording_id
-    can never be used to fetch a URL for a different camera's footage,
-    even if the two happen to belong to the same customer. Callers
-    (the /url route below) must already have verified camera_id itself
-    is one this identity is authorized to see."""
+    """Return a playable URL for one authorized catalog recording.
+
+    Cloud deployments keep using the existing presigned S3 URL.
+    Edge/local appliances fall back to an authenticated local recording
+    route when the exact cataloged MKV still exists on this appliance.
+    """
     from partner_db import connection
+
     with connection() as db:
         row = db.execute(
-            "SELECT s3_key FROM recordings WHERE id=? AND camera_id=? AND status='available'",
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
             (recording_id, camera_id),
         ).fetchone()
+
     if not row:
         return None
-    return _presigned_recording_url(row["s3_key"])
+
+    cloud_url = _presigned_recording_url(row["s3_key"])
+    if cloud_url:
+        return cloud_url
+
+    camera_number = row["camera_number"]
+    if camera_number is None:
+        return None
+
+    filename = Path(row["s3_key"]).name
+    if not filename.endswith(".mkv"):
+        return None
+    if filename != Path(filename).name:
+        return None
+    if not filename.startswith(f"camera{camera_number}_"):
+        return None
+
+    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not local_path.is_file():
+        return None
+
+    return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
 
 
 def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
@@ -139881,6 +139516,103 @@ def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
     if cameras is None:
         return False
     return camera_id in {camera["id"] for camera in cameras}
+
+
+
+@app.post("/api/customer/clips")
+async def customer_create_clip(request: Request) -> dict:
+    payload = await request.json()
+
+    camera_id = str(payload.get("camera_id") or "")
+    start_raw = payload.get("start_time")
+    end_raw = payload.get("end_time")
+
+    if not camera_id or not start_raw or not end_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="camera_id, start_time and end_time are required.",
+        )
+
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    try:
+        start_time = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+        end_time = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clip timestamp.")
+
+    start_time = start_time.replace(tzinfo=None)
+    end_time = end_time.replace(tzinfo=None)
+
+    duration = end_time - start_time
+
+    if duration <= timedelta(0):
+        raise HTTPException(status_code=400, detail="End time must be after start time.")
+
+    if duration > timedelta(hours=1):
+        raise HTTPException(status_code=400, detail="Manual clips are limited to one hour.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        camera = db.execute(
+            "SELECT camera_number FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+
+    if not camera or camera["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+
+    camera_number = int(camera["camera_number"])
+
+    job_id = uuid.uuid4().hex
+
+    clip_jobs[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 2,
+        "message": "Clip queued…",
+    }
+
+    task = asyncio.create_task(
+        build_manual_clip(
+            job_id,
+            camera_number,
+            start_time,
+            end_time,
+        )
+    )
+
+    clip_tasks.add(task)
+    task.add_done_callback(clip_tasks.discard)
+
+    return clip_jobs[job_id]
+
+
+@app.get("/api/customer/clips/{job_id}")
+def customer_clip_status(job_id: str, request: Request) -> dict:
+    # A customer must at least have a valid portal identity to inspect
+    # customer clip jobs. The clip itself was already authorized by
+    # camera ownership/access when the job was created.
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        raise HTTPException(status_code=403, detail="Authentication required.")
+
+    return clip_jobs.get(
+        job_id,
+        {
+            "id": job_id,
+            "status": "error",
+            "progress": 0,
+            "message": "Clip job not found.",
+        },
+    )
 
 
 @app.get("/api/customer/recordings/{camera_id}")
@@ -139909,16 +139641,6 @@ def customer_recording_dates(camera_id: str, request: Request) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     return {"dates": _customer_recording_dates(camera_id)}
-
-
-@app.get("/api/customer/recordings/{camera_id}/{recording_id}/url")
-def customer_recording_url(camera_id: str, recording_id: str, request: Request) -> dict:
-    if not _customer_authorized_camera_id(request, camera_id):
-        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
-    url = _customer_recording_url(camera_id, recording_id)
-    if not url:
-        raise HTTPException(status_code=404, detail="Recording not found or not yet available.")
-    return {"url": url}
 
 
 def _customer_event_media_url(camera_id: str, event_id: str) -> str | None:
@@ -139992,6 +139714,16 @@ def customer_event_thumbnail(camera_id: str, event_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Event thumbnail not available.")
 
     return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/url")
+def customer_recording_url(camera_id: str, recording_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    url = _customer_recording_url(camera_id, recording_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Recording not found or not yet available.")
+    return {"url": url}
 
 
 _recording_media_cache_locks: dict = {}
@@ -141086,17 +140818,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
   const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
-  // P0 #5 (2026-09-04): Processing... -> ready reconciliation for the
-  // mobile Events cards. A fresh event's own clip/thumbnail can now
-  // take single-digit-to-low-double-digit seconds to arrive (was
-  // ~33min before the Samsung stream-copy fix) -- this window narrows
-  // "no thumbnail" down to "no thumbnail, but still plausibly being
-  // processed" so only that case shows Processing... instead of the
-  // same "No clip available" a genuinely clipless event (most
-  // detection types, by design) correctly shows immediately.
   const MOBILE_EVENT_PENDING_WINDOW_MS=120000;
   const MOBILE_EVENT_POLL_INTERVAL_MS=4000;
-  const MOBILE_EVENT_POLL_MAX_ATTEMPTS=15; // ~60s ceiling, then settle on whatever's known
+  const MOBILE_EVENT_POLL_MAX_ATTEMPTS=15;
   let mobileEventPollTimer=null;
   let mobileEventPollAttempts=0;
 
@@ -141106,15 +140830,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     return ageMs>=0&&ageMs<MOBILE_EVENT_PENDING_WINDOW_MS;
   }}
 
-  // Deliberately polls /api/customer/events/recent -- the same
-  // customer-scoped, self-authorizing list the page already rendered
-  // once at load -- rather than a per-event endpoint keyed on an id
-  // that may not exist yet for a just-created row. Re-invokes
-  // renderMobileRecentEvents() itself on the merged result instead of
-  // hand-patching DOM nodes: that keeps this reconciliation exactly as
-  // correct as the render path it reuses, and merging fresh rows into
-  // existing ones by id (never appending) is what makes a duplicate
-  // row structurally impossible here.
   function scheduleMobileEventPoll(cameraId,clips,events){{
     const stillPending=events.some(isMobileEventPending);
     if(!stillPending||mobileEventPollAttempts>=MOBILE_EVENT_POLL_MAX_ATTEMPTS){{
@@ -141135,11 +140850,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         events.forEach(existing=>{{if(existing.id)byId.set(existing.id,existing);}});
         freshEvents.forEach(fresh=>{{if(fresh.id)byId.set(fresh.id,fresh);}});
         renderMobileRecentEvents(cameraId,clips,Array.from(byId.values()));
-      }}catch(error){{
-        // Network hiccup -- the next scheduled poll (if anything is
-        // still pending) tries again; nothing to surface to the user
-        // for a transient failure here.
-      }}
+      }}catch(error){{}}
     }},MOBILE_EVENT_POLL_INTERVAL_MS);
   }}
 
@@ -142122,7 +141833,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 </script>'''
 
     return page_shell("Playback", "playback", content, scripts)
-
 
 @app.get("/playback", response_class=HTMLResponse)
 def playback(request: Request) -> str:
