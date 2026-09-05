@@ -1,6 +1,6 @@
 // Real, executed behavioral test of the desktop Events page's
 // scheduleEventPoll()/reconcileDesktopEvent()/settleOverdueDesktopRows()
-// reconciliation loop (P0 #5 remediation, rounds 2-4 -- round 3,
+// reconciliation loop (P0 #5 remediation, rounds 2-5 -- round 3,
 // 2026-09-05, fixed a real P0 blocker ChatGPT Work's own staging QA
 // found: round 2's scheduleEventPoll() permanently stopped for good
 // the moment nothing was processing, so a page loaded with zero
@@ -23,7 +23,20 @@
 // wrongly scheduled during an active fetch at all: a stray short-delay
 // timer inserted after a long-delay one would previously never get a
 // chance to fire before it, silently hiding exactly the race this
-// suite exists to catch.
+// suite exists to catch. Round 5, 2026-09-05 (staging QA root-cause
+// trace): Array.prototype.forEach() does not catch a callback's own
+// exception -- it propagates immediately and skips every remaining,
+// not-yet-visited element. Since a poll response batch is reversed
+// (oldest-of-this-batch first) before iterating, a single bad EXISTING
+// event anywhere in that batch could silently block every genuinely
+// NEW event ordered after it from ever being reconciled -- forever, on
+// every subsequent poll, since the outer catch swallowed it identically
+// to an ordinary network failure, with nothing logged anywhere. Round 5
+// wraps each event's own reconciliation in its own try/catch (so one
+// bad event only skips itself, logging its id and the error) and splits
+// the outer catch so AbortError/network failures stay quiet exactly as
+// before, but any other, truly unexpected exception is now surfaced via
+// console.error instead of silently swallowed.
 //
 // String-content assertions on the rendered HTML can prove the
 // constants and markup exist, but they cannot exercise the actual
@@ -302,7 +315,31 @@ globalThis.document = {
   createElement: (tag) => new FakeElement(tag),
   addEventListener: () => {},
 };
-globalThis.CSS = { escape: (s) => String(s).replace(/["\\]/g, "\\$&") };
+// Round 5: CSS.escape() is a genuine call reconcileDesktopEvent() makes
+// for EVERY event (new or already-known) via its own tr[data-event-id=...]
+// lookup -- a real, controllable dependency point, not a hand-inserted
+// hook, so a sentinel id can legitimately force a single event's own
+// reconciliation to throw without touching the real extracted source at
+// all. Any other id behaves exactly as CSS.escape actually does.
+const THROW_ON_EVENT_ID = "__p05_round5_throw_sentinel__";
+globalThis.CSS = {
+  escape: (s) => {
+    if (s === THROW_ON_EVENT_ID) throw new Error("simulated reconciliation failure for " + s);
+    return String(s).replace(/["\\]/g, "\\$&");
+  },
+};
+
+// Round 5: captures console.error calls instead of letting them print,
+// so tests can assert exactly what (and how many times) the real code
+// logged -- both the per-event id+error (item requirement) and the
+// outer unexpected-exception case, while still distinguishing "nothing
+// was logged" (the expected/quiet AbortError and network-failure paths)
+// from a real assertion failure.
+let capturedConsoleErrors = [];
+const realConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  capturedConsoleErrors.push(args);
+};
 
 function makeNamedElement(tag, id) {
   const el = new FakeElement(tag);
@@ -417,6 +454,7 @@ function resetFakes() {
   fetchQueue = [];
   fetchCalls = [];
   pendingTimers = new Map();
+  capturedConsoleErrors = [];
 }
 
 // ---------------------------------------------------------------- load real source
@@ -717,6 +755,163 @@ test("no-overlap: scheduleEventPoll() called again mid-flight never starts a sec
   if (fetchCalls.length !== 2) throw new Error(`expected exactly one retry fetch after the timeout, got ${fetchCalls.length} total calls`);
   const row = tbody.querySelector('tr[data-event-id="ev-inflight"]');
   if (row.dataset.mediaState !== "ready") throw new Error("expected the row to reconcile normally once polling resumed");
+});
+
+// ------------------------------------------------- round 5: per-event fault isolation (staging QA root-cause trace)
+
+// The core fix: Array.forEach() aborts on a callback's first exception
+// and never visits the remaining elements. A response batch is reversed
+// (oldest-of-this-batch first) before iterating, so a bad EXISTING event
+// ordered before the genuinely NEW ones used to be able to silently
+// block every new event from ever appearing -- exactly the symptom
+// staging QA observed. This drives a single poll response containing
+// five events (in real DESC/newest-first order, exactly as the API
+// returns): the newest and 2nd-newest are brand new, a duplicate of an
+// already-known row sits after that, the sentinel event that fails
+// reconciliation sits in the middle, and the oldest is also brand new --
+// so after reversal (oldest-first iteration), the failing event has
+// events both before AND after it, and two of the ones after it are
+// genuinely new insertions that must not be lost.
+test("one bad event mid-batch is skipped and logged; events before and after it still insert, order/duplicates/count intact", async () => {
+  resetFakes();
+  const { tbody, countPill1, countPill2 } = buildFixture();
+  tbody.children = [];
+  addRow(tbody, { id: "ev-r5-existing", camera: "1", timestamp: isoAgo(60000), hasClip: true, mediaState: "ready" });
+  countPill1.dataset.count = "1";
+  countPill1._innerHTML = "1 event(s)";
+  countPill2.dataset.count = "1";
+  countPill2._innerHTML = "1 event(s)";
+  const mod = factory();
+  mod.scheduleEventPoll();
+
+  // Real API order: DESC, newest first.
+  const newest = freshEvent("ev-r5-newest", { hasClip: true, ageMs: 1000 });
+  const secondNewest = freshEvent("ev-r5-second", { hasClip: true, ageMs: 2000 });
+  const duplicate = freshEvent("ev-r5-existing", { hasClip: true, ageMs: 60000 }); // already known -- update in place
+  const failing = freshEvent(THROW_ON_EVENT_ID, { hasClip: false, ageMs: 3000 });
+  const oldest = freshEvent("ev-r5-oldest", { hasClip: true, ageMs: 5000 });
+  fetchQueue.push(jsonResponse(200, { events: [newest, secondNewest, duplicate, failing, oldest] }));
+  await flushOneTimer();
+
+  if (fetchCalls.length !== 1) throw new Error(`expected exactly 1 fetch call, got ${fetchCalls.length}`);
+
+  // The failing sentinel must never produce a row of its own.
+  if (tbody.querySelector(`tr[data-event-id="${THROW_ON_EVENT_ID}"]`)) {
+    throw new Error("the event whose reconciliation threw must never end up with a row in the DOM");
+  }
+
+  // Every OTHER event -- including the two ordered after the failure in
+  // iteration order (ev-r5-second, ev-r5-newest) -- must still be
+  // inserted or updated. This is the actual regression this test exists
+  // to prove: before round 5, ev-r5-second and ev-r5-newest would have
+  // been silently dropped because the forEach aborted at `failing`.
+  const ids = tbody.children.map((r) => r.dataset.eventId);
+  // ev-r5-oldest is inserted first (right before the pre-existing row,
+  // which itself never moves -- it's reconciled in place, not
+  // re-inserted), then ev-r5-second and ev-r5-newest each get inserted
+  // ahead of it in turn -- newest-first overall, failing sentinel
+  // excluded entirely, and the pre-existing row stays last since
+  // nothing new is ever ordered older than it in this batch.
+  if (ids.join(",") !== "ev-r5-newest,ev-r5-second,ev-r5-oldest,ev-r5-existing") {
+    throw new Error(`expected newest-first order ev-r5-newest,ev-r5-second,ev-r5-oldest,ev-r5-existing (failing sentinel excluded), got ${ids.join(",")}`);
+  }
+  if (tbody.children.length !== 4) throw new Error(`expected exactly 4 rows (5 events minus the 1 that failed), got ${tbody.children.length}`);
+
+  // Duplicate handling: ev-r5-existing updated in place, never a second row.
+  if (ids.filter((id) => id === "ev-r5-existing").length !== 1) throw new Error("expected exactly one ev-r5-existing row, updated in place");
+  const existingRow = tbody.querySelector('tr[data-event-id="ev-r5-existing"]');
+  if (existingRow.dataset.mediaState !== "ready") throw new Error("expected the duplicate to have reconciled to ready in place");
+
+  // Count: 3 genuinely new rows inserted (newest, second-newest, oldest)
+  // -- the duplicate must not increment, and the failed sentinel must
+  // not increment either.
+  const [c1, c2] = pillCounts(countPill1, countPill2);
+  if (c1 !== 4 || c2 !== 4) throw new Error(`expected both count pills at 4 (1 pre-existing + 3 new, duplicate and failure excluded), got ${c1}/${c2}`);
+
+  // The failing event's id and error must be logged, and nothing else
+  // must have logged an error for this otherwise-successful poll.
+  if (capturedConsoleErrors.length !== 1) {
+    throw new Error(`expected exactly 1 console.error call (for the one failing event), got ${capturedConsoleErrors.length}`);
+  }
+  const [message, loggedId, loggedError] = capturedConsoleErrors[0];
+  if (loggedId !== THROW_ON_EVENT_ID) throw new Error(`expected the failing event's own id to be logged, got ${loggedId}`);
+  if (!(loggedError instanceof Error)) throw new Error("expected the actual error object to be logged alongside the event id");
+  if (typeof message !== "string" || !message.length) throw new Error("expected a descriptive message logged alongside the event id and error");
+});
+
+// Round 5: the outer catch must distinguish "expected" failures
+// (AbortError from the fetch's own timeout, and a network-level
+// TypeError -- the same signature real browsers use for "Failed to
+// fetch") from anything else. Both expected cases must remain quiet
+// (no console.error) and must still retry/recover normally -- unchanged
+// from round 4's behavior, just now explicitly asserted here rather
+// than only inferred from the row settling correctly.
+test("AbortError and network-failure TypeErrors both stay quiet (no console.error) and the loop still recovers normally", async () => {
+  resetFakes();
+  const { tbody } = buildFixture();
+  addRow(tbody, { id: "ev-r5-quiet", timestamp: isoAgo(5000), mediaState: "processing" });
+  const mod = factory();
+  mod.scheduleEventPoll();
+
+  // Network-level TypeError.
+  fetchQueue.push(() => {
+    throw new TypeError("network down");
+  });
+  await flushOneTimer();
+  if (capturedConsoleErrors.length !== 0) throw new Error("a network TypeError must not be logged -- it's an expected, quiet retry path");
+
+  // AbortError via the fetch's own EVENT_FETCH_TIMEOUT_MS timeout.
+  fetchQueue.push(neverResolves());
+  await flushOneTimer(); // starts the hung fetch
+  await flushOneTimer(); // its own internal timeout fires, aborting it
+  if (capturedConsoleErrors.length !== 0) throw new Error("an AbortError from the fetch's own timeout must not be logged -- it's an expected, quiet retry path");
+
+  // The loop must still be fully functional afterward -- not merely
+  // silent, but genuinely recovered.
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-r5-quiet", { hasClip: true, ageMs: 5000 })] }));
+  const recovered = await flushOneTimer();
+  if (!recovered) throw new Error("expected normal scheduling to resume after both quiet failure paths");
+  const row = tbody.querySelector('tr[data-event-id="ev-r5-quiet"]');
+  if (row.dataset.mediaState !== "ready") throw new Error("expected the row to reconcile normally once polling recovered");
+  if (capturedConsoleErrors.length !== 0) throw new Error("the successful recovery poll itself must not log anything");
+});
+
+// Round 5: anything reaching the outer catch that is NEITHER an
+// AbortError NOR a network-level TypeError is, by construction, not a
+// per-event reconciliation failure (those are caught inside the forEach
+// now) -- it's something unexpected in the surrounding fetch/parse logic
+// itself (simulated here as response.json() itself throwing, e.g. on
+// malformed JSON), and must be surfaced via console.error rather than
+// silently swallowed alongside routine network retries.
+test("an unexpected exception outside the per-event loop (e.g. malformed JSON) is logged, and polling still retries", async () => {
+  resetFakes();
+  buildFixture();
+  const mod = factory();
+  mod.scheduleEventPoll();
+  fetchQueue.push(() => ({
+    ok: true,
+    status: 200,
+    json: async () => {
+      throw new Error("malformed JSON body");
+    },
+  }));
+  const flushed = await flushOneTimer();
+  if (!flushed) throw new Error("expected a retry to still be scheduled after the unexpected exception");
+  if (capturedConsoleErrors.length !== 1) {
+    throw new Error(`expected exactly 1 console.error call for the unexpected exception, got ${capturedConsoleErrors.length}`);
+  }
+  const [, loggedError] = capturedConsoleErrors[0];
+  if (!(loggedError instanceof Error) || loggedError.message !== "malformed JSON body") {
+    throw new Error("expected the actual unexpected error to be logged");
+  }
+  // And discovery genuinely still works on the very next tick -- logging
+  // the failure must not have replaced normal retry behavior.
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-r5-after-unexpected", { hasClip: true, ageMs: 1000 })] }));
+  await flushOneTimer();
+  const tbody = document.querySelector("#events-table tbody");
+  if (!tbody.querySelector('tr[data-event-id="ev-r5-after-unexpected"]')) {
+    throw new Error("polling must still find a real new event after recovering from the unexpected exception");
+  }
 });
 
 // ------------------------------------------------- round 3: discovery bootstrap (real P0 blocker)

@@ -119609,13 +119609,30 @@ def _render_customer_events(request: Request) -> str:
           // tbody.insertBefore(firstChild) calls end up in the correct
           // newest-first visual order -- see reconcileDesktopEvent()'s
           // own docstring.
+          // Round 5 fix (2026-09-05, staging QA root-cause trace): each
+          // event is reconciled inside its own try/catch. Array.forEach()
+          // does not catch a callback's own exception -- it propagates
+          // immediately and skips every remaining, not-yet-visited
+          // element. Before this fix, one bad event anywhere in the
+          // batch (this array is oldest-of-this-batch first, so a
+          // failure on an older/already-known event would silently
+          // block every genuinely new event ordered after it) could
+          // silently prevent every event after it from ever being
+          // reconciled, forever, on every subsequent poll -- with
+          // nothing logged anywhere, since the outer catch below
+          // swallowed it identically to an ordinary network failure.
+          // One bad event must never block the rest of its own batch.
           [...(payload.events||[])].reverse().forEach(event=>{
-            const newRow=reconcileDesktopEvent(event);
-            if(newRow&&tbody){
-              tbody.insertBefore(newRow,tbody.firstChild);
-              wireEventThumbPlayer(newRow);
-              rows.push(newRow);
-              updateVisibleEventCount(1);
+            try{
+              const newRow=reconcileDesktopEvent(event);
+              if(newRow&&tbody){
+                tbody.insertBefore(newRow,tbody.firstChild);
+                wireEventThumbPlayer(newRow);
+                rows.push(newRow);
+                updateVisibleEventCount(1);
+              }
+            }catch(eventError){
+              console.error('scheduleEventPoll: failed to reconcile event',event&&event.id,eventError);
             }
           });
           apply();
@@ -119623,10 +119640,24 @@ def _render_customer_events(request: Request) -> str:
         // non-2xx: transient, retried below via finally -- never a
         // permanent stop.
       }catch(error){
-        // AbortError (a fetch that exceeded EVENT_FETCH_TIMEOUT_MS) or
-        // a genuine transient network failure -- either way, retried
-        // below via finally, never a permanent stop. Discovery at the
-        // slow cadence is not interrupted by this either.
+        // Round 5: AbortError (a fetch that exceeded
+        // EVENT_FETCH_TIMEOUT_MS) and a genuine network-level failure
+        // (fetch() itself rejects with a TypeError for those -- "Failed
+        // to fetch" and friends, the same signature real browsers use)
+        // are both expected, ordinary conditions -- retried below via
+        // finally, quietly, exactly as before. Anything else reaching
+        // this catch is, by construction, NOT a per-event reconciliation
+        // failure (those are now caught above, inside the forEach) --
+        // it's something unexpected in the surrounding fetch/parse
+        // logic itself, and must be surfaced rather than silently
+        // swallowed alongside routine network retries.
+        if(error&&error.name==='AbortError'){
+          // expected timeout -- quiet.
+        }else if(error instanceof TypeError){
+          // expected network failure -- quiet, retried below.
+        }else{
+          console.error('scheduleEventPoll: unexpected error while polling for events',error);
+        }
       }finally{
         clearTimeout(fetchTimeoutId);
         // Checked every tick regardless of this attempt's own
