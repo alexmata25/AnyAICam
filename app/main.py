@@ -119567,18 +119567,34 @@ def _render_customer_events(request: Request) -> str:
   // infrequent -- just enough to notice a brand new event without a
   // manual reload) and at EVENT_FAST_POLL_INTERVAL_MS the moment
   // anyDesktopRowStillProcessing() is true (the existing
-  // Processing…-> ready reconciliation cadence, unchanged). The
-  // eventPollState guard (only one timer ever pending at a time) is
-  // the only thing that can make a second scheduleEventPoll() call a
-  // no-op -- it is never set back to null just because nothing is
-  // currently processing.
+  // Processing…-> ready reconciliation cadence, unchanged).
+  //
+  // Round 4 fix (2026-09-05, Codex final review): round 3's guard
+  // against a second concurrent timer/fetch only checked
+  // eventPollState.timer -- but state.timer is deliberately nulled out
+  // at the very top of the timer callback below, BEFORE the fetch
+  // itself even starts, so that guard was blind for this request's
+  // entire in-flight lifetime. Any call to scheduleEventPoll() landing
+  // during that window (present or future -- a visibility-change
+  // rewake, a manual retry hook, anything) would see
+  // eventPollState.timer===null and schedule a second, fully
+  // independent timer/fetch pair against the very same state object,
+  // violating the "only one timer/fetch in flight at a time" invariant
+  // this loop is required to hold. inFlight is now the single source
+  // of truth for "a request is currently outstanding": set the instant
+  // the timer fires, before the fetch call, and cleared only in
+  // `finally` -- after the response (or failure) has already been
+  // fully handled and settlement has already run -- so the very next
+  // scheduleEventPoll() call, whether it's this function's own
+  // self-rearm or an external one, always sees an accurate picture.
   function scheduleEventPoll(){
-    if(eventPollState&&eventPollState.timer)return;
-    if(!eventPollState)eventPollState={timer:null,controller:null};
+    if(eventPollState&&(eventPollState.timer||eventPollState.inFlight))return;
+    if(!eventPollState)eventPollState={timer:null,controller:null,inFlight:false};
     const state=eventPollState;
     const interval=anyDesktopRowStillProcessing()?EVENT_FAST_POLL_INTERVAL_MS:EVENT_SLOW_POLL_INTERVAL_MS;
     state.timer=setTimeout(async()=>{
       state.timer=null;
+      state.inFlight=true;
       const controller=new AbortController();
       state.controller=controller;
       const fetchTimeoutId=setTimeout(()=>controller.abort(),EVENT_FETCH_TIMEOUT_MS);
@@ -119620,6 +119636,11 @@ def _render_customer_events(request: Request) -> str:
         // exactly at a row's deadline still settles it here rather
         // than only ever settling on a successful reconcile.
         settleOverdueDesktopRows();
+        // Cleared before the self-rearm below so that rearm (or any
+        // other caller landing here concurrently) sees inFlight===false
+        // and is allowed to schedule the next tick -- never the other
+        // way around, which would deadlock discovery forever.
+        state.inFlight=false;
         if(eventPollState===state){
           scheduleEventPoll();
         }

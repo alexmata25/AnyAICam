@@ -1,16 +1,33 @@
 // Real, executed behavioral test of the desktop Events page's
 // scheduleEventPoll()/reconcileDesktopEvent()/settleOverdueDesktopRows()
-// reconciliation loop (P0 #5 remediation, rounds 2 and 3 -- round 3,
+// reconciliation loop (P0 #5 remediation, rounds 2-4 -- round 3,
 // 2026-09-05, fixed a real P0 blocker ChatGPT Work's own staging QA
 // found: round 2's scheduleEventPoll() permanently stopped for good
 // the moment nothing was processing, so a page loaded with zero
 // pending rows could never discover an event created afterward without
-// a manual reload. Round 3 adds a slow discovery cadence
+// a manual reload. Round 3 added a slow discovery cadence
 // (EVENT_SLOW_POLL_INTERVAL_MS) that never permanently stops, switching
 // to the existing fast cadence the moment something is actually
-// processing). String-content assertions on the rendered HTML can
-// prove the constants and markup exist, but they cannot exercise the
-// actual async retry/timeout/deadline/DOM-mutation behavior these bugs
+// processing. Round 4, 2026-09-05 (Codex final review on round 3):
+// round 3's "only one timer/fetch in flight" guard checked only
+// eventPollState.timer, which is nulled out at the very top of the
+// timer callback -- before the fetch itself starts -- so a second
+// scheduleEventPoll() call landing during an in-flight request could
+// still schedule a second, independent timer/fetch pair. Fixed with an
+// explicit inFlight flag. This also rewrites several tests that
+// previously drove behavior by calling internal helpers
+// (reconcileDesktopEvent()) directly instead of through the real
+// scheduleEventPoll() fetch callback, and fixes the fake timer queue
+// itself to fire in chronological (fireAt) order rather than insertion
+// order -- required for a test to be able to expose a timer that was
+// wrongly scheduled during an active fetch at all: a stray short-delay
+// timer inserted after a long-delay one would previously never get a
+// chance to fire before it, silently hiding exactly the race this
+// suite exists to catch.
+//
+// String-content assertions on the rendered HTML can prove the
+// constants and markup exist, but they cannot exercise the actual
+// async retry/timeout/deadline/DOM-mutation behavior these bugs
 // depended on -- only running the real code with controllable
 // fetch/AbortController/timers/DOM can (same rationale as this
 // suite's siblings, mobile_event_poll.test.mjs and
@@ -59,10 +76,11 @@ let fakeNow = Date.now();
 Date.now = () => fakeNow;
 
 let timerIdSeq = 1;
-let pendingTimers = new Map(); // id -> { fn, ms }
+let pendingTimers = new Map(); // id -> { fn, ms, fireAt }
 function fakeSetTimeout(fn, ms) {
   const id = timerIdSeq++;
-  pendingTimers.set(id, { fn, ms: ms || 0 });
+  const delay = ms || 0;
+  pendingTimers.set(id, { fn, ms: delay, fireAt: fakeNow + delay });
   return id;
 }
 function fakeClearTimeout(id) {
@@ -74,12 +92,20 @@ globalThis.clearTimeout = fakeClearTimeout;
 async function settle() {
   await new Promise((resolve) => realSetImmediate(resolve));
 }
+// Round 4 fix: fires whichever pending timer has the earliest fireAt
+// (the absolute instant it was scheduled to go off), not whichever was
+// inserted into the Map first. A real browser's timer queue is
+// chronological, not insertion-ordered -- a wrongly-scheduled 4000ms
+// timer inserted AFTER an already-pending 8000ms one must still fire
+// first, exactly as it would for real. Ties (identical fireAt) fall
+// back to insertion order (ascending id) purely for determinism.
 async function flushOneTimer() {
   const entries = [...pendingTimers.entries()];
   if (entries.length === 0) return false;
-  const [id, { fn, ms }] = entries[0];
+  entries.sort((a, b) => a[1].fireAt - b[1].fireAt || a[0] - b[0]);
+  const [id, { fn, fireAt }] = entries[0];
   pendingTimers.delete(id);
-  fakeNow += ms;
+  fakeNow = Math.max(fakeNow, fireAt);
   const result = fn();
   if (result && typeof result.catch === "function") result.catch(() => {});
   await settle();
@@ -410,6 +436,10 @@ function pendingTimerDelay() {
   return entries[0].ms;
 }
 
+function pillCounts(countPill1, countPill2) {
+  return [parseInt(countPill1.dataset.count, 10), parseInt(countPill2.dataset.count, 10)];
+}
+
 function freshEvent(id, { hasClip = false, ageMs = 0, camera = "cam-1", confidence = 0.9 } = {}) {
   return {
     id,
@@ -550,53 +580,143 @@ test("a ready event is reconciled in place, ordering/count issues aside", async 
   if (tbody.children.length !== 1) throw new Error("must not create a duplicate row for an existing event id");
 });
 
-test("multiple new events in one response preserve newest-first order", async () => {
+// Round 4 (Codex final review, item 3): previously this test drove
+// ordering by calling mod.reconcileDesktopEvent() and tbody.insertBefore()
+// directly, bypassing scheduleEventPoll()'s own fetch-success handler --
+// the actual code responsible for iterating a DESC batch and inserting
+// each row in the right place. Rewritten to go through the real
+// callback: one poll response returns three brand-new events in the
+// same newest-first order the real endpoint uses, and the assertion is
+// on the DOM order that callback itself produced.
+test("multiple new events in one poll response preserve newest-first order, via the real poll callback", async () => {
   resetFakes();
-  const { tbody, countPill1 } = buildFixture();
-  // Start with zero existing rows -- every event in the response below
-  // is genuinely new.
-  tbody.children = [];
+  const { tbody } = buildFixture();
+  tbody.children = []; // start with zero existing rows -- every event below is genuinely new
   const mod = factory();
+  mod.scheduleEventPoll();
   const oldest = freshEvent("ev-old", { hasClip: true, ageMs: 30000 });
   const middle = freshEvent("ev-mid", { hasClip: true, ageMs: 20000 });
   const newest = freshEvent("ev-new", { hasClip: true, ageMs: 10000 });
-  // The real endpoint returns DESC (newest first) -- reconcile in that
-  // same order via the module's own reconciliation entry point.
-  [newest, middle, oldest].reverse().forEach((event) => {
-    const row = mod.reconcileDesktopEvent(event);
-    if (row) tbody.insertBefore(row, tbody.firstChild);
-  });
+  // The real endpoint returns DESC (newest first) -- that's the exact
+  // shape scheduleEventPoll()'s own fetch handler is written to expect.
+  fetchQueue.push(jsonResponse(200, { events: [newest, middle, oldest] }));
+  await flushOneTimer();
   const ids = tbody.children.map((r) => r.dataset.eventId);
   if (ids.join(",") !== "ev-new,ev-mid,ev-old") {
     throw new Error(`expected newest-first order ev-new,ev-mid,ev-old but got ${ids.join(",")}`);
   }
 });
 
-test("duplicate event IDs across polls never create a second row", async () => {
+// Round 4 (Codex final review, item 4): previously this test only
+// called mod.reconcileDesktopEvent() once against a row that was never
+// actually inserted by a real poll. Rewritten to drive two genuine,
+// sequential polls through scheduleEventPoll(): the first discovers
+// event A, the second returns A again (already-known, must update in
+// place) plus a genuinely new event B -- the DOM must end up with
+// exactly one row for each.
+test("duplicate event IDs across real polls never create a second row", async () => {
   resetFakes();
   const { tbody } = buildFixture();
-  addRow(tbody, { id: "ev-7", timestamp: isoAgo(5000), mediaState: "processing" });
+  tbody.children = [];
   const mod = factory();
-  const again = mod.reconcileDesktopEvent(freshEvent("ev-7", { hasClip: true, ageMs: 5000 }));
-  if (again !== null) throw new Error("reconciling an existing event id must return null (update in place), never a new row");
-  if (tbody.children.length !== 1) throw new Error("must still have exactly one row for ev-7");
+  mod.scheduleEventPoll();
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-7a", { hasClip: false, ageMs: 0 })] }));
+  await flushOneTimer(); // first poll discovers ev-7a as Processing
+  if (tbody.children.length !== 1) throw new Error("expected exactly 1 row after the first poll");
+  fetchQueue.push(
+    jsonResponse(200, {
+      events: [freshEvent("ev-7b", { hasClip: true, ageMs: 1000 }), freshEvent("ev-7a", { hasClip: true, ageMs: 4000 })],
+    })
+  );
+  await flushOneTimer(); // second poll: ev-7a again (now ready) + genuinely new ev-7b
+  const ids = tbody.children.map((r) => r.dataset.eventId);
+  if (ids.filter((id) => id === "ev-7a").length !== 1) throw new Error(`expected exactly one ev-7a row, got ids=${ids.join(",")}`);
+  if (ids.filter((id) => id === "ev-7b").length !== 1) throw new Error(`expected exactly one ev-7b row, got ids=${ids.join(",")}`);
+  if (tbody.children.length !== 2) throw new Error(`expected exactly 2 rows total, got ${tbody.children.length}`);
+  const rowA = tbody.querySelector('tr[data-event-id="ev-7a"]');
+  if (rowA.dataset.mediaState !== "ready") throw new Error("expected ev-7a to have updated in place to ready, not been replaced");
 });
 
-test("only one timer/fetch is ever in flight at a time", async () => {
+// Round 4 (Codex final review, item 5): visible counts asserted through
+// the real polling callback -- must increment exactly once per unique
+// newly-inserted event, and never for a duplicate/already-known id
+// reappearing in a later poll response.
+test("visible event counts increment once per unique new event and never for duplicates, via the real poll callback", async () => {
   resetFakes();
-  const { tbody } = buildFixture();
-  addRow(tbody, { id: "ev-8", timestamp: isoAgo(5000), mediaState: "processing" });
+  const { tbody, countPill1, countPill2 } = buildFixture();
+  tbody.children = [];
+  countPill1.dataset.count = "0";
+  countPill1._innerHTML = "0 event(s)";
+  countPill2.dataset.count = "0";
+  countPill2._innerHTML = "0 event(s)";
   const mod = factory();
   mod.scheduleEventPoll();
+  fetchQueue.push(
+    jsonResponse(200, {
+      events: [freshEvent("ev-c2", { hasClip: true, ageMs: 1000 }), freshEvent("ev-c1", { hasClip: true, ageMs: 2000 })],
+    })
+  );
+  await flushOneTimer(); // 2 genuinely new events
+  let [c1, c2] = pillCounts(countPill1, countPill2);
+  if (c1 !== 2 || c2 !== 2) throw new Error(`expected both count pills at 2 after 2 new events, got ${c1}/${c2}`);
+  fetchQueue.push(
+    jsonResponse(200, {
+      events: [freshEvent("ev-c3", { hasClip: true, ageMs: 500 }), freshEvent("ev-c1", { hasClip: true, ageMs: 2000 }), freshEvent("ev-c2", { hasClip: true, ageMs: 1000 })],
+    })
+  );
+  await flushOneTimer(); // 1 genuinely new event (ev-c3) + 2 duplicates (ev-c1, ev-c2) reconciled in place
+  [c1, c2] = pillCounts(countPill1, countPill2);
+  if (c1 !== 3 || c2 !== 3) {
+    throw new Error(`expected both count pills at 3 after 1 more unique event (duplicates must not increment), got ${c1}/${c2}`);
+  }
+  if (tbody.children.length !== 3) throw new Error(`expected exactly 3 rows total, got ${tbody.children.length}`);
+});
+
+// Round 4 (Codex final review, item 6): the actual no-overlap
+// invariant, driven behaviorally through the real callback rather than
+// only inspecting internal state. A fetch is left genuinely hanging;
+// scheduleEventPoll() is called again while it's still in flight (the
+// exact window round 3's state.timer-only guard was blind to, since
+// state.timer is nulled before the fetch starts); then the fake clock
+// is advanced using chronological (fireAt-order) flushing far enough
+// that any wrongly-scheduled second cadence timer would already have
+// fired and started a second fetch, before the original request is
+// ever resolved or timed out.
+test("no-overlap: scheduleEventPoll() called again mid-flight never starts a second fetch, even once a wrongly-scheduled timer's own delay would have elapsed", async () => {
+  resetFakes();
+  const { tbody } = buildFixture();
+  addRow(tbody, { id: "ev-inflight", timestamp: isoAgo(5000), mediaState: "processing" }); // fast (4000ms) cadence
+  const mod = factory();
   mod.scheduleEventPoll();
-  mod.scheduleEventPoll();
-  if (pendingTimers.size !== 1) throw new Error(`expected exactly 1 pending timer, found ${pendingTimers.size}`);
+  if (pendingTimerDelay() !== 4000) throw new Error("expected the fast cadence while a row is processing");
   fetchQueue.push(neverResolves());
-  await flushOneTimer();
-  if (fetchCalls.length !== 1) throw new Error("expected exactly 1 fetch call in flight");
+  await flushOneTimer(); // fires the cadence timer; the fetch starts and hangs (state.timer is now null, inFlight true)
+  if (fetchCalls.length !== 1) throw new Error("expected exactly 1 fetch to have started");
+  // The exact window round 3 was blind to: call scheduleEventPoll()
+  // again while the fetch above is still unresolved.
   mod.scheduleEventPoll();
   mod.scheduleEventPoll();
-  if (fetchCalls.length !== 1) throw new Error("calling scheduleEventPoll again while a fetch is in flight must not start a second one");
+  if (pendingTimers.size !== 1) {
+    throw new Error(
+      `expected exactly 1 pending timer (the fetch's own 8000ms timeout) while a request is in flight, found ${pendingTimers.size} -- a second scheduleEventPoll() call scheduled an extra timer during an active fetch`
+    );
+  }
+  // Advance the clock in chronological order. If the bug were present,
+  // a wrongly-scheduled 4000ms cadence timer would fire here, BEFORE
+  // the fetch's own 8000ms timeout, and start a second concurrent
+  // fetch.
+  await flushOneTimer(); // the fetch's own 8000ms timeout aborts it
+  if (fetchCalls.length !== 1) {
+    throw new Error("a second fetch was started before the original in-flight request was ever resolved or timed out -- no-overlap invariant violated");
+  }
+  // The original request has now genuinely finished (timed out).
+  // Normal scheduling must resume, exactly once.
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-inflight", { hasClip: true, ageMs: 5000 })] }));
+  const resumed = await flushOneTimer();
+  if (!resumed) throw new Error("expected normal scheduling to resume after the in-flight request finally settled");
+  if (fetchCalls.length !== 2) throw new Error(`expected exactly one retry fetch after the timeout, got ${fetchCalls.length} total calls`);
+  const row = tbody.querySelector('tr[data-event-id="ev-inflight"]');
+  if (row.dataset.mediaState !== "ready") throw new Error("expected the row to reconcile normally once polling resumed");
 });
 
 // ------------------------------------------------- round 3: discovery bootstrap (real P0 blocker)
