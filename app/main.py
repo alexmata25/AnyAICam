@@ -1922,7 +1922,7 @@ def legacy_camera_numbers_in_use() -> list[int]:
     ]
 
 
-def get_camera_numbers(customer_id: str | None = None) -> list[int]:
+def get_camera_numbers() -> list[int]:
     """The real, currently-provisioned set of camera_number slots this
     appliance's FFmpeg/HLS/recording/analytics pipeline should run --
     sourced from the same multi-tenant `cameras` table Wizard A/B
@@ -1932,26 +1932,6 @@ def get_camera_numbers(customer_id: str | None = None) -> list[int]:
     appliance_id/customer_id scoping is needed here; see the Phase 3
     report for this documented limitation in a future multi-appliance
     "combined" deployment.
-
-    2026-09-04: customer_id is a new, optional, additive parameter --
-    every existing edge-role caller (none of which have a customer_id
-    to pass) is completely unaffected, since omitting it reproduces
-    today's exact unscoped query. It exists for the cloud role, where
-    the assumption in the paragraph above is false: EC2's `cameras`
-    table is genuinely multi-tenant, one shared database across every
-    customer, not "exactly one customer's rows". Confirmed live: two
-    unrelated customers each provisioned camera_number 1-5, and the
-    unscoped query summed both -- "10 cameras configured, license
-    permits 5" -- one customer's license being enforced against a
-    total that included a second customer's own, entirely separate
-    cameras. When customer_id is given, it's scoped with AND customer_
-    id=? and the legacy-env-var fallback below is skipped even on a
-    genuine zero-cameras result: that fallback exists for a brand-new
-    *edge* install with nothing provisioned yet, and has no meaning
-    for "this one cloud customer happens to have zero cameras" --
-    falling back to CAMERA<n>_HOST/USERNAME/PASSWORD env-var slots
-    there would just resurrect the same kind of phantom-camera bug
-    this function's own fallback logic was already written to avoid.
 
     Falls back to the legacy CAMERA<n>_HOST/USERNAME/PASSWORD env-var
     slots ONLY when at least one is genuinely configured (see
@@ -1969,25 +1949,17 @@ def get_camera_numbers(customer_id: str | None = None) -> list[int]:
     try:
         from partner_db import connection
         with connection() as db:
-            if customer_id is not None:
-                assigned = db.execute(
-                    "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL AND customer_id=? ORDER BY camera_number",
-                    (customer_id,),
-                ).fetchall()
-            else:
-                assigned = db.execute(
-                    "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
-                ).fetchall()
+            assigned = db.execute(
+                "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
+            ).fetchall()
     except Exception:
         assigned = []
     numbers = [int(item["camera_number"]) for item in assigned]
-    if numbers or customer_id is not None:
-        return numbers
-    return legacy_camera_numbers_in_use()
+    return numbers if numbers else legacy_camera_numbers_in_use()
 
 
-def get_camera_count(customer_id: str | None = None) -> int:
-    return len(get_camera_numbers(customer_id=customer_id))
+def get_camera_count() -> int:
+    return len(get_camera_numbers())
 
 
 def get_supervisor_slot_count() -> int:
@@ -23013,11 +22985,7 @@ def customer_cloud_usage_snapshot(user: dict) -> dict:
 
 
 
-        # 2026-09-04: scoped to this customer -- see get_camera_numbers()'s
-        # own comment for the cross-tenant-leak this closes. user.get(
-        # "customer_id") is None for any caller that doesn't have one
-        # (unaffected, matches today's behavior exactly).
-        "configured_cameras": get_camera_count(customer_id=user.get("customer_id")),
+        "configured_cameras": get_camera_count(),
 
 
 
@@ -24070,12 +24038,7 @@ def feature_entitlement(feature: str, snapshot: dict | None = None) -> dict:
 
 
 
-def license_enforcement_snapshot(camera_count: int | None = None, customer_id: str | None = None) -> dict:
-    # 2026-09-04: customer_id is new and optional -- only used to scope
-    # the get_camera_count() fallback below when the caller doesn't
-    # already provide an explicit camera_count of its own. See get_
-    # camera_numbers()'s own comment for the full cross-tenant-leak
-    # root cause this closes.
+def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
 
 
 
@@ -24093,7 +24056,7 @@ def license_enforcement_snapshot(camera_count: int | None = None, customer_id: s
 
 
 
-    current_camera_count = get_camera_count(customer_id=customer_id) if camera_count is None else max(0, int(camera_count))
+    current_camera_count = get_camera_count() if camera_count is None else max(0, int(camera_count))
 
 
 
@@ -24903,12 +24866,7 @@ def license_enforcement_snapshot(camera_count: int | None = None, customer_id: s
 
 
 
-def license_warning_banner(customer_id: str | None = None) -> str:
-    # 2026-09-04: customer_id is new/optional -- see get_camera_numbers()'s
-    # own comment. page_shell() (this function's only caller) now passes
-    # the current page's already-resolved identity's customer_id, so the
-    # banner shown on every customer-facing page (including /alerts) is
-    # scoped to that customer's own cameras, not every tenant's combined.
+def license_warning_banner() -> str:
 
 
 
@@ -24935,7 +24893,7 @@ def license_warning_banner(customer_id: str | None = None) -> str:
 
 
 
-    snapshot = license_enforcement_snapshot(customer_id=customer_id)
+    snapshot = license_enforcement_snapshot()
 
 
 
@@ -40782,40 +40740,15 @@ app.mount("/recordings", StaticFiles(directory="/app/recordings"), name="recordi
 
 
 
-# The customer portal's own nav (NAV_ITEMS, filtered by navigation_
-# keys_for_role() for role in CUSTOMER_PORTAL_ROLES) links to a MIX of
-# "/customer"-prefixed paths (already covered below by the plain
-# path.startswith("/customer") branch) and bare top-level paths that
-# were not -- confirmed by reading NAV_ITEMS directly rather than
-# guessing from the URL alone: "/customer-live" and "/customer-app-
-# settings" already had the prefix, but "/dashboard", "/playback",
-# "/events", "/alerts", "/investigate", and "/subscription-portal" did
-# not, so an unauthenticated (or session-expired) customer clicking
-# any of THOSE landed on the local-emergency-recovery /login instead
-# of the customer sign-in page -- reported live on app.anyaicam.com
-# (RUNTIME_ROLE=cloud) as "/dashboard and /playback redirect to
-# /login". ("/mobile-app", NAV_ITEMS' remaining bare-path entry, is
-# deliberately NOT listed here -- it's already in PUBLIC_PATH_PREFIXES
-# below, so authentication_middleware never reaches this branch for it
-# at all; that page currently has no route handler behind it, a real
-# but separate missing-page gap, out of scope for this auth-routing
-# fix.) Only applied when RUNTIME_ROLE == "cloud": on an edge
-# appliance, an unauthenticated visitor to these exact same shared
-# dual-purpose routes (see e.g. playback()'s own _customer_playback_
-# cameras() branch) is the appliance's own local owner, not a cloud
-# customer account, and the existing local-emergency-recovery /login
-# is the correct destination for them -- unchanged here.
-CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
-    "/dashboard",
-    "/playback",
-    "/events",
-    "/alerts",
-    "/investigate",
-    "/subscription-portal",
-)
-
-
 PUBLIC_PATH_PREFIXES = (
+
+
+
+
+
+
+
+
     "/login",
 
     "/customer-login.html",
@@ -41119,17 +41052,10 @@ async def authentication_middleware(request: Request, call_next):
     if path.startswith("/customer"):
         return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
 
-    # Cloud-only widening of the same customer-login redirect to the
-    # bare-path half of the customer nav (see CLOUD_CUSTOMER_NAV_PATH_
-    # PREFIXES's own comment for exactly which paths and why). Gated to
-    # RUNTIME_ROLE == "cloud" specifically: these are the same shared
-    # dual-purpose routes an edge appliance's own local owner also
-    # legitimately reaches unauthenticated, and for them /login (this
-    # function's existing, unchanged fallback below) remains correct.
-    if RUNTIME_ROLE == "cloud" and any(
-        path == prefix or path.startswith(prefix + "/") for prefix in CLOUD_CUSTOMER_NAV_PATH_PREFIXES
-    ):
-        return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
+
+
+
+
 
     return RedirectResponse(f"/login?next={next_url}", status_code=303)
 
@@ -47637,7 +47563,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-    content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
+    content = license_warning_banner() + content
 
 
 
@@ -51181,55 +51107,7 @@ if(resetButton)resetButton.onclick=async()=>{if(!confirm('Reset local activation
 
 
 
-def camera_status(request: Request) -> dict:
-    customer_cameras = _customer_playback_cameras(request)
-    if customer_cameras is not None:
-        # Customer-portal identity: scope to only this customer's own
-        # cameras -- never the shared, multi-tenant camera_number
-        # sequence _legacy_camera_status() below iterates -- and source
-        # online/recording from the appliance's own live heartbeat
-        # (appliance_camera_status, keyed by the real camera.id) instead
-        # of the local HLS-manifest/camera_process_state check further
-        # down. That check is edge-appliance-only (correct on
-        # Samsung/Ryzen, where a local relay actually writes those
-        # files); this cloud host runs no local relay for a customer's
-        # cameras at all, so it always reported every camera offline
-        # regardless of the appliance's real, live state.
-        return _customer_camera_status(customer_cameras)
-    return _legacy_camera_status()
-
-
-def _customer_camera_status(customer_cameras: list[dict]) -> dict:
-    from partner_db import connection
-    cameras = []
-    with connection() as db:
-        for camera in customer_cameras:
-            camera_number = camera.get("camera_number")
-            if camera_number is None:
-                continue
-            status_row = db.execute(
-                "SELECT online, recording FROM appliance_camera_status WHERE camera_id=?",
-                (camera["id"],),
-            ).fetchone()
-            online = bool(status_row["online"]) if status_row else False
-            recording_running = bool(status_row["recording"]) if status_row else False
-            cameras.append(
-                {
-                    "camera": camera_number,
-                    "online": online,
-                    "stream": "online" if online else "offline",
-                    "recording": "running" if recording_running else "stopped",
-                    "last_stream_update_seconds": None,
-                    "reconnects": 0,
-                    "last_exit_code": None,
-                    "last_error": None,
-                    "last_error_at": None,
-                }
-            )
-    return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
-
-
-def _legacy_camera_status() -> dict:
+def camera_status() -> dict:
 
 
 
@@ -73166,20 +73044,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-def dashboard(request: Request) -> str:
-    _customer_dashboard_cameras = _customer_playback_cameras(request)
-    if _customer_dashboard_cameras is not None:
-        # Customer-portal identity: only this customer's own camera
-        # numbers -- see camera_status()'s own comment for why the
-        # shared, multi-tenant get_camera_numbers() sequence below must
-        # never be used to build a real customer's Dashboard.
-        _dashboard_camera_numbers = [
-            camera["camera_number"]
-            for camera in _customer_dashboard_cameras
-            if camera.get("camera_number") is not None
-        ]
-    else:
-        _dashboard_camera_numbers = list(get_camera_numbers())
+def dashboard() -> str:
 
 
 
@@ -73485,7 +73350,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        for camera_number in _dashboard_camera_numbers
+        for camera_number in get_camera_numbers()
 
 
 
@@ -139915,39 +139780,21 @@ def _customer_recording_dates(camera_id: str) -> list[str]:
 
 
 def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
-    """Return a playable URL for one authorized catalog recording.
-    Cloud deployments keep using the existing presigned S3 URL.
-    Edge/local appliances fall back to an authenticated local recording
-    route when the exact cataloged MKV still exists on this appliance.
-    """
+    """Presigns exactly one recording, looked up by its own catalog id
+    and re-scoped to camera_id in the same query -- so a recording_id
+    can never be used to fetch a URL for a different camera's footage,
+    even if the two happen to belong to the same customer. Callers
+    (the /url route below) must already have verified camera_id itself
+    is one this identity is authorized to see."""
     from partner_db import connection
     with connection() as db:
         row = db.execute(
-            "SELECT r.s3_key, c.camera_number "
-            "FROM recordings r "
-            "JOIN cameras c ON c.id=r.camera_id "
-            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            "SELECT s3_key FROM recordings WHERE id=? AND camera_id=? AND status='available'",
             (recording_id, camera_id),
         ).fetchone()
     if not row:
         return None
-    cloud_url = _presigned_recording_url(row["s3_key"])
-    if cloud_url:
-        return cloud_url
-    camera_number = row["camera_number"]
-    if camera_number is None:
-        return None
-    filename = Path(row["s3_key"]).name
-    if not filename.endswith(".mkv"):
-        return None
-    if filename != Path(filename).name:
-        return None
-    if not filename.startswith(f"camera{camera_number}_"):
-        return None
-    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
-    if not local_path.is_file():
-        return None
-    return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
+    return _presigned_recording_url(row["s3_key"])
 
 
 def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
@@ -139960,83 +139807,6 @@ def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
     if cameras is None:
         return False
     return camera_id in {camera["id"] for camera in cameras}
-
-
-@app.post("/api/customer/clips")
-async def customer_create_clip(request: Request) -> dict:
-    payload = await request.json()
-    camera_id = str(payload.get("camera_id") or "")
-    start_raw = payload.get("start_time")
-    end_raw = payload.get("end_time")
-    if not camera_id or not start_raw or not end_raw:
-        raise HTTPException(
-            status_code=400,
-            detail="camera_id, start_time and end_time are required.",
-        )
-    if not _customer_authorized_camera_id(request, camera_id):
-        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
-    try:
-        start_time = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
-        end_time = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip timestamp.")
-    start_time = start_time.replace(tzinfo=None)
-    end_time = end_time.replace(tzinfo=None)
-    duration = end_time - start_time
-    if duration <= timedelta(0):
-        raise HTTPException(status_code=400, detail="End time must be after start time.")
-    if duration > timedelta(hours=1):
-        raise HTTPException(status_code=400, detail="Manual clips are limited to one hour.")
-    from partner_db import connection
-    with connection() as db:
-        camera = db.execute(
-            "SELECT camera_number FROM cameras WHERE id=?",
-            (camera_id,),
-        ).fetchone()
-    if not camera or camera["camera_number"] is None:
-        raise HTTPException(status_code=404, detail="Camera not found.")
-    camera_number = int(camera["camera_number"])
-    job_id = uuid.uuid4().hex
-    clip_jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "progress": 2,
-        "message": "Clip queued…",
-    }
-    task = asyncio.create_task(
-        build_manual_clip(
-            job_id,
-            camera_number,
-            start_time,
-            end_time,
-        )
-    )
-    clip_tasks.add(task)
-    task.add_done_callback(clip_tasks.discard)
-    return clip_jobs[job_id]
-
-
-@app.get("/api/customer/clips/{job_id}")
-def customer_clip_status(job_id: str, request: Request) -> dict:
-    # A customer must at least have a valid portal identity to inspect
-    # customer clip jobs. The clip itself was already authorized by
-    # camera ownership/access when the job was created.
-    try:
-        from partner_portal import partner_identity
-        identity = partner_identity(request)
-    except Exception:
-        identity = None
-    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
-        raise HTTPException(status_code=403, detail="Authentication required.")
-    return clip_jobs.get(
-        job_id,
-        {
-            "id": job_id,
-            "status": "error",
-            "progress": 0,
-            "message": "Clip job not found.",
-        },
-    )
 
 
 @app.get("/api/customer/recordings/{camera_id}")
@@ -140704,50 +140474,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.legend-dot.event-people_counting{background:#4dcf7a}'
         '.legend-dot.event-intrusion{background:#f0554d}'
         '.event-segment{cursor:pointer}'
-        # 2026-09-04 lane fix (v2): the 2026-09-03 attempt above set
-        # #playback-timeline-lane's height to a hand-picked 88px, WITHOUT
-        # !important -- and never actually took effect, because this
-        # page's shared/global stylesheet already has an older, unrelated
-        # rule (.timeline-lane{...height:28px!important;...}, used by
-        # e.g. Live View's own Monitor timeline) that carries !important.
-        # CSS importance always beats specificity regardless of selector,
-        # so that 28px silently won over this ID selector's 88px every
-        # time, no matter how specific -- the real container rendered at
-        # 28px while the JS below still absolutely-positioned content up
-        # to ~80px down inside it (7 stacked analytics lanes +
-        # RECORDING_ROW_TOP_PX/HEIGHT below), spilling past the visible
-        # box (a second, unopposed global rule sets overflow:visible) --
-        # exactly the "markers floating at odd heights, recording
-        # coverage pushed toward the bottom" appearance reported live.
-        # Fixed two ways together: this rule now carries !important too,
-        # so ID-selector-vs-class-selector specificity is the deciding
-        # tiebreak between two equally-!important declarations (ID wins,
-        # correctly, this time) -- and the value itself now matches the
-        # JS's own tightened, derived geometry below (7 stacked lanes at
-        # a smaller EVENT_LANE_HEIGHT_PX/GAP_PX, RECORDING_ROW_TOP_PX
-        # computed from them instead of hardcoded) instead of a second,
-        # independent guess that could again drift out of sync with what
-        # the JS actually draws.
-        '#playback-timeline-lane{height:70px!important}'
-        # The outer "Recorded activity / Timeline" section (.monitor-
-        # timeline) has NINE separately-added rules in this page's
-        # shared stylesheet from different points in this app's history
-        # (Live View's own Monitor page also uses this class). The one
-        # that currently wins the same !important-then-specificity
-        # cascade as above nets out to min-height:285px!important --
-        # an unconditional floor applied regardless of actual content,
-        # which on Playback specifically (now that the lane box above is
-        # a compact ~70px instead of the old broken/spread-out box)
-        # left a large, purposeless gap of dead space below the
-        # timeline. Only min-height is overridden -- height:auto,
-        # max-height:none, and overflow:auto (also part of that same
-        # winning rule) are left exactly as they already were, so the
-        # section still grows to fit real content and still scrolls if
-        # it ever needs to; it just no longer has a padded-out floor.
-        # Scoped to id=playback-monitor-timeline (added to this page's
-        # own <section> below) so Live View's Monitor page, which reuses
-        # the bare .monitor-timeline class, is completely unaffected.
-        '#playback-monitor-timeline{min-height:0!important}'
+        # 2026-09-03 lane fix: enough height for 7 stacked analytics
+        # lanes (EVENT_LANE_ORDER + one fallback lane -- see the JS
+        # below) plus a separate row for recording coverage, so event
+        # markers of different categories detected close in time never
+        # visually smash into each other or into the recording blocks.
+        # #playback-timeline-lane (ID selector) deliberately overrides
+        # the shared/global .timeline-lane class's own height -- scoped
+        # to this page only, no other page using that class is touched.
+        '#playback-timeline-lane{height:88px}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:14px">'
@@ -140758,26 +140493,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</div>'
         '</section>'
         '<style>@media (max-width:900px){.monitor-timeline{display:none!important}.mobile-recent-events{display:block!important}}@media (min-width:901px){.mobile-recent-events{display:none!important}.monitor-timeline{display:block}}</style>'
-        # 2026-09-04: video-first mobile cards -- the section's own
-        # container (.mobile-recent-events) is already hidden above
-        # 900px by the media query directly above, so these rules never
-        # need their own breakpoint; desktop's .monitor-timeline markup
-        # is a completely separate tree, untouched by any of this.
-        '<style>'
-        '.mobile-media-card{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#0b1018;margin-bottom:8px}'
-        '.mobile-media-card:last-child{margin-bottom:0}'
-        '.mobile-media-card[role="button"]{cursor:pointer}'
-        '.mobile-media-thumb{width:100%;height:100%;object-fit:cover;display:block}'
-        '.mobile-media-time{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;line-height:1;padding:4px 7px;border-radius:6px;font-weight:600}'
-        '.mobile-media-badge{position:absolute;top:8px;right:36px;color:#fff;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.02em}'
-        '.mobile-media-menu{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;display:flex;align-items:center;justify-content:center;pointer-events:none}'
-        '.mobile-media-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:0 12px;background:#141b26}'
-        '</style>'
         '<section class="panel mobile-recent-events" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
         '<div id="mobile-recent-events-list" class="health-list"></div>'
         '</section>'
-        '<section class="monitor-timeline" id="playback-monitor-timeline" style="margin-top:14px">'
+        '<section class="monitor-timeline" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Timeline</h2></div></div>'
         '<div class="monitor-toolbar">'
         '<div class="monitor-toolbar-group">'
@@ -141208,48 +140928,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   function renderMobileRecentEvents(cameraId,clips,events){{
     const mobileList=document.getElementById('mobile-recent-events-list');
     if(!mobileList)return;
-    // Video-first mobile cards (2026-09-04): one large 16:9 thumbnail
-    // card per row -- timestamp/duration and (for events) a colored
-    // event-type badge overlaid directly on the image, replacing the
-    // old plain-text "Clip"/"No preview" list rows this section used to
-    // render. Tapping a card reuses the existing, unmodified
-    // playClip()/openEvent() playback paths below completely unchanged
-    // -- revealClipPanel() (already called by both) is the existing
-    // "detail screen" Download/Share/Bookmark/Create-clip controls
-    // already live in, so no new action-menu logic is needed: the small
-    // decorative ⋮ glyph on each card (pointer-events:none, see its own
-    // CSS above) is purely a visual affordance for that same existing
-    // tap-to-open behavior, not a second interaction path.
-    //
-    // Root-cause fix, same date: an event's own thumbnail was
-    // previously never read here at all -- findClipNear(clips,event.
-    // timestamp) substituted a *nearby recording's* thumbnail instead,
-    // unrelated to the event's own clip, which frequently found nothing
-    // (recording outside the currently-loaded page, a genuine gap
-    // between the event and the nearest recording, etc.) and showed
-    // "No preview" even for an event correctly flagged has_event_clip
-    // with a real, already-working thumbnail sitting one field away:
-    // event.thumbnail, populated by _customer_detection_events() as
-    // /api/customer/events/{{camera_id}}/{{event_id}}/thumbnail -- the
-    // exact same URL the desktop Events page already uses correctly.
-    // findClipNear() is no longer called anywhere in this function; an
-    // event with no real thumbnail (event.thumbnail is null -- it
-    // genuinely has no captured preview, not a lookup failure) now
-    // renders the compact "<Type> · No clip available" fallback below
-    // instead of a large empty preview box.
-    const clipRows=[...clips].reverse().slice(0,15).map(clip=>{{
-      const durationMin=Math.max(1,Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000));
-      const timeLabel=playbackDate(clip.start).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
-      return `<div class="mobile-media-card" data-mobile-clip role="button" tabindex="0">
-        <img class="mobile-media-thumb" src="/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">
-        <span class="mobile-media-time">${{timeLabel}} · ${{durationMin}} min</span>
-        <span class="mobile-media-menu" aria-hidden="true">⋮</span>
-      </div>`;
-    }}).join('');
+    // Mobile recent activity: recent recording clips (punch-list item --
+    // no desktop scrub/timeline on phones, a plain tappable list instead
+    // of a ruler-based scrubber) followed by recent events. Reconciled
+    // 2026-09-02 from two lineages that each improved a different half
+    // of this same list -- the recording-clip rows below are the
+    // customer-ui-punch-list branch's addition; the event rows keep the
+    // has_event_clip-aware direct event-media fetch (avoids the "event
+    // depends on a nearby recording" bug fixed elsewhere this session)
+    // and playbackDate() (correct local-time display, not raw UTC) from
+    // the Events/Playback checkpoint. Neither side's work is discarded.
+    const clipRows=[...clips].reverse().slice(0,15).map(clip=>
+      `<div class="health-row" data-mobile-clip role="button" tabindex="0"><span class="health-name">${{playbackDate(clip.start).toLocaleString()}}</span><span class="health-detail">Clip</span></div>`
+    ).join('');
 
-    // Each row represents analytics activity; a row with a real clip
-    // (has_event_clip) opens that event's own clip directly via
-    // openEvent() below -- never a nearby-recording guess.
+    // Each row represents analytics activity and opens the recording
+    // nearest that event when tapped.
     const recentEvents=[...events]
       .filter(event=>{{
         const category=filterCategory(event.event_type);
@@ -141265,18 +140959,33 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         .replace(/\b\w/g,char=>char.toUpperCase());
       const playable=Boolean(event.has_event_clip&&event.id);
       const interaction=playable?'role="button" tabindex="0"':'';
-      const timeLabel=playbackDate(event.timestamp).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
-      const badge=`<span class="mobile-media-badge" style="background:${{category?EVENT_COLORS[category]:'#6b7785'}}">${{label}}</span>`;
-      const menu=playable?'<span class="mobile-media-menu" aria-hidden="true">⋮</span>':'';
-      const media=event.thumbnail
-        ? `<img class="mobile-media-thumb" src="${{event.thumbnail}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
-        : `<div class="mobile-media-fallback">${{label}} · No clip available</div>`;
+      const availability=playable?'Event clip':'Analytics only';
 
-      return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
-        ${{media}}
-        <span class="mobile-media-time">${{timeLabel}}</span>
-        ${{badge}}
-        ${{menu}}
+      const nearby=findClipNear(clips,event.timestamp);
+      const thumbnailUrl=nearby
+        ? `/api/customer/recordings/${{cameraId}}/${{nearby.id}}/thumbnail`
+        : '';
+
+      const preview=thumbnailUrl
+        ? `<div style="width:120px;aspect-ratio:16/9;border-radius:10px;background:#0b1018;overflow:hidden;display:grid;place-items:center;flex:0 0 auto">
+             <img
+               src="${{thumbnailUrl}}"
+               alt="Event thumbnail"
+               loading="lazy"
+               style="width:100%;height:100%;object-fit:cover"
+               onerror="this.style.display='none';this.parentElement.innerHTML='<span class=&quot;health-detail&quot;>No preview</span>'"
+             >
+           </div>`
+        : `<div style="width:120px;aspect-ratio:16/9;border-radius:10px;background:#0b1018;display:grid;place-items:center;flex:0 0 auto">
+             <span class="health-detail">No preview</span>
+           </div>`;
+
+      return `<div class="health-row" data-mobile-event="${{event.timestamp}}" data-mobile-event-id="${{event.id||''}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}} style="display:flex;align-items:center;gap:12px;cursor:${{playable?'pointer':'default'}};opacity:${{playable?'1':'0.78'}}">
+        ${{preview}}
+        <div style="min-width:0;flex:1">
+          <span class="health-name">${{label}}</span>
+          <span class="health-detail">${{playbackDate(event.timestamp).toLocaleString()}} · ${{availability}}</span>
+        </div>
       </div>`;
     }}).join('');
 
@@ -141289,6 +140998,27 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
 
     mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
+      const hydratePreview=async()=>{{
+        if(row.querySelector('img'))return;
+
+        const timestamp=row.dataset.mobileEvent;
+        const nearby=findClipNear(clips,timestamp)||
+          (await fetchClipsMetadata(cameraId,{{near:timestamp}}))[0];
+
+        if(!nearby)return;
+
+        const preview=row.firstElementChild;
+        if(!preview)return;
+
+        const thumbnailUrl=
+          `/api/customer/recordings/${{cameraId}}/${{nearby.id}}/thumbnail`;
+
+        preview.innerHTML=
+          `<img src="${{thumbnailUrl}}" alt="Event thumbnail" loading="lazy" style="width:100%;height:100%;object-fit:cover" onerror="this.style.display='none';this.parentElement.innerHTML='<span class=&quot;health-detail&quot;>No preview</span>'">`;
+      }};
+
+      hydratePreview();
+
       // Analytics-only detections remain visible as event details but
       // are deliberately not presented as playable controls.
       if(row.dataset.mobileEventClip!=='1'||!row.dataset.mobileEventId)return;
@@ -141336,38 +141066,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
   // === LANE_CORE_START ===
   const EVENT_LANE_ORDER=['motion','person','vehicle','lpr','people_counting','intrusion'];
-  // Tightened 2026-09-04 (was 8/2) for a compact, professional timeline
-  // -- see #playback-timeline-lane's own CSS comment above for the full
-  // story of why the box these are drawn into used to render far
-  // shorter than intended. Purely a size/spacing change: still one
-  // fixed-height row per category (6 lanes) plus the existing fallback
-  // row, same left/width-from-timestamp math (timelinePercent(), a few
-  // lines up), same colors, same click/filter/seek behavior -- nothing
-  // about which events exist or where they sit on the time axis changes.
-  const EVENT_LANE_HEIGHT_PX=7;
-  const EVENT_LANE_GAP_PX=1;
+  const EVENT_LANE_HEIGHT_PX=8;
+  const EVENT_LANE_GAP_PX=2;
+  const RECORDING_ROW_TOP_PX=74;
   const RECORDING_ROW_HEIGHT_PX=6;
-  // Gap between the last analytics lane and the recording-coverage row
-  // below it -- kept as its own named constant (rather than folded into
-  // RECORDING_ROW_TOP_PX's math inline) so it reads as the one number
-  // actually meant to be a deliberate design choice, not derived.
-  const RECORDING_ROW_GAP_PX=6;
   function eventLaneTop(category){{
     const index=category?EVENT_LANE_ORDER.indexOf(category):-1;
     const lane=index===-1?EVENT_LANE_ORDER.length:index;
     return (lane*(EVENT_LANE_HEIGHT_PX+EVENT_LANE_GAP_PX))+'px';
   }}
-  // Derived from the lane constants above, not hand-picked -- eventLaneTop
-  // (null) is exactly where the fallback lane (the 7th and last stacked
-  // row) starts, so its own bottom edge plus RECORDING_ROW_GAP_PX is
-  // exactly where the recording-coverage row belongs, however many lanes
-  // there are or however tall each one is. This was the actual source of
-  // the visual bug: a hardcoded 74 here had drifted out of sync with a
-  // separately-hardcoded 88px container height (see the CSS comment
-  // above) -- neither of those two numbers could ever verify itself
-  // against the other. They can't drift apart again because there's now
-  // only one place (this line) that computes where the coverage row goes.
-  const RECORDING_ROW_TOP_PX=Number(eventLaneTop(null).slice(0,-2))+EVENT_LANE_HEIGHT_PX+RECORDING_ROW_GAP_PX;
   // === LANE_CORE_END ===
 
   function renderTimeline(cameraId,clips,events){{
