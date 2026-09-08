@@ -6,6 +6,26 @@ from database_backend import connect
 logger=logging.getLogger('anyaicam.migrations')
 
 MIGRATIONS=[
+    ('20260907_customer_registration_requests','''
+CREATE TABLE IF NOT EXISTS customer_registration_requests(
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    partner_id TEXT,
+    customer_id TEXT,
+    user_id TEXT,
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by TEXT,
+    rejection_reason TEXT,
+    FOREIGN KEY(partner_id) REFERENCES partners(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(user_id) REFERENCES partner_users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_customer_registration_status_partner ON customer_registration_requests(status,partner_id,requested_at);
+'''),
     ('20260801_cloud_security','''
 CREATE TABLE IF NOT EXISTS account_lockouts(email TEXT PRIMARY KEY,attempts INTEGER NOT NULL DEFAULT 0,locked_until TEXT,last_attempt_at TEXT);
 CREATE TABLE IF NOT EXISTS password_reset_tokens(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,email TEXT NOT NULL,token_hash TEXT NOT NULL,expires_at TEXT NOT NULL,used_at TEXT,created_at TEXT NOT NULL);
