@@ -1,12 +1,8 @@
-"""Playback: without a deep-link timestamp, the page now auto-loads the
-most recent recording instead of leaving the player with no source
-until something is clicked. Fixes a real customer-reported regression:
-backend URLs and data were correct (see test_customer_recordings_r4.py
-and test_recording_read_credentials_cache.py), but the player stayed
-black at 0:00 because nothing ever called playClip() on a normal page
-load -- only an explicit click or a ?t= deep link did. Clicking a
-segment/row/marker is unchanged; this only adds what happens with none
-of those yet.
+"""Playback: without a deep-link timestamp, the page selects the most
+recent recording and exposes the explicit Play action. Event-media
+readiness reconciliation deliberately avoids initiating media playback
+without a user action, while still preventing the old empty black 0:00
+state. Clicking a segment/row/marker is unchanged.
 
 Updated for the bounded-load rewrite (test_playback_bounded_load.py):
 _render_customer_playback() now sources its initial data from
@@ -29,7 +25,7 @@ def _fake_request(t=None, camera=None):
     return SimpleNamespace(query_params=SimpleNamespace(get=lambda key, default=None: {"t": t, "camera": camera}.get(key, default)))
 
 
-def test_no_deep_link_auto_plays_the_most_recent_clip(monkeypatch):
+def test_no_deep_link_selects_the_most_recent_clip_without_autoplay(monkeypatch):
     monkeypatch.setattr(main, "_customer_recording_rows", lambda camera_id, **kwargs: [
         {"id": "rec-old", "start": "2026-08-20T10:00:00", "end": "2026-08-20T10:05:00", "name": "old.mp4"},
         {"id": "rec-newest", "start": "2026-08-23T18:57:10", "end": "2026-08-23T19:01:08", "name": "newest.mp4"},
@@ -40,7 +36,9 @@ def test_no_deep_link_auto_plays_the_most_recent_clip(monkeypatch):
     j = html.index("filterButtons.forEach", i)
     branch = html[i:j]
     assert "}else if(clips.length){" in branch
-    assert "playClip(cameraId,clips[clips.length-1]);" in branch  # the newest clip, since clips is oldest-first
+    assert "selectedClip=clips[clips.length-1];" in branch  # newest; clips is oldest-first
+    assert "timelinePlayButton.disabled=false;" in branch
+    assert "playClip(cameraId,clips[clips.length-1]);" not in branch
 
 
 def test_deep_link_timestamp_behavior_is_unchanged(monkeypatch):

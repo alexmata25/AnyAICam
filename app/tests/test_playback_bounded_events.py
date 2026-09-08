@@ -3,8 +3,8 @@ events/{camera_id} -- the same bounded-load fix as recordings, for a
 second dataset. The timeline used to embed a customer's entire
 detection_events history for every camera (12,000+ rows measured for
 one real account) to plot a single 24h axis. This queries exactly one
-camera and one calendar date, and returns only the two fields the
-timeline's own JS reads (event_type, timestamp).
+camera and one calendar date, and returns only the bounded event-media
+fields the timeline and readiness UI read.
 
 Direct function calls for the query layer; the route itself is called
 directly too (see test_playback_bounded_load.py's own note on why
@@ -53,7 +53,13 @@ def test_only_the_requested_date_is_returned(db_path):
         _seed_event(conn, "ev-1", "cam-1", "person", "2026-08-20T10:00:00")
         _seed_event(conn, "ev-2", "cam-1", "car", "2026-08-21T10:00:00")
         result = main._customer_camera_events("cam-1", "2026-08-20")
-    assert result == [{"event_type": "person", "timestamp": "2026-08-20T10:00:00"}]
+    assert result == [{
+        "id": "ev-1",
+        "event_type": "person",
+        "timestamp": "2026-08-20T10:00:00",
+        "has_event_clip": False,
+        "media_state": "unavailable",
+    }]
 
 
 def test_only_the_requested_camera_is_returned(db_path):
@@ -70,14 +76,16 @@ def test_only_the_requested_camera_is_returned(db_path):
     assert result[0]["event_type"] == "person"
 
 
-def test_returns_only_event_type_and_timestamp(db_path):
+def test_returns_only_bounded_timeline_and_media_readiness_fields(db_path):
     with override_target(sqlite_path=db_path):
         initialize_database()
         conn = sqlite3.connect(db_path)
         _seed_base_tenant(conn)
         _seed_event(conn, "ev-1", "cam-1", "truck", "2026-08-20T10:00:00")
         result = main._customer_camera_events("cam-1", "2026-08-20")
-    assert set(result[0].keys()) == {"event_type", "timestamp"}
+    assert set(result[0].keys()) == {
+        "id", "event_type", "timestamp", "has_event_clip", "media_state"
+    }
 
 
 def test_empty_date_returns_empty_list(db_path):

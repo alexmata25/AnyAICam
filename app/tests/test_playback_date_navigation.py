@@ -125,7 +125,7 @@ def test_date_with_and_without_recordings_status_text(monkeypatch):
 def test_camera_switch_preserves_selected_date(monkeypatch):
     html = _render(monkeypatch)
     idx = html.index("cameraTiles.forEach(tile=>{")
-    block = html[idx: idx + 1100]
+    block = html[idx:html.index("let lastTap=0;", idx)]
     assert "if(viewingDate){" in block
     assert "loadRecordingsForDate(selectedCameraId,viewingDate)" in block
     assert "}else{" in block
