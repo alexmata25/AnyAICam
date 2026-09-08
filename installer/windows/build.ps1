@@ -1,3 +1,4 @@
+param([switch]$Sign)
 $ErrorActionPreference = 'Stop'
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
 if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
@@ -11,5 +12,33 @@ foreach ($line in Get-Content (Join-Path $PSScriptRoot 'wheels.lock.sha256')) {
     $wheel = Join-Path $wheelRoot $parts[1]
     if (-not (Test-Path $wheel) -or (Get-FileHash -Algorithm SHA256 $wheel).Hash.ToLowerInvariant() -ne $parts[0]) { throw "Wheel checksum failed: $($parts[1])" }
 }
-& $iscc (Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss')
+$installerScript = Join-Path $PSScriptRoot 'AnyAiCam-VMS.iss'
+$compilerArguments = @()
+if ($Sign) {
+    $signTool = $env:ANYAICAM_SIGNTOOL_PATH
+    $thumbprint = ($env:ANYAICAM_SIGN_CERT_SHA1 -replace '\s','').ToUpperInvariant()
+    $timestampUrl = $env:ANYAICAM_TIMESTAMP_URL
+    if (-not (Test-Path -LiteralPath $signTool)) { throw 'ANYAICAM_SIGNTOOL_PATH must identify signtool.exe.' }
+    if ($thumbprint -notmatch '^[0-9A-F]{40}$') { throw 'ANYAICAM_SIGN_CERT_SHA1 must be a 40-character certificate thumbprint.' }
+    if ($timestampUrl -notmatch '^https?://') { throw 'ANYAICAM_TIMESTAMP_URL must be an HTTP(S) RFC 3161 endpoint.' }
+    $certificate = Get-ChildItem Cert:\CurrentUser\My,Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $thumbprint -and $_.HasPrivateKey -and $_.NotAfter -gt (Get-Date) -and ($_.EnhancedKeyUsageList.ObjectId.Value -contains '1.3.6.1.5.5.7.3.3') } |
+        Select-Object -First 1
+    if (-not $certificate) { throw 'The requested valid code-signing certificate with private key was not found.' }
+    $signCommand = '"' + $signTool + '" sign /sha1 ' + $thumbprint + ' /fd SHA256 /tr "' + $timestampUrl + '" /td SHA256 $f'
+    $compilerArguments += '/DEnableSigning=1'
+    $compilerArguments += '/SAnyAiCamSign=' + $signCommand
+}
+$compilerArguments += $installerScript
+& $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+if ($Sign) {
+    $setup = Get-Item (Join-Path $PSScriptRoot 'output\AnyAiCam-VMS-Setup-0.1.2-947f8bc.exe')
+    $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)
+    if ($signedUninstallers.Count -eq 0) { throw 'Inno Setup did not produce a cached signed uninstaller.' }
+    foreach ($file in @($setup) + $signedUninstallers) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $thumbprint) { throw "Authenticode verification failed: $($file.FullName)" }
+    }
+    Write-Output "Verified Authenticode signatures on setup and $($signedUninstallers.Count) cached uninstaller(s)."
+}

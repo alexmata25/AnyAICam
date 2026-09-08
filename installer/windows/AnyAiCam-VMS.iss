@@ -18,6 +18,11 @@ SolidCompression=yes
 WizardStyle=modern
 SetupLogging=yes
 CloseApplications=no
+#ifdef EnableSigning
+SignTool=AnyAiCamSign
+SignedUninstaller=yes
+SignedUninstallerDir=output\signed-uninstallers
+#endif
 [Dirs]
 Name: "{commonappdata}\AnyAiCam"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\config"; Flags: uninsneveruninstall

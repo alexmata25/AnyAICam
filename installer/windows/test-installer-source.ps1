@@ -28,6 +28,9 @@ if (-not $runtime.Contains('--no-index')) { throw 'Runtime dependency installati
 foreach ($forbidden in @('InstallAllUsers=', 'python-3.12.10-amd64.exe', '/uninstall')) {
     if ($iss.Contains($forbidden)) { throw "Installer manifest contains unsafe registered-Python operation: $forbidden" }
 }
+foreach ($signingText in @('SignTool=AnyAiCamSign', 'SignedUninstaller=yes', 'SignedUninstallerDir=', 'Get-AuthenticodeSignature', 'ANYAICAM_TIMESTAMP_URL')) {
+    if (-not ((Get-Content -Raw (Join-Path $root 'installer\windows\AnyAiCam-VMS.iss')) + (Get-Content -Raw (Join-Path $root 'installer\windows\build.ps1'))).Contains($signingText)) { throw "Signing support is missing $signingText" }
+}
 $xml = [xml](Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\AnyAiCamVMS.xml'))
 if ($xml.service.startmode -ne 'Automatic') { throw 'Service is not automatic.' }
 if (-not $xml.service.onfailure) { throw 'Service has no restart-on-failure policy.' }
