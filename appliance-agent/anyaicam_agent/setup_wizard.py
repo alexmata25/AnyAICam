@@ -4,9 +4,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .config import AgentConfig,save_credential
+from .config import AgentConfig
 from .discovery import scan
 from .portal import PortalClient,PortalError
+from .reenrollment import ReenrollmentError,coordinated_reenroll
 
 
 def qr_payload():
@@ -28,11 +29,20 @@ def main():
     try: activated=client.activate(config.cloud_id,token)
     except PortalError as error: raise SystemExit(f'Activation failed: {error}')
     print('Assigned customer:',activated.get('customer_id')); print('Assigned site:',activated.get('site_id'))
-    config.save(); save_credential(config,{'appliance_id':activated['appliance_id'],'credential_id':activated['credential_id'],'credential':activated['credential']})
+    def restart_service(): subprocess.run(['systemctl','restart','anyaicam-agent.service'],check=True)
+    def verify_authentication(identity):
+        check=PortalClient(config.portal_url,identity['appliance_id'],identity['credential'])
+        check.request('GET','/api/appliance/commands')
+        return True
+    try:
+        coordinated_reenroll(config,activated,expected_cloud_id=config.cloud_id,
+            vms_identity_path=Path(config.vms_recordings_path)/'appliance_identity.json',
+            restart_service=restart_service,verify_authentication=verify_authentication)
+    except ReenrollmentError as error: raise SystemExit(str(error)) from error
     if input('Run camera discovery now? [Y/n]: ').strip().lower()!='n':
         cameras=scan(config.discovery_networks); config.cameras_file.parent.mkdir(parents=True,exist_ok=True); config.cameras_file.write_text(json.dumps(cameras,indent=2),encoding='utf-8'); print(f'Discovered {len(cameras)} compatible endpoints.')
     print('Configuration saved securely.')
-    if input('Start AnyAiCam service now? [Y/n]: ').strip().lower()!='n': subprocess.run(['systemctl','start','anyaicam-agent.service'],check=False)
+    print('AnyAiCam service restarted and authenticated during identity commit.')
 
 
 if __name__=='__main__': main()

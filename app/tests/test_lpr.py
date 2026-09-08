@@ -13,6 +13,7 @@ is what actually protects the pipeline's output quality.
 
 import numpy as np
 import pytest
+import builtins
 
 import lpr
 
@@ -112,6 +113,40 @@ def test_recognize_plate_returns_none_when_disabled(monkeypatch):
     assert lpr.recognize_plate(frame) is None
 
 
+def test_disabled_lpr_does_not_import_optional_ocr_dependency(monkeypatch):
+    monkeypatch.setattr(lpr, "LPR_ENABLED", False)
+    real_import = builtins.__import__
+
+    def reject_pytesseract(name, *args, **kwargs):
+        if name == "pytesseract":
+            raise AssertionError("disabled LPR attempted to import pytesseract")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_pytesseract)
+    assert lpr.capability() == {
+        "enabled": False,
+        "available": False,
+        "reason": "LPR is disabled",
+    }
+    assert lpr.recognize_plate(_render_plate_image("ABC1234")) is None
+
+
+def test_enabled_lpr_reports_missing_ocr_dependency_without_raising(monkeypatch):
+    real_import = builtins.__import__
+
+    def reject_pytesseract(name, *args, **kwargs):
+        if name == "pytesseract":
+            raise ImportError("optional OCR package is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_pytesseract)
+    state = lpr.capability()
+    assert state["enabled"] is True
+    assert state["available"] is False
+    assert "LPR unavailable" in state["reason"]
+    assert lpr.read_plate_text(_render_plate_image("ABC1234")) is None
+
+
 def test_recognize_plate_returns_none_for_camera_not_in_scope(monkeypatch):
     monkeypatch.setattr(lpr, "LPR_CAMERAS", frozenset({1, 2, 3, 4}))
     frame = _render_plate_image("ABC1234")
@@ -139,6 +174,8 @@ def test_real_ocr_reads_a_clean_synthetic_plate():
     # this pipeline. The contract under test is "the real engine reads
     # a plausible plate of the right length with real confidence,"
     # not "OCR never makes a mistake."
+    if not lpr.capability()["available"]:
+        pytest.skip("optional pytesseract/Tesseract runtime is not installed")
     image = _render_plate_image("ABC1234")
     result = lpr.read_plate_text(image)
     assert result is not None
