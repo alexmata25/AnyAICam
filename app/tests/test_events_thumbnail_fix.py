@@ -141,7 +141,7 @@ def test_events_page_row_renders_a_real_img_for_the_clip_thumbnail(monkeypatch):
     monkeypatch.setattr(main, "_customer_playback_cameras", lambda request: [
         {"id": "cam-1", "name": "Front Door", "camera_number": 1}
     ])
-    monkeypatch.setattr(main, "_customer_detection_events", lambda request: [{
+    monkeypatch.setattr(main, "_customer_detection_events", lambda request, **kwargs: [{
         "id": "ev-1", "camera": 1, "camera_id": "cam-1", "camera_name": "Front Door",
         "event_type": "motion", "timestamp": "2026-09-02T15:02:32.948459", "confidence": 20.9,
         "thumbnail": "/api/customer/events/cam-1/ev-1/thumbnail", "has_event_clip": True,
@@ -155,10 +155,15 @@ def test_events_page_row_without_a_thumbnail_still_shows_the_em_dash(monkeypatch
     monkeypatch.setattr(main, "_customer_playback_cameras", lambda request: [
         {"id": "cam-1", "name": "Front Door", "camera_number": 1}
     ])
-    monkeypatch.setattr(main, "_customer_detection_events", lambda request: [{
+    monkeypatch.setattr(main, "_customer_detection_events", lambda request, **kwargs: [{
         "id": "ev-2", "camera": 1, "camera_id": "cam-1", "camera_name": "Front Door",
         "event_type": "person", "timestamp": "2026-09-02T15:00:00", "confidence": 0.9,
         "thumbnail": None, "has_event_clip": False,
     }])
     html = main._render_customer_events(_fake_request())
-    assert '<td>—</td>' in html
+    # P0 #5 Phase 3 (2026-09-05): the thumbnail <td> gained a
+    # class="event-thumbnail-cell" hook so the desktop poll loop can
+    # patch it in place once media becomes ready -- the em dash itself
+    # is unchanged for an old, genuinely clipless event (well outside
+    # the pending window relative to this fixture's fixed timestamp).
+    assert '<td class="event-thumbnail-cell">—</td>' in html
