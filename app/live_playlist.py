@@ -23,7 +23,9 @@ import time
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
+from cloud_config import settings
+from local_live_hls import require_local_camera, local_playlist, segment_path
 
 from appliance_cloud import live_manifest_store
 from appliance_protocol import live_relay_s3_prefix
@@ -125,15 +127,14 @@ def render_playlist(
     return "\n".join(lines) + "\n"
 
 
-def register_live_playlist_routes(app: FastAPI) -> None:
+def register_live_playlist_routes(app: FastAPI, *, hls_folder=None, local_identity=lambda: None) -> None:
     def customer_owner(request: Request) -> dict:
         identity = partner_identity(request)
-        if not identity or identity.get('role') != 'customer_owner':
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
             raise HTTPException(status_code=403, detail='Customer owner permission required.')
         return identity
 
-    @app.get('/api/customer/cameras/{camera_id}/live/playlist.m3u8')
-    def live_playlist(request: Request, camera_id: str) -> Response:
+    def authorized_camera(request: Request, camera_id: str):
         identity = customer_owner(request)
         with connection() as db:
             camera = db.execute(
@@ -149,8 +150,8 @@ def register_live_playlist_routes(app: FastAPI) -> None:
             # keyed on (same resolution notification_engine.py's caller
             # already performs before querying this same table).
             user = db.execute(
-                'SELECT id FROM partner_users WHERE email=?',
-                (identity['email'],),
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity['email'],identity['customer_id']),
             ).fetchone()
             if not user:
                 raise HTTPException(status_code=403, detail='Customer owner permission required.')
@@ -168,11 +169,31 @@ def register_live_playlist_routes(app: FastAPI) -> None:
         if camera_number is None:
             raise HTTPException(status_code=409, detail='Camera has no assigned relay slot; live view is unavailable.')
 
+        return dict(camera), camera_number
+
+    def local_context(request, camera_id):
+        camera, number = authorized_camera(request,camera_id)
+        if hls_folder is None or _cloudfront_base_url() or os.environ.get(CLOUDFRONT_KEY_PAIR_ID_ENV,'').strip():
+            raise HTTPException(status_code=503,detail='Local live view is unavailable.')
+        with connection() as db:
+            require_local_camera(camera,local_identity(),settings.runtime_role,db)
+        return camera,number
+
+    @app.get('/api/customer/cameras/{camera_id}/live/segments/{segment_name}')
+    def live_segment(request: Request,camera_id: str,segment_name: str):
+        camera,number=local_context(request,camera_id)
+        return FileResponse(segment_path(hls_folder,number,segment_name),media_type='video/mp2t',headers={'Cache-Control':'no-store'})
+
+    @app.get('/api/customer/cameras/{camera_id}/live/playlist.m3u8')
+    def live_playlist(request: Request, camera_id: str) -> Response:
+        camera,camera_number=authorized_camera(request,camera_id)
         rsa_signer = get_configured_signer()
         key_id = os.environ.get(CLOUDFRONT_KEY_PAIR_ID_ENV, '').strip()
         cloudfront_base_url = _cloudfront_base_url()
         if rsa_signer is None or not key_id or not cloudfront_base_url:
-            raise HTTPException(status_code=503, detail='Live view signing is not configured.')
+            camera,camera_number=local_context(request,camera_id)
+            return Response(local_playlist(hls_folder,camera_number,camera_id,STALE_MANIFEST_SECONDS),
+                            media_type='application/vnd.apple.mpegurl',headers={'Cache-Control':'no-store'})
 
         expected_prefix = live_relay_s3_prefix(camera['customer_id'], camera['site_id'], camera['appliance_id'], camera_id)
         manifest = live_manifest_store.manifest_for(camera_id)

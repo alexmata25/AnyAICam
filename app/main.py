@@ -527,7 +527,7 @@ except ImportError:
 
 STATIC_FOLDER = Path("/app/static")
 
-HLS_FOLDER = Path("/app/static/hls")
+HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).parent / "static" / "hls") if os.name == "nt" else "/app/static/hls"))
 
 HLS_URL_PREFIX = "/static/hls"
 
@@ -16471,6 +16471,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
+        "-hls_segment_filename", str(HLS_FOLDER / f"camera{camera_number}_%09d.ts"),
         output_file,
 
 
@@ -47845,7 +47846,7 @@ register_appliance_cloud_routes(app, page_shell, current_user)
 # appliance-commands fix already established for this codebase.
 register_notification_settings_routes(app, page_shell)
 register_partner_workspace_routes(app, page_shell)
-register_live_playlist_routes(app)
+register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
 register_talk_session_routes(app)
