@@ -31,6 +31,9 @@ foreach ($forbidden in @('InstallAllUsers=', 'python-3.12.10-amd64.exe', '/unins
 foreach ($signingText in @('SignTool=AnyAiCamSign', 'SignedUninstaller=yes', 'SignedUninstallerDir=', 'Get-AuthenticodeSignature', 'ANYAICAM_TIMESTAMP_URL')) {
     if (-not ((Get-Content -Raw (Join-Path $root 'installer\windows\AnyAiCam-VMS.iss')) + (Get-Content -Raw (Join-Path $root 'installer\windows\build.ps1'))).Contains($signingText)) { throw "Signing support is missing $signingText" }
 }
+foreach ($azureSigningText in @('AzureSign', '/dlib', '/dmdf', 'timestamp.acs.microsoft.com')) {
+    if (-not (Get-Content -Raw (Join-Path $root 'installer\windows\build.ps1')).Contains($azureSigningText)) { throw "Azure signing support is missing $azureSigningText" }
+}
 $requirements = Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\requirements-windows.txt')
 foreach ($requiredPin in @('torch==2.5.1+cpu', 'torchvision==0.20.1+cpu', 'ultralytics==8.3.40')) {
     if (-not $requirements.Contains($requiredPin)) { throw "CPU AI manifest is missing $requiredPin" }

@@ -1,5 +1,6 @@
-param([switch]$Sign)
+param([switch]$Sign, [switch]$AzureSign)
 $ErrorActionPreference = 'Stop'
+if ($Sign -and $AzureSign) { throw 'Choose either certificate-store signing or Azure Artifact Signing.' }
 $iscc = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
 if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup compiler not found: $iscc" }
 $vendor = Join-Path $PSScriptRoot 'vendor'
@@ -29,16 +30,28 @@ if ($Sign) {
     $compilerArguments += '/DEnableSigning=1'
     $compilerArguments += '/SAnyAiCamSign=' + $signCommand
 }
+if ($AzureSign) {
+    $signTool = if ($env:ANYAICAM_SIGNTOOL_PATH) { $env:ANYAICAM_SIGNTOOL_PATH } else { 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe' }
+    $dlib = if ($env:ANYAICAM_AZURE_SIGNING_DLIB) { $env:ANYAICAM_AZURE_SIGNING_DLIB } else { Join-Path $env:LOCALAPPDATA 'Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll' }
+    $metadata = if ($env:ANYAICAM_AZURE_SIGNING_METADATA) { $env:ANYAICAM_AZURE_SIGNING_METADATA } else { 'C:\AnyAiCamSigning\metadata.json' }
+    $timestampUrl = if ($env:ANYAICAM_TIMESTAMP_URL) { $env:ANYAICAM_TIMESTAMP_URL } else { 'http://timestamp.acs.microsoft.com' }
+    foreach ($path in @($signTool, $dlib, $metadata)) { if (-not (Test-Path -LiteralPath $path)) { throw "Azure signing dependency not found: $path" } }
+    $signCommand = '$q' + $signTool + '$q sign /fd SHA256 /tr $q' + $timestampUrl + '$q /td SHA256 /dlib $q' + $dlib + '$q /dmdf $q' + $metadata + '$q $f'
+    $compilerArguments += '/DEnableSigning=1'
+    $compilerArguments += '/SAnyAiCamSign=' + $signCommand
+}
 $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
-if ($Sign) {
+if ($Sign -or $AzureSign) {
     $setup = Get-Item (Join-Path $PSScriptRoot 'output\AnyAiCam-VMS-Setup-0.1.3-ec5272f.exe')
     $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)
-    if ($signedUninstallers.Count -eq 0) { throw 'Inno Setup did not produce a cached signed uninstaller.' }
     foreach ($file in @($setup) + $signedUninstallers) {
         $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
-        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $thumbprint) { throw "Authenticode verification failed: $($file.FullName)" }
+        if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed: $($file.FullName)" }
+        if ($Sign -and $signature.SignerCertificate.Thumbprint -ne $thumbprint) { throw "Signer certificate mismatch: $($file.FullName)" }
+        & $signTool verify /pa /all $file.FullName | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "SignTool verification failed: $($file.FullName)" }
     }
     Write-Output "Verified Authenticode signatures on setup and $($signedUninstallers.Count) cached uninstaller(s)."
 }
