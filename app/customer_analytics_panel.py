@@ -40,6 +40,13 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     "people_counting": ("People Counting", ("people_counting",)),
     "lpr": ("LPR", ("lpr",)),
     "ppe": ("PPE", ("ppe",)),
+    # AAC (facial recognition / access-control), Phase 1: gated per-camera
+    # through this exact same camera_analytics_entitlements mechanism as
+    # every other analytic -- see facial_events.py's record_facial_events(),
+    # which refuses to run at all for a camera without an active
+    # 'facial_recognition' row here, and facial_people.py/facial_recognition_ui.py
+    # for enrollment/watchlist management.
+    "facial_recognition": ("AAC Facial Recognition", ("facial_recognition",)),
 }
 
 # Never show an empty bar: this pin exists so ANALYTIC_LABELS additions
@@ -212,6 +219,15 @@ UPGRADE_CARD_CONTENT: dict[str, dict] = {
             "Useful for job sites, warehouses, and industrial areas",
         ],
     },
+    "facial_recognition": {
+        "description": "Recognize enrolled people at this camera, flag watchlist matches, "
+                        "and log unknown faces.",
+        "benefits": [
+            "Match against enrolled employees/known visitors",
+            "Watchlist alerts for flagged individuals",
+            "Full facial-event history with confidence and thumbnails",
+        ],
+    },
 }
 
 
@@ -315,11 +331,40 @@ def summarize_smart_motion(events: list[dict]) -> dict:
     }
 
 
+def summarize_facial_recognition(events: list[dict]) -> dict:
+    """events: detection_events rows for event_type='facial_recognition'.
+    The richer per-match fields (matched person, watchlist state,
+    per-face thumbnail) live in facial_events.py's own dedicated table,
+    not detections_json -- this summary is only the same lightweight
+    "most recent activity" shape every other analytic pill shows;
+    the full Facial Events/Match detail screens (facial_recognition_ui.py)
+    are the real, complete view."""
+    if not events:
+        return {"latest_state": None, "latest_timestamp": None, "recent": []}
+    latest = events[0]
+    latest_detections = _parse_detections(latest.get("detections_json"))
+    recent = [
+        {
+            "state": _parse_detections(item.get("detections_json")).get("match_state"),
+            "person": _parse_detections(item.get("detections_json")).get("matched_person_name"),
+            "timestamp": item.get("event_timestamp"),
+            "confidence": item.get("confidence"),
+        }
+        for item in events[:10]
+    ]
+    return {
+        "latest_state": latest_detections.get("match_state"),
+        "latest_timestamp": latest.get("event_timestamp"),
+        "recent": recent,
+    }
+
+
 SUMMARIZERS = {
     "smart_motion": summarize_smart_motion,
     "people_counting": summarize_people_counting,
     "lpr": summarize_lpr,
     "ppe": summarize_ppe,
+    "facial_recognition": summarize_facial_recognition,
 }
 
 

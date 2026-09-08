@@ -37692,6 +37692,38 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
                 append_analytics_event(ppe_event)
                 saved_events.append(ppe_event)
+        # AAC (facial recognition / access-control analytics), Phase 1.
+        # Same shape as the PPE hook directly above: a person's own crop
+        # in, event(s) out -- but AAC events are written straight into
+        # detection_events/facial_events via facial_events.py (see that
+        # module's own docstring for why, unlike PPE/LPR, this does NOT
+        # go through append_analytics_event()/analytics_sync.py), so
+        # this hook opens its own short-lived database_backend.connect()
+        # rather than building a local-JSON event dict. relay_provider is
+        # deliberately omitted (defaults to None inside
+        # record_facial_events(), which then skips access-rule/relay
+        # evaluation entirely) -- Phase 1 records facial match history
+        # only; wiring a live relay provider into this hot detection path
+        # is explicitly future work (see the Phase 1 report), not
+        # something this hook does implicitly.
+        if class_name == "person" and facial_recognition.is_camera_enabled(camera_number):
+            for person_detection in class_detections:
+                try:
+                    fx, fy, fw, fh = (
+                        person_detection["x"],
+                        person_detection["y"],
+                        person_detection["width"],
+                        person_detection["height"],
+                    )
+                    person_crop_for_aac = frame[fy : fy + fh, fx : fx + fw]
+                    from database_backend import connect as aac_connect
+
+                    with aac_connect() as aac_db:
+                        facial_events.record_facial_events(
+                            aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now
+                        )
+                except Exception as error:
+                    print(f"Camera {camera_number} AAC facial recognition skipped (non-fatal): {error}")
         if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number):
             for vehicle_detection in class_detections:
                 try:
@@ -39251,6 +39283,8 @@ import lpr
 import ppe
 import smart_motion
 import people_counting
+import facial_events
+import facial_recognition
 
 
 @asynccontextmanager
@@ -47192,6 +47226,7 @@ from live_view_sessions import register_live_view_session_routes
 from live_view_page import register_live_view_page_routes
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
+from facial_recognition_ui import register_facial_recognition_routes
 
 
 
@@ -47315,6 +47350,7 @@ register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
 register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
+register_facial_recognition_routes(app, page_shell)
 
 
 
