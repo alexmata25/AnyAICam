@@ -4,14 +4,9 @@ main.py), locates a candidate plate region inside that vehicle's own
 crop and reads its text -- purely local, purely offline, no network
 calls and no third-party service.
 
-Deliberately dependency-light in the same sense camera_mapping.py and
-smart_motion.py are: no import of `main`, so this module (and its
-tests) stay free of main.py's own test-discovery-order fragility. It
-does import cv2 and pytesseract, both already real dependencies of
-this project (opencv-python already ships the Haar cascade this module
-uses at cv2.data.haarcascades -- no new model file, no download, no
-external asset); pytesseract wraps the tesseract-ocr engine, installed
-via the Dockerfile, entirely local.
+The OCR dependency is optional and loaded only when enabled LPR is
+actually invoked.  Core VMS startup must not depend on either the
+``pytesseract`` package or the Tesseract executable.
 
 Every public function is exception-safe by design (returns None on any
 failure) -- a plate that can't be found or read must never interrupt
@@ -23,9 +18,8 @@ import re
 import time
 
 import cv2
-import pytesseract
 
-LPR_ENABLED = os.environ.get("ANYAICAM_LPR_ENABLED", "true").strip().lower() == "true"
+LPR_ENABLED = os.environ.get("ANYAICAM_LPR_ENABLED", "false").strip().lower() == "true"
 
 _DEFAULT_VEHICLE_CLASSES = "car,truck,bus"
 LPR_VEHICLE_CLASSES = frozenset(
@@ -50,6 +44,39 @@ _PLATE_CHAR_WHITELIST = re.compile(r"[^A-Z0-9]")
 
 _cascade = None
 _cascade_load_failed = False
+_pytesseract = None
+_ocr_load_attempted = False
+_ocr_unavailable_reason = None
+
+
+def _get_pytesseract():
+    """Load and validate the optional local OCR adapter on first use."""
+    global _pytesseract, _ocr_load_attempted, _ocr_unavailable_reason
+    if _ocr_load_attempted:
+        return _pytesseract
+    _ocr_load_attempted = True
+    try:
+        import pytesseract as adapter
+
+        adapter.get_tesseract_version()
+        _pytesseract = adapter
+        _ocr_unavailable_reason = None
+    except Exception as error:
+        _pytesseract = None
+        _ocr_unavailable_reason = str(error) or error.__class__.__name__
+    return _pytesseract
+
+
+def capability() -> dict:
+    """Return an explicit, non-throwing LPR capability state."""
+    if not LPR_ENABLED:
+        return {"enabled": False, "available": False, "reason": "LPR is disabled"}
+    available = _get_pytesseract() is not None
+    return {
+        "enabled": True,
+        "available": available,
+        "reason": None if available else f"LPR unavailable: {_ocr_unavailable_reason}",
+    }
 
 
 def _get_cascade():
@@ -75,9 +102,12 @@ def _get_cascade():
 def reset_state() -> None:
     """Test-only: clears the lazy-loaded cascade singleton so tests can
     exercise both the loaded and not-yet-loaded paths independently."""
-    global _cascade, _cascade_load_failed
+    global _cascade, _cascade_load_failed, _pytesseract, _ocr_load_attempted, _ocr_unavailable_reason
     _cascade = None
     _cascade_load_failed = False
+    _pytesseract = None
+    _ocr_load_attempted = False
+    _ocr_unavailable_reason = None
 
 
 def normalize_plate_text(raw: str) -> str:
@@ -124,7 +154,10 @@ def read_plate_text(plate_crop_bgr):
     (normalized_text, confidence) or None -- never raises; any
     tesseract/opencv failure or an implausible/low-confidence read is
     treated the same as "no plate found", not an error."""
-    if plate_crop_bgr is None or plate_crop_bgr.size == 0:
+    if not LPR_ENABLED or plate_crop_bgr is None or plate_crop_bgr.size == 0:
+        return None
+    adapter = _get_pytesseract()
+    if adapter is None:
         return None
     try:
         gray = cv2.cvtColor(plate_crop_bgr, cv2.COLOR_BGR2GRAY)
@@ -135,8 +168,8 @@ def read_plate_text(plate_crop_bgr):
         scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         _, thresholded = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         config = "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        data = pytesseract.image_to_data(
-            thresholded, config=config, output_type=pytesseract.Output.DICT
+        data = adapter.image_to_data(
+            thresholded, config=config, output_type=adapter.Output.DICT
         )
     except Exception:
         return None
