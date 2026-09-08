@@ -31,18 +31,41 @@ from __future__ import annotations
 
 import base64
 import binascii
+import html
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 import facial_events
 import facial_people
 import facial_recognition
 from customer_policy import same_customer
 from partner_db import allowed, audit, connection
+
+# Every id this module ever builds a filesystem path out of -- customer_id
+# (client-supplied for staff roles; see _resolve_customer_id()), plus our
+# own server-generated person_id/embedding_id -- must pass this check
+# before touching the filesystem. In practice facial_people.enroll_person()
+# already refuses a customer_id that doesn't exist in `customers` (a real
+# foreign-key constraint, enforced on both SQLite and PostgreSQL), which
+# transitively blocks a path-traversal payload from ever reaching
+# _save_face_crop() today -- but that protection is implicit and backend-
+# dependent, not something this module asserts for itself. This is the
+# explicit, local, defense-in-depth check: reject anything containing a
+# path separator or a `..` segment before it can become part of a path,
+# so a future change elsewhere (a relaxed FK, a different backend, a new
+# caller) can never turn this into a path-traversal write.
+_SAFE_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _require_safe_path_segment(value: str, *, field: str) -> str:
+    if not value or not _SAFE_PATH_SEGMENT.match(value):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}.")
+    return value
 
 
 def _resolve_customer_id(identity: dict, requested: str | None) -> str:
@@ -58,10 +81,17 @@ def _resolve_customer_id(identity: dict, requested: str | None) -> str:
         own = identity.get("customer_id")
         if not own or (requested and not same_customer(requested, own)):
             raise HTTPException(status_code=403, detail="You are not authorized for that customer.")
-        return own
+        return _require_safe_path_segment(own, field="customer_id")
     if not requested:
         raise HTTPException(status_code=400, detail="customer_id is required.")
-    return requested
+    # Validated here, once, for every caller (not only the enrollment-image
+    # upload path that actually touches the filesystem) -- every real
+    # customer_id in this codebase is a secrets.token_hex()/simple slug
+    # value (see customer_registration.py), so this never rejects a
+    # legitimate id; it exists purely to make a path-traversal payload
+    # (e.g. "../../etc") fail fast, here, before it can reach any query
+    # or, later, any filesystem path built from this value.
+    return _require_safe_path_segment(requested, field="customer_id")
 
 
 def _require(request: Request, permission: str) -> dict:
@@ -100,9 +130,18 @@ def _decode_image(image_base64: str):
 def _save_face_crop(image_bgr, observation, *, customer_id: str, person_id: str, embedding_id: str) -> str:
     import cv2
 
-    folder = facial_people.AAC_FACES_FOLDER / customer_id / person_id
+    # customer_id was already validated in _resolve_customer_id(); person_id
+    # and embedding_id are re-validated here too, even though both are
+    # always this module's own secrets.token_hex()-based ids by the time
+    # this function runs (add_reference_image() already required person_id
+    # to resolve to a real row before this is ever called) -- see this
+    # module's own _require_safe_path_segment() docstring for why that
+    # transitive protection alone isn't treated as sufficient here.
+    safe_person_id = _require_safe_path_segment(person_id, field="person_id")
+    safe_embedding_id = _require_safe_path_segment(embedding_id, field="embedding_id")
+    folder = facial_people.AAC_FACES_FOLDER / customer_id / safe_person_id
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{embedding_id}.jpg"
+    path = folder / f"{safe_embedding_id}.jpg"
     crop = image_bgr[
         observation.bbox.y : observation.bbox.y + observation.bbox.height,
         observation.bbox.x : observation.bbox.x + observation.bbox.width,
@@ -407,6 +446,7 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
 <label>Search<input id="aac-search"></label><button class="ghost-button" id="aac-refresh">Refresh</button></section>
 <section class="panel" id="aac-people-list"><p class="health-detail">Enter a customer id and refresh.</p></section>'''
         scripts = '''<script>
+function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function aacLoadPeople(){
   const customerId=document.getElementById('aac-customer-id').value.trim();
   const search=document.getElementById('aac-search').value.trim();
@@ -418,8 +458,13 @@ async function aacLoadPeople(){
   if(!response.ok){box.innerHTML='<p class="health-detail">Unable to load people.</p>';return;}
   const data=await response.json();
   if(!data.people.length){box.innerHTML='<p class="empty">No enrolled people yet.</p>';return;}
+  // display_name/external_reference are free text a 'facial.manage' user
+  // chose (enroll_person()/update_person() accept any string) -- every
+  // value below is HTML-escaped before it reaches innerHTML so a
+  // maliciously-crafted name can never execute as markup/script in
+  // another user's (e.g. an administrator's) browser session.
   box.innerHTML='<table class="data-table"><thead><tr><th>Name</th><th>Reference</th><th>Status</th><th></th></tr></thead><tbody>'+
-    data.people.map(p=>`<tr><td><a href="/aac/people/enroll?person_id=${p.id}&customer_id=${customerId}">${p.display_name}</a></td><td>${p.external_reference||''}</td><td>${p.status}</td>
+    data.people.map(p=>`<tr><td><a href="/aac/people/enroll?person_id=${encodeURIComponent(p.id)}&customer_id=${encodeURIComponent(customerId)}">${aacEsc(p.display_name)}</a></td><td>${aacEsc(p.external_reference||'')}</td><td>${aacEsc(p.status)}</td>
     <td><button class="ghost-button" onclick="aacDeletePerson('${p.id}','${customerId}')">Delete</button></td></tr>`).join('')+'</tbody></table>';
 }
 async function aacDeletePerson(personId,customerId){
@@ -487,14 +532,17 @@ document.getElementById('e-upload').addEventListener('click',async()=>{
 <button class="action-button" id="w-create">Create watchlist</button></section>
 <section class="panel" id="w-list"></section>'''
         scripts = '''<script>
+function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function wLoad(){
   const customerId=document.getElementById('w-customer-id').value.trim();
   if(!customerId)return;
-  const response=await fetch('/api/aac/watchlists?customer_id='+customerId);
+  const response=await fetch('/api/aac/watchlists?customer_id='+encodeURIComponent(customerId));
   const box=document.getElementById('w-list');
   if(!response.ok){box.innerHTML='';return;}
   const data=await response.json();
-  box.innerHTML=data.watchlists.map(w=>`<div class="panel"><strong>${w.name}</strong> (${w.classification})
+  // w.name is free text a 'facial.manage' user chose -- escaped before
+  // reaching innerHTML (see aac_people_page's own comment on this).
+  box.innerHTML=data.watchlists.map(w=>`<div class="panel"><strong>${aacEsc(w.name)}</strong> (${aacEsc(w.classification)})
     <button class="ghost-button" onclick="wDelete('${w.id}','${customerId}')">Delete</button></div>`).join('')||'<p class="empty">No watchlists yet.</p>';
 }
 async function wDelete(id,customerId){await fetch(`/api/aac/watchlists/${id}?customer_id=${customerId}`,{method:'DELETE'});wLoad();}
@@ -516,6 +564,7 @@ document.getElementById('w-customer-id').addEventListener('change',wLoad);
 <button class="ghost-button" id="ev-refresh">Refresh</button></section>
 <section class="panel" id="ev-list"></section>'''
         scripts = '''<script>
+function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 document.getElementById('ev-refresh').addEventListener('click',async()=>{
   const customerId=document.getElementById('ev-customer-id').value.trim();
   if(!customerId)return;
@@ -526,31 +575,61 @@ document.getElementById('ev-refresh').addEventListener('click',async()=>{
   const box=document.getElementById('ev-list');
   if(!response.ok){box.innerHTML='';return;}
   const data=await response.json();
+  // matched_person_name is a denormalized snapshot of a display_name a
+  // 'facial.manage' user chose -- escaped before reaching innerHTML (see
+  // aac_people_page's own comment on this).
   box.innerHTML='<table class="data-table"><thead><tr><th>Time</th><th>Camera</th><th>State</th><th>Person</th><th>Confidence</th></tr></thead><tbody>'+
-    data.events.map(e=>`<tr><td><a href="/aac/events/${e.id}?customer_id=${customerId}">${e.event_timestamp}</a></td><td>${e.camera_id}</td><td>${e.match_state}</td><td>${e.matched_person_name||'—'}</td><td>${e.confidence}</td></tr>`).join('')+'</tbody></table>';
+    data.events.map(e=>`<tr><td><a href="/aac/events/${encodeURIComponent(e.id)}?customer_id=${encodeURIComponent(customerId)}">${aacEsc(e.event_timestamp)}</a></td><td>${aacEsc(e.camera_id)}</td><td>${aacEsc(e.match_state)}</td><td>${aacEsc(e.matched_person_name||'—')}</td><td>${aacEsc(e.confidence)}</td></tr>`).join('')+'</tbody></table>';
 });
 </script>'''
         return _page(request, "AAC Facial events", content, scripts)
 
+    @app.get("/api/aac/events/{event_id}/thumbnail")
+    def aac_event_thumbnail(request: Request, event_id: str, customer_id: str | None = None):
+        identity = _require(request, "facial.view")
+        resolved = _resolve_customer_id(identity, customer_id)
+        with connection() as db:
+            event = facial_events.get_event_detail(db, customer_id=resolved, event_id=event_id)
+        # The path is read only from this already-tenant-scoped DB row --
+        # never from any client-supplied path -- so there is no path-
+        # traversal surface here regardless of what event_id looks like:
+        # a caller can, at most, select WHICH of their own tenant's
+        # already-recorded thumbnail paths gets served, never an
+        # arbitrary filesystem path of their own choosing.
+        path = Path(event["face_thumbnail_path"]) if event and event.get("face_thumbnail_path") else None
+        if path is None or not path.is_file():
+            raise HTTPException(status_code=404, detail="Thumbnail not found.")
+        return FileResponse(str(path), media_type="image/jpeg")
+
     @app.get("/aac/events/{event_id}", response_class=HTMLResponse)
     def aac_event_detail_page(request: Request, event_id: str):
+        # event_id is a raw URL path segment -- HTML-escaped here (server
+        # side, before it ever reaches the response body) so a crafted
+        # URL cannot break out of the data-event-id attribute.
         content = f'''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Match detail</h1></div></header>
-<section class="panel" id="d-detail" data-event-id="{event_id}"></section>'''
+<section class="panel" id="d-detail" data-event-id="{html.escape(event_id)}"></section>'''
         scripts = '''<script>
+function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 (async()=>{
   const box=document.getElementById('d-detail');
   const eventId=box.dataset.eventId;
   const customerId=new URLSearchParams(location.search).get('customer_id')||'';
-  const response=await fetch(`/api/aac/events/${eventId}?customer_id=${customerId}`);
+  const response=await fetch(`/api/aac/events/${encodeURIComponent(eventId)}?customer_id=${encodeURIComponent(customerId)}`);
   if(!response.ok){box.innerHTML='<p class="health-detail">Event not found.</p>';return;}
   const e=await response.json();
-  box.innerHTML=`<div class="health-row"><span>Time</span><strong>${e.event_timestamp}</strong></div>
-  <div class="health-row"><span>Camera</span><strong>${e.camera_id}</strong></div>
-  <div class="health-row"><span>State</span><strong>${e.match_state}</strong></div>
-  <div class="health-row"><span>Matched person</span><strong>${e.matched_person_name||'—'}</strong></div>
-  <div class="health-row"><span>Watchlist</span><strong>${e.matched_watchlist_name||'—'}</strong></div>
-  <div class="health-row"><span>Confidence</span><strong>${e.confidence}</strong></div>
-  <div class="health-row"><span>Engine</span><strong>${e.engine}</strong></div>`;
+  // matched_person_name/matched_watchlist_name are denormalized snapshots
+  // of free text a 'facial.manage' user chose -- escaped before reaching
+  // innerHTML (see aac_people_page's own comment on this). The thumbnail
+  // <img> below is intentionally allowed to fail silently (onerror hides
+  // it) -- not every event has one yet (e.g. no face crop could be saved).
+  box.innerHTML=`<img src="/api/aac/events/${encodeURIComponent(eventId)}/thumbnail?customer_id=${encodeURIComponent(customerId)}" alt="Face thumbnail" style="max-width:200px;border-radius:8px;display:block;margin-bottom:12px" onerror="this.style.display='none'">
+  <div class="health-row"><span>Time</span><strong>${aacEsc(e.event_timestamp)}</strong></div>
+  <div class="health-row"><span>Camera</span><strong>${aacEsc(e.camera_id)}</strong></div>
+  <div class="health-row"><span>State</span><strong>${aacEsc(e.match_state)}</strong></div>
+  <div class="health-row"><span>Matched person</span><strong>${aacEsc(e.matched_person_name||'—')}</strong></div>
+  <div class="health-row"><span>Watchlist</span><strong>${aacEsc(e.matched_watchlist_name||'—')}</strong></div>
+  <div class="health-row"><span>Confidence</span><strong>${aacEsc(e.confidence)}</strong></div>
+  <div class="health-row"><span>Engine</span><strong>${aacEsc(e.engine)}</strong></div>`;
 })();
 </script>'''
         return _page(request, "AAC Match detail", content, scripts)

@@ -78,20 +78,29 @@ class _EmbeddingCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, str], tuple[float, list, frozenset]] = {}
+        self._entries: dict[tuple[str, str, str], tuple[float, list, frozenset]] = {}
 
     def reset(self) -> None:
         with self._lock:
             self._entries.clear()
 
-    def get(self, db, *, customer_id: str, engine: str) -> tuple[list, frozenset]:
-        key = (customer_id, engine)
+    def get(self, db, *, customer_id: str, engine: str, engine_version: str) -> tuple[list, frozenset]:
+        # Keyed by (customer_id, engine, engine_version): a cached set
+        # loaded under one embedding-format version must never be
+        # handed back once the running engine's version changes (e.g.
+        # a deploy that upgrades embed_face_crop()) -- see
+        # facial_recognition.match_face()'s own engine_version guard for
+        # why comparing across versions is a correctness issue, not
+        # just a cache-staleness one.
+        key = (customer_id, engine, engine_version)
         now = time.monotonic()
         with self._lock:
             cached = self._entries.get(key)
             if cached is not None and (now - cached[0]) < EMBEDDING_CACHE_TTL_SECONDS:
                 return cached[1], cached[2]
-        embeddings = facial_people.enrolled_embeddings_for_matching(db, customer_id=customer_id, engine=engine)
+        embeddings = facial_people.enrolled_embeddings_for_matching(
+            db, customer_id=customer_id, engine=engine, engine_version=engine_version
+        )
         watchlisted = facial_people.watchlisted_person_ids(db, customer_id=customer_id)
         with self._lock:
             self._entries[key] = (now, embeddings, watchlisted)
@@ -153,6 +162,7 @@ def create_match_event(
     matched_watchlist: dict | None,
     confidence: float,
     engine: str,
+    engine_version: str,
     face_bbox: dict | None,
     face_thumbnail_path: str | None,
     now,
@@ -185,8 +195,8 @@ def create_match_event(
         ),
     )
     db.execute(
-        "INSERT INTO facial_events(id,detection_event_id,customer_id,site_id,camera_id,match_state,matched_person_id,matched_person_name,matched_watchlist_id,matched_watchlist_name,confidence,engine,face_bbox_json,face_thumbnail_path,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO facial_events(id,detection_event_id,customer_id,site_id,camera_id,match_state,matched_person_id,matched_person_name,matched_watchlist_id,matched_watchlist_name,confidence,engine,engine_version,face_bbox_json,face_thumbnail_path,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             event_id,
             detection_event_id,
@@ -200,6 +210,7 @@ def create_match_event(
             (matched_watchlist or {}).get("name"),
             round(float(confidence), 4),
             engine,
+            engine_version,
             json.dumps(face_bbox) if face_bbox else None,
             face_thumbnail_path,
             timestamp,
@@ -218,6 +229,7 @@ def create_match_event(
         "matched_watchlist_name": (matched_watchlist or {}).get("name"),
         "confidence": round(float(confidence), 4),
         "engine": engine,
+        "engine_version": engine_version,
         "created_at": timestamp,
     }
 
@@ -319,10 +331,15 @@ def record_facial_events(
     if not observations:
         return []
     engine = observations[0].engine
-    enrolled, watchlisted = _embedding_cache.get(db, customer_id=context["customer_id"], engine=engine)
+    engine_version = observations[0].engine_version
+    enrolled, watchlisted = _embedding_cache.get(
+        db, customer_id=context["customer_id"], engine=engine, engine_version=engine_version
+    )
     created: list[dict] = []
     for observation in observations:
-        candidate = facial_recognition.match_face(observation.embedding, enrolled, engine=engine)
+        candidate = facial_recognition.match_face(
+            observation.embedding, enrolled, engine=engine, engine_version=observation.engine_version
+        )
         match_state, accepted = facial_recognition.classify_match(
             candidate, threshold=settings["min_confidence"], watchlist_person_ids=watchlisted
         )
@@ -382,6 +399,7 @@ def record_facial_events(
             matched_watchlist=matched_watchlist,
             confidence=confidence,
             engine=engine,
+            engine_version=observation.engine_version,
             face_bbox={
                 "x": observation.bbox.x,
                 "y": observation.bbox.y,

@@ -143,15 +143,25 @@ class HaarEmbeddingFaceEngine(FaceEngine):
 
     Embedding: a deterministic, CPU-only feature vector over the face
     crop (resize to a fixed size, grayscale, histogram-equalize to
-    reduce lighting sensitivity, flatten, L2-normalize). This is a
-    classical baseline, not a deep embedding -- it captures real facial
-    structure well enough to distinguish clearly different people in
-    good conditions, but is not claimed to match production deep-
-    learning face recognition accuracy. See this module's own docstring.
+    reduce lighting sensitivity, mean-center, flatten, L2-normalize).
+    This is a classical baseline, not a deep embedding -- it captures
+    real facial structure well enough to distinguish clearly different
+    people in good conditions, but is not claimed to match production
+    deep-learning face recognition accuracy. See this module's own
+    docstring, and test_facial_recognition_engine_limits.py for
+    quantified lighting/pose/scale sensitivity measurements.
+
+    version="2": embed_face_crop() mean-centers before normalizing (see
+    that function's own docstring for why version 1's uncentered cosine
+    similarity was measurably less discriminative). Embeddings are only
+    ever compared within the same (engine, engine_version) pair -- see
+    match_face() -- so this bump is what correctly stops a stored
+    version-1 embedding from ever being silently compared against a
+    version-2 query embedding as if they were compatible.
     """
 
     name = "haar_intensity"
-    version = "1"
+    version = "2"
 
     def __init__(self) -> None:
         self._cascade = None
@@ -207,7 +217,21 @@ def embed_face_crop(face_crop_bgr) -> tuple[float, ...] | None:
     out from HaarEmbeddingFaceEngine.embed() so embedding math is
     directly unit-testable with any synthetic image -- it never depends
     on the Haar cascade succeeding, matching lpr.py's own separation of
-    "find the region" from "read what's in it"."""
+    "find the region" from "read what's in it".
+
+    Mean-centered before L2-normalizing (version 2 of this embedding --
+    see HaarEmbeddingFaceEngine.version): cosine similarity on a raw,
+    un-centered intensity vector is dominated by overall mean
+    brightness, not spatial shape -- empirically (see
+    test_facial_recognition_engine_limits.py's own review-driven
+    measurements), two CLEARLY different synthetic images scored ~0.85
+    similarity under the uncentered (version 1) formula, purely because
+    both had a broadly similar average brightness. Subtracting the
+    crop's own mean before normalizing removes that brightness-driven
+    baseline and leaves cosine similarity measuring shape/structure, as
+    intended -- it does not fix the engine's still-real pose/rotation
+    sensitivity (see that same test file), which requires an actual
+    alignment step, not a normalization change."""
     if face_crop_bgr is None or getattr(face_crop_bgr, "size", 0) == 0:
         return None
     try:
@@ -217,10 +241,11 @@ def embed_face_crop(face_crop_bgr) -> tuple[float, ...] | None:
     except Exception:
         return None
     vector = equalized.astype(np.float64).flatten()
-    norm = float(np.linalg.norm(vector))
+    centered = vector - vector.mean()
+    norm = float(np.linalg.norm(centered))
     if norm == 0.0:
         return None
-    unit = vector / norm
+    unit = centered / norm
     return tuple(round(float(value), 8) for value in unit)
 
 
@@ -345,6 +370,7 @@ class EnrolledEmbedding:
     person_id: str
     embedding: tuple[float, ...]
     engine: str
+    engine_version: str = ""
 
 
 @dataclass(frozen=True)
@@ -353,7 +379,13 @@ class MatchCandidate:
     similarity: float
 
 
-def match_face(embedding: tuple[float, ...], enrolled: list[EnrolledEmbedding], *, engine: str) -> MatchCandidate | None:
+def match_face(
+    embedding: tuple[float, ...],
+    enrolled: list[EnrolledEmbedding],
+    *,
+    engine: str,
+    engine_version: str = "",
+) -> MatchCandidate | None:
     """Best-scoring enrolled person for this embedding, or None if
     `enrolled` is empty. A person can have multiple reference
     embeddings (facial_people.py supports multiple enrollment images
@@ -361,15 +393,22 @@ def match_face(embedding: tuple[float, ...], enrolled: list[EnrolledEmbedding], 
     not an average, since one clean reference image outscoring several
     poor ones is the correct signal, not noise to be diluted.
 
-    Embeddings produced by a DIFFERENT engine than the one given here
-    are silently excluded, never compared -- a Haar-intensity embedding
-    and a future deep-model embedding live in unrelated vector spaces;
-    comparing them would produce a meaningless similarity score that
-    could look confident while being pure noise. This is a correctness
-    guard, not an optimization."""
+    Embeddings produced by a DIFFERENT engine, OR a different VERSION of
+    the same engine, are silently excluded, never compared -- a
+    Haar-intensity embedding and a future deep-model embedding live in
+    unrelated vector spaces, and (the reason engine_version is checked
+    too, not only engine) two versions of the SAME formula can just as
+    easily be incompatible: embed_face_crop()'s own version bump from
+    "1" to "2" (mean-centering added) is exactly this case -- comparing
+    a stored v1 embedding against a v2 query embedding would produce a
+    similarity score with no more meaning than any other engine
+    mismatch. `engine_version=""` (the default) matches only enrolled
+    rows that also have no recorded version, which is never true for a
+    real embedding produced by this module -- callers should always
+    pass the real version they're matching with."""
     best: MatchCandidate | None = None
     for candidate in enrolled:
-        if candidate.engine != engine:
+        if candidate.engine != engine or candidate.engine_version != engine_version:
             continue
         similarity = cosine_similarity(embedding, candidate.embedding)
         if best is None or similarity > best.similarity:

@@ -151,7 +151,7 @@ def test_enrolled_embeddings_for_matching_excludes_disabled_people(db):
     facial_people.update_person(db, customer_id="cust-1", person_id=disabled, status="disabled", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=active, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=disabled, embedding=(0.0, 1.0), engine="haar_intensity", engine_version="1", now=NOW)
-    enrolled = facial_people.enrolled_embeddings_for_matching(db, customer_id="cust-1", engine="haar_intensity")
+    enrolled = facial_people.enrolled_embeddings_for_matching(db, customer_id="cust-1", engine="haar_intensity", engine_version="1")
     assert [e.person_id for e in enrolled] == [active]
 
 
@@ -164,7 +164,7 @@ def test_enrolled_embeddings_for_matching_never_crosses_tenants(db):
     person_2 = facial_people.enroll_person(db, customer_id="cust-2", display_name="Mallory", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_1, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-2", person_id=person_2, embedding=(0.0, 1.0), engine="haar_intensity", engine_version="1", now=NOW)
-    enrolled = facial_people.enrolled_embeddings_for_matching(db, customer_id="cust-1", engine="haar_intensity")
+    enrolled = facial_people.enrolled_embeddings_for_matching(db, customer_id="cust-1", engine="haar_intensity", engine_version="1")
     assert [e.person_id for e in enrolled] == [person_1]
 
 

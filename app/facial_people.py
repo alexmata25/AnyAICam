@@ -237,23 +237,37 @@ def delete_reference_image(db, *, customer_id: str, person_id: str, embedding_id
     return True
 
 
-def enrolled_embeddings_for_matching(db, *, customer_id: str, engine: str):
+def enrolled_embeddings_for_matching(db, *, customer_id: str, engine: str, engine_version: str):
     """Every active person's embeddings for this customer, in the shape
     facial_recognition.match_face() consumes. Never returns embeddings
     for a disabled person (status != 'active') or for any other
     customer_id -- this is the query facial_events.py's in-memory match
     cache refreshes from, and is the one point that must never leak
-    another tenant's biometric data into a live matching pass."""
+    another tenant's biometric data into a live matching pass.
+
+    Also scoped by engine_version, not just engine: a stored embedding
+    from an older version of the same engine formula (e.g. before
+    embed_face_crop()'s mean-centering was added) is excluded here, at
+    the query itself, on top of match_face()'s own independent
+    engine_version check -- an enrolled person whose only reference
+    images predate an embedding-format change simply has no usable
+    embeddings until re-enrolled, rather than being silently compared
+    against a query embedding from an incompatible formula."""
     from facial_recognition import EnrolledEmbedding
 
     rows = db.execute(
         "SELECT fe.person_id AS person_id, fe.embedding_json AS embedding_json "
         "FROM facial_embeddings fe JOIN facial_people fp ON fp.id=fe.person_id "
-        "WHERE fe.customer_id=? AND fe.engine=? AND fp.customer_id=? AND fp.status='active'",
-        (customer_id, engine, customer_id),
+        "WHERE fe.customer_id=? AND fe.engine=? AND fe.engine_version=? AND fp.customer_id=? AND fp.status='active'",
+        (customer_id, engine, engine_version, customer_id),
     ).fetchall()
     return [
-        EnrolledEmbedding(person_id=row["person_id"], embedding=tuple(json.loads(row["embedding_json"])), engine=engine)
+        EnrolledEmbedding(
+            person_id=row["person_id"],
+            embedding=tuple(json.loads(row["embedding_json"])),
+            engine=engine,
+            engine_version=engine_version,
+        )
         for row in rows
     ]
 

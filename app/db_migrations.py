@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS facial_events(
     matched_watchlist_name TEXT,
     confidence REAL NOT NULL,
     engine TEXT NOT NULL,
+    engine_version TEXT,
     face_bbox_json TEXT,
     face_thumbnail_path TEXT,
     created_at TEXT NOT NULL,
