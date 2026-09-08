@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from pricing_config import calculate_partner_quote, load_pricing, public_pricing, save_pricing
-from partner_db import authenticate_detailed, audit, allowed, connection, password_hash
+from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
@@ -124,6 +124,41 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
     @app.get('/api/public-pricing')
     def public_prices() -> dict:
         return public_pricing()
+
+    def setup_available():
+        if settings.runtime_role not in {'edge', 'combined'}:
+            raise HTTPException(status_code=404)
+        with connection() as db:
+            if db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None:
+                raise HTTPException(status_code=404)
+
+    @app.get('/first-admin-setup', response_class=HTMLResponse)
+    def first_admin_setup(request: Request):
+        setup_available()
+        content = '<h1>Create the administrator account</h1><form id="first-admin-form"><label>Email<input name="email" type="email" required></label><label>Password<input name="password" type="password" minlength="12" required></label><label>Confirm password<input name="confirm" type="password" minlength="12" required></label><button>Create account</button><p role="status" id="setup-status"></p></form>'
+        scripts = """<script>document.getElementById('first-admin-form').addEventListener('submit',async event=>{
+          event.preventDefault();const form=event.currentTarget, status=document.getElementById('setup-status');
+          if(form.elements.password.value!==form.elements.confirm.value){status.textContent='Passwords do not match.';return;}
+          const csrf=document.cookie.split('; ').find(c=>c.startsWith('anyaicam_csrf='));
+          try{const response=await fetch('/api/first-admin-setup',{method:'POST',credentials:'same-origin',
+            headers:{'Content-Type':'application/json','X-CSRF-Token':csrf?decodeURIComponent(csrf.substring(14)):''},
+            body:JSON.stringify({email:form.elements.email.value,password:form.elements.password.value})});
+            const payload=await response.json();if(!response.ok){status.textContent=payload.detail||'Setup failed.';return;}
+            form.reset();location.href='/partner.html';
+          }catch(error){status.textContent='Unable to connect. Try again.';}
+        });</script>"""
+        return shell('First-time setup','partner-login',content,scripts)
+
+    @app.post('/api/first-admin-setup')
+    def first_admin_submit(payload: dict):
+        setup_available()
+        try:
+            user_id=create_first_admin(str(payload.get('email','')),str(payload.get('password','')))
+        except ValueError as error:
+            raise HTTPException(status_code=400,detail=str(error)) from error
+        except FirstAdminAlreadyExists as error:
+            raise HTTPException(status_code=409,detail='An administrator account already exists.') from error
+        return {'message':'Administrator created. Sign in.', 'destination':'/partner.html'}
 
     @app.get('/partner-login', response_class=HTMLResponse)
     def partner_login(request: Request) -> str:

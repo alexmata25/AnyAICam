@@ -40968,6 +40968,10 @@ async def authentication_middleware(request: Request, call_next):
 
 
     path = request.url.path
+    # Exact paths only; handlers independently enforce deployment and empty DB.
+    if path in {'/first-admin-setup', '/api/first-admin-setup'}:
+        return await call_next(request)
+
 
 
 

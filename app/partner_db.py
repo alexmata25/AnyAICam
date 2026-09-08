@@ -247,29 +247,28 @@ class FirstAdminAlreadyExists(Exception):
 
 
 def create_first_admin(email: str, password: str) -> str:
-    """The interactive counterpart to bootstrap_admin() above: the
-    operator enters the email/password themselves, once, through the
-    browser (see partner_portal.py's /setup), instead of an operator
-    having to set ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD in the
-    server environment (which would otherwise be the ONLY way to seed
-    a first identity on a fresh edge appliance -- and would mean the
-    plaintext password sitting in a persistent env file, exactly what
-    this function exists to avoid). password_hash() runs immediately;
-    the plaintext is never written anywhere, not even transiently to a
-    file. The "does an admin already exist" check happens INSIDE this
-    same connection/transaction, immediately before the insert -- not
-    only at the caller's earlier GET-time check -- so this can never
-    create a second admin even under a race between two concurrent
-    attempts hitting the endpoint at once. Raises FirstAdminAlreadyExists
-    (never silently no-ops, and never overwrites anything) if any
-    partner_users row already exists. Returns the new user's id."""
-    now=datetime.now().isoformat(); partner_id='anyaicam-primary'
+    """Atomically create the initial administrator and its global identity grant."""
+    email = str(email).strip().lower()
+    if not email or '@' not in email or len(password) < 12:
+        raise ValueError('A valid email and a password of at least 12 characters are required.')
+    hashed = password_hash(password)
+    now = datetime.now().isoformat()
     with connection() as db:
+        # Serialize the empty-table check across processes, not only threads.
+        if backend() == 'sqlite':
+            db.execute('BEGIN IMMEDIATE')
+        else:
+            db.execute('LOCK TABLE partner_users IN EXCLUSIVE MODE')
         if db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None:
             raise FirstAdminAlreadyExists('An administrator account already exists.')
-        db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
-        user_id=secrets.token_hex(5)
-        db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
+        db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',
+                   ('anyaicam-primary','AnyAiCam','approved',REAL_SOURCE,now))
+        user_id = secrets.token_hex(16)
+        db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',
+                   (user_id,'anyaicam-primary',email,'Administrator','administrator',hashed,now))
+        from appliance_identity import create_grant
+        create_grant(db,user_id=user_id,role='administrator',scope_type='global',scope_id=None,
+                     granted_by='system:first_admin_setup',now=now)
     return user_id
 
 
