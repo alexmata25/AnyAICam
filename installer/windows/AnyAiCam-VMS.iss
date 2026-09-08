@@ -26,7 +26,7 @@ Name: "{commonappdata}\AnyAiCam\recordings"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\hls"; Flags: uninsneveruninstall
 Name: "{commonappdata}\AnyAiCam\logs"; Flags: uninsneveruninstall
 [Files]
-Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\app\*"; DestDir: "{app}\app"; Excludes: "tests\*,__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "requirements-windows.txt"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
@@ -37,13 +37,44 @@ Source: "vendor\python-3.12.10-amd64.exe"; DestDir: "{tmp}"; Flags: deleteafteri
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 [Run]
-Filename: "{tmp}\python-3.12.10-amd64.exe"; Parameters: "/quiet InstallAllUsers=1 TargetDir=""{app}\runtime\python"" Include_pip=1 Include_launcher=0 Include_test=0 PrependPath=0 Shortcuts=0"; StatusMsg: "Installing the private Python runtime..."; Flags: waituntilterminated
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\installer\install-runtime.ps1"" -InstallRoot ""{app}"" -DataRoot ""{commonappdata}\AnyAiCam"" -SourceCommit ""{#SourceCommit}"""; StatusMsg: "Installing AnyAiCam runtime dependencies..."; Flags: waituntilterminated
-Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "install"; StatusMsg: "Installing the AnyAiCam Windows service..."; Flags: runhidden waituntilterminated
-Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "start"; StatusMsg: "Starting the AnyAiCam Windows service..."; Flags: runhidden waituntilterminated
 Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: postinstall shellexec skipifsilent unchecked
 [UninstallRun]
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVMS"
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamVMS"
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}"
+
+[Code]
+procedure ExecRequired(const FileName, Parameters, Description: String);
+var ResultCode: Integer;
+begin
+  WizardForm.StatusLabel.Caption := Description;
+  if (not Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)) or (ResultCode <> 0) then
+    RaiseException(Description + ' failed with exit code ' + IntToStr(ResultCode) + '.');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  ServiceExecutable: String;
+begin
+  Result := '';
+  ServiceExecutable := ExpandConstant('{app}\service\AnyAiCamVMS.exe');
+  if FileExists(ServiceExecutable) then
+  begin
+    Exec(ServiceExecutable, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec(ServiceExecutable, 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    ExecRequired(ExpandConstant('{tmp}\python-3.12.10-amd64.exe'), '/quiet InstallAllUsers=1 TargetDir="' + ExpandConstant('{app}\runtime\python') + '" Include_pip=1 Include_launcher=0 Include_test=0 PrependPath=0 Shortcuts=0', 'Installing the private Python runtime...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}"', 'Installing AnyAiCam runtime dependencies...');
+    ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
+    ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
+  end;
+end;

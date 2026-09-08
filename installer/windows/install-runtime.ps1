@@ -23,12 +23,14 @@ if (Test-Path -LiteralPath $environmentFile) {
 }
 if (-not $values.Contains('ANYAICAM_APP_SECRETS')) {
     $bytes = New-Object byte[] 32
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    $values['ANYAICAM_APP_SECRETS'] = [Convert]::ToHexString($bytes).ToLowerInvariant()
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+    $values['ANYAICAM_APP_SECRETS'] = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
 }
 if (-not $values.Contains('ANYAICAM_CAMERA_CREDENTIAL_KEY')) {
     $bytes = New-Object byte[] 32
-    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
     $values['ANYAICAM_CAMERA_CREDENTIAL_KEY'] = [Convert]::ToBase64String($bytes).Replace('+','-').Replace('/','_')
 }
 $values['ANYAICAM_RUNTIME_ROLE'] = 'edge'
