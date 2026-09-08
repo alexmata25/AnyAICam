@@ -31,6 +31,16 @@ foreach ($forbidden in @('InstallAllUsers=', 'python-3.12.10-amd64.exe', '/unins
 foreach ($signingText in @('SignTool=AnyAiCamSign', 'SignedUninstaller=yes', 'SignedUninstallerDir=', 'Get-AuthenticodeSignature', 'ANYAICAM_TIMESTAMP_URL')) {
     if (-not ((Get-Content -Raw (Join-Path $root 'installer\windows\AnyAiCam-VMS.iss')) + (Get-Content -Raw (Join-Path $root 'installer\windows\build.ps1'))).Contains($signingText)) { throw "Signing support is missing $signingText" }
 }
+$requirements = Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\requirements-windows.txt')
+foreach ($requiredPin in @('torch==2.5.1+cpu', 'torchvision==0.20.1+cpu', 'ultralytics==8.3.40')) {
+    if (-not $requirements.Contains($requiredPin)) { throw "CPU AI manifest is missing $requiredPin" }
+}
+foreach ($forbiddenPackage in @('nvidia-', 'nvidia_', 'pytesseract==', 'ultralytics-platform==')) {
+    if ($requirements.Contains($forbiddenPackage)) { throw "CPU AI manifest contains forbidden package $forbiddenPackage" }
+}
+foreach ($sourceText in @('#define AppVersion "0.1.3"', '#define SourceCommit "ec5272fb619eda50e188eaac7c6629e1157af3e7"', 'AnyAiCam-VMS-Setup-0.1.3-ec5272f')) {
+    if (-not $iss.Contains($sourceText)) { throw "Installer source metadata is missing $sourceText" }
+}
 $xml = [xml](Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\AnyAiCamVMS.xml'))
 if ($xml.service.startmode -ne 'Automatic') { throw 'Service is not automatic.' }
 if (-not $xml.service.onfailure) { throw 'Service has no restart-on-failure policy.' }

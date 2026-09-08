@@ -1,6 +1,6 @@
 #define AppName "AnyAiCam VMS"
-#define AppVersion "0.1.2"
-#define SourceCommit "947f8bc35e7a7686cfcb69241870d67f992b00ca"
+#define AppVersion "0.1.3"
+#define SourceCommit "ec5272fb619eda50e188eaac7c6629e1157af3e7"
 [Setup]
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
 AppName={#AppName}
@@ -12,7 +12,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 OutputDir=output
-OutputBaseFilename=AnyAiCam-VMS-Setup-0.1.2-947f8bc
+OutputBaseFilename=AnyAiCam-VMS-Setup-0.1.3-ec5272f
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

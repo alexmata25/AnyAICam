@@ -33,7 +33,7 @@ $compilerArguments += $installerScript
 & $iscc @compilerArguments
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
 if ($Sign) {
-    $setup = Get-Item (Join-Path $PSScriptRoot 'output\AnyAiCam-VMS-Setup-0.1.2-947f8bc.exe')
+    $setup = Get-Item (Join-Path $PSScriptRoot 'output\AnyAiCam-VMS-Setup-0.1.3-ec5272f.exe')
     $signedUninstallers = @(Get-ChildItem (Join-Path $PSScriptRoot 'output\signed-uninstallers') -Filter '*.exe' -ErrorAction Stop)
     if ($signedUninstallers.Count -eq 0) { throw 'Inno Setup did not produce a cached signed uninstaller.' }
     foreach ($file in @($setup) + $signedUninstallers) {
