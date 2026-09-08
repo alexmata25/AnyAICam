@@ -212,18 +212,36 @@ def test_unverified_camera_rejected_at_the_audio_socket(client, db_path):
     assert response.status_code == 409  # never even gets a session_id
 
 
-def test_no_appliance_channel_rejects_the_audio_socket(client, db_path):
+def test_no_appliance_channel_uses_local_isapi_fallback(client, db_path, monkeypatch):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed_tenant(db)
             _seed_camera(db, "cam-1", talk_down_supported=1)
 
+    calls = []
+    class FakeLocalRelay:
+        def __init__(self, camera, sample_rate, session_id):
+            calls.append((camera["id"], sample_rate, session_id))
+            self.error = None
+        def start(self): return True
+        def send_pcm16(self, frame): calls.append(frame)
+        def stop(self): calls.append("stopped")
+    monkeypatch.setattr(talk_audio_relay, "_LocalIsapiTalkRelay", FakeLocalRelay)
     session_id = _start_session(client, "cam-1", {partner_portal.SESSION_COOKIE: _owner_cookie()})
-    # No appliance has connected its control channel at all.
-    with pytest.raises(Exception):
-        with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}):
-            pass
+    with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio?sample_rate=44100", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}) as websocket:
+        websocket.send_bytes(b"\x00\x00")
+    assert calls[0] == ("cam-1", 44100, session_id)
+    assert b"\x00\x00" in calls
+    assert calls[-1] == "stopped"
 
+
+def test_isapi_diagnostic_logging_is_credential_safe():
+    import inspect
+    source = inspect.getsource(talk_audio_relay._LocalIsapiTalkRelay)
+    assert "talk_isapi_diagnostic" in source
+    diagnostic_lines = "\n".join(line for line in source.splitlines() if "talk_isapi_diagnostic" in line or "logger." in line)
+    for forbidden in ("username", "password", "Authorization", "encrypted_blob", "pcm_b64"):
+        assert forbidden not in diagnostic_lines
 
 # --------------------------------------------------------------- lifecycle / cleanup
 
