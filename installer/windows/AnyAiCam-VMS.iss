@@ -1,5 +1,5 @@
 #define AppName "AnyAiCam VMS"
-#define AppVersion "0.1.0"
+#define AppVersion "0.1.1"
 #define SourceCommit "947f8bc35e7a7686cfcb69241870d67f992b00ca"
 [Setup]
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
@@ -12,7 +12,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 OutputDir=output
-OutputBaseFilename=AnyAiCam-VMS-Setup-0.1.0-947f8bc
+OutputBaseFilename=AnyAiCam-VMS-Setup-0.1.1-947f8bc
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -32,7 +32,8 @@ Source: "service-launcher.ps1"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "install-runtime.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
-Source: "vendor\python-3.12.10-amd64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "vendor\get-pip.py"; DestDir: "{tmp}"; Flags: deleteafterinstall
 [Icons]
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
@@ -40,6 +41,7 @@ Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Filename: "http://127.0.0.1:8000"; Description: "Open AnyAiCam VMS"; Flags: postinstall shellexec skipifsilent unchecked
 [UninstallRun]
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "stop"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "StopAnyAiCamVMS"
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -Command ""Start-Sleep -Seconds 3"""; Flags: runhidden waituntilterminated; RunOnceId: "WaitForAnyAiCamVMS"
 Filename: "{app}\service\AnyAiCamVMS.exe"; Parameters: "uninstall"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RemoveAnyAiCamVMS"
 
 [UninstallDelete]
@@ -64,6 +66,7 @@ begin
   if FileExists(ServiceExecutable) then
   begin
     Exec(ServiceExecutable, 'stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(3000);
     Exec(ServiceExecutable, 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
@@ -72,8 +75,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    ExecRequired(ExpandConstant('{tmp}\python-3.12.10-amd64.exe'), '/quiet InstallAllUsers=1 TargetDir="' + ExpandConstant('{app}\runtime\python') + '" Include_pip=1 Include_launcher=0 Include_test=0 PrependPath=0 Shortcuts=0', 'Installing the private Python runtime...');
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}"', 'Installing AnyAiCam runtime dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
   end;

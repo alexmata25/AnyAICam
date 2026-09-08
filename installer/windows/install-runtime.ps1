@@ -1,11 +1,25 @@
 param(
     [Parameter(Mandatory=$true)][string]$InstallRoot,
     [Parameter(Mandatory=$true)][string]$DataRoot,
-    [Parameter(Mandatory=$true)][string]$SourceCommit
+    [Parameter(Mandatory=$true)][string]$SourceCommit,
+    [Parameter(Mandatory=$true)][string]$PythonArchive,
+    [Parameter(Mandatory=$true)][string]$GetPipScript
 )
 $ErrorActionPreference = 'Stop'
-$python = Join-Path $InstallRoot 'runtime\python\python.exe'
-if (-not (Test-Path -LiteralPath $python)) { throw "Bundled Python installation failed: $python" }
+$pythonRoot = Join-Path $InstallRoot 'runtime\python'
+$python = Join-Path $pythonRoot 'python.exe'
+if (-not (Test-Path -LiteralPath $python)) {
+    New-Item -ItemType Directory -Force -Path $pythonRoot | Out-Null
+    Expand-Archive -LiteralPath $PythonArchive -DestinationPath $pythonRoot -Force
+}
+if (-not (Test-Path -LiteralPath $python)) { throw "Bundled Python extraction failed: $python" }
+$pathFile = Get-ChildItem -LiteralPath $pythonRoot -Filter 'python*._pth' | Select-Object -First 1
+if (-not $pathFile) { throw 'Bundled Python path configuration was not found.' }
+$pathContent = Get-Content -LiteralPath $pathFile.FullName
+$pathContent = $pathContent | ForEach-Object { if ($_ -eq '#import site') { 'import site' } else { $_ } }
+[IO.File]::WriteAllLines($pathFile.FullName, $pathContent, [Text.UTF8Encoding]::new($false))
+& $python $GetPipScript --disable-pip-version-check --no-warn-script-location
+if ($LASTEXITCODE -ne 0) { throw 'Private pip bootstrap failed.' }
 & $python -m pip install --disable-pip-version-check --no-warn-script-location -r (Join-Path $InstallRoot 'installer\requirements-windows.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
 
