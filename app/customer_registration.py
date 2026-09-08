@@ -78,6 +78,8 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
     with connection() as db:
         if backend() == "sqlite":
             db.execute("BEGIN IMMEDIATE")
+        else:
+            db.execute("SELECT id FROM customer_registration_requests WHERE id=? FOR UPDATE", (request_id,))
         item = _request_for_actor(db, request_id, actor)
         if item["status"] == "approved":
             return {"status": "complete", "message": "Account was already approved.", "customer_id": item["customer_id"], "user_id": item["user_id"]}

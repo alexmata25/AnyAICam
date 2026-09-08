@@ -58,6 +58,7 @@ def target_key():
 
 def _postgres_sql(sql: str) -> str:
     converted=sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT','BIGSERIAL PRIMARY KEY')
+    converted=re.sub(r'\bBLOB\b','BYTEA',converted,flags=re.I)
     if re.match(r'\s*INSERT OR IGNORE\s+',converted,re.I):
         converted=re.sub(r'INSERT OR IGNORE','INSERT',converted,count=1,flags=re.I).rstrip().rstrip(';')+' ON CONFLICT DO NOTHING'
     return converted.replace('?','%s')
