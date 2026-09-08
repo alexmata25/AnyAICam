@@ -20,9 +20,11 @@ foreach ($name in @('ANYAICAM_STATIC_FOLDER', 'ANYAICAM_RECORDINGS_FOLDER', 'ANY
     if (-not $main.Contains($name)) { throw "main.py is missing $name Windows path support" }
 }
 $iss = Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\AnyAiCam-VMS.iss')
-foreach ($text in @('uninsneveruninstall', 'AnyAiCamVMS.exe', 'python-3.12.10-embed-amd64.zip', 'get-pip.py', 'Start-Sleep -Seconds 3', 'PrivilegesRequired=admin')) {
+foreach ($text in @('uninsneveruninstall', 'AnyAiCamVMS.exe', 'python-3.12.10-embed-amd64.zip', 'get-pip.py', 'vendor\wheels\*', 'ffmpeg-8.1.2-essentials_build.zip', 'Start-Sleep -Seconds 3', 'PrivilegesRequired=admin')) {
     if (-not $iss.Contains($text)) { throw "Installer manifest is missing $text" }
 }
+$runtime = Get-Content -Raw -LiteralPath (Join-Path $root 'installer\windows\install-runtime.ps1')
+if (-not $runtime.Contains('--no-index')) { throw 'Runtime dependency installation is not offline-only.' }
 foreach ($forbidden in @('InstallAllUsers=', 'python-3.12.10-amd64.exe', '/uninstall')) {
     if ($iss.Contains($forbidden)) { throw "Installer manifest contains unsafe registered-Python operation: $forbidden" }
 }

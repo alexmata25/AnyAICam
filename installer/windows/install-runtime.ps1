@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory=$true)][string]$DataRoot,
     [Parameter(Mandatory=$true)][string]$SourceCommit,
     [Parameter(Mandatory=$true)][string]$PythonArchive,
-    [Parameter(Mandatory=$true)][string]$GetPipScript
+    [Parameter(Mandatory=$true)][string]$GetPipScript,
+    [Parameter(Mandatory=$true)][string]$WheelRoot,
+    [Parameter(Mandatory=$true)][string]$FFmpegArchive
 )
 $ErrorActionPreference = 'Stop'
 $pythonRoot = Join-Path $InstallRoot 'runtime\python'
@@ -18,10 +20,22 @@ if (-not $pathFile) { throw 'Bundled Python path configuration was not found.' }
 $pathContent = Get-Content -LiteralPath $pathFile.FullName
 $pathContent = $pathContent | ForEach-Object { if ($_ -eq '#import site') { 'import site' } else { $_ } }
 [IO.File]::WriteAllLines($pathFile.FullName, $pathContent, [Text.UTF8Encoding]::new($false))
-& $python $GetPipScript --disable-pip-version-check --no-warn-script-location
+& $python $GetPipScript --no-index --find-links $WheelRoot --disable-pip-version-check --no-warn-script-location
 if ($LASTEXITCODE -ne 0) { throw 'Private pip bootstrap failed.' }
-& $python -m pip install --disable-pip-version-check --no-warn-script-location -r (Join-Path $InstallRoot 'installer\requirements-windows.txt')
+& $python -m pip install --no-index --find-links $WheelRoot --disable-pip-version-check --no-warn-script-location -r (Join-Path $InstallRoot 'installer\requirements-windows.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed.' }
+
+$ffmpegRoot = Join-Path $InstallRoot 'runtime\tools\ffmpeg'
+if (-not (Test-Path (Join-Path $ffmpegRoot 'ffmpeg.exe'))) {
+    $ffmpegTemp = Join-Path $env:TEMP ('anyaicam-ffmpeg-' + [guid]::NewGuid().ToString('N'))
+    try {
+        Expand-Archive -LiteralPath $FFmpegArchive -DestinationPath $ffmpegTemp -Force
+        $ffmpeg = Get-ChildItem -LiteralPath $ffmpegTemp -Filter ffmpeg.exe -Recurse | Select-Object -First 1
+        if (-not $ffmpeg) { throw 'FFmpeg archive does not contain ffmpeg.exe.' }
+        New-Item -ItemType Directory -Force -Path $ffmpegRoot | Out-Null
+        Copy-Item -Path (Join-Path $ffmpeg.Directory.FullName '*') -Destination $ffmpegRoot -Recurse -Force
+    } finally { if (Test-Path $ffmpegTemp) { Remove-Item $ffmpegTemp -Recurse -Force } }
+}
 
 foreach ($directory in @('config', 'database', 'recordings', 'hls', 'logs')) {
     New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot $directory) | Out-Null

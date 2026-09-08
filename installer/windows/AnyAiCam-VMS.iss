@@ -1,5 +1,5 @@
 #define AppName "AnyAiCam VMS"
-#define AppVersion "0.1.1"
+#define AppVersion "0.1.2"
 #define SourceCommit "947f8bc35e7a7686cfcb69241870d67f992b00ca"
 [Setup]
 AppId={{E7B7D8B3-2EE7-4A24-8B02-F6DFA8D99B38}
@@ -12,7 +12,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 OutputDir=output
-OutputBaseFilename=AnyAiCam-VMS-Setup-0.1.1-947f8bc
+OutputBaseFilename=AnyAiCam-VMS-Setup-0.1.2-947f8bc
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -34,6 +34,8 @@ Source: "AnyAiCamVMS.xml"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "vendor\WinSW-x64.exe"; DestDir: "{app}\service"; DestName: "AnyAiCamVMS.exe"; Flags: ignoreversion
 Source: "vendor\python-3.12.10-embed-amd64.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "vendor\get-pip.py"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "vendor\wheels\*"; DestDir: "{tmp}\wheels"; Flags: deleteafterinstall recursesubdirs createallsubdirs
+Source: "vendor\ffmpeg-8.1.2-essentials_build.zip"; DestDir: "{tmp}"; Flags: deleteafterinstall
 [Icons]
 Name: "{group}\Open AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
 Name: "{commondesktop}\AnyAiCam VMS"; Filename: "http://127.0.0.1:8000"
@@ -75,7 +77,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '"', 'Installing AnyAiCam private runtime and dependencies...');
+    ExecRequired(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\installer\install-runtime.ps1') + '" -InstallRoot "' + ExpandConstant('{app}') + '" -DataRoot "' + ExpandConstant('{commonappdata}\AnyAiCam') + '" -SourceCommit "{#SourceCommit}" -PythonArchive "' + ExpandConstant('{tmp}\python-3.12.10-embed-amd64.zip') + '" -GetPipScript "' + ExpandConstant('{tmp}\get-pip.py') + '" -WheelRoot "' + ExpandConstant('{tmp}\wheels') + '" -FFmpegArchive "' + ExpandConstant('{tmp}\ffmpeg-8.1.2-essentials_build.zip') + '"', 'Installing AnyAiCam private runtime and dependencies...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'install', 'Installing the AnyAiCam Windows service...');
     ExecRequired(ExpandConstant('{app}\service\AnyAiCamVMS.exe'), 'start', 'Starting the AnyAiCam Windows service...');
   end;
