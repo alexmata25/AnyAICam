@@ -1,0 +1,15 @@
+<service>
+  <id>AnyAiCamVMS</id>
+  <name>AnyAiCam VMS</name>
+  <description>AnyAiCam local video management service</description>
+  <executable>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</executable>
+  <arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%BASE%\service-launcher.ps1"</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+  <startmode>Automatic</startmode>
+  <stoptimeout>30 sec</stoptimeout>
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <resetfailure>1 hour</resetfailure>
+  <logpath>%ProgramData%\AnyAiCam\logs</logpath>
+  <log mode="roll-by-size-time"><sizeThreshold>10240</sizeThreshold><pattern>yyyyMMdd</pattern><autoRollAtTime>00:00:00</autoRollAtTime><zipOlderThanNumDays>7</zipOlderThanNumDays><zipDateFormat>yyyyMM</zipDateFormat></log>
+</service>

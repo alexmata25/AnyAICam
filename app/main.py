@@ -525,7 +525,7 @@ except ImportError:
 
 
 
-STATIC_FOLDER = Path("/app/static")
+STATIC_FOLDER = Path(os.environ.get("ANYAICAM_STATIC_FOLDER", "/app/static"))
 
 HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).parent / "static" / "hls") if os.name == "nt" else "/app/static/hls"))
 
@@ -540,7 +540,7 @@ HLS_CACHE_CONTROL = "no-store, no-cache, must-revalidate, max-age=0"
 
 
 
-RECORDINGS_FOLDER = Path("/app/recordings")
+RECORDINGS_FOLDER = Path(os.environ.get("ANYAICAM_RECORDINGS_FOLDER", "/app/recordings"))
 
 
 
