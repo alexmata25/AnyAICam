@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+[[ "${1:-}" == configure ]] || exit 0
+id -u anyaicam >/dev/null 2>&1 || useradd --system --home /var/lib/anyaicam --shell /usr/sbin/nologin anyaicam
+install -d -m 0750 -o anyaicam -g anyaicam /etc/anyaicam /var/lib/anyaicam /var/lib/anyaicam/vms /var/lib/anyaicam/vms/{recordings,data-config,hls} /var/log/anyaicam
+e=/etc/anyaicam/vms.env; touch "$e"
+grep -q '^ANYAICAM_RUNTIME_ROLE=' "$e" || echo 'ANYAICAM_RUNTIME_ROLE=edge' >> "$e"
+grep -q '^ANYAICAM_ENV=' "$e" || echo 'ANYAICAM_ENV=production' >> "$e"
+grep -q '^ANYAICAM_APP_SECRETS=' "$e" || printf 'ANYAICAM_APP_SECRETS=%s\n' "$(head -c 32 /dev/urandom|od -An -tx1|tr -d ' \n')" >> "$e"
+grep -q '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$e" || printf 'ANYAICAM_CAMERA_CREDENTIAL_KEY=%s\n' "$(head -c 32 /dev/urandom|base64|tr -d '\n'|tr '+/' '-_')" >> "$e"
+sed -i '/^ANYAICAM_VMS_COMMIT=/d;/^ANYAICAM_BUILD_ID=/d' "$e"
+printf '%s\n' 'ANYAICAM_VMS_COMMIT=ec5272fb619eda50e188eaac7c6629e1157af3e7' 'ANYAICAM_BUILD_ID=ec5272fb619eda50e188eaac7c6629e1157af3e7' >> "$e"
+chown anyaicam:anyaicam "$e"; chmod 0640 "$e"
+echo '0.1.3+ec5272f-1' > /etc/anyaicam/installed_version
+echo '{"package_version":"0.1.3+ec5272f-1","vms_commit":"ec5272fb619eda50e188eaac7c6629e1157af3e7","runtime":"docker-compose","architecture":"amd64"}' > /etc/anyaicam/vms_release.json
+python3 -m venv /opt/anyaicam-agent/venv
+/opt/anyaicam-agent/venv/bin/pip install --disable-pip-version-check --no-cache-dir /opt/anyaicam-agent/source
+docker build --pull=false -f /opt/anyaicam/Dockerfile.package -t anyaicam-vms:0.1.3-ec5272f /opt/anyaicam
+systemctl daemon-reload
+systemctl enable anyaicam-vms.service anyaicam-agent.service
+systemctl restart anyaicam-vms.service
+ok=0; for _ in $(seq 1 60); do curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
+[[ "$ok" == 1 ]] || { echo 'VMS health check failed; persistent state preserved.' >&2; exit 1; }
+if [ -s /var/lib/anyaicam/credential.json ]; then
+  systemctl restart anyaicam-agent.service
+else
+  systemctl stop anyaicam-agent.service 2>/dev/null || true
+  echo 'Appliance agent installed and enabled; run anyaicam-setup to activate it.'
+fi

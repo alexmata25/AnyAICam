@@ -1,0 +1,14 @@
+[Unit]
+Description=AnyAiCam VMS
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/anyaicam
+ExecStart=/usr/bin/docker compose -f /opt/anyaicam/docker-compose.package.yml up -d
+ExecStop=/usr/bin/docker compose -f /opt/anyaicam/docker-compose.package.yml down
+TimeoutStartSec=300
+[Install]
+WantedBy=multi-user.target

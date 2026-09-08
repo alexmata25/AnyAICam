@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+[ "${1:-}" != upgrade ] || systemctl stop anyaicam-agent.service anyaicam-vms.service 2>/dev/null || true
+exit 0

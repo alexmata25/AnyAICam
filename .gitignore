@@ -9,3 +9,4 @@ logs.txt
 __pycache__/
 *.pyc
 .phase6-migration-test-*.db
+installer/linux-deb/dist/

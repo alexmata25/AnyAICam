@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+[[ "${1:-}" == --yes-i-understand ]] || { echo 'This permanently deletes all AnyAiCam customer data. Re-run with --yes-i-understand after a verified backup.' >&2; exit 2; }
+systemctl stop anyaicam-agent.service anyaicam-vms.service 2>/dev/null || true
+rm -rf /etc/anyaicam /var/lib/anyaicam /var/log/anyaicam

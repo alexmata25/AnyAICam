@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+systemctl --no-pager --full status anyaicam-vms.service anyaicam-agent.service
+docker inspect --format '{{.State.Health.Status}}' anyaicam-vms

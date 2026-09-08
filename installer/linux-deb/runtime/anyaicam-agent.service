@@ -1,0 +1,24 @@
+[Unit]
+Description=AnyAiCam Appliance Agent
+After=network-online.target anyaicam-vms.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/anyaicam/credential.json
+
+[Service]
+Type=simple
+User=anyaicam
+Group=anyaicam
+EnvironmentFile=-/etc/anyaicam/agent.env
+ExecStart=/opt/anyaicam-agent/venv/bin/anyaicam-agent
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/anyaicam /var/log/anyaicam /etc/anyaicam
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

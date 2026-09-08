@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = remove ] || [ "${1:-}" = purge ]; then
+  systemctl disable anyaicam-agent.service anyaicam-vms.service 2>/dev/null || true
+  docker image rm anyaicam-vms:0.1.3-ec5272f >/dev/null 2>&1 || true
+  rm -rf /opt/anyaicam-agent
+  systemctl daemon-reload 2>/dev/null || true
+fi
+if [ "${1:-}" = purge ]; then rm -f /etc/anyaicam/installed_version /etc/anyaicam/vms_release.json; fi
+# Customer configuration, identity, database, and recordings are retained.
+exit 0

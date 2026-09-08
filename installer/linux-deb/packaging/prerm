@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in remove|upgrade|deconfigure) systemctl stop anyaicam-agent.service anyaicam-vms.service 2>/dev/null || true;; esac
+exit 0
