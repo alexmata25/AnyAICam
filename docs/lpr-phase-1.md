@@ -64,3 +64,33 @@ dedupe, and snapshot/media mapping before claiming supported camera capacity.
 
 Recommended candidates for evaluation are a lightweight OpenCV-compatible plate
 detector and PaddleOCR CPU, but neither is bundled or required in Phase 1.
+
+## Phase 2 controlled-validation record
+
+The first compatible, **validation-only** CPU stack on the authorized Ryzen
+test appliance is pinned as follows:
+
+* `paddlepaddle==3.2.0`
+* `paddleocr==3.3.3`
+* detector: `PP-OCRv5_mobile_det`
+* recognizer: `latin_PP-OCRv5_mobile_rec`
+
+This is not an application dependency, installer dependency, or production
+runtime requirement.  The combination was installed only in a disposable
+`/tmp` environment, where a synthetic `ABC1234` image completed CPU inference
+without the earlier oneDNN/PIR error.  It must remain behind `OcrAdapter` and a
+future optional edge runner; `app/lpr.py` must not import PaddleOCR, OpenCV,
+or a camera client.
+
+`lpr_validation.py` defines the stdout contract for a future explicitly
+authorized edge-validation runner.  It emits a single JSON line after all
+work is complete, rather than relying on intermixed OCR-library progress
+output.  That line includes candidate count, crop dimensions, raw and
+normalized OCR text, confidence, and detector/OCR/total latency.  It excludes
+RTSP URLs, credentials, images, filesystem paths, cloud-upload data, and any
+relay/action command.
+
+The current state is paused awaiting natural driveway traffic.  A parked-car
+sample is only a static sanity check, never an accuracy, capacity, duplicate,
+or moving-vehicle benchmark.  Cloud upload, notifications, and relay/access
+actions remain off.
