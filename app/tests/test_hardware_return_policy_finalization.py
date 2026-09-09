@@ -218,6 +218,25 @@ def test_return_request_rejected_after_the_30_day_window_has_passed(db_path, tmp
             hr.request_return(order["id"])
 
 
+def test_the_30th_day_since_delivery_is_still_eligible(db_path, tmp_path, _hardware_map, _approved_values):
+    """Exact boundary: exactly 30 days since delivery must still be
+    accepted -- the window is inclusive of day 30, not exclusive."""
+    _seed_customer(db_path)
+    order = _place_and_ship_order(db_path, delivered_days_ago=30)
+    with override_target(sqlite_path=db_path):
+        hardware_return = hr.request_return(order["id"])
+    assert hardware_return["status"] == "return_requested"
+
+
+def test_the_31st_day_since_delivery_is_rejected(db_path, tmp_path, _hardware_map, _approved_values):
+    """Exact boundary: one day past the 30-day window must be rejected."""
+    _seed_customer(db_path)
+    order = _place_and_ship_order(db_path, delivered_days_ago=31)
+    with override_target(sqlite_path=db_path):
+        with pytest.raises(ValueError, match="return window"):
+            hr.request_return(order["id"])
+
+
 def test_return_window_measures_from_delivery_not_shipment_when_both_known(db_path, tmp_path, _hardware_map, _approved_values):
     """Shipped 60 days ago but delivered only 5 days ago (e.g. a slow
     carrier) -- must use delivery, the customer's own real clock."""
