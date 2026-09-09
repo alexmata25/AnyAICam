@@ -743,6 +743,26 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         success=bool(payload.get('success')); message=str(payload.get('message',''))[:500]
         now=datetime.now().isoformat(); camera_id=None
         with connection() as db:
+            # Provisioning Phase 7: second, appliance-authenticated
+            # enforcement of the purchased camera-slot maximum -- the
+            # first gate is request_camera_provisioning()'s own check
+            # (partner_workspace.py) at request time, but that check
+            # can't see camera counts on OTHER outstanding jobs decided
+            # between request and this confirmation, so the limit is
+            # re-checked here, right before the row that actually
+            # consumes a slot would be created. Only applies to a
+            # genuinely NEW device_key -- rediscovering/reconnecting an
+            # existing camera below never consumes a new slot and is
+            # never blocked by this check.
+            if success:
+                already_known=db.execute('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(job['customer_id'],job['device_key'])).fetchone()
+                if not already_known:
+                    from customer_entitlements import total_camera_slots
+                    slot_limit=total_camera_slots(job['customer_id'])
+                    configured=db.execute('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',(job['customer_id'],)).fetchone()['n']
+                    if configured>=slot_limit:
+                        success=False
+                        message=f'Camera limit reached: this account is licensed for {slot_limit} camera(s). Upgrade the plan or remove a camera before adding another.'
             if success:
                 # device_key identifies the physical camera itself (its
                 # ONVIF endpoint reference UUID), not an appliance-camera

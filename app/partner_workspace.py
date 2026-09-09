@@ -654,6 +654,26 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         if username or password:
             encrypted=encrypt_camera_credentials(str(username or ''),str(password or ''))
             if encrypted is None: raise HTTPException(status_code=503,detail='Camera credential handling is not configured on this deployment yet. Contact support before adding a credentialed camera.')
+        # Provisioning Phase 7: enforce the purchased camera-slot maximum
+        # (customer_entitlements.total_camera_slots() -- the one function
+        # anything claim/refresh/provisioning-shaped must call, never a
+        # hard-coded constant, per that module's own docstring). Re-
+        # provisioning an ALREADY-KNOWN device_key (the customer's own
+        # existing camera reconnecting, being rediscovered on a new scan,
+        # or moved to a different appliance/site) never consumes a new
+        # slot and is never blocked here -- only a genuinely new device_
+        # key counts toward the limit. Queued-but-not-yet-confirmed
+        # requests count too, so a burst of simultaneous "Add this
+        # camera" clicks can't race past the limit before any of them
+        # reach appliance_submit_provisioning()'s own second gate.
+        from customer_entitlements import total_camera_slots
+        already_known_device = row('SELECT id FROM cameras WHERE customer_id=? AND device_key=?',(identity['customer_id'],device_key))
+        if not already_known_device:
+            slot_limit=total_camera_slots(identity['customer_id'])
+            configured=row('SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND device_key IS NOT NULL',(identity['customer_id'],))['n']
+            pending=row("SELECT COUNT(*) AS n FROM camera_provisioning_requests WHERE customer_id=? AND status='queued'",(identity['customer_id'],))['n']
+            if configured+pending>=slot_limit:
+                raise HTTPException(status_code=403,detail=f'Camera limit reached: this account is licensed for {slot_limit} camera(s). Upgrade your plan or remove a camera before adding another.')
         job_id=secrets.token_hex(6); now=datetime.now().isoformat()
         with connection() as db:
             db.execute(
