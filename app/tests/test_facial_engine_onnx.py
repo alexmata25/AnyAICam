@@ -38,7 +38,7 @@ def onnx_models_available():
         engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, engine_module._DETECTOR_SHA256
     )
     embedding_path = engine_module._ensure_model(
-        engine_module._EMBEDDING_URL, engine_module._EMBEDDING_FILENAME, engine_module._EMBEDDING_SHA256
+        engine_module._SFACE_URL, engine_module._SFACE_FILENAME, engine_module._SFACE_SHA256
     )
     try:
         import onnxruntime  # noqa: F401
@@ -46,6 +46,23 @@ def onnx_models_available():
         pytest.skip("onnxruntime is not installed in this environment")
     if detector_path is None or embedding_path is None:
         pytest.skip("AAC ONNX models could not be downloaded/verified in this environment")
+    return detector_path, embedding_path
+
+
+@pytest.fixture(scope="module")
+def arcface_model_available():
+    detector_path = engine_module._ensure_model(
+        engine_module._DETECTOR_URL, engine_module._DETECTOR_FILENAME, engine_module._DETECTOR_SHA256
+    )
+    embedding_path = engine_module._ensure_model(
+        engine_module._ARCFACE_URL, engine_module._ARCFACE_FILENAME, engine_module._ARCFACE_SHA256
+    )
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError:
+        pytest.skip("onnxruntime is not installed in this environment")
+    if detector_path is None or embedding_path is None:
+        pytest.skip("AAC ArcFace model could not be downloaded/verified in this environment")
     return detector_path, embedding_path
 
 
@@ -214,7 +231,7 @@ def test_get_engine_selects_onnx_when_configured_and_available(monkeypatch, onnx
 
 def test_get_engine_falls_back_to_haar_when_onnx_forced_but_unavailable(monkeypatch):
     monkeypatch.setattr(fr, "FACE_ENGINE_SELECTION", "onnx")
-    monkeypatch.setattr(fr, "_build_onnx_engine", lambda: None)
+    monkeypatch.setattr(fr, "_build_named_onnx_engine", lambda class_name: None)
     fr.reset_engine()
     engine = fr.get_engine()
     assert engine.name == "haar_intensity"
@@ -223,20 +240,142 @@ def test_get_engine_falls_back_to_haar_when_onnx_forced_but_unavailable(monkeypa
 
 def test_get_engine_default_selection_is_haar_without_touching_onnx(monkeypatch):
     """The default (no ANYAICAM_FACE_ENGINE set) must never even
-    attempt to build the onnx engine -- this is what keeps this
+    attempt to build any onnx engine -- this is what keeps this
     project's test suite and default deployment hermetic/network-free
     unless an operator explicitly opts in (see FACE_ENGINE_SELECTION's
     own comment)."""
     monkeypatch.setattr(fr, "FACE_ENGINE_SELECTION", "haar")
 
-    def fail_if_called():
-        raise AssertionError("_build_onnx_engine() must not be called when FACE_ENGINE_SELECTION='haar'")
+    def fail_if_called(class_name):
+        raise AssertionError(f"_build_named_onnx_engine({class_name!r}) must not be called when FACE_ENGINE_SELECTION='haar'")
 
-    monkeypatch.setattr(fr, "_build_onnx_engine", fail_if_called)
+    monkeypatch.setattr(fr, "_build_named_onnx_engine", fail_if_called)
     fr.reset_engine()
     engine = fr.get_engine()
     assert engine.name == "haar_intensity"
     fr.reset_engine()
+
+
+def test_get_engine_selects_arcface_when_configured_and_available(monkeypatch, arcface_model_available):
+    monkeypatch.setattr(fr, "FACE_ENGINE_SELECTION", "arcface")
+    fr.reset_engine()
+    engine = fr.get_engine()
+    assert engine.name == "onnx_yunet_arcface"
+    fr.reset_engine()
+
+
+def test_get_engine_auto_prefers_arcface_over_sface(monkeypatch, arcface_model_available):
+    monkeypatch.setattr(fr, "FACE_ENGINE_SELECTION", "auto")
+    fr.reset_engine()
+    engine = fr.get_engine()
+    assert engine.name == "onnx_yunet_arcface"
+    fr.reset_engine()
+
+
+# --------------------------------------------------------------- ArcFaceOnnxEngine (Phase 5)
+#
+# Unlike SFace (Phase 2), there is no OpenCV-bundled reference
+# implementation of this exact ArcFace ONNX Model Zoo artifact to diff
+# against bit-for-bit -- see facial_engine_onnx.py's own docstring for
+# why the RGB/raw-range/CHW preprocessing convention used here is a
+# documented-convention match (the ONNX Model Zoo's own reference
+# notebook), not an independently cross-validated one. These tests
+# verify what IS independently provable without a real face photo or a
+# second reference implementation: real download+integrity, real model
+# loading, deterministic/unit-length/distinct output, and correct
+# engine/version isolation from SFace and Haar.
+
+
+def test_arcface_model_integrity_hash_matches_pinned_value(arcface_model_available):
+    _, embedding_path = arcface_model_available
+    assert engine_module._sha256(embedding_path) == engine_module._ARCFACE_SHA256
+
+
+def test_arcface_capability_reports_available(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    capability = engine.capability()
+    assert capability["available"] is True, capability.get("reason")
+    assert capability["engine"] == "onnx_yunet_arcface"
+    assert "CPUExecutionProvider" in capability["providers"]
+    assert capability["gpu"] is False
+
+
+def test_arcface_detect_faces_on_structured_noise_finds_nothing(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    assert engine.detect_faces(_noise_image()) == []
+
+
+def test_arcface_embed_returns_none_when_no_face_can_be_realigned(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    assert engine.embed(_noise_image(size=160)) is None
+
+
+def test_arcface_embedding_model_output_shape_is_512_dim(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    engine.capability()  # forces load
+    rng = np.random.default_rng(7)
+    aligned = rng.integers(0, 255, size=(112, 112, 3), dtype=np.uint8)
+    embedding = engine._run_embedding_model(aligned)
+    assert embedding is not None
+    assert len(embedding) == 512  # ArcFace's own documented embedding dimension -- vs. SFace's 128
+
+
+def test_arcface_embedding_output_is_unit_length(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    engine.capability()
+    rng = np.random.default_rng(9)
+    aligned = rng.integers(0, 255, size=(112, 112, 3), dtype=np.uint8)
+    embedding = engine._run_embedding_model(aligned)
+    assert embedding is not None
+    assert abs(np.linalg.norm(np.asarray(embedding)) - 1.0) < 1e-6
+
+
+def test_arcface_embedding_is_deterministic(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    engine.capability()
+    rng = np.random.default_rng(9)
+    aligned = rng.integers(0, 255, size=(112, 112, 3), dtype=np.uint8)
+    first = engine._run_embedding_model(aligned.copy())
+    second = engine._run_embedding_model(aligned.copy())
+    assert first == second
+
+
+def test_arcface_distinguishes_different_inputs(arcface_model_available):
+    engine = engine_module.ArcFaceOnnxEngine()
+    engine.capability()
+    a = engine._run_embedding_model(np.random.default_rng(1).integers(0, 255, size=(112, 112, 3), dtype=np.uint8))
+    b = engine._run_embedding_model(np.random.default_rng(2).integers(0, 255, size=(112, 112, 3), dtype=np.uint8))
+    assert a != b
+    assert fr.cosine_similarity(a, b) < 0.999
+
+
+def test_arcface_has_a_distinct_name_and_version_from_sface_and_haar():
+    arcface_engine = engine_module.ArcFaceOnnxEngine()
+    sface_engine = engine_module.OnnxFaceEngine()
+    haar_engine = fr.HaarEmbeddingFaceEngine()
+    names = {arcface_engine.name, sface_engine.name, haar_engine.name}
+    assert len(names) == 3  # all three distinct -- required for match_face()'s own engine-scoping guard
+
+
+def test_arcface_and_sface_embeddings_are_never_silently_compared(arcface_model_available):
+    """Same core requirement as Phase 2's Haar/SFace test, now for the
+    Phase 5 engine: match_face() must never treat ArcFace's 512-dim
+    embeddings as comparable to SFace's 128-dim ones (or, hypothetically,
+    to any future engine that happened to also produce 512-dim vectors)."""
+    arcface_embedding = tuple([0.1] * 512)
+    enrolled = [fr.EnrolledEmbedding(person_id="alice", embedding=arcface_embedding, engine="onnx_yunet_sface", engine_version="1")]
+    result = fr.match_face(arcface_embedding, enrolled, engine="onnx_yunet_arcface", engine_version="1")
+    assert result is None
+
+
+def test_arcface_and_sface_share_the_same_yunet_detector_and_aligner_models():
+    """Both engines are pinned to the SAME YuNet detector file and the
+    SAME SFace-weights-backed aligner (alignCrop() is a generic
+    landmark aligner, not embedding-specific -- see
+    facial_engine_onnx.py's own docstring for why reusing it for
+    ArcFace's alignment is a documented-convention choice)."""
+    assert engine_module.ArcFaceOnnxEngine._EMBEDDING_FILENAME != engine_module.OnnxFaceEngine._EMBEDDING_FILENAME
+    assert engine_module._DETECTOR_FILENAME  # shared detector constant, not per-subclass
 
 
 # --------------------------------------------------------------- engine/version compatibility (never silently mixed)

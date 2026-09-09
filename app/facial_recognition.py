@@ -255,29 +255,34 @@ _engine: FaceEngine | None = None
 
 # 'haar' (the default) never imports facial_engine_onnx at all -- core
 # VMS startup and every test that doesn't explicitly opt in never
-# touches onnxruntime or the network. 'onnx' forces the Phase 2
-# production-capable engine (facial_engine_onnx.OnnxFaceEngine); if it
-# reports itself unavailable (onnxruntime not installed, or the model
-# files couldn't be downloaded/verified -- see that module's own
-# docstring), get_engine() falls back to Haar rather than leaving AAC
-# entirely non-functional, matching this codebase's "never crash the
-# detection pipeline" convention (ppe.py/lpr.py do the same for their
-# own optional dependencies). 'auto' tries onnx first, silently
-# preferring it when available, falling back to haar otherwise -- this
-# is NOT the default, specifically so this project's test suite (which
-# never sets this env var) stays hermetic and network-free by default;
-# an operator opts into the stronger engine explicitly.
+# touches onnxruntime or the network. 'arcface' forces the Phase 5
+# production-candidate engine (facial_engine_onnx.ArcFaceOnnxEngine --
+# see that module's own docstring for full model/license details);
+# 'onnx' forces the Phase 2 SFace engine, kept available ONLY as a
+# fallback/test engine -- Phase 4's real-camera impostor test measured
+# a 51%+ false-accept rate at every threshold from 0.55-0.75 against a
+# real second person, so 'onnx' must never be selected for anything
+# resembling access control. If the requested engine reports itself
+# unavailable (onnxruntime not installed, or model files couldn't be
+# downloaded/verified), get_engine() falls back to Haar rather than
+# leaving AAC entirely non-functional, matching this codebase's "never
+# crash the detection pipeline" convention (ppe.py/lpr.py do the same
+# for their own optional dependencies). 'auto' tries arcface, then
+# onnx, then haar, silently preferring the strongest one available --
+# this is NOT the default, specifically so this project's test suite
+# (which never sets this env var) stays hermetic and network-free by
+# default; an operator opts into a stronger engine explicitly.
 FACE_ENGINE_SELECTION = os.environ.get("ANYAICAM_FACE_ENGINE", "haar").strip().lower()
 
 _engine_fallback_logged = False
 
 
-def _build_onnx_engine() -> FaceEngine | None:
+def _build_named_onnx_engine(class_name: str) -> FaceEngine | None:
     try:
-        from facial_engine_onnx import OnnxFaceEngine
+        import facial_engine_onnx
     except ImportError:
         return None
-    candidate = OnnxFaceEngine()
+    candidate = getattr(facial_engine_onnx, class_name)()
     if not candidate.capability().get("available"):
         return None
     return candidate
@@ -286,23 +291,28 @@ def _build_onnx_engine() -> FaceEngine | None:
 def get_engine() -> FaceEngine:
     """Lazy singleton, matching get_yolo_model()'s own pattern in
     main.py. See FACE_ENGINE_SELECTION's own comment for what
-    ANYAICAM_FACE_ENGINE=haar|onnx|auto each do. An unrecognized value
-    falls back to 'haar' rather than raising, so a deployment never
-    fails to start over a typo in this optional setting."""
+    ANYAICAM_FACE_ENGINE=haar|onnx|arcface|auto each do. An unrecognized
+    value falls back to 'haar' rather than raising, so a deployment
+    never fails to start over a typo in this optional setting."""
     global _engine, _engine_fallback_logged
     with _engine_lock:
         if _engine is not None:
             return _engine
+        if FACE_ENGINE_SELECTION in ("arcface", "auto"):
+            arcface_engine = _build_named_onnx_engine("ArcFaceOnnxEngine")
+            if arcface_engine is not None:
+                _engine = arcface_engine
+                return _engine
         if FACE_ENGINE_SELECTION in ("onnx", "auto"):
-            onnx_engine = _build_onnx_engine()
+            onnx_engine = _build_named_onnx_engine("OnnxFaceEngine")
             if onnx_engine is not None:
                 _engine = onnx_engine
                 return _engine
-            if FACE_ENGINE_SELECTION == "onnx" and not _engine_fallback_logged:
-                _engine_fallback_logged = True
-                logging.getLogger("anyaicam.facial_recognition").warning(
-                    "facial_recognition.onnx_engine_unavailable_falling_back_to_haar"
-                )
+        if FACE_ENGINE_SELECTION in ("onnx", "arcface") and not _engine_fallback_logged:
+            _engine_fallback_logged = True
+            logging.getLogger("anyaicam.facial_recognition").warning(
+                "facial_recognition.requested_engine_unavailable_falling_back_to_haar requested=%s", FACE_ENGINE_SELECTION
+            )
         _engine = HaarEmbeddingFaceEngine()
         return _engine
 
