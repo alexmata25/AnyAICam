@@ -1,0 +1,49 @@
+services:
+  portal:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: anyaicam-staging-portal
+    restart: unless-stopped
+    env_file:
+      - /etc/anyaicam-staging/vms-staging.env
+    volumes:
+      - /var/lib/anyaicam-staging/db:/app/data
+      - /var/lib/anyaicam-staging/recordings:/app/recordings
+      - /var/lib/anyaicam-staging/hls:/app/static/hls
+      - /var/lib/anyaicam-staging/data-config:/opt/anyaicam/data/config
+    expose:
+      - "8000"
+    healthcheck:
+      # ANYAICAM_TRUSTED_HOSTS rejects a bare Host header -- the healthcheck
+      # (and Caddy's own active health check, see Caddyfile's health_headers)
+      # must send the real staging Host or every check 400s despite the app
+      # being genuinely healthy.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8000/health', headers={'Host':'portal-staging.anyaicam.com'}), timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: anyaicam-staging-caddy
+    restart: unless-stopped
+    depends_on:
+      - portal
+    environment:
+      APP_UPSTREAM: portal:8000
+      TLS_EMAIL: replace@example.com
+      PUBLIC_DOMAIN: portal-staging.anyaicam.com
+      PORTAL_DOMAIN: portal-staging.anyaicam.com
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  caddy_data:
+  caddy_config:
