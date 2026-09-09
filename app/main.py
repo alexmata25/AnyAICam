@@ -112278,106 +112278,83 @@ async def stripe_webhook(request: Request) -> dict:
 
 
 
-    if not record_stripe_webhook_event(event):
+    # Provisioning Phase 7: record_stripe_webhook_event() below is the
+    # pre-existing, unchanged Stripe-event dedup gate -- still the sole
+    # authority on "have we seen this exact event id before" and still
+    # never weakened. What changed: a duplicate no longer short-circuits
+    # the ENTIRE route before the notification layer gets a turn. Root
+    # cause this fixes (found by this session's own real-HTTP-route
+    # staging validation, not by a unit test that calls sync/notify
+    # functions directly and therefore never passes through this gate at
+    # all): the old code returned {"status":"complete","duplicate":True}
+    # immediately on a duplicate, before EVER reaching notify_from_
+    # stripe_event() -- so a "service is ready" email that failed to send
+    # on the first delivery had no real trigger that could ever retry it,
+    # since Stripe only redelivers an event it has already seen, and that
+    # redelivery hit this exact gate every time.
+    is_new_event = record_stripe_webhook_event(event)
 
+    if is_new_event:
+        process_stripe_webhook_event(event)
 
+        # Provisioning Phase 2: additive authoritative-entitlement sync,
+        # on its own DB-backed idempotency (provisioning_webhook_events) --
+        # never the legacy record_stripe_webhook_event()/billing_accounts.
+        # json path above, which is untouched. Wrapped so a failure here
+        # can never break the 200 response Stripe needs to stop retrying,
+        # nor prevent the legacy processing above from having already run.
+        # Only ever runs for a genuinely NEW event id -- see is_new_event
+        # above -- so a redelivered event can never re-process/duplicate
+        # an entitlement.
+        try:
+            from customer_entitlements import sync_entitlement_from_stripe_event
+            sync_entitlement_from_stripe_event(event)
+        except Exception:
+            structured_log(
+                "provisioning.entitlement_sync_failed",
+                level="error",
+                event_id=event.get("id"),
+                event_type=event.get("type"),
+            )
 
+        # Provisioning Phase 5: additive one-time HARDWARE order sync, fully
+        # independent of the entitlement sync directly above -- see hardware_
+        # orders.py's module docstring for the fail-closed separation
+        # contract (a hardware Price ID is never in PRICE_ID_CAMERA_SLOT_MAP,
+        # a camera-slot Price ID is never in HARDWARE_PRICE_MAP, so neither
+        # sync can ever act on the other's event). Wrapped the same way, for
+        # the same reason: never break the 200 response Stripe needs, never
+        # block the entitlement sync above from having already run. Also
+        # only ever runs for a genuinely new event id, for the same reason --
+        # a redelivered event can never create a duplicate hardware order.
+        try:
+            from hardware_orders import sync_hardware_order_from_stripe_event
+            sync_hardware_order_from_stripe_event(event)
+        except Exception:
+            structured_log(
+                "provisioning.hardware_order_sync_failed",
+                level="error",
+                event_id=event.get("id"),
+                event_type=event.get("type"),
+            )
 
-
-
-
-
-        return {
-
-
-
-
-
-
-
-
-            "status": "complete",
-
-
-
-
-
-
-
-
-            "duplicate": True,
-
-
-
-
-
-
-
-
-        }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    process_stripe_webhook_event(event)
-
-    # Provisioning Phase 2: additive authoritative-entitlement sync,
-    # on its own DB-backed idempotency (provisioning_webhook_events) --
-    # never the legacy record_stripe_webhook_event()/billing_accounts.
-    # json path above, which is untouched. Wrapped so a failure here
-    # can never break the 200 response Stripe needs to stop retrying,
-    # nor prevent the legacy processing above from having already run.
-    try:
-        from customer_entitlements import sync_entitlement_from_stripe_event
-        sync_entitlement_from_stripe_event(event)
-    except Exception:
-        structured_log(
-            "provisioning.entitlement_sync_failed",
-            level="error",
-            event_id=event.get("id"),
-            event_type=event.get("type"),
-        )
-
-    # Provisioning Phase 5: additive one-time HARDWARE order sync, fully
-    # independent of the entitlement sync directly above -- see hardware_
-    # orders.py's module docstring for the fail-closed separation
-    # contract (a hardware Price ID is never in PRICE_ID_CAMERA_SLOT_MAP,
-    # a camera-slot Price ID is never in HARDWARE_PRICE_MAP, so neither
-    # sync can ever act on the other's event). Wrapped the same way, for
-    # the same reason: never break the 200 response Stripe needs, never
-    # block the entitlement sync above from having already run.
-    try:
-        from hardware_orders import sync_hardware_order_from_stripe_event
-        sync_hardware_order_from_stripe_event(event)
-    except Exception:
-        structured_log(
-            "provisioning.hardware_order_sync_failed",
-            level="error",
-            event_id=event.get("id"),
-            event_type=event.get("type"),
-        )
-
-    # Provisioning Phase 6: customer-facing post-purchase email, strictly
-    # AFTER both syncs above have already committed (or not) their own
-    # state -- notify_from_stripe_event() only ever reads their results,
-    # never triggers entitlement/order processing itself, and its own
-    # internal try/except (see purchase_notifications.py) means an email
-    # failure here can never roll back or block the entitlement/order
-    # commit that already happened above, nor the 200 response Stripe
-    # needs to stop retrying.
+    # Provisioning Phase 6/7: customer-facing post-purchase email. Runs on
+    # EVERY delivery of this event -- fresh (is_new_event True) or a
+    # genuine Stripe redelivery (is_new_event False) -- never gated behind
+    # is_new_event, unlike the entitlement/hardware syncs above. This is
+    # deliberate and safe, not a weakening of Stripe-event idempotency:
+    # notify_from_stripe_event() is independently idempotent per (event_
+    # id, notification_type) via its own provisioning_notifications table
+    # (see purchase_notifications.py's module docstring) -- a notification
+    # already marked 'sent' is skipped every time, so a fresh event and
+    # every later redelivery of it converge on sending at most one email.
+    # What redelivery now enables that it couldn't before this fix: a
+    # notification still marked 'failed' from an earlier delivery gets a
+    # real retry, because this call is no longer unreachable behind the
+    # duplicate-event gate. An email failure here still can never roll
+    # back or block the entitlement/order commit above (which, on a
+    # redelivery, already happened during a PRIOR delivery -- nothing to
+    # roll back on this one), nor the 200 response Stripe needs.
     try:
         from purchase_notifications import notify_from_stripe_event
         notify_from_stripe_event(event)
@@ -112388,6 +112365,12 @@ async def stripe_webhook(request: Request) -> dict:
             event_id=event.get("id"),
             event_type=event.get("type"),
         )
+
+    if not is_new_event:
+        return {
+            "status": "complete",
+            "duplicate": True,
+        }
 
 
 
