@@ -47,28 +47,47 @@ Phase 2 update: wired into production + authoritative-identity-first
 /api/payments/stripe/webhook route in main.py (additively -- after the
 existing legacy `process_stripe_webhook_event()` call, in its own
 try/except so a failure here can never break the legacy 200 response
-Stripe needs to stop retrying). `create_stripe_checkout()` was also
-updated to carry two new pieces of information through Stripe metadata,
-round-tripping back on every later event for this checkout/subscription
-without needing a second API call to Stripe:
+Stripe needs to stop retrying). `create_stripe_checkout()` carries the
+authoritative `customers.id` through Stripe metadata
+(`anyaicam_customer_id`, set only for a real signed-in customer_owner
+session) so identity resolution never depends on customer-supplied
+email when a session already exists.
 
-- `anyaicam_customer_id`: the authoritative `customers.id`, set only
-  when the checkout was created from a real `partner_identity()`
-  customer_owner session. This is what "do not trust customer-supplied
-  email as the primary identity when already signed in" means in
-  practice -- `_sync_checkout_completed()` below looks this up FIRST,
-  before ever falling back to email matching.
-- `anyaicam_camera_slot_quantity`: the exact Stripe Checkout line-item
-  quantity the customer chose (already customer-facing today via
-  `StripeCheckoutCreateModel.quantity`, 1-100). This is used as the
-  camera-slot count directly, instead of a guessed per-plan constant.
-  `PRODUCT_CAMERA_SLOTS` below is kept ONLY as a fallback for a checkout
-  session created before this metadata field existed; it defaults to 0
-  (not an invented number) and is env-configurable so operators can set
-  it explicitly if that fallback path is ever actually needed -- see the
-  Phase 2 report for the audit finding that no real Stripe
-  product/price -> camera-slot mapping exists in production
-  configuration today, and why this module does not invent one.
+Phase 3 update: FIXED camera-slot tiers, server-side only
+-----------------------------------------------------------
+Approved product decision: AnyAiCam uses fixed camera-slot tiers (e.g.
+"1-16 cameras"), never an arbitrary customer-chosen quantity. Phase 2's
+`anyaicam_camera_slot_quantity` metadata (the browser-chosen Stripe
+line-item quantity) is REMOVED as an entitlement-quantity source -- it
+was exactly the "trust a browser-submitted number" gap Phase 3's
+security review explicitly closes (see PRICE_ID_CAMERA_SLOT_MAP below).
+`create_stripe_checkout()` also now hard-codes the Stripe line-item
+quantity to 1 rather than a browser-submitted number, so even Stripe's
+own `quantity` field can never be used as a slot-count vector if a
+future maintainer starts reading it.
+
+The new, sole source of camera-slot quantity is PRICE_ID_CAMERA_SLOT_MAP:
+a server-side, env-configured mapping from the exact Stripe Price ID
+purchased (carried through as `anyaicam_stripe_price_id` metadata --
+selected server-side in create_stripe_checkout() via stripe_price_map(),
+never client-supplied) to {"product": ..., "camera_slot_maximum": ...}.
+A checkout or subscription event referencing a Price ID that is not in
+this map is NEVER granted any camera slots -- fail closed, not a guess.
+
+Phase 3 audit finding: no fixed camera-slot tier (including the
+confirmed "1-16 cameras = $14.99" tier) has a proven Stripe Price ID
+anywhere in existing configuration. Checked: (a) this app's own
+STRIPE_PRICE_STARTER/PROFESSIONAL/ENTERPRISE env vars -- unset on the
+one production-style instance checked; (b) the entire anyaicam.com PHP
+website codebase's Stripe integration (stripe-config.php, checkout.php,
+stripe-webhook.php) -- which is scoped EXCLUSIVELY to one-time Videoloft
+adapter/camera/PoE hardware purchases; checkout.php's own comment reads
+"Only adapter payments are accepted through Stripe. Cloud billing is
+handled separately by Videoloft." No camera-slot subscription Price ID
+or product exists in either place. PRICE_ID_CAMERA_SLOT_MAP therefore
+ships EMPTY by default (`{}`) -- see the Phase 3 report for what
+production configuration is still required before this can grant real
+entitlements, and why none was invented here.
 """
 from __future__ import annotations
 
@@ -108,11 +127,16 @@ def upsert_entitlement(
     stripe_customer_id: Optional[str] = None,
     stripe_subscription_id: Optional[str] = None,
     stripe_checkout_session_id: Optional[str] = None,
+    stripe_price_id: Optional[str] = None,
     expires_at: Optional[str] = None,
 ) -> dict:
     """Idempotent per (customer_id, product) -- see module docstring for
-    why this updates in place rather than accumulating rows. A field left
-    as None on an update never blanks out a previously-recorded Stripe
+    why this updates in place rather than accumulating rows. `product` is
+    a STABLE category string (e.g. always "camera_slots"), not a
+    per-tier name -- an upgrade/downgrade between fixed tiers must update
+    this SAME row, never fragment into one row per tier; stripe_price_id
+    records which specific tier is currently active. A field left as
+    None on an update never blanks out a previously-recorded Stripe
     reference (COALESCE), since not every event carries every field
     (e.g. a subscription-cancelled event has no checkout_session_id)."""
     existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (customer_id, product))
@@ -124,19 +148,20 @@ def upsert_entitlement(
                 "stripe_customer_id=COALESCE(?,stripe_customer_id),"
                 "stripe_subscription_id=COALESCE(?,stripe_subscription_id),"
                 "stripe_checkout_session_id=COALESCE(?,stripe_checkout_session_id),"
+                "stripe_price_id=COALESCE(?,stripe_price_id),"
                 "expires_at=?,updated_at=? WHERE id=?",
                 (camera_slot_quantity, status, stripe_customer_id, stripe_subscription_id,
-                 stripe_checkout_session_id, expires_at, now, existing["id"]),
+                 stripe_checkout_session_id, stripe_price_id, expires_at, now, existing["id"]),
             )
             entitlement_id = existing["id"]
         else:
             entitlement_id = uuid.uuid4().hex
             db.execute(
                 "INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,"
-                "stripe_customer_id,stripe_subscription_id,stripe_checkout_session_id,created_at,updated_at,expires_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "stripe_customer_id,stripe_subscription_id,stripe_checkout_session_id,stripe_price_id,created_at,updated_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (entitlement_id, customer_id, product, camera_slot_quantity, status,
-                 stripe_customer_id, stripe_subscription_id, stripe_checkout_session_id, now, now, expires_at),
+                 stripe_customer_id, stripe_subscription_id, stripe_checkout_session_id, stripe_price_id, now, now, expires_at),
             )
     return row("SELECT * FROM customer_entitlements WHERE id=?", (entitlement_id,))
 
@@ -167,6 +192,7 @@ def create_pending_link(
     camera_slot_quantity: int,
     stripe_customer_id: Optional[str] = None,
     stripe_checkout_session_id: Optional[str] = None,
+    stripe_price_id: Optional[str] = None,
     raw_event: dict,
 ) -> dict:
     """Checkout-first safety net: a Stripe purchase completed under an
@@ -178,8 +204,8 @@ def create_pending_link(
     with connection() as db:
         db.execute(
             "INSERT INTO pending_customer_links(id,normalized_email,stripe_customer_id,stripe_checkout_session_id,"
-            "product,camera_slot_quantity,raw_event_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (link_id, normalize_email(email), stripe_customer_id, stripe_checkout_session_id,
+            "stripe_price_id,product,camera_slot_quantity,raw_event_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (link_id, normalize_email(email), stripe_customer_id, stripe_checkout_session_id, stripe_price_id,
              product, camera_slot_quantity, json.dumps(raw_event), "pending", _now()),
         )
     return row("SELECT * FROM pending_customer_links WHERE id=?", (link_id,))
@@ -208,6 +234,7 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
             status="active",
             stripe_customer_id=link["stripe_customer_id"],
             stripe_checkout_session_id=link["stripe_checkout_session_id"],
+            stripe_price_id=link.get("stripe_price_id"),
         )
         with connection() as db:
             db.execute(
@@ -224,24 +251,49 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
 # as of Phase 2 -- see module docstring. Each function here remains
 # independently callable/testable against a synthetic Stripe event dict.
 
-# Fallback-only camera-slot counts, used exclusively when a
-# checkout.session.completed event has no anyaicam_camera_slot_quantity
-# metadata (only possible for a session created before Phase 2 shipped).
-# Audit finding (Phase 2): no real Stripe product/price -> camera-slot
-# mapping exists anywhere in production configuration today --
-# LICENSE_PLAN_FEATURES (main.py) is a feature-flag list with no
-# quantities, and STRIPE_PRICE_STARTER/PROFESSIONAL/ENTERPRISE are bare
-# price-id env vars with no attached quantity metadata. Defaulting to 0
-# here is deliberate -- "0 slots" is an honest, visible "not configured"
-# signal, never a guessed number. Set ANYAICAM_CAMERA_SLOTS_* explicitly
-# if this fallback path is ever actually exercised in production.
-PRODUCT_CAMERA_SLOTS = {
-    "starter": int(os.environ.get("ANYAICAM_CAMERA_SLOTS_STARTER", "0") or 0),
-    "professional": int(os.environ.get("ANYAICAM_CAMERA_SLOTS_PROFESSIONAL", "0") or 0),
-    "enterprise": int(os.environ.get("ANYAICAM_CAMERA_SLOTS_ENTERPRISE", "0") or 0),
-}
+# Server-side, fixed Stripe-Price-ID -> camera-slot-tier mapping. The
+# ONLY source of camera-slot quantity as of Phase 3 -- never a browser-
+# submitted quantity, never a per-plan constant. Format (via
+# ANYAICAM_STRIPE_PRICE_TIER_MAP, a JSON object):
+#   {"price_1AbC...": {"product": "camera_slots_1_16", "camera_slot_maximum": 16},
+#    "price_1DeF...": {"product": "camera_slots_17_32", "camera_slot_maximum": 32}}
+# Ships EMPTY by default -- see module docstring for the Phase 3 audit
+# finding that no tier's Price ID is proven anywhere in existing
+# configuration. A Price ID not present here is never granted slots.
+def _load_price_tier_map() -> dict:
+    raw = os.environ.get("ANYAICAM_STRIPE_PRICE_TIER_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+PRICE_ID_CAMERA_SLOT_MAP = _load_price_tier_map()
 
 SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
+
+
+def resolve_tier(price_id: str) -> Optional[dict]:
+    """Returns {"product": ..., "camera_slot_maximum": ...} for a
+    server-verified Stripe Price ID, or None if this Price ID has no
+    configured tier -- callers must treat None as "grant nothing",
+    never fall back to a guessed quantity."""
+    if not price_id:
+        return None
+    tier = PRICE_ID_CAMERA_SLOT_MAP.get(price_id)
+    if not isinstance(tier, dict):
+        return None
+    product = str(tier.get("product") or "").strip()
+    try:
+        camera_slot_maximum = int(tier.get("camera_slot_maximum"))
+    except (TypeError, ValueError):
+        return None
+    if not product:
+        return None
+    return {"product": product, "camera_slot_maximum": camera_slot_maximum}
 
 
 def is_event_processed(event_id: str) -> bool:
@@ -284,27 +336,29 @@ def sync_entitlement_from_stripe_event(event: dict) -> dict:
 def _extract_checkout_fields(session_obj: dict) -> dict:
     email = (session_obj.get("customer_details") or {}).get("email") or session_obj.get("customer_email") or ""
     metadata = session_obj.get("metadata") or {}
-    plan = str(metadata.get("anyaicam_plan") or "").strip().lower()
-    quantity_raw = metadata.get("anyaicam_camera_slot_quantity")
-    try:
-        camera_slot_quantity = int(quantity_raw) if quantity_raw not in (None, "") else PRODUCT_CAMERA_SLOTS.get(plan, 0)
-    except (TypeError, ValueError):
-        camera_slot_quantity = PRODUCT_CAMERA_SLOTS.get(plan, 0)
+    price_id = str(metadata.get("anyaicam_stripe_price_id") or "").strip()
     return {
         "email": email,
-        "plan": plan,
+        "price_id": price_id,
         "authoritative_customer_id": str(metadata.get("anyaicam_customer_id") or "") or None,
         "stripe_customer_id": str(session_obj.get("customer") or "") or None,
         "stripe_checkout_session_id": str(session_obj.get("id") or "") or None,
-        "camera_slot_quantity": camera_slot_quantity,
     }
 
 
 def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
     fields = _extract_checkout_fields(session_obj)
-    if not fields["plan"]:
-        return {"status": "ignored", "reason": "missing anyaicam_plan metadata"}
+
+    # Fixed-tier lookup is server-side and Price-ID-keyed only -- never a
+    # browser-submitted quantity (see module docstring). A Price ID with
+    # no configured tier is never granted any slots, regardless of what
+    # any other metadata on this event claims (tamper resistance: a
+    # forged/stale anyaicam_camera_slot_quantity value, if one is even
+    # present on an old-shaped event, is never read here at all).
+    tier = resolve_tier(fields["price_id"])
+    if not tier:
+        return {"status": "ignored", "reason": "no verified tier mapping for this stripe price id", "price_id": fields["price_id"]}
 
     # Authoritative-identity-first: a checkout created from a real,
     # signed-in customer_owner session carries its own customers.id in
@@ -322,30 +376,51 @@ def _sync_checkout_completed(event: dict) -> dict:
         if not fields["email"]:
             return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
         link = create_pending_link(
-            email=fields["email"], product=fields["plan"], camera_slot_quantity=fields["camera_slot_quantity"],
+            email=fields["email"], product=tier["product"], camera_slot_quantity=tier["camera_slot_maximum"],
             stripe_customer_id=fields["stripe_customer_id"], stripe_checkout_session_id=fields["stripe_checkout_session_id"],
-            raw_event=event,
+            stripe_price_id=fields["price_id"], raw_event=event,
         )
         return {"status": "pending_link_created", "pending_link_id": link["id"]}
     entitlement = upsert_entitlement(
-        customer_id=customer["id"], product=fields["plan"], camera_slot_quantity=fields["camera_slot_quantity"],
+        customer_id=customer["id"], product=tier["product"], camera_slot_quantity=tier["camera_slot_maximum"],
         status="active", stripe_customer_id=fields["stripe_customer_id"],
-        stripe_checkout_session_id=fields["stripe_checkout_session_id"],
+        stripe_checkout_session_id=fields["stripe_checkout_session_id"], stripe_price_id=fields["price_id"],
     )
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"], "customer_id": customer["id"]}
+
+
+def _current_subscription_price_id(subscription_obj: dict) -> str:
+    """Stripe's subscription object always carries its own current
+    `items.data[].price.id` -- the true, authoritative price a customer
+    is on right now, including after a self-service upgrade/downgrade
+    through the Stripe Customer Portal (which does NOT automatically
+    update arbitrary metadata fields set at creation time, so trusting
+    only our own anyaicam_stripe_price_id metadata here would silently
+    miss a portal-driven tier change). Falls back to that metadata only
+    for a stripped-down payload with no items data (e.g. a minimal test
+    event)."""
+    items = ((subscription_obj.get("items") or {}).get("data") or [])
+    if items and isinstance(items[0], dict):
+        price_id = str((items[0].get("price") or {}).get("id") or "").strip()
+        if price_id:
+            return price_id
+    return str((subscription_obj.get("metadata") or {}).get("anyaicam_stripe_price_id") or "").strip()
 
 
 def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     subscription_obj = (event.get("data") or {}).get("object") or {}
     stripe_customer_id = str(subscription_obj.get("customer") or "")
     metadata = subscription_obj.get("metadata") or {}
-    plan = str(metadata.get("anyaicam_plan") or "").strip().lower()
+    price_id = _current_subscription_price_id(subscription_obj)
     metadata_customer_id = str(metadata.get("anyaicam_customer_id") or "") or None
-    if not stripe_customer_id or not plan:
-        return {"status": "ignored", "reason": "missing stripe customer id or anyaicam_plan metadata"}
+    if not stripe_customer_id or not price_id:
+        return {"status": "ignored", "reason": "missing stripe customer id or anyaicam_stripe_price_id metadata"}
+    tier = resolve_tier(price_id)
+    if not tier:
+        return {"status": "ignored", "reason": "no verified tier mapping for this stripe price id", "price_id": price_id}
     existing = row(
         "SELECT * FROM customer_entitlements WHERE stripe_customer_id=? AND product=?",
-        (stripe_customer_id, plan),
+        (stripe_customer_id, tier["product"]),
     )
     if not existing and metadata_customer_id:
         # Self-healing path: Stripe does not guarantee webhook delivery
@@ -355,16 +430,21 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         # customer_id (see create_stripe_checkout()'s subscription_data
         # metadata), so look the entitlement up that way instead of
         # giving up.
-        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (metadata_customer_id, plan))
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (metadata_customer_id, tier["product"]))
     if not existing:
         return {"status": "ignored", "reason": "no existing entitlement for this stripe customer/product"}
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
     entitlement = upsert_entitlement(
         customer_id=existing["customer_id"],
-        product=plan,
-        camera_slot_quantity=0 if new_status == "cancelled" else existing["camera_slot_quantity"],
+        product=tier["product"],
+        # An upgrade (a different Price ID's subscription.updated for the
+        # SAME product) would arrive with a different tier -- always take
+        # the current event's own verified maximum, never carry forward
+        # the prior row's value, except on cancellation (0).
+        camera_slot_quantity=0 if new_status == "cancelled" else tier["camera_slot_maximum"],
         status=new_status,
         stripe_customer_id=stripe_customer_id,
         stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
+        stripe_price_id=price_id,
     )
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}

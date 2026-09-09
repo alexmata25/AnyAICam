@@ -110998,7 +110998,13 @@ def create_stripe_checkout(
 
 
 
-        ("line_items[0][quantity]", str(quantity)),
+        # Provisioning Phase 3: fixed camera-slot tiers -- the Stripe
+        # line-item quantity is hard-coded to 1 (one subscription to one
+        # specific fixed-tier price), never the customer-submitted
+        # `quantity` field, so it can never become a slot-count multiplier
+        # even if a future maintainer starts reading Stripe's own
+        # quantity value instead of the server-side tier map.
+        ("line_items[0][quantity]", "1"),
 
 
 
@@ -111026,11 +111032,15 @@ def create_stripe_checkout(
 
 
         ("metadata[anyaicam_plan]", plan),
-        # Provisioning Phase 2: the checkout-chosen quantity IS the
-        # authoritative camera-slot count -- carried through metadata
-        # instead of a guessed per-plan constant (see
-        # customer_entitlements.py's PRODUCT_CAMERA_SLOTS docstring).
-        ("metadata[anyaicam_camera_slot_quantity]", str(quantity)),
+        # Provisioning Phase 3: fixed camera-slot tiers -- price_id is
+        # chosen server-side above (stripe_price_map()), never from the
+        # request body, and is the sole key the webhook handler uses to
+        # look up the server-verified camera-slot maximum (see
+        # customer_entitlements.py's PRICE_ID_CAMERA_SLOT_MAP). The
+        # customer-submitted `quantity` is deliberately NOT sent as
+        # entitlement-bearing metadata any more -- see the hard-coded
+        # line_items[0][quantity] below.
+        ("metadata[anyaicam_stripe_price_id]", price_id),
 
 
 
@@ -111049,7 +111059,7 @@ def create_stripe_checkout(
 
 
         ("subscription_data[metadata][anyaicam_plan]", plan),
-        ("subscription_data[metadata][anyaicam_camera_slot_quantity]", str(quantity)),
+        ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
 
 
 

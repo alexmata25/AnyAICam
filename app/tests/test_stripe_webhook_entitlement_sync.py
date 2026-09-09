@@ -1,5 +1,5 @@
-"""Provisioning Phase 2: proves POST /api/payments/stripe/webhook now
-also drives customer_entitlements via sync_entitlement_from_stripe_event()
+"""Provisioning Phase 2/3: proves POST /api/payments/stripe/webhook
+drives customer_entitlements via sync_entitlement_from_stripe_event()
 -- additively, alongside the existing legacy processing
 (process_stripe_webhook_event() / billing_accounts.json), with:
 
@@ -13,7 +13,13 @@ also drives customer_entitlements via sync_entitlement_from_stripe_event()
   before it even reaches process_stripe_webhook_event() OR the new
   entitlement sync,
 - the NEW DB-backed provisioning_webhook_events idempotency as a second,
-  independent guard specifically for the entitlement side.
+  independent guard specifically for the entitlement side,
+- Phase 3's fixed camera-slot tiers: entitlement quantity comes solely
+  from a server-side Price-ID -> tier lookup (PRICE_ID_CAMERA_SLOT_MAP,
+  monkeypatched here to a synthetic tier standing in for a real,
+  ops-configured Stripe Price ID -- see customer_entitlements.py's
+  module docstring for the audit finding that none is proven anywhere
+  in existing production configuration today).
 """
 import hashlib
 import hmac
@@ -25,6 +31,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from database_backend import override_target
+
+TIER_1_16 = "price_test_1_16"
 
 
 @pytest.fixture()
@@ -38,6 +46,7 @@ def client(db_path, tmp_path, monkeypatch):
         from partner_db import initialize_database
         initialize_database()
         import main
+        import customer_entitlements as ce
 
         monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")
         monkeypatch.setattr(main, "SESSIONS_FILE", tmp_path / "sessions.json")
@@ -45,6 +54,7 @@ def client(db_path, tmp_path, monkeypatch):
         monkeypatch.setattr(main, "PAYMENT_SESSIONS_FILE", tmp_path / "payment_sessions.json")
         monkeypatch.setattr(main, "BILLING_ACCOUNTS_FILE", tmp_path / "billing_accounts.json")
         monkeypatch.setattr(main, "verify_stripe_webhook_signature", lambda payload, signature: True)
+        monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", {TIER_1_16: {"product": "camera_slots", "camera_slot_maximum": 16}})
 
         with TestClient(main.app, follow_redirects=False) as test_client:
             yield test_client, main
@@ -61,9 +71,9 @@ def _seed_tenant(db_path, customer_id="cust-1", email="real-customer@example.tes
         conn.commit()
 
 
-def _checkout_completed_event(event_id="evt_1", email="real-customer@example.test", plan="starter",
-                               stripe_customer="cus_1", quantity=4, customer_id=None):
-    metadata = {"anyaicam_plan": plan, "anyaicam_camera_slot_quantity": str(quantity)}
+def _checkout_completed_event(event_id="evt_1", email="real-customer@example.test", price_id=TIER_1_16,
+                               stripe_customer="cus_1", customer_id=None):
+    metadata = {"anyaicam_stripe_price_id": price_id}
     if customer_id:
         metadata["anyaicam_customer_id"] = customer_id
     return {
@@ -94,19 +104,34 @@ def _post_webhook(test_client, event):
 def test_checkout_completed_updates_customer_entitlements_for_a_signed_in_customer(client, db_path):
     test_client, main = client
     _seed_tenant(db_path, customer_id="cust-1", email="real-customer@example.test")
-    response = _post_webhook(test_client, _checkout_completed_event(customer_id="cust-1", quantity=8))
+    response = _post_webhook(test_client, _checkout_completed_event(customer_id="cust-1"))
     assert response.status_code == 200
 
     with override_target(sqlite_path=str(db_path)):
         import customer_entitlements as ce
         total = ce.total_camera_slots("cust-1")
-    assert total == 8
+    assert total == 16
+
+
+def test_checkout_completed_with_an_unmapped_price_id_grants_nothing(client, db_path):
+    """Fixed-tier fail-closed behavior, exercised through the real HTTP
+    route: a Price ID with no server-side tier configured must never
+    grant camera slots, even though the webhook itself is accepted."""
+    test_client, main = client
+    _seed_tenant(db_path, customer_id="cust-1", email="real-customer@example.test")
+    response = _post_webhook(test_client, _checkout_completed_event(customer_id="cust-1", price_id="price_totally_unconfigured"))
+    assert response.status_code == 200
+
+    with override_target(sqlite_path=str(db_path)):
+        import customer_entitlements as ce
+        total = ce.total_camera_slots("cust-1")
+    assert total == 0
 
 
 def test_duplicate_stripe_event_never_double_grants_slots(client, db_path):
     test_client, main = client
     _seed_tenant(db_path, customer_id="cust-1", email="real-customer@example.test")
-    event = _checkout_completed_event(event_id="evt_dup", customer_id="cust-1", quantity=5)
+    event = _checkout_completed_event(event_id="evt_dup", customer_id="cust-1")
 
     first = _post_webhook(test_client, event)
     second = _post_webhook(test_client, event)
@@ -118,13 +143,13 @@ def test_duplicate_stripe_event_never_double_grants_slots(client, db_path):
         import customer_entitlements as ce
         total = ce.total_camera_slots("cust-1")
         entitlements = ce.get_entitlements_for_customer("cust-1")
-    assert total == 5
+    assert total == 16
     assert len(entitlements) == 1
 
 
 def test_checkout_before_registration_creates_a_pending_link_not_a_duplicate_customer(client, db_path):
     test_client, main = client
-    response = _post_webhook(test_client, _checkout_completed_event(email="brand-new@example.test", quantity=4))
+    response = _post_webhook(test_client, _checkout_completed_event(email="brand-new@example.test"))
     assert response.status_code == 200
 
     with override_target(sqlite_path=str(db_path)):
@@ -132,7 +157,7 @@ def test_checkout_before_registration_creates_a_pending_link_not_a_duplicate_cus
         customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
         pending = conn.execute("SELECT status,camera_slot_quantity FROM pending_customer_links WHERE normalized_email=?", ("brand-new@example.test",)).fetchone()
     assert customers == 0  # no duplicate/guessed customer created
-    assert pending == ("pending", 4)
+    assert pending == ("pending", 16)
 
 
 def test_entitlement_sync_failure_never_breaks_the_webhook_response(client, db_path, monkeypatch):
@@ -167,12 +192,15 @@ def test_legacy_processing_still_runs_unchanged_alongside_the_new_sync(client, d
 def test_subscription_cancellation_updates_entitlement_status_via_webhook(client, db_path):
     test_client, main = client
     _seed_tenant(db_path, customer_id="cust-1", email="real-customer@example.test")
-    _post_webhook(test_client, _checkout_completed_event(event_id="evt_created", customer_id="cust-1", stripe_customer="cus_sub_1", quantity=10))
+    _post_webhook(test_client, _checkout_completed_event(event_id="evt_created", customer_id="cust-1", stripe_customer="cus_sub_1"))
 
     cancel_event = {
         "id": "evt_cancelled",
         "type": "customer.subscription.deleted",
-        "data": {"object": {"id": "sub_1", "customer": "cus_sub_1", "status": "canceled", "metadata": {"anyaicam_plan": "starter"}}},
+        "data": {"object": {
+            "id": "sub_1", "customer": "cus_sub_1", "status": "canceled",
+            "items": {"data": [{"price": {"id": TIER_1_16}}]}, "metadata": {},
+        }},
     }
     response = _post_webhook(test_client, cancel_event)
     assert response.status_code == 200

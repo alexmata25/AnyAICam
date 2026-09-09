@@ -321,6 +321,24 @@ def apply_migrations():
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
         if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')
 
+        # Provisioning Phase 3: `product` is a stable category string
+        # (e.g. always "camera_slots") so an upgrade/downgrade between
+        # fixed tiers updates the SAME row (customer_id,product) rather
+        # than fragmenting into one row per tier -- see customer_
+        # entitlements.py's module docstring. stripe_price_id records
+        # exactly which server-verified tier is currently active, for
+        # traceability/support/display, independent of that stable
+        # product key.
+        entitlement_columns=({item['name'] for item in db.execute('PRAGMA table_info(customer_entitlements)').fetchall()}
+                             if backend()=='sqlite' else
+                             {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='customer_entitlements'").fetchall()})
+        if 'stripe_price_id' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN stripe_price_id TEXT')
+
+        pending_link_columns=({item['name'] for item in db.execute('PRAGMA table_info(pending_customer_links)').fetchall()}
+                              if backend()=='sqlite' else
+                              {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='pending_customer_links'").fetchall()})
+        if 'stripe_price_id' not in pending_link_columns: db.execute('ALTER TABLE pending_customer_links ADD COLUMN stripe_price_id TEXT')
+
         # Appliance identity contract (see appliance_identity.py):
         # authorization_version_at_login records the identity's
         # authorization_version at the moment this session was

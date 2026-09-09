@@ -119,13 +119,28 @@ def test_resolving_pending_links_is_a_noop_when_none_exist(db_path):
 
 
 # --------------------------------------------------------- Stripe webhook bridge
+#
+# Phase 3: fixed camera-slot tiers, server-side Price-ID-keyed only. Every
+# test below runs with a synthetic PRICE_ID_CAMERA_SLOT_MAP (monkeypatched)
+# standing in for real, ops-configured tier Price IDs -- see customer_
+# entitlements.py's module docstring for the audit finding that no such
+# Price ID is proven anywhere in existing production configuration today.
+
+TIER_1_16 = "price_test_1_16"
+TIER_17_32 = "price_test_17_32"
 
 
-def _checkout_event(event_id="evt_checkout_1", email="real-customer@example.test", plan="starter", stripe_customer="cus_1",
-                     camera_slot_quantity=None, authoritative_customer_id=None):
-    metadata = {"anyaicam_plan": plan}
-    if camera_slot_quantity is not None:
-        metadata["anyaicam_camera_slot_quantity"] = str(camera_slot_quantity)
+@pytest.fixture(autouse=True)
+def _tier_map(monkeypatch):
+    monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", {
+        TIER_1_16: {"product": "camera_slots", "camera_slot_maximum": 16},
+        TIER_17_32: {"product": "camera_slots", "camera_slot_maximum": 32},
+    })
+
+
+def _checkout_event(event_id="evt_checkout_1", email="real-customer@example.test", price_id=TIER_1_16, stripe_customer="cus_1",
+                     authoritative_customer_id=None):
+    metadata = {"anyaicam_stripe_price_id": price_id}
     if authoritative_customer_id is not None:
         metadata["anyaicam_customer_id"] = authoritative_customer_id
     return {
@@ -140,13 +155,28 @@ def _checkout_event(event_id="evt_checkout_1", email="real-customer@example.test
     }
 
 
-def test_checkout_completed_grants_entitlement_for_a_matching_authoritative_customer(db_path):
+def _subscription_event(event_id, *, stripe_customer, price_id, status="active", customer_id=None, event_type="customer.subscription.updated"):
+    metadata = {}
+    if customer_id is not None:
+        metadata["anyaicam_customer_id"] = customer_id
+    return {
+        "id": event_id,
+        "type": event_type,
+        "data": {"object": {
+            "id": "sub_1", "customer": stripe_customer, "status": status,
+            "items": {"data": [{"price": {"id": price_id}}]},
+            "metadata": metadata,
+        }},
+    }
+
+
+def test_checkout_completed_grants_the_servers_verified_tier_maximum(db_path):
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        result = ce.sync_entitlement_from_stripe_event(_checkout_event())
+        result = ce.sync_entitlement_from_stripe_event(_checkout_event(price_id=TIER_1_16))
         total = ce.total_camera_slots("cust-1")
     assert result["status"] == "entitlement_updated"
-    assert total == ce.PRODUCT_CAMERA_SLOTS["starter"]
+    assert total == 16
 
 
 def test_checkout_completed_creates_a_pending_link_when_no_customer_matches(db_path):
@@ -168,7 +198,19 @@ def test_checkout_completed_event_is_idempotent_on_retry(db_path):
     assert len(entitlements) == 1
 
 
-def test_checkout_completed_ignored_without_plan_metadata(db_path):
+def test_checkout_completed_ignored_when_price_id_has_no_verified_tier(db_path):
+    """The core Phase 3 security fix: an unmapped Price ID -- including
+    one an attacker crafted -- must never grant any camera slots. Fail
+    closed, not a guess."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        result = ce.sync_entitlement_from_stripe_event(_checkout_event(price_id="price_totally_unconfigured"))
+        total = ce.total_camera_slots("cust-1")
+    assert result["status"] == "ignored"
+    assert total == 0
+
+
+def test_checkout_completed_ignored_without_any_price_id_metadata(db_path):
     _seed_customer(db_path)
     event = _checkout_event()
     event["data"]["object"]["metadata"] = {}
@@ -186,12 +228,8 @@ def test_event_without_an_id_is_rejected_outright(db_path):
 def test_subscription_deleted_cancels_the_entitlement_and_zeroes_camera_slots(db_path):
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        ce.sync_entitlement_from_stripe_event(_checkout_event(stripe_customer="cus_sub_1"))
-        cancel_event = {
-            "id": "evt_cancel_1",
-            "type": "customer.subscription.deleted",
-            "data": {"object": {"id": "sub_1", "customer": "cus_sub_1", "status": "canceled", "metadata": {"anyaicam_plan": "starter"}}},
-        }
+        ce.sync_entitlement_from_stripe_event(_checkout_event(stripe_customer="cus_sub_1", price_id=TIER_1_16))
+        cancel_event = _subscription_event("evt_cancel_1", stripe_customer="cus_sub_1", price_id=TIER_1_16, status="canceled", event_type="customer.subscription.deleted")
         result = ce.sync_entitlement_from_stripe_event(cancel_event)
         total = ce.total_camera_slots("cust-1")
     assert result["status"] == "entitlement_updated"
@@ -200,42 +238,30 @@ def test_subscription_deleted_cancels_the_entitlement_and_zeroes_camera_slots(db
 
 def test_subscription_update_for_an_unknown_stripe_customer_is_ignored_not_fabricated(db_path):
     with override_target(sqlite_path=db_path):
-        event = {
-            "id": "evt_unknown_1",
-            "type": "customer.subscription.updated",
-            "data": {"object": {"id": "sub_x", "customer": "cus_never_seen", "status": "active", "metadata": {"anyaicam_plan": "starter"}}},
-        }
+        event = _subscription_event("evt_unknown_1", stripe_customer="cus_never_seen", price_id=TIER_1_16)
         result = ce.sync_entitlement_from_stripe_event(event)
     assert result["status"] == "ignored"
 
 
-# --------------------------- Phase 2: authoritative-identity-first + real quantity
-
-
-def test_checkout_completed_uses_the_real_stripe_line_item_quantity_not_a_guessed_constant(db_path):
-    _seed_customer(db_path, email="real-customer@example.test")
-    with override_target(sqlite_path=db_path):
-        ce.sync_entitlement_from_stripe_event(_checkout_event(camera_slot_quantity=7))
-        total = ce.total_camera_slots("cust-1")
-    assert total == 7
+# ------------------------------------- Phase 2 (still true under Phase 3): identity
 
 
 def test_checkout_completed_prefers_authoritative_customer_id_metadata_over_email(db_path):
-    """The core Phase 2 identity fix: a signed-in checkout must never be
-    resolved by re-deriving identity from customer-supplied email when
-    the checkout already carries the real customers.id."""
+    """A signed-in checkout must never be resolved by re-deriving
+    identity from customer-supplied email when the checkout already
+    carries the real customers.id."""
     _seed_customer(db_path, customer_id="cust-1", email="real-customer@example.test")
     _seed_customer(db_path, customer_id="cust-2", email="a-different-email-entirely@example.test")
     with override_target(sqlite_path=db_path):
         # Email on the Stripe session points at cust-1's email, but the
         # authoritative metadata says cust-2 -- metadata must win.
-        event = _checkout_event(email="real-customer@example.test", camera_slot_quantity=5, authoritative_customer_id="cust-2")
+        event = _checkout_event(email="real-customer@example.test", price_id=TIER_1_16, authoritative_customer_id="cust-2")
         result = ce.sync_entitlement_from_stripe_event(event)
         cust1_total = ce.total_camera_slots("cust-1")
         cust2_total = ce.total_camera_slots("cust-2")
     assert result["customer_id"] == "cust-2"
     assert cust1_total == 0
-    assert cust2_total == 5
+    assert cust2_total == 16
 
 
 def test_checkout_completed_falls_back_to_email_when_no_authoritative_customer_id(db_path):
@@ -244,7 +270,7 @@ def test_checkout_completed_falls_back_to_email_when_no_authoritative_customer_i
     the expected, documented fallback (not a bug)."""
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        result = ce.sync_entitlement_from_stripe_event(_checkout_event(camera_slot_quantity=5))
+        result = ce.sync_entitlement_from_stripe_event(_checkout_event())
     assert result["status"] == "entitlement_updated"
     assert result["customer_id"] == "cust-1"
 
@@ -254,7 +280,7 @@ def test_checkout_completed_with_unknown_authoritative_customer_id_falls_back_to
     or silently drop the purchase -- email reconciliation still applies."""
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        event = _checkout_event(camera_slot_quantity=5, authoritative_customer_id="cust-deleted")
+        event = _checkout_event(authoritative_customer_id="cust-deleted")
         result = ce.sync_entitlement_from_stripe_event(event)
     assert result["status"] == "entitlement_updated"
     assert result["customer_id"] == "cust-1"
@@ -271,20 +297,13 @@ def test_subscription_change_self_heals_via_metadata_customer_id_when_stripe_cus
         # Entitlement exists (e.g. created via a pending-link resolution
         # that never recorded a stripe_customer_id) but under no
         # stripe_customer_id this subscription event's own value matches.
-        ce.upsert_entitlement(customer_id="cust-1", product="professional", camera_slot_quantity=10, status="active")
-        event = {
-            "id": "evt_sub_selfheal",
-            "type": "customer.subscription.updated",
-            "data": {"object": {
-                "id": "sub_1", "customer": "cus_not_previously_recorded", "status": "active",
-                "metadata": {"anyaicam_plan": "professional", "anyaicam_customer_id": "cust-1"},
-            }},
-        }
+        ce.upsert_entitlement(customer_id="cust-1", product="camera_slots", camera_slot_quantity=16, status="active")
+        event = _subscription_event("evt_sub_selfheal", stripe_customer="cus_not_previously_recorded", price_id=TIER_1_16, customer_id="cust-1")
         result = ce.sync_entitlement_from_stripe_event(event)
         entitlement = ce.get_entitlements_for_customer("cust-1")[0]
     assert result["status"] == "entitlement_updated"
     assert entitlement["stripe_customer_id"] == "cus_not_previously_recorded"  # now backfilled
-    assert entitlement["camera_slot_quantity"] == 10  # unchanged -- an update event doesn't invent a new quantity
+    assert entitlement["camera_slot_quantity"] == 16
 
 
 def test_subscription_event_never_fabricates_an_entitlement_out_of_nothing(db_path):
@@ -293,40 +312,64 @@ def test_subscription_event_never_fabricates_an_entitlement_out_of_nothing(db_pa
     bare subscription event with no prior checkout at all."""
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        event = {
-            "id": "evt_sub_first",
-            "type": "customer.subscription.updated",
-            "data": {"object": {
-                "id": "sub_1", "customer": "cus_never_seen_yet", "status": "active",
-                "metadata": {"anyaicam_plan": "professional", "anyaicam_customer_id": "cust-1"},
-            }},
-        }
+        event = _subscription_event("evt_sub_first", stripe_customer="cus_never_seen_yet", price_id=TIER_1_16, customer_id="cust-1")
         result = ce.sync_entitlement_from_stripe_event(event)
         entitlements = ce.get_entitlements_for_customer("cust-1")
     assert result["status"] == "ignored"
     assert entitlements == []
 
 
-def test_subscription_updated_with_a_new_quantity_reflects_a_plan_change(db_path):
-    """A plain subscription.updated (not cancellation) -- e.g. the
-    customer changed their Stripe-side quantity/plan directly through the
-    Stripe customer portal rather than a new checkout. Must update
-    in place, active, with the new count -- not treat it as a
-    cancellation and not accumulate a second row."""
+# ------------------------------------------------------- Phase 3: fixed tiers
+
+
+def test_subscription_updated_with_the_same_tier_is_a_pure_status_refresh(db_path):
+    """A plain subscription.updated for the SAME price/tier (e.g. Stripe
+    re-confirming an active subscription) must update in place, active,
+    with the same verified maximum -- not accumulate a second row."""
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        ce.sync_entitlement_from_stripe_event(_checkout_event(stripe_customer="cus_upgrade_1", camera_slot_quantity=4))
-        update_event = {
-            "id": "evt_upgrade_1",
-            "type": "customer.subscription.updated",
-            "data": {"object": {"id": "sub_1", "customer": "cus_upgrade_1", "status": "active", "metadata": {"anyaicam_plan": "starter"}}},
-        }
+        ce.sync_entitlement_from_stripe_event(_checkout_event(stripe_customer="cus_refresh_1", price_id=TIER_1_16))
+        update_event = _subscription_event("evt_refresh_1", stripe_customer="cus_refresh_1", price_id=TIER_1_16)
         result = ce.sync_entitlement_from_stripe_event(update_event)
         entitlements = ce.get_entitlements_for_customer("cust-1")
     assert result["status"] == "entitlement_updated"
     assert len(entitlements) == 1
     assert entitlements[0]["status"] == "active"
-    assert entitlements[0]["camera_slot_quantity"] == 4  # unchanged by a bare status-only update event
+    assert entitlements[0]["camera_slot_quantity"] == 16
+
+
+def test_upgrade_to_a_higher_tier_updates_the_same_entitlement_row(db_path):
+    """The exact Phase 3 upgrade requirement: 1-16 -> 17-32, same
+    customer_entitlements record, no duplicate row, VMS refresh sees the
+    new maximum."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        ce.sync_entitlement_from_stripe_event(_checkout_event(stripe_customer="cus_upgrade_1", price_id=TIER_1_16))
+        before = ce.get_entitlements_for_customer("cust-1")
+        upgrade_event = _subscription_event("evt_upgrade_1", stripe_customer="cus_upgrade_1", price_id=TIER_17_32)
+        result = ce.sync_entitlement_from_stripe_event(upgrade_event)
+        after = ce.get_entitlements_for_customer("cust-1")
+        total = ce.total_camera_slots("cust-1")
+    assert result["status"] == "entitlement_updated"
+    assert len(after) == 1
+    assert after[0]["id"] == before[0]["id"]  # same row, not a second one
+    assert after[0]["stripe_price_id"] == TIER_17_32
+    assert total == 32
+
+
+def test_tampered_camera_slot_quantity_metadata_is_never_read(db_path):
+    """Even if a checkout.session.completed event carries a forged/stale
+    anyaicam_camera_slot_quantity field claiming an enormous number
+    (Phase 2's now-removed mechanism), the Phase 3 entitlement sync must
+    never read it -- only the server-verified Price ID tier matters."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        event = _checkout_event(price_id=TIER_1_16)
+        event["data"]["object"]["metadata"]["anyaicam_camera_slot_quantity"] = "999999"
+        result = ce.sync_entitlement_from_stripe_event(event)
+        total = ce.total_camera_slots("cust-1")
+    assert result["status"] == "entitlement_updated"
+    assert total == 16  # the real 1-16 tier maximum, not the forged 999999
 
 
 def test_duplicate_checkout_session_replayed_under_a_different_event_id_does_not_double_count(db_path):
@@ -337,11 +380,23 @@ def test_duplicate_checkout_session_replayed_under_a_different_event_id_does_not
     still prevent double-counting."""
     _seed_customer(db_path, email="real-customer@example.test")
     with override_target(sqlite_path=db_path):
-        first = ce.sync_entitlement_from_stripe_event(_checkout_event(event_id="evt_a", camera_slot_quantity=6))
-        second = ce.sync_entitlement_from_stripe_event(_checkout_event(event_id="evt_b", camera_slot_quantity=6))
+        first = ce.sync_entitlement_from_stripe_event(_checkout_event(event_id="evt_a", price_id=TIER_1_16))
+        second = ce.sync_entitlement_from_stripe_event(_checkout_event(event_id="evt_b", price_id=TIER_1_16))
         total = ce.total_camera_slots("cust-1")
         entitlements = ce.get_entitlements_for_customer("cust-1")
     assert first["status"] == "entitlement_updated"
     assert second["status"] == "entitlement_updated"  # a different event id, so processed -- but idempotent by design
-    assert total == 6  # not 12
+    assert total == 16  # not 32
     assert len(entitlements) == 1
+
+
+def test_resolve_tier_rejects_a_malformed_map_entry(db_path, monkeypatch):
+    """Defensive: a bad ANYAICAM_STRIPE_PRICE_TIER_MAP entry (missing
+    camera_slot_maximum, non-numeric, empty product) must never resolve
+    to a usable tier -- fail closed, not a crash or a guessed number."""
+    with override_target(sqlite_path=db_path):
+        assert ce.resolve_tier("price_totally_unconfigured") is None
+        monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", {"price_bad": {"product": "camera_slots"}})
+        assert ce.resolve_tier("price_bad") is None
+        monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", {"price_bad2": {"camera_slot_maximum": 16}})
+        assert ce.resolve_tier("price_bad2") is None

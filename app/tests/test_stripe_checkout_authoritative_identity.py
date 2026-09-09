@@ -1,11 +1,15 @@
-"""Provisioning Phase 2: proves POST /api/payments/checkout now carries
+"""Provisioning Phase 2/3: proves POST /api/payments/checkout carries
 authoritative identity through Stripe metadata instead of trusting
 customer-supplied email as primary identity when the caller is already
 signed in via the authoritative customer system (partner_identity()),
 while preserving every existing legacy field/behavior for a caller with
 no authoritative session at all (current_user()/users.json/
 billing_accounts.json untouched -- see main.py's create_stripe_checkout()
-for the exact diff and rationale).
+for the exact diff and rationale). Phase 3 additionally proves the fixed-
+tier hardening: a customer-submitted `quantity` never reaches Stripe as
+a slot-count vector (line-item quantity hard-coded to 1, no camera-slot-
+bearing metadata sent) -- the server-selected Stripe Price ID
+(`anyaicam_stripe_price_id`) is the only camera-slot-relevant signal.
 
 stripe_api_post() (the actual network call to Stripe) is monkeypatched
 to capture the `fields` list instead of making a real HTTP request --
@@ -106,7 +110,11 @@ def test_anonymous_checkout_keeps_every_existing_legacy_field(client):
     assert "subscription_data[metadata][anyaicam_customer_id]" not in fields
 
 
-def test_anonymous_checkout_still_carries_the_chosen_quantity_as_camera_slot_metadata(client):
+def test_customer_submitted_quantity_is_never_sent_to_stripe_as_a_slot_multiplier(client):
+    """Phase 3: fixed camera-slot tiers -- a customer-submitted `quantity`
+    must never reach Stripe as the line-item quantity (it is hard-coded
+    to 1) or as camera-slot-bearing metadata, even though the request
+    field itself still exists on the model for backward compatibility."""
     test_client, captured = client
     import main
     token = _legacy_session_cookie(main)
@@ -116,9 +124,26 @@ def test_anonymous_checkout_still_carries_the_chosen_quantity_as_camera_slot_met
     )
     assert response.status_code == 200
     fields = _fields_dict(captured["fields"])
-    assert fields["line_items[0][quantity]"] == "6"
-    assert fields["metadata[anyaicam_camera_slot_quantity]"] == "6"
-    assert fields["subscription_data[metadata][anyaicam_camera_slot_quantity]"] == "6"
+    assert fields["line_items[0][quantity]"] == "1"
+    assert "metadata[anyaicam_camera_slot_quantity]" not in fields
+    assert "subscription_data[metadata][anyaicam_camera_slot_quantity]" not in fields
+
+
+def test_checkout_carries_the_server_selected_price_id_never_a_browser_value(client):
+    """The sole source of camera-slot entitlement quantity going forward
+    -- server-selected via stripe_price_map(), independently of whatever
+    the request body contains."""
+    test_client, captured = client
+    import main
+    token = _legacy_session_cookie(main)
+    response = test_client.post(
+        "/api/payments/checkout", json={"plan": "professional", "quantity": 1},
+        cookies={main.SESSION_COOKIE_NAME: token},
+    )
+    assert response.status_code == 200
+    fields = _fields_dict(captured["fields"])
+    assert fields["metadata[anyaicam_stripe_price_id]"] == "price_test_pro"
+    assert fields["subscription_data[metadata][anyaicam_stripe_price_id]"] == "price_test_pro"
 
 
 # --------------------------------------------- authoritative signed-in path
@@ -137,7 +162,8 @@ def test_signed_in_customer_checkout_carries_the_authoritative_customer_id(clien
     fields = _fields_dict(captured["fields"])
     assert fields["metadata[anyaicam_customer_id]"] == "cust-1"
     assert fields["subscription_data[metadata][anyaicam_customer_id]"] == "cust-1"
-    assert fields["metadata[anyaicam_camera_slot_quantity]"] == "3"
+    assert fields["metadata[anyaicam_stripe_price_id]"] == "price_test_starter"
+    assert "metadata[anyaicam_camera_slot_quantity]" not in fields  # the customer-submitted quantity (3) is never sent as slot-bearing metadata
 
 
 def test_signed_in_customer_checkout_prefers_the_authoritative_email_for_stripe_customer_email(client, db_path):
