@@ -287,51 +287,104 @@ def test_email_delivery_failure_full_stack_entitlement_correct(client, db_path, 
     assert _previews(tmp_path) == []
 
 
-def test_STAGING_FINDING_a_redelivered_event_never_reaches_the_retry_because_of_pre_existing_legacy_dedup(client, db_path, monkeypatch):
-    """Real finding from this staging validation, not a pre-written
-    expectation: main.py's webhook route has a pre-existing, Phase-6-
-    unrelated idempotency gate --
+def test_FIXED_a_redelivered_event_retries_a_failed_notification_without_reprocessing_the_entitlement(client, db_path, monkeypatch):
+    """Regression test for the exact gap this staging pass found and
+    fixed: main.py's webhook route used to short-circuit the ENTIRE
+    route -- including notify_from_stripe_event() -- on any redelivery
+    of an already-seen event id (record_stripe_webhook_event()'s
+    pre-existing duplicate gate), so a 'failed' provisioning_
+    notifications row from the first delivery had no real trigger that
+    could ever retry it: Stripe only redelivers an event it has already
+    seen, and every such redelivery hit that same early return.
 
-        if not record_stripe_webhook_event(event): return {"status":
-        "complete", "duplicate": True}
+    The fix: record_stripe_webhook_event()'s dedup still gates the
+    entitlement/hardware syncs (a redelivery NEVER re-runs those -- no
+    duplicate entitlement, no duplicate hardware order, proven below),
+    but notify_from_stripe_event() now runs on every delivery, fresh or
+    redelivered, relying on its OWN separate (event_id, notification_
+    type) idempotency to guarantee at most one successful send while
+    still allowing a 'failed' row to be retried.
 
-    -- that runs BEFORE process_stripe_webhook_event(), BEFORE the
-    entitlement/hardware syncs, and BEFORE notify_from_stripe_event(),
-    for ANY event id the route has seen before. A literal redelivery of
-    the exact same Stripe event (a genuine Stripe retry, or a human
-    clicking "resend" in the Stripe Dashboard) short-circuits at that
-    gate and never reaches Phase 6's notification code at all -- so a
-    'failed' provisioning_notifications row set on the first delivery is
-    NOT actually retried by a real webhook redelivery today, contradicting
-    what this test originally assumed before being run against the real
-    route (a purely direct-function-call unit test would never have
-    caught this, since it never goes through record_stripe_webhook_event()
-    in the first place). This is the most important actionable output of
-    this staging pass -- see the final report.
+    Full required sequence, all through the real HTTP route:
+      first webhook (email backend broken) -> entitlement/order commits,
+        email attempt fails, recorded 'failed'
+      Stripe redelivers the SAME event (email backend now healthy) ->
+        response still reports duplicate:true, NO duplicate entitlement,
+        NO duplicate hardware order, the failed email is retried and
+        now marked 'sent'
+      a THIRD delivery of the same event -> no third email
     """
     test_client, tmp_path = client
     _seed_customer(db_path)
-    event = _checkout_event("evt_staging_flaky2", TIER_LOCAL_1_8, customer_id="cust-1")
+    event = _checkout_event("evt_staging_retry_fix", TIER_LOCAL_1_8, customer_id="cust-1")
 
     import purchase_notifications as pn
+    import customer_entitlements as ce
 
     class _FailingBackend:
         def send(self, *a, **k):
             raise RuntimeError("staging SMTP simulated failure")
 
+    # --- delivery 1: entitlement commits, email fails ---
     monkeypatch.setattr(pn, "get_email_service", lambda: _FailingBackend())
-    _post_webhook(test_client, event)
-
-    monkeypatch.setattr(pn, "get_email_service", email_service.get_email_service)
-    redelivery = _post_webhook(test_client, event)  # same event id, real Stripe-retry shape
-    assert redelivery.status_code == 200
-    assert redelivery.json().get("duplicate") is True  # confirms the pre-existing gate is what fired
+    first = _post_webhook(test_client, event)
+    assert first.status_code == 200
+    assert first.json().get("duplicate") is not True  # a genuinely new event
 
     with override_target(sqlite_path=str(db_path)):
         from partner_db import row
-        still_failed = row("SELECT status FROM provisioning_notifications WHERE stripe_event_id=?", ("evt_staging_flaky2",))
-    assert still_failed["status"] == "failed"  # never retried by the redelivery itself
+        total_after_first = ce.total_camera_slots("cust-1")
+        entitlements_after_first = ce.get_entitlements_for_customer("cust-1")
+        row_after_first = row("SELECT status FROM provisioning_notifications WHERE stripe_event_id=?", ("evt_staging_retry_fix",))
+    assert total_after_first == 8
+    assert len(entitlements_after_first) == 1  # exactly one entitlement row
+    assert row_after_first["status"] == "failed"
     assert _previews(tmp_path) == []
+
+    # --- delivery 2: Stripe redelivers the same event; email backend is healthy again ---
+    monkeypatch.setattr(pn, "get_email_service", email_service.get_email_service)
+    redelivery = _post_webhook(test_client, event)
+    assert redelivery.status_code == 200
+    assert redelivery.json().get("duplicate") is True  # the dedup gate still correctly identifies it
+
+    with override_target(sqlite_path=str(db_path)):
+        total_after_redelivery = ce.total_camera_slots("cust-1")
+        entitlements_after_redelivery = ce.get_entitlements_for_customer("cust-1")
+        row_after_redelivery = row("SELECT status FROM provisioning_notifications WHERE stripe_event_id=?", ("evt_staging_retry_fix",))
+    assert total_after_redelivery == 8  # unchanged
+    assert len(entitlements_after_redelivery) == 1  # still exactly one row -- no duplicate entitlement
+    assert entitlements_after_redelivery[0]["id"] == entitlements_after_first[0]["id"]  # the SAME row, not a new one
+    assert row_after_redelivery["status"] == "sent"  # the retry succeeded
+    previews = _previews(tmp_path)
+    assert len(previews) == 1
+    assert previews[0]["type"] == "account_ready"
+
+    # --- delivery 3: another redelivery must not send a second email ---
+    third = _post_webhook(test_client, event)
+    assert third.status_code == 200
+    assert third.json().get("duplicate") is True
+    assert len(_previews(tmp_path)) == 1  # still exactly one
+
+
+def test_FIXED_redelivery_never_creates_a_duplicate_hardware_order_either(client, db_path, monkeypatch):
+    """Same fix, same guarantee, for the hardware-order side -- a
+    redelivered event must never create a second hardware_orders row,
+    even though notify_from_stripe_event() now runs on every delivery."""
+    test_client, tmp_path = client
+    _seed_customer(db_path)
+    event = _checkout_event("evt_staging_hw_retry", RYZEN_STARTER_STAGING, customer_id="cust-1", mode="payment")
+
+    first = _post_webhook(test_client, event)
+    assert first.status_code == 200
+    second = _post_webhook(test_client, event)
+    assert second.status_code == 200
+    assert second.json().get("duplicate") is True
+
+    with override_target(sqlite_path=str(db_path)):
+        import hardware_orders as ho
+        orders = ho.get_orders_for_customer("cust-1")
+    assert len(orders) == 1  # no duplicate hardware order from the redelivery
+    assert len(_previews(tmp_path)) == 1  # no duplicate hardware confirmation email either
 
 
 def test_a_failed_notification_CAN_be_retried_by_directly_re_invoking_the_notifier(client, db_path, monkeypatch):
