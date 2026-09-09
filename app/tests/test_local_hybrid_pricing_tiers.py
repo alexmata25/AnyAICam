@@ -174,3 +174,72 @@ def test_cancelling_hybrid_leaves_local_active(db_path, _real_tier_map):
         entitlements = {e["product"]: (e["camera_slot_quantity"], e["status"]) for e in ce.get_entitlements_for_customer("cust-1")}
     assert entitlements["camera_slots_hybrid"] == (0, "cancelled")
     assert entitlements["camera_slots_local"] == (8, "active")
+
+
+# --------------------------------------- verified production Stripe Price IDs
+#
+# The actual 8 LIVE-mode Price IDs from the production Stripe account,
+# confirmed via the Stripe Dashboard (Sandbox/Test toggle off, /products)
+# -- not secrets, safe to keep in source (same treatment as the
+# pre-existing hardware Price IDs already in stripe-config.php). These
+# live in ecs-task-definition.production.json's environment block, not
+# yet deployed. This test proves PLAN_TIERS resolves each one to the
+# exact right product/camera-slot-maximum when set as env vars -- it
+# never calls Stripe itself.
+
+LIVE_PRICE_IDS = {
+    "ANYAICAM_STRIPE_PRICE_LOCAL_1_8": "price_1UDee3GllhK80H2nK4uQLBKe",
+    "ANYAICAM_STRIPE_PRICE_LOCAL_9_16": "price_1UDeehGllhK80H2nf61pHif8",
+    "ANYAICAM_STRIPE_PRICE_LOCAL_17_32": "price_1UDeeqGllhK80H2nyZ9Mz8BE",
+    "ANYAICAM_STRIPE_PRICE_LOCAL_33_64": "price_1UDeeQGllhK80H2nVRRrsksb",
+    "ANYAICAM_STRIPE_PRICE_HYBRID_1_8": "price_1UDecwGllhK80H2nEDSd6dww",
+    "ANYAICAM_STRIPE_PRICE_HYBRID_9_16": "price_1UDef0GllhK80H2n5NcWtqDK",
+    "ANYAICAM_STRIPE_PRICE_HYBRID_17_32": "price_1UDef2GllhK80H2nbIf7ZTHY",
+    "ANYAICAM_STRIPE_PRICE_HYBRID_33_64": "price_1UDef5GllhK80H2nNqYcCbMs",
+}
+
+EXPECTED_FOR_LIVE_ID = {
+    "price_1UDee3GllhK80H2nK4uQLBKe": ("camera_slots_local", 8),
+    "price_1UDeehGllhK80H2nf61pHif8": ("camera_slots_local", 16),
+    "price_1UDeeqGllhK80H2nyZ9Mz8BE": ("camera_slots_local", 32),
+    "price_1UDeeQGllhK80H2nVRRrsksb": ("camera_slots_local", 64),
+    "price_1UDecwGllhK80H2nEDSd6dww": ("camera_slots_hybrid", 8),
+    "price_1UDef0GllhK80H2n5NcWtqDK": ("camera_slots_hybrid", 16),
+    "price_1UDef2GllhK80H2nbIf7ZTHY": ("camera_slots_hybrid", 32),
+    "price_1UDef5GllhK80H2nNqYcCbMs": ("camera_slots_hybrid", 64),
+}
+
+
+def test_all_eight_live_price_ids_are_distinct():
+    assert len(set(LIVE_PRICE_IDS.values())) == 8
+
+
+def test_all_eight_live_price_ids_resolve_to_the_correct_tier(monkeypatch):
+    for env_var, price_id in LIVE_PRICE_IDS.items():
+        monkeypatch.setenv(env_var, price_id)
+    mapping = ce._load_price_tier_map()
+    assert len(mapping) == 8
+    # PRICE_ID_CAMERA_SLOT_MAP is computed once at process/import time in
+    # production (matching how ECS actually injects env vars before the
+    # app starts) -- monkeypatch.setenv() alone doesn't retroactively
+    # change the already-imported module global, so re-point it at the
+    # freshly loaded mapping here to exercise resolve_tier()'s real
+    # lookup logic against these exact values, the same way it would run
+    # against a freshly started production process.
+    monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", mapping)
+    for price_id, (expected_product, expected_max) in EXPECTED_FOR_LIVE_ID.items():
+        tier = ce.resolve_tier(price_id)
+        assert tier == {"product": expected_product, "camera_slot_maximum": expected_max}
+
+
+def test_live_price_ids_never_collide_with_the_staging_test_ids():
+    """Sanity guard: the live and test-mode Price ID sets must be
+    disjoint -- if they ever collided, a sandbox purchase could
+    accidentally resolve against a production tier or vice versa."""
+    test_ids = {
+        "price_1UD2xKGllhK80H2nFJwtFJvw", "price_1UD2yLGllhK80H2n7Z2q8AM3",
+        "price_1UD2z4GllhK80H2ncjHZVhms", "price_1UD30bGllhK80H2nfmvPZnSA",
+        "price_1UD31AGllhK80H2nMKtYEmVw", "price_1UD31mGllhK80H2nJqorGzU6",
+        "price_1UD32kGllhK80H2nGaOQB9XI", "price_1UD33SGllhK80H2nxrbBT2ch",
+    }
+    assert test_ids.isdisjoint(LIVE_PRICE_IDS.values())
