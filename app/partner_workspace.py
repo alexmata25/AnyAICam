@@ -1,5 +1,6 @@
 from cloud_config import settings as cloud_settings
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta
 from html import escape
@@ -520,6 +521,23 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # "use a camera slot" as the two distinct concepts the
         # provisioning spec describes, rather than conflating them.
         from customer_entitlements import total_camera_slots
+        # Provisioning Phase 8 follow-up: this -- the customer's own
+        # browser-facing "claim my appliance" action -- is the approved
+        # Getting Started trigger, not hardware-payment success (see
+        # purchase_notifications.send_getting_started_email()'s own
+        # docstring). Fires at most once per customer regardless of how
+        # many appliances they ever link, via that function's own
+        # per-customer idempotency key -- never gated on or triggered by
+        # this being the customer's FIRST appliance. Best-effort: a
+        # notification failure must never block a successful link, which
+        # has already fully succeeded by this point.
+        try:
+            from purchase_notifications import send_getting_started_email
+            send_getting_started_email(identity['customer_id'])
+        except Exception:
+            logging.getLogger('anyaicam.partner_workspace').exception(
+                'Failed to send Getting Started email after appliance link for customer %s', identity['customer_id']
+            )
         return {'message':'Appliance linked to customer account.','appliance_id':appliance['id'],'camera_slots_purchased':total_camera_slots(identity['customer_id'])}
 
     # Real state lifecycle for a scan job -- a customer must always get

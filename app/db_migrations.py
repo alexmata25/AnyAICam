@@ -347,6 +347,17 @@ CREATE TABLE IF NOT EXISTS hardware_returns(
 CREATE INDEX IF NOT EXISTS idx_hardware_returns_order ON hardware_returns(order_id);
 CREATE INDEX IF NOT EXISTS idx_hardware_returns_customer ON hardware_returns(customer_id);
 '''),
+    # Provisioning Phase 8 follow-up: explicit, testable defective/
+    # damaged-on-arrival exception to the restocking fee. Approved
+    # policy: no restocking fee applies when the hardware was defective
+    # due to AnyAiCam or arrived damaged. Recorded as its own boolean at
+    # inspection time (see hardware_returns.record_inspection_and_
+    # calculate_refund()) rather than inferred from damage_notes text --
+    # an explicit flag an admin deliberately sets, never a guess parsed
+    # from free text.
+    ('20260911_hardware_returns_defective_flag','''
+ALTER TABLE hardware_returns ADD COLUMN is_defective_or_damaged_on_arrival INTEGER NOT NULL DEFAULT 0;
+'''),
 ]
 
 
