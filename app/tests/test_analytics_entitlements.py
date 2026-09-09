@@ -279,6 +279,39 @@ def test_a_camera_slot_purchase_grants_no_analytics(db_path, _analytics_price_ma
         assert ae.get_active_analytics_for_customer("cust-1") == []
 
 
+# -------------------------------------------- checkout-before-registration
+
+
+def test_an_analytics_purchase_under_an_unknown_email_creates_a_pending_link_not_a_drop(db_path, _analytics_price_map):
+    """Before this fix, an analytics checkout with no matching customer
+    just returned 'ignored' and the purchase was silently dropped --
+    unlike camera-slot and hardware purchases, which already had this
+    safety net (customer_entitlements.create_pending_link()/hardware_
+    orders.create_pending_link())."""
+    with override_target(sqlite_path=db_path):
+        result = ae.sync_analytics_from_stripe_event(
+            _checkout_event("evt_1", SMART_MOTION_TEST_PRICE, email="brand-new@example.test")
+        )
+        assert result["status"] == "pending_link_created"
+        assert result["analytic_key"] == "smart_motion"
+
+
+def test_resolving_a_pending_analytics_link_grants_the_entitlement(db_path, _analytics_price_map):
+    # Purchase happens BEFORE the customer account exists (no matching row
+    # at checkout time) -- then the account is created/approved afterward,
+    # under the same email, exactly like a real checkout-before-
+    # registration website visitor.
+    with override_target(sqlite_path=db_path):
+        ae.sync_analytics_from_stripe_event(_checkout_event("evt_1", SMART_MOTION_TEST_PRICE, email="brand-new@example.test"))
+        assert ae.get_active_analytics_for_customer("cust-2") == []
+
+    _seed_customer(db_path, customer_id="cust-2", email="brand-new@example.test")
+    with override_target(sqlite_path=db_path):
+        resolved = ae.resolve_pending_links_for_customer("cust-2", "brand-new@example.test")
+        assert len(resolved) == 1
+        assert ae.get_active_analytics_for_customer("cust-2") == ["smart_motion"]
+
+
 def test_a_hardware_purchase_grants_no_analytics(db_path, _analytics_price_map, monkeypatch):
     monkeypatch.setattr(ho, "HARDWARE_PRICE_MAP", {
         "price_relay": {"sku": "AIC-RELAY-NUMATO-3CH", "product": "numato_3_channel_relay", "name": "Numato 3-Channel Relay Module", "amount_cents": 14999},

@@ -358,6 +358,34 @@ CREATE INDEX IF NOT EXISTS idx_hardware_returns_customer ON hardware_returns(cus
     ('20260911_hardware_returns_defective_flag','''
 ALTER TABLE hardware_returns ADD COLUMN is_defective_or_damaged_on_arrival INTEGER NOT NULL DEFAULT 0;
 '''),
+    # Website checkout build: an anonymous storefront visitor buying an
+    # analytics add-on (no signed-in customer_owner session, no matching
+    # customers row for their email yet) needs the exact same checkout-
+    # before-registration safety net customer_entitlements.py's
+    # pending_customer_links and hardware_orders.py's pending_hardware_
+    # order_links already give camera-slot and hardware purchases -- see
+    # analytics_entitlements.py's own module docstring for why this is
+    # the same existing pattern, not a new one. Schema deliberately
+    # mirrors pending_hardware_order_links column-for-column (minus the
+    # hardware-only sku/product_name/amount_cents columns, plus
+    # analytic_key in their place).
+    ('20260912_pending_analytics_links','''
+CREATE TABLE IF NOT EXISTS pending_analytics_links(
+    id TEXT PRIMARY KEY,
+    normalized_email TEXT NOT NULL,
+    stripe_customer_id TEXT,
+    stripe_checkout_session_id TEXT,
+    stripe_price_id TEXT NOT NULL,
+    analytic_key TEXT NOT NULL,
+    raw_event_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_customer_id TEXT,
+    FOREIGN KEY(resolved_customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_analytics_links_email_status ON pending_analytics_links(normalized_email,status);
+'''),
 ]
 
 

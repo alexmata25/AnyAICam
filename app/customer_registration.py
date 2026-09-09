@@ -144,6 +144,17 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
         logging.getLogger("anyaicam.customer_registration").exception(
             "Failed to resolve pending hardware order links for newly approved customer %s", customer_id
         )
+    # Same best-effort, checkout-before-registration reconciliation as
+    # above, for ANALYTICS add-on purchases (see analytics_entitlements.py) --
+    # its own separate table/pending-link kind, never conflated with
+    # camera-slot entitlements or hardware orders.
+    try:
+        from analytics_entitlements import resolve_pending_links_for_customer as resolve_pending_analytics_links
+        resolve_pending_analytics_links(customer_id, item["email"])
+    except Exception:
+        logging.getLogger("anyaicam.customer_registration").exception(
+            "Failed to resolve pending analytics links for newly approved customer %s", customer_id
+        )
     # Provisioning Phase 6: now that any pending purchase (camera-slot
     # entitlement and/or hardware order) has been attached to this real
     # account, send the final customer-facing "ready"/order-confirmation

@@ -59,6 +59,7 @@ never writes to customer_entitlements/hardware_orders tables.
 """
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime
@@ -172,6 +173,53 @@ def get_analytics_subscriptions_for_customer(customer_id: str) -> list[dict]:
     )
 
 
+def create_pending_link(
+    *, email: str, stripe_price_id: str, analytic_key: str,
+    stripe_customer_id: Optional[str] = None,
+    stripe_checkout_session_id: Optional[str] = None, raw_event: dict,
+) -> dict:
+    """Same checkout-before-registration safety net as customer_
+    entitlements.create_pending_link() and hardware_orders.create_pending_
+    link() -- a website purchase made under an email with no matching
+    customer yet (the normal case for a marketing-site visitor who has
+    never signed in to the VMS). Without this, an analytics purchase
+    under those conditions would previously just return "ignored" and be
+    dropped, unlike camera-slot and hardware purchases which already had
+    this net."""
+    link_id = uuid.uuid4().hex
+    with connection() as db:
+        db.execute(
+            "INSERT INTO pending_analytics_links(id,normalized_email,stripe_customer_id,"
+            "stripe_checkout_session_id,stripe_price_id,analytic_key,raw_event_json,status,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (link_id, (email or "").strip().lower(), stripe_customer_id, stripe_checkout_session_id,
+             stripe_price_id, analytic_key, json.dumps(raw_event), "pending", datetime.now().isoformat()),
+        )
+    return row("SELECT * FROM pending_analytics_links WHERE id=?", (link_id,))
+
+
+def resolve_pending_links_for_customer(customer_id: str, email: str) -> list[str]:
+    """Mirrors customer_entitlements.resolve_pending_links_for_customer()
+    and hardware_orders.resolve_pending_links_for_customer() exactly --
+    call only against an email the caller has already verified belongs
+    to this customer (e.g. right after registration approval)."""
+    normalized = (email or "").strip().lower()
+    pending = rows("SELECT * FROM pending_analytics_links WHERE normalized_email=? AND status='pending'", (normalized,))
+    resolved_ids = []
+    for link in pending:
+        upsert_analytics_subscription(
+            customer_id=customer_id, analytic_key=link["analytic_key"], status="active",
+            stripe_customer_id=link["stripe_customer_id"], stripe_price_id=link["stripe_price_id"],
+        )
+        with connection() as db:
+            db.execute(
+                "UPDATE pending_analytics_links SET status='resolved',resolved_at=?,resolved_customer_id=? WHERE id=?",
+                (datetime.now().isoformat(), customer_id, link["id"]),
+            )
+        resolved_ids.append(link["id"])
+    return resolved_ids
+
+
 def get_active_analytics_for_customer(customer_id: str) -> list[str]:
     """Every analytic_key currently licensed for this customer. 'active'
     here means status != 'cancelled', the exact convention
@@ -209,8 +257,15 @@ def _sync_checkout_completed(event: dict) -> dict:
         customer = row("SELECT * FROM customers WHERE id=?", (fields["authoritative_customer_id"],))
     if not customer and fields["email"]:
         customer = _find_customer_by_email(fields["email"])
+
     if not customer:
-        return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
+        if not fields["email"]:
+            return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
+        link = create_pending_link(
+            email=fields["email"], stripe_price_id=fields["price_id"], analytic_key=analytic["analytic_key"],
+            stripe_customer_id=fields["stripe_customer_id"], raw_event=event,
+        )
+        return {"status": "pending_link_created", "pending_link_id": link["id"], "analytic_key": analytic["analytic_key"]}
 
     subscription = upsert_analytics_subscription(
         customer_id=customer["id"], analytic_key=analytic["analytic_key"], status="active",
