@@ -259,22 +259,269 @@ def _plan_cancelled_email(first_name: str, plan_label: str) -> tuple[str, str, s
     return subject, text, html
 
 
-def _hardware_order_email(first_name: str, product_name: str, quantity: int) -> tuple[str, str, str]:
-    subject = "Your AnyAiCam hardware order has been received"
-    qty_text = f"{quantity} × {product_name}" if quantity != 1 else product_name
+SUPPORT_EMAIL = "amata@anyaicam.com"
+SUPPORT_LINK = "https://anyaicam.com/support.html"
+SIGN_IN_LINK = "https://app.anyaicam.com"
+# Staging draft URLs -- these pages are NOT published live yet (see
+# website-pricing-review/staging/policies/); update once the real,
+# reviewed policy pages are published.
+SHIPPING_POLICY_LINK = "https://anyaicam.com/shipping-policy.html"
+RETURN_REFUND_POLICY_LINK = "https://anyaicam.com/hardware-return-refund-policy.html"
+CANCELLATION_POLICY_LINK = "https://anyaicam.com/cancellation-policy.html"
+
+_SUPPORT_FOOTER_TEXT = f"Questions? Contact us at {SUPPORT_EMAIL} or visit {SUPPORT_LINK}.\n\n— The AnyAiCam Team"
+_SUPPORT_FOOTER_HTML = f'<p>Questions? Contact us at <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> or visit <a href="{SUPPORT_LINK}">{SUPPORT_LINK}</a>.</p><p>— The AnyAiCam Team</p>'
+
+
+def _format_amount(amount_cents: int) -> str:
+    return f"${amount_cents / 100:,.2f}"
+
+
+def _format_date(iso_timestamp: str) -> str:
+    try:
+        return datetime.fromisoformat(iso_timestamp).strftime("%B %d, %Y")
+    except (TypeError, ValueError):
+        return iso_timestamp or ""
+
+
+def _hardware_order_email(first_name: str, order: dict) -> tuple[str, str, str]:
+    """Order-confirmation email -- sent immediately after a successful
+    hardware payment/order record, per this phase's explicit content
+    requirements. Deliberately never claims camera slots are active --
+    hardware and camera-slot subscriptions remain separate (see this
+    module's and hardware_orders.py's own separation contract)."""
+    from hardware_fulfillment import PREPARATION_TIMEFRAME_TEXT, generate_order_number
+    subject = "Your AnyAiCam hardware order is confirmed"
+    quantity = int(order["quantity"] or 1)
+    qty_text = f"{quantity} × {order['product_name']}" if quantity != 1 else order["product_name"]
+    order_number = generate_order_number(order["id"])
+    amount = _format_amount(order["amount_cents"])
+    purchase_date = _format_date(order["created_at"])
     text = (
         f"Hi {first_name},\n\n"
-        f"Your AnyAiCam hardware order has been received: {qty_text}.\n\n"
-        f"We'll follow up with shipping details separately. This order does not include any camera-slot "
-        f"subscription -- if you'd also like recurring camera-slot service, that's purchased separately.\n\n"
-        f"— The AnyAiCam Team"
+        f"Your AnyAiCam hardware order is confirmed.\n\n"
+        f"Order number: {order_number}\n"
+        f"Product: {qty_text}\n"
+        f"Amount paid: {amount}\n"
+        f"Date purchased: {purchase_date}\n\n"
+        f"{PREPARATION_TIMEFRAME_TEXT}\n\n"
+        f"Before shipment, AnyAiCam prepares, installs and configures the VMS software on your appliance, "
+        f"and tests it -- this ensures it's ready to use the moment it arrives.\n\n"
+        f"Manage your account: {SIGN_IN_LINK}\n\n"
+        f"Please note: purchasing hardware does not activate camera slots on your account. Camera-slot "
+        f"service (Local or Hybrid plans) is purchased and managed separately.\n\n"
+        f"Shipping, return, and refund terms: {SHIPPING_POLICY_LINK} / {RETURN_REFUND_POLICY_LINK}\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
     )
     html = (
         f"<p>Hi {first_name},</p>"
-        f"<p>Your AnyAiCam hardware order has been received: <strong>{qty_text}</strong>.</p>"
-        f"<p>We'll follow up with shipping details separately. This order does not include any camera-slot "
-        f"subscription — if you'd also like recurring camera-slot service, that's purchased separately.</p>"
-        f"<p>— The AnyAiCam Team</p>"
+        f"<p>Your AnyAiCam hardware order is confirmed.</p>"
+        f"<p><strong>Order number:</strong> {order_number}<br>"
+        f"<strong>Product:</strong> {qty_text}<br>"
+        f"<strong>Amount paid:</strong> {amount}<br>"
+        f"<strong>Date purchased:</strong> {purchase_date}</p>"
+        f"<p>{PREPARATION_TIMEFRAME_TEXT}</p>"
+        f"<p>Before shipment, AnyAiCam prepares, installs and configures the VMS software on your appliance, "
+        f"and tests it — this ensures it's ready to use the moment it arrives.</p>"
+        f'<p>Manage your account: <a href="{SIGN_IN_LINK}">{SIGN_IN_LINK}</a></p>'
+        f"<p>Please note: purchasing hardware does not activate camera slots on your account. Camera-slot "
+        f"service (Local or Hybrid plans) is purchased and managed separately.</p>"
+        f'<p>Shipping, return, and refund terms: <a href="{SHIPPING_POLICY_LINK}">Shipping Policy</a> / '
+        f'<a href="{RETURN_REFUND_POLICY_LINK}">Hardware Return &amp; Refund Policy</a></p>'
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
+def _hardware_shipped_email(first_name: str, order: dict) -> tuple[str, str, str]:
+    from hardware_fulfillment import generate_order_number
+    subject = "Your AnyAiCam order has shipped"
+    order_number = generate_order_number(order["id"])
+    lines_text = [f"Order number: {order_number}", f"Product: {order['product_name']}"]
+    lines_html = [f"<strong>Order number:</strong> {order_number}", f"<strong>Product:</strong> {order['product_name']}"]
+    if order.get("carrier"):
+        lines_text.append(f"Carrier: {order['carrier']}")
+        lines_html.append(f"<strong>Carrier:</strong> {order['carrier']}")
+    if order.get("tracking_number"):
+        lines_text.append(f"Tracking number: {order['tracking_number']}")
+        lines_html.append(f"<strong>Tracking number:</strong> {order['tracking_number']}")
+    if order.get("tracking_link"):
+        lines_text.append(f"Track your shipment: {order['tracking_link']}")
+        lines_html.append(f'<strong>Track your shipment:</strong> <a href="{order["tracking_link"]}">{order["tracking_link"]}</a>')
+    if order.get("shipped_at"):
+        lines_text.append(f"Date shipped: {_format_date(order['shipped_at'])}")
+        lines_html.append(f"<strong>Date shipped:</strong> {_format_date(order['shipped_at'])}")
+    text = (
+        f"Hi {first_name},\n\n"
+        f"Your AnyAiCam order has shipped.\n\n"
+        + "\n".join(lines_text) + "\n\n"
+        f"When your appliance arrives, sign in to your AnyAiCam account to complete setup and connect your cameras.\n\n"
+        f"Sign in: {SIGN_IN_LINK}\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>Your AnyAiCam order has shipped.</p>"
+        f"<p>{'<br>'.join(lines_html)}</p>"
+        f"<p>When your appliance arrives, sign in to your AnyAiCam account to complete setup and connect your cameras.</p>"
+        f'<p>Sign in: <a href="{SIGN_IN_LINK}">{SIGN_IN_LINK}</a></p>'
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
+def _hardware_cancellation_email(first_name: str, order: dict) -> tuple[str, str, str]:
+    from hardware_fulfillment import generate_order_number
+    subject = "Your AnyAiCam cancellation has been received"
+    order_number = generate_order_number(order["id"])
+    already_shipped = order["fulfillment_status"] == "cancelled" and bool(order.get("shipped_at"))
+    shipped_line = "This order had already shipped before cancellation." if already_shipped else "This order had not yet shipped."
+    text = (
+        f"Hi {first_name},\n\n"
+        f"Your AnyAiCam cancellation request has been received and processed.\n\n"
+        f"Order number: {order_number}\n"
+        f"Product: {order['product_name']}\n"
+        f"Cancellation status: Cancelled\n"
+        f"{shipped_line}\n\n"
+        f"Next step: our team will review your order and follow up on any applicable refund. Refund amounts, "
+        f"if any, are calculated according to our published policies and will be confirmed separately -- we "
+        f"are not able to state a specific refund amount in this message.\n\n"
+        f"Applicable policy: {CANCELLATION_POLICY_LINK} / {RETURN_REFUND_POLICY_LINK}\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>Your AnyAiCam cancellation request has been received and processed.</p>"
+        f"<p><strong>Order number:</strong> {order_number}<br>"
+        f"<strong>Product:</strong> {order['product_name']}<br>"
+        f"<strong>Cancellation status:</strong> Cancelled<br>{shipped_line}</p>"
+        f"<p>Next step: our team will review your order and follow up on any applicable refund. Refund amounts, "
+        f"if any, are calculated according to our published policies and will be confirmed separately — we "
+        f"are not able to state a specific refund amount in this message.</p>"
+        f'<p>Applicable policy: <a href="{CANCELLATION_POLICY_LINK}">Cancellation Policy</a> / '
+        f'<a href="{RETURN_REFUND_POLICY_LINK}">Hardware Return &amp; Refund Policy</a></p>'
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
+def _return_authorized_email(first_name: str, order: dict, hardware_return: dict) -> tuple[str, str, str]:
+    from hardware_fulfillment import generate_order_number
+    subject = "Your AnyAiCam return request has been approved"
+    order_number = generate_order_number(order["id"])
+    reference = hardware_return.get("return_reference") or "(pending assignment)"
+    text = (
+        f"Hi {first_name},\n\n"
+        f"Your AnyAiCam return request has been approved.\n\n"
+        f"Order number: {order_number}\n"
+        f"Product: {order['product_name']}\n"
+        f"Return authorization number: {reference}\n\n"
+        f"Please include all original accessories and packaging where possible. Our support team will follow up "
+        f"with return shipping instructions if they were not already provided.\n\n"
+        f"Once received, your returned equipment will be inspected. The final refund amount is determined "
+        f"according to our published Hardware Return & Refund Policy, including any applicable restocking fee.\n\n"
+        f"Policy: {RETURN_REFUND_POLICY_LINK}\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>Your AnyAiCam return request has been approved.</p>"
+        f"<p><strong>Order number:</strong> {order_number}<br>"
+        f"<strong>Product:</strong> {order['product_name']}<br>"
+        f"<strong>Return authorization number:</strong> {reference}</p>"
+        f"<p>Please include all original accessories and packaging where possible. Our support team will follow up "
+        f"with return shipping instructions if they were not already provided.</p>"
+        f"<p>Once received, your returned equipment will be inspected. The final refund amount is determined "
+        f"according to our published Hardware Return &amp; Refund Policy, including any applicable restocking fee.</p>"
+        f'<p>Policy: <a href="{RETURN_REFUND_POLICY_LINK}">{RETURN_REFUND_POLICY_LINK}</a></p>'
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
+def _return_received_email(first_name: str, order: dict) -> tuple[str, str, str]:
+    from hardware_fulfillment import generate_order_number
+    subject = "We received your AnyAiCam return"
+    order_number = generate_order_number(order["id"])
+    text = (
+        f"Hi {first_name},\n\n"
+        f"We've received your returned AnyAiCam equipment.\n\n"
+        f"Order number: {order_number}\n"
+        f"Product: {order['product_name']}\n\n"
+        f"Inspection is now pending. Your final refund amount will be confirmed once inspection is complete -- "
+        f"we are not able to confirm a final refund amount yet.\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>We've received your returned AnyAiCam equipment.</p>"
+        f"<p><strong>Order number:</strong> {order_number}<br><strong>Product:</strong> {order['product_name']}</p>"
+        f"<p>Inspection is now pending. Your final refund amount will be confirmed once inspection is complete — "
+        f"we are not able to confirm a final refund amount yet.</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
+def _refund_processed_email(first_name: str, order: dict, hardware_return: dict) -> tuple[str, str, str]:
+    from hardware_fulfillment import generate_order_number
+    subject = "Your AnyAiCam refund has been processed"
+    order_number = generate_order_number(order["id"])
+    original = _format_amount(hardware_return["original_amount_cents"])
+    fee_cents = hardware_return.get("restocking_fee_cents") or 0
+    fee = _format_amount(fee_cents)
+    final_amount = _format_amount(hardware_return["approved_refund_cents"])
+    refund_date = _format_date(hardware_return.get("refunded_at") or "")
+    text = (
+        f"Hi {first_name},\n\n"
+        f"Your AnyAiCam refund has been processed.\n\n"
+        f"Order number: {order_number}\n"
+        f"Original purchase amount: {original}\n"
+        f"Restocking fee: {fee}\n"
+        f"Final refund amount: {final_amount}\n"
+        f"Refund date: {refund_date}\n\n"
+        f"Bank/card posting times vary by financial institution and can take several business days to appear.\n\n"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>Your AnyAiCam refund has been processed.</p>"
+        f"<p><strong>Order number:</strong> {order_number}<br>"
+        f"<strong>Original purchase amount:</strong> {original}<br>"
+        f"<strong>Restocking fee:</strong> {fee}<br>"
+        f"<strong>Final refund amount:</strong> {final_amount}<br>"
+        f"<strong>Refund date:</strong> {refund_date}</p>"
+        f"<p>Bank/card posting times vary by financial institution and can take several business days to appear.</p>"
+        f"{_SUPPORT_FOOTER_HTML}"
+    )
+    return subject, text, html
+
+
+def _getting_started_email(first_name: str, camera_slot_summary: Optional[tuple[str, int]]) -> tuple[str, str, str]:
+    subject = "Get started with your AnyAiCam system"
+    capacity_text = ""
+    capacity_html = ""
+    if camera_slot_summary:
+        plan_label, quantity = camera_slot_summary
+        capacity_text = f"Your {plan_label} plan supports up to {quantity} cameras.\n\n"
+        capacity_html = f"<p>Your {plan_label} plan supports up to {quantity} cameras.</p>"
+    text = (
+        f"Hi {first_name},\n\n"
+        f"Let's get your AnyAiCam system set up.\n\n"
+        f"1. Sign in: {SIGN_IN_LINK}\n"
+        f"2. Connect your appliance using the Cloud ID and activation code provided with your device.\n"
+        f"3. Add and configure your cameras from the dashboard.\n\n"
+        f"{capacity_text}"
+        f"{_SUPPORT_FOOTER_TEXT}"
+    )
+    html = (
+        f"<p>Hi {first_name},</p>"
+        f"<p>Let's get your AnyAiCam system set up.</p>"
+        f'<ol><li>Sign in: <a href="{SIGN_IN_LINK}">{SIGN_IN_LINK}</a></li>'
+        f"<li>Connect your appliance using the Cloud ID and activation code provided with your device.</li>"
+        f"<li>Add and configure your cameras from the dashboard.</li></ol>"
+        f"{capacity_html}"
+        f"{_SUPPORT_FOOTER_HTML}"
     )
     return subject, text, html
 
@@ -415,11 +662,136 @@ def _notify_hardware_order(event_id: str, order: dict) -> dict:
     customer = _customer_row(order["customer_id"]) if order.get("customer_id") else None
     first_name = _first_name(customer.get("name")) if customer else "there"
     recipient = (customer.get("email") if customer else None) or ""
-    subject, text, html = _hardware_order_email(first_name, order["product_name"], int(order["quantity"] or 1))
+    subject, text, html = _hardware_order_email(first_name, order)
     return _send_once(
         event_id=event_id, notification_type="hardware_order_confirmation",
         customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"order_id": order["id"], "sku": order["sku"]},
+    )
+
+
+# ------------------------------------------------- fulfillment/return triggers
+#
+# Unlike notify_from_stripe_event() above, these are triggered by ADMIN
+# ACTIONS (marking an order shipped, authorizing a return, ...), not by a
+# Stripe webhook delivery -- there is no stripe_event_id to key
+# idempotency off of. Each uses a synthetic, deterministic key
+# (f"hardware-<action>:<row-id>") in the SAME provisioning_notifications
+# table/(_send_once) infrastructure the Stripe-driven path uses -- one
+# action (e.g. hardware_fulfillment.mark_shipped()) can only ever
+# generate one email, called twice or not, exactly like the webhook path.
+
+
+def notify_hardware_shipped(order_id: str) -> dict:
+    order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
+    if not order:
+        return {"status": "ignored", "reason": "unknown order"}
+    customer = _customer_row(order["customer_id"]) if order.get("customer_id") else None
+    first_name = _first_name(customer.get("name")) if customer else "there"
+    recipient = (customer.get("email") if customer else None) or ""
+    subject, text, html = _hardware_shipped_email(first_name, order)
+    return _send_once(
+        event_id=f"hardware-shipped:{order_id}", notification_type="hardware_shipped",
+        customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
+        metadata={"order_id": order_id},
+    )
+
+
+def notify_hardware_cancellation(order_id: str) -> dict:
+    order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
+    if not order:
+        return {"status": "ignored", "reason": "unknown order"}
+    customer = _customer_row(order["customer_id"]) if order.get("customer_id") else None
+    first_name = _first_name(customer.get("name")) if customer else "there"
+    recipient = (customer.get("email") if customer else None) or ""
+    subject, text, html = _hardware_cancellation_email(first_name, order)
+    return _send_once(
+        event_id=f"hardware-cancelled:{order_id}", notification_type="hardware_cancellation",
+        customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
+        metadata={"order_id": order_id},
+    )
+
+
+def notify_return_authorized(return_id: str) -> dict:
+    hardware_return = row("SELECT * FROM hardware_returns WHERE id=?", (return_id,))
+    if not hardware_return:
+        return {"status": "ignored", "reason": "unknown return"}
+    order = row("SELECT * FROM hardware_orders WHERE id=?", (hardware_return["order_id"],))
+    if not order:
+        return {"status": "ignored", "reason": "unknown order"}
+    customer = _customer_row(hardware_return["customer_id"]) if hardware_return.get("customer_id") else None
+    first_name = _first_name(customer.get("name")) if customer else "there"
+    recipient = (customer.get("email") if customer else None) or ""
+    subject, text, html = _return_authorized_email(first_name, order, hardware_return)
+    return _send_once(
+        event_id=f"return-authorized:{return_id}", notification_type="return_authorized",
+        customer_id=hardware_return.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
+        metadata={"return_id": return_id, "order_id": order["id"]},
+    )
+
+
+def notify_return_received(return_id: str) -> dict:
+    hardware_return = row("SELECT * FROM hardware_returns WHERE id=?", (return_id,))
+    if not hardware_return:
+        return {"status": "ignored", "reason": "unknown return"}
+    order = row("SELECT * FROM hardware_orders WHERE id=?", (hardware_return["order_id"],))
+    if not order:
+        return {"status": "ignored", "reason": "unknown order"}
+    customer = _customer_row(hardware_return["customer_id"]) if hardware_return.get("customer_id") else None
+    first_name = _first_name(customer.get("name")) if customer else "there"
+    recipient = (customer.get("email") if customer else None) or ""
+    subject, text, html = _return_received_email(first_name, order)
+    return _send_once(
+        event_id=f"return-received:{return_id}", notification_type="return_received",
+        customer_id=hardware_return.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
+        metadata={"return_id": return_id, "order_id": order["id"]},
+    )
+
+
+def notify_refund_processed(return_id: str) -> dict:
+    hardware_return = row("SELECT * FROM hardware_returns WHERE id=?", (return_id,))
+    if not hardware_return:
+        return {"status": "ignored", "reason": "unknown return"}
+    order = row("SELECT * FROM hardware_orders WHERE id=?", (hardware_return["order_id"],))
+    if not order:
+        return {"status": "ignored", "reason": "unknown order"}
+    customer = _customer_row(hardware_return["customer_id"]) if hardware_return.get("customer_id") else None
+    first_name = _first_name(customer.get("name")) if customer else "there"
+    recipient = (customer.get("email") if customer else None) or ""
+    subject, text, html = _refund_processed_email(first_name, order, hardware_return)
+    return _send_once(
+        event_id=f"refund-processed:{return_id}", notification_type="refund_processed",
+        customer_id=hardware_return.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
+        metadata={"return_id": return_id, "order_id": order["id"]},
+    )
+
+
+def send_getting_started_email(customer_id: str) -> dict:
+    """Standalone, admin/support-triggered (e.g. once a shipped
+    appliance's activation is confirmed) -- never fired automatically on
+    every entitlement change. Camera capacity is included ONLY if the
+    entitlement backend confirms an active Local/Hybrid entitlement for
+    this customer right now -- never claimed from hardware purchase
+    alone. Idempotency key is per-customer (this message makes sense to
+    send at most once per customer in the normal case); call again
+    deliberately if a genuine resend is needed -- there is no Stripe
+    event or fulfillment action this ties to."""
+    customer = _customer_row(customer_id)
+    if not customer:
+        return {"status": "ignored", "reason": "unknown customer"}
+    first_name = _first_name(customer.get("name"))
+    recipient = customer.get("email") or ""
+    from customer_entitlements import get_entitlements_for_customer
+    camera_slot_summary = None
+    for entitlement in get_entitlements_for_customer(customer_id):
+        if entitlement["status"] == "active" and int(entitlement["camera_slot_quantity"] or 0) > 0:
+            camera_slot_summary = (_plan_label(entitlement["product"]), int(entitlement["camera_slot_quantity"]))
+            break
+    subject, text, html = _getting_started_email(first_name, camera_slot_summary)
+    return _send_once(
+        event_id=f"getting-started:{customer_id}", notification_type="getting_started",
+        customer_id=customer_id, recipient_email=recipient, subject=subject, text=text, html=html,
+        metadata={"camera_slot_summary": bool(camera_slot_summary)},
     )
 
 

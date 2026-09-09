@@ -179,14 +179,21 @@ def upsert_order(
     stripe_payment_intent_id: Optional[str] = None,
     stripe_customer_id: Optional[str] = None,
     status: str = "pending",
-    fulfillment_status: str = "unfulfilled",
+    fulfillment_status: str = "paid",
 ) -> dict:
     """Idempotent per (stripe_checkout_session_id, sku) when a session id
     is present -- a replayed webhook delivery for the same session/SKU
     updates the SAME row (e.g. pending -> paid) rather than creating a
     duplicate order. Without a session id (a rare/manual path) this
     always inserts a new row, since there is nothing to key a replay
-    check against."""
+    check against.
+
+    fulfillment_status is set ONLY on initial creation (default 'paid',
+    the first state in hardware_fulfillment.FULFILLMENT_STATES) and is
+    deliberately NEVER touched by the UPDATE/replay branch below -- once
+    an order has progressed (preparing/shipped/etc. via hardware_
+    fulfillment.advance_fulfillment_status()), a replayed Stripe webhook
+    for the SAME checkout must never regress it back to a default value."""
     existing = None
     if stripe_checkout_session_id:
         existing = row(
@@ -198,9 +205,9 @@ def upsert_order(
         if existing:
             db.execute(
                 "UPDATE hardware_orders SET customer_id=COALESCE(?,customer_id),status=?,"
-                "fulfillment_status=?,stripe_payment_intent_id=COALESCE(?,stripe_payment_intent_id),"
+                "stripe_payment_intent_id=COALESCE(?,stripe_payment_intent_id),"
                 "stripe_customer_id=COALESCE(?,stripe_customer_id),updated_at=? WHERE id=?",
-                (customer_id, status, fulfillment_status, stripe_payment_intent_id,
+                (customer_id, status, stripe_payment_intent_id,
                  stripe_customer_id, now, existing["id"]),
             )
             order_row_id = existing["id"]

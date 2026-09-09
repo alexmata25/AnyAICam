@@ -191,7 +191,7 @@ def test_hardware_only_purchase_sends_order_confirmation_never_a_camera_slot_ema
     assert len(previews) == 1
     assert previews[0]["type"] == "hardware_order_confirmation"
     assert "Ryzen Starter" in previews[0]["text"]
-    assert "camera" not in previews[0]["text"].lower() or "does not include any camera-slot" in previews[0]["text"]
+    assert "does not activate camera slots" in previews[0]["text"]
 
 
 # --------------------------------------------------------------- idempotency

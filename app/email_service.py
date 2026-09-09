@@ -14,6 +14,10 @@ EMAIL_TYPES={
     # purchase_notifications.py. Additive only; the six types above are
     # unchanged.
     'account_ready','setup_required','plan_updated','plan_cancelled','hardware_order_confirmation',
+    # Provisioning Phase 8: hardware fulfillment/return lifecycle -- see
+    # hardware_fulfillment.py, hardware_returns.py, purchase_
+    # notifications.py. Additive only; every type above is unchanged.
+    'hardware_shipped','hardware_cancellation','return_authorized','return_received','refund_processed','getting_started',
 }
 
 

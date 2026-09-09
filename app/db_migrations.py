@@ -293,6 +293,60 @@ CREATE TABLE IF NOT EXISTS provisioning_notifications(
 CREATE UNIQUE INDEX IF NOT EXISTS idx_provisioning_notifications_event_type ON provisioning_notifications(stripe_event_id,notification_type);
 CREATE INDEX IF NOT EXISTS idx_provisioning_notifications_customer ON provisioning_notifications(customer_id);
 '''),
+    # Provisioning Phase 8: hardware order FULFILLMENT lifecycle (paid ->
+    # preparing -> configuring -> testing -> ready_to_ship -> shipped ->
+    # delivered, or cancelled) and the separate RETURN/refund workflow.
+    # See hardware_fulfillment.py's and hardware_returns.py's module
+    # docstrings for the full state-machine contract. Additive columns on
+    # the EXISTING hardware_orders table (never touches customer_
+    # entitlements or camera_slot logic in any way -- hardware fulfillment
+    # and camera-slot subscriptions remain completely separate systems,
+    # per this phase's explicit requirement) plus one new table for
+    # returns, since a return is a materially different shape of record
+    # (inspection findings, restocking fee, approved refund amount) than
+    # an order itself, and one order can in principle have zero or one
+    # return -- never modeled as more columns bolted onto hardware_orders.
+    ('20260910_hardware_fulfillment_and_returns','''
+ALTER TABLE hardware_orders ADD COLUMN order_number TEXT;
+ALTER TABLE hardware_orders ADD COLUMN carrier TEXT;
+ALTER TABLE hardware_orders ADD COLUMN tracking_number TEXT;
+ALTER TABLE hardware_orders ADD COLUMN tracking_link TEXT;
+ALTER TABLE hardware_orders ADD COLUMN shipped_at TEXT;
+ALTER TABLE hardware_orders ADD COLUMN delivered_at TEXT;
+ALTER TABLE hardware_orders ADD COLUMN cancelled_at TEXT;
+CREATE TABLE IF NOT EXISTS hardware_returns(
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    customer_id TEXT,
+    sku TEXT NOT NULL,
+    serial_number TEXT,
+    status TEXT NOT NULL DEFAULT 'return_requested',
+    return_reference TEXT,
+    requested_at TEXT NOT NULL,
+    authorized_at TEXT,
+    shipped_back_at TEXT,
+    received_at TEXT,
+    condition_notes TEXT,
+    accessories_included TEXT,
+    damage_notes TEXT,
+    inspected_at TEXT,
+    inspected_by TEXT,
+    original_amount_cents INTEGER NOT NULL,
+    restocking_fee_cents INTEGER,
+    restocking_fee_percent_applied REAL,
+    approved_refund_cents INTEGER,
+    refund_status TEXT NOT NULL DEFAULT 'not_started',
+    refund_approved_by TEXT,
+    refund_approved_at TEXT,
+    refunded_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(order_id) REFERENCES hardware_orders(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_hardware_returns_order ON hardware_returns(order_id);
+CREATE INDEX IF NOT EXISTS idx_hardware_returns_customer ON hardware_returns(customer_id);
+'''),
 ]
 
 
