@@ -55,6 +55,19 @@ class AgentConfig:
     # was wired in -- see the diagnostics tests.
     vms_local_health_url: str='http://127.0.0.1:8000/health'
 
+    # Provisioning Phase 7 (device-side entitlement refresh): how often
+    # service.py's periodic pull path (poll_entitlement()) calls the
+    # already-existing, already-tested cloud endpoint POST /api/
+    # provisioning/refresh (provisioning_api.py) to learn this
+    # customer's current Local/Hybrid camera-slot entitlement. The cloud
+    # endpoint existed and was tested long before anything on the device
+    # side ever called it -- this is that missing caller. Deliberately a
+    # separate, slower cadence than checkin_seconds (the normal
+    # heartbeat/camera/command poll interval), matching update_check_
+    # interval_seconds' own established precedent for "this doesn't need
+    # to run at operational-polling frequency."
+    entitlement_refresh_interval_seconds: int=1800
+
     def __post_init__(self): self.discovery_networks=self.discovery_networks or []
 
     @property
@@ -69,6 +82,8 @@ class AgentConfig:
     def camera_bindings_file(self): return Path(self.state_dir)/'camera_bindings.json'
     @property
     def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
+    @property
+    def entitlement_state_file(self): return Path(self.state_dir)/'entitlement_state.json'
 
     # RDM4 (remote device management -- privileged actions): the ONLY
     # channel by which this unprivileged agent process can ever request
@@ -108,9 +123,9 @@ class AgentConfig:
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
         if path.exists(): data=json.loads(path.read_text(encoding='utf-8'))
-        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','vms_hls_path':'ANYAICAM_VMS_HLS_PATH','vms_recordings_path':'ANYAICAM_VMS_RECORDINGS_PATH','vms_status_freshness_seconds':'ANYAICAM_VMS_STATUS_FRESHNESS_SECONDS','vms_recording_freshness_seconds':'ANYAICAM_VMS_RECORDING_FRESHNESS_SECONDS','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS','vms_local_health_url':'ANYAICAM_VMS_LOCAL_HEALTH_URL'}
+        aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','vms_hls_path':'ANYAICAM_VMS_HLS_PATH','vms_recordings_path':'ANYAICAM_VMS_RECORDINGS_PATH','vms_status_freshness_seconds':'ANYAICAM_VMS_STATUS_FRESHNESS_SECONDS','vms_recording_freshness_seconds':'ANYAICAM_VMS_RECORDING_FRESHNESS_SECONDS','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS','vms_local_health_url':'ANYAICAM_VMS_LOCAL_HEALTH_URL','entitlement_refresh_interval_seconds':'ANYAICAM_ENTITLEMENT_REFRESH_INTERVAL_SECONDS'}
         for key,environment in aliases.items():
-            if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','vms_status_freshness_seconds','vms_recording_freshness_seconds','update_check_interval_seconds'} else os.environ[environment]
+            if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','vms_status_freshness_seconds','vms_recording_freshness_seconds','update_check_interval_seconds','entitlement_refresh_interval_seconds'} else os.environ[environment]
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})
 
     def save(self,path: str|Path|None=None):

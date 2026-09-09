@@ -50,6 +50,7 @@ class ApplianceAgent:
         self.vms_status=LocalVmsStatusReader(config.vms_hls_path,config.vms_recordings_path,config.vms_status_freshness_seconds,config.vms_recording_freshness_seconds)
         self.update_resume_failed=False
         self._next_source_check_at=0.0
+        self._next_entitlement_check_at=0.0
     def resolve_update_state(self):
         # RDM-2 Groups 2A/2E: runs once at startup, before any command
         # processing -- per UpdateStateMachine.resume_if_pending()'s own
@@ -172,6 +173,69 @@ class ApplianceAgent:
                 self.log.info('Periodic update check concluded: %s',result.as_dict())
         except Exception:
             self.log.exception('Periodic update source check failed; will retry next cycle')
+    def current_camera_slot_quantity(self) -> int:
+        # Fail-closed by construction: an appliance that has never
+        # successfully completed a refresh (fresh install, or every
+        # attempt so far has failed) reports 0, never a guessed/unlimited
+        # value -- matches customer_entitlements.total_camera_slots()'s
+        # own "sum only *active* entitlements, never a hard-coded
+        # constant" discipline on the cloud side.
+        try:
+            data=json.loads(self.config.entitlement_state_file.read_text(encoding='utf-8'))
+            return max(0,int(data.get('camera_slot_quantity',0)))
+        except (OSError,json.JSONDecodeError,ValueError,TypeError):
+            return 0
+    def poll_entitlement(self):
+        # Provisioning Phase 7: the device-side caller for the cloud's
+        # already-existing, already-tested POST /api/provisioning/refresh
+        # (provisioning_api.py) -- that endpoint predates this call site;
+        # nothing on the device ever invoked it before this. Uses the
+        # SAME self.client the rest of this agent already authenticates
+        # every other cloud call with (signed X-Appliance-Id/X-Request-
+        # Timestamp/X-Request-Nonce/Bearer credential) -- no second
+        # identity/auth mechanism, no credential of any kind persisted
+        # beyond the one this agent already manages via config.
+        # credential_file.
+        #
+        # Own cadence (entitlement_refresh_interval_seconds, default
+        # 1800s), deliberately separate from checkin_seconds -- matches
+        # check_for_source_update()'s own established precedent
+        # immediately above. Isolated in its own try/except so a failure
+        # here never aborts the rest of cycle() (heartbeat/camera-sync/
+        # command-polling all still run).
+        #
+        # Fail-safe on cloud unavailability: on ANY PortalError (network
+        # failure, timeout, auth issue, cloud down), this logs and
+        # returns WITHOUT touching entitlement_state_file at all -- the
+        # last successfully-fetched value (via current_camera_slot_
+        # quantity() above) is preserved exactly as it was, never
+        # optimistically bumped, never zeroed out just because this one
+        # refresh attempt failed. A genuinely fresh install that has
+        # never once succeeded correctly reports 0 (fail closed), not a
+        # stale guess and not unlimited.
+        now=time.time()
+        if now<self._next_entitlement_check_at:
+            return
+        self._next_entitlement_check_at=now+self.config.entitlement_refresh_interval_seconds
+        try:
+            response=self.client.request('POST','/api/provisioning/refresh')
+        except PortalError as error:
+            self.log.warning('Entitlement refresh unavailable; keeping last known value. error=%s',error)
+            return
+        except Exception:
+            self.log.exception('Unexpected error during entitlement refresh; keeping last known value.')
+            return
+        try:
+            quantity=max(0,int(response.get('camera_slot_quantity',0)))
+        except (TypeError, ValueError):
+            self.log.warning('Entitlement refresh returned an unusable camera_slot_quantity; keeping last known value. response=%s',sanitize(response))
+            return
+        atomic_write_json(self.config.entitlement_state_file,{
+            'camera_slot_quantity':quantity,
+            'entitlements':response.get('entitlements',[]),
+            'fetched_at':time.time(),
+        })
+        self.log.info('Entitlement refreshed camera_slot_quantity=%s',quantity)
     def cameras(self):
         try: return json.loads(self.config.cameras_file.read_text(encoding='utf-8'))
         except (OSError,json.JSONDecodeError): return []
@@ -314,7 +378,7 @@ class ApplianceAgent:
             atomic_write_json(self.config.cameras_file,merged)
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
     def cycle(self):
-        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update()
+        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement()
     def run(self):
         if not self.client.credential: raise RuntimeError('Appliance is not activated. Run anyaicam-setup first.')
         self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',self.config.cloud_id,self.config.mode)
