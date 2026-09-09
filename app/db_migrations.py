@@ -194,6 +194,105 @@ CREATE TABLE IF NOT EXISTS detection_event_media(
 CREATE INDEX IF NOT EXISTS idx_detection_event_media_camera
 ON detection_event_media(camera_id,started_at);
 '''),
+    # Provisioning Phase 5: one-time HARDWARE purchases (Ryzen appliances,
+    # the Numato relay module) get their own table, deliberately separate
+    # from customer_entitlements (recurring Local/Hybrid camera-slot
+    # subscriptions). See hardware_orders.py's module docstring for the
+    # full separation contract -- a hardware Price ID must never resolve
+    # against PRICE_ID_CAMERA_SLOT_MAP and a camera-slot Price ID must
+    # never resolve against HARDWARE_CATALOG; each module's own resolver
+    # only recognizes its own price IDs and fails closed on everything
+    # else, so this table and customer_entitlements can never cross-grant.
+    #
+    # customer_id is nullable (unlike customer_entitlements' NOT NULL):
+    # a hardware purchase can complete before the buyer's authoritative
+    # customer_id is resolvable (no signed-in session, checkout email
+    # doesn't match an existing customer yet) -- see hardware_orders.py's
+    # pending-link handling, which mirrors customer_entitlements.py's own
+    # pending_customer_links pattern rather than inventing a second one.
+    #
+    # One row per (stripe_checkout_session_id, sku): a session can contain
+    # more than one hardware line item (see stripe-checkout.php's existing
+    # multi-item hardware_items pattern), and Stripe may retry the same
+    # webhook delivery, so this composite unique index is what makes a
+    # replayed event a no-op rather than a duplicate order row.
+    ('20260909_hardware_orders','''
+CREATE TABLE IF NOT EXISTS hardware_orders(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT,
+    sku TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    stripe_price_id TEXT NOT NULL,
+    stripe_checkout_session_id TEXT,
+    stripe_payment_intent_id TEXT,
+    stripe_customer_id TEXT,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    amount_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'usd',
+    status TEXT NOT NULL DEFAULT 'pending',
+    fulfillment_status TEXT NOT NULL DEFAULT 'unfulfilled',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_hardware_orders_customer ON hardware_orders(customer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hardware_orders_session_sku ON hardware_orders(stripe_checkout_session_id,sku);
+CREATE TABLE IF NOT EXISTS pending_hardware_order_links(
+    id TEXT PRIMARY KEY,
+    normalized_email TEXT NOT NULL,
+    stripe_customer_id TEXT,
+    stripe_checkout_session_id TEXT,
+    stripe_price_id TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    amount_cents INTEGER NOT NULL,
+    raw_event_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_customer_id TEXT,
+    FOREIGN KEY(resolved_customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_hardware_links_email_status ON pending_hardware_order_links(normalized_email,status);
+'''),
+    # Provisioning Phase 6: durable, at-most-once tracking of customer-
+    # facing post-purchase emails ("your service is ready", "plan
+    # updated", "cancelled", hardware order confirmation, "complete your
+    # setup"). Deliberately its own table, separate from both the
+    # entitlement-processing idempotency (provisioning_webhook_events --
+    # gates whether entitlement LOGIC re-runs) and the generic in-app
+    # notifications/notification_deliveries tables (event/camera-alert
+    # shaped, not purchase-shaped). See purchase_notifications.py's
+    # module docstring for why these two idempotency concerns must stay
+    # separate: entitlement processing and email delivery can fail
+    # independently, and a failed email must be retryable on the next
+    # webhook redelivery WITHOUT re-running (or being blocked by) already-
+    # completed entitlement processing.
+    #
+    # UNIQUE(stripe_event_id,notification_type): the same Stripe event,
+    # redelivered any number of times, can produce at most one row per
+    # notification type -- a second delivery either finds status='sent'
+    # (skip, already sent) or status='failed' (retry the send, update
+    # this same row in place).
+    ('20260909_provisioning_notifications','''
+CREATE TABLE IF NOT EXISTS provisioning_notifications(
+    id TEXT PRIMARY KEY,
+    stripe_event_id TEXT NOT NULL,
+    notification_type TEXT NOT NULL,
+    customer_id TEXT,
+    recipient_email TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    sent_at TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_provisioning_notifications_event_type ON provisioning_notifications(stripe_event_id,notification_type);
+CREATE INDEX IF NOT EXISTS idx_provisioning_notifications_customer ON provisioning_notifications(customer_id);
+'''),
 ]
 
 

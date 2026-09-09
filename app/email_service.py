@@ -8,7 +8,13 @@ from pathlib import Path
 
 from cloud_config import settings
 
-EMAIL_TYPES={'invitation','password_reset','onboarding','appliance_alert','quote_delivery','notification_test'}
+EMAIL_TYPES={
+    'invitation','password_reset','onboarding','appliance_alert','quote_delivery','notification_test',
+    # Provisioning Phase 6: post-purchase customer notifications -- see
+    # purchase_notifications.py. Additive only; the six types above are
+    # unchanged.
+    'account_ready','setup_required','plan_updated','plan_cancelled','hardware_order_confirmation',
+}
 
 
 class EmailBackend(ABC):

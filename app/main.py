@@ -7552,6 +7552,14 @@ class BillingSupportTicketUpdateModel(BaseModel):
 
 
 
+class HardwareCheckoutCreateModel(BaseModel):
+    # Provisioning Phase 5: the customer selects a catalog SKU, never a
+    # Stripe Price ID -- create_hardware_checkout() below resolves sku
+    # server-side via hardware_orders.HARDWARE_CATALOG the same way
+    # create_stripe_checkout() resolves plan via stripe_price_map(), so a
+    # browser can never submit an arbitrary Price ID.
+    sku: str
+    quantity: int = 1
 class StripeCheckoutCreateModel(BaseModel):
 
 
@@ -111536,6 +111544,92 @@ def create_stripe_checkout(
 
 
 
+@app.post("/api/payments/hardware-checkout")
+def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Request) -> dict:
+    """Provisioning Phase 5: one-time HARDWARE purchase checkout (Ryzen
+    appliances, the Numato relay module) -- mode=payment, deliberately
+    separate from create_stripe_checkout() above (subscription mode,
+    legacy plan/camera-slot flow). The customer selects a catalog `sku`
+    (see HardwareCheckoutCreateModel); the Stripe Price ID is resolved
+    server-side from hardware_orders.HARDWARE_CATALOG only -- a browser
+    can never submit an arbitrary Price ID here, matching the same
+    discipline create_stripe_checkout() already applies to `plan`. See
+    hardware_orders.py's module docstring for why this is a separate
+    catalog/table from customer_entitlements' camera-slot tiers, and
+    stays that way end to end: this endpoint never touches
+    customer_entitlements, and the webhook-side sync this feeds
+    (hardware_orders.sync_hardware_order_from_stripe_event()) never
+    grants a camera slot.
+    """
+    user = current_user(request)
+
+    from partner_portal import partner_identity as _authoritative_identity
+    _identity = _authoritative_identity(request)
+    authoritative_customer_id = ""
+    authoritative_email = ""
+    if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
+        authoritative_customer_id = str(_identity["customer_id"])
+        authoritative_email = str(_identity.get("email") or "")
+
+    from hardware_orders import HARDWARE_CATALOG
+    sku = payload.sku.strip()
+    catalog_entry = next((item for item in HARDWARE_CATALOG if item[0] == sku), None)
+    if not catalog_entry:
+        raise HTTPException(status_code=400, detail="Unknown hardware SKU.")
+    _, product, name, amount_cents, env_var = catalog_entry
+    price_id = os.environ.get(env_var, "").strip()
+    if not price_id:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {sku}.")
+
+    quantity = max(1, min(10, int(payload.quantity)))
+
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+
+    fields = [
+        ("mode", "payment"),
+        ("success_url", f"{PUBLIC_BASE_URL}/subscription-portal?hardware_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/subscription-portal?hardware_payment=cancelled"),
+        ("line_items[0][price]", price_id),
+        ("line_items[0][quantity]", str(quantity)),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_hardware_sku]", sku),
+        ("metadata[anyaicam_hardware_quantity]", str(quantity)),
+        ("allow_promotion_codes", "false"),
+    ]
+    if authoritative_customer_id:
+        fields.append(("metadata[anyaicam_customer_id]", authoritative_customer_id))
+
+    account = billing_account_for_user(user)
+    customer_id_for_stripe = stripe_customer_id_for_account(account)
+    if customer_id_for_stripe:
+        fields.append(("customer", customer_id_for_stripe))
+    elif authoritative_email or account.get("billing_email") or user.get("email"):
+        fields.append(("customer_email", str(authoritative_email or account.get("billing_email") or user.get("email"))))
+
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+
+    structured_log(
+        "stripe.hardware_checkout_created",
+        session_id=session_id,
+        sku=sku,
+        quantity=quantity,
+        user_id=user.get("id"),
+    )
+    return {
+        "status": "complete",
+        "session_id": session_id,
+        "checkout_url": checkout_url,
+        "sku": sku,
+        "product_name": name,
+        "message": "Stripe Checkout Session created.",
+    }
+
+
 @app.post("/api/payments/customer-portal")
 
 
@@ -112252,6 +112346,44 @@ async def stripe_webhook(request: Request) -> dict:
     except Exception:
         structured_log(
             "provisioning.entitlement_sync_failed",
+            level="error",
+            event_id=event.get("id"),
+            event_type=event.get("type"),
+        )
+
+    # Provisioning Phase 5: additive one-time HARDWARE order sync, fully
+    # independent of the entitlement sync directly above -- see hardware_
+    # orders.py's module docstring for the fail-closed separation
+    # contract (a hardware Price ID is never in PRICE_ID_CAMERA_SLOT_MAP,
+    # a camera-slot Price ID is never in HARDWARE_PRICE_MAP, so neither
+    # sync can ever act on the other's event). Wrapped the same way, for
+    # the same reason: never break the 200 response Stripe needs, never
+    # block the entitlement sync above from having already run.
+    try:
+        from hardware_orders import sync_hardware_order_from_stripe_event
+        sync_hardware_order_from_stripe_event(event)
+    except Exception:
+        structured_log(
+            "provisioning.hardware_order_sync_failed",
+            level="error",
+            event_id=event.get("id"),
+            event_type=event.get("type"),
+        )
+
+    # Provisioning Phase 6: customer-facing post-purchase email, strictly
+    # AFTER both syncs above have already committed (or not) their own
+    # state -- notify_from_stripe_event() only ever reads their results,
+    # never triggers entitlement/order processing itself, and its own
+    # internal try/except (see purchase_notifications.py) means an email
+    # failure here can never roll back or block the entitlement/order
+    # commit that already happened above, nor the 200 response Stripe
+    # needs to stop retrying.
+    try:
+        from purchase_notifications import notify_from_stripe_event
+        notify_from_stripe_event(event)
+    except Exception:
+        structured_log(
+            "provisioning.purchase_notification_failed",
             level="error",
             event_id=event.get("id"),
             event_type=event.get("type"),

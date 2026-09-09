@@ -133,6 +133,31 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
         logging.getLogger("anyaicam.customer_registration").exception(
             "Failed to resolve pending entitlement links for newly approved customer %s", customer_id
         )
+    # Same best-effort, checkout-before-registration reconciliation as
+    # above, for one-time HARDWARE purchases (see hardware_orders.py) --
+    # a separate call because it's a separate table/pending-link kind,
+    # never conflated with camera-slot entitlements.
+    try:
+        from hardware_orders import resolve_pending_links_for_customer as resolve_pending_hardware_links
+        resolve_pending_hardware_links(customer_id, item["email"])
+    except Exception:
+        logging.getLogger("anyaicam.customer_registration").exception(
+            "Failed to resolve pending hardware order links for newly approved customer %s", customer_id
+        )
+    # Provisioning Phase 6: now that any pending purchase (camera-slot
+    # entitlement and/or hardware order) has been attached to this real
+    # account, send the final customer-facing "ready"/order-confirmation
+    # email(s) -- see purchase_notifications.py's module docstring for
+    # why this uses its own idempotency key here rather than a Stripe
+    # event id. Best-effort: a notification failure must never fail
+    # account approval, which has already fully succeeded by this point.
+    try:
+        from purchase_notifications import notify_registration_resolved
+        notify_registration_resolved(customer_id)
+    except Exception:
+        logging.getLogger("anyaicam.customer_registration").exception(
+            "Failed to send post-registration purchase notifications for customer %s", customer_id
+        )
     return {"status": "complete", "message": "Customer account approved.", "customer_id": customer_id, "user_id": user_id}
 
 
