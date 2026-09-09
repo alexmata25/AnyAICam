@@ -47310,6 +47310,16 @@ register_appliance_cloud_routes(app, page_shell, current_user)
 # appliance-commands fix already established for this codebase.
 register_notification_settings_routes(app, page_shell)
 register_partner_workspace_routes(app, page_shell)
+# Provisioning Phase 1 (website -> Stripe -> AWS -> customer -> camera
+# slots -> installation activation): additive routes only -- GET
+# /api/customer/entitlements, GET /api/customer/installations, POST
+# /api/provisioning/release, POST /api/provisioning/refresh. Does not
+# touch the existing Stripe checkout/webhook routes or
+# register_partner_workspace_routes()'s own POST /api/customer/
+# appliances/link (that endpoint already is the claim flow -- see
+# provisioning_api.py's module docstring).
+from provisioning_api import register_provisioning_api_routes
+register_provisioning_api_routes(app)
 register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)

@@ -6,6 +6,62 @@ from database_backend import connect
 logger=logging.getLogger('anyaicam.migrations')
 
 MIGRATIONS=[
+    # Provisioning Phase 1 (customer purchase -> AWS entitlement -> VMS
+    # activation): the authoritative record of what a customer has
+    # actually paid for, independent of the pre-existing partner-entered
+    # `plans`/`analytics_subscriptions` quote tables (which a partner
+    # types in by hand during onboarding and are never touched by a real
+    # Stripe event) and independent of the legacy billing_accounts.json/
+    # LICENSE_PLAN_FEATURES system the live Stripe webhook currently
+    # updates (keyed to the old current_user()/users.json identity, not
+    # to customers.id). See customer_entitlements.py's module docstring
+    # for the full audit finding this migration exists to fix.
+    #
+    # camera_slot_quantity is deliberately a plain integer summed at read
+    # time (customer_entitlements.total_camera_slots()), not a running
+    # ledger of +/- adjustments -- an entitlement row always reflects
+    # "what Stripe currently says for this product", so a later webhook
+    # for the same customer_id+product updates the existing row in place
+    # instead of accumulating duplicates.
+    ('20260908_customer_entitlements','''
+CREATE TABLE IF NOT EXISTS customer_entitlements(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    product TEXT NOT NULL,
+    camera_slot_quantity INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    stripe_checkout_session_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_customer_entitlements_customer ON customer_entitlements(customer_id,product);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customer_entitlements_customer_product ON customer_entitlements(customer_id,product);
+CREATE TABLE IF NOT EXISTS pending_customer_links(
+    id TEXT PRIMARY KEY,
+    normalized_email TEXT NOT NULL,
+    stripe_customer_id TEXT,
+    stripe_checkout_session_id TEXT,
+    product TEXT NOT NULL,
+    camera_slot_quantity INTEGER NOT NULL DEFAULT 0,
+    raw_event_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_customer_id TEXT,
+    FOREIGN KEY(resolved_customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_customer_links_email_status ON pending_customer_links(normalized_email,status);
+CREATE TABLE IF NOT EXISTS provisioning_webhook_events(
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    processed_at TEXT NOT NULL,
+    result TEXT NOT NULL
+);
+'''),
     ('20260907_customer_registration_requests','''
 CREATE TABLE IF NOT EXISTS customer_registration_requests(
     id TEXT PRIMARY KEY,

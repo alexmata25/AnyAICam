@@ -1,3 +1,4 @@
+import logging
 import secrets
 from datetime import datetime
 from fastapi import HTTPException, Request
@@ -113,6 +114,24 @@ def approve_registration(request_id: str, partner_id: str | None, actor: dict) -
         db.execute(
             "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
             (actor["email"], "administrator" if actor["master"] else "partner_owner", "customer_registration.approved", "customer_registration", request_id, '{}', now),
+        )
+    # Provisioning Phase 1: this is the exact moment a brand-new customer's
+    # authoritative identity (customers.id) first exists with a verified
+    # email -- the safe point to attach any Stripe purchase that completed
+    # under this email before the account existed (see customer_
+    # entitlements.create_pending_link()/resolve_pending_links_for_
+    # customer()'s own docstring for why this must only ever run against
+    # an email the approval flow has already verified, never an
+    # unauthenticated caller-supplied one). A brand-new approval can never
+    # have a pending link to resolve except in this exact race, so this is
+    # a no-op the overwhelming majority of the time; kept best-effort so a
+    # customer's account approval is never blocked by it.
+    try:
+        from customer_entitlements import resolve_pending_links_for_customer
+        resolve_pending_links_for_customer(customer_id, item["email"])
+    except Exception:
+        logging.getLogger("anyaicam.customer_registration").exception(
+            "Failed to resolve pending entitlement links for newly approved customer %s", customer_id
         )
     return {"status": "complete", "message": "Customer account approved.", "customer_id": customer_id, "user_id": user_id}
 
