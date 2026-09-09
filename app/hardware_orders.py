@@ -70,9 +70,18 @@ key) for HARDWARE_PRICE_MAP to actually populate. Until then, or in any
 environment without them set, every *_PRICE_ID resolves to None and
 HARDWARE_PRICE_MAP is empty -- fail closed, not a guess.
 
-Product-label correction: the AAC Facial Recognition appliance's correct
-model name is "MINISFORUM AI X1 Pro-470" -- never "AI X1-255" (that name
-belongs to the Ryzen Starter unit, a different physical appliance).
+Product-label correction: the ryzen_aac_facial_recognition SKU's correct
+underlying hardware model is "MINISFORUM AI X1 Pro-470" -- never
+"AI X1-255" (that model belongs to the ryzen_starter unit, a different
+physical appliance). This still holds after the display-name rename
+below -- "MINISFORUM AI X1 Pro-470" is the model spec, "AnyAiCam
+Enterprise" is now the customer-facing product name for that same SKU.
+
+Display-name rename (this pass, staging only): customer-facing names
+changed to "AnyAiCam Starter" / "AnyAiCam Professional" / "AnyAiCam
+Enterprise" for ryzen_starter / ryzen_enterprise / ryzen_aac_facial_
+recognition respectively -- see HARDWARE_CATALOG below for the full
+rationale. SKUs, product keys, and Price ID env vars are unchanged.
 """
 from __future__ import annotations
 
@@ -104,10 +113,41 @@ def find_customer_by_email(email: str) -> Optional[dict]:
 
 # sku, product (stable key -- never reused across different physical
 # items), customer-facing name, amount_cents, price_id_env_var.
+#
+# Display-name rename (staging, this pass): the customer-facing `name`
+# strings below were changed from "AnyAiCam Ryzen Starter/Enterprise/AAC
+# Facial Recognition Appliance" to "AnyAiCam Starter/Professional/
+# Enterprise" -- SKU, product key, and Price ID env var are all
+# UNCHANGED, by explicit instruction ("do not change IDs or
+# provisioning"). This is purely a display-string edit: nothing in this
+# module (or anywhere else -- see the module's own separation-contract
+# tests) ever looks up a hardware order by name, so the rename cannot
+# affect order matching, entitlement resolution, or the fail-closed
+# separation from customer_entitlements.
+#
+# "AnyAiCam Professional" and "AnyAiCam Enterprise" are DISPLAY TEXT
+# only -- they do not collide with this codebase's separate legacy
+# software plan keys ("starter"/"professional"/"enterprise" in main.py's
+# LICENSE_PLAN_FEATURES) at the DATA level, since this hardware
+# product's own internal key stays "ryzen_enterprise" (never bare
+# "enterprise" or "professional") -- see test_hardware_orders.py's
+# existing collision-guard test, still valid unchanged. Customers may
+# still see the word "Professional"/"Enterprise" in two different
+# contexts (this one-time hardware appliance vs. the unrelated recurring
+# software plan) -- a UX naming-clarity question, not a code hazard.
+#
+# The former "AAC Facial Recognition" appliance is now displayed simply
+# as "AnyAiCam Enterprise" -- the top hardware tier. Facial recognition
+# as a CAPABILITY is intended to be positioned as an analytics add-on
+# (see website-pricing-review/build-your-system.html's existing
+# `face_access`/"AAC Facial Recognition / Face Access" feature-quantity
+# field, already separate from appliance selection) rather than the
+# defining trait of one specific hardware SKU -- no code change was
+# needed here for that part; it was already structured this way.
 HARDWARE_CATALOG = [
-    ("AIC-APPLIANCE-RYZEN-STARTER", "ryzen_starter", "AnyAiCam Ryzen Starter Appliance", 124999, "ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"),
-    ("AIC-APPLIANCE-RYZEN-ENTERPRISE", "ryzen_enterprise", "AnyAiCam Ryzen Enterprise Appliance", 174999, "ANYAICAM_STRIPE_PRICE_RYZEN_ENTERPRISE"),
-    ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", "ryzen_aac_facial_recognition", "AnyAiCam Ryzen AAC Facial Recognition Appliance", 224999, "ANYAICAM_STRIPE_PRICE_RYZEN_AAC_FACIAL"),
+    ("AIC-APPLIANCE-RYZEN-STARTER", "ryzen_starter", "AnyAiCam Starter", 124999, "ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"),
+    ("AIC-APPLIANCE-RYZEN-ENTERPRISE", "ryzen_enterprise", "AnyAiCam Professional", 174999, "ANYAICAM_STRIPE_PRICE_RYZEN_ENTERPRISE"),
+    ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", "ryzen_aac_facial_recognition", "AnyAiCam Enterprise", 224999, "ANYAICAM_STRIPE_PRICE_RYZEN_AAC_FACIAL"),
     ("AIC-RELAY-NUMATO-3CH", "numato_3_channel_relay", "Numato 3-Channel Relay Module", 14999, "ANYAICAM_STRIPE_PRICE_RELAY_NUMATO_3CH"),
 ]
 

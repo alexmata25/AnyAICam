@@ -64,7 +64,7 @@ def _tier_map(monkeypatch):
 @pytest.fixture()
 def _hardware_map(monkeypatch):
     monkeypatch.setattr(ho, "HARDWARE_PRICE_MAP", {
-        RYZEN_STARTER_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Ryzen Starter Appliance", "amount_cents": 124999},
+        RYZEN_STARTER_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Starter", "amount_cents": 124999},
     })
 
 
@@ -190,7 +190,7 @@ def test_hardware_only_purchase_sends_order_confirmation_never_a_camera_slot_ema
     previews = _read_previews(tmp_path)
     assert len(previews) == 1
     assert previews[0]["type"] == "hardware_order_confirmation"
-    assert "Ryzen Starter" in previews[0]["text"]
+    assert "AnyAiCam Starter" in previews[0]["text"]
     assert "does not activate camera slots" in previews[0]["text"]
 
 

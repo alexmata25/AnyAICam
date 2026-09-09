@@ -47,7 +47,7 @@ def _preview_email_dir(tmp_path, monkeypatch):
 @pytest.fixture()
 def _hardware_map(monkeypatch):
     monkeypatch.setattr(ho, "HARDWARE_PRICE_MAP", {
-        RYZEN_STARTER_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Ryzen Starter Appliance", "amount_cents": 124999},
+        RYZEN_STARTER_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Starter", "amount_cents": 124999},
     })
 
 

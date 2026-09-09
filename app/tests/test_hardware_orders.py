@@ -37,9 +37,9 @@ def _db(db_path):
 @pytest.fixture()
 def _hardware_price_map(monkeypatch):
     monkeypatch.setattr(ho, "HARDWARE_PRICE_MAP", {
-        RYZEN_STARTER_TEST_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Ryzen Starter Appliance", "amount_cents": 124999},
-        RYZEN_ENTERPRISE_TEST_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-ENTERPRISE", "product": "ryzen_enterprise", "name": "AnyAiCam Ryzen Enterprise Appliance", "amount_cents": 174999},
-        RYZEN_AAC_TEST_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-AAC-FACIAL", "product": "ryzen_aac_facial_recognition", "name": "AnyAiCam Ryzen AAC Facial Recognition Appliance", "amount_cents": 224999},
+        RYZEN_STARTER_TEST_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Starter", "amount_cents": 124999},
+        RYZEN_ENTERPRISE_TEST_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-ENTERPRISE", "product": "ryzen_enterprise", "name": "AnyAiCam Professional", "amount_cents": 174999},
+        RYZEN_AAC_TEST_PRICE: {"sku": "AIC-APPLIANCE-RYZEN-AAC-FACIAL", "product": "ryzen_aac_facial_recognition", "name": "AnyAiCam Enterprise", "amount_cents": 224999},
         RELAY_TEST_PRICE: {"sku": "AIC-RELAY-NUMATO-3CH", "product": "numato_3_channel_relay", "name": "Numato 3-Channel Relay Module", "amount_cents": 14999},
     })
 
@@ -88,6 +88,54 @@ def test_catalog_has_exactly_the_four_expected_skus_at_the_verified_prices():
         "ryzen_aac_facial_recognition": ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", 224999),
         "numato_3_channel_relay": ("AIC-RELAY-NUMATO-3CH", 14999),
     }
+
+
+def test_the_display_name_rename_only_touched_the_name_field(monkeypatch):
+    """Regression test for the display-name-only rename (customer
+    request: rename the customer-facing appliance names to 'AnyAiCam
+    Starter/Professional/Enterprise', 'do not change IDs or
+    provisioning'). Proves both halves of that instruction: the new
+    names are actually in the real catalog, AND every identifier that
+    provisioning/entitlement logic actually depends on -- SKU, product
+    key, amount, and the Price ID env var name itself -- is byte-for-
+    byte unchanged from before the rename."""
+    rows = ho._catalog_rows()
+    by_product = {r["product"]: r for r in rows}
+    assert by_product["ryzen_starter"]["name"] == "AnyAiCam Starter"
+    assert by_product["ryzen_enterprise"]["name"] == "AnyAiCam Professional"
+    assert by_product["ryzen_aac_facial_recognition"]["name"] == "AnyAiCam Enterprise"
+    assert by_product["numato_3_channel_relay"]["name"] == "Numato 3-Channel Relay Module"  # untouched, not part of this rename
+
+    # SKU/product/amount/env-var-name unchanged (same assertion as
+    # test_catalog_has_exactly_the_four_expected_skus_at_the_verified_
+    # prices above, restated here so this test alone documents "the
+    # rename changed display text only" without depending on that other
+    # test having run).
+    assert {product: (sku, amount) for sku, product, _, amount, _ in ho.HARDWARE_CATALOG} == {
+        "ryzen_starter": ("AIC-APPLIANCE-RYZEN-STARTER", 124999),
+        "ryzen_enterprise": ("AIC-APPLIANCE-RYZEN-ENTERPRISE", 174999),
+        "ryzen_aac_facial_recognition": ("AIC-APPLIANCE-RYZEN-AAC-FACIAL", 224999),
+        "numato_3_channel_relay": ("AIC-RELAY-NUMATO-3CH", 14999),
+    }
+    env_vars = {product: env_var for _, product, _, _, env_var in ho.HARDWARE_CATALOG}
+    assert env_vars["ryzen_starter"] == "ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"
+    assert env_vars["ryzen_enterprise"] == "ANYAICAM_STRIPE_PRICE_RYZEN_ENTERPRISE"
+    assert env_vars["ryzen_aac_facial_recognition"] == "ANYAICAM_STRIPE_PRICE_RYZEN_AAC_FACIAL"
+
+
+def test_new_display_names_never_resolve_by_name_only_by_sku_and_price_id(monkeypatch):
+    """The rename cannot affect order matching: resolve_hardware_sku()
+    (the ONLY function that turns an incoming Stripe Price ID into a
+    hardware order) never looks at, compares, or is influenced by the
+    `name` field at all -- verified here by resolving through a real
+    Price ID and confirming the returned name is the NEW display name,
+    proving the lookup path is Price-ID-in/name-out, never name-in."""
+    monkeypatch.setattr(ho, "HARDWARE_PRICE_MAP", {
+        "price_rename_check": {"sku": "AIC-APPLIANCE-RYZEN-ENTERPRISE", "product": "ryzen_enterprise", "name": "AnyAiCam Professional", "amount_cents": 174999},
+    })
+    resolved = ho.resolve_hardware_sku("price_rename_check")
+    assert resolved["sku"] == "AIC-APPLIANCE-RYZEN-ENTERPRISE"  # identity resolved by Price ID, unaffected by name
+    assert resolved["name"] == "AnyAiCam Professional"  # display name is just carried through, never looked up by
 
 
 def test_no_sku_ships_with_a_stripe_price_id_configured_by_default():

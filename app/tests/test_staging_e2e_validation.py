@@ -79,7 +79,7 @@ def client(db_path, tmp_path, monkeypatch):
             TIER_HYBRID_1_8: {"product": "camera_slots_hybrid", "camera_slot_maximum": 8},
         })
         monkeypatch.setattr(ho, "HARDWARE_PRICE_MAP", {
-            RYZEN_STARTER_STAGING: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Ryzen Starter Appliance", "amount_cents": 124999},
+            RYZEN_STARTER_STAGING: {"sku": "AIC-APPLIANCE-RYZEN-STARTER", "product": "ryzen_starter", "name": "AnyAiCam Starter", "amount_cents": 124999},
         })
 
         email_patch = dataclasses.replace(email_service.settings, email_backend="preview", email_preview_dir=str(tmp_path / "email-preview"))
