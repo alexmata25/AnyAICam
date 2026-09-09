@@ -14,6 +14,7 @@ description). Proves:
 - an env-configured Local Price ID and Hybrid Price ID resolve
   independently and update independent customer_entitlements rows.
 """
+import os
 import sqlite3
 
 import pytest
@@ -243,3 +244,42 @@ def test_live_price_ids_never_collide_with_the_staging_test_ids():
         "price_1UD32kGllhK80H2nGaOQB9XI", "price_1UD33SGllhK80H2nxrbBT2ch",
     }
     assert test_ids.isdisjoint(LIVE_PRICE_IDS.values())
+
+
+# --------------------------------- Phase 4: the $1 live plumbing-test product
+
+
+def test_the_dollar_test_products_price_id_is_excluded_from_slot_entitlement():
+    """Phase 4: a real $1.00 live checkout against "AnyAiCam Test System"
+    (price_1UDegIGllhK80H2nHCfGvcz8) already succeeded, proving live
+    Stripe/payment/webhook plumbing -- but it must NEVER be treated as
+    proof of, or a source of, camera-slot entitlement. It is deliberately
+    absent from PLAN_TIERS/PRICE_ID_CAMERA_SLOT_MAP, so resolve_tier()
+    correctly returns None for it even if a real webhook event for this
+    exact purchase were replayed through sync_entitlement_from_stripe_
+    event() -- the event would be recorded as "ignored", not granted."""
+    dollar_test_price_id = "price_1UDegIGllhK80H2nHCfGvcz8"
+    assert dollar_test_price_id not in ce.PRICE_ID_CAMERA_SLOT_MAP
+    assert ce.resolve_tier(dollar_test_price_id) is None
+    for _, _, _, _, _, _, env_var in ce.PLAN_TIERS:
+        assert os.environ.get(env_var, "") != dollar_test_price_id
+
+
+def test_dollar_test_checkout_event_grants_nothing_end_to_end(db_path):
+    """Full sync_entitlement_from_stripe_event() path with the real
+    Price ID, proving the whole pipeline -- not just resolve_tier() in
+    isolation -- treats it as unrecognized."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    event = {
+        "id": "evt_dollar_test_1", "type": "checkout.session.completed",
+        "data": {"object": {
+            "id": "cs_dollar_test", "customer": "cus_dollar_test",
+            "customer_details": {"email": "real-customer@example.test"},
+            "metadata": {"anyaicam_stripe_price_id": "price_1UDegIGllhK80H2nHCfGvcz8", "anyaicam_customer_id": "cust-1"},
+        }},
+    }
+    with override_target(sqlite_path=db_path):
+        result = ce.sync_entitlement_from_stripe_event(event)
+        total = ce.total_camera_slots("cust-1")
+    assert result["status"] == "ignored"
+    assert total == 0
