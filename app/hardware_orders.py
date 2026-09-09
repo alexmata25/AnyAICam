@@ -60,13 +60,19 @@ from this task's explicit instruction for the relay module:
     ryzen_aac_facial_recognition   $2,249.99 (224999 cents)
     numato_3_channel_relay           $149.99 ( 14999 cents)
 
-No Stripe TEST/SANDBOX secret key was available in this environment to
-query or create a real Stripe Price ID for any of the four SKUs, so
-every *_PRICE_ID env var below ships unset and HARDWARE_PRICE_MAP ships
-empty by default -- exactly like customer_entitlements.PRICE_ID_CAMERA_
-SLOT_MAP did before its 8 tiers' real Price IDs existed. Fail closed, not
-a guess: PRICE_ID_REQUIRED for all four until a real TEST Price ID is
-created and this environment is configured with it.
+Real Stripe TEST/SANDBOX Price IDs for all four SKUs were confirmed by
+the site owner and are documented in deploy/.env.staging.example under
+ANYAICAM_STRIPE_PRICE_RYZEN_STARTER/RYZEN_ENTERPRISE/RYZEN_AAC_FACIAL/
+RELAY_NUMATO_3CH -- this module still resolves them purely from the
+environment (never hardcoded here), so a staging deployment must set
+those four env vars (and ANYAICAM_STRIPE_SECRET_KEY to a sk_test_...
+key) for HARDWARE_PRICE_MAP to actually populate. Until then, or in any
+environment without them set, every *_PRICE_ID resolves to None and
+HARDWARE_PRICE_MAP is empty -- fail closed, not a guess.
+
+Product-label correction: the AAC Facial Recognition appliance's correct
+model name is "MINISFORUM AI X1 Pro-470" -- never "AI X1-255" (that name
+belongs to the Ryzen Starter unit, a different physical appliance).
 """
 from __future__ import annotations
 
