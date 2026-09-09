@@ -60,6 +60,23 @@ def _connect_src_csp() -> str:
 
 _MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
 
+# Provisioning Phase 4: Stripe's real webhook POST carries a
+# Stripe-Signature header, never our anyaicam_csrf cookie/token pair --
+# Stripe cannot present a token it was never issued. Confirmed live on
+# app.anyaicam.com: every POST to this route, including one with a
+# stripe-signature header, was rejected 403 "CSRF validation failed"
+# before ever reaching that route's own cryptographic signature check
+# (verify_stripe_webhook_signature() in main.py), which means no real
+# Stripe event could ever have been processed. Exempted by EXACT path
+# only -- not a prefix -- so this never widens to /api/payments/* or
+# /api/* (e.g. POST /api/payments/checkout, a browser-originated
+# request that legitimately carries the CSRF cookie/token, keeps
+# requiring it exactly as before). The route itself remains fully
+# protected: it still requires and verifies Stripe-Signature against
+# the configured webhook signing secret before doing anything else --
+# this exemption removes only the CSRF check, never authentication.
+CSRF_EXEMPT_EXACT_PATHS = {'/api/payments/stripe/webhook'}
+
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
     @staticmethod
@@ -123,7 +140,7 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if request.url.query: destination+='?'+request.url.query
             return RedirectResponse(destination,status_code=308)
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
-        if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
+        if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout' and request.url.path not in CSRF_EXEMPT_EXACT_PATHS:
             cookie=request.cookies.get('anyaicam_csrf'); token=request.headers.get('x-csrf-token')
             # No cookie means the final check below can never pass regardless of
             # what the body contains -- fail now instead of buffering a body an
