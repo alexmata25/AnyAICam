@@ -88,6 +88,22 @@ or product exists in either place. PRICE_ID_CAMERA_SLOT_MAP therefore
 ships EMPTY by default (`{}`) -- see the Phase 3 report for what
 production configuration is still required before this can grant real
 entitlements, and why none was invented here.
+
+Phase 4 update: verified Local/Hybrid pricing from the AWS cost model
+----------------------------------------------------------------------
+PLAN_TIERS replaces the placeholder 1-16/17-32 example from Phase 3 with
+the real 8-tier structure verified directly from AnyAiCam_AWS_Cost_
+Model_2026-09.xlsx's "Local" and "Hybrid" sheets (read from the workbook
+itself, not retyped from a description): four camera-count bands (1-8,
+9-16, 17-32, 33-64) under each of two separate service lines, Local and
+Hybrid, each with its own monthly retail price and its own `product`
+key (`camera_slots_local`/`camera_slots_hybrid`) so the two service
+lines can never collide even where their camera_slot_maximum coincides.
+PRICE_ID_CAMERA_SLOT_MAP is now built from PLAN_TIERS instead of a raw
+JSON env var. Re-audited against this same set of sources (this app's
+env vars, pricing_config.py, and the entire anyaicam.com PHP codebase)
+for all 8 exact price points -- still none proven anywhere; every tier's
+Price ID env var ships unset.
 """
 from __future__ import annotations
 
@@ -251,24 +267,77 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
 # as of Phase 2 -- see module docstring. Each function here remains
 # independently callable/testable against a synthetic Stripe event dict.
 
-# Server-side, fixed Stripe-Price-ID -> camera-slot-tier mapping. The
-# ONLY source of camera-slot quantity as of Phase 3 -- never a browser-
-# submitted quantity, never a per-plan constant. Format (via
-# ANYAICAM_STRIPE_PRICE_TIER_MAP, a JSON object):
-#   {"price_1AbC...": {"product": "camera_slots_1_16", "camera_slot_maximum": 16},
-#    "price_1DeF...": {"product": "camera_slots_17_32", "camera_slot_maximum": 32}}
-# Ships EMPTY by default -- see module docstring for the Phase 3 audit
-# finding that no tier's Price ID is proven anywhere in existing
-# configuration. A Price ID not present here is never granted slots.
+# Verified planning reference: AnyAiCam_AWS_Cost_Model_2026-09.xlsx,
+# "Local" and "Hybrid" sheets, column G ("Retail/site $"), read directly
+# from the workbook (not retyped from memory) -- confirmed identical
+# across every resolution row within each camera tier. This is a
+# PLANNING reference, not proof any Stripe product/Price ID exists for
+# these tiers -- see stripe_price_id below and the Phase 3/4 report for
+# the audit that found none of these 8 price points anywhere in existing
+# Stripe or website configuration.
+#
+# Local and Hybrid are deliberately separate service lines even where
+# their camera_slot_maximum coincides (both top out at 64) -- `product`
+# encodes which one, so a customer's Local and Hybrid entitlements (if
+# they somehow held both) never collide or overwrite each other, and an
+# upgrade within one line (e.g. Local 1-8 -> Local 9-16) never touches
+# the other. Each tier's real Stripe Price ID -- when one is created and
+# verified -- goes in its own env var; unset (the default for all eight
+# today) means that tier is not purchasable/grantable yet, not a guess.
+PLAN_TIERS = [
+    # plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, price_id_env_var
+    ("local", "1-8", 1, 8, 8, 14.99, "ANYAICAM_STRIPE_PRICE_LOCAL_1_8"),
+    ("local", "9-16", 9, 16, 16, 19.99, "ANYAICAM_STRIPE_PRICE_LOCAL_9_16"),
+    ("local", "17-32", 17, 32, 32, 29.99, "ANYAICAM_STRIPE_PRICE_LOCAL_17_32"),
+    ("local", "33-64", 33, 64, 64, 49.99, "ANYAICAM_STRIPE_PRICE_LOCAL_33_64"),
+    ("hybrid", "1-8", 1, 8, 8, 29.99, "ANYAICAM_STRIPE_PRICE_HYBRID_1_8"),
+    ("hybrid", "9-16", 9, 16, 16, 49.99, "ANYAICAM_STRIPE_PRICE_HYBRID_9_16"),
+    ("hybrid", "17-32", 17, 32, 32, 89.99, "ANYAICAM_STRIPE_PRICE_HYBRID_17_32"),
+    ("hybrid", "33-64", 33, 64, 64, 149.99, "ANYAICAM_STRIPE_PRICE_HYBRID_33_64"),
+]
+
+
+def _plan_tier_rows() -> list[dict]:
+    rows = []
+    for plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, env_var in PLAN_TIERS:
+        rows.append({
+            "plan_type": plan_type,
+            "tier_label": tier_label,
+            "min_cameras": min_cameras,
+            "max_cameras": max_cameras,
+            "camera_slot_maximum": camera_slot_maximum,
+            "monthly_retail_usd": monthly_retail_usd,
+            "product": f"camera_slots_{plan_type}",
+            "stripe_price_id": os.environ.get(env_var, "").strip() or None,
+        })
+    return rows
+
+
+def pricing_table_for_website() -> list[dict]:
+    """Prepared, ready-to-render pricing data for the customer-facing VMS
+    website pricing section -- plan type, camera range, and verified
+    monthly retail price for all 8 tiers, straight from the AWS cost
+    model workbook. Does NOT include stripe_price_id (irrelevant to a
+    pricing page, and unset for all eight tiers today besides)."""
+    return [
+        {"plan_type": r["plan_type"], "tier_label": r["tier_label"], "min_cameras": r["min_cameras"],
+         "max_cameras": r["max_cameras"], "monthly_retail_usd": r["monthly_retail_usd"]}
+        for r in _plan_tier_rows()
+    ]
+
+
 def _load_price_tier_map() -> dict:
-    raw = os.environ.get("ANYAICAM_STRIPE_PRICE_TIER_MAP", "").strip()
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    """Server-side, fixed Stripe-Price-ID -> camera-slot-tier mapping.
+    The ONLY source of camera-slot quantity as of Phase 3 -- never a
+    browser-submitted quantity, never a per-plan constant. Built from
+    PLAN_TIERS above; a tier whose env var is unset contributes no entry
+    at all, so resolve_tier() correctly treats its Price ID (there isn't
+    one yet) as unverified -- fail closed, not a guess."""
+    mapping = {}
+    for tier in _plan_tier_rows():
+        if tier["stripe_price_id"]:
+            mapping[tier["stripe_price_id"]] = {"product": tier["product"], "camera_slot_maximum": tier["camera_slot_maximum"]}
+    return mapping
 
 
 PRICE_ID_CAMERA_SLOT_MAP = _load_price_tier_map()
