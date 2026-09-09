@@ -393,11 +393,23 @@ def person_watchlist_memberships(db, *, customer_id: str, person_id: str) -> lis
 # Settings
 # --------------------------------------------------------------------------
 
+# 'engine' was a Phase 1 mistake, found and fixed during the Phase 2
+# Codex review: facial_events.py never actually read
+# facial_settings.engine to pick a matching engine -- it always used
+# whichever engine facial_recognition.get_engine()'s process-wide
+# singleton resolved to (controlled by the deployment-wide
+# ANYAICAM_FACE_ENGINE setting, not per customer). The stored 'engine'
+# column let an operator "choose" a value that had zero effect --
+# a misleading, inert setting. get_settings() below now reports the
+# REAL, live active engine instead (never read from this dict, always
+# computed fresh), and update_settings() no longer accepts an 'engine'
+# override at all -- there is exactly one engine running per
+# deployment, shared by every customer/camera on it, so "per customer"
+# was never a coherent choice for this field to begin with.
 DEFAULT_SETTINGS = {
     "min_confidence": 0.6,
     "unknown_person_events_enabled": True,
     "debounce_seconds": 30,
-    "engine": "haar_intensity",
 }
 
 
@@ -406,42 +418,52 @@ def get_settings(db, *, customer_id: str) -> dict:
     (unwritten, not persisted) if they have never saved any -- matches
     this codebase's own no-hidden-default convention: a customer that
     never configured AAC gets the documented, code-level default, never
-    a silently-different one from an empty row."""
+    a silently-different one from an empty row.
+
+    'engine'/'engine_version' in the returned dict are always the
+    REAL, currently active engine (see this module's own comment on
+    DEFAULT_SETTINGS above) -- read-only, informational, never
+    persisted and never settable via update_settings()."""
     row = db.execute("SELECT * FROM facial_settings WHERE customer_id=?", (customer_id,)).fetchone()
     if row is None:
-        return {"customer_id": customer_id, **DEFAULT_SETTINGS}
-    result = dict(row)
-    result["unknown_person_events_enabled"] = bool(result["unknown_person_events_enabled"])
+        result = {"customer_id": customer_id, **DEFAULT_SETTINGS}
+    else:
+        result = {key: value for key, value in dict(row).items() if key != "engine"}
+        result["unknown_person_events_enabled"] = bool(result["unknown_person_events_enabled"])
+    from facial_recognition import get_engine
+
+    active_engine = get_engine()
+    result["engine"] = active_engine.name
+    result["engine_version"] = active_engine.version
     return result
 
 
 def update_settings(db, *, customer_id: str, now: str, **fields) -> dict:
+    fields.pop("engine", None)  # never settable -- see DEFAULT_SETTINGS's own comment
     current = get_settings(db, customer_id=customer_id)
     merged = {**{k: v for k, v in current.items() if k in DEFAULT_SETTINGS}, **{k: v for k, v in fields.items() if v is not None}}
     existing = db.execute("SELECT id FROM facial_settings WHERE customer_id=?", (customer_id,)).fetchone()
     if existing:
         db.execute(
-            "UPDATE facial_settings SET min_confidence=?,unknown_person_events_enabled=?,debounce_seconds=?,engine=?,updated_at=? WHERE customer_id=?",
+            "UPDATE facial_settings SET min_confidence=?,unknown_person_events_enabled=?,debounce_seconds=?,updated_at=? WHERE customer_id=?",
             (
                 merged["min_confidence"],
                 int(bool(merged["unknown_person_events_enabled"])),
                 merged["debounce_seconds"],
-                merged["engine"],
                 now,
                 customer_id,
             ),
         )
     else:
         db.execute(
-            "INSERT INTO facial_settings(id,customer_id,min_confidence,unknown_person_events_enabled,debounce_seconds,engine,updated_at) "
-            "VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO facial_settings(id,customer_id,min_confidence,unknown_person_events_enabled,debounce_seconds,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
             (
                 _new_id("settings"),
                 customer_id,
                 merged["min_confidence"],
                 int(bool(merged["unknown_person_events_enabled"])),
                 merged["debounce_seconds"],
-                merged["engine"],
                 now,
             ),
         )

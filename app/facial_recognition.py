@@ -34,6 +34,7 @@ ANYAICAM_FACE_ENGINE without touching any caller.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import threading
@@ -252,18 +253,57 @@ def embed_face_crop(face_crop_bgr) -> tuple[float, ...] | None:
 _engine_lock = threading.Lock()
 _engine: FaceEngine | None = None
 
+# 'haar' (the default) never imports facial_engine_onnx at all -- core
+# VMS startup and every test that doesn't explicitly opt in never
+# touches onnxruntime or the network. 'onnx' forces the Phase 2
+# production-capable engine (facial_engine_onnx.OnnxFaceEngine); if it
+# reports itself unavailable (onnxruntime not installed, or the model
+# files couldn't be downloaded/verified -- see that module's own
+# docstring), get_engine() falls back to Haar rather than leaving AAC
+# entirely non-functional, matching this codebase's "never crash the
+# detection pipeline" convention (ppe.py/lpr.py do the same for their
+# own optional dependencies). 'auto' tries onnx first, silently
+# preferring it when available, falling back to haar otherwise -- this
+# is NOT the default, specifically so this project's test suite (which
+# never sets this env var) stays hermetic and network-free by default;
+# an operator opts into the stronger engine explicitly.
+FACE_ENGINE_SELECTION = os.environ.get("ANYAICAM_FACE_ENGINE", "haar").strip().lower()
+
+_engine_fallback_logged = False
+
+
+def _build_onnx_engine() -> FaceEngine | None:
+    try:
+        from facial_engine_onnx import OnnxFaceEngine
+    except ImportError:
+        return None
+    candidate = OnnxFaceEngine()
+    if not candidate.capability().get("available"):
+        return None
+    return candidate
+
 
 def get_engine() -> FaceEngine:
     """Lazy singleton, matching get_yolo_model()'s own pattern in
-    main.py. ANYAICAM_FACE_ENGINE selects the backend -- 'haar' (the
-    default, always available) is the only built-in engine in Phase 1;
-    an unrecognized value falls back to 'haar' rather than raising, so
-    a deployment never fails to start over a typo in this optional
-    setting."""
-    global _engine
+    main.py. See FACE_ENGINE_SELECTION's own comment for what
+    ANYAICAM_FACE_ENGINE=haar|onnx|auto each do. An unrecognized value
+    falls back to 'haar' rather than raising, so a deployment never
+    fails to start over a typo in this optional setting."""
+    global _engine, _engine_fallback_logged
     with _engine_lock:
-        if _engine is None:
-            _engine = HaarEmbeddingFaceEngine()
+        if _engine is not None:
+            return _engine
+        if FACE_ENGINE_SELECTION in ("onnx", "auto"):
+            onnx_engine = _build_onnx_engine()
+            if onnx_engine is not None:
+                _engine = onnx_engine
+                return _engine
+            if FACE_ENGINE_SELECTION == "onnx" and not _engine_fallback_logged:
+                _engine_fallback_logged = True
+                logging.getLogger("anyaicam.facial_recognition").warning(
+                    "facial_recognition.onnx_engine_unavailable_falling_back_to_haar"
+                )
+        _engine = HaarEmbeddingFaceEngine()
         return _engine
 
 
@@ -276,7 +316,9 @@ def reset_engine() -> None:
 
 def capability() -> dict:
     """Explicit, non-throwing AAC capability state, mirroring lpr.py's
-    own capability()."""
+    own capability(). Reflects whichever engine get_engine() actually
+    resolved to -- e.g. reports the ONNX engine's own provider list and
+    availability when ANYAICAM_FACE_ENGINE selects it, not always Haar's."""
     if not FACIAL_RECOGNITION_ENABLED:
         return {"enabled": False, "available": False, "reason": "AAC facial recognition is disabled"}
     engine_capability = get_engine().capability()

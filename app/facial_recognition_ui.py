@@ -645,8 +645,11 @@ function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&am
 <label>Debounce seconds<input id="s-debounce" type="number" min="0"></label>
 <button class="action-button" id="s-save">Save settings</button>
 <p role="status" id="s-status"></p>
+<div class="health-row"><span>Active face engine</span><strong id="s-engine">&mdash;</strong></div>
+<p class="health-detail">The engine is a deployment-wide setting (ANYAICAM_FACE_ENGINE), shared by every customer/camera on this appliance -- shown here for information only, not editable per customer.</p>
 </section>'''
         scripts = '''<script>
+function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function sLoad(){
   const customerId=document.getElementById('s-customer-id').value.trim();
   if(!customerId)return;
@@ -656,6 +659,7 @@ async function sLoad(){
   document.getElementById('s-confidence').value=s.min_confidence;
   document.getElementById('s-unknown').checked=!!s.unknown_person_events_enabled;
   document.getElementById('s-debounce').value=s.debounce_seconds;
+  document.getElementById('s-engine').textContent=aacEsc(s.engine)+' (v'+aacEsc(s.engine_version)+')';
 }
 document.getElementById('s-load').addEventListener('click',sLoad);
 document.getElementById('s-save').addEventListener('click',async()=>{

@@ -37692,20 +37692,35 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
                 append_analytics_event(ppe_event)
                 saved_events.append(ppe_event)
-        # AAC (facial recognition / access-control analytics), Phase 1.
+        # AAC (facial recognition / access-control analytics).
         # Same shape as the PPE hook directly above: a person's own crop
         # in, event(s) out -- but AAC events are written straight into
-        # detection_events/facial_events via facial_events.py (see that
-        # module's own docstring for why, unlike PPE/LPR, this does NOT
-        # go through append_analytics_event()/analytics_sync.py), so
-        # this hook opens its own short-lived database_backend.connect()
-        # rather than building a local-JSON event dict. relay_provider is
-        # deliberately omitted (defaults to None inside
-        # record_facial_events(), which then skips access-rule/relay
-        # evaluation entirely) -- Phase 1 records facial match history
-        # only; wiring a live relay provider into this hot detection path
-        # is explicitly future work (see the Phase 1 report), not
-        # something this hook does implicitly.
+        # detection_events/facial_events via facial_events.py (this hook
+        # opens its own short-lived database_backend.connect() rather
+        # than building only a local-JSON event dict), which is correct
+        # and complete on its own for a single-database deployment
+        # (Ryzen/Samsung). relay_provider is deliberately omitted
+        # (defaults to None inside record_facial_events(), which then
+        # skips access-rule/relay evaluation entirely) -- this hook
+        # records facial match history only; wiring a live relay
+        # provider into this hot detection path remains explicit future
+        # work, not something this hook does implicitly.
+        #
+        # Phase 2: each created event is ALSO appended to the local
+        # ANALYTICS_EVENTS_FILE (append_analytics_event(), the exact
+        # same call ppe.py's own hook makes) -- not instead of the
+        # direct write above, in addition to it. The direct write is
+        # what makes local matching/debounce/history work today, on
+        # this database, with no cloud involved; this second, local-
+        # JSON copy exists purely so analytics_sync.py's own existing
+        # appliance -> cloud forwarding (already the mechanism ppe/lpr
+        # events use) has something to forward for a SPLIT edge/cloud
+        # deployment, where the edge's own direct write above lands in
+        # a database the cloud customer portal never reads. See
+        # analytics_sync.py's own facial_recognition special case in
+        # _build_payload() and appliance_cloud.py's facial_events
+        # detail-row creation in analytics_event_available() for the
+        # cloud-side half of this.
         if class_name == "person" and facial_recognition.is_camera_enabled(camera_number):
             for person_detection in class_detections:
                 try:
@@ -37719,8 +37734,29 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                     from database_backend import connect as aac_connect
 
                     with aac_connect() as aac_db:
-                        facial_events.record_facial_events(
+                        aac_events_created = facial_events.record_facial_events(
                             aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now
+                        )
+                    for aac_event in aac_events_created:
+                        append_analytics_event(
+                            {
+                                "id": aac_event["id"],
+                                "camera": camera_number,
+                                "event_type": "facial_recognition",
+                                "timestamp": now.isoformat(),
+                                "confidence": aac_event["confidence"],
+                                "object_count": 1,
+                                "thumbnail": thumbnail_url,
+                                "linked_recording": linked_recording,
+                                "mock": False,
+                                "match_state": aac_event["match_state"],
+                                "matched_person_id": aac_event["matched_person_id"],
+                                "matched_person_name": aac_event["matched_person_name"],
+                                "matched_watchlist_id": aac_event["matched_watchlist_id"],
+                                "matched_watchlist_name": aac_event["matched_watchlist_name"],
+                                "engine": aac_event["engine"],
+                                "engine_version": aac_event["engine_version"],
+                            }
                         )
                 except Exception as error:
                     print(f"Camera {camera_number} AAC facial recognition skipped (non-fatal): {error}")
@@ -39283,6 +39319,7 @@ import lpr
 import ppe
 import smart_motion
 import people_counting
+import facial_embedding_sync
 import facial_events
 import facial_recognition
 
@@ -39624,6 +39661,11 @@ async def lifespan(app: FastAPI):
     analytics_sync_task = (
         asyncio.create_task(analytics_sync.analytics_sync_worker())
         if RUNTIME_ROLE in {"edge", "combined"} and analytics_sync.ANALYTICS_SYNC_ENABLED
+        else None
+    )
+    facial_embedding_sync_task = (
+        asyncio.create_task(facial_embedding_sync.facial_embedding_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and facial_embedding_sync.FACIAL_EMBEDDING_SYNC_ENABLED
         else None
     )
 
@@ -46227,6 +46269,13 @@ NAV_ITEMS = [
 
     ("analytics-entitlements", "/analytics-entitlements", "◆", "Analytics entitlements"),
 
+    # AAC (facial recognition / access-control analytics), Phase 2.
+    # Visibility is further gated below (see visible_nav_items) by the
+    # viewer's own facial.view permission, not by role membership in
+    # this list -- being in NAV_ITEMS at all only makes "aac" eligible
+    # to appear, the same as every other entry here.
+    ("aac", "/aac/people", "◎", "Facial Recognition"),
+
 
 
 
@@ -46446,7 +46495,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "investigate", "dashboard",
+            "live", "events", "alerts", "playback", "investigate", "dashboard", "aac",
 
 
 
@@ -46698,6 +46747,26 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
+def _facial_view_permitted(shell_user: dict | None, shell_role: str) -> bool:
+    """AAC (facial recognition) nav-visibility gate: True only for an
+    identity partner_db.ROLE_PERMISSIONS actually grants 'facial.view'
+    to -- the exact same check every AAC route already enforces (see
+    facial_recognition_ui.py's own _require()), so the nav link and the
+    pages it points to can never disagree about who's allowed to see
+    them. shell_user may be the newer partner_portal identity dict or
+    the legacy current_user() one (see this function's caller in
+    page_shell()) -- allowed() only ever reads .get('role'), so either
+    shape works; a role partner_db.ROLE_PERMISSIONS doesn't recognize
+    at all (e.g. a legacy-only role name) simply isn't granted, same as
+    an anonymous visitor."""
+    try:
+        from partner_db import allowed as partner_db_allowed
+    except Exception:
+        return False
+    identity = shell_user if isinstance(shell_user, dict) else {}
+    return partner_db_allowed({**identity, "role": shell_role}, "facial.view")
+
+
 def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
@@ -46783,6 +46852,20 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
         if (allowed_keys is None or item[0] in allowed_keys)
         and (item[0] != "customer-app-settings" or shell_role in CUSTOMER_PORTAL_ROLES)
+        # AAC (facial recognition), Phase 2: being in allowed_keys above
+        # (added for administrator/customer_owner/customer_viewer) only
+        # makes "aac" ELIGIBLE -- this is the actual permission gate,
+        # using the exact same partner_db.ROLE_PERMISSIONS/allowed()
+        # this whole feature's own routes already enforce, so a role
+        # granted facial.view there is never out of sync with what the
+        # nav link itself checks. Known gap, not introduced by this
+        # change: partner_owner/salesperson/technician aren't wired
+        # into ANY branch of navigation_keys_for_role() yet (a
+        # pre-existing limitation of this legacy nav system, not
+        # specific to AAC) -- those roles won't see this link even
+        # though partner_owner/technician do hold facial.view/
+        # facial.manage. See the Phase 2 report's own nav section.
+        and (item[0] != "aac" or _facial_view_permitted(shell_user, shell_role))
 
 
 

@@ -306,3 +306,33 @@ def test_settings_are_scoped_per_customer(db):
     facial_people.update_settings(db, customer_id="cust-1", min_confidence=0.9, now=NOW)
     other = facial_people.get_settings(db, customer_id="cust-2")
     assert other["min_confidence"] == 0.6  # cust-2 unaffected, still the default
+
+
+def test_get_settings_engine_reflects_the_real_active_engine_not_a_stored_choice(db, monkeypatch):
+    """Phase 2 Codex review fix: 'engine' must always be the real,
+    currently active engine (facial_recognition.get_engine()), never a
+    stored, disconnected value -- see DEFAULT_SETTINGS's own comment on
+    why this was found to be an inert setting in Phase 1."""
+    import facial_recognition as fr
+
+    class _FakeEngine:
+        name = "fake_engine_for_test"
+        version = "9"
+
+    monkeypatch.setattr(fr, "get_engine", lambda: _FakeEngine())
+    settings = facial_people.get_settings(db, customer_id="cust-1")
+    assert settings["engine"] == "fake_engine_for_test"
+    assert settings["engine_version"] == "9"
+
+
+def test_update_settings_ignores_an_engine_override_attempt(db, monkeypatch):
+    import facial_recognition as fr
+
+    class _FakeEngine:
+        name = "fake_engine_for_test"
+        version = "9"
+
+    monkeypatch.setattr(fr, "get_engine", lambda: _FakeEngine())
+    result = facial_people.update_settings(db, customer_id="cust-1", engine="attacker_chosen_engine", min_confidence=0.7, now=NOW)
+    assert result["engine"] == "fake_engine_for_test"  # the real active engine, not the attempted override
+    assert result["min_confidence"] == 0.7  # other, real fields still apply normally

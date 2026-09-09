@@ -184,6 +184,40 @@ def test_severe_downscale_simulating_a_distant_face_degrades_the_match():
     assert similarity < baseline
 
 
+# --------------------------------------------------------------- partial occlusion (synthetic proxy)
+
+
+def _occlude_lower_half(image: np.ndarray) -> np.ndarray:
+    """A solid block over the lower half of the crop -- a rough,
+    synthetic stand-in for a mask, hand, or held object covering part
+    of a face. Not a claim about real occlusion robustness (sunglasses/
+    a real mask have very different visual structure than a flat
+    block) -- see this test's own docstring for what it can and can't
+    show without a real face photo."""
+    occluded = image.copy()
+    height = occluded.shape[0]
+    occluded[height // 2 :, :, :] = 90
+    return occluded
+
+
+def test_partial_occlusion_measurably_degrades_the_match():
+    """What this CAN honestly show without a real face photo: covering
+    part of the input measurably changes the embedding, because this
+    engine has no learned understanding of "this is an occluded face,
+    the same identity" -- unlike a real lighting/pose transform of the
+    SAME content, an occlusion replaces real information with none.
+    What it CANNOT show: how a real face behind real glasses or a real
+    mask actually performs -- that requires a real photo, deferred to
+    real-camera validation (see the Phase 2 report's own note)."""
+    face = _synthetic_face()
+    occluded = _occlude_lower_half(face)
+    similarity = _similarity(face, occluded)
+    lightly_transformed = _similarity(face, _darken(face, 0.9))
+    assert similarity < lightly_transformed, (
+        "occlusion should degrade the match more than a mild, information-preserving transform"
+    )
+
+
 # --------------------------------------------------------------- multiple faces (engine-level, not pipeline-level)
 
 
