@@ -480,6 +480,22 @@ def apply_migrations():
                               {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='analytics_subscriptions'").fetchall()})
         if 'licensed_quantity' not in subscription_columns: db.execute('ALTER TABLE analytics_subscriptions ADD COLUMN licensed_quantity INTEGER NOT NULL DEFAULT 1')
 
+        # Stripe TEST analytics wiring: analytics_subscriptions is the
+        # pre-existing manual/partner-entered licensing table (see
+        # customer_entitlements.py's module docstring, finding #3) --
+        # these columns let analytics_entitlements.py's Stripe webhook
+        # bridge write to and reconcile against this SAME table (never a
+        # second analytics/licensing architecture) with the same
+        # traceability customer_entitlements/hardware_orders already have
+        # for their own Stripe-driven rows.
+        for name,definition in (
+            ('stripe_customer_id','TEXT'),
+            ('stripe_subscription_id','TEXT'),
+            ('stripe_price_id','TEXT'),
+            ('updated_at','TEXT'),
+        ):
+            if name not in subscription_columns: db.execute(f'ALTER TABLE analytics_subscriptions ADD COLUMN {name} {definition}')
+
         appliance_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()}
                            if backend()=='sqlite' else
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})

@@ -64,6 +64,7 @@ from partner_db import audit, connection, row, rows
 from partner_portal import partner_identity
 
 from customer_entitlements import get_entitlements_for_customer, total_camera_slots
+from analytics_entitlements import get_active_analytics_for_customer
 
 
 def _customer_owner(request: Request) -> dict:
@@ -83,6 +84,7 @@ def register_provisioning_api_routes(app: FastAPI) -> None:
             "customer_id": customer_id,
             "entitlements": entitlements,
             "total_camera_slots": total_camera_slots(customer_id),
+            "enabled_analytics": get_active_analytics_for_customer(customer_id),
         }
 
     @app.get("/api/customer/installations")
@@ -149,4 +151,11 @@ def register_provisioning_api_routes(app: FastAPI) -> None:
                 }
                 for item in entitlements
             ],
+            # Analytics attach to the customer/site entitlement, not to a
+            # per-analytic Cloud ID -- one appliance, one refresh call,
+            # every purchased capability (camera-slot plan type + max,
+            # plus every currently-licensed analytic) in one response. See
+            # analytics_entitlements.py's module docstring for why this is
+            # the existing analytics_subscriptions table, not a new one.
+            "enabled_analytics": get_active_analytics_for_customer(customer_id),
         }

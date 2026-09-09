@@ -112338,6 +112338,28 @@ async def stripe_webhook(request: Request) -> dict:
                 event_type=event.get("type"),
             )
 
+        # Stripe TEST analytics wiring: additive analytics-add-on sync,
+        # fully independent of both syncs above -- see analytics_
+        # entitlements.py's module docstring for the fail-closed
+        # separation (an analytics Price ID is never in PRICE_ID_CAMERA_
+        # SLOT_MAP or HARDWARE_PRICE_MAP, and a camera-slot/hardware Price
+        # ID is never in ANALYTICS_PRICE_MAP, so none of the three syncs
+        # can ever act on another's event). Wrapped the same way, for the
+        # same reason: never break the 200 response Stripe needs, never
+        # block the syncs above from having already run. Also only ever
+        # runs for a genuinely new event id -- a redelivered event can
+        # never double-grant or double-revoke an analytics entitlement.
+        try:
+            from analytics_entitlements import sync_analytics_from_stripe_event
+            sync_analytics_from_stripe_event(event)
+        except Exception:
+            structured_log(
+                "provisioning.analytics_sync_failed",
+                level="error",
+                event_id=event.get("id"),
+                event_type=event.get("type"),
+            )
+
     # Provisioning Phase 6/7: customer-facing post-purchase email. Runs on
     # EVERY delivery of this event -- fresh (is_new_event True) or a
     # genuine Stripe redelivery (is_new_event False) -- never gated behind
