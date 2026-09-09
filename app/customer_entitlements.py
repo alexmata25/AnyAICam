@@ -35,19 +35,45 @@ customer identity. This module is that answer. It is deliberately
 additive: it does not replace or migrate #1-#3 (that is a product
 decision for a later phase, once a partner-facing reconciliation between
 partner-quoted `plans`/`analytics_subscriptions` and Stripe-verified
-`customer_entitlements` is designed), and it does NOT touch the live
-POST /api/payments/stripe/webhook route in main.py -- seeing this
-module's Stripe bridge (`sync_entitlement_from_stripe_event()`) receive
-real production events is a separate, explicit decision for whoever
-authorizes Phase 2, not something this module wires in on its own.
+`customer_entitlements` is designed).
 
 Camera-slot capacity must never be hard-coded into the installer: any
 future claim/refresh code must call `total_camera_slots()`, never read a
 constant.
+
+Phase 2 update: wired into production + authoritative-identity-first
+------------------------------------------------------------------
+`sync_entitlement_from_stripe_event()` is now called from the live POST
+/api/payments/stripe/webhook route in main.py (additively -- after the
+existing legacy `process_stripe_webhook_event()` call, in its own
+try/except so a failure here can never break the legacy 200 response
+Stripe needs to stop retrying). `create_stripe_checkout()` was also
+updated to carry two new pieces of information through Stripe metadata,
+round-tripping back on every later event for this checkout/subscription
+without needing a second API call to Stripe:
+
+- `anyaicam_customer_id`: the authoritative `customers.id`, set only
+  when the checkout was created from a real `partner_identity()`
+  customer_owner session. This is what "do not trust customer-supplied
+  email as the primary identity when already signed in" means in
+  practice -- `_sync_checkout_completed()` below looks this up FIRST,
+  before ever falling back to email matching.
+- `anyaicam_camera_slot_quantity`: the exact Stripe Checkout line-item
+  quantity the customer chose (already customer-facing today via
+  `StripeCheckoutCreateModel.quantity`, 1-100). This is used as the
+  camera-slot count directly, instead of a guessed per-plan constant.
+  `PRODUCT_CAMERA_SLOTS` below is kept ONLY as a fallback for a checkout
+  session created before this metadata field existed; it defaults to 0
+  (not an invented number) and is env-configurable so operators can set
+  it explicitly if that fallback path is ever actually needed -- see the
+  Phase 2 report for the audit finding that no real Stripe
+  product/price -> camera-slot mapping exists in production
+  configuration today, and why this module does not invent one.
 """
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -194,20 +220,25 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
 
 # --------------------------------------------------------- Stripe webhook bridge
 #
-# NOT wired into the live POST /api/payments/stripe/webhook route in
-# main.py -- see module docstring. Each function here is independently
-# callable/testable against a synthetic Stripe event dict.
+# Wired into the live POST /api/payments/stripe/webhook route in main.py
+# as of Phase 2 -- see module docstring. Each function here remains
+# independently callable/testable against a synthetic Stripe event dict.
 
-# Camera slots per plan tier. Mirrors main.py's existing LICENSE_PLAN_
-# FEATURES tiers (starter/professional/enterprise) as a starting point;
-# kept as its own explicit, editable map rather than importing main.py
-# (which would be a heavy, one-directional circular import for a single
-# constant) so Phase 2 can move this to real per-Stripe-price metadata
-# without changing this module's contract.
+# Fallback-only camera-slot counts, used exclusively when a
+# checkout.session.completed event has no anyaicam_camera_slot_quantity
+# metadata (only possible for a session created before Phase 2 shipped).
+# Audit finding (Phase 2): no real Stripe product/price -> camera-slot
+# mapping exists anywhere in production configuration today --
+# LICENSE_PLAN_FEATURES (main.py) is a feature-flag list with no
+# quantities, and STRIPE_PRICE_STARTER/PROFESSIONAL/ENTERPRISE are bare
+# price-id env vars with no attached quantity metadata. Defaulting to 0
+# here is deliberate -- "0 slots" is an honest, visible "not configured"
+# signal, never a guessed number. Set ANYAICAM_CAMERA_SLOTS_* explicitly
+# if this fallback path is ever actually exercised in production.
 PRODUCT_CAMERA_SLOTS = {
-    "starter": 4,
-    "professional": 10,
-    "enterprise": 25,
+    "starter": int(os.environ.get("ANYAICAM_CAMERA_SLOTS_STARTER", "0") or 0),
+    "professional": int(os.environ.get("ANYAICAM_CAMERA_SLOTS_PROFESSIONAL", "0") or 0),
+    "enterprise": int(os.environ.get("ANYAICAM_CAMERA_SLOTS_ENTERPRISE", "0") or 0),
 }
 
 SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
@@ -254,22 +285,42 @@ def _extract_checkout_fields(session_obj: dict) -> dict:
     email = (session_obj.get("customer_details") or {}).get("email") or session_obj.get("customer_email") or ""
     metadata = session_obj.get("metadata") or {}
     plan = str(metadata.get("anyaicam_plan") or "").strip().lower()
+    quantity_raw = metadata.get("anyaicam_camera_slot_quantity")
+    try:
+        camera_slot_quantity = int(quantity_raw) if quantity_raw not in (None, "") else PRODUCT_CAMERA_SLOTS.get(plan, 0)
+    except (TypeError, ValueError):
+        camera_slot_quantity = PRODUCT_CAMERA_SLOTS.get(plan, 0)
     return {
         "email": email,
         "plan": plan,
+        "authoritative_customer_id": str(metadata.get("anyaicam_customer_id") or "") or None,
         "stripe_customer_id": str(session_obj.get("customer") or "") or None,
         "stripe_checkout_session_id": str(session_obj.get("id") or "") or None,
-        "camera_slot_quantity": PRODUCT_CAMERA_SLOTS.get(plan, 0),
+        "camera_slot_quantity": camera_slot_quantity,
     }
 
 
 def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
     fields = _extract_checkout_fields(session_obj)
-    if not fields["email"] or not fields["plan"]:
-        return {"status": "ignored", "reason": "missing customer email or anyaicam_plan metadata"}
-    customer = find_customer_by_email(fields["email"])
+    if not fields["plan"]:
+        return {"status": "ignored", "reason": "missing anyaicam_plan metadata"}
+
+    # Authoritative-identity-first: a checkout created from a real,
+    # signed-in customer_owner session carries its own customers.id in
+    # metadata (see create_stripe_checkout() in main.py) -- trust that
+    # directly, never re-derive identity from the customer-supplied
+    # email when it's available. Email is only the fallback/reconciliation
+    # path for a checkout-before-registration purchase.
+    customer = None
+    if fields["authoritative_customer_id"]:
+        customer = row("SELECT * FROM customers WHERE id=?", (fields["authoritative_customer_id"],))
+    if not customer and fields["email"]:
+        customer = find_customer_by_email(fields["email"])
+
     if not customer:
+        if not fields["email"]:
+            return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
         link = create_pending_link(
             email=fields["email"], product=fields["plan"], camera_slot_quantity=fields["camera_slot_quantity"],
             stripe_customer_id=fields["stripe_customer_id"], stripe_checkout_session_id=fields["stripe_checkout_session_id"],
@@ -287,13 +338,24 @@ def _sync_checkout_completed(event: dict) -> dict:
 def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     subscription_obj = (event.get("data") or {}).get("object") or {}
     stripe_customer_id = str(subscription_obj.get("customer") or "")
-    plan = str((subscription_obj.get("metadata") or {}).get("anyaicam_plan") or "").strip().lower()
+    metadata = subscription_obj.get("metadata") or {}
+    plan = str(metadata.get("anyaicam_plan") or "").strip().lower()
+    metadata_customer_id = str(metadata.get("anyaicam_customer_id") or "") or None
     if not stripe_customer_id or not plan:
         return {"status": "ignored", "reason": "missing stripe customer id or anyaicam_plan metadata"}
     existing = row(
         "SELECT * FROM customer_entitlements WHERE stripe_customer_id=? AND product=?",
         (stripe_customer_id, plan),
     )
+    if not existing and metadata_customer_id:
+        # Self-healing path: Stripe does not guarantee webhook delivery
+        # order, so a subscription.updated event can in principle arrive
+        # before checkout.session.completed created the entitlement row.
+        # The subscription's own metadata still carries the authoritative
+        # customer_id (see create_stripe_checkout()'s subscription_data
+        # metadata), so look the entitlement up that way instead of
+        # giving up.
+        existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (metadata_customer_id, plan))
     if not existing:
         return {"status": "ignored", "reason": "no existing entitlement for this stripe customer/product"}
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"

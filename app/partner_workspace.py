@@ -506,7 +506,21 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         appliance=row('SELECT * FROM appliances WHERE cloud_id=? AND customer_id=?',(cloud_id,identity['customer_id']))
         if not appliance: raise HTTPException(status_code=404,detail='Cloud ID was not found on this customer account.')
         with connection() as db: db.execute("UPDATE appliances SET activation_status='linked',online_status=?,software_version=?,last_check_in=? WHERE id=?",(verification.get('online_status','offline'),verification.get('software_version',appliance.get('software_version')),verification.get('last_check_in'),appliance['id']))
-        audit(identity,'appliance.linked','appliance',appliance['id']); return {'message':'Appliance linked to customer account.','appliance_id':appliance['id']}
+        audit(identity,'appliance.linked','appliance',appliance['id'])
+        # Provisioning Phase 2: surface the customer's current
+        # customer_entitlements-derived camera-slot count on claim --
+        # informational only, deliberately NOT a gate on claiming the
+        # installation itself. An installation with zero purchased slots
+        # can still be claimed (it will just show 0 of 0 configurable
+        # cameras until a purchase grants slots); real slot enforcement
+        # belongs at camera-provisioning time (PUT /api/customer/cameras),
+        # the same pattern this codebase already uses for per-camera
+        # analytics entitlements (see customer_analytics_panel.py's
+        # assign_entitlement()). This keeps "claim an installation" and
+        # "use a camera slot" as the two distinct concepts the
+        # provisioning spec describes, rather than conflating them.
+        from customer_entitlements import total_camera_slots
+        return {'message':'Appliance linked to customer account.','appliance_id':appliance['id'],'camera_slots_purchased':total_camera_slots(identity['customer_id'])}
 
     # Real state lifecycle for a scan job -- a customer must always get
     # honest feedback, never an indefinite silent "queued". Terminal

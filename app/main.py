@@ -22,6 +22,30 @@ import binascii
 
 
 
+# Provisioning Phase 2 audit finding: neither `hashlib` nor `hmac` was
+# imported anywhere in this file, even though verify_stripe_webhook_
+# signature() (below) calls both -- and a second, unrelated caller at
+# (search for hashlib.sha256()) does too. Both call sites were dormant
+# NameError bugs: verify_stripe_webhook_signature() only reaches them
+# once ANYAICAM_STRIPE_WEBHOOK_SECRET is actually configured (it returns
+# False before that point when the secret is empty, which is why this
+# was never caught by any existing test -- there were none for this
+# route before this phase). Discovered while adding webhook coverage for
+# Phase 2; fixed here since "preserve existing Stripe signature
+# verification" is meaningless if that verification cannot run at all.
+# NOTE: this reconciliation-branch checkout of main.py may not be
+# byte-identical to whatever main.py is actually running on the Ryzen
+# appliance -- see this session's own prior finding that the Ryzen's
+# live app/main.py, not this git checkout, is the authoritative
+# production baseline. Whether this exact bug is live in production is
+# therefore unconfirmed and should be checked against the real running
+# file before being treated as a confirmed production incident.
+import hashlib
+import hmac
+
+
+
+
 
 
 
@@ -110726,6 +110750,22 @@ def create_stripe_checkout(
 
     user = current_user(request)
 
+    # Provisioning Phase 2: prefer the authoritative customer identity
+    # (partner_identity()/customers.id) over the legacy current_user()/
+    # users.json identity when a real customer_owner session exists --
+    # see customer_entitlements.py's module docstring for the audit
+    # finding this closes. current_user() is still consulted (both here
+    # and below) so a legacy/internal account with no authoritative
+    # customer record keeps working exactly as before -- additive, not
+    # a replacement.
+    from partner_portal import partner_identity as _authoritative_identity
+    _identity = _authoritative_identity(request)
+    authoritative_customer_id = ""
+    authoritative_email = ""
+    if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
+        authoritative_customer_id = str(_identity["customer_id"])
+        authoritative_email = str(_identity.get("email") or "")
+
 
 
 
@@ -110986,6 +111026,11 @@ def create_stripe_checkout(
 
 
         ("metadata[anyaicam_plan]", plan),
+        # Provisioning Phase 2: the checkout-chosen quantity IS the
+        # authoritative camera-slot count -- carried through metadata
+        # instead of a guessed per-plan constant (see
+        # customer_entitlements.py's PRODUCT_CAMERA_SLOTS docstring).
+        ("metadata[anyaicam_camera_slot_quantity]", str(quantity)),
 
 
 
@@ -111004,6 +111049,7 @@ def create_stripe_checkout(
 
 
         ("subscription_data[metadata][anyaicam_plan]", plan),
+        ("subscription_data[metadata][anyaicam_camera_slot_quantity]", str(quantity)),
 
 
 
@@ -111022,6 +111068,15 @@ def create_stripe_checkout(
 
 
     ]
+    if authoritative_customer_id:
+        # Provisioning Phase 2: carry the authoritative customers.id
+        # through Stripe metadata on both the session and the
+        # subscription it creates, so the webhook handler can resolve
+        # identity directly instead of ever re-deriving it from
+        # customer-supplied email (see customer_entitlements.py's
+        # _sync_checkout_completed()/_sync_subscription_change()).
+        fields.append(("metadata[anyaicam_customer_id]", authoritative_customer_id))
+        fields.append(("subscription_data[metadata][anyaicam_customer_id]", authoritative_customer_id))
 
 
 
@@ -111057,7 +111112,7 @@ def create_stripe_checkout(
 
 
 
-    elif account.get("billing_email") or user.get("email"):
+    elif authoritative_email or account.get("billing_email") or user.get("email"):
 
 
 
@@ -111084,7 +111139,7 @@ def create_stripe_checkout(
 
 
 
-            str(account.get("billing_email") or user.get("email")),
+            str(authoritative_email or account.get("billing_email") or user.get("email")),
 
 
 
@@ -112174,6 +112229,23 @@ async def stripe_webhook(request: Request) -> dict:
 
 
     process_stripe_webhook_event(event)
+
+    # Provisioning Phase 2: additive authoritative-entitlement sync,
+    # on its own DB-backed idempotency (provisioning_webhook_events) --
+    # never the legacy record_stripe_webhook_event()/billing_accounts.
+    # json path above, which is untouched. Wrapped so a failure here
+    # can never break the 200 response Stripe needs to stop retrying,
+    # nor prevent the legacy processing above from having already run.
+    try:
+        from customer_entitlements import sync_entitlement_from_stripe_event
+        sync_entitlement_from_stripe_event(event)
+    except Exception:
+        structured_log(
+            "provisioning.entitlement_sync_failed",
+            level="error",
+            event_id=event.get("id"),
+            event_type=event.get("type"),
+        )
 
 
 

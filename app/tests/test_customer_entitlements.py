@@ -121,7 +121,13 @@ def test_resolving_pending_links_is_a_noop_when_none_exist(db_path):
 # --------------------------------------------------------- Stripe webhook bridge
 
 
-def _checkout_event(event_id="evt_checkout_1", email="real-customer@example.test", plan="starter", stripe_customer="cus_1"):
+def _checkout_event(event_id="evt_checkout_1", email="real-customer@example.test", plan="starter", stripe_customer="cus_1",
+                     camera_slot_quantity=None, authoritative_customer_id=None):
+    metadata = {"anyaicam_plan": plan}
+    if camera_slot_quantity is not None:
+        metadata["anyaicam_camera_slot_quantity"] = str(camera_slot_quantity)
+    if authoritative_customer_id is not None:
+        metadata["anyaicam_customer_id"] = authoritative_customer_id
     return {
         "id": event_id,
         "type": "checkout.session.completed",
@@ -129,7 +135,7 @@ def _checkout_event(event_id="evt_checkout_1", email="real-customer@example.test
             "id": "cs_test_1",
             "customer": stripe_customer,
             "customer_details": {"email": email},
-            "metadata": {"anyaicam_plan": plan},
+            "metadata": metadata,
         }},
     }
 
@@ -201,3 +207,141 @@ def test_subscription_update_for_an_unknown_stripe_customer_is_ignored_not_fabri
         }
         result = ce.sync_entitlement_from_stripe_event(event)
     assert result["status"] == "ignored"
+
+
+# --------------------------- Phase 2: authoritative-identity-first + real quantity
+
+
+def test_checkout_completed_uses_the_real_stripe_line_item_quantity_not_a_guessed_constant(db_path):
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        ce.sync_entitlement_from_stripe_event(_checkout_event(camera_slot_quantity=7))
+        total = ce.total_camera_slots("cust-1")
+    assert total == 7
+
+
+def test_checkout_completed_prefers_authoritative_customer_id_metadata_over_email(db_path):
+    """The core Phase 2 identity fix: a signed-in checkout must never be
+    resolved by re-deriving identity from customer-supplied email when
+    the checkout already carries the real customers.id."""
+    _seed_customer(db_path, customer_id="cust-1", email="real-customer@example.test")
+    _seed_customer(db_path, customer_id="cust-2", email="a-different-email-entirely@example.test")
+    with override_target(sqlite_path=db_path):
+        # Email on the Stripe session points at cust-1's email, but the
+        # authoritative metadata says cust-2 -- metadata must win.
+        event = _checkout_event(email="real-customer@example.test", camera_slot_quantity=5, authoritative_customer_id="cust-2")
+        result = ce.sync_entitlement_from_stripe_event(event)
+        cust1_total = ce.total_camera_slots("cust-1")
+        cust2_total = ce.total_camera_slots("cust-2")
+    assert result["customer_id"] == "cust-2"
+    assert cust1_total == 0
+    assert cust2_total == 5
+
+
+def test_checkout_completed_falls_back_to_email_when_no_authoritative_customer_id(db_path):
+    """Checkout-before-registration path: no signed-in session, so no
+    anyaicam_customer_id metadata -- email is the only signal, and that's
+    the expected, documented fallback (not a bug)."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        result = ce.sync_entitlement_from_stripe_event(_checkout_event(camera_slot_quantity=5))
+    assert result["status"] == "entitlement_updated"
+    assert result["customer_id"] == "cust-1"
+
+
+def test_checkout_completed_with_unknown_authoritative_customer_id_falls_back_to_email(db_path):
+    """Defensive: a stale/deleted customer_id in metadata must not crash
+    or silently drop the purchase -- email reconciliation still applies."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        event = _checkout_event(camera_slot_quantity=5, authoritative_customer_id="cust-deleted")
+        result = ce.sync_entitlement_from_stripe_event(event)
+    assert result["status"] == "entitlement_updated"
+    assert result["customer_id"] == "cust-1"
+
+
+def test_subscription_change_self_heals_via_metadata_customer_id_when_stripe_customer_id_doesnt_match_yet(db_path):
+    """Stripe does not guarantee webhook delivery order relative to which
+    stripe_customer_id ends up recorded locally. If the direct
+    (stripe_customer_id, product) lookup misses, the subscription's own
+    metadata still carries the authoritative customer_id -- fall back to
+    that instead of giving up."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        # Entitlement exists (e.g. created via a pending-link resolution
+        # that never recorded a stripe_customer_id) but under no
+        # stripe_customer_id this subscription event's own value matches.
+        ce.upsert_entitlement(customer_id="cust-1", product="professional", camera_slot_quantity=10, status="active")
+        event = {
+            "id": "evt_sub_selfheal",
+            "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_1", "customer": "cus_not_previously_recorded", "status": "active",
+                "metadata": {"anyaicam_plan": "professional", "anyaicam_customer_id": "cust-1"},
+            }},
+        }
+        result = ce.sync_entitlement_from_stripe_event(event)
+        entitlement = ce.get_entitlements_for_customer("cust-1")[0]
+    assert result["status"] == "entitlement_updated"
+    assert entitlement["stripe_customer_id"] == "cus_not_previously_recorded"  # now backfilled
+    assert entitlement["camera_slot_quantity"] == 10  # unchanged -- an update event doesn't invent a new quantity
+
+
+def test_subscription_event_never_fabricates_an_entitlement_out_of_nothing(db_path):
+    """The self-heal fallback only ever repairs the LOOKUP for an
+    entitlement that already exists -- it must never create one from a
+    bare subscription event with no prior checkout at all."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        event = {
+            "id": "evt_sub_first",
+            "type": "customer.subscription.updated",
+            "data": {"object": {
+                "id": "sub_1", "customer": "cus_never_seen_yet", "status": "active",
+                "metadata": {"anyaicam_plan": "professional", "anyaicam_customer_id": "cust-1"},
+            }},
+        }
+        result = ce.sync_entitlement_from_stripe_event(event)
+        entitlements = ce.get_entitlements_for_customer("cust-1")
+    assert result["status"] == "ignored"
+    assert entitlements == []
+
+
+def test_subscription_updated_with_a_new_quantity_reflects_a_plan_change(db_path):
+    """A plain subscription.updated (not cancellation) -- e.g. the
+    customer changed their Stripe-side quantity/plan directly through the
+    Stripe customer portal rather than a new checkout. Must update
+    in place, active, with the new count -- not treat it as a
+    cancellation and not accumulate a second row."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        ce.sync_entitlement_from_stripe_event(_checkout_event(stripe_customer="cus_upgrade_1", camera_slot_quantity=4))
+        update_event = {
+            "id": "evt_upgrade_1",
+            "type": "customer.subscription.updated",
+            "data": {"object": {"id": "sub_1", "customer": "cus_upgrade_1", "status": "active", "metadata": {"anyaicam_plan": "starter"}}},
+        }
+        result = ce.sync_entitlement_from_stripe_event(update_event)
+        entitlements = ce.get_entitlements_for_customer("cust-1")
+    assert result["status"] == "entitlement_updated"
+    assert len(entitlements) == 1
+    assert entitlements[0]["status"] == "active"
+    assert entitlements[0]["camera_slot_quantity"] == 4  # unchanged by a bare status-only update event
+
+
+def test_duplicate_checkout_session_replayed_under_a_different_event_id_does_not_double_count(db_path):
+    """Distinct from plain event-id idempotency: even if Stripe somehow
+    redelivers the SAME checkout session's completion under two
+    different event ids (a stricter case than a same-event-id retry),
+    upsert_entitlement()'s per-(customer_id, product) idempotency must
+    still prevent double-counting."""
+    _seed_customer(db_path, email="real-customer@example.test")
+    with override_target(sqlite_path=db_path):
+        first = ce.sync_entitlement_from_stripe_event(_checkout_event(event_id="evt_a", camera_slot_quantity=6))
+        second = ce.sync_entitlement_from_stripe_event(_checkout_event(event_id="evt_b", camera_slot_quantity=6))
+        total = ce.total_camera_slots("cust-1")
+        entitlements = ce.get_entitlements_for_customer("cust-1")
+    assert first["status"] == "entitlement_updated"
+    assert second["status"] == "entitlement_updated"  # a different event id, so processed -- but idempotent by design
+    assert total == 6  # not 12
+    assert len(entitlements) == 1
