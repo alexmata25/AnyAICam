@@ -40948,6 +40948,19 @@ PUBLIC_PATH_PREFIXES = (
 
     "/api/payments/stripe/webhook",
     "/api/appliance/",
+    # Appliance-authenticated (authenticate_appliance(): signed X-Appliance-Id/
+    # X-Request-Timestamp/X-Request-Nonce/Bearer credential, never a browser
+    # session), same as every /api/appliance/* route above -- but this one
+    # route lives under a different path prefix, so it was never covered by
+    # the "/api/appliance/" entry. Found by this session's own real-HTTP
+    # sandbox-purchase E2E test: a genuinely claimed, activated test
+    # appliance calling this exact route got a generic 401 "Authentication
+    # required" from THIS middleware -- authenticate_appliance() inside the
+    # route was never even reached. An exact-path entry, not a broader
+    # "/api/provisioning/" prefix: POST /api/provisioning/release
+    # (provisioning_api.py) is deliberately browser-session-authenticated
+    # (_customer_owner()) and must stay behind this middleware.
+    "/api/provisioning/refresh",
 
 
 

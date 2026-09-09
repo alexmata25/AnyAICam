@@ -201,3 +201,25 @@ def test_refresh_never_accepts_a_customer_browser_session_in_place_of_appliance_
     _seed_appliance(db_path, appliance_id="appl-1", cloud_id="AIC-1", credential="cred-1")
     response = client.post("/api/provisioning/refresh", cookies={_cookie(): _owner_cookie()})
     assert response.status_code == 401
+
+
+def test_refresh_route_is_exempt_from_the_global_browser_auth_middleware():
+    """Regression: this file's own `client` fixture builds a stripped-down
+    app (provisioning_api + appliance_cloud only, no main.authentication_
+    middleware), so every test above it passes even when the real deployed
+    app would 401 every appliance request before authenticate_appliance()
+    is ever reached. Found by a real end-to-end staging sandbox-purchase
+    test: a genuinely claimed, activated test appliance got a generic 401
+    "Authentication required" from the middleware, not from this route.
+    Root cause: PUBLIC_PATH_PREFIXES exempted every other appliance-
+    authenticated route via the "/api/appliance/" prefix, but this route
+    lives under a different prefix ("/api/provisioning/") that was never
+    added. Fixed by adding this route's exact path -- not the broader
+    "/api/provisioning/" prefix, since POST /api/provisioning/release is
+    deliberately browser-session-authenticated and must stay behind the
+    middleware."""
+    import main
+    assert "/api/provisioning/refresh" in main.PUBLIC_PATH_PREFIXES
+    covered = lambda path: any(path == prefix or path.startswith(prefix) for prefix in main.PUBLIC_PATH_PREFIXES)
+    assert covered("/api/provisioning/refresh")
+    assert not covered("/api/provisioning/release")

@@ -75,7 +75,20 @@ _MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; no
 # protected: it still requires and verifies Stripe-Signature against
 # the configured webhook signing secret before doing anything else --
 # this exemption removes only the CSRF check, never authentication.
-CSRF_EXEMPT_EXACT_PATHS = {'/api/payments/stripe/webhook'}
+#
+# POST /api/provisioning/refresh (provisioning_api.py) is appliance-
+# authenticated exactly like every /api/appliance/* route (signed
+# X-Appliance-Id/X-Request-Timestamp/X-Request-Nonce/Bearer credential,
+# already CSRF-exempt via this dispatch method's own `not bearer` check
+# above whenever a real appliance sends its Bearer credential) but lives
+# under a different path prefix, so the '/api/appliance/' prefix
+# exemption below never covered it. Added here, by exact path, for the
+# same reason as the webhook route above: an appliance request with no
+# credentials at all (e.g. a misconfigured/compromised device, or this
+# module's own test coverage of that case) must still fail with
+# authenticate_appliance()'s own 401, not a misleading "CSRF validation
+# failed" that has nothing to do with why the request was rejected.
+CSRF_EXEMPT_EXACT_PATHS = {'/api/payments/stripe/webhook', '/api/provisioning/refresh'}
 
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
