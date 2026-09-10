@@ -27,6 +27,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_RELEASE_PATHS = (
     "app",
     "requirements.txt",
+    "requirements-cpu.txt",
     "Dockerfile",
     "Dockerfile.production",
     "docker-compose.yml",
