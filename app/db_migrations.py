@@ -318,3 +318,29 @@ def apply_migrations():
                          if backend()=='sqlite' else
                          {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='user_sessions'").fetchall()})
         if 'authorization_version_at_login' not in session_columns: db.execute('ALTER TABLE user_sessions ADD COLUMN authorization_version_at_login INTEGER')
+
+        # Phase 1 security-hardening checkpoint (see
+        # docs/non-interactive-activation-phase1-security-hardening-report.md):
+        # claim_proof_plaintext (the original Phase 1 column) is left in
+        # place -- never dropped, per this file's own established
+        # convention -- but new code never writes to it again. These
+        # three replace it:
+        #   claim_proof_encrypted: the confirmed claim_proof, encrypted
+        #     at rest (appliance_protocol.encrypt_claim_flow_secret())
+        #     instead of stored raw, so a DB-file-level read no longer
+        #     hands out a live, redeemable secret the way a plaintext
+        #     column would.
+        #   completed_credential_encrypted / credential_recovery_expires_at:
+        #     the ONE-TIME credential claim/complete mints, held
+        #     encrypted for a short recovery window so a retry after a
+        #     lost response can recover the SAME credential instead of
+        #     permanently losing enrollment or minting a second one.
+        claim_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliance_claims)').fetchall()}
+                       if backend()=='sqlite' else
+                       {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliance_claims'").fetchall()})
+        for name,definition in (
+            ('claim_proof_encrypted','TEXT'),
+            ('completed_credential_encrypted','TEXT'),
+            ('credential_recovery_expires_at','TEXT'),
+        ):
+            if name not in claim_columns: db.execute(f'ALTER TABLE appliance_claims ADD COLUMN {name} {definition}')
