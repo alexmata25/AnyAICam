@@ -145,7 +145,7 @@ class WatcherDispatchTests(unittest.TestCase):
     def test_dispatch_table_is_exactly_two_fixed_actions(self):
         self.assertEqual(watcher.DISPATCH, {
             'reboot': ['systemctl', 'reboot'],
-            'restart_vms': ['docker', 'restart', 'anyaicam-vms'],
+            'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
         })
 
     def _write_marker(self, tmp_path, marker):
@@ -171,12 +171,17 @@ class WatcherDispatchTests(unittest.TestCase):
         self.assertFalse(path.exists())  # consumed
 
     def test_real_run_executes_exactly_the_fixed_argv_for_restart_vms(self):
+        # `docker compose ... up -d`, not `docker restart` -- confirmed
+        # live that `docker restart` never re-reads vms.env, so the
+        # activation flow's own ANYAICAM_CLOUD_URL write would silently
+        # never take effect. See DISPATCH's own comment in
+        # privileged_watcher.py for the full story.
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'restart_vms.json'
             path.write_text(json.dumps({'type': 'restart_vms', 'command_id': 'xyz'}))
             with patch.object(watcher.subprocess, 'run') as run:
                 watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
-            run.assert_called_once_with(['docker', 'restart', 'anyaicam-vms'], check=False)
+            run.assert_called_once_with(['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'], check=False)
 
     def test_marker_extra_fields_never_reach_subprocess(self):
         """The core no-arbitrary-shell guarantee at the privileged layer:
