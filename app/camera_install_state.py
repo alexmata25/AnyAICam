@@ -24,6 +24,23 @@ working exactly as before; an installer-provisioned customer whose
 appliance is actually online now also shows correctly, without anyone
 manually flipping cameras.status.
 
+Second confirmed-live bug, found while investigating /customer-account
+showing a purchased-but-undiscovered placeholder slot as "Camera 1 ·
+Configured · Live view": cameras.status='configured' is NOT reliable
+proof of a real camera on its own -- /customer/setup's Step 5 "Save
+camera setup" sets it unconditionally for every row it submits,
+placeholder rows (device_key=NULL, never a physically discovered
+device -- see partner_workspace.py's onboard_customer()) included, the
+instant a customer renames one and saves. device_key is the one column
+only ever set by a confirmed device (appliance_cloud.py's
+appliance_submit_provisioning()), so the 'configured' signal is now
+additionally gated on it being present. The other two signals
+(appliance_reported_online/recording, has_cloud_recording) are left
+unconditional -- they are already reliably real-only in production, since
+the appliance/relay only ever reports against a camera_id it genuinely
+knows about, and gating them on device_key would wrongly break the
+installer-provisioned case this module exists to support.
+
 Pure, DB/FastAPI-free decision logic (fully unit-testable); DB-touching
 callers build the plain booleans/strings this takes from their own
 already-scoped SQL, matching camera_access.py's established
@@ -35,6 +52,7 @@ from __future__ import annotations
 def camera_is_installed(
     *,
     camera_status: str | None,
+    device_key: str | None,
     appliance_reported_online: bool,
     appliance_reported_recording: bool,
     has_cloud_recording: bool,
@@ -42,10 +60,12 @@ def camera_is_installed(
     """True the moment ANY independent signal says this camera is real
     and working -- never only whether the customer manually completed
     /customer/setup:
-      - cameras.status == 'configured' (the original, customer-wizard-
-        driven signal -- kept exactly as before for backward
-        compatibility; a customer who did complete setup keeps working
-        unchanged).
+      - cameras.status == 'configured' AND device_key is present (the
+        original, customer-wizard-driven signal -- kept for backward
+        compatibility for a customer who did complete setup on a real,
+        discovered camera; NOT trusted alone for a device_key-less
+        onboarding placeholder, which Step 5 sets to 'configured' just
+        as easily as a real camera).
       - the appliance's own live heartbeat currently reports this
         camera online or recording -- an installer-provisioned camera
         that is actually running is real regardless of whether the
@@ -55,7 +75,7 @@ def camera_is_installed(
     Fails closed (False) only when none of these signals exist -- the
     one case "Pending installation" should still legitimately mean: a
     camera that has truly never been provisioned or ever reported in."""
-    if camera_status == "configured":
+    if camera_status == "configured" and device_key:
         return True
     if appliance_reported_online or appliance_reported_recording:
         return True
@@ -67,6 +87,7 @@ def camera_is_installed(
 def camera_status_label(
     *,
     camera_status: str | None,
+    device_key: str | None,
     appliance_reported_online: bool,
     appliance_reported_recording: bool,
     has_cloud_recording: bool,
@@ -84,7 +105,7 @@ def camera_status_label(
         return "Online"
     if appliance_reported_recording:
         return "Recording"
-    if camera_status == "configured":
+    if camera_status == "configured" and device_key:
         return "Configured"
     if has_cloud_recording:
         return "Recorded footage available"

@@ -344,38 +344,56 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # wizard, has real, online, recording cameras that must show as
         # installed without ever touching that wizard.
         all_customer_cameras=rows(
-            'SELECT c.id,c.name,c.camera_number,c.status,'
+            'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,'
             'MAX(COALESCE(acs.online,0)) AS appliance_online,'
             'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
             'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
-            'WHERE c.customer_id=? GROUP BY c.id,c.name,c.camera_number,c.status ORDER BY c.camera_number',
+            'WHERE c.customer_id=? GROUP BY c.id,c.name,c.camera_number,c.status,c.device_key ORDER BY c.camera_number',
             (customer['id'],)
         )
         for camera in all_customer_cameras:
             camera['has_recording']=bool(row('SELECT 1 FROM recordings WHERE camera_id=?',(camera['id'],)))
             camera['installed']=camera_is_installed(
                 camera_status=camera['status'],
+                device_key=camera['device_key'],
                 appliance_reported_online=bool(camera['appliance_online']),
                 appliance_reported_recording=bool(camera['appliance_recording']),
                 has_cloud_recording=camera['has_recording'],
             )
         cameras=[camera for camera in all_customer_cameras if camera['installed']]
 
+        # Confirmed live: a purchased-but-undiscovered onboarding
+        # placeholder (device_key=NULL, status forced to 'configured' by
+        # Step 5's bulk save -- see camera_install_state.py's own module
+        # docstring) rendered identically to a real camera here: "Camera
+        # 1 / Configured / Live view", for an appliance that has never
+        # checked in. Licensed capacity now comes from the same Stripe-
+        # verified source used everywhere else (customer_entitlements.
+        # total_camera_slots()), never from however many placeholder rows
+        # onboarding happened to pre-create -- so a Local 1-8 purchase
+        # correctly shows 8 slots, not however many placeholders exist.
+        from customer_entitlements import total_camera_slots
+        licensed_slots=total_camera_slots(customer['id'])
+        configured_count=len(cameras)
+
         # An activated appliance is necessary but not sufficient: a
         # customer can have a linked, activated appliance and still
-        # have zero real cameras (nothing discovered/confirmed, and
-        # never reported in by the appliance either) -- that customer
-        # belongs in Setup too, not looking at an empty or
-        # placeholder-only camera list on their own account page.
-        if identity['role']=='customer_owner' and not (activated and cameras):
+        # have zero real cameras and zero purchased slots -- that
+        # customer belongs in Setup too. Once they've purchased at least
+        # one camera slot (or already have a real, discovered camera),
+        # they land on this dashboard instead, which now shows their
+        # licensed-but-undiscovered slots honestly rather than hiding
+        # them or redirecting away.
+        if identity['role']=='customer_owner' and not (activated and (cameras or licensed_slots>0)):
             return RedirectResponse('/customer/setup',status_code=303)
 
-        camera_cards=''.join(
+        real_camera_cards=''.join(
             f'''<article class="feature-card">
                 <div class="feature-icon">▣</div>
                 <h2>{escape(camera.get("name") or f"Camera {camera.get('camera_number') or ''}")}</h2>
                 <p>{escape(camera_status_label(
                     camera_status=camera['status'],
+                    device_key=camera['device_key'],
                     appliance_reported_online=bool(camera['appliance_online']),
                     appliance_reported_recording=bool(camera['appliance_recording']),
                     has_cloud_recording=camera['has_recording'],
@@ -383,7 +401,21 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 <a class="action-button" href="/customer/cameras/{escape(camera['id'],quote=True)}/live">Live view</a>
             </article>'''
             for camera in cameras
-        ) or '<div class="empty">No cameras are assigned to this customer account.</div>'
+        )
+        # Every licensed slot beyond the real, discovered cameras is
+        # shown honestly as unused/not-yet-discovered -- no Live view, no
+        # Playback, no implication it's online or configured -- while the
+        # slot itself is preserved for future discovery (nothing here
+        # creates, deletes, or claims a camera row).
+        placeholder_slot_cards=''.join(
+            f'''<article class="feature-card feature-card-placeholder">
+                <div class="feature-icon">▢</div>
+                <h2>Camera slot {n}</h2>
+                <p class="health-detail">Waiting for appliance discovery</p>
+            </article>'''
+            for n in range(configured_count+1,max(licensed_slots,configured_count)+1)
+        )
+        camera_cards=(real_camera_cards+placeholder_slot_cards) or '<div class="empty">No camera slots are available on this account yet.</div>'
 
         content=f'''<header class="topbar">
             <div>
@@ -398,7 +430,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             <div class="panel-head">
                 <div>
                     <h2>Your cameras</h2>
-                    <div class="health-detail">Live video is delivered through the AnyAiCam cloud relay.</div>
+                    <div class="health-detail">{configured_count} of {licensed_slots} camera{'s' if licensed_slots!=1 else ''} configured &middot; Live video is delivered through the AnyAiCam cloud relay.</div>
                 </div>
             </div>
             <div class="feature-grid">{camera_cards}</div>
