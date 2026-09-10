@@ -210,6 +210,11 @@ def test_a_closed_target_loop_is_logged_not_silently_swallowed(monkeypatch, tmp_
 
 def test_ai_person_detector_captures_the_loop_exactly_once(monkeypatch):
     monkeypatch.setattr(main, "_ai_event_media_loop", None)
+    # This is a loop-capture unit test, not a startup-stagger test.  Its
+    # synthetic high camera number would otherwise sleep for an arbitrary
+    # production stagger before reaching the intentionally unavailable
+    # detector branch below.
+    monkeypatch.setattr(main, "AI_DETECTOR_STARTUP_STAGGER_SECONDS", 0)
     monkeypatch.setattr(main, "cv2", None)  # short-circuits to the early "unavailable" return
     monkeypatch.setitem(main.ai_detection_state, 160, {})
 
