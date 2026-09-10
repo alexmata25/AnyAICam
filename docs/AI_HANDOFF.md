@@ -11,8 +11,14 @@ up next has one current starting point.
 ## Status right now
 
 Branch `staging/cloud-integration-repair` is **pushed to origin**, tip
-`363c3466dcdff7316e0b5b3fc1bcedd07a7b6d47`. Code and docs are staging-
-ready. **Nothing has been deployed anywhere.** `anyaicam-staging`
+`8a83bf30a67b6a7434bed8fac44f16a9095d12ed`. Code and docs are staging-
+ready. **Nothing has been deployed anywhere since the disposable EC2
+instance from the edge-validation pass was terminated** (see
+`docs/phase1-edge-validation-report.md` and
+`docs/phase1-privileged-watcher-fix-report.md` for what was found/fixed
+there, including the privileged-watcher packaging gap -- now fixed, but
+not yet re-verified live on a real host; that's the first thing to check
+whenever staging/edge validation resumes). `anyaicam-staging`
 (34.194.19.113) -- the only host reachable under that name this session
 -- turned out to be the **cloud control-plane** (portal + storefront +
 Caddy, `ANYAICAM_RUNTIME_ROLE=cloud`, live Stripe keys configured), not
