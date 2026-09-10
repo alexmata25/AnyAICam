@@ -138,6 +138,21 @@ CREATE TABLE IF NOT EXISTS detection_event_media(
 CREATE INDEX IF NOT EXISTS idx_detection_event_media_camera
 ON detection_event_media(camera_id,started_at);
 '''),
+    ('20260910_appliance_update_results','''
+CREATE TABLE IF NOT EXISTS appliance_update_results(
+    update_id TEXT NOT NULL,
+    appliance_id TEXT NOT NULL,
+    from_version TEXT,
+    to_version TEXT,
+    state TEXT NOT NULL,
+    error TEXT,
+    rollback_from TEXT,
+    duration_seconds REAL,
+    reported_at TEXT NOT NULL,
+    PRIMARY KEY(update_id,appliance_id),
+    FOREIGN KEY(appliance_id) REFERENCES appliances(id)
+);
+'''),
 ]
 
 

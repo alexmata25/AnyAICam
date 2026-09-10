@@ -1,4 +1,5 @@
 from cloud_config import settings as cloud_settings
+import base64
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, decrypt_camera_credentials, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
 from live_manifest import LiveManifestStore
+from object_storage import get_storage
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
@@ -849,6 +851,58 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             changed=db.execute('UPDATE appliance_commands SET status=?,completed_at=?,error=? WHERE id=? AND appliance_id=? AND status IN (\'delivered\',\'pending\')',(status,datetime.now().isoformat(),str(payload.get('error',''))[:500],command_id,appliance['id'])).rowcount
         if not changed: raise HTTPException(status_code=409,detail='Command is unknown or already finalized.')
         audit({'email':appliance['cloud_id'],'role':'appliance'},f'appliance.command_{status}','appliance_command',command_id); return {'status':'accepted'}
+
+    @app.get('/api/appliance/updates/latest')
+    def appliance_update_latest(request: Request,target: str='',channel: str='') -> dict:
+        # RDM-2 Group 2D: the server half of an already-built, already-
+        # tested device client (updater/s3_source.py's ManifestSource) --
+        # see updates_storage.py's own module docstring for how this gap
+        # was found (the endpoint was never registered, so every call
+        # 404'd and the device raised SourceUnavailable). target/channel
+        # are re-validated independently of whatever the client already
+        # checked -- there is no shared import path between this package
+        # and the agent's, so nothing from the request is trusted as-is.
+        authenticate_appliance(request)
+        from updates_storage import get_latest_release,load_signing_key,sign_manifest,validate_path_segment
+        try:
+            target=validate_path_segment(target,'target'); channel=validate_path_segment(channel,'channel')
+        except ValueError as error:
+            raise HTTPException(status_code=400,detail=str(error)) from error
+        release=get_latest_release(target,channel)
+        if not release:
+            # The safe-by-default, common case: no release has been
+            # published for this target/channel. Never a 404 -- s3_source.
+            # py's ManifestSource treats exactly this shape as "no update
+            # right now," not an error.
+            return {'status':'no_update_available'}
+        signing_key=load_signing_key()
+        if signing_key is None:
+            logger.error('appliance_updates.signing_key_unavailable target=%s channel=%s',target,channel)
+            raise HTTPException(status_code=503,detail='Update signing is not configured.')
+        signature=sign_manifest(release['manifest'],signing_key)
+        package_url=get_storage().url('updates',release['package_key'],expires_seconds=300)
+        return {'manifest':release['manifest'],'signature':base64.b64encode(signature).decode('ascii'),'package_url':package_url}
+
+    @app.post('/api/appliance/updates/{update_id}/result')
+    def appliance_update_result(request: Request,update_id: str,payload: dict) -> dict:
+        # RDM-2 Group 2E's reporting counterpart -- service.py's
+        # report_update_result() posts here. A second report for the
+        # same (update_id, appliance_id) is a 409, matching that
+        # method's own documented expectation (never retried) and the
+        # same "never-retryable conflict" shape command_result() above
+        # already uses for the generic command channel.
+        appliance=authenticate_appliance(request)
+        state=str(payload.get('state','')).strip()
+        if not state: raise HTTPException(status_code=400,detail='state is required.')
+        now=datetime.now().isoformat()
+        with connection() as db:
+            try:
+                db.execute('INSERT INTO appliance_update_results(update_id,appliance_id,from_version,to_version,state,error,rollback_from,duration_seconds,reported_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                    (update_id,appliance['id'],payload.get('from_version'),payload.get('to_version'),state,str(payload.get('error',''))[:500],payload.get('rollback_from'),payload.get('duration_seconds'),now))
+            except Exception as error:
+                raise HTTPException(status_code=409,detail='An update result was already reported for this update_id.') from error
+        audit({'email':appliance['cloud_id'],'role':'appliance'},'appliance.update_result_reported','appliance_update',update_id,{'state':state})
+        return {'status':'accepted'}
 
     @app.post('/api/admin/appliances/{appliance_id}/activation-token')
     def admin_activation_token(request: Request,appliance_id: str,payload: dict) -> dict:

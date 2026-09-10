@@ -11,6 +11,14 @@ services:
     - /var/lib/anyaicam/vms/recordings:/app/recordings
     - /var/lib/anyaicam/vms/hls:/app/static/hls
     - /var/lib/anyaicam/vms/data-config:/opt/anyaicam/data/config
+    # Read-only: lets recording_uploader.py/live_relay_uploader.py/
+    # analytics_sync.py/event_media_uploader.py read the appliance-agent's
+    # own credential.json (STATE_DIR/credential.json in each of those
+    # modules) to authenticate their own control-plane calls -- the same
+    # appliance identity the agent already authenticates with, never a
+    # separate or permanent AWS credential. Read-only so the VMS container
+    # can never modify the agent's own identity state.
+    - /var/lib/anyaicam:/var/lib/anyaicam:ro
     restart: unless-stopped
     healthcheck:
       test:

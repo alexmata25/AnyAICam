@@ -70,3 +70,43 @@ def coordinated_reenroll(config:AgentConfig,activation_response:dict,*,expected_
             except FileNotFoundError:pass
     log.info("Appliance re-enrollment completed and control-plane authentication succeeded.")
     return {"cloud_id":activation["cloud_id"],"appliance_id":activation["appliance_id"],"backup_dir":str(backup)}
+
+def first_enroll(config:AgentConfig,activation_response:dict,*,expected_cloud_id:str,vms_identity_path:str|Path,restart_service:Callable[[],None],verify_authentication:Callable[[dict],bool],replace_file:Callable=os.replace,logger=None):
+    """First-ever activation of a fresh appliance: agent.json, credential.json,
+    and the VMS's own appliance_identity.json do not exist yet, so
+    coordinated_reenroll()'s precondition (all three already present, so a
+    failure has a prior identity to roll back to) can never be satisfied --
+    calling it on a truly fresh box always raises ValueError before any
+    identity is written. This is the missing first-time counterpart: same
+    stage-then-replace-then-verify shape and the same staged-agreement check,
+    just with nothing to preserve or restore. On any failure, whatever was
+    staged or already replaced is removed rather than "restored" (there is no
+    prior identity to restore to), leaving a fresh appliance exactly as
+    unactivated as before the attempt, safe to retry."""
+    log=logger or logging.getLogger("anyaicam.reenrollment"); activation=validate_activation_response(activation_response,expected_cloud_id)
+    agent_path=Path(config.config_dir)/"agent.json"; credential_path=config.credential_file; vms_path=Path(vms_identity_path); paths=(agent_path,credential_path,vms_path)
+    existing=[p for p in paths if p.is_file()]
+    if existing: raise ValueError("Cannot perform first-time enrollment: identity file(s) already exist: "+", ".join(str(p) for p in existing)+". Use coordinated_reenroll() to replace an existing activation instead.")
+    agent=asdict(config); agent["cloud_id"]=activation["cloud_id"]
+    credential={"appliance_id":activation["appliance_id"],"credential_id":activation["credential_id"],"credential":activation["credential"]}
+    vms={"appliance_id":activation["appliance_id"],"cloud_id":activation["cloud_id"],"credential":activation["credential"],"customer_id":activation["customer_id"],"site_id":activation["site_id"],"partner_id":activation["partner_id"],"activated_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"activation_version":1}
+    staged={}; touched=[]
+    try:
+        for p,value in ((agent_path,agent),(credential_path,credential),(vms_path,vms)): staged[p]=_stage(p,value,prefix="enroll")
+        a,c,v=(_read(staged[p]) for p in paths)
+        if {(a.get("cloud_id"),c.get("appliance_id")),(v.get("cloud_id"),v.get("appliance_id")),(activation["cloud_id"],activation["appliance_id"])}.__len__()!=1 or c.get("credential")!=v.get("credential"): raise ValueError("Staged identity documents do not agree.")
+        for p in paths: replace_file(staged[p],p); os.chmod(p,0o600); touched.append(p)
+        restart_service()
+        if not verify_authentication(activation): raise RuntimeError("Control-plane authentication failed after first-time enrollment.")
+    except Exception as error:
+        for p in touched:
+            try:p.unlink()
+            except FileNotFoundError:pass
+        log.error("First-time appliance enrollment failed; no identity was left behind (%s).",type(error).__name__)
+        raise ReenrollmentError("First-time appliance enrollment failed; the appliance remains unactivated.") from error
+    finally:
+        for p in staged.values():
+            try:p.unlink()
+            except FileNotFoundError:pass
+    log.info("First-time appliance enrollment completed and control-plane authentication succeeded.")
+    return {"cloud_id":activation["cloud_id"],"appliance_id":activation["appliance_id"]}
