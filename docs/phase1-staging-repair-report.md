@@ -424,10 +424,12 @@ this Windows machine cannot run the Compose stack; that verification is
 staging step 5 (§6) and the Samsung checklist (§7), both not yet
 executed.
 
-## 12. Final staging-readiness decision
+## 12. Final staging-readiness decision (as of the code/docs commits)
 
 **Ready for the staging installation plan in §6, with one explicit
-condition.**
+condition** -- see §13, which records what actually happened when this
+was attempted: the plan itself needs a different, actual
+edge-appliance-shaped target before it can be carried out.
 
 What's settled:
 - All four confirmed root causes are fixed, tested, and produce zero
@@ -457,6 +459,47 @@ What's still open, and why this isn't an unconditional "go":
   still unresolved in the suite generally -- not a blocker for this
   patch, but worth the team's attention separately.
 
-**Recommendation:** proceed to the staging installation plan (§6) next.
-Do not proceed to the Samsung checklist (§7) until staging step 5's live
-checks all pass. Awaiting approval before taking that step.
+**Recommendation (as originally written):** proceed to the staging
+installation plan (§6) next. Do not proceed to the Samsung checklist
+(§7) until staging step 5's live checks all pass. Superseded by §13.
+
+## 13. Staging environment reconnaissance (attempted, then stopped)
+
+Branch pushed to `origin` (`staging/cloud-integration-repair`, tip
+`363c346`). Before executing §6's install/deploy steps, read-only
+reconnaissance was run against `anyaicam-staging` (34.194.19.113, the
+only host this session has SSH access to under that name) to confirm
+its state first, per §6 step 2's own "back up before touching anything"
+discipline.
+
+**Finding: §6's staging installation plan targeted the wrong kind of
+host, and was not executed.** `anyaicam-staging` has no `/etc/anyaicam`,
+`/opt/anyaicam`, `/var/lib/anyaicam`, or `anyaicam` system user -- the
+appliance installer has never run there. It instead runs three unrelated
+containers (`anyaicam-staging-portal`, `anyaicam-staging-caddy`,
+`anyaicam-staging-storefront`) -- confirmed to be the **cloud
+control-plane** deployment (`ANYAICAM_RUNTIME_ROLE=cloud` inside the
+portal container, which does run this repo's `app/` code) plus a
+separate storefront/reverse-proxy stack, not an edge appliance running
+the agent+VMS Docker Compose pair this work actually changed. It is
+also a live, shared, Stripe-connected staging service (confirmed
+`ANYAICAM_STRIPE_SECRET_KEY`/`ANYAICAM_STRIPE_WEBHOOK_SECRET`/admin-
+password env vars are configured there -- variable *names* only were
+read via `env | cut -d= -f1`; no secret value was ever printed), not a
+disposable test box. `installer/README.md`'s own "Phase 4 gate" already
+says appliance-installer validation belongs on "one fresh disposable
+Ubuntu 24.04 t3.xlarge," not a shared cloud host -- this session also has
+no AWS credentials configured locally to provision one.
+
+Given that, **no deploy, install, or container change was made on
+`anyaicam-staging` or anywhere else.** The mismatch and four options
+(provision a disposable instance, validate only the cloud-side
+`updates/latest` route against the existing portal container, point at a
+different host, or stop) were presented back for a decision -- the
+decision was to stop here without deploying. §6's plan needs revising
+against an actual edge-appliance-shaped target before it can be
+executed; that is next-session work, not resolved by this report.
+
+**Status at end of session: code and documentation are staging-ready
+(§9-§12); the branch is pushed; nothing has been deployed, installed, or
+run against any live host, staging or Samsung.**

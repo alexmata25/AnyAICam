@@ -8,6 +8,23 @@ other branches' earlier history but this branch's own lineage never carried
 it forward. Recreating it here so anyone (human or Claude) picking this work
 up next has one current starting point.
 
+## Status right now
+
+Branch `staging/cloud-integration-repair` is **pushed to origin**, tip
+`363c3466dcdff7316e0b5b3fc1bcedd07a7b6d47`. Code and docs are staging-
+ready. **Nothing has been deployed anywhere.** `anyaicam-staging`
+(34.194.19.113) -- the only host reachable under that name this session
+-- turned out to be the **cloud control-plane** (portal + storefront +
+Caddy, `ANYAICAM_RUNTIME_ROLE=cloud`, live Stripe keys configured), not
+an edge-appliance host running the agent+VMS Docker Compose pair this
+work changed; the appliance installer has never run there at all (no
+`/etc/anyaicam`, `/opt/anyaicam`, `/var/lib/anyaicam`, no `anyaicam`
+user). Full detail: `docs/phase1-staging-repair-report.md` §13. **Before
+any further staging work, figure out where an actual edge-appliance-
+shaped Linux/Docker target is** -- a fresh disposable instance
+(`installer/README.md`'s own stated validation target) is the most
+likely answer, which needs AWS credentials this session didn't have.
+
 ## Repository orientation (read this first)
 
 - **`origin/main` and `origin/develop` are stale.** Both are frozen at the
@@ -36,8 +53,8 @@ checklist, and rollback procedure: **`docs/phase1-staging-repair-report.md`**
 (read that file for the details -- not duplicated here).
 
 Branch: `staging/cloud-integration-repair`, latest commit
-`50bdd6ed4d77c859b5b4b2ea1ea05df7bbbbb9b2` (code) plus documentation
-commits on top. Not pushed. Not deployed. Samsung untouched.
+`363c3466dcdff7316e0b5b3fc1bcedd07a7b6d47`. **Pushed to origin.** Not
+deployed anywhere (see "Status right now" above). Samsung untouched.
 
 In one sentence: a fresh appliance could never finish activating at all
 (`coordinated_reenroll()` required an identity that doesn't exist yet on a
