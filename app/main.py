@@ -47204,6 +47204,7 @@ from partner_workspace import register_partner_workspace_routes, render_partner_
 
 
 from appliance_cloud import register_appliance_cloud_routes
+from appliance_claims import register_appliance_claim_routes
 from notification_settings_page import register_notification_settings_routes
 from live_playlist import register_live_playlist_routes
 from live_view_sessions import register_live_view_session_routes
@@ -47319,6 +47320,13 @@ register_customer_registration_routes(app, page_shell, current_user, is_master_a
 # route first fixes that; nothing about either route's own behavior
 # changed.
 register_appliance_cloud_routes(app, page_shell, current_user)
+# Phase 1 of the non-interactive/self-service claim flow (see
+# docs/non-interactive-activation-phase1-plan.md) -- a fully separate,
+# additive route set from the admin-driven activation routes just
+# registered above. No shared route paths with either
+# register_appliance_cloud_routes() or register_partner_workspace_routes(),
+# so registration order relative to those two does not matter here.
+register_appliance_claim_routes(app)
 # Registered before register_partner_workspace_routes() runs the
 # generic @app.get("/settings/{settings_slug}") catch-all it (or later
 # code in this file) may match against -- see that route's own handling
