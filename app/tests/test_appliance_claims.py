@@ -28,6 +28,13 @@ claim/status:
     deviation documented in appliance_claims.py) neither is the full
     request line of any call that used to carry one of those values in
     its URL
+  * device_id must be a proper UUIDv4 (security-hardening checkpoint):
+    sequential/short/malformed strings and UUIDv1/v3/v5 (same
+    8-4-4-4-12 shape, different version/variant nibbles) are all
+    rejected by claim/begin -- the regression coverage for the device-
+    hijack blocker closed in that pass (see appliance_claims.py's own
+    comment on DEVICE_ID_PATTERN and
+    docs/non-interactive-activation-phase1-security-hardening-report.md)
 
 Imports appliance_cloud/appliance_claims (which import partner_db,
 triggering its import-time schema init) -- redirects to a throwaway
@@ -39,6 +46,7 @@ established pattern (see test_appliance_updates_latest.py).
 import logging
 import secrets
 import time
+import uuid
 
 import pytest
 from fastapi import FastAPI
@@ -52,6 +60,12 @@ with override_target(sqlite_path="/tmp/test_appliance_claims_import.db"):
     import appliance_cloud
     import partner_portal
     from partner_db import connection
+
+# A real device_id must be a UUIDv4 (see appliance_claims.py's own
+# DEVICE_ID_PATTERN comment) -- this fixed value stands in for what
+# installer/09-identity.sh's `/proc/sys/kernel/random/uuid` would
+# actually generate on a real appliance.
+VALID_DEVICE_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _seed_customer(db, customer_id="cust-1", site_id="site-1", partner_id="partner-1", email="owner@example.test"):
@@ -130,7 +144,7 @@ def _seeded_customer(db_path, **kwargs):
             _seed_customer(db, **kwargs)
 
 
-def _begin(client, device_id="AIC-DEVICE-0001"):
+def _begin(client, device_id=VALID_DEVICE_ID):
     return client.post("/api/appliance/claim/begin", json={"device_id": device_id})
 
 
@@ -177,7 +191,7 @@ def test_begin_rejects_already_provisioned_device(client, db_path):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed_customer(db)
-            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", ("appl-1", "cust-1", "site-1", "AIC-DEVICE-0001", "2026-09-10T00:00:00"))
+            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", ("appl-1", "cust-1", "site-1", VALID_DEVICE_ID.upper(), "2026-09-10T00:00:00"))
 
     response = _begin(client)
 
@@ -190,6 +204,56 @@ def test_begin_rejects_malformed_device_id(client, db_path):
     response = _begin(client, device_id="bad")
 
     assert response.status_code == 400
+
+
+def test_begin_accepts_a_real_uuid4_regardless_of_casing(client, db_path):
+    # installer/09-identity.sh generates lowercase (kernel uuid), but
+    # nothing about the wire format should reject uppercase.
+    _seeded_customer(db_path)
+
+    response = _begin(client, device_id=VALID_DEVICE_ID.upper())
+
+    assert response.status_code == 200
+
+
+# --------------------------------------------------------- device_id hardening:
+# regression coverage for the device-hijack blocker (security-hardening
+# checkpoint). Each of these device_id values was, before this pass,
+# accepted by the old 8-128-char-alphanumeric pattern -- any one of
+# them being accepted meant an unauthenticated caller could open a
+# claim (and learn its claim_code) for a device_id it merely guessed.
+# None of these may ever reach 200.
+
+
+@pytest.mark.parametrize(
+    "device_id",
+    [
+        pytest.param("AIC-SERIAL-000042", id="sequential_vendor_serial"),
+        pytest.param("00000001", id="short_sequential_id"),
+        pytest.param("DEVICE042", id="short_predictable_label"),
+        pytest.param("11111111-1111-1111-1111-111111111111", id="all_same_digit_not_a_real_uuid_version"),
+        pytest.param(str(uuid.uuid1()), id="uuid1_time_based"),
+        pytest.param(str(uuid.uuid3(uuid.NAMESPACE_DNS, "anyaicam-appliance")), id="uuid3_namespace_md5"),
+        pytest.param(str(uuid.uuid5(uuid.NAMESPACE_DNS, "anyaicam-appliance")), id="uuid5_namespace_sha1"),
+        pytest.param("11111111111141118111111111111111", id="uuid4_shape_without_hyphens"),
+        pytest.param("11111111-1111-5111-8111-111111111111", id="malformed_uuid_wrong_version_nibble"),
+        pytest.param("11111111-1111-4111-c111-111111111111", id="malformed_uuid_wrong_variant_nibble"),
+        pytest.param("g1111111-1111-4111-8111-111111111111", id="malformed_uuid_non_hex_character"),
+        pytest.param("11111111-1111-4111-8111-11111111111", id="malformed_uuid_too_short"),
+        pytest.param("11111111-1111-4111-8111-1111111111111", id="malformed_uuid_too_long"),
+        pytest.param("", id="empty_string"),
+    ],
+)
+def test_begin_rejects_non_uuid4_device_ids(client, db_path, device_id):
+    _seeded_customer(db_path)
+
+    response = _begin(client, device_id=device_id)
+
+    assert response.status_code == 400
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            count = db.execute("SELECT COUNT(*) AS n FROM appliance_claims").fetchone()["n"]
+    assert count == 0, f"a claim session (and its claim_code) must never be created for a rejected device_id, got {device_id!r}"
 
 
 # --------------------------------------------------------- claim/status
@@ -280,7 +344,7 @@ def test_portal_confirm_succeeds_for_own_site(client, db_path):
     response = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
 
     assert response.status_code == 200
-    assert response.json() == {"status": "claimed", "device_id": "AIC-DEVICE-0001"}
+    assert response.json() == {"status": "claimed", "device_id": VALID_DEVICE_ID}
 
 
 def test_portal_confirm_twice_is_conflict(client, db_path):
@@ -298,7 +362,7 @@ def test_portal_confirm_twice_is_conflict(client, db_path):
 # --------------------------------------------------------- claim/complete
 
 
-def _claim_through_to_proof(client, db_path, device_id="AIC-DEVICE-0001"):
+def _claim_through_to_proof(client, db_path, device_id=VALID_DEVICE_ID):
     _seeded_customer(db_path)
     session = _begin(client, device_id=device_id).json()
     confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
@@ -315,7 +379,7 @@ def test_complete_produces_activate_shaped_response_and_working_credential(clien
     assert response.status_code == 200
     body = response.json()
     assert set(body.keys()) == {"appliance_id", "cloud_id", "credential", "credential_id", "partner_id", "customer_id", "site_id", "message"}
-    assert body["cloud_id"] == "AIC-DEVICE-0001"
+    assert body["cloud_id"] == VALID_DEVICE_ID.upper()
     assert body["customer_id"] == "cust-1"
     assert body["site_id"] == "site-1"
 
@@ -346,7 +410,7 @@ def test_complete_rejects_replayed_proof(client, db_path):
     assert second.status_code in (403, 409)
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id='AIC-DEVICE-0001'").fetchone()["n"]
+            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
             assert count == 1
 
 
@@ -361,7 +425,7 @@ def test_complete_rejects_expired_proof(client, db_path):
     assert response.status_code == 403
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id='AIC-DEVICE-0001'").fetchone()["n"]
+            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
             assert count == 0
 
 

@@ -110,7 +110,38 @@ claim_portal_limiter = RateLimiter(30, 60)
 
 CLAIM_SESSION_TTL_MINUTES = 15
 CLAIM_PROOF_TTL_MINUTES = 5
-DEVICE_ID_PATTERN = re.compile(r'^[A-Za-z0-9._:-]{8,128}$')
+# Security-hardening checkpoint (see docs/non-interactive-activation-
+# phase1-security-hardening-report.md): the original pattern here --
+# any 8-128 char alphanumeric string -- accepted anything, including a
+# short, sequential, attacker-guessable device_id. Since claim_begin
+# hands the claim_code for a not-yet-provisioned device_id directly to
+# whoever calls it first, with no authentication at all, a guessable
+# device_id let an unauthenticated attacker open and complete a claim
+# for someone else's real appliance before its rightful owner ever
+# activated it -- confirmed as a working end-to-end exploit during the
+# audit this hardening pass closes.
+#
+# installer/09-identity.sh is the ONLY place in this repository that
+# generates an appliance-local identifier intended for exactly this
+# purpose: `appliance_id="$(cat /proc/sys/kernel/random/uuid)"`. Per
+# the Linux kernel's own contract for that interface, this is always a
+# random (version 4) UUID in canonical lowercase form -- so requiring
+# a proper UUIDv4 here matches the only real identifier this
+# repository's own installer ever produces, not an arbitrary new
+# restriction. This does NOT touch the existing admin-assigned
+# `cloud_id` format ("AIC-XXXXXXXX"-style codes) used by the
+# unmodified /api/appliance/activate and appliance_cloud.py -- that is
+# a completely separate field, validated nowhere near this module, and
+# this pattern only ever gates the NEW self-service claim flow's
+# device_id parameter.
+#
+# Version nibble (3rd group, 1st hex digit) must be '4'; variant
+# nibble (4th group, 1st hex digit) must be one of 8/9/a/b per RFC
+# 4122 -- this is what actually distinguishes UUIDv4 from UUIDv1/v3/v5
+# (which share the same 8-4-4-4-12 shape but a different version
+# nibble) and from a random string that merely happens to look
+# hex-and-hyphen-shaped.
+DEVICE_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$')
 
 
 def _now() -> datetime:
@@ -142,6 +173,16 @@ def _require_self_link_permission(identity: dict) -> None:
 
 def _valid_device_id(device_id: str) -> bool:
     return bool(DEVICE_ID_PATTERN.match(device_id or ''))
+
+
+def _normalize_device_id(device_id: str) -> str:
+    # Accepts either casing (the kernel's uuid interface always emits
+    # lowercase, but nothing stops a caller from upper-casing it in
+    # transit) and stores/looks up one canonical lowercase form so two
+    # requests for "the same" device_id in different casing are always
+    # treated as the same device -- validated by _valid_device_id()
+    # before this is ever called.
+    return device_id.lower()
 
 
 def _generate_claim_code() -> str:
@@ -200,7 +241,8 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=429, detail='Claim attempt rate exceeded.')
         device_id = str(payload.get('device_id', '')).strip()
         if not _valid_device_id(device_id):
-            raise HTTPException(status_code=400, detail='device_id is missing or has an invalid format.')
+            raise HTTPException(status_code=400, detail='device_id must be a valid UUIDv4.')
+        device_id = _normalize_device_id(device_id)
         existing_appliance = row('SELECT id FROM appliances WHERE cloud_id=?', (device_id.upper(),))
         if existing_appliance:
             raise HTTPException(status_code=409, detail='This device is already provisioned. Use the existing activation flow.')
