@@ -81,6 +81,7 @@ plan doc's originally path/query-based endpoint shapes.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import secrets
@@ -110,6 +111,14 @@ claim_portal_limiter = RateLimiter(30, 60)
 
 CLAIM_SESSION_TTL_MINUTES = 15
 CLAIM_PROOF_TTL_MINUTES = 5
+# Security-hardening checkpoint, hardening item 3: how long a retry of
+# claim/complete can still recover the original credential after a
+# successful completion whose response the device never saw. Same
+# order of magnitude as the other windows in this flow -- long enough
+# to cover a realistic retry (a reboot, a dropped connection), short
+# enough to bound how long a recoverable (if encrypted) copy of a live
+# credential sits in the database.
+CREDENTIAL_RECOVERY_TTL_MINUTES = 15
 # Security-hardening checkpoint (see docs/non-interactive-activation-
 # phase1-security-hardening-report.md): the original pattern here --
 # any 8-128 char alphanumeric string -- accepted anything, including a
@@ -268,6 +277,54 @@ def _expire_if_due(claim: dict) -> dict:
         claim['claim_proof_plaintext'] = None
         return claim
     return claim
+
+
+def _recover_completed_result(claim: dict) -> dict | None:
+    """Security-hardening checkpoint, hardening item 3: lets a retried
+    claim/complete (same claim_session_id, same claim_proof, called
+    again after the original successful completion) recover the exact
+    same activation result -- appliance_id, cloud_id, credential,
+    credential_id, partner_id, customer_id, site_id -- instead of
+    either 403ing forever (the original Phase 1 behavior: the device's
+    response was lost, and the one-time-shown credential was then
+    permanently unrecoverable) or minting a second credential (which
+    would violate "only one appliance credential is created").
+
+    Returns None if there is nothing left to recover -- either the
+    recovery window has passed, or no recovery material was ever
+    stored (e.g. ANYAICAM_CLAIM_FLOW_SECRET_KEY was unset at the
+    original completion, in which case retry-recovery was never
+    possible for this claim, but the original completion itself was
+    never blocked on that -- see the success path below). Lazily nulls
+    the encrypted material once it's past its own recovery window,
+    bounding its at-rest lifetime the same way abandoned claim proofs
+    are bounded by _expire_if_due()."""
+    if not claim.get('completed_credential_encrypted'):
+        return None
+    if not _still_valid(claim.get('credential_recovery_expires_at')):
+        with connection() as db:
+            db.execute('UPDATE appliance_claims SET completed_credential_encrypted=NULL WHERE id=?', (claim['id'],))
+        return None
+    decrypted = decrypt_claim_flow_secret(claim['completed_credential_encrypted'])
+    if not decrypted:
+        return None
+    try:
+        recovered = json.loads(decrypted)
+    except json.JSONDecodeError:
+        return None
+    appliance = row('SELECT * FROM appliances WHERE id=?', (claim.get('appliance_id'),))
+    if not appliance:
+        return None
+    return {
+        'appliance_id': claim['appliance_id'],
+        'cloud_id': appliance['cloud_id'],
+        'credential': recovered.get('credential'),
+        'credential_id': recovered.get('credential_id'),
+        'partner_id': appliance.get('partner_id'),
+        'customer_id': appliance['customer_id'],
+        'site_id': appliance['site_id'],
+        'message': 'Store this permanent credential securely; it will not be shown again.',
+    }
 
 
 def register_appliance_claim_routes(app: FastAPI) -> None:
@@ -439,13 +496,26 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
         if not claim_session_id or not claim_proof:
             raise HTTPException(status_code=400, detail='claim_session_id and claim_proof are required.')
         claim = row('SELECT * FROM appliance_claims WHERE claim_session_id=?', (claim_session_id,))
-        if not claim or claim['status'] != 'claimed' or not claim.get('claim_proof_hash'):
+        if not claim or not claim.get('claim_proof_hash') or not verify_password(claim_proof, claim['claim_proof_hash']):
             raise HTTPException(status_code=403, detail='Claim is not ready to be completed.')
-        try:
-            proof_still_valid = datetime.fromisoformat(claim['proof_expires_at']) > _now()
-        except (KeyError, TypeError, ValueError):
-            proof_still_valid = False
-        if not proof_still_valid or not verify_password(claim_proof, claim['claim_proof_hash']):
+        if claim['status'] == 'completed':
+            # Retry-safety path (hardening item 3): the proof already
+            # verified above against this exact row's own hash (never
+            # cleared on completion -- only claim_proof_encrypted is),
+            # so this is confirmed to be a genuine retry of THIS same
+            # claim, not a guess. Recover the original result rather
+            # than creating a second credential or leaving the device
+            # permanently unable to finish enrollment.
+            recovered = _recover_completed_result(claim)
+            if recovered is None:
+                raise HTTPException(status_code=409, detail='Claim was already completed and its credential can no longer be recovered.')
+            return recovered
+        if claim['status'] != 'claimed':
+            raise HTTPException(status_code=403, detail='Claim is not ready to be completed.')
+        # claim_proof itself was already verified against claim_proof_hash
+        # above (before the status branch), so only expiry remains to
+        # check here.
+        if not _still_valid(claim.get('proof_expires_at')):
             raise HTTPException(status_code=403, detail='Claim proof is invalid or expired.')
         now = _now()
         with connection() as db:
@@ -474,6 +544,19 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
             db.execute(
                 'INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)',
                 (credential_id, appliance_id, password_hash(credential), now.isoformat(), 'claim'),
+            )
+            # Hardening item 3: best-effort, not a gate on completion
+            # itself -- unlike confirm's fail-closed encryption
+            # requirement, a retry-recovery feature must never block
+            # the primary credential-issuance transaction. If the key
+            # is unset here, the completion still succeeds; a retry in
+            # that edge case simply finds nothing to recover and falls
+            # back to the pre-hardening 409 behavior.
+            recovery_ciphertext = encrypt_claim_flow_secret(json.dumps({'credential': credential, 'credential_id': credential_id}))
+            recovery_expires_at = (now + timedelta(minutes=CREDENTIAL_RECOVERY_TTL_MINUTES)).isoformat() if recovery_ciphertext else None
+            db.execute(
+                'UPDATE appliance_claims SET completed_credential_encrypted=?,credential_recovery_expires_at=? WHERE id=?',
+                (recovery_ciphertext, recovery_expires_at, claim['id']),
             )
         appliance = row('SELECT * FROM appliances WHERE id=?', (appliance_id,))
         # Same durable-persistence call activate_appliance() makes as

@@ -45,6 +45,7 @@ established pattern (see test_appliance_updates_latest.py).
 
 import logging
 import secrets
+import threading
 import time
 import uuid
 
@@ -515,18 +516,145 @@ def test_complete_produces_activate_shaped_response_and_working_credential(clien
     assert heartbeat.status_code == 200
 
 
-def test_complete_rejects_replayed_proof(client, db_path):
+def test_complete_retry_recovers_the_same_result_not_a_second_credential(client, db_path):
+    # Security-hardening checkpoint, hardening item 3: a retry with the
+    # SAME valid claim_session_id+claim_proof after a successful
+    # completion (simulating the device never seeing the first
+    # response) must recover the identical activation result -- never
+    # a 403/409 that strands the device, and never a second credential.
     claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
     first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
     assert first.status_code == 200
 
     second = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
 
-    assert second.status_code in (403, 409)
+    assert second.status_code == 200
+    assert second.json() == first.json(), "a retry must recover the exact same result, not a different (e.g. rotated) credential"
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
-            assert count == 1
+            appliance_count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
+            credential_count = db.execute(
+                "SELECT COUNT(*) AS n FROM appliance_credentials WHERE appliance_id=?", (first.json()["appliance_id"],)
+            ).fetchone()["n"]
+    assert appliance_count == 1, "only one appliance may ever be created for this claim"
+    assert credential_count == 1, "only one appliance credential may ever be created for this claim"
+
+
+def test_complete_retry_fails_closed_with_wrong_proof_even_after_completion(client, db_path):
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    assert first.status_code == 200
+
+    wrong = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": "not-the-real-proof"})
+
+    assert wrong.status_code == 403
+
+
+def test_complete_retry_after_recovery_window_expires_is_a_clean_conflict(client, db_path):
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    assert first.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute(
+                "UPDATE appliance_claims SET credential_recovery_expires_at=? WHERE claim_session_id=?",
+                ("2020-01-01T00:00:00", claim_session_id),
+            )
+
+    retry = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+
+    assert retry.status_code == 409
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            appliance_count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
+            encrypted_after = db.execute(
+                "SELECT completed_credential_encrypted FROM appliance_claims WHERE claim_session_id=?", (claim_session_id,)
+            ).fetchone()["completed_credential_encrypted"]
+    assert appliance_count == 1, "a stale retry must never mint a second credential"
+    assert encrypted_after is None, "the recovery ciphertext must be cleared once its own window has passed"
+
+
+def test_complete_retry_survives_a_simulated_process_restart(client, db_path, identity_file):
+    # Recovery material must be durably persisted (the database), not
+    # cached in this process's memory -- a fresh FastAPI app/TestClient
+    # instance pointed at the SAME database stands in for "a different
+    # cloud worker process, or this same process after a restart,
+    # handles the retry".
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    assert first.status_code == 200
+
+    with override_target(sqlite_path=str(db_path)):
+        fresh_app = FastAPI()
+        appliance_cloud.register_appliance_cloud_routes(fresh_app, shell=lambda *a, **k: "")
+        appliance_claims.register_appliance_claim_routes(fresh_app)
+        with TestClient(fresh_app) as fresh_client:
+            retry = fresh_client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+
+    assert retry.status_code == 200
+    assert retry.json() == first.json()
+
+
+def test_complete_is_multi_worker_safe_under_concurrent_retries(client, db_path, identity_file, monkeypatch):
+    # The claim is completed once (sequentially, establishing the
+    # 'completed' state a real retry would actually encounter), then
+    # twenty concurrent callers -- standing in for the device's own
+    # retry racing against several other cloud worker processes
+    # handling the same lost-response retry -- all present the SAME
+    # valid claim_session_id+claim_proof simultaneously against that
+    # already-completed claim. Exactly one appliance and one credential
+    # may exist afterward, and every successful (200) response must
+    # carry the identical result.
+    #
+    # threading.Thread does not inherit contextvars, so override_target
+    # (a contextvars.ContextVar) is invisible in a naively-spawned
+    # thread -- each worker thread below binds it itself, in its own
+    # native context, rather than trying to share one contextvars.Context
+    # across concurrent threads (which raises "context already entered").
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+    original = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    assert original.status_code == 200
+    # This test isolates multi-worker retry-safety specifically, not
+    # activation_limiter's own (separately tested) rate-limit capacity
+    # -- raise its limit for this test's duration so 20 concurrent
+    # calls (from 20 distinct in-process "workers", all sharing the
+    # TestClient's single fixed source IP) aren't partly rejected by a
+    # budget this test isn't about.
+    appliance_cloud.activation_limiter.events.clear()
+    monkeypatch.setattr(appliance_cloud.activation_limiter, "limit", 1000)
+    results = []
+    lock = threading.Lock()
+
+    def worker():
+        with override_target(sqlite_path=str(db_path)):
+            worker_app = FastAPI()
+            appliance_cloud.register_appliance_cloud_routes(worker_app, shell=lambda *a, **k: "")
+            appliance_claims.register_appliance_claim_routes(worker_app)
+            with TestClient(worker_app) as worker_client:
+                response = worker_client.post(
+                    "/api/appliance/claim/complete",
+                    json={"claim_session_id": claim_session_id, "claim_proof": claim_proof},
+                )
+        with lock:
+            results.append((response.status_code, response.json()))
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+    successes = [body for status, body in results if status == 200]
+    assert len(successes) == 20, f"every concurrent retry of a valid, already-completed claim must succeed, got statuses {[s for s, _ in results]}"
+    assert all(body == original.json() for body in successes), "every concurrent retry must recover the exact original result"
+    assert len({body["appliance_id"] for body in successes}) == 1
+    assert len({body["credential"] for body in successes}) == 1
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            appliance_count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
+            credential_count = db.execute(
+                "SELECT COUNT(*) AS n FROM appliance_credentials WHERE appliance_id=?", (successes[0]["appliance_id"],)
+            ).fetchone()["n"]
+    assert appliance_count == 1
+    assert credential_count == 1
 
 
 def test_complete_rejects_expired_proof(client, db_path):
