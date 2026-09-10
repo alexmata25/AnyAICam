@@ -153,6 +153,32 @@ CREATE TABLE IF NOT EXISTS appliance_update_results(
     FOREIGN KEY(appliance_id) REFERENCES appliances(id)
 );
 '''),
+    ('20260910_appliance_claims','''
+CREATE TABLE IF NOT EXISTS appliance_claims(
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    claim_session_id TEXT UNIQUE NOT NULL,
+    claim_code_hash TEXT NOT NULL,
+    claim_proof_hash TEXT,
+    claim_proof_plaintext TEXT,
+    status TEXT NOT NULL,
+    customer_id TEXT,
+    site_id TEXT,
+    claimed_by TEXT,
+    appliance_id TEXT,
+    proof_expires_at TEXT,
+    expires_at TEXT NOT NULL,
+    claimed_at TEXT,
+    completed_at TEXT,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(site_id) REFERENCES sites(id),
+    FOREIGN KEY(appliance_id) REFERENCES appliances(id)
+);
+CREATE INDEX IF NOT EXISTS idx_appliance_claims_device_id ON appliance_claims(device_id);
+CREATE INDEX IF NOT EXISTS idx_appliance_claims_status ON appliance_claims(status);
+'''),
 ]
 
 
