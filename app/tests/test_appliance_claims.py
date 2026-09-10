@@ -132,6 +132,15 @@ def claim_flow_key(monkeypatch):
     monkeypatch.setenv("ANYAICAM_CLAIM_FLOW_SECRET_KEY", Fernet.generate_key().decode())
 
 
+def _shell_stub(title, icon, content, scripts=''):
+    # Minimal stand-in for main.py's real page_shell -- just enough
+    # structure (title, content, scripts all present in the output) for
+    # a test to assert against, matching appliance_cloud's own
+    # shell=lambda *a, **k: "" stub philosophy but preserving enough to
+    # actually check the new claim page's content (Phase 2A).
+    return f'<html><head><title>{title} · {icon}</title></head><body>{content}{scripts}</body></html>'
+
+
 @pytest.fixture()
 def client(db_path, identity_file, claim_flow_key):
     # Shared module-level RateLimiter singletons, never reset by
@@ -146,7 +155,7 @@ def client(db_path, identity_file, claim_flow_key):
         initialize_database()
         app = FastAPI()
         appliance_cloud.register_appliance_cloud_routes(app, shell=lambda *a, **k: "")
-        appliance_claims.register_appliance_claim_routes(app)
+        appliance_claims.register_appliance_claim_routes(app, shell=_shell_stub)
         with TestClient(app) as test_client:
             yield test_client
 
@@ -418,6 +427,38 @@ def test_expired_claimed_row_can_no_longer_be_completed(client, db_path):
         with connection() as db:
             count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
     assert count == 0
+
+
+# --------------------------------------------------------- Phase 2A: customer claim page
+
+
+def test_claim_page_redirects_unauthenticated_visitors_to_login(client, db_path):
+    response = client.get("/customer/claim-appliance", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/partner-login"
+
+
+def test_claim_page_rejects_non_customer_owner_roles(client, db_path):
+    admin_cookie = partner_portal._token("admin@example.test", "administrator", None, None)
+
+    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: admin_cookie})
+
+    assert response.status_code == 403
+
+
+def test_claim_page_renders_the_customers_own_sites(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_customer(db)
+            _seed_other_customer_site(db)
+
+    response = client.get("/customer/claim-appliance", cookies={partner_portal.SESSION_COOKIE: _customer_cookie()})
+
+    assert response.status_code == 200
+    assert "Claim an appliance" in response.text
+    assert "site-1" in response.text
+    assert "site-other" not in response.text, "must never list a different customer's site"
 
 
 # --------------------------------------------------------- portal lookup/confirm

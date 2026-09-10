@@ -47326,7 +47326,11 @@ register_appliance_cloud_routes(app, page_shell, current_user)
 # registered above. No shared route paths with either
 # register_appliance_cloud_routes() or register_partner_workspace_routes(),
 # so registration order relative to those two does not matter here.
-register_appliance_claim_routes(app)
+# page_shell (Phase 2A) renders the one new customer-facing page,
+# GET /customer/claim-appliance -- not shadowed by anything registered
+# before or after this line (no /customer/{...} wildcard exists
+# anywhere in this codebase).
+register_appliance_claim_routes(app, page_shell)
 # Registered before register_partner_workspace_routes() runs the
 # generic @app.get("/settings/{settings_slug}") catch-all it (or later
 # code in this file) may match against -- see that route's own handling

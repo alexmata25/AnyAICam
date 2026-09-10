@@ -86,8 +86,11 @@ import logging
 import re
 import secrets
 from datetime import datetime, timedelta
+from html import escape
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from appliance_cloud import activation_limiter
 from appliance_protocol import RateLimiter, decrypt_claim_flow_secret, encrypt_claim_flow_secret
@@ -327,7 +330,12 @@ def _recover_completed_result(claim: dict) -> dict | None:
     }
 
 
-def register_appliance_claim_routes(app: FastAPI) -> None:
+def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None) -> None:
+    """`shell` is optional and only used by the customer-facing claim
+    page (Phase 2A) -- every device-facing and JSON portal route below
+    is unaffected by whether it's supplied, matching this codebase's
+    existing convention (register_appliance_cloud_routes' own
+    `current_user` parameter works the same way)."""
     @app.post('/api/appliance/claim/begin')
     def claim_begin(request: Request, payload: dict) -> dict:
         client = _client_ip(request)
@@ -588,3 +596,77 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
             'site_id': appliance['site_id'],
             'message': 'Store this permanent credential securely; it will not be shown again.',
         }
+
+    if shell is None:
+        return
+
+    # Phase 2A: the smallest customer-facing page that can drive the
+    # existing JSON APIs above -- enter a code, look it up, review the
+    # device_id, pick one of this customer's own sites, confirm. No QR
+    # scanning, no polling for the device to finish (that happens on
+    # the appliance's own terminal, not here), reusing this codebase's
+    # existing page_shell/CSS conventions unchanged (same
+    # .action-button/.ghost-button/.panel/.health-detail classes
+    # partner_workspace.py's customer pages already use). The shell's
+    # own global fetch wrapper (see page_shell's own <script> in
+    # main.py) attaches X-CSRF-Token to same-origin POSTs automatically,
+    # so the two fetch() calls below need no special CSRF handling,
+    # matching every other customer-facing action button in this
+    # codebase (e.g. partner_workspace.py's link_customer_appliance
+    # button).
+    @app.get('/customer/claim-appliance', response_class=HTMLResponse)
+    def customer_claim_appliance_page(request: Request):
+        identity = partner_identity(request)
+        if not identity:
+            return RedirectResponse('/partner-login', status_code=303)
+        if identity.get('role') != 'customer_owner':
+            raise HTTPException(status_code=403, detail='Customer owner permission required.')
+        sites = rows('SELECT * FROM sites WHERE customer_id=?', (identity['customer_id'],))
+        site_options = ''.join(f'<option value="{escape(s["id"],quote=True)}">{escape(s["name"])}</option>' for s in sites) or '<option value="">No sites on this account yet</option>'
+        content = f'''<header class="topbar"><div><p class="eyebrow">Add an appliance</p><h1>Claim an appliance</h1></div></header>
+        <section class="panel">
+          <div id="claim-step-code">
+            <p>Enter the claim code shown on the appliance during setup.</p>
+            <label>Claim code<input id="claim-code-input" maxlength="16" autocapitalize="characters" placeholder="ABCD1234"></label>
+            <button class="action-button" id="claim-lookup-button">Look up</button>
+            <p id="claim-lookup-message" class="health-detail"></p>
+          </div>
+          <div id="claim-step-confirm" hidden>
+            <p>Appliance found: <strong id="claim-device-id"></strong></p>
+            <label>Site<select id="claim-site-select">{site_options}</select></label>
+            <button class="action-button" id="claim-confirm-button">Confirm claim</button>
+            <button class="ghost-button" id="claim-cancel-button">Start over</button>
+            <p id="claim-confirm-message" class="health-detail"></p>
+          </div>
+          <div id="claim-step-done" hidden>
+            <p>Claim confirmed. The appliance will finish activating automatically within a few seconds.</p>
+          </div>
+        </section>'''
+        scripts = '''<script>
+        document.getElementById('claim-lookup-button').onclick=async()=>{
+          const code=document.getElementById('claim-code-input').value.trim().toUpperCase(),message=document.getElementById('claim-lookup-message');
+          message.textContent='';
+          const response=await fetch('/api/portal/claims/lookup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim_code:code})}),body=await response.json();
+          if(!response.ok){message.textContent=body.detail||'Claim code not found or expired.';return}
+          document.getElementById('claim-device-id').textContent=body.device_id;
+          document.getElementById('claim-step-code').hidden=true;
+          document.getElementById('claim-step-confirm').hidden=false;
+        };
+        document.getElementById('claim-cancel-button').onclick=()=>{
+          document.getElementById('claim-step-confirm').hidden=true;
+          document.getElementById('claim-step-code').hidden=false;
+          document.getElementById('claim-code-input').value='';
+          document.getElementById('claim-confirm-message').textContent='';
+        };
+        document.getElementById('claim-confirm-button').onclick=async()=>{
+          const code=document.getElementById('claim-code-input').value.trim().toUpperCase(),siteId=document.getElementById('claim-site-select').value,message=document.getElementById('claim-confirm-message'),button=document.getElementById('claim-confirm-button');
+          if(!siteId){message.textContent='Select a site first.';return}
+          button.disabled=true;
+          const response=await fetch('/api/portal/claims/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({claim_code:code,site_id:siteId})}),body=await response.json();
+          if(!response.ok){button.disabled=false;message.textContent=body.detail||'Could not confirm the claim.';return}
+          document.getElementById('claim-step-confirm').hidden=true;
+          document.getElementById('claim-step-done').hidden=false;
+          showToast('Appliance claim confirmed.');
+        };
+        </script>'''
+        return shell('Claim appliance', 'users', content, scripts)
