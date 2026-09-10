@@ -18,9 +18,16 @@ claim/status:
     including the site-ownership check, and claim/status starts
     returning claim_proof once a claim is confirmed
 
-claim/complete tests are added to this same file in the next commit,
-once that route exists (see the Phase 1 plan doc's 6-commit
-implementation order).
+  * claim/complete performs the one-time exchange into the existing,
+    unmodified persist_activation()/appliance_credentials machinery,
+    fails closed on a replayed or expired proof, and the resulting
+    credential authenticates successfully against the untouched
+    authenticate_appliance() used by every other appliance route
+  * no claim_code, claim_proof, or credential value is ever written to
+    the log stream, and (this is what actually caught the URL-path
+    deviation documented in appliance_claims.py) neither is the full
+    request line of any call that used to carry one of those values in
+    its URL
 
 Imports appliance_cloud/appliance_claims (which import partner_db,
 triggering its import-time schema init) -- redirects to a throwaway
@@ -28,6 +35,10 @@ sqlite file via override_target() before that import happens, matching
 this project's own documented constraint and every other test file's
 established pattern (see test_appliance_updates_latest.py).
 """
+
+import logging
+import secrets
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -57,6 +68,15 @@ def _seed_other_customer_site(db, site_id="site-other"):
 
 def _customer_cookie(email="owner@example.test", customer_id="cust-1", partner_id=None):
     return partner_portal._token(email, "customer_owner", partner_id, customer_id)
+
+
+def _appliance_auth_headers(appliance_id: str, credential: str) -> dict:
+    return {
+        "X-Appliance-Id": appliance_id,
+        "X-Request-Timestamp": str(int(time.time())),
+        "X-Request-Nonce": secrets.token_hex(16),
+        "Authorization": f"Bearer {credential}",
+    }
 
 
 @pytest.fixture()
@@ -252,3 +272,101 @@ def test_portal_confirm_twice_is_conflict(client, db_path):
     second = _confirm(client, session["claim_code"], "site-1", cookie=cookie)
 
     assert second.status_code in (403, 404, 409)
+
+
+# --------------------------------------------------------- claim/complete
+
+
+def _claim_through_to_proof(client, db_path, device_id="AIC-DEVICE-0001"):
+    _seeded_customer(db_path)
+    session = _begin(client, device_id=device_id).json()
+    confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+    assert confirm.status_code == 200
+    status = _status(client, session["claim_session_id"]).json()
+    return session["claim_session_id"], status["claim_proof"]
+
+
+def test_complete_produces_activate_shaped_response_and_working_credential(client, db_path):
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+
+    response = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body.keys()) == {"appliance_id", "cloud_id", "credential", "credential_id", "partner_id", "customer_id", "site_id", "message"}
+    assert body["cloud_id"] == "AIC-DEVICE-0001"
+    assert body["customer_id"] == "cust-1"
+    assert body["site_id"] == "site-1"
+
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            appliance = db.execute("SELECT * FROM appliances WHERE id=?", (body["appliance_id"],)).fetchone()
+            assert appliance["customer_id"] == "cust-1"
+            assert appliance["site_id"] == "site-1"
+
+    # End-to-end: the freshly minted credential authenticates against
+    # the existing, untouched authenticate_appliance() boundary exactly
+    # like any admin-activated appliance's credential would.
+    heartbeat = client.post(
+        "/api/appliance/heartbeat",
+        headers=_appliance_auth_headers(body["appliance_id"], body["credential"]),
+        json={"uptime_seconds": 120, "cpu": 5, "memory": 10},
+    )
+    assert heartbeat.status_code == 200
+
+
+def test_complete_rejects_replayed_proof(client, db_path):
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+    first = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+    assert first.status_code == 200
+
+    second = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+
+    assert second.status_code in (403, 409)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id='AIC-DEVICE-0001'").fetchone()["n"]
+            assert count == 1
+
+
+def test_complete_rejects_expired_proof(client, db_path):
+    claim_session_id, claim_proof = _claim_through_to_proof(client, db_path)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("UPDATE appliance_claims SET proof_expires_at=? WHERE claim_session_id=?", ("2020-01-01T00:00:00", claim_session_id))
+
+    response = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": claim_proof})
+
+    assert response.status_code == 403
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id='AIC-DEVICE-0001'").fetchone()["n"]
+            assert count == 0
+
+
+def test_complete_rejects_wrong_proof(client, db_path):
+    claim_session_id, _ = _claim_through_to_proof(client, db_path)
+
+    response = client.post("/api/appliance/claim/complete", json={"claim_session_id": claim_session_id, "claim_proof": "not-the-real-proof"})
+
+    assert response.status_code == 403
+
+
+# --------------------------------------------------------- secret hygiene
+
+
+def test_full_happy_path_never_logs_secrets(client, db_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+    confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+    assert confirm.status_code == 200
+    status = _status(client, session["claim_session_id"]).json()
+    complete = client.post("/api/appliance/claim/complete", json={"claim_session_id": session["claim_session_id"], "claim_proof": status["claim_proof"]})
+    assert complete.status_code == 200
+    credential = complete.json()["credential"]
+
+    secrets_that_must_never_be_logged = [session["claim_code"], status["claim_proof"], credential]
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    for secret in secrets_that_must_never_be_logged:
+        assert secret not in log_text

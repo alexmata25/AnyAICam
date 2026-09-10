@@ -9,13 +9,12 @@ customer/site, and no credential yet can register itself, wait for a
 customer to confirm it in the portal, and redeem a one-time proof for
 a permanent credential.
 
-This commit adds the portal-facing lookup/confirm routes on top of the
-previous commit's device-facing claim/begin and claim/status -- a
-customer can now confirm a pending claim and bind it to one of their
-own sites, but claim/complete does not exist yet, so a confirmed claim
-still cannot be redeemed into a credential. That lands in the next
-commit; see the Phase 1 plan doc's 6-commit implementation order and
-the Phase 1 completion report for the full picture.
+This commit adds claim/complete, the one-time exchange of a confirmed
+claim into the existing enrollment/credential mechanism -- completing
+the cloud-side half of the Phase 1 plan doc's flow (agent-side
+PortalClient methods and their tests land in the next commit; see the
+Phase 1 plan doc's 6-commit implementation order and the Phase 1
+completion report for the full picture).
 
 Portal-facing endpoints (claim lookup, claim confirm) reuse the exact
 identity/permission pattern partner_workspace.py's existing
@@ -51,8 +50,7 @@ requires a pre-created appliances row scoped to the customer). Both
 keep working exactly as before; this module never reads from or
 writes to appliance_activation_tokens, and appliance_claims.py's own
 new table is the only thing it touches until the one-time INSERT into
-the existing appliances table at claim/complete (added in a later
-commit).
+the existing appliances table at claim/complete.
 
 Why a new table instead of relaxing appliances.customer_id/site_id's
 NOT NULL constraints: see the Phase 1 plan doc §1. In short, a
@@ -62,18 +60,19 @@ on an existing appliance_id), so all pre-claim and claim-in-progress
 state lives in appliance_claims (this module) instead, and appliances
 is only ever INSERTed once a claim actually completes.
 
-Trust model for the device-facing endpoints: the device has no
-credential yet, by definition, so these are protected the same way
+Trust model for the three device-facing endpoints (claim/begin,
+claim/status, claim/complete): the device has no credential yet, by
+definition, so these are protected the same way
 appliance_cloud.activate_appliance() already protects its own
 unauthenticated cloud_id+token exchange -- rate limiting, unguessable
 high-entropy random tokens, and short expiries -- not a bearer
 credential. claim_session_id and claim_proof are both treated as
 bearer-equivalent secrets: never logged, and matched with
 verify_password()'s constant-time comparison exactly like every other
-hashed secret in this codebase. This is also why claim_session_id
-(here) and claim_code/claim_proof (added in later commits) are always
-carried in a POST body, never a URL path or query string -- a URL is
-what every access log line at every layer (this process, any reverse
+hashed secret in this codebase. This is also why claim_session_id and
+claim_code/claim_proof are always carried in a POST body, never a URL
+path or query string -- a URL is what every access log line at every
+layer (this process, any reverse
 proxy, a CDN) is built from, and this repo already has one documented
 instance of exactly that mistake for password-reset tokens (see
 docs/customer-appliance-readiness-blockers.md). See the Phase 1
@@ -89,6 +88,7 @@ from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
 
+from appliance_cloud import activation_limiter
 from appliance_protocol import RateLimiter
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
 from partner_portal import partner_identity
@@ -98,7 +98,12 @@ logger = logging.getLogger('anyaicam.appliance_claims')
 # Same shape/window as appliance_cloud.activation_limiter -- this flow
 # is the self-service sibling of that same activation surface and
 # deserves the same throttling posture, not a stricter or looser one
-# invented from scratch.
+# invented from scratch. claim/complete reuses activation_limiter
+# itself (the exact same instance appliance_cloud.activate_appliance()
+# already throttles with), since both are, from an abuse-budget
+# perspective, "an unauthenticated attempt to redeem a device
+# credential from this IP" -- one shared budget, not two independent
+# ones an attacker could exhaust separately.
 claim_begin_limiter = RateLimiter(10, 300)
 claim_status_limiter = RateLimiter(120, 60)
 claim_portal_limiter = RateLimiter(30, 60)
@@ -321,11 +326,88 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
         # redemption) in the same appliance_claims row rather than an
         # in-process cache -- durable persistence, as design rule #1 in
         # the state-machine doc requires, and safe across multiple
-        # cloud worker processes. claim/complete (added in the next
-        # commit) will null this column out the moment the proof is
-        # consumed; short TTL and the column's own narrow purpose bound
-        # its exposure the same way every other single-use hashed
-        # secret in this codebase is bounded.
+        # cloud worker processes. claim_complete() below nulls this
+        # column out the moment the proof is consumed; short TTL and
+        # the column's own narrow purpose bound its exposure the same
+        # way every other single-use hashed secret in this codebase is
+        # bounded.
         audit(identity, 'appliance_claim.confirmed', 'appliance_claim', claim['id'])
         logger.info('Claim confirmed claim_session_id=%s customer_id=%s site_id=%s', claim['claim_session_id'], identity['customer_id'], site_id)
         return {'status': 'claimed', 'device_id': claim['device_id']}
+
+    @app.post('/api/appliance/claim/complete')
+    def claim_complete(request: Request, payload: dict) -> dict:
+        client = _client_ip(request)
+        if not activation_limiter.allow(client):
+            raise HTTPException(status_code=429, detail='Claim completion rate exceeded.')
+        claim_session_id = str(payload.get('claim_session_id', '')).strip()
+        claim_proof = str(payload.get('claim_proof', '')).strip()
+        if not claim_session_id or not claim_proof:
+            raise HTTPException(status_code=400, detail='claim_session_id and claim_proof are required.')
+        claim = row('SELECT * FROM appliance_claims WHERE claim_session_id=?', (claim_session_id,))
+        if not claim or claim['status'] != 'claimed' or not claim.get('claim_proof_hash'):
+            raise HTTPException(status_code=403, detail='Claim is not ready to be completed.')
+        try:
+            proof_still_valid = datetime.fromisoformat(claim['proof_expires_at']) > _now()
+        except (KeyError, TypeError, ValueError):
+            proof_still_valid = False
+        if not proof_still_valid or not verify_password(claim_proof, claim['claim_proof_hash']):
+            raise HTTPException(status_code=403, detail='Claim proof is invalid or expired.')
+        now = _now()
+        with connection() as db:
+            # Consume the proof atomically -- exactly the same
+            # check-rowcount-before-mutating-further-state pattern
+            # appliance_cloud.activate_appliance() uses for its own
+            # single-use activation token. A second call with the same
+            # (now-consumed) proof gets rowcount==0 here and fails
+            # closed with 409, never a second appliances row or a
+            # second credential.
+            changed = db.execute(
+                "UPDATE appliance_claims SET status='completed',completed_at=?,claim_proof_plaintext=NULL WHERE id=? AND status='claimed'",
+                (now.isoformat(), claim['id']),
+            ).rowcount
+            if changed != 1:
+                raise HTTPException(status_code=409, detail='Claim proof was already used.')
+            appliance_id = secrets.token_hex(16)
+            cloud_id = claim['device_id'].upper()
+            db.execute(
+                'INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)',
+                (appliance_id, claim['customer_id'], claim['site_id'], cloud_id, now.isoformat()),
+            )
+            db.execute('UPDATE appliance_claims SET appliance_id=? WHERE id=?', (appliance_id, claim['id']))
+            credential = secrets.token_urlsafe(48)
+            credential_id = secrets.token_hex(8)
+            db.execute(
+                'INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)',
+                (credential_id, appliance_id, password_hash(credential), now.isoformat(), 'claim'),
+            )
+        appliance = row('SELECT * FROM appliances WHERE id=?', (appliance_id,))
+        # Same durable-persistence call activate_appliance() makes as
+        # its own last step -- see appliance_activation.py. Untouched,
+        # unmodified; this is the entire "one-time exchange into the
+        # existing enrollment/credential mechanism" the Phase 1 plan
+        # asked for.
+        from appliance_activation import ActivationConflict, persist_activation
+        try:
+            persist_activation(
+                appliance_id=appliance_id,
+                cloud_id=cloud_id,
+                credential=credential,
+                customer_id=appliance['customer_id'],
+                site_id=appliance['site_id'],
+                partner_id=appliance.get('partner_id'),
+            )
+        except ActivationConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        audit({'email': cloud_id, 'role': 'appliance'}, 'appliance_claim.completed', 'appliance', appliance_id)
+        logger.info('Claim completed appliance_id=%s cloud_id=%s', appliance_id, cloud_id)
+        return {
+            'appliance_id': appliance_id,
+            'cloud_id': cloud_id,
+            'credential': credential,
+            'credential_id': credential_id,
+            'partner_id': appliance.get('partner_id'),
+            'customer_id': appliance['customer_id'],
+            'site_id': appliance['site_id'],
+            'message': 'Store this permanent credential securely; it will not be shown again.',
+        }
