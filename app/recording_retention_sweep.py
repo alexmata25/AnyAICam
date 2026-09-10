@@ -75,7 +75,9 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
     customer, not expressible as a single static SQL WHERE clause --
     rather than a per-plan-tier UNION query."""
     candidates = []
-    for row in db.execute("SELECT id, customer_id, s3_key, started_at FROM recordings WHERE status='available'").fetchall():
+    rows = list(db.execute("SELECT id, customer_id, s3_key, started_at, 'recording' AS kind FROM recordings WHERE status='available'").fetchall())
+    rows += list(db.execute("SELECT id, customer_id, s3_key, started_at, 'event_media' AS kind FROM detection_event_media").fetchall())
+    for row in rows:
         retention_days = _customer_retention_days(db, row["customer_id"])
         if retention_days is None:
             continue
@@ -137,7 +139,8 @@ def run_retention_sweep_tick(now: datetime | None = None) -> dict:
         if not _delete_recording_object(candidate["s3_key"]):
             continue
         with connection() as db:
-            db.execute("DELETE FROM recordings WHERE id=?", (candidate["id"],))
+            table = "recordings" if candidate["kind"] == "recording" else "detection_event_media"
+            db.execute(f"DELETE FROM {table} WHERE id=?", (candidate["id"],))
         deleted += 1
         logger.info(
             "recording_retention.deleted recording_id=%s customer_id=%s",

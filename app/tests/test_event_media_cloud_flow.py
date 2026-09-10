@@ -37,7 +37,8 @@ def _seed(db):
     db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", ("site-1", "cust-1", "Site", now))
     db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)", ("appl-1", "cust-1", "site-1", "AIC-TEST", now))
     db.execute("INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at) VALUES(?,?,?,?)", ("cred-1", "appl-1", password_hash("credential"), now))
-    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,created_at) VALUES(?,?,?,?,?,?)", ("cam-1", "cust-1", "site-1", "appl-1", "Driveway", now))
+    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,cloud_recording_mode,created_at) VALUES(?,?,?,?,?,?,?)", ("cam-1", "cust-1", "site-1", "appl-1", "Driveway", "motion", now))
+    db.execute("INSERT INTO plans(id,customer_id,recording_mode,retention_days,created_at) VALUES(?,?,?,?,?)", ("plan-1", "cust-1", "motion", 7, now))
 
 
 @pytest.fixture()
@@ -110,6 +111,19 @@ def test_media_registration_rejects_an_unrelated_key_inside_the_camera_prefix(cl
         json=_media_payload(s3_key="recordings/cust-1/site-1/appl-1/cam-1/2026/08/21/archive/unrelated.mp4"),
     )
     assert response.status_code == 403
+
+
+def test_media_registration_enforces_six_hour_daily_allowance(client, monkeypatch):
+    test_client, database = client
+    monkeypatch.setattr(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True)
+    assert test_client.post("/api/appliance/analytics/cam-1/events", headers=_headers(), json=_event_payload()).status_code == 200
+    with override_target(sqlite_path=str(database)):
+        with connection() as db:
+            event_id = db.execute("SELECT id FROM detection_events WHERE local_event_id='evt-1'").fetchone()["id"]
+            db.execute("INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("old", event_id, "cust-1", "cam-1", "old", "2026-08-21T00:00:00", "2026-08-21T00:00:01", 21600, "2026-08-21T00:00:00"))
+    response = test_client.post("/api/appliance/analytics/cam-1/events/evt-1/media", headers=_headers(), json=_media_payload())
+    assert response.status_code == 403
+    assert "allowance" in response.json()["detail"]
 
 
 def test_local_path_rejects_traversal_before_any_upload(tmp_path, monkeypatch):
