@@ -21,7 +21,8 @@ import logging
 import os
 import subprocess
 import time
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import recording_uploader as recording_upload
@@ -43,6 +44,10 @@ RECORDINGS_ROOT = APP_ROOT / "recordings"
 # default posture as every sibling cloud-call flag, not a silent
 # continuation of the previous always-on behavior.
 EVENT_MEDIA_UPLOAD_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED", "false").strip().lower() == "true"
+RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
+RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
+RETRY_MAX_JOBS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_JOBS", "10")))
+event_media_retry_state = {"worker_status": "not_started", "last_summary": None, "last_error": None}
 
 
 def _local_path_from_recording_url(value: str | None) -> Path | None:
@@ -350,20 +355,45 @@ def upload_motion_event_media(
     return False
 
 
-def retry_pending_event_media(max_jobs: int = 10) -> dict:
+def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     """Retry durable jobs on the next local worker tick; never contacts a
     service unless the normal event-media feature gate is enabled."""
     attempted = completed = 0
-    for job in event_media_outbox.load()[:max(1, max_jobs)]:
+    for job in event_media_outbox.due()[:max(1, max_jobs)]:
         attempted += 1
         try:
-            if upload_motion_event_media(
+            succeeded = upload_motion_event_media(
                 event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
                 event_start=datetime.fromisoformat(str(job["event_start"])),
                 event_end=datetime.fromisoformat(str(job["event_end"])),
                 clip_url=str(job["clip_url"]), thumbnail_url=job.get("thumbnail_url"),
-            ):
+            )
+            if succeeded:
                 completed += 1
+            else:
+                attempts = int(job.get("attempts", 0)) + 1
+                delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
+                event_media_outbox.replace(str(job["event_id"]), {**job, "attempts": attempts, "last_error": "retry_failed", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
         except (KeyError, TypeError, ValueError):
-            logger.warning("event_media.outbox_invalid event_id=%r", job.get("event_id"))
+            # Keep malformed records inspectable, but defer them so one bad
+            # item cannot cause a tight loop or block later jobs.
+            attempts = int(job.get("attempts", 0)) + 1
+            delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
+            event_media_outbox.replace(str(job.get("event_id")), {**job, "attempts": attempts, "last_error": "invalid_job", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
     return {"attempted": attempted, "completed": completed, "pending": len(event_media_outbox.load())}
+
+
+async def event_media_retry_worker() -> None:
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        event_media_retry_state["worker_status"] = "disabled"
+        while True: await asyncio.sleep(3600)
+    event_media_retry_state["worker_status"] = "running"
+    while True:
+        try:
+            event_media_retry_state["last_summary"] = await asyncio.to_thread(retry_pending_event_media)
+            event_media_retry_state["last_error"] = None
+        except asyncio.CancelledError: raise
+        except Exception as error:
+            event_media_retry_state["last_error"] = type(error).__name__
+            logger.warning("event_media.retry_tick_failed error=%s", type(error).__name__)
+        await asyncio.sleep(RETRY_SECONDS)

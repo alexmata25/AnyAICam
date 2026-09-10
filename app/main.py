@@ -39247,6 +39247,7 @@ import live_relay_uploader
 import recording_uploader
 import recording_retention_sweep
 import analytics_sync
+import event_media_uploader
 import lpr
 import ppe
 import smart_motion
@@ -39592,6 +39593,11 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and analytics_sync.ANALYTICS_SYNC_ENABLED
         else None
     )
+    event_media_retry_task = (
+        asyncio.create_task(event_media_uploader.event_media_retry_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and event_media_uploader.EVENT_MEDIA_UPLOAD_ENABLED
+        else None
+    )
 
 
 
@@ -39753,6 +39759,8 @@ async def lifespan(app: FastAPI):
             recording_upload_task.cancel()
         if recording_retention_sweep_task:
             recording_retention_sweep_task.cancel()
+        if event_media_retry_task:
+            event_media_retry_task.cancel()
 
 
 
@@ -39851,6 +39859,8 @@ async def lifespan(app: FastAPI):
             pending.append(recording_upload_task)
         if recording_retention_sweep_task:
             pending.append(recording_retention_sweep_task)
+        if event_media_retry_task:
+            pending.append(event_media_retry_task)
 
 
 
