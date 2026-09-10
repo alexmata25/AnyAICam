@@ -6,6 +6,24 @@ record in `docs/blockers-before-universal-release.md`, written before
 this session, not re-discovered by it) found -- not a new redesign
 proposal, and nothing here has been changed.
 
+**Update, Phase 1 of the non-interactive activation system (see
+`docs/non-interactive-activation-phase1-plan.md` and
+`docs/non-interactive-activation-phase1-completion-report.md`):** the
+cloud-side half of the blocker below is now built and tested --
+`POST /api/appliance/claim/begin`, `POST /api/appliance/claim/status`,
+`POST /api/portal/claims/lookup`, `POST /api/portal/claims/confirm`,
+and `POST /api/appliance/claim/complete` let a device with no
+pre-created identity register itself, wait for an authenticated
+customer to confirm it against one of their own sites, and redeem a
+one-time proof for a permanent credential -- without an admin ever
+pre-creating an `appliances` row or minting a token. The terminal-
+session blocker described just below is **not** resolved by this:
+nothing yet calls these new endpoints from the appliance side except
+three new, unwired `PortalClient` methods, `anyaicam-setup` is
+unmodified, and no local web UI or companion app exists. Closing the
+actual customer-facing gap is still real product work; what Phase 1
+removes is the cloud-side excuse for not starting it.
+
 ## The single biggest blocker: activation requires a terminal session
 
 `anyaicam-setup` (`appliance-agent/anyaicam_agent/setup_wizard.py`) is
@@ -86,7 +104,10 @@ than assuming they're forgotten:
   exists** beyond what's described above for activation specifically --
   worth deciding, when the time comes, whether any *other* first-boot
   configuration (network, camera pre-discovery, branding) needs a
-  similar non-interactive path.
+  similar non-interactive path. Partially addressed for activation
+  itself by Phase 1 (see the update note at the top of this document):
+  a device no longer needs a pre-created identity row before it can be
+  claimed, but nothing on the device side calls the new claim flow yet.
 
 ## What is explicitly NOT a blocker, based on this session's findings
 
