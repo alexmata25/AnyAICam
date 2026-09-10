@@ -90,6 +90,18 @@ def process_marker(path: Path, dry_run: bool, grace_seconds: float = GRACE_SECON
         return None
     command_id = marker.get('command_id')
     action_type = marker.get('type')
+    # isinstance check BEFORE the DISPATCH.get() lookup below -- confirmed
+    # by test: an unhashable `type` (e.g. a list, dict, or set, whether
+    # malformed input or a deliberate attempt to crash the watcher) raised
+    # an unhandled TypeError out of dict.get() instead of being rejected
+    # the same safe way every other unknown type already is. A crashed
+    # oneshot service run can leave OTHER pending markers unprocessed
+    # until the next trigger and, depending on systemd's own failure
+    # handling, the unit sitting in a failed state -- exactly the "unsafe
+    # failure behavior" this design's docstring promises never happens.
+    if not isinstance(action_type, str):
+        log.warning('Ignoring marker %s with non-string type=%r', path, action_type)
+        return None
     if not command_id or not isinstance(command_id, str):
         log.warning('Ignoring marker %s with missing/invalid command_id', path)
         return None

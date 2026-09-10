@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_release_installer import INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
+from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
 
 
 class RunGitAutocrlfOverrideTests(unittest.TestCase):
@@ -176,6 +176,47 @@ class DockerfileCopySourcesAreAllReleasedTests(unittest.TestCase):
 
     def test_requirements_cpu_txt_is_required(self):
         self.assertIn("requirements-cpu.txt", REQUIRED_RELEASE_PATHS)
+
+
+class PrivilegedWatcherIsPackagedTests(unittest.TestCase):
+    """A fourth confirmed-live blocker, found while fixing restart_vms's
+    own dispatched command: appliance-agent/system/ (privileged_watcher.
+    py plus its two systemd units) is a completely different directory
+    from appliance-agent/systemd/ (only anyaicam-agent.service) -- the
+    similar name is exactly why this had never been noticed by
+    inspection. AGENT_RELEASE_PATHS only ever packaged the latter, so
+    restart_vms/reboot_appliance could never function on any real
+    installed appliance, independent of the dispatched command itself
+    being correct. See docs/phase1-edge-validation-report.md."""
+
+    def test_appliance_agent_system_directory_is_packaged(self):
+        self.assertIn("appliance-agent/system", AGENT_RELEASE_PATHS)
+
+    def test_appliance_agent_systemd_directory_is_still_separately_packaged(self):
+        # Regression guard against "fixing" this by renaming/merging the
+        # two directories instead of listing both -- anyaicam-agent.
+        # service (appliance-agent/systemd/) must keep shipping too.
+        self.assertIn("appliance-agent/systemd", AGENT_RELEASE_PATHS)
+
+    def test_the_packaged_directory_actually_contains_the_watcher_and_both_units(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        system_dir = repo_root / "appliance-agent" / "system"
+        self.assertTrue((system_dir / "privileged_watcher.py").is_file())
+        self.assertTrue((system_dir / "anyaicam-privileged-watcher.path").is_file())
+        self.assertTrue((system_dir / "anyaicam-privileged-watcher.service").is_file())
+
+    def test_service_unit_execstart_matches_where_the_installer_actually_puts_the_script(self):
+        """These two facts live in different files (the unit's ExecStart=
+        here, the installed path in scripts/lib-privileged-watcher.sh's
+        own default) with nothing enforcing they agree -- this test is
+        that enforcement, so a future edit to either one alone fails
+        here instead of shipping a unit that points at a path the
+        installer never actually populates."""
+        repo_root = Path(__file__).resolve().parents[2]
+        unit_text = (repo_root / "appliance-agent" / "system" / "anyaicam-privileged-watcher.service").read_text(encoding="utf-8")
+        lib_text = (repo_root / "appliance-agent" / "scripts" / "lib-privileged-watcher.sh").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/opt/anyaicam-agent/privileged/watcher.py", unit_text)
+        self.assertIn("/opt/anyaicam-agent/privileged", lib_text)
 
 
 if __name__ == "__main__":

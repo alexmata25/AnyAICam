@@ -268,6 +268,124 @@ class WatcherDispatchTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / 'reboot.json').exists())
             self.assertTrue((Path(tmp) / 'restart_vms.json').exists())
 
+    # ----------------------------------------------------- malformed/unsupported actions, exhaustively
+
+    def test_marker_that_is_a_json_array_not_an_object_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'weird.json'
+            path.write_text(json.dumps(['reboot', 'abc']))
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+            self.assertTrue(path.exists())
+
+    def test_marker_that_is_a_bare_json_string_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'weird.json'
+            path.write_text(json.dumps('reboot'))
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+
+    def test_type_field_that_is_not_a_string_is_ignored(self):
+        """type must exactly match a DISPATCH key (a string) -- a
+        non-string type (e.g. someone smuggling a list/dict, hoping for
+        a permissive membership check somewhere) can never match and is
+        rejected the same as any other unknown type."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_marker(tmp, {'type': ['restart_vms'], 'command_id': 'abc'})
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+
+    def test_type_that_looks_like_a_shell_command_is_still_just_an_unknown_type(self):
+        """A `type` value crafted to look like a shell command is not
+        special-cased or sanitized -- it's simply not a DISPATCH key, so
+        it's rejected the exact same way 'shutdown' already is above.
+        Nothing in this script ever interprets `type` as anything other
+        than a dict lookup key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_marker(tmp, {'type': 'restart_vms; rm -rf /', 'command_id': 'abc'})
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+
+    def test_command_id_that_is_not_a_string_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_marker(tmp, {'type': 'reboot', 'command_id': 12345})
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+
+    def test_empty_marker_object_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_marker(tmp, {})
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+
+    def test_nonexistent_marker_file_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'does-not-exist.json'
+            with patch.object(watcher.subprocess, 'run') as run:
+                result = watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_not_called()
+            self.assertIsNone(result)
+
+    # ----------------------------------------------------- no general-purpose root command execution
+
+    def test_no_dispatch_value_contains_a_shell_metacharacter_or_shell_invocation(self):
+        """Every DISPATCH argv is a fixed list of plain executable/
+        argument tokens -- proves this stays true even as new actions
+        are added: no semicolons, pipes, redirects, subshells,
+        backticks, or an explicit shell (sh/bash/-c) anywhere in any
+        argv. This is what makes the whole design "no general-purpose
+        root command execution" rather than "no general-purpose root
+        command execution today" -- a future DISPATCH entry that broke
+        this would fail here, not just get discovered live."""
+        forbidden = (';', '|', '&', '>', '<', '`', '$(', 'sh', 'bash', '-c')
+        for action_type, argv in watcher.DISPATCH.items():
+            for token in argv:
+                for marker in forbidden:
+                    self.assertNotIn(
+                        marker, token,
+                        f"DISPATCH[{action_type!r}] argv token {token!r} contains {marker!r} -- "
+                        "this design's entire safety property is that argv is always a fixed, "
+                        "literal command with no shell involved.",
+                    )
+
+    def test_subprocess_run_is_never_invoked_with_shell_true(self):
+        """A static guard against the one-line regression that would
+        undo this script's entire no-shell guarantee: reads
+        process_marker()'s own source and asserts `shell=True` never
+        appears in it. Cheap, exact, and fails at review/CI time rather
+        than only being discoverable by an actual injection attempt."""
+        import inspect
+        source = inspect.getsource(watcher.process_marker)
+        self.assertNotIn('shell=True', source)
+        self.assertNotIn('shell = True', source)
+
+    def test_marker_cannot_supply_its_own_argv_even_when_shaped_like_the_real_dispatch(self):
+        """Belt-and-suspenders on top of test_marker_extra_fields_never_
+        reach_subprocess: an `argv` field shaped exactly like a real
+        DISPATCH value, but pointing at a different (attacker-chosen)
+        command, must still never be read -- only DISPATCH[type] is ever
+        used, never anything from the marker itself."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_marker(tmp, {
+                'type': 'reboot', 'command_id': 'abc',
+                'argv': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
+            })
+            with patch.object(watcher.subprocess, 'run') as run:
+                watcher.process_marker(path, dry_run=False, grace_seconds=0, sleep=lambda s: None)
+            run.assert_called_once_with(['systemctl', 'reboot'], check=False)
+
 
 if __name__ == '__main__':
     unittest.main()

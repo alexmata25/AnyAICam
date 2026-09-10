@@ -11,3 +11,26 @@ Description=AnyAiCam privileged action watcher (reboot/VMS restart)
 [Service]
 Type=oneshot
 ExecStart=/opt/anyaicam-agent/privileged/watcher.py
+
+# Least-privilege hardening. This unit still runs as root (unavoidable --
+# it execs `systemctl reboot` and `docker compose ... up -d`, and those
+# are its ENTIRE reason to exist), so this is deliberately the safe
+# subset that narrows what root-in-this-unit can touch without risking
+# breaking Docker-socket or systemd-dbus access -- ProtectSystem=strict
+# was considered and rejected: it would make the whole filesystem
+# read-only except explicit ReadWritePaths, which could plausibly break
+# `docker`'s own runtime files or `systemctl`'s dbus socket in ways this
+# repo has no live target to verify against right now. Nothing below
+# restricts filesystem writes or process creation -- only kernel/
+# hostname/clock tunables and privilege-escalation-via-setuid, none of
+# which either exec'd command needs.
+NoNewPrivileges=true
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true

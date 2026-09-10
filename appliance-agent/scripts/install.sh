@@ -2,6 +2,8 @@
 set -euo pipefail
 if [[ $EUID -ne 0 ]]; then echo "Run with sudo." >&2; exit 1; fi
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib-privileged-watcher.sh
+source "$SOURCE_DIR/scripts/lib-privileged-watcher.sh"
 chmod 0755 "$SOURCE_DIR"/scripts/*.sh
 id -u anyaicam >/dev/null 2>&1 || useradd --system --home /var/lib/anyaicam --shell /usr/sbin/nologin anyaicam
 install -d -m 0750 -o anyaicam -g anyaicam /opt/anyaicam-agent /etc/anyaicam /var/lib/anyaicam /var/lib/anyaicam/recordings /var/log/anyaicam
@@ -27,4 +29,5 @@ systemctl enable anyaicam-agent.service
 # above) -- exactly the same pattern installer/08-systemd-setup.sh already
 # uses for anyaicam-vms.service.
 systemctl restart anyaicam-agent.service
+install_privileged_watcher "$SOURCE_DIR"
 echo "Installed and running. Run: sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup"

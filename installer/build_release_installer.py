@@ -33,6 +33,21 @@ REQUIRED_RELEASE_PATHS = (
     "docker-compose.yml",
 )
 OPTIONAL_RELEASE_PATHS = ("migrations", "static", "templates", "systemd")
+# appliance-agent/system: the RDM4 privileged watcher (privileged_watcher.py
+# plus its two systemd units) -- confirmed live to be missing from every
+# release built before this: the watcher was never shipped at all, so
+# restart_vms/reboot_appliance could never function on a real installed
+# appliance regardless of anything else being correct. appliance-agent/
+# systemd (singular concern: anyaicam-agent.service) is a different,
+# already-packaged directory -- the similar name is exactly why this was
+# never noticed by inspection alone.
+AGENT_RELEASE_PATHS = (
+    "appliance-agent/pyproject.toml",
+    "appliance-agent/anyaicam_agent",
+    "appliance-agent/scripts",
+    "appliance-agent/systemd",
+    "appliance-agent/system",
+)
 INSTALLER_RUNTIME_FILES = (
     "install.sh",
     "01-preflight.sh",
@@ -343,13 +358,7 @@ def main() -> int:
         shutil.copytree(exported_installer / "runtime", package / "runtime", copy_function=shutil.copy2)
 
         agent_export = temp / "agent-export"
-        agent_paths = (
-            "appliance-agent/pyproject.toml",
-            "appliance-agent/anyaicam_agent",
-            "appliance-agent/scripts",
-            "appliance-agent/systemd",
-        )
-        git_export_paths(repo_root, installer_commit, agent_paths, agent_export)
+        git_export_paths(repo_root, installer_commit, AGENT_RELEASE_PATHS, agent_export)
         shutil.copytree(agent_export / "appliance-agent", package / "payload/agent", copy_function=shutil.copy2)
 
         copy_release(release_root, package / "payload/vms")
