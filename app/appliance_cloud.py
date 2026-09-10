@@ -18,6 +18,7 @@ from partner_db import audit, connection, password_hash, row, rows, verify_passw
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, recording_s3_prefix, recording_session_name, recording_session_policy
+from event_media_policy import allows_event_media
 
 try:
     import boto3
@@ -542,6 +543,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
 
         camera=_authorized_camera(appliance,camera_id)
+        if camera.get('cloud_recording_mode') != 'motion':
+            raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
         safe=sanitize_appliance_payload(payload)
 
         local_event_id=str(local_event_id or '').strip()
@@ -603,6 +606,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 raise HTTPException(status_code=403,detail="s3_key is not this event's authorized clip key.")
             if thumbnail_s3_key and thumbnail_s3_key != expected_thumbnail_key:
                 raise HTTPException(status_code=403,detail="thumbnail_s3_key is not this event's authorized thumbnail key.")
+            try:
+                event_at=datetime.fromisoformat(str(event_timestamp).replace('Z','+00:00')).replace(tzinfo=None)
+                duration=float(duration_seconds)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400,detail='duration_seconds is required.')
+            allowed, reason=allows_event_media(db,camera['customer_id'],camera_id,event_at,duration)
+            if not allowed: raise HTTPException(status_code=403,detail=reason)
 
             existing=db.execute(
                 'SELECT id FROM detection_event_media WHERE detection_event_id=?',

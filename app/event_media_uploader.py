@@ -26,6 +26,7 @@ from pathlib import Path
 
 import recording_uploader as recording_upload
 from event_clips import compute_clip_window
+import event_media_outbox
 
 logger = logging.getLogger("anyaicam.event_media_uploader")
 
@@ -211,6 +212,12 @@ def upload_motion_event_media(
         return False
 
     camera_id = identity["camera_id"]
+    # Persist the original local references before the first cloud attempt.
+    # Repeating the deterministic S3 puts is safe, and lets a later worker
+    # resume after a crash or a failed upload/registration attempt.
+    event_media_outbox.put({"event_id": event_id, "camera_number": camera_number,
+                            "event_start": event_start.isoformat(), "event_end": event_end.isoformat(),
+                            "clip_url": clip_url, "thumbnail_url": thumbnail_url})
     session = recording_upload._ensure_session(camera_number, camera_id)
 
     if not session:
@@ -326,6 +333,7 @@ def upload_motion_event_media(
                 clip_key,
                 thumbnail_key,
             )
+            event_media_outbox.remove(event_id)
             return True
 
         if attempt < 12:
@@ -340,3 +348,22 @@ def upload_motion_event_media(
     )
 
     return False
+
+
+def retry_pending_event_media(max_jobs: int = 10) -> dict:
+    """Retry durable jobs on the next local worker tick; never contacts a
+    service unless the normal event-media feature gate is enabled."""
+    attempted = completed = 0
+    for job in event_media_outbox.load()[:max(1, max_jobs)]:
+        attempted += 1
+        try:
+            if upload_motion_event_media(
+                event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
+                event_start=datetime.fromisoformat(str(job["event_start"])),
+                event_end=datetime.fromisoformat(str(job["event_end"])),
+                clip_url=str(job["clip_url"]), thumbnail_url=job.get("thumbnail_url"),
+            ):
+                completed += 1
+        except (KeyError, TypeError, ValueError):
+            logger.warning("event_media.outbox_invalid event_id=%r", job.get("event_id"))
+    return {"attempted": attempted, "completed": completed, "pending": len(event_media_outbox.load())}
