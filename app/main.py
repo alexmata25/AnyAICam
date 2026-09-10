@@ -15335,7 +15335,16 @@ def readiness_snapshot() -> dict:
 
 
 
-    statuses = camera_status().get("cameras", [])
+    # _legacy_camera_status(), not camera_status(): none of this file's
+    # three request-less callers (readiness_snapshot(), health_monitor(),
+    # site_monitoring_summary()) have an HTTP request/customer-session to
+    # scope by -- that's what camera_status(request)'s customer-portal
+    # branch needs. Calling camera_status() with no arguments at all is
+    # what crashed GET /ready with a 500 (TypeError: missing required
+    # argument 'request') -- confirmed live on a fresh install. The
+    # legacy, appliance-wide camera listing is exactly what a system-
+    # level status check wants regardless of who (if anyone) is logged in.
+    statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -38819,7 +38828,16 @@ async def health_monitor() -> None:
 
 
 
-        statuses = camera_status().get("cameras", [])
+        # _legacy_camera_status(), not camera_status(): none of this file's
+        # three request-less callers (readiness_snapshot(), health_monitor(),
+        # site_monitoring_summary()) have an HTTP request/customer-session to
+        # scope by -- that's what camera_status(request)'s customer-portal
+        # branch needs. Calling camera_status() with no arguments at all is
+        # what crashed GET /ready with a 500 (TypeError: missing required
+        # argument 'request') -- confirmed live on a fresh install. The
+        # legacy, appliance-wide camera listing is exactly what a system-
+        # level status check wants regardless of who (if anyone) is logged in.
+        statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -127492,7 +127510,16 @@ def site_monitoring_summary() -> dict:
 
 
 
-    statuses = camera_status().get("cameras", [])
+    # _legacy_camera_status(), not camera_status(): none of this file's
+    # three request-less callers (readiness_snapshot(), health_monitor(),
+    # site_monitoring_summary()) have an HTTP request/customer-session to
+    # scope by -- that's what camera_status(request)'s customer-portal
+    # branch needs. Calling camera_status() with no arguments at all is
+    # what crashed GET /ready with a 500 (TypeError: missing required
+    # argument 'request') -- confirmed live on a fresh install. The
+    # legacy, appliance-wide camera listing is exactly what a system-
+    # level status check wants regardless of who (if anyone) is logged in.
+    statuses = _legacy_camera_status().get("cameras", [])
 
 
 
