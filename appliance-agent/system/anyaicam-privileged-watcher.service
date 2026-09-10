@@ -7,6 +7,27 @@ Description=AnyAiCam privileged action watcher (reboot/VMS restart)
 # whole RDM4 remote-management design with real privilege, which is
 # exactly why its own input is reduced to "does a known marker type
 # exist" and nothing else -- see privileged_watcher.py's own docstring.
+#
+# StartLimitIntervalSec=0 (disables systemd's default start-rate-limit
+# for this unit entirely): confirmed live -- privileged_watcher.py's
+# process_marker() deliberately leaves an unknown/malformed marker IN
+# PLACE (never deletes it, so an operator can inspect it), which means
+# the .path unit refires on every later transition of the directory
+# from empty to non-empty while that leftover file is still present.
+# Five such refires within systemd's default 10s/5-start window put
+# this unit into `failed (Result: start-limit-hit)` -- and a FAILED
+# oneshot unit is never retriggered by its .path unit again until an
+# operator runs `systemctl reset-failed`, silently disabling
+# restart_vms/reboot_appliance entirely, for a real request queued
+# after the block, with no crash and no bad exit code to point at (each
+# individual run still exited 0/SUCCESS). This is exactly the "unsafe
+# failure behavior" this design must never have -- a handful of
+# leftover unknown markers must never be able to disable the mechanism
+# for a legitimate later request. Each individual invocation is already
+# fast, idempotent, and side-effect-free for any marker it doesn't
+# recognize, so unlimited restarts of this specific oneshot unit carry
+# none of the risk systemd's default limit exists to guard against.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

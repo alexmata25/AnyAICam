@@ -218,6 +218,31 @@ class PrivilegedWatcherIsPackagedTests(unittest.TestCase):
         self.assertIn("ExecStart=/opt/anyaicam-agent/privileged/watcher.py", unit_text)
         self.assertIn("/opt/anyaicam-agent/privileged", lib_text)
 
+    def test_both_units_disable_the_systemd_start_rate_limit(self):
+        """Confirmed live on a real disposable EC2 instance: leaving a
+        handful of unknown/malformed markers in the pending_actions
+        directory (privileged_watcher.py deliberately never deletes
+        them, so an operator can inspect what was rejected) caused
+        BOTH anyaicam-privileged-watcher.path and its .service to hit
+        systemd's default start-rate-limit and go `failed` after only a
+        few closely-spaced triggers -- and a FAILED unit is never
+        retriggered again until an operator runs `systemctl reset-
+        failed`, silently disabling restart_vms/reboot_appliance for
+        any real request queued after the block, with no crash and no
+        bad exit code to point at. Both units must set
+        StartLimitIntervalSec=0 (this test cannot exercise real systemd
+        rate-limiting itself -- no real systemd is available in this
+        test environment -- so it locks in the config line the live
+        finding actually required)."""
+        repo_root = Path(__file__).resolve().parents[2]
+        for unit_name in ("anyaicam-privileged-watcher.path", "anyaicam-privileged-watcher.service"):
+            unit_text = (repo_root / "appliance-agent" / "system" / unit_name).read_text(encoding="utf-8")
+            self.assertIn(
+                "StartLimitIntervalSec=0", unit_text,
+                f"{unit_name} must disable systemd's start-rate-limit, or a burst of "
+                "unknown/malformed markers can permanently block real requests.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
