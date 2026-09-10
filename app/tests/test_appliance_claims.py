@@ -120,7 +120,19 @@ def identity_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def client(db_path, identity_file):
+def claim_flow_key(monkeypatch):
+    # Security-hardening checkpoint: portal_claim_confirm() now fails
+    # closed (503) unless ANYAICAM_CLAIM_FLOW_SECRET_KEY is configured
+    # -- see appliance_protocol.claim_flow_secret_key()'s own
+    # docstring. A fresh, random Fernet key per test, matching
+    # test_appliance_updates_latest.py's own signing_key_pair fixture
+    # pattern for the equivalent update-signing-key requirement.
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv("ANYAICAM_CLAIM_FLOW_SECRET_KEY", Fernet.generate_key().decode())
+
+
+@pytest.fixture()
+def client(db_path, identity_file, claim_flow_key):
     # Shared module-level RateLimiter singletons, never reset by
     # database/target isolation -- see test_appliance_activation_
     # endpoint.py's matching fixture comment.
@@ -302,6 +314,109 @@ def test_status_returns_proof_repeatedly_once_claimed(client, db_path):
 
     assert first["status"] == "claimed" and first["claim_proof"]
     assert second["claim_proof"] == first["claim_proof"]
+
+
+# --------------------------------------------------------- security-hardening
+# checkpoint: claim_proof is encrypted at rest, not stored raw, and an
+# abandoned (claimed-but-never-completed) claim is swept to a terminal
+# state that clears the recoverable material -- regression coverage for
+# both halves of hardening item 2.
+
+
+def test_claim_proof_is_never_stored_raw_in_the_database(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+    confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+    assert confirm.status_code == 200
+    proof = _status(client, session["claim_session_id"]).json()["claim_proof"]
+
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            stored = db.execute(
+                "SELECT claim_proof_encrypted, claim_proof_plaintext FROM appliance_claims WHERE claim_session_id=?",
+                (session["claim_session_id"],),
+            ).fetchone()
+
+    assert stored["claim_proof_plaintext"] is None, "the retired plaintext column must never be written by new code"
+    assert stored["claim_proof_encrypted"] is not None
+    assert proof not in stored["claim_proof_encrypted"], "the raw proof value must not appear inside its own encrypted form"
+
+
+def test_confirm_fails_closed_when_claim_flow_key_is_unset(client, db_path, monkeypatch):
+    monkeypatch.delenv("ANYAICAM_CLAIM_FLOW_SECRET_KEY", raising=False)
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+
+    response = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+
+    assert response.status_code == 503
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            status = db.execute(
+                "SELECT status FROM appliance_claims WHERE claim_session_id=?", (session["claim_session_id"],)
+            ).fetchone()["status"]
+    assert status == "pending", "a failed-closed confirm must never leave the claim half-claimed"
+
+
+def test_abandoned_claimed_row_expires_and_clears_recoverable_proof(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+    confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+    assert confirm.status_code == 200
+    # Simulate the device never coming back to redeem the proof, past
+    # its TTL -- the exact scenario the security audit found lingered
+    # forever in the original Phase 1 implementation.
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute(
+                "UPDATE appliance_claims SET proof_expires_at=? WHERE claim_session_id=?",
+                ("2020-01-01T00:00:00", session["claim_session_id"]),
+            )
+
+    status_response = _status(client, session["claim_session_id"]).json()
+
+    assert status_response == {"status": "expired"}
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            row_after = db.execute(
+                "SELECT status, claim_proof_encrypted, claim_proof_plaintext, claim_proof_hash FROM appliance_claims WHERE claim_session_id=?",
+                (session["claim_session_id"],),
+            ).fetchone()
+    assert row_after["status"] == "expired"
+    assert row_after["claim_proof_encrypted"] is None
+    assert row_after["claim_proof_plaintext"] is None
+    # claim_proof_hash is deliberately left alone -- one-way, needed
+    # for audit trail, matching appliance_activation_tokens's own
+    # forever-retention of used/expired token hashes.
+    assert row_after["claim_proof_hash"] is not None
+
+
+def test_expired_claimed_row_can_no_longer_be_completed(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+    confirm = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+    assert confirm.status_code == 200
+    proof = _status(client, session["claim_session_id"]).json()["claim_proof"]
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute(
+                "UPDATE appliance_claims SET proof_expires_at=? WHERE claim_session_id=?",
+                ("2020-01-01T00:00:00", session["claim_session_id"]),
+            )
+    # Touch claim/status once so the lazy-expiry sweep actually runs
+    # (matches how a device would naturally discover this).
+    _status(client, session["claim_session_id"])
+
+    response = client.post(
+        "/api/appliance/claim/complete",
+        json={"claim_session_id": session["claim_session_id"], "claim_proof": proof},
+    )
+
+    assert response.status_code == 403
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (VALID_DEVICE_ID.upper(),)).fetchone()["n"]
+    assert count == 0
 
 
 # --------------------------------------------------------- portal lookup/confirm

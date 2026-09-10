@@ -89,7 +89,7 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request
 
 from appliance_cloud import activation_limiter
-from appliance_protocol import RateLimiter
+from appliance_protocol import RateLimiter, decrypt_claim_flow_secret, encrypt_claim_flow_secret
 from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
 from partner_portal import partner_identity
 
@@ -214,22 +214,59 @@ def _find_claim_by_code(claim_code: str) -> dict | None:
     return None
 
 
-def _expire_if_due(claim: dict) -> dict:
-    """Lazy expiry: flips a pending row to expired on the next read
-    that touches it, rather than running a separate sweep job (see
-    Phase 1 plan §8). Never mutates a non-pending row."""
-    if claim['status'] != 'pending':
-        return claim
+def _still_valid(timestamp: str | None) -> bool:
+    if not timestamp:
+        return False
     try:
-        still_valid = datetime.fromisoformat(claim['expires_at']) > _now()
-    except ValueError:
-        still_valid = False
-    if still_valid:
+        return datetime.fromisoformat(timestamp) > _now()
+    except (TypeError, ValueError):
+        return False
+
+
+def _expire_if_due(claim: dict) -> dict:
+    """Lazy expiry: flips a stale row to 'expired' on the next read
+    that touches it, rather than running a separate sweep job (see
+    Phase 1 plan §8). Never mutates a row already in a terminal state
+    (completed/expired/revoked).
+
+    Handles two distinct expiries, security-hardening checkpoint
+    addition for the second one:
+      - 'pending' past expires_at -- the original Phase 1 behavior:
+        nothing sensitive to clear here (claim_code_hash is a hash,
+        not a recoverable secret).
+      - 'claimed' past proof_expires_at -- an abandoned claim whose
+        confirmed-but-never-redeemed proof would otherwise sit
+        encrypted-but-live in the database indefinitely. Transitioning
+        it to 'expired' AND nulling claim_proof_encrypted here is what
+        actually bounds that secret's at-rest lifetime; leaving the
+        row at 'claimed' forever (the original Phase 1 behavior) meant
+        the API correctly stopped *serving* the proof once its TTL
+        passed, but the database still held a live, recoverable copy
+        of it forever. claim_proof_hash is left alone even here (it is
+        one-way and needed for audit-trail purposes, matching
+        appliance_activation_tokens's own forever-retention of used/
+        expired token hashes)."""
+    if claim['status'] == 'pending':
+        if _still_valid(claim['expires_at']):
+            return claim
+        with connection() as db:
+            db.execute("UPDATE appliance_claims SET status='expired' WHERE id=? AND status='pending'", (claim['id'],))
+        claim = dict(claim)
+        claim['status'] = 'expired'
         return claim
-    with connection() as db:
-        db.execute("UPDATE appliance_claims SET status='expired' WHERE id=? AND status='pending'", (claim['id'],))
-    claim = dict(claim)
-    claim['status'] = 'expired'
+    if claim['status'] == 'claimed':
+        if _still_valid(claim.get('proof_expires_at')):
+            return claim
+        with connection() as db:
+            db.execute(
+                "UPDATE appliance_claims SET status='expired',claim_proof_encrypted=NULL,claim_proof_plaintext=NULL WHERE id=? AND status='claimed'",
+                (claim['id'],),
+            )
+        claim = dict(claim)
+        claim['status'] = 'expired'
+        claim['claim_proof_encrypted'] = None
+        claim['claim_proof_plaintext'] = None
+        return claim
     return claim
 
 
@@ -290,18 +327,19 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
             return {'status': 'expired'}
         claim = _expire_if_due(claim)
         response = {'status': claim['status']}
-        if claim['status'] == 'claimed' and claim.get('claim_proof_plaintext'):
-            try:
-                proof_still_valid = datetime.fromisoformat(claim['proof_expires_at']) > _now()
-            except (KeyError, TypeError, ValueError):
-                proof_still_valid = False
-            if proof_still_valid:
-                # Returned on every poll while still valid, never
-                # marked "issued" at read time -- consumption happens
-                # only at claim/complete (added in a later commit),
-                # which is what the "idempotent retry" requirement
-                # actually depends on.
-                response['claim_proof'] = claim['claim_proof_plaintext']
+        if claim['status'] == 'claimed' and claim.get('claim_proof_encrypted') and _still_valid(claim.get('proof_expires_at')):
+            # Returned on every poll while still valid, never marked
+            # "issued" at read time -- consumption happens only at
+            # claim/complete, which is what the "idempotent retry"
+            # requirement actually depends on. Decrypted from
+            # claim_proof_encrypted (security-hardening checkpoint --
+            # the original Phase 1 implementation stored this raw in
+            # claim_proof_plaintext; see appliance_protocol.
+            # decrypt_claim_flow_secret()'s own docstring for why this
+            # column is now encrypted instead).
+            decrypted = decrypt_claim_flow_secret(claim['claim_proof_encrypted'])
+            if decrypted:
+                response['claim_proof'] = decrypted
         return response
 
     # claim_code is a bearer-equivalent secret (see this module's
@@ -351,12 +389,22 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
         if not site:
             raise HTTPException(status_code=403, detail='That site does not belong to your account.')
         claim_proof = secrets.token_urlsafe(32)
+        # Security-hardening checkpoint: encrypt the proof before it
+        # ever touches the database, rather than storing it raw in
+        # claim_proof_plaintext (the original Phase 1 column, still
+        # present in the schema but never written by this code again).
+        # Fails closed -- if ANYAICAM_CLAIM_FLOW_SECRET_KEY isn't
+        # configured, this refuses to confirm the claim at all rather
+        # than silently falling back to plaintext storage.
+        encrypted_proof = encrypt_claim_flow_secret(claim_proof)
+        if not encrypted_proof:
+            raise HTTPException(status_code=503, detail='Claim confirmation is temporarily unavailable.')
         now = _now()
         proof_expires_at = (now + timedelta(minutes=CLAIM_PROOF_TTL_MINUTES)).isoformat()
         with connection() as db:
             changed = db.execute(
-                "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_plaintext=?,proof_expires_at=? WHERE id=? AND status='pending'",
-                (identity['customer_id'], site_id, identity.get('email'), now.isoformat(), password_hash(claim_proof), claim_proof, proof_expires_at, claim['id']),
+                "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_encrypted=?,proof_expires_at=? WHERE id=? AND status='pending'",
+                (identity['customer_id'], site_id, identity.get('email'), now.isoformat(), password_hash(claim_proof), encrypted_proof, proof_expires_at, claim['id']),
             ).rowcount
         if changed != 1:
             raise HTTPException(status_code=409, detail='Claim is no longer pending (already claimed or expired).')
@@ -364,14 +412,18 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
         # ever delivered to the device via claim/status, so a
         # browser-side leak (XSS, shared screen, browser history)
         # cannot hand out a redeemable credential. It IS held briefly
-        # (claim_proof_plaintext, alongside the hash used to verify
+        # (claim_proof_encrypted, alongside the hash used to verify
         # redemption) in the same appliance_claims row rather than an
         # in-process cache -- durable persistence, as design rule #1 in
         # the state-machine doc requires, and safe across multiple
         # cloud worker processes. claim_complete() below nulls this
-        # column out the moment the proof is consumed; short TTL and
-        # the column's own narrow purpose bound its exposure the same
-        # way every other single-use hashed secret in this codebase is
+        # column out the moment the proof is consumed; _expire_if_due()
+        # nulls it too if the claim is instead abandoned past its TTL
+        # (security-hardening checkpoint -- the original Phase 1
+        # implementation left an abandoned claim's plaintext proof
+        # sitting in the database indefinitely). Short TTL and the
+        # column's own narrow purpose bound its exposure the same way
+        # every other single-use hashed secret in this codebase is
         # bounded.
         audit(identity, 'appliance_claim.confirmed', 'appliance_claim', claim['id'])
         logger.info('Claim confirmed claim_session_id=%s customer_id=%s site_id=%s', claim['claim_session_id'], identity['customer_id'], site_id)
@@ -405,7 +457,7 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
             # closed with 409, never a second appliances row or a
             # second credential.
             changed = db.execute(
-                "UPDATE appliance_claims SET status='completed',completed_at=?,claim_proof_plaintext=NULL WHERE id=? AND status='claimed'",
+                "UPDATE appliance_claims SET status='completed',completed_at=?,claim_proof_encrypted=NULL WHERE id=? AND status='claimed'",
                 (now.isoformat(), claim['id']),
             ).rowcount
             if changed != 1:
