@@ -76,6 +76,8 @@ reset_fixture() {
     DF_TOTAL_GB=999999
     SYSTEMCTL_CALL_LOG="$FIXTURE_ROOT/.systemctl-calls"
     rm -f "$SYSTEMCTL_CALL_LOG"
+    USERDEL_CALL_LOG="$FIXTURE_ROOT/.userdel-calls"
+    rm -f "$USERDEL_CALL_LOG"
 }
 
 # A minimal fake built appliance-agent release payload for
@@ -177,6 +179,14 @@ apt-get() {
         return 0
     fi
     command apt-get "$@"
+}
+userdel() {
+    # run_uninstall()'s --purge-all branch only needs this to not fail;
+    # no real user should be touched by this harness. Logged so a test
+    # can assert it was actually called, without needing a real system
+    # user to exist.
+    [[ -n "${USERDEL_CALL_LOG:-}" ]] && printf '%s\n' "$*" >>"$USERDEL_CALL_LOG"
+    return 0
 }
 df() {
     # Only the two exact invocations storage_preflight() makes are
@@ -648,6 +658,27 @@ assert_eq "VMS recordings content is byte-identical after default uninstall" "$R
 assert_exit "VMS data-config directory still exists after default uninstall" 0 test -d "$VMS_DATA_CONFIG_DIR"
 assert_exit "appliance identity file still exists after default uninstall" 0 test -f "$IDENTITY_FILE"
 assert_eq "appliance identity is byte-identical after default uninstall" "$IDENTITY_HASH_BEFORE" "$(sha256sum "$IDENTITY_FILE" 2>/dev/null | cut -d' ' -f1)"
+
+echo
+echo "== run_uninstall() --purge-all =="
+
+# 26. Concrete defect found while reviewing the full fresh-install/
+#     uninstall/reinstall workflow ahead of Samsung deployment:
+#     --purge-all removed every persistent directory but never the
+#     anyaicam system user -- confirmed live that `id -u anyaicam`
+#     still succeeds afterward, so detect_install_state() never reports
+#     0/5 ("clean") again post-purge, and the very next install run
+#     goes through the existing/repair path (a much looser storage-
+#     preflight floor) instead of the strict 100GB clean-install check
+#     that path is meant to enforce -- even though every other trace of
+#     the appliance is genuinely gone. A true "start over from scratch"
+#     reinstall needs the system user gone too, not just its data.
+reset_fixture
+make_fake_agent_payload
+mkdir -p "$CONFIG_DIR" "$VMS_RECORDINGS_DIR"
+assert_exit "run_uninstall --purge-all succeeds" 0 run_uninstall --purge-all
+assert_eq "userdel anyaicam was called" "1" "$(grep -c '^anyaicam$' "$USERDEL_CALL_LOG" 2>/dev/null)"
+assert_exit "CONFIG_DIR is removed by purge" 1 test -d "$CONFIG_DIR"
 
 echo
 echo "== disable_system_suspend() =="

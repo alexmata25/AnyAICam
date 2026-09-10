@@ -204,5 +204,47 @@ assert_eq "an already-queued pending action marker is untouched by a repair run"
 assert_exit "watcher script still present after repair" 0 test -f "$OPT_ROOT/privileged/watcher.py"
 
 echo
+echo "== uninstall_privileged_watcher(): leaves no stale unit or software behind =="
+
+# 6. Concrete defect found while reviewing the uninstall/reinstall
+#    workflow ahead of Samsung deployment: appliance-agent/scripts/
+#    uninstall.sh already did `rm -rf /opt/anyaicam-agent` (removing
+#    this watcher's own script) but nothing disabled or removed its two
+#    systemd units -- a default uninstall left the .path unit enabled
+#    and watching a directory with no watcher script left to run.
+reset_fixture
+make_fake_watcher_payload
+install_privileged_watcher "$SOURCE_PAYLOAD_DIR" >/dev/null 2>&1
+: >"$SYSTEMCTL_CALL_LOG"  # clear install-time calls so uninstall's own are isolated below
+assert_exit "uninstall_privileged_watcher succeeds" 0 uninstall_privileged_watcher
+assert_eq "the .path unit is disabled --now" "1" "$(grep -c '^disable --now anyaicam-privileged-watcher.path$' "$SYSTEMCTL_CALL_LOG")"
+assert_exit "watcher script is removed" 1 test -f "$OPT_ROOT/privileged/watcher.py"
+assert_exit "watcher directory is removed" 1 test -d "$OPT_ROOT/privileged"
+assert_exit ".path unit file is removed" 1 test -f "$SYSTEMD_DIR/anyaicam-privileged-watcher.path"
+assert_exit ".service unit file is removed" 1 test -f "$SYSTEMD_DIR/anyaicam-privileged-watcher.service"
+assert_eq "daemon-reload was called after removal" "1" "$(grep -c '^daemon-reload$' "$SYSTEMCTL_CALL_LOG")"
+
+# 7. Uninstall never touches recordings or a queued pending action --
+#    those belong to /var/lib/anyaicam, a completely different tree
+#    this function has no path variable pointing at, but the properties
+#    checked in Phase 1's own default-uninstall coverage
+#    (installer/tests/run_tests.sh) are worth re-confirming here since
+#    this is the function that changed.
+reset_fixture
+make_fake_watcher_payload
+install_privileged_watcher "$SOURCE_PAYLOAD_DIR" >/dev/null 2>&1
+RECORDINGS_DIR="$FIXTURE_ROOT/var/lib/anyaicam/vms/recordings"
+mkdir -p "$RECORDINGS_DIR"
+echo "real-recording-data" > "$RECORDINGS_DIR/clip1.mp4"
+uninstall_privileged_watcher >/dev/null 2>&1
+assert_eq "recordings are untouched by uninstall" "real-recording-data" "$(cat "$RECORDINGS_DIR/clip1.mp4" 2>/dev/null)"
+
+# 8. Uninstalling when nothing was ever installed is a safe no-op
+#    (matches run_uninstall()'s own `|| true` / 2>/dev/null tolerance
+#    for a component that may never have been present).
+reset_fixture
+assert_exit "uninstalling a never-installed watcher does not error" 0 uninstall_privileged_watcher
+
+echo
 echo "== summary: $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

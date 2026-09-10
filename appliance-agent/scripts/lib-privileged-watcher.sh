@@ -72,3 +72,29 @@ install_privileged_watcher() {
     # disturb anyaicam-agent.service.
     systemctl enable --now anyaicam-privileged-watcher.path
 }
+
+uninstall_privileged_watcher() {
+    # Pairs with install_privileged_watcher() above -- found missing
+    # while reviewing the uninstall/reinstall workflow ahead of the
+    # Samsung deployment: appliance-agent/scripts/uninstall.sh already
+    # does `rm -rf /opt/anyaicam-agent` unconditionally (removing this
+    # watcher's own script along with everything else under it), but
+    # nothing anywhere disabled or removed the two systemd units this
+    # function's install-side counterpart creates under
+    # /etc/systemd/system. Left in place, the .path unit stays enabled
+    # and continues watching /var/lib/anyaicam/pending_actions (which a
+    # default, non-purge uninstall correctly preserves) with no watcher
+    # script left for it to run -- any later write to that directory
+    # (a stale queued action, or a reinstall that briefly recreates the
+    # directory before this same install function reaches it again)
+    # would trigger a .service whose ExecStart binary no longer exists.
+    # Same overridable path variables as the install side, for the same
+    # fixture-root test redirection.
+    local watcher_dir="${PRIVILEGED_WATCHER_INSTALL_DIR:-/opt/anyaicam-agent/privileged}"
+    local systemd_dir="${PRIVILEGED_WATCHER_SYSTEMD_DIR:-/etc/systemd/system}"
+
+    systemctl disable --now anyaicam-privileged-watcher.path 2>/dev/null || true
+    rm -f "$systemd_dir/anyaicam-privileged-watcher.path" "$systemd_dir/anyaicam-privileged-watcher.service"
+    rm -rf "$watcher_dir"
+    systemctl daemon-reload
+}

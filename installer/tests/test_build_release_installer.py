@@ -243,6 +243,29 @@ class PrivilegedWatcherIsPackagedTests(unittest.TestCase):
                 "unknown/malformed markers can permanently block real requests.",
             )
 
+    def test_uninstall_removes_what_install_creates(self):
+        """Found while reviewing the full fresh-install/uninstall/
+        reinstall workflow ahead of Samsung deployment (not from a live
+        run this time -- a straight reading of the two scripts): install.
+        sh calls install_privileged_watcher(), which creates two systemd
+        units and a script directory, but scripts/uninstall.sh never
+        called anything to remove them -- confirmed by the absence of
+        `uninstall_privileged_watcher` anywhere in it before this fix.
+        A default (non-purge) uninstall left the .path unit enabled and
+        watching a directory with no watcher script left to run it.
+        This test only proves the call site exists and is wired to the
+        same lib both scripts already share; appliance-agent/tests/
+        test_privileged_watcher_install.sh proves the function's own
+        behavior (units actually disabled and files actually removed)
+        against a fixture root."""
+        repo_root = Path(__file__).resolve().parents[2]
+        install_text = (repo_root / "appliance-agent" / "scripts" / "install.sh").read_text(encoding="utf-8")
+        uninstall_text = (repo_root / "appliance-agent" / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+        self.assertIn("install_privileged_watcher", install_text)
+        self.assertIn("source", uninstall_text)
+        self.assertIn("lib-privileged-watcher.sh", uninstall_text)
+        self.assertIn("uninstall_privileged_watcher", uninstall_text)
+
 
 if __name__ == "__main__":
     unittest.main()
