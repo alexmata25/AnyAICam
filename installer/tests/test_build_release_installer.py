@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_release_installer import INSTALLER_RUNTIME_FILES, run_git, write_deterministic_tar  # noqa: E402
+from build_release_installer import INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
 
 
 class RunGitAutocrlfOverrideTests(unittest.TestCase):
@@ -129,6 +129,53 @@ class DeterministicTarExecutableBitTests(unittest.TestCase):
         self.assertIn("validate.sh", expected)
         self.assertIn("uninstall.sh", expected)
         self.assertNotIn("README.md", expected)
+
+
+class DockerfileCopySourcesAreAllReleasedTests(unittest.TestCase):
+    """A third confirmed-live release blocker, same family as the two
+    above (both caught only by actually running the built package on a
+    real target, never by this test file): REQUIRED_RELEASE_PATHS
+    listed requirements.txt but not requirements-cpu.txt, even though
+    both Dockerfile and Dockerfile.production COPY it -- a release built
+    from that allowlist always failed `docker compose build` on a real
+    Linux/Docker host with 'requirements-cpu.txt: not found', confirmed
+    live on a fresh disposable EC2 instance. REQUIRED_RELEASE_PATHS now
+    includes it; this test parses both real repo-root Dockerfiles for
+    every top-level COPY source and asserts each one is covered by
+    REQUIRED_RELEASE_PATHS or OPTIONAL_RELEASE_PATHS, so a Dockerfile
+    referencing a new root-level file without updating that allowlist
+    fails here instead of only being discovered by a live install."""
+
+    _COPY_RE = __import__("re").compile(r"^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+\s*$", __import__("re").MULTILINE)
+
+    def _copy_sources(self, dockerfile: Path) -> set[str]:
+        text = dockerfile.read_text(encoding="utf-8")
+        sources = set()
+        for match in self._COPY_RE.finditer(text):
+            src = match.group(1).lstrip("./")
+            # Directory copies (e.g. "app", "./app") are covered by the
+            # "app" entry itself; only bare top-level file names are
+            # relevant here.
+            top_level = src.split("/", 1)[0]
+            sources.add(top_level)
+        return sources
+
+    def test_every_dockerfile_copy_source_is_in_the_release_allowlist(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        allowlisted = set(REQUIRED_RELEASE_PATHS) | set(OPTIONAL_RELEASE_PATHS)
+        for name in ("Dockerfile", "Dockerfile.production"):
+            dockerfile = repo_root / name
+            if not dockerfile.is_file():
+                continue
+            for source in self._copy_sources(dockerfile):
+                self.assertIn(
+                    source, allowlisted,
+                    f"{name} COPYs {source!r} but it is not in REQUIRED_RELEASE_PATHS or "
+                    "OPTIONAL_RELEASE_PATHS -- a built release package would be missing it.",
+                )
+
+    def test_requirements_cpu_txt_is_required(self):
+        self.assertIn("requirements-cpu.txt", REQUIRED_RELEASE_PATHS)
 
 
 if __name__ == "__main__":
