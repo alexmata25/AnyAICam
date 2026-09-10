@@ -9,6 +9,38 @@ from .config import AgentConfig
 FIELDS={"appliance_id","cloud_id","credential","credential_id","customer_id","site_id","partner_id"}
 class ReenrollmentError(RuntimeError): pass
 
+def ensure_identity_files_exist(config:AgentConfig,vms_identity_path:str|Path) -> None:
+    """First-run bootstrap for coordinated_reenroll(), which requires
+    every one of the three identity files to already exist ("Every
+    existing identity file must be present before re-enrollment.") --
+    correct for its real job of replacing an EXISTING identity, but a
+    genuinely fresh appliance (first-ever anyaicam-setup run) has none
+    of the three yet. Confirmed: calling coordinated_reenroll() on a
+    fresh install raises that exact ValueError immediately, before any
+    real activation is even attempted -- every test in
+    test_reenrollment.py pre-seeds all three files for exactly this
+    reason, and none covers a genuinely fresh device.
+
+    Creates each missing file with the minimal, safe "not yet
+    activated" placeholder coordinated_reenroll() already knows how to
+    treat as activation_version 0 (previous.get("activation_version",0)
+    defaults to int 0 when the key is absent, satisfying its own
+    validation). Never touches a file that already exists -- a device
+    with a real prior identity is completely unaffected, and
+    re-enrollment there behaves exactly as it always has. Must be
+    called before coordinated_reenroll(), as this box's own anyaicam
+    user (same as the caller), so ownership of anything created here
+    matches every other agent-written file."""
+    agent_path=Path(config.config_dir)/"agent.json"
+    credential_path=config.credential_file
+    vms_path=Path(vms_identity_path)
+    for path,placeholder in ((agent_path,asdict(config)),(credential_path,{}),(vms_path,{})):
+        if path.exists(): continue
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(json.dumps(placeholder,indent=2),encoding="utf-8")
+        try: os.chmod(path,0o600)
+        except OSError: pass
+
 def validate_activation_response(value,expected_cloud_id):
     if not isinstance(value,dict) or not FIELDS.issubset(value): raise ValueError("Activation response is incomplete.")
     for field in FIELDS-{"partner_id"}:

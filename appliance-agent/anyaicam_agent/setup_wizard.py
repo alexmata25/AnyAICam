@@ -7,7 +7,7 @@ from pathlib import Path
 from .config import AgentConfig
 from .discovery import scan
 from .portal import PortalClient,PortalError
-from .reenrollment import ReenrollmentError,coordinated_reenroll
+from .reenrollment import ReenrollmentError,coordinated_reenroll,ensure_identity_files_exist
 
 
 def qr_payload():
@@ -34,9 +34,15 @@ def main():
         check=PortalClient(config.portal_url,identity['appliance_id'],identity['credential'])
         check.request('GET','/api/appliance/commands')
         return True
+    vms_identity_path=Path(config.vms_recordings_path)/'appliance_identity.json'
+    # First-run bootstrap: on a genuinely fresh appliance, none of the
+    # three identity files coordinated_reenroll() requires exist yet --
+    # see ensure_identity_files_exist()'s own docstring. A no-op on a
+    # device that already has a real prior identity.
+    ensure_identity_files_exist(config,vms_identity_path)
     try:
         coordinated_reenroll(config,activated,expected_cloud_id=config.cloud_id,
-            vms_identity_path=Path(config.vms_recordings_path)/'appliance_identity.json',
+            vms_identity_path=vms_identity_path,
             restart_service=restart_service,verify_authentication=verify_authentication)
     except ReenrollmentError as error: raise SystemExit(str(error)) from error
     if input('Run camera discovery now? [Y/n]: ').strip().lower()!='n':
