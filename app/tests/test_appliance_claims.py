@@ -47,6 +47,7 @@ from fastapi.testclient import TestClient
 from database_backend import override_target
 
 with override_target(sqlite_path="/tmp/test_appliance_claims_import.db"):
+    import appliance_activation
     import appliance_claims
     import appliance_cloud
     import partner_portal
@@ -85,7 +86,27 @@ def db_path(tmp_path):
 
 
 @pytest.fixture()
-def client(db_path):
+def identity_file(tmp_path, monkeypatch):
+    # claim_complete() calls the real, unmodified persist_activation(),
+    # which reads/writes ACTIVATION_IDENTITY_FILE -- a real local file
+    # (defaults to /app/recordings/appliance_identity.json), not scoped
+    # by override_target() (that only covers the SQL database target).
+    # Without this, every test here that reaches claim/complete would
+    # silently read and mutate whatever real file happens to sit at
+    # that default path on the machine running the tests -- exactly
+    # the isolation test_appliance_activation_endpoint.py's own
+    # matching fixture already established for the equivalent
+    # /api/appliance/activate tests. Found via a security-audit
+    # verification script hitting a spurious ActivationConflict caused
+    # by exactly this leakage; fixed here as the one concrete
+    # correctness defect that audit turned up.
+    path = tmp_path / "appliance_identity.json"
+    monkeypatch.setattr(appliance_activation, "ACTIVATION_IDENTITY_FILE", path)
+    return path
+
+
+@pytest.fixture()
+def client(db_path, identity_file):
     # Shared module-level RateLimiter singletons, never reset by
     # database/target isolation -- see test_appliance_activation_
     # endpoint.py's matching fixture comment.
