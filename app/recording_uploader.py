@@ -240,8 +240,8 @@ def _control_plane_get(path: str) -> dict | None:
 
 
 def _refresh_camera_map() -> None:
-    """Polls the existing, unchanged GET /api/appliance/configuration for
-    this appliance's own camera_number -> camera_id/site_id mapping.
+    """Polls GET /api/appliance/configuration for this appliance's own
+    camera_number -> camera_id/site_id/cloud-recording-mode mapping.
     Never writes anything; a failed/unreachable poll just leaves the
     previous mapping in place, so a transient network blip never stops
     already-known cameras from continuing to upload."""
@@ -264,7 +264,16 @@ def _refresh_camera_map() -> None:
             continue
         if not isinstance(site_id, str) or not site_id.strip():
             continue
-        mapping[camera_number] = {"camera_id": camera_id, "site_id": site_id}
+        # ``recording_mode`` is the authoritative per-camera entitlement
+        # returned by appliance_cloud.  Keep it with the existing camera map
+        # so event-media upload does not need a second, less consistently
+        # refreshed configuration channel.
+        recording_mode = item.get("recording_mode")
+        mapping[camera_number] = {
+            "camera_id": camera_id,
+            "site_id": site_id,
+            "cloud_recording_mode": recording_mode if isinstance(recording_mode, str) else None,
+        }
     with _lock:
         _camera_map.clear()
         _camera_map.update(mapping)

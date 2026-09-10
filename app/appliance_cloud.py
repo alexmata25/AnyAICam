@@ -566,18 +566,6 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             camera_id,
         )
 
-        if not s3_key.startswith(expected_prefix):
-            raise HTTPException(
-                status_code=403,
-                detail="s3_key is outside this camera's authorized prefix.",
-            )
-
-        if thumbnail_s3_key and not thumbnail_s3_key.startswith(expected_prefix):
-            raise HTTPException(
-                status_code=403,
-                detail="thumbnail_s3_key is outside this camera's authorized prefix.",
-            )
-
         now=datetime.now().isoformat()
 
         with connection() as db:
@@ -592,6 +580,29 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     status_code=404,
                     detail='Detection event has not reached the cloud yet.',
                 )
+
+            # A camera-scoped upload credential can write beneath its
+            # recording prefix.  This catalog endpoint is intentionally
+            # narrower: it only accepts the deterministic event
+            # clip/thumbnail pair for the event being registered, so an
+            # appliance cannot label an unrelated recording object as this
+            # event's media.  Use the already-stored event timestamp, not
+            # client timing fields: a pre-roll window can cross midnight.
+            event_timestamp=db.execute(
+                'SELECT event_timestamp FROM detection_events WHERE id=?',
+                (event['id'],),
+            ).fetchone()['event_timestamp']
+            try:
+                event_date=datetime.fromisoformat(str(event_timestamp).replace('Z','+00:00')).strftime('%Y/%m/%d')
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400,detail='Detection event timestamp is invalid.')
+            event_prefix=f"{expected_prefix}{event_date}/events/motion_{local_event_id}"
+            expected_clip_key=event_prefix + '.mp4'
+            expected_thumbnail_key=event_prefix + '.jpg'
+            if s3_key != expected_clip_key:
+                raise HTTPException(status_code=403,detail="s3_key is not this event's authorized clip key.")
+            if thumbnail_s3_key and thumbnail_s3_key != expected_thumbnail_key:
+                raise HTTPException(status_code=403,detail="thumbnail_s3_key is not this event's authorized thumbnail key.")
 
             existing=db.execute(
                 'SELECT id FROM detection_event_media WHERE detection_event_id=?',
