@@ -29,6 +29,9 @@ from event_clips import compute_clip_window
 
 logger = logging.getLogger("anyaicam.event_media_uploader")
 
+APP_ROOT = Path("/app")
+RECORDINGS_ROOT = APP_ROOT / "recordings"
+
 # Default false: matches the same safe-by-default convention every other
 # appliance -> cloud call in this codebase already uses (recording_
 # uploader.RECORDING_UPLOAD_ENABLED, analytics_sync.ANALYTICS_SYNC_
@@ -50,7 +53,15 @@ def _local_path_from_recording_url(value: str | None) -> Path | None:
     if not value.startswith("/recordings/"):
         return None
 
-    path = Path("/app") / value.lstrip("/")
+    # URLs are not file capabilities.  Resolve and contain the resulting
+    # filesystem path before opening it so a URL such as
+    # /recordings/../../etc/shadow can never be turned into an upload.
+    try:
+        root = RECORDINGS_ROOT.resolve(strict=True)
+        path = (APP_ROOT / value.lstrip("/")).resolve(strict=True)
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return None
     return path if path.is_file() else None
 
 
@@ -203,7 +214,10 @@ def upload_motion_event_media(
     # recording_uploader.py's own continuous-recording upload path;
     # this module's uploads (motion-event clips/thumbnails) are Cloud
     # Motion's own distinct entitlement and are never inferred from a
-    # camera's continuous-recording eligibility.
+    # camera's continuous-recording eligibility. (Independently
+    # confirmed live and fixed twice, once on staging's own branch and
+    # once during this session's Phase C real-hardware validation --
+    # both converged on the identical gate below.)
     if identity.get("cloud_recording_mode") != "motion":
         logger.info(
             "event_media.camera_ineligible event_id=%s camera=%s cloud_recording_mode=%s",
