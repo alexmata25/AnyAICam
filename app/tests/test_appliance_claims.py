@@ -1,8 +1,9 @@
 """Phase 1 of the non-interactive/self-service appliance claim flow --
 see docs/non-interactive-activation-phase1-plan.md and
 appliance_claims.py's own module docstring for the full design this
-proves. This commit covers only the device-facing claim/begin and
-claim/status routes added so far:
+proves. This commit adds coverage for the portal-facing lookup/confirm
+routes on top of the previous commit's device-facing claim/begin and
+claim/status:
 
   * claim/begin issues a session+code, and is idempotent (resumes the
     same session) while one is already pending for a device
@@ -11,10 +12,15 @@ claim/status routes added so far:
   * claim/status never distinguishes "wrong id" from "expired" (no
     session-id enumeration oracle), and lazily expires a stale pending
     claim
+  * the portal lookup/confirm routes enforce the exact same
+    partner_identity()+customer_owner+appliance.self.link boundary the
+    existing POST /api/customer/appliances/link route already uses,
+    including the site-ownership check, and claim/status starts
+    returning claim_proof once a claim is confirmed
 
-Portal lookup/confirm and claim/complete tests are added to this same
-file in later commits, once those routes exist (see the Phase 1 plan
-doc's 6-commit implementation order).
+claim/complete tests are added to this same file in the next commit,
+once that route exists (see the Phase 1 plan doc's 6-commit
+implementation order).
 
 Imports appliance_cloud/appliance_claims (which import partner_db,
 triggering its import-time schema init) -- redirects to a throwaway
@@ -32,6 +38,7 @@ from database_backend import override_target
 with override_target(sqlite_path="/tmp/test_appliance_claims_import.db"):
     import appliance_claims
     import appliance_cloud
+    import partner_portal
     from partner_db import connection
 
 
@@ -40,6 +47,16 @@ def _seed_customer(db, customer_id="cust-1", site_id="site-1", partner_id="partn
     db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", (partner_id, "Test Partner", "approved", "real", now))
     db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)", (customer_id, partner_id, "Test Customer", email, "active", "real", now))
     db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (site_id, customer_id, "Test Site", now))
+
+
+def _seed_other_customer_site(db, site_id="site-other"):
+    now = "2026-09-10T00:00:00"
+    db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES(?,?,?,?,?,?,?)", ("cust-other", "partner-1", "Other Customer", "other@example.test", "active", "real", now))
+    db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (site_id, "cust-other", "Other Site", now))
+
+
+def _customer_cookie(email="owner@example.test", customer_id="cust-1", partner_id=None):
+    return partner_portal._token(email, "customer_owner", partner_id, customer_id)
 
 
 @pytest.fixture()
@@ -55,6 +72,7 @@ def client(db_path):
     appliance_cloud.activation_limiter.events.clear()
     appliance_claims.claim_begin_limiter.events.clear()
     appliance_claims.claim_status_limiter.events.clear()
+    appliance_claims.claim_portal_limiter.events.clear()
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
         initialize_database()
@@ -77,6 +95,16 @@ def _begin(client, device_id="AIC-DEVICE-0001"):
 
 def _status(client, claim_session_id):
     return client.post("/api/appliance/claim/status", json={"claim_session_id": claim_session_id})
+
+
+def _lookup(client, claim_code, cookie=None):
+    cookies = {partner_portal.SESSION_COOKIE: cookie} if cookie else {}
+    return client.post("/api/portal/claims/lookup", cookies=cookies, json={"claim_code": claim_code})
+
+
+def _confirm(client, claim_code, site_id, cookie=None):
+    cookies = {partner_portal.SESSION_COOKIE: cookie} if cookie else {}
+    return client.post("/api/portal/claims/confirm", cookies=cookies, json={"claim_code": claim_code, "site_id": site_id})
 
 
 # --------------------------------------------------------- claim/begin
@@ -157,3 +185,70 @@ def test_status_lazily_expires_stale_pending_claim(client, db_path, monkeypatch)
 
     assert first["status"] == "expired"
     assert second["status"] == "expired"
+
+
+def test_status_returns_proof_repeatedly_once_claimed(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+    assert _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie()).status_code == 200
+
+    first = _status(client, session["claim_session_id"]).json()
+    second = _status(client, session["claim_session_id"]).json()
+
+    assert first["status"] == "claimed" and first["claim_proof"]
+    assert second["claim_proof"] == first["claim_proof"]
+
+
+# --------------------------------------------------------- portal lookup/confirm
+
+
+def test_portal_lookup_requires_customer_owner_role(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+
+    response = _lookup(client, session["claim_code"])
+
+    assert response.status_code == 403
+
+
+def test_portal_lookup_wrong_code_is_404(client, db_path):
+    _seeded_customer(db_path)
+    _begin(client)
+
+    response = _lookup(client, "WRONGCOD", cookie=_customer_cookie())
+
+    assert response.status_code == 404
+
+
+def test_portal_confirm_rejects_site_owned_by_a_different_customer(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_customer(db)
+            _seed_other_customer_site(db)
+    session = _begin(client).json()
+
+    response = _confirm(client, session["claim_code"], "site-other", cookie=_customer_cookie())
+
+    assert response.status_code == 403
+
+
+def test_portal_confirm_succeeds_for_own_site(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+
+    response = _confirm(client, session["claim_code"], "site-1", cookie=_customer_cookie())
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "claimed", "device_id": "AIC-DEVICE-0001"}
+
+
+def test_portal_confirm_twice_is_conflict(client, db_path):
+    _seeded_customer(db_path)
+    session = _begin(client).json()
+    cookie = _customer_cookie()
+    first = _confirm(client, session["claim_code"], "site-1", cookie=cookie)
+    assert first.status_code == 200
+
+    second = _confirm(client, session["claim_code"], "site-1", cookie=cookie)
+
+    assert second.status_code in (403, 404, 409)

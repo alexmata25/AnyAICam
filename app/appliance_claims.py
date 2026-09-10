@@ -9,13 +9,39 @@ customer/site, and no credential yet can register itself, wait for a
 customer to confirm it in the portal, and redeem a one-time proof for
 a permanent credential.
 
-This commit adds only the device-facing claim/begin and claim/status
-routes -- a device can open a claim session and poll it, but nothing
-yet lets a customer actually confirm one, so every claim in this
-commit alone stays pending until it expires. The portal lookup/confirm
-routes and claim/complete follow in later commits; see the Phase 1
-plan doc's 6-commit implementation order and the Phase 1 completion
-report for the full picture.
+This commit adds the portal-facing lookup/confirm routes on top of the
+previous commit's device-facing claim/begin and claim/status -- a
+customer can now confirm a pending claim and bind it to one of their
+own sites, but claim/complete does not exist yet, so a confirmed claim
+still cannot be redeemed into a credential. That lands in the next
+commit; see the Phase 1 plan doc's 6-commit implementation order and
+the Phase 1 completion report for the full picture.
+
+Portal-facing endpoints (claim lookup, claim confirm) reuse the exact
+identity/permission pattern partner_workspace.py's existing
+POST /api/customer/appliances/link already established for "a customer
+attaches an appliance to their own account": partner_identity() +
+role=='customer_owner' + require_permission(identity,
+'appliance.self.link'). No new permission was added -- this is the
+same customer action, just reached over a different transport.
+
+Claim-code lookup tradeoff (see Phase 1 plan §8, and re-verified here
+against the real code): password hashing in this codebase
+(partner_db.verify_password) already does a constant-time digest
+compare via hmac.compare_digest, so a single comparison is not a
+timing oracle. What IS a deliberate, documented tradeoff is that
+_find_claim_by_code() below never does an indexed exact-match lookup
+by code -- claim codes are never stored in a form that would allow one
+-- so it scans every still-pending, unexpired row and compares hashes
+one at a time, returning on the first match or after exhausting the
+list. This means the *number of rows scanned* (and therefore wall-clock
+time) leaks a coarse signal correlated with "how many claims are
+currently pending", not with whether any specific guess was close to a
+real code, and returning on first match means a match takes less time
+on average than a full scan -- an intentionally bounded, low-volume
+tradeoff, not a claim of constant-time behavior. Acceptable at Phase 1
+volumes (tens of concurrently pending claims); would need a keyed-HMAC
+indexed column if that ever changed.
 
 Deliberately independent of the existing, unmodified admin-driven
 paths in appliance_cloud.py (POST /api/appliance/activate, which
@@ -64,7 +90,8 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request
 
 from appliance_protocol import RateLimiter
-from partner_db import connection, password_hash, row, rows
+from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
+from partner_portal import partner_identity
 
 logger = logging.getLogger('anyaicam.appliance_claims')
 
@@ -74,8 +101,10 @@ logger = logging.getLogger('anyaicam.appliance_claims')
 # invented from scratch.
 claim_begin_limiter = RateLimiter(10, 300)
 claim_status_limiter = RateLimiter(120, 60)
+claim_portal_limiter = RateLimiter(30, 60)
 
 CLAIM_SESSION_TTL_MINUTES = 15
+CLAIM_PROOF_TTL_MINUTES = 5
 DEVICE_ID_PATTERN = re.compile(r'^[A-Za-z0-9._:-]{8,128}$')
 
 
@@ -85,6 +114,25 @@ def _now() -> datetime:
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else 'unknown'
+
+
+def _customer_owner(request: Request) -> dict:
+    """Identical check to partner_workspace.py's own private
+    customer_owner() closure -- duplicated here rather than imported
+    because that helper is a nested closure inside
+    register_partner_workspace_routes(), not a module-level export.
+    Kept intentionally tiny and identical so it can't drift."""
+    identity = partner_identity(request)
+    if not identity or identity.get('role') != 'customer_owner':
+        raise HTTPException(status_code=403, detail='Customer owner permission required.')
+    return identity
+
+
+def _require_self_link_permission(identity: dict) -> None:
+    try:
+        require_permission(identity, 'appliance.self.link')
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
 
 
 def _valid_device_id(device_id: str) -> bool:
@@ -107,6 +155,17 @@ def _find_pending_claim_for_device(device_id: str) -> dict | None:
         (device_id, now_text),
     )
     return candidates[0] if candidates else None
+
+
+def _find_claim_by_code(claim_code: str) -> dict | None:
+    """Bounded linear scan over pending, unexpired claims -- see this
+    module's docstring for why an indexed exact lookup is deliberately
+    not used here."""
+    now_text = _now().isoformat()
+    for candidate in rows("SELECT * FROM appliance_claims WHERE status='pending' AND expires_at>?", (now_text,)):
+        if verify_password(claim_code, candidate['claim_code_hash']):
+            return candidate
+    return None
 
 
 def _expire_if_due(claim: dict) -> dict:
@@ -197,3 +256,76 @@ def register_appliance_claim_routes(app: FastAPI) -> None:
                 # actually depends on.
                 response['claim_proof'] = claim['claim_proof_plaintext']
         return response
+
+    # claim_code is a bearer-equivalent secret (see this module's
+    # docstring), so -- unlike a normal resource identifier -- it must
+    # never appear in a URL: the request path (and query string, just
+    # as much) is what every access log line is built from, at every
+    # layer between the browser and this process (uvicorn, any reverse
+    # proxy, a CDN) regardless of anything this application does, and
+    # is what ends up in browser history. This repo already has one
+    # documented instance of exactly this mistake (password-reset
+    # tokens logged via GET query strings, see
+    # docs/customer-appliance-readiness-blockers.md) -- both portal
+    # routes below take claim_code in the POST body specifically to
+    # avoid repeating it. This is a deviation from the path-based
+    # `GET/POST /api/portal/claims/{claim_code}[/confirm]` shape in the
+    # Phase 1 plan doc, caught by this module's own automated secret-
+    # hygiene test; see the Phase 1 completion report for the full
+    # explanation.
+    @app.post('/api/portal/claims/lookup')
+    def portal_claim_lookup(request: Request, payload: dict) -> dict:
+        identity = _customer_owner(request)
+        _require_self_link_permission(identity)
+        if not claim_portal_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
+            raise HTTPException(status_code=429, detail='Claim lookup rate exceeded.')
+        claim_code = str(payload.get('claim_code', '')).strip()
+        claim = _find_claim_by_code(claim_code)
+        if not claim:
+            raise HTTPException(status_code=404, detail='Claim code not found or expired.')
+        return {'device_id': claim['device_id'], 'expires_at': claim['expires_at']}
+
+    @app.post('/api/portal/claims/confirm')
+    def portal_claim_confirm(request: Request, payload: dict) -> dict:
+        identity = _customer_owner(request)
+        _require_self_link_permission(identity)
+        if not claim_portal_limiter.allow(identity.get('email', identity.get('id', 'unknown'))):
+            raise HTTPException(status_code=429, detail='Claim confirmation rate exceeded.')
+        claim_code = str(payload.get('claim_code', '')).strip()
+        site_id = str(payload.get('site_id', '')).strip()
+        if not claim_code:
+            raise HTTPException(status_code=400, detail='claim_code is required.')
+        if not site_id:
+            raise HTTPException(status_code=400, detail='site_id is required.')
+        claim = _find_claim_by_code(claim_code)
+        if not claim:
+            raise HTTPException(status_code=404, detail='Claim code not found or expired.')
+        site = row('SELECT id FROM sites WHERE id=? AND customer_id=?', (site_id, identity['customer_id']))
+        if not site:
+            raise HTTPException(status_code=403, detail='That site does not belong to your account.')
+        claim_proof = secrets.token_urlsafe(32)
+        now = _now()
+        proof_expires_at = (now + timedelta(minutes=CLAIM_PROOF_TTL_MINUTES)).isoformat()
+        with connection() as db:
+            changed = db.execute(
+                "UPDATE appliance_claims SET status='claimed',customer_id=?,site_id=?,claimed_by=?,claimed_at=?,claim_proof_hash=?,claim_proof_plaintext=?,proof_expires_at=? WHERE id=? AND status='pending'",
+                (identity['customer_id'], site_id, identity.get('email'), now.isoformat(), password_hash(claim_proof), claim_proof, proof_expires_at, claim['id']),
+            ).rowcount
+        if changed != 1:
+            raise HTTPException(status_code=409, detail='Claim is no longer pending (already claimed or expired).')
+        # The proof itself is never returned to the browser -- only
+        # ever delivered to the device via claim/status, so a
+        # browser-side leak (XSS, shared screen, browser history)
+        # cannot hand out a redeemable credential. It IS held briefly
+        # (claim_proof_plaintext, alongside the hash used to verify
+        # redemption) in the same appliance_claims row rather than an
+        # in-process cache -- durable persistence, as design rule #1 in
+        # the state-machine doc requires, and safe across multiple
+        # cloud worker processes. claim/complete (added in the next
+        # commit) will null this column out the moment the proof is
+        # consumed; short TTL and the column's own narrow purpose bound
+        # its exposure the same way every other single-use hashed
+        # secret in this codebase is bounded.
+        audit(identity, 'appliance_claim.confirmed', 'appliance_claim', claim['id'])
+        logger.info('Claim confirmed claim_session_id=%s customer_id=%s site_id=%s', claim['claim_session_id'], identity['customer_id'], site_id)
+        return {'status': 'claimed', 'device_id': claim['device_id']}
