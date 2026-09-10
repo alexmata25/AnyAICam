@@ -50706,7 +50706,18 @@ if(resetButton)resetButton.onclick=async()=>{if(!confirm('Reset local activation
 
 
 
-def camera_status(request: Request) -> dict:
+def camera_status(request: Request = None) -> dict:
+    # request is optional: /ready's own readiness_snapshot() calls this
+    # directly (no HTTP request in scope at all -- confirmed live during
+    # disposable installer validation, GET /ready always 500'd with
+    # "camera_status() missing 1 required positional argument: 'request'").
+    # request=None flows into _customer_playback_cameras(None), whose
+    # existing try/except around partner_identity(request) already
+    # catches that and returns None (no customer identity), which is
+    # exactly the correct fallback here: an internal readiness check has
+    # no portal session to scope to, so it must use this edge appliance's
+    # own local _legacy_camera_status(), the same as any anonymous/non-
+    # customer caller.
     customer_cameras = _customer_playback_cameras(request)
     if customer_cameras is not None:
         # Customer-portal identity: scope to only this customer's own
