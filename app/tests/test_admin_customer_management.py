@@ -235,17 +235,25 @@ def test_administrator_can_create_a_customer_for_an_explicit_partner_id(http_cli
 
 # =============================================================== updating an existing customer's camera entitlement
 #
-# Confirmed live on Samsung: a real site had 5 discovered cameras but the
-# customer portal showed "4/4" -- expected_camera_count (partner_
-# workspace.py's list_customer_cameras()) reads plans.camera_quantity,
-# the quote/entitlement value from onboarding, never the count of
-# discovered devices. The normal supported path to correct this without
-# recreating the customer is PUT /api/partner/customers/{id}/plan
-# (change_customer_plan()), which inserts a fresh plans row -- the most
-# recent one is always what list_customer_cameras() reads.
+# Historical note: expected_camera_count used to read plans.camera_quantity
+# (a partner-quoted value from onboarding, predating the Local/Hybrid
+# Stripe camera-slot architecture), so PUT /api/partner/customers/{id}/plan
+# (change_customer_plan(), which inserts a fresh plans row) used to be able
+# to "correct" a customer's apparent camera entitlement just by requoting.
+#
+# That's now a confirmed-live bug in the opposite direction: plans.* is
+# never touched by a real Stripe purchase (see customer_entitlements.py's
+# own module docstring, audit finding #2), so a partner requoting the
+# plans table for unrelated reasons (e.g. changing recording resolution/
+# retention) must never silently change what the customer is actually
+# licensed for. expected_camera_count (partner_workspace.py's
+# list_customer_cameras()) now reads total_camera_slots() --
+# customer_entitlements, the Stripe-verified source -- exclusively.
+# plans.* remains the partner-facing recording-configuration quote tool
+# (resolution/mode/retention), fully independent of camera-slot licensing.
 
 
-def test_updating_plan_quantity_corrects_the_customers_camera_entitlement(http_client):
+def test_updating_plan_quantity_does_not_alter_the_customers_stripe_verified_camera_entitlement(http_client):
     client, db_path = http_client
     conn = sqlite3.connect(db_path)
     _seed_partner(conn, "partner-1")
@@ -257,19 +265,30 @@ def test_updating_plan_quantity_corrects_the_customers_camera_entitlement(http_c
         "INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         ("plan-1", "cust-1", "2mp", "motion", 2, 4, 7.99, 6.39, "quote", "2026-01-01"),
     )
+    # The real, Stripe-verified licensed capacity -- 5 slots -- independent
+    # of whatever the plans table's camera_quantity says.
+    conn.execute(
+        "INSERT INTO customer_entitlements(id,customer_id,product,camera_slot_quantity,status,stripe_checkout_session_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("ent-1", "cust-1", "camera_slots_local", 5, "active", "cs_test_1", "2026-01-01", "2026-01-01"),
+    )
     conn.commit()
     admin_token = partner_portal._token("owner@example.test", "partner_owner", "partner-1", None, None)
 
+    # A partner requotes the recording configuration to a different
+    # camera_quantity (e.g. for an unrelated retention/resolution change) --
+    # this is a legitimate use of the quote tool, unrelated to billing.
     response = client.put(
         "/api/partner/customers/cust-1/plan",
-        json={"resolution": "2mp", "recording": "motion", "retention": 2, "quantity": 5},
+        json={"resolution": "2mp", "recording": "motion", "retention": 2, "quantity": 8},
         cookies={partner_portal.SESSION_COOKIE: admin_token},
     )
     assert response.status_code == 200
-    assert response.json()["quote"]["quantity"] == 5
+    assert response.json()["quote"]["quantity"] == 8  # the quote tool itself still works
 
     # The actual production read path a real customer portal page hits --
-    # not just a direct query against the plans table.
+    # not just a direct query against the plans table. It must reflect the
+    # Stripe-verified entitlement (5), never the just-requoted plans value
+    # (8).
     customer_token = partner_portal._token("customer@example.test", "customer_owner", "partner-1", "cust-1", None)
     cameras_response = client.get("/api/customer/cameras", cookies={partner_portal.SESSION_COOKIE: customer_token})
     assert cameras_response.status_code == 200

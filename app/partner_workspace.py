@@ -413,6 +413,39 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         if identity.get('role')!='customer_owner': raise HTTPException(status_code=403,detail='Customer owner permission required.')
         customer=row('SELECT * FROM customers WHERE id=?',(identity['customer_id'],)); sites=rows('SELECT * FROM sites WHERE customer_id=?',(identity['customer_id'],)); appliances=rows('SELECT * FROM appliances WHERE customer_id=?',(identity['customer_id'],)); cameras=rows('SELECT * FROM cameras WHERE customer_id=?',(identity['customer_id'],)); plan=row('SELECT * FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(identity['customer_id'],)) or {}
         if not customer: raise HTTPException(status_code=404,detail='Customer account not found.')
+        # Provisioning audit fix: Step 6 used to show plans.* (a legacy,
+        # partner-quoted per-camera/resolution/retention estimate that
+        # predates the Local/Hybrid camera-slot architecture, is never
+        # touched by a real Stripe purchase, and for this exact customer
+        # was left over from an admin-side onboarding placeholder quote --
+        # see customer_entitlements.py's own module docstring, audit
+        # finding #2, for why that table can never be trusted as "what
+        # this customer is billed"). LICENSING/BILLING (what Stripe
+        # actually verified: hardware, camera-slot tier + licensed
+        # capacity, analytics add-ons) is now shown from the same
+        # authoritative sources the rest of this app already uses for
+        # billing -- never re-derived here. plans.* is kept for what it's
+        # still legitimately used for (recording_retention_sweep.py's real
+        # retention-days enforcement) and shown separately, as RECORDING
+        # CONFIGURATION, never as a dollar amount -- Stripe is the only
+        # source of what this customer is actually charged.
+        from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS
+        from hardware_orders import get_orders_for_customer
+        from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
+        entitlements=get_entitlements_for_customer(identity['customer_id'])
+        camera_entitlement=next((e for e in entitlements if e['product'] in ('camera_slots_local','camera_slots_hybrid') and e['status']=='active'),None)
+        licensed_slots=total_camera_slots(identity['customer_id'])
+        if camera_entitlement:
+            plan_type='hybrid' if camera_entitlement['product']=='camera_slots_hybrid' else 'local'
+            tier_label=next((t[1] for t in PLAN_TIERS if t[0]==plan_type and t[4]==camera_entitlement['camera_slot_quantity']),f'{licensed_slots} cameras')
+            camera_plan_summary=f'{plan_type.title()} {tier_label} &middot; {licensed_slots} licensed camera slots'
+        else:
+            camera_plan_summary='No camera-slot plan purchased yet'
+        hardware_orders_list=[o for o in get_orders_for_customer(identity['customer_id']) if o['status']=='paid']
+        hardware_summary=', '.join(f"{escape(o['product_name'])} (paid)" for o in hardware_orders_list) or 'No hardware purchased yet'
+        analytics_labels={key:label for key,label,_env in ANALYTICS_CATALOG}
+        active_analytics=get_active_analytics_for_customer(identity['customer_id'])
+        analytics_summary=', '.join(escape(analytics_labels.get(key,key)) for key in active_analytics) or 'None purchased'
         # Confirmed live on Samsung: refreshing this page always reset the
         # wizard to Step 1 and forgot the selected appliance, even though
         # POST /api/customer/setup/progress faithfully saves current_step
@@ -430,7 +463,20 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         initial_appliance_id=str(draft_data.get('appliance_id') or '')
         if not any(a['id']==initial_appliance_id for a in appliances): initial_appliance_id=appliances[0]['id'] if appliances else ''
         appliance_options=''.join(f'<option value="{a["id"]}" {"selected" if a["id"]==initial_appliance_id else ""}>{escape(a["cloud_id"])} · {escape(a.get("online_status") or "offline")}</option>' for a in appliances)
-        camera_rows=''.join(f'<tr><td>{escape(c["name"])}</td><td><input class="setup-camera-name" data-id="{c["id"]}" value="{escape(c["name"],quote=True)}"></td><td><select class="setup-camera-site">'+''.join(f'<option value="{s["id"]}" {"selected" if s["id"]==c["site_id"] else ""}>{escape(s["name"])}</option>' for s in sites)+'</select></td><td>'+escape(c.get('status') or 'pending')+'</td></tr>' for c in cameras) or '<tr><td colspan="4">No cameras discovered or preconfigured yet.</td></tr>'
+        # Provisioning audit fix: a camera row with no device_key was never
+        # discovered on any appliance -- it's a purchased-slot placeholder
+        # created at onboarding time (see partner_workspace.onboard_
+        # customer()'s own per-quantity INSERT loop), not a physical
+        # device. Shown identically to a real, provisioned camera before
+        # this fix (same table, same "pending"-shaped status text), which
+        # is exactly what let an unconfigured/offline appliance look like
+        # it had already discovered a camera. A real, provisioned camera
+        # always has a device_key (appliance_cloud.appliance_submit_
+        # provisioning() is the only code path that ever sets one) --
+        # that single column is what distinguishes the two here, same
+        # signal /api/customer/cameras already uses for its own configured
+        # count.
+        camera_rows=''.join(f'<tr><td>{escape(c["name"])}</td><td><input class="setup-camera-name" data-id="{c["id"]}" value="{escape(c["name"],quote=True)}"></td><td><select class="setup-camera-site">'+''.join(f'<option value="{s["id"]}" {"selected" if s["id"]==c["site_id"] else ""}>{escape(s["name"])}</option>' for s in sites)+'</select></td><td>'+(f'<span class="pill">Licensed slot &middot; not yet discovered</span>' if not c.get('device_key') else escape(c.get('status') or 'pending'))+'</td></tr>' for c in cameras) or '<tr><td colspan="4">No cameras discovered or preconfigured yet.</td></tr>'
         content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header><p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>6</strong> of 7 (Customer portion)</p><section class="panel"><div class="workspace-tabs" id="customer-setup-tabs" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto"><button class="workspace-tab active">1 Welcome</button><button class="workspace-tab">2 Add appliance</button><button class="workspace-tab">3 Status</button><button class="workspace-tab">4 Discover</button><button class="workspace-tab">5 Cameras</button><button class="workspace-tab">6 Review</button><button class="workspace-tab">7 Confirm</button></div>
         <div class="customer-setup-step" data-step="1"><h2>Welcome to AnyAiCam</h2><p>This setup links your appliance, requests camera discovery from that appliance, and saves your camera and subscription settings.</p><div class="mock-banner">The browser does not scan the local network. Camera discovery runs on the assigned appliance.</div></div>
         <div class="customer-setup-step" data-step="2" hidden><h2>Add appliance</h2>
@@ -454,7 +500,9 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         <div class="customer-setup-step" data-step="3" hidden><h2>Appliance status</h2><select id="customer-appliance">{appliance_options}</select><div id="appliance-status" class="panel" style="margin-top:14px"></div></div>
         <div class="customer-setup-step" data-step="4" hidden><h2>Discover cameras</h2><p>The selected appliance performs discovery. This page only submits the job and displays its progress.</p><button class="action-button" id="start-camera-scan">Request appliance scan</button><div class="storage-bar"><span id="scan-progress" style="width:0%"></span></div><p id="scan-message" class="health-detail"></p><div id="scan-results"></div></div>
         <div class="customer-setup-step" data-step="5" hidden><h2>Camera setup</h2><p class="health-detail" id="camera-progress"></p><div style="overflow:auto"><table class="data-table"><thead><tr><th>Camera</th><th>Rename</th><th>Location/site</th><th>Status</th></tr></thead><tbody>{camera_rows}</tbody></table></div><p class="health-detail">Recording, retention, analytics, and notifications use the selected customer plan. Per-camera overrides can be added after activation.</p><button class="ghost-button" id="save-camera-setup">Save camera setup</button></div>
-        <div class="customer-setup-step" data-step="6" hidden><h2>Review subscription</h2><div id="customer-subscription-review" class="panel"><p>{escape(str(plan.get('resolution','—')).upper())} · {escape(str(plan.get('recording_mode','—')))} · {plan.get('retention_days','—')} days · {plan.get('camera_quantity',0)} cameras</p><p>Estimated monthly subscription: <strong>${float(plan.get('retail_monthly') or 0):,.2f}</strong></p><p class="health-detail">Estimate only until the order is confirmed.</p></div></div>
+        <div class="customer-setup-step" data-step="6" hidden><h2>Review your account</h2>
+        <div id="customer-subscription-review" class="panel"><h3 style="margin-top:0">Licensing &amp; billing &middot; from Stripe</h3><p>Hardware: {hardware_summary}</p><p>Camera plan: {camera_plan_summary}</p><p>Analytics: {analytics_summary}</p><p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p></div>
+        <div class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local recording configuration</h3><p>{escape(str(plan.get('resolution','—')).upper())} &middot; {escape(str(plan.get('recording_mode','—')))} &middot; retention up to {plan.get('retention_days','—')} days</p><p class="health-detail">Recording length depends on your appliance's available storage, not a separate charge -- this is a configuration setting, not a purchased product.</p></div></div>
         <div class="customer-setup-step" data-step="7" hidden><h2>Confirm and save</h2><p>Confirm the appliance, camera assignments, recording plan, retention, analytics, and notification preferences.</p><button class="action-button" id="confirm-customer-setup">Confirm and open dashboard</button></div>
         <div class="dialog-actions"><button class="ghost-button" id="customer-setup-back" hidden>Back</button><button class="action-button" id="customer-setup-next">Save and continue</button></div></section>'''
         appliance_json=json.dumps(appliances).replace('</','<\\/')
@@ -723,7 +771,18 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         identity=customer_owner(request)
         cameras=rows("SELECT id,name,site_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? ORDER BY created_at",(identity['customer_id'],))
         for camera in cameras: camera['credentials_configured']=bool(row('SELECT 1 FROM camera_credentials WHERE camera_id=?',(camera['id'],)))
-        plan=row('SELECT camera_quantity FROM plans WHERE customer_id=? ORDER BY created_at DESC LIMIT 1',(identity['customer_id'],)) or {}
+        # Provisioning audit fix: this used to read plans.camera_quantity --
+        # a legacy, partner-quoted, per-camera-subscription estimate that
+        # predates the Local/Hybrid camera-slot architecture and is never
+        # touched by a real Stripe purchase (see customer_entitlements.py's
+        # own module docstring, audit finding #2). A customer who bought
+        # "Local 1-8" through Stripe TEST checkout was shown "0 of 1
+        # cameras configured" here -- the real, Stripe-verified capacity
+        # (8) was never consulted. total_camera_slots() is the one
+        # function anything camera-count-shaped must call, per that
+        # module's own docstring; this is exactly that shape.
+        from customer_entitlements import total_camera_slots
+        expected_slots=total_camera_slots(identity['customer_id'])
         # Confirmed live: counting by status=='configured' alone let an
         # onboarding placeholder (device_key=NULL, never a real discovered
         # device) count as "configured" the instant its name was saved
@@ -738,8 +797,7 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         # by device_key here -- not status -- so a customer's progress
         # reflects real, working cameras, never a renamed placeholder.
         configured=len([c for c in cameras if c.get('device_key')])
-        expected=int(plan.get('camera_quantity') or 0)
-        return {'cameras':cameras,'expected_camera_count':expected,'configured_camera_count':configured,'onboarding_complete':expected>0 and configured>=expected}
+        return {'cameras':cameras,'expected_camera_count':expected_slots,'configured_camera_count':configured,'onboarding_complete':expected_slots>0 and configured>=expected_slots}
 
     # NOTE: a second, identically-pathed `provision_customer_camera`
     # handler used to be registered here. Starlette matches routes in
