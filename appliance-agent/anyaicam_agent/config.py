@@ -59,6 +59,30 @@ class AgentConfig:
 
     @property
     def credential_file(self): return Path(self.state_dir)/'credential.json'
+    # Phase 2A (non-interactive claim flow, appliance side): where an
+    # in-progress claim's own state is durably recorded -- claim_session_id
+    # and, once known, claim_proof are both bearer-equivalent secrets
+    # (see app/appliance_claims.py's own docstring), so this file gets
+    # the exact same 0600-permission, atomic-write treatment as
+    # credential_file above (see save_claim_state()/load_claim_state()).
+    # Persisting claim_proof here the moment it's learned -- not just
+    # claim_session_id -- is what lets a restart between confirmation
+    # and completion retry claim/complete with the identical value
+    # afterward, matching the cloud side's own retry-safety guarantee
+    # (Phase 1 security-hardening checkpoint, hardening item 3) instead
+    # of stranding enrollment if the completion response is lost.
+    @property
+    def claim_state_file(self): return Path(self.state_dir)/'claim_state.json'
+    # The appliance's own UUIDv4 identity, generated once by
+    # installer/09-identity.sh (`cat /proc/sys/kernel/random/uuid`) and
+    # preserved across reinstalls -- a config_dir path (provisioned,
+    # read-only-in-practice trust material), not state_dir, matching
+    # trusted_public_key_file's own placement rationale below. This is
+    # the one real identifier this repository's own installer produces,
+    # and the exact value claim/begin's device_id now requires (see
+    # appliance_claims.py's DEVICE_ID_PATTERN comment).
+    @property
+    def installer_identity_file(self): return Path(self.config_dir)/'appliance_identity.json'
     @property
     def queue_file(self): return Path(self.state_dir)/'offline_queue.db'
     @property
@@ -124,3 +148,21 @@ def load_credential(config: AgentConfig) -> dict|None:
 
 def save_credential(config: AgentConfig,value: dict):
     config.credential_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.credential_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.credential_file); os.chmod(config.credential_file,0o600)
+
+
+# Phase 2A claim-flow state -- same read/write/delete shape as
+# load_credential()/save_credential() above, for the same reason
+# (claim_state_file holds a bearer-equivalent secret once claim_proof
+# is known).
+def load_claim_state(config: AgentConfig) -> dict|None:
+    try: return json.loads(config.claim_state_file.read_text(encoding='utf-8'))
+    except (OSError,json.JSONDecodeError): return None
+
+
+def save_claim_state(config: AgentConfig,value: dict):
+    config.claim_state_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.claim_state_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.claim_state_file); os.chmod(config.claim_state_file,0o600)
+
+
+def clear_claim_state(config: AgentConfig):
+    try: config.claim_state_file.unlink()
+    except FileNotFoundError: pass
