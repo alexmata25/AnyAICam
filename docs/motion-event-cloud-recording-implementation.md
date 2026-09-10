@@ -31,8 +31,9 @@ All of these must be true for a controlled edge test; defaults remain off:
 
 ## Still required before real edge-to-S3 validation
 
-* Add the outbox retry tick to the approved edge worker lifecycle and verify it
-  does not compete with recording/AI workers.
+* Verify the now-wired retry worker on a disposable appliance: it starts only
+  when the event-media flag is enabled, scans at the configured interval, and
+  resumes the persistent outbox after a restart.
 * Create isolated bucket, upload/read/delete roles, and a lifecycle backstop;
   prove each role has only its intended S3 action.
 * Use one disposable appliance identity/camera and a non-customer test plan to
