@@ -1,19 +1,27 @@
 # Installer Artifact Manifest
 
-## Current status — release-driven source ready, canonical VMS release pending
+## Current status — disposable EC2 lifecycle validation PASSED
 
-Branch: `feature/release-driven-appliance-installer`
+Branch: `claude/customer-provisioning-phase1`
 
-No customer installer artifact is canonical yet. The installer source is prepared
-to build a self-contained artifact only after an approved canonical VMS release
-is supplied. Until that input exists:
-
-- VMS release commit: **PENDING**
-- VMS release archive SHA-256: **PENDING**
-- installer artifact filename: **PENDING**
-- installer artifact SHA-256: **PENDING**
-- disposable Ubuntu 24.04 `t3.xlarge` lifecycle validation: **NOT RUN**
-- Samsung clean-install decision: **NO-GO / NOT YET VALIDATED**
+- VMS release commit: `019428ebfa897ad2e403d8683834767464806a7d`
+- VMS release archive SHA-256: `fc32366069a8b6aebae13ea5e46c3690fb2ab6c64180e54ba3ddf21173402c53`
+- installer artifact filename: `anyaicam-appliance-installer-1.1.0-vms-019428ebfa89.tar.gz`
+- installer artifact SHA-256: `ff571ae082c0db3e39ab35a804a2d3bbad085297227056c43253e6566e12bbfe`
+- disposable Ubuntu 24.04 `t3.xlarge` lifecycle validation (2026-09-10, us-east-1
+  sandbox account, instance since terminated): **PASSED** -- clean install, repair/
+  reinstall, reboot recovery, service enable/active/restart-safety, and default
+  uninstall (protected-state preservation verified byte-identical) all confirmed.
+  Two real bugs were found and fixed during this run: `requirements-cpu.txt` was
+  missing from `REQUIRED_RELEASE_PATHS`, so no built release could ever complete
+  its Docker image build; and `GET /ready` 500'd unconditionally on every call
+  (`camera_status()` called with a missing required argument from ~10 call
+  sites). Both are fixed and covered by regression tests.
+- Samsung clean-install decision: **GO**, pending the user's explicit approval to
+  proceed on the physical device. This validation covered install mechanics
+  only on a synthetic/unconfigured host -- it did not exercise the staging
+  cloud endpoint, activation, check-in, or entitlement refresh, which remain
+  to be verified against the real Cloud ID on Samsung itself.
 
 The historical August 24 `e4e0008...` handoff and its old tarball hashes are
 retained only as reconstruction history. They are not a default application
