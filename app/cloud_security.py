@@ -225,9 +225,32 @@ def create_password_reset(user_id: str,email: str):
 
 
 def consume_password_reset(raw: str,new_password: str):
+    """Returns the account's role on success (a truthy string -- every
+    partner_users role is a non-empty value), or None if the token was
+    invalid/expired/already used. Callers that only care about success/
+    failure can keep using this exactly like the old bool return; the
+    role is additionally needed to route a customer_owner/customer_viewer
+    account back to the customer sign-in page instead of the partner one
+    (see password_reset_complete() in cloud_features.py) -- confirmed
+    live on staging: the reset page previously always redirected to
+    /partner-login regardless of role, which (a) is the wrong page for a
+    customer account and (b) wasn't even reachable pre-login itself (see
+    PUBLIC_PATH_PREFIXES's own history), together producing the exact
+    "redirected to the emergency recovery page, then invalid email or
+    password" report this fixes.
+    also clears must_change_password: the user just set a real password
+    of their own choosing through this exact flow, so forcing them
+    through ANOTHER "create your permanent password" step immediately
+    after logging in would be a confusing loop, not a security
+    improvement -- must_change_password exists for a partner-issued
+    temporary password the recipient has never chosen themselves, which
+    this is no longer true of the moment this function runs."""
     records=[]
     with connection() as db: records=[dict(item) for item in db.execute('SELECT * FROM password_reset_tokens WHERE used_at IS NULL AND expires_at>?',(datetime.now().isoformat(),)).fetchall()]
     match=next((item for item in records if verify_password(raw,item['token_hash'])),None)
-    if not match: return False
-    with connection() as db: db.execute('UPDATE partner_users SET password_hash=? WHERE id=?',(password_hash(new_password),match['user_id'])); db.execute('UPDATE password_reset_tokens SET used_at=? WHERE id=?',(datetime.now().isoformat(),match['id']))
-    return True
+    if not match: return None
+    with connection() as db:
+        db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0 WHERE id=?',(password_hash(new_password),match['user_id']))
+        db.execute('UPDATE password_reset_tokens SET used_at=? WHERE id=?',(datetime.now().isoformat(),match['id']))
+        role_row=db.execute('SELECT role FROM partner_users WHERE id=?',(match['user_id'],)).fetchone()
+    return role_row['role'] if role_row else None

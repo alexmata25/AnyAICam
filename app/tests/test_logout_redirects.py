@@ -302,8 +302,21 @@ def test_partner_side_forgot_password_flow_is_unchanged_and_still_reachable(http
     # Regression: the existing partner/admin forgot-password flow must
     # keep working exactly as before -- only the customer side gets its
     # own separate pages.
+    #
+    # The redirect target itself is no longer a hardcoded '/partner-login'
+    # string in this page's own markup -- it's now role-aware, computed
+    # server-side by POST /api/password-reset/complete (see cloud_
+    # security.consume_password_reset()'s returned role and cloud_
+    # features.password_reset_complete()) and returned as `destination`
+    # in that response, since a customer_owner/customer_viewer account
+    # must land on /customer-login.html, never the partner page (see
+    # test_password_reset_link_host.py's own dedicated coverage of both
+    # branches). This page's own inline script only needs a same-page
+    # fallback for the case no destination came back at all; '/partner.html'
+    # (the confirmed-public, actively-used partner/admin/technician entry
+    # point) is exactly that -- correctly still present here.
     forgot = http_client.get("/forgot-password")
     assert forgot.status_code == 200
     reset = http_client.get("/reset-password?token=xyz")
     assert reset.status_code == 200
-    assert "location.href='/partner-login'" in reset.text
+    assert "location.href=r.destination||'/partner.html'" in reset.text

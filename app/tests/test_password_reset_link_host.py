@@ -72,6 +72,23 @@ def _seed_admin(db_path, email="admin@example.test"):
     conn.commit()
 
 
+def _seed_customer(db_path, email="customer@example.test", must_change_password=1):
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,created_at) VALUES(?,?,?,?)", ("partner-1", "Partner", "approved", "2026-01-01"))
+    conn.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,created_at) VALUES(?,?,?,?,?,?)", ("cust-1", "partner-1", "Customer", email, "active", "2026-01-01"))
+    conn.execute(
+        "INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("cust-user-1", "partner-1", email, "Customer", "customer_owner", password_hash("temp-password-123"), 1, "cust-1", "2026-01-01", must_change_password),
+    )
+    conn.commit()
+
+
+def _request_and_extract_token(http_client, capturing, email):
+    http_client.post("/api/password-reset/request", json={"email": email})
+    text = capturing.sent[-1]["text"]
+    return text.split("token=")[1].strip()
+
+
 def _edge_production():
     return Settings(environment="production", runtime_role="edge", app_secrets=[STRONG_SECRET])
 
@@ -143,6 +160,75 @@ def test_reset_page_html_escapes_the_token_query_parameter(http_client):
     assert response.status_code == 200
     assert 'onmouseover="alert(1)"' not in response.text
     assert "&quot;" in response.text or "&#34;" in response.text
+
+
+# ------------------------------------------- role-aware post-reset destination
+#
+# Regression for a real staging report: a customer_owner account's
+# successful password reset always redirected to /partner-login
+# regardless of role. Independent of that page's own reachability bug
+# (see test_provisioning_api.py's PUBLIC_PATH_PREFIXES coverage for the
+# analogous /api/provisioning/refresh fix), /partner-login is simply the
+# wrong destination for a customer account -- its login form has no
+# "customer" portal option, and /partner.html's own text says customer
+# accounts cannot use it. Customers must land on /customer-login.html;
+# every other role lands on /partner.html (the confirmed-public,
+# actively-used partner/admin/technician entry point).
+
+
+def test_successful_reset_for_a_customer_account_returns_the_customer_login_destination(http_client, db_path, monkeypatch):
+    _seed_customer(db_path, email="customer@example.test")
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    monkeypatch.setattr(cloud_features, "settings", _cloud_production())
+
+    token = _request_and_extract_token(http_client, capturing, "customer@example.test")
+    response = http_client.post("/api/password-reset/complete", json={"token": token, "password": "brand-new-password-123"})
+
+    assert response.status_code == 200
+    assert response.json()["destination"] == "/customer-login.html"
+
+
+def test_successful_reset_for_a_non_customer_account_returns_the_partner_login_destination(http_client, db_path, monkeypatch):
+    _seed_admin(db_path, email="admin@example.test")
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    monkeypatch.setattr(cloud_features, "settings", _cloud_production())
+
+    token = _request_and_extract_token(http_client, capturing, "admin@example.test")
+    response = http_client.post("/api/password-reset/complete", json={"token": token, "password": "brand-new-password-123"})
+
+    assert response.status_code == 200
+    assert response.json()["destination"] == "/partner.html"
+
+
+def test_successful_reset_clears_must_change_password(http_client, db_path, monkeypatch):
+    """The account just set a real password of its own choosing through
+    this exact flow -- must_change_password (meant for an unopened
+    partner-issued temporary password) must not force it through a
+    second "create your permanent password" step right after logging
+    in."""
+    _seed_customer(db_path, email="customer@example.test", must_change_password=1)
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+    monkeypatch.setattr(cloud_features, "settings", _cloud_production())
+
+    token = _request_and_extract_token(http_client, capturing, "customer@example.test")
+    http_client.post("/api/password-reset/complete", json={"token": token, "password": "brand-new-password-123"})
+
+    with override_target(sqlite_path=db_path):
+        row = sqlite3.connect(db_path).execute("SELECT must_change_password FROM partner_users WHERE email='customer@example.test'").fetchone()
+    assert row[0] == 0
+
+
+def test_an_invalid_or_expired_token_still_fails_exactly_as_before(http_client, db_path, monkeypatch):
+    _seed_customer(db_path, email="customer@example.test")
+    monkeypatch.setattr(cloud_features, "settings", _cloud_production())
+
+    response = http_client.post("/api/password-reset/complete", json={"token": "not-a-real-token", "password": "brand-new-password-123"})
+
+    assert response.status_code == 400
+    assert "destination" not in response.json()
 
 
 def test_reset_page_has_a_show_hide_password_toggle_defaulting_to_masked(http_client):

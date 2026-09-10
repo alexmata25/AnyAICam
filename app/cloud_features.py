@@ -102,11 +102,23 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     def password_reset_complete(payload: dict):
         password=str(payload.get('password',''))
         if len(password)<12: raise HTTPException(status_code=400,detail='Password must contain at least 12 characters.')
-        if not consume_password_reset(str(payload.get('token','')),password):
+        role=consume_password_reset(str(payload.get('token','')),password)
+        if not role:
             audit({'email':'unknown','role':'anonymous'},'password_reset.failed','partner_user','',{'reason':'invalid_or_expired'})
             raise HTTPException(status_code=400,detail='Reset token is invalid, expired, or already used.')
         audit({'email':'password-reset','role':'account'},'password_reset.completed','partner_user','')
-        return {'message':'Password updated. You can now sign in.'}
+        # Role-aware post-reset destination -- a customer_owner/customer_
+        # viewer account must land on the customer sign-in page, never the
+        # partner one (that page's own login form has no "customer" portal
+        # option at all, and its own text says customer accounts cannot
+        # use it). Every other role goes to /partner.html, the confirmed-
+        # public, actively-used partner/admin/technician sign-in page --
+        # not /partner-login, a second, older login page under this same
+        # app that (independent of this fix) isn't reachable without an
+        # existing session, so redirecting there would reproduce the same
+        # "bounced to /login" failure this endpoint is fixing.
+        destination='/customer-login.html' if role in ('customer_owner','customer_viewer') else '/partner.html'
+        return {'message':'Password updated. You can now sign in.','destination':destination}
 
     @app.get('/reset-password',response_class=HTMLResponse)
     def password_reset_page(token: str=''):
@@ -134,7 +146,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         # logged is affected. Defaults masked (type="password") on load.
         # This page has one password field today (no separate confirm
         # field to mirror it onto).
-        content=f'''<style>.password-wrap{{position:relative}}.password-wrap input{{padding-right:5rem}}.show-password{{position:absolute;right:.4rem;top:.4rem;border:0;background:#edf1fa;border-radius:8px;padding:.48rem;cursor:pointer}}</style><header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<div class="password-wrap"><input id="reset-password" type="password" minlength="12" autocomplete="new-password" required><button id="show-password" class="show-password" type="button">Show</button></div></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('show-password').onclick=()=>{const input=document.getElementById('reset-password'),button=document.getElementById('show-password');input.type=input.type==='password'?'text':'password';button.textContent=input.type==='password'?'Show':'Hide'};document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href='/partner-login',800)})</script>'''; return shell('Reset password','users',content,scripts)
+        content=f'''<style>.password-wrap{{position:relative}}.password-wrap input{{padding-right:5rem}}.show-password{{position:absolute;right:.4rem;top:.4rem;border:0;background:#edf1fa;border-radius:8px;padding:.48rem;cursor:pointer}}</style><header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<div class="password-wrap"><input id="reset-password" type="password" minlength="12" autocomplete="new-password" required><button id="show-password" class="show-password" type="button">Show</button></div></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>document.getElementById('show-password').onclick=()=>{const input=document.getElementById('reset-password'),button=document.getElementById('show-password');input.type=input.type==='password'?'text':'password';button.textContent=input.type==='password'?'Show':'Hide'};document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href=r.destination||'/partner.html',800)})</script>'''; return shell('Reset password','users',content,scripts)
 
     # /forgot-password and /reset-password above render inside shell() --
     # the same dark Admin/Partner Portal chrome every /partner.html-side
