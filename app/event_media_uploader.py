@@ -43,6 +43,12 @@ RECORDINGS_ROOT = APP_ROOT / "recordings"
 # sets ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED now gets the same off-by-
 # default posture as every sibling cloud-call flag, not a silent
 # continuation of the previous always-on behavior.
+# Local capture is deliberately independent from transport.  It permits only
+# validation of the local clip/thumbnail paths and an atomic outbox write;
+# it never reads an appliance identity, requests STS credentials, contacts
+# the control plane, or initializes an S3 client.  Keep it off by default so
+# existing installations do not start retaining new event media unexpectedly.
+EVENT_MEDIA_CAPTURE_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_CAPTURE_ENABLED", "false").strip().lower() == "true"
 EVENT_MEDIA_UPLOAD_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED", "false").strip().lower() == "true"
 RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
 RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
@@ -69,6 +75,19 @@ def _local_path_from_recording_url(value: str | None) -> Path | None:
     except (OSError, ValueError):
         return None
     return path if path.is_file() else None
+
+
+def _safe_recording_url(value: str | None) -> str | None:
+    """Canonical local reference safe to persist in the durable outbox.
+
+    Recording URLs are paths, never bearer URLs.  Remove query and fragment
+    data before persistence so a caller cannot accidentally retain a token in
+    the outbox while still allowing the existing local path resolver to
+    validate containment.
+    """
+    if not value:
+        return None
+    return str(value).split("#", 1)[0].split("?", 1)[0]
 
 
 def _duration_seconds(path: Path) -> float | None:
@@ -166,21 +185,20 @@ def upload_motion_event_media(
     clip_url: str,
     thumbnail_url: str | None,
 ) -> bool:
-    # Checked first, before any local file/network work below: local
-    # event/clip/thumbnail creation (all upstream of this function) is
-    # never affected either way -- only the STS credential request, the
-    # S3 clip/thumbnail upload, and the two control-plane POSTs
-    # (_ensure_detection_event_synced()'s event registration and this
-    # function's own /events/{id}/media registration) are skipped.
-    if not EVENT_MEDIA_UPLOAD_ENABLED:
+    # Upload historically caused the first durable outbox write.  Preserve
+    # that behavior by making upload imply local capture, while allowing a
+    # separately enabled local-only capture run to stop before every
+    # credential, S3, and control-plane operation.
+    if not (EVENT_MEDIA_CAPTURE_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED):
         logger.info(
-            "event_media.upload_disabled event_id=%s camera=%s",
+            "event_media.capture_disabled event_id=%s camera=%s",
             event_id,
             camera_number,
         )
         return False
 
-    clip_path = _local_path_from_recording_url(clip_url)
+    safe_clip_url = _safe_recording_url(clip_url)
+    clip_path = _local_path_from_recording_url(safe_clip_url)
 
     if clip_path is None:
         logger.warning(
@@ -191,7 +209,28 @@ def upload_motion_event_media(
         )
         return False
 
-    thumbnail_path = _local_path_from_recording_url(thumbnail_url)
+    safe_thumbnail_url = _safe_recording_url(thumbnail_url)
+    thumbnail_path = _local_path_from_recording_url(safe_thumbnail_url)
+    if thumbnail_path is None:
+        safe_thumbnail_url = None
+
+    # Persist only deterministic local references and timing metadata.  In
+    # particular, no identity, bearer credential, STS material, bucket, or
+    # cloud-derived key can enter the durable outbox.
+    event_media_outbox.put({"event_id": event_id, "camera_number": camera_number,
+                            "event_start": event_start.isoformat(), "event_end": event_end.isoformat(),
+                            "clip_url": safe_clip_url, "thumbnail_url": safe_thumbnail_url})
+
+    # This is the hard local-only boundary.  Nothing below it may run unless
+    # the explicit transport flag is true.
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        logger.info(
+            "event_media.captured_local event_id=%s camera=%s thumbnail=%s",
+            event_id,
+            camera_number,
+            thumbnail_path is not None,
+        )
+        return True
 
     recording_upload._refresh_camera_map()
     identity = recording_upload._camera_identity(camera_number)
@@ -217,12 +256,6 @@ def upload_motion_event_media(
         return False
 
     camera_id = identity["camera_id"]
-    # Persist the original local references before the first cloud attempt.
-    # Repeating the deterministic S3 puts is safe, and lets a later worker
-    # resume after a crash or a failed upload/registration attempt.
-    event_media_outbox.put({"event_id": event_id, "camera_number": camera_number,
-                            "event_start": event_start.isoformat(), "event_end": event_end.isoformat(),
-                            "clip_url": clip_url, "thumbnail_url": thumbnail_url})
     session = recording_upload._ensure_session(camera_number, camera_id)
 
     if not session:
@@ -358,6 +391,12 @@ def upload_motion_event_media(
 def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     """Retry durable jobs on the next local worker tick; never contacts a
     service unless the normal event-media feature gate is enabled."""
+    # Keep this guard here as well as in event_media_retry_worker(): tests,
+    # diagnostics, and future supervisors may call this synchronous entry
+    # point directly.  An upload-disabled local-capture run must never turn
+    # into transport because of such a call.
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        return {"attempted": 0, "completed": 0, "pending": len(event_media_outbox.load())}
     attempted = completed = 0
     for job in event_media_outbox.due()[:max(1, max_jobs)]:
         attempted += 1
