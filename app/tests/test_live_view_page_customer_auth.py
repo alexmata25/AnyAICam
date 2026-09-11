@@ -93,7 +93,18 @@ def client(db_path):
             from partner_db import connection
             with connection() as conn:
                 _seed_two_customers(conn)
-        with TestClient(main.app) as test_client:
+        # base_url matches whatever this process's own ANYAICAM_TRUSTED_HOSTS
+        # allows -- confirmed live: this suite unconditionally failed every
+        # test with 400 Bad Request ("Invalid host header") in any
+        # environment that narrows trusted_hosts from the wide-open default
+        # (e.g. staging's portal-staging.anyaicam.com), since TestClient's
+        # default Host header ("testserver") was never in that list. Never
+        # exercised or noticed before because this suite had only ever been
+        # run in a clean environment with the untouched default.
+        from cloud_config import settings
+        trusted = settings.effective_trusted_hosts or []
+        allowed_host = "testserver" if ("*" in trusted or "testserver" in trusted or not trusted) else trusted[0]
+        with TestClient(main.app, base_url=f"http://{allowed_host}") as test_client:
             yield test_client
 
 
