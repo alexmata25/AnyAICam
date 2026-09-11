@@ -617,6 +617,189 @@ recorded above.
 
 ---
 
+## Staging blue-green design + rehearsal — GO (2026-09-11)
+
+Designed and rehearsed a blue-green traffic-switch mechanism that avoids
+depending on the image store staying stable (the exact thing that
+stopped the previous attempt). **Entirely read-only investigation +
+disposable-DB rehearsal — live BLUE/Caddy/storefront/DB never touched.**
+
+### Architecture
+
+- **BLUE** = the currently-running `anyaicam-staging-portal` container,
+  DNS-resolvable on the `deploy_default` bridge network as `portal`
+  (its network alias — matches Caddy's current `dial: "portal:8000"`).
+  Never removed, never rebuilt in this design.
+- **GREEN** = a new, separate container, `portal-green`, attached to the
+  *same* `deploy_default` network (so Caddy can reach it once switched)
+  but with **no host port published on that network** — only a
+  loopback-only host port (`127.0.0.1:18300`) for private testing.
+  Never externally reachable through Caddy until explicitly switched.
+- **Traffic switch mechanism — Caddy's Admin API, not the Caddyfile.**
+  Confirmed live on `127.0.0.1:2019` inside the caddy container (my
+  first probe via `wget localhost:2019` failed only because busybox
+  wget tried `::1` first; `127.0.0.1` explicitly works). The exact
+  reverse-proxy upstream lives at this JSON path in the running config
+  (derived by parsing a live `GET /config/`, not guessed):
+  `apps.http.servers.srv0.routes[0].handle[0].routes[0].handle[3].upstreams[0].dial`,
+  currently `"portal:8000"`. **A `PATCH` to that one path changes the
+  live upstream in memory only — the persistent `Caddyfile` on disk is
+  never touched, and no `caddy reload`/restart is needed.** This also
+  means an in-memory switch is inherently self-healing: if the admin
+  API path is ever abandoned or caddy is restarted/reloaded for any
+  other reason, it reverts to the Caddyfile's own `{$APP_UPSTREAM:vms:8000}`
+  default — i.e., whatever the compose file's `APP_UPSTREAM` env var
+  says (currently `portal:8000`, matching BLUE) — never silently stuck
+  pointing at a GREEN that no longer exists.
+
+### SQLite concurrency — the constraint that shapes the real cutover sequence
+
+Confirmed two hard facts, not assumptions:
+- The live DB (`ANYAICAM_PARTNER_DB=/app/data/staging.db`) uses
+  `journal_mode: delete` (SQLite's default rollback journal), **not
+  WAL** — only one writer is ever safe at a time; a second process
+  holding the same file open risks lock contention/corruption.
+- `live_relay_idle_sweep_worker()` (`app/live_relay_idle_sweep.py`),
+  which starts unconditionally for `RUNTIME_ROLE in {cloud, combined}`,
+  performs real DB writes every 10 seconds (`IDLE_SWEEP_INTERVAL_SECONDS`)
+  regardless of whether the container is receiving any HTTP traffic.
+
+**Conclusion, stated plainly rather than glossed over**: BLUE and GREEN
+must never both hold the live `staging.db` file open for writes at the
+same time — not even briefly, not even with zero incoming HTTP traffic,
+because BLUE's own background worker writes independently of traffic.
+A literal zero-downtime "both fully running against the same live file"
+design is not safe with this app's current default journal mode. The
+responsible design instead achieves **near-zero downtime** (a few
+seconds) while fully eliminating the concurrent-writer risk: **BLUE is
+briefly `docker stop`ped (never removed/rebuilt/retagged) immediately
+before GREEN is started against the real live DB file**, then Caddy is
+switched to GREEN. "BLUE remains running and immediately recoverable"
+is satisfied as "BLUE's container/image are never destroyed or
+replaced, and `docker start` brings it back instantly" — which is also
+exactly what avoids the previous attempt's image-store failure mode,
+since no image is ever re-tagged or rebuilt in this design at all.
+
+### Rehearsal performed (disposable copy only, per requirement 5)
+
+- Disposable DB copy: `~/blue-green-rehearsal/green-disposable.db`,
+  SHA-256 `7a997d95b72bff3a7838967dbcc29479243dd037047c231bb8fe4b35ada416ce`
+  (copied from the already-verified pre-cutover backup).
+- GREEN started from the already-built `deploy-portal:latest`
+  (`4ade2352b1ea6da9c56a339650773c01879c0b98`), attached to
+  `deploy_default`, env copied from live's non-secret config with a
+  throwaway `ANYAICAM_APP_SECRETS` and `ANYAICAM_PARTNER_DB` pointed at
+  the disposable file only.
+- **Verified privately** (via `127.0.0.1:18300`, never through Caddy):
+  `/health` 200; `/version` clean; `/ready` 503 with `self_test.ok:
+  true`/`configuration_valid: true` (expected — no AWS configured,
+  matching live reality); claim route genuinely registered (422 on an
+  empty body, not 404); `claim/begin` with a real UUIDv4 returned a real
+  `claim_session_id`/`claim_code`.
+- **DB integrity/visibility**: `PRAGMA integrity_check: ok`; reference
+  row counts (`appliances:3, customers:3, partner_users:4, cameras:15`)
+  unchanged from baseline; only the one intentional `appliance_claims`
+  test row present.
+- **No unintended workers**: only `live_relay_idle_sweep_task` started
+  (correctly cloud/combined-role-gated); no edge-only worker.
+- **BLUE confirmed unaffected throughout**: `/health` 200, `claim/begin`
+  still 404 (proving BLUE never changed), uptime continuous.
+- **Caddy confirmed untouched throughout**: the admin API path above
+  still reads `"portal:8000"` after the full rehearsal — no PATCH was
+  ever sent to it in this rehearsal, per "do not execute the live
+  traffic switch."
+- Rehearsal container (`portal-green`) stopped and removed afterward;
+  the disposable DB copy and env file remain at
+  `~/blue-green-rehearsal/` for reference.
+
+### Exact live cutover procedure (NOT executed — for review)
+
+```bash
+# 1. Fresh pre-cutover DB backup + row-count baseline (same method as before)
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+sudo python3 -c "
+import sqlite3
+srcconn = sqlite3.connect('file:/var/lib/anyaicam-staging/db/staging.db?mode=ro', uri=True)
+dstconn = sqlite3.connect(f'/var/lib/anyaicam-staging/db/staging-pre-bluegreen-backup-${TS}.db')
+srcconn.backup(dstconn); dstconn.close(); srcconn.close()
+"
+sudo sha256sum /var/lib/anyaicam-staging/db/staging-pre-bluegreen-backup-${TS}.db
+
+# 2. Build GREEN's real env (live non-secret values + throwaway secret --
+#    same scrubbing approach as the rehearsal, but pointed at the REAL DB)
+sudo bash ~/build_rehearsal_env.sh   # or hand-adapt; sets ANYAICAM_PARTNER_DB
+sed -i 's|ANYAICAM_PARTNER_DB=.*|ANYAICAM_PARTNER_DB=/app/data/staging.db|' ~/blue-green-rehearsal/green.env
+sed -i '/^ANYAICAM_APP_SECRETS=/d' ~/blue-green-rehearsal/green.env
+sudo grep '^ANYAICAM_APP_SECRETS=' /etc/anyaicam-staging/vms-staging.env >> ~/blue-green-rehearsal/green.env  # use the REAL secret for the real cutover, not the rehearsal throwaway
+
+# 3. Stop BLUE (preserve, never remove) -- brief downtime window starts
+docker stop anyaicam-staging-portal
+
+# 4. Start GREEN against the REAL live DB file
+docker run -d --name portal-green --network deploy_default \
+  --env-file ~/blue-green-rehearsal/green.env \
+  -v /var/lib/anyaicam-staging/db:/app/data \
+  -v /var/lib/anyaicam-staging/recordings:/app/recordings \
+  -v /var/lib/anyaicam-staging/hls:/app/static/hls \
+  -v /var/lib/anyaicam-staging/data-config:/opt/anyaicam/data/config \
+  deploy-portal:latest
+
+# 5. Verify GREEN privately before switching traffic (no host port needed --
+#    exec into caddy or use `docker exec portal-green` for a loopback check)
+sleep 8
+docker exec anyaicam-staging-caddy wget -qO- --header='Host: portal-staging.anyaicam.com' http://portal-green:8000/health
+docker exec anyaicam-staging-caddy wget -qO- --header='Host: portal-staging.anyaicam.com' http://portal-green:8000/version
+
+# 6. Switch traffic -- Caddy admin API PATCH, Caddyfile untouched
+docker exec anyaicam-staging-caddy wget -q --method=PATCH \
+  --header='Content-Type: application/json' \
+  --body-data='"portal-green:8000"' \
+  -O- http://127.0.0.1:2019/config/apps/http/servers/srv0/routes/0/handle/0/routes/0/handle/3/upstreams/0/dial
+# downtime window ends here
+
+# 7. Post-switch verification through the real public path
+curl -s -H "Host: portal-staging.anyaicam.com" -w "\nHTTP_STATUS:%{http_code}\n" https://portal-staging.anyaicam.com/health
+curl -s -H "Host: portal-staging.anyaicam.com" https://portal-staging.anyaicam.com/version; echo
+DEVICE_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+curl -s -H "Host: portal-staging.anyaicam.com" -H "Content-Type: application/json" -X POST \
+  -d "{\"device_id\":\"$DEVICE_ID\"}" -w "\nHTTP_STATUS:%{http_code}\n" \
+  https://portal-staging.anyaicam.com/api/appliance/claim/begin
+
+# 8. DB integrity/row-count re-check against the now-live-again real file
+sudo python3 ~/inspect_staging_schema.py /var/lib/anyaicam-staging/db/staging.db
+```
+
+### Rollback (immediate, from GREEN back to still-preserved BLUE)
+
+```bash
+# Traffic first
+docker exec anyaicam-staging-caddy wget -q --method=PATCH \
+  --header='Content-Type: application/json' \
+  --body-data='"portal:8000"' \
+  -O- http://127.0.0.1:2019/config/apps/http/servers/srv0/routes/0/handle/0/routes/0/handle/3/upstreams/0/dial
+# Then stop GREEN (it's the one holding the live DB file now) and restart BLUE
+docker stop portal-green && docker rm portal-green
+docker start anyaicam-staging-portal
+curl -s -H "Host: portal-staging.anyaicam.com" -w "\nHTTP_STATUS:%{http_code}\n" https://portal-staging.anyaicam.com/health
+```
+Rollback triggers: any of the same conditions from the earlier
+cutover-attempt plan (health ≠ 200, claim/begin 404 or 5xx, row-count
+drift beyond the one intentional test claim, integrity_check ≠ ok, new
+container unhealthy within ~2 minutes).
+
+### GO / NO-GO
+
+**GO**, with one disclosed, deliberate deviation from a literal
+zero-downtime ask: a few seconds of BLUE downtime while GREEN takes over
+the live DB file, required by SQLite's non-WAL journal mode and
+`live_relay_idle_sweep_worker`'s unconditional periodic writes. This is
+the responsible tradeoff — the alternative (both running against the
+same file simultaneously) is a real corruption risk, not a rehearsal
+formality. Not yet executed; awaiting explicit GO for the live traffic
+switch.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
