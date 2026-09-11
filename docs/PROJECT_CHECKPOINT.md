@@ -55,31 +55,53 @@ This branch merges, with deliberate conflict resolution (not a blind merge):
   `restart_count` migration
 
 **RC1 was deployed to Ryzen (2026-09-11, clean install) and failed
-validation** — see "RC1 → RC2 on Ryzen" below. **RC2 fixes that defect and
-has been built + locally smoke-tested but NOT yet deployed to Ryzen** (or
-anywhere else — not staging, not Samsung). Do not treat RC2 as deployed
-until a specific deploy record says otherwise, added below.
+validation** — see "RC1 → RC2 on Ryzen" below. **RC2 fixed that source
+defect and was deployed to Ryzen, where its own `validate.sh` surfaced a
+second, independent, installer-only defect** — see "RC2 → RC3 on Ryzen"
+below. **RC3 fixes that and has been built (installer artifact only —
+its VMS image is byte-identical to RC2's, see note below) but NOT yet
+deployed to Ryzen.** Do not treat RC3 as deployed until a specific deploy
+record says otherwise, added below.
 
 ```
+GOLDEN BUILD: golden-foundation-rc3 — commit 4ade235
+  (full sha 4ade2352b1ea6da9c56a339650773c01879c0b98)
+Built: 2026-09-11, from `reconcile/golden-foundation-20260911` worktree
+  `AnyAiCam-VMS-reconciliation`.
+VMS container image: IDENTICAL to RC2's -- `git diff --stat 34d9d5c 4ade235
+  -- app/ appliance-agent/ Dockerfile requirements.txt requirements-cpu.txt`
+  is empty; this commit only changes `installer/validate.sh` and
+  `installer/tests/run_tests.sh`. No new VMS image was built; RC3's
+  installer, when run, produces the exact same VMS image RC2's did
+  (digest sha256:6ff38cc2c81f6398ce6b95abf42ce5056a8f9eec5a67258dd1f2cb06e9f930af,
+  tags anyaicam-vms:golden-rc2/golden-rc3/34d9d5c/4ade235 all equivalent).
+Installer artifact (the actual thing to deploy — built via
+  installer/build_release_installer.py --vms-commit 4ade2352b1ea6da9c56a339650773c01879c0b98):
+  anyaicam-appliance-installer-1.1.0-vms-4ade2352b1ea.tar.gz
+  artifact sha256: f8797d627a580363f2f1807c9a7d9b91f29c73df84a4348b30fee49afc56e5c7
+  embedded source sha256: 051236ff6cd14821019e711e66f97ae061c5a6e539b84b6c631553ff74a3fa21
+Tested: installer/tests/run_tests.sh (66 passed incl. 5 new
+  ready_endpoint_self_test_ok() cases, same 11 pre-existing unrelated
+  failures as the unmodified script) + installer/tests/test_build_release_installer.py
+  (12 passed, 1 pre-existing skip). Not yet deployed/validated on Ryzen.
+
+Prior build (RC2, source defect fixed, but its own installer's validate.sh
+had a second, independent defect — see "RC2 → RC3 on Ryzen" below):
 GOLDEN BUILD: golden-foundation-rc2 — commit 34d9d5c
   (full sha 34d9d5ca96b674f0d4a7212bbf7996d52f063fa0)
-Built: 2026-09-11, from `reconcile/golden-foundation-20260911` worktree
-  `AnyAiCam-VMS-reconciliation`, via the repo's own `Dockerfile` (the same
-  one deploy/docker-compose.*.example.yml reference — NOT Dockerfile.production,
-  which nothing in this repo actually deploys with).
 VMS container image digest (local build, not yet pushed to a registry):
   sha256:6ff38cc2c81f6398ce6b95abf42ce5056a8f9eec5a67258dd1f2cb06e9f930af
   tags: anyaicam-vms:golden-rc2, anyaicam-vms:34d9d5c
-Installer artifact (the actual thing to deploy — built via
-  installer/build_release_installer.py --vms-commit 34d9d5ca96b674f0d4a7212bbf7996d52f063fa0):
+Installer artifact:
   anyaicam-appliance-installer-1.1.0-vms-34d9d5ca96b6.tar.gz
   artifact sha256: 8912bcd17041cad1ad0cbf813a5dcb148b23deb2dd1e0c7b1da17893a3283566
-  embedded source sha256: b04b976979f41baa6f27e8e1d4ed670745981f45c7f3b3a626110a29656bc51d
-Local smoke test (Windows dev machine, disposable container, NOT Ryzen):
-  ANYAICAM_RUNTIME_ROLE=edge + ANYAICAM_ENV=production + zero cameras ->
-  self_test.ok=true, configuration_valid 0 critical (was 6). ready=false
-  still, correctly, because recording_workers=0 (edge role legitimately
-  requires recording>0) -- expected until cameras are discovered.
+Deployed to: Ryzen (2026-09-11) as a clean install; install itself
+  succeeded, but its bundled `validate.sh` failed on the second defect
+  above. **Still installed and running on Ryzen as of this writing** --
+  not wiped, not touched further (no patches, no restart, no camera
+  discovery, no claim) since the failure was diagnosed. See
+  "RC2 → RC3 on Ryzen" below and `docs/checkpoints/RYZEN.md` for Ryzen's
+  exact current live state before assuming otherwise.
 
 Prior build (RC1, failed validation — kept for history, do not deploy):
 GOLDEN BUILD: golden-foundation-rc1 — commit 1dfcbf2
@@ -150,9 +172,64 @@ Locally smoke-tested (see GOLDEN BUILD block above): `self_test.ok`
 flips true, `configuration_valid` critical count 6 → 0, for the exact
 production+edge+zero-cloud-config shape Ryzen hit.
 
-**Not yet re-deployed to Ryzen.** RC2 (`34d9d5c`) is built and locally
-verified only. Camera discovery/claim on Ryzen was never reached (blocked
-by the RC1 failure) — still pending.
+RC2 (`34d9d5c`) was then deployed to Ryzen the same way as RC1 (Ryzen
+purged again first via `uninstall.sh --purge-all`, fresh transfer,
+SHA-256 verify, `sudo bash install.sh`). See "RC2 → RC3 on Ryzen" below
+for what that deployment found.
+
+---
+
+## RC2 → RC3 on Ryzen (2026-09-11)
+
+RC2 (`34d9d5c`) installed clean on Ryzen exactly like RC1 (Ryzen was
+purged again first: `uninstall.sh --purge-all`, plus removal of two
+unrelated stale Docker volumes from an old `test1` compose project,
+`anyaicam-test1_test1_hls`/`anyaicam-test1_test1_recordings`, confirmed
+via their on-disk content/timestamps to be ~2-week-old stale lab-test
+data, not RC1 leftovers). `install.sh` reported `detected state=clean`
+and the exact approved commit. `validate.sh` then reported exactly one
+failure: `FAIL: VMS local ready endpoint responds`.
+
+Live diagnostics on Ryzen (`curl -s -w '\nHTTP_STATUS:%{http_code}\n'
+http://127.0.0.1:8000/ready`, read-only, no patches) confirmed the RC1
+defect was genuinely fixed: `self_test.ok: true`, `configuration_valid:
+true`, `0 critical` issues. `/ready` still returned HTTP 503 only because
+`ready: false` — expected, since a fresh, unclaimed, zero-camera edge
+appliance has `recording_workers: 0`, and `readiness_snapshot()`
+deliberately requires `recording>0` for the edge role.
+
+**Root cause (a second, independent, installer-only defect — confirmed
+by reading `installer/validate.sh`, not guesswork):** the ready-endpoint
+check used `curl -fsS ... /ready`; curl's `-f` flag treats *any* non-2xx
+HTTP status as failure. Since a genuinely fresh appliance's `/ready`
+legitimately returns 503 until it has cameras, `validate.sh` could never
+pass on a truly clean install — it was conflating "the VMS process
+started correctly" (`self_test.ok`) with "this specific appliance
+already has a camera recording" (`ready`), a business-readiness
+condition `install.sh` never establishes and `validate.sh` was never in
+a position to require.
+
+**Fixed in commit `4ade235`** (on top of `34d9d5c`): `installer/
+validate.sh`'s check now fetches `/ready` without `-f` (so a 503 still
+yields the JSON body) and asserts `self_test.ok` directly instead of the
+HTTP status code. Still correctly fails if the VMS is genuinely
+unreachable or actually broken. `validate.sh`'s top-level check
+invocations were also refactored into a `run_validate()` function behind
+the same source-vs-execute guard `install.sh`/`uninstall.sh` already
+use, making it safely unit-testable for the first time. Regression
+coverage: `installer/tests/run_tests.sh`, 5 new cases (the exact
+Ryzen/RC2 shape passes; RC1's real defect shape still fails; a fully
+ready appliance still passes; an unreachable VMS still fails; a
+malformed response still fails).
+
+**Not yet re-deployed to Ryzen.** RC3 (`4ade235`) is built (installer
+artifact only — its VMS image is byte-identical to RC2's, `app/`/
+`appliance-agent/`/`Dockerfile`/requirements are untouched by this
+commit) but not yet transferred or installed. **Ryzen currently still
+has RC2 installed and running**, unclaimed, zero cameras, untouched
+since the `validate.sh` failure was diagnosed (no patches, no restart,
+no camera discovery, no claim attempted) — see
+`docs/checkpoints/RYZEN.md` for its exact live state.
 
 ---
 
