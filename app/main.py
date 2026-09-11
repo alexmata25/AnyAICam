@@ -12183,41 +12183,29 @@ def configuration_issues() -> list[dict]:
 
     if DEPLOYMENT_ENV in {"staging", "production"}:
 
+        # AWS/cloud infrastructure (AWS_REGION, external database, S3
+        # bucket, public URL, Secrets Manager) is only ever required for
+        # an appliance that does cloud-facing work directly --
+        # RUNTIME_ROLE cloud/combined -- matching readiness_snapshot()'s
+        # own role scoping one level up (role_ready only requires
+        # cloud_foundation_ready for those two roles, never for edge).
+        # A pure edge appliance's own cloud interactions go through the
+        # appliance-agent's separately-scoped claim/upload credentials,
+        # never these env vars baked into the VMS container itself --
+        # requiring them here made every genuinely clean edge install
+        # permanently un-ready regardless of camera/claim state, since
+        # this check ignored RUNTIME_ROLE entirely. Confirmed live on
+        # Ryzen's first zero-manual-patch clean install (2026-09-11,
+        # golden-foundation-rc1 -> rc2): every prior Ryzen validation had
+        # AWS_REGION etc. already hand-patched into vms.env from earlier
+        # sessions, which is exactly what masked this. Regression tests:
+        # app/tests/test_ready_endpoint_role_aware_configuration.py.
+        if RUNTIME_ROLE in {"cloud", "combined"}:
 
 
 
 
-
-
-
-        cloud_checks = cloud_configuration_snapshot()
-
-
-
-
-
-
-
-
-        for key in cloud_checks["missing_cloud_requirements"]:
-
-
-
-
-
-
-
-
-            issues.append({
-
-
-
-
-
-
-
-
-                "key": key,
+            cloud_checks = cloud_configuration_snapshot()
 
 
 
@@ -12226,25 +12214,12 @@ def configuration_issues() -> list[dict]:
 
 
 
-                "severity": "warning" if DEPLOYMENT_ENV == "staging" else "critical",
-
-
-
-
-
-
-
-
-                "message": f"AWS deployment requirement is not configured: {key}.",
-
-
-
-
-
-
-
-
-            })
+            for key in cloud_checks["missing_cloud_requirements"]:
+                issues.append({
+                    "key": key,
+                    "severity": "warning" if DEPLOYMENT_ENV == "staging" else "critical",
+                    "message": f"AWS deployment requirement is not configured: {key}.",
+                })
 
 
 
@@ -12307,51 +12282,21 @@ def configuration_issues() -> list[dict]:
 
 
 
-        if DEPLOYMENT_ENV == "production" and not FORCE_HTTPS:
-
-
-
-
-
-
-
-
+        # Mirrors _default_force_https()'s own edge_production carve-out
+        # exactly: a production edge appliance has no TLS listener of its
+        # own (reached over a private LAN/Tailscale, or an operator-
+        # provided reverse proxy that terminates TLS in front of it), so
+        # FORCE_HTTPS correctly *defaults* to False there already -- this
+        # check used to require it be True anyway, contradicting its own
+        # default and permanently failing configuration_valid on every
+        # production edge box that hasn't explicitly overridden it.
+        # Cloud/combined production is unchanged -- still required.
+        edge_production = DEPLOYMENT_ENV == "production" and RUNTIME_ROLE == "edge"
+        if DEPLOYMENT_ENV == "production" and not edge_production and not FORCE_HTTPS:
             issues.append({
-
-
-
-
-
-
-
-
                 "key": "ANYAICAM_FORCE_HTTPS",
-
-
-
-
-
-
-
-
                 "severity": "critical",
-
-
-
-
-
-
-
-
                 "message": "HTTPS enforcement must be enabled in production.",
-
-
-
-
-
-
-
-
             })
 
 
