@@ -738,7 +738,23 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         fine at the DB level; the client's own HLS/manifest polling
         (already real, not a cached/stale frame -- see
         camera_status()/get_camera_numbers() in main.py) is what actually
-        confirms a live stream is flowing."""
+        confirms a live stream is flowing.
+
+        'degraded' is NOT the same as offline -- health_state()
+        (appliance_protocol.py) sets online_status='degraded' for
+        warnings like low_disk or high_cpu on an appliance that is still
+        heartbeating, still authenticated, and still actively relaying
+        video (confirmed live: an appliance at 91.9% disk usage kept
+        streaming all 5 cameras successfully through the multi-camera
+        grid page throughout). Blocking live view here on 'degraded'
+        alone was the actual bug -- this endpoint previously treated any
+        non-'online' status identically to a genuinely unreachable
+        appliance, which is what silently defeated the dedicated
+        single-camera page while the grid page (no such pre-check)
+        thereby worked. Every other non-'online','degraded' value
+        (offline, revoked, None/NULL, or anything future/unrecognized)
+        still fails closed as appliance_offline -- only these two known,
+        explicitly-modeled "still reachable" states are let through."""
         identity = partner_identity(request)
         if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
             return RedirectResponse('/partner-login', status_code=303)
@@ -749,6 +765,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             appliance = db.execute(
                 'SELECT online_status FROM appliances WHERE id=?', (camera.get('appliance_id'),)
             ).fetchone()
+            if appliance and appliance['online_status'] == 'degraded':
+                return {'state': 'degraded', 'message': 'The appliance is reporting a health warning; live view may be affected.'}
             if appliance and appliance['online_status'] != 'online':
                 return {'state': 'appliance_offline', 'message': 'The appliance for this camera is offline.'}
         return {'state': 'unknown'}
@@ -1027,7 +1045,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       // Every analytic always gets a pill -- enabled ones show real
       // results, disabled ones show an upgrade card (punch-list:
       // "no dead space, never leave the analytics section blank").
-      analyticsPills.innerHTML=analytics.map(item=>`<button type="button" class="filter" role="tab" data-key="${{item.key}}">${{item.label}}${{item.enabled?'':' <span class='pill wait' style='margin-left:4px'>Upgrade</span>'}}</button>`).join('');
+      analyticsPills.innerHTML=analytics.map(item=>`<button type="button" class="filter" role="tab" data-key="${{item.key}}">${{item.label}}${{item.enabled?'':' <span class="pill wait" style="margin-left:4px">Upgrade</span>'}}</button>`).join('');
       [...analyticsPills.children].forEach(pill=>pill.addEventListener('click',()=>selectAnalytic(pill.dataset.key)));
       analyticsSection.hidden=false;
       const firstEnabled=analytics.find(item=>item.enabled);
@@ -1042,6 +1060,11 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         const {{state,message}}=await response.json();
         if(state==='not_configured'){{setStatus(message||'Not configured');placeholder.hidden=false;return}}
         if(state==='appliance_offline'){{setStatus(message||'Appliance offline');placeholder.hidden=false;return}}
+        // 'degraded' is a health warning (e.g. low disk), not an outage --
+        // the appliance is still heartbeating and relaying, so live view
+        // proceeds normally; the warning is only surfaced as a transient
+        // status line, never blocking startSession() below.
+        if(state==='degraded'){{setStatus(message||'Appliance health warning -- starting live view…')}}
       }}
     }}catch(e){{}}
     startSession();
