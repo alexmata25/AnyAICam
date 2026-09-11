@@ -1,8 +1,8 @@
 # Ryzen appliance — checkpoint
 
-**Read `docs/PROJECT_CHECKPOINT.md` first.** This file assumes that context,
-and in particular the "RC1 → RC2 on Ryzen" and "RC2 → RC3 on Ryzen"
-sections there.
+**Read `docs/PROJECT_CHECKPOINT.md` first.** This file assumes that
+context, and in particular the "RC1 → RC2 on Ryzen", "RC2 → RC3 on
+Ryzen", and "RC3 on Ryzen — PASSED" sections there.
 
 ## 2026-09-11: Ryzen was wiped and reinstalled clean — do not assume anything below this line about "5 real cameras" applies anymore
 
@@ -29,66 +29,56 @@ reactivated with a genuine paying customer's identity in the future, this
 file must be updated again to say so explicitly before "do not touch"
 language applies again.
 
-## Current real state (as of the 2026-09-11 RC2 install)
+## Current real state (as of the 2026-09-11 RC3 install — validate.sh PASSED)
 
-- **Disk**: was 100% full / 0 bytes free before the first wipe; freed to
-  346GB. After RC1's uninstall + RC2 install + removal of two stale,
-  unrelated `test1`-project Docker volumes (`anyaicam-test1_test1_hls`/
-  `_recordings`, ~962MB, confirmed 2+ weeks old): **405GB free, 8% used
-  (28GB)**, fully accounted for (Docker build cache ~2.85GB + systemd
-  journal ~1.8GB, both left alone as unrelated to AnyAiCam).
-- **RC1** (`1dfcbf2`) was installed clean, but its `validate.sh` failed on
-  a real source defect (`configuration_issues()` not being
-  `RUNTIME_ROLE`-aware). Ryzen was purged again (`uninstall.sh
-  --purge-all`) before RC2.
-- **RC2** (`34d9d5c`) fixes that defect and **is currently installed and
-  running on Ryzen right now** (`anyaicam-vms.service`/
-  `anyaicam-agent.service` both active). Confirmed live via raw `/ready`
-  diagnostics: `self_test.ok: true`, `configuration_valid: true`, 0
-  critical issues -- the RC1 defect is genuinely fixed. RC2's own
-  `validate.sh` still reported one failure, but it was `validate.sh`
-  itself that was wrong (see PROJECT_CHECKPOINT.md's "RC2 → RC3 on
-  Ryzen"), not the running software.
-- **RC3** (`4ade235`) fixes that `validate.sh` defect (installer-only
-  change; VMS image identical to RC2's) and is built, but **has not been
-  transferred to or installed on Ryzen yet**.
-- **Ryzen has NOT been touched since RC2's `validate.sh` failure was
-  diagnosed** -- explicitly no patches, no restart, no config changes, no
-  camera discovery, no claim attempt. It is sitting exactly as RC2's
-  installer left it.
-- **Appliance identity**: RC2's install issued a fresh
-  `installer/09-identity.sh` UUID (distinct from RC1's
-  `99c44cb8-428d-44e4-a1bf-41f95fd2e268`, which no longer applies -- get
-  the current one via `sudo cat /etc/anyaicam/appliance_identity.json` if
-  needed; not re-recorded here since it will change again once RC3 goes
-  through its own clean install). This is installer identity only, not a
-  cloud claim/activation -- no `cloud_id`/`customer_id` exists.
+- **Disk**: 405GB free, 8% used (28GB) as of the RC2 install; not
+  independently rechecked after RC3's repair-path install (expect no
+  material change -- RC3's VMS image is byte-identical to RC2's, no new
+  layers to pull/build beyond what's already cached).
+- **RC1** (`1dfcbf2`) installed clean, but `validate.sh` failed on a real
+  source defect (`configuration_issues()` not `RUNTIME_ROLE`-aware).
+  Ryzen was purged (`uninstall.sh --purge-all`) before RC2.
+- **RC2** (`34d9d5c`) fixed that defect (confirmed live via raw `/ready`
+  diagnostics before RC3 was deployed). Its own `validate.sh` had a
+  separate, installer-only defect (curl -f treating a legitimate 503 as
+  failure).
+- **RC3** (`4ade235`) fixed the `validate.sh` defect and **is now
+  installed and running on Ryzen, with `validate.sh` PASSING (0
+  failures)** -- the first golden build to pass its own installer's full
+  validation on real hardware. Deployed via the repair path (RC2 was
+  never wiped for this step -- `detect_install_state()` correctly
+  reported 5/5 markers -> `existing`, confirmed in the actual output, not
+  assumed).
+- **No runtime patches were applied at any point** across RC1, RC2, or
+  RC3 on Ryzen -- every fix that mattered went through
+  BUG FOUND → FIX SOURCE → REGRESSION TEST → COMMIT → BUILD → DEPLOY →
+  VERIFY, never a hand-edit on the box itself.
+- **Appliance identity**: preserved from the RC2 install (RC3 was a
+  repair-path install, not a fresh one, so the identity file was not
+  regenerated). Read it live via `sudo cat
+  /etc/anyaicam/appliance_identity.json` if the exact UUID is needed --
+  not recorded here since a value that can change with a future
+  clean-install run isn't safe to treat as a citable fact after the
+  fact. This is installer identity only, not a cloud claim/activation --
+  no `cloud_id`/`customer_id` exists yet.
 - **Cameras**: zero configured, zero discovered, zero recording -- by
-  design, this is still a pre-claim, pre-discovery installer validation
-  appliance, not yet a functioning camera system.
+  design. Claim/activation and camera discovery have not been performed.
 - **Live Relay / Motion Cloud / customer portal / Live View**: not yet
-  validated against RC2 or RC3 -- blocked behind claim + camera discovery,
+  validated against RC3 -- blocked behind claim + camera discovery,
   neither of which has happened yet.
 
 ## Exact next step
 
-1. Deploy RC3 (`4ade235`) to Ryzen. Since RC2 is currently installed
-   (not wiped), `install.sh`'s `detect_install_state()` should detect
-   `existing` and go through the repair path automatically -- confirm
-   this is what actually happens rather than assuming; do not manually
-   force a mode. Transfer the artifact (SHA-256:
-   `f8797d627a580363f2f1807c9a7d9b91f29c73df84a4348b30fee49afc56e5c7`,
-   see PROJECT_CHECKPOINT.md), verify on both ends, `sudo bash
-   install.sh`.
-2. Run `validate.sh` again; confirm ALL checks pass this time, including
-   the fixed ready-endpoint check.
-3. Proceed through the actual claim/activation flow (`anyaicam-setup
+1. Proceed through the actual claim/activation flow (`anyaicam-setup
    --claim` or interactive) — this establishes a **new** cloud identity;
    do not attempt to reuse any prior `cloud_id`/`customer_id` from before
-   either wipe.
-4. Reconnect the 5 physical cameras through the supported discovery
+   either wipe (RC1's `99c44cb8-428d-44e4-a1bf-41f95fd2e268` installer
+   identity, or the pre-reconciliation real activation
+   `AIC-C90CF0C9`/`4efaf5153f` -- neither applies to this appliance
+   anymore).
+2. Reconnect the 5 physical cameras through the supported discovery
    workflow (not manual CAMERA{n}_* env vars).
-5. Validate, in order: recording, motion detection/event media, Motion
+3. Validate, in order: recording, motion detection/event media, Motion
    Cloud upload (once camera + cloud identity + AWS config all exist),
    customer portal camera mapping/status, Live View (both grid and
    dedicated single-camera pages), restart persistence, and specifically
@@ -97,6 +87,6 @@ language applies again.
    closed in source as of `1dfcbf2`, but has never been checked against
    Ryzen's *actual* real hardware/restart behavior, only against the
    regression test suite).
-6. Update this file again once any of the above changes real state on
+4. Update this file again once any of the above changes real state on
    Ryzen — a checkpoint that isn't updated is worse than none, per
    `docs/PROJECT_CHECKPOINT.md`'s own standing rule.

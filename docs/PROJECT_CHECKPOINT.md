@@ -58,10 +58,12 @@ This branch merges, with deliberate conflict resolution (not a blind merge):
 validation** — see "RC1 → RC2 on Ryzen" below. **RC2 fixed that source
 defect and was deployed to Ryzen, where its own `validate.sh` surfaced a
 second, independent, installer-only defect** — see "RC2 → RC3 on Ryzen"
-below. **RC3 fixes that and has been built (installer artifact only —
-its VMS image is byte-identical to RC2's, see note below) but NOT yet
-deployed to Ryzen.** Do not treat RC3 as deployed until a specific deploy
-record says otherwise, added below.
+below. **RC3 fixes that and has been deployed to Ryzen (repair-path
+install over the existing RC2 install) and PASSED validate.sh with 0
+failures** — see "RC3 on Ryzen — PASSED" below. RC3 is the first golden
+build to pass its own installer's full validation on real hardware.
+**Claim/activation and camera discovery have NOT been performed yet** —
+do not treat those as done.
 
 ```
 GOLDEN BUILD: golden-foundation-rc3 — commit 4ade235
@@ -83,7 +85,11 @@ Installer artifact (the actual thing to deploy — built via
 Tested: installer/tests/run_tests.sh (66 passed incl. 5 new
   ready_endpoint_self_test_ok() cases, same 11 pre-existing unrelated
   failures as the unmodified script) + installer/tests/test_build_release_installer.py
-  (12 passed, 1 pre-existing skip). Not yet deployed/validated on Ryzen.
+  (12 passed, 1 pre-existing skip).
+Deployed to: Ryzen (2026-09-11), repair-path install over the existing
+  RC2 install (detect_install_state() correctly reported 5/5 markers ->
+  existing, not clean). validate.sh PASSED: 0 failures -- see "RC3 on
+  Ryzen — PASSED" below for the full result.
 
 Prior build (RC2, source defect fixed, but its own installer's validate.sh
 had a second, independent defect — see "RC2 → RC3 on Ryzen" below):
@@ -222,14 +228,49 @@ Ryzen/RC2 shape passes; RC1's real defect shape still fails; a fully
 ready appliance still passes; an unreachable VMS still fails; a
 malformed response still fails).
 
-**Not yet re-deployed to Ryzen.** RC3 (`4ade235`) is built (installer
-artifact only — its VMS image is byte-identical to RC2's, `app/`/
-`appliance-agent/`/`Dockerfile`/requirements are untouched by this
-commit) but not yet transferred or installed. **Ryzen currently still
-has RC2 installed and running**, unclaimed, zero cameras, untouched
-since the `validate.sh` failure was diagnosed (no patches, no restart,
-no camera discovery, no claim attempted) — see
-`docs/checkpoints/RYZEN.md` for its exact live state.
+RC3 (`4ade235`) was built (installer artifact only — its VMS image is
+byte-identical to RC2's, `app/`/`appliance-agent/`/`Dockerfile`/
+requirements untouched by this commit), then deployed to Ryzen. See
+"RC3 on Ryzen — PASSED" below.
+
+---
+
+## RC3 on Ryzen — PASSED (2026-09-11)
+
+RC3 (`4ade235`) was transferred to Ryzen, SHA-256-verified on both ends
+(artifact `f8797d627a580363f2f1807c9a7d9b91f29c73df84a4348b30fee49afc56e5c7`),
+extracted, and `release.env` confirmed (`VMS_RELEASE_COMMIT`/
+`INSTALLER_SOURCE_COMMIT` both `4ade2352b1ea6da9c56a339650773c01879c0b98`,
+`VMS_RELEASE_SHA256` `051236ff6cd14821019e711e66f97ae061c5a6e539b84b6c631553ff74a3fa21`)
+before running anything. `sudo bash install.sh` was then run directly
+over the existing RC2 install (no wipe this time — RC2 was left running
+untouched since its `validate.sh` failure was diagnosed).
+
+`install.sh` correctly detected **`existing`** (5/5 markers), routing
+through the repair path rather than clean-install — confirmed, not
+assumed. Existing appliance identity was preserved (not regenerated).
+Installed release confirmed as the exact approved commit.
+
+**`validate.sh` PASSED with 0 failures** — the first golden build to
+pass its own installer's full validation on real hardware:
+- Health endpoint: PASS
+- Ready endpoint reachable + `self_test` PASS (the `4ade235` fix, live)
+- Zero-camera business readiness correctly **not** required at install
+  time (the exact behavior `ready_endpoint_self_test_ok()` was written
+  to produce)
+- `/version` reports exact approved commit: PASS
+- All other pre-existing checks (systemd units, quarantine directory,
+  suspend/hibernate masking, release markers, etc.): PASS
+
+This physically confirms both the `34d9d5c` role-aware-configuration fix
+and the `4ade235` `validate.sh` fix on real hardware, not just in
+regression tests or a disposable local container.
+
+**Ryzen's current real state:** RC3 installed and running, `validate.sh`
+clean. **Still unclaimed, zero cameras** — no claim/activation and no
+camera discovery have been performed. No runtime patches applied at any
+point in the RC1→RC2→RC3 sequence. See `docs/checkpoints/RYZEN.md` for
+the exact current state before the next session acts on it.
 
 ---
 
