@@ -261,21 +261,50 @@ fixture's customer, which is a fixture/entitlement-seeding question, not a
 feature-flag question — flagged for further investigation, not yet
 root-caused.
 
-**Control run in progress**: to separate "caused by reconciliation" from
-"caused by running tests inside a container configured for real staging
-traffic" without hand-verifying every one of the 231 failures individually,
-the *currently-deployed* code (copied directly from the running
-container's `/app`, since no `git` binary is available inside it to check
-out a specific commit) is being run through the identical harness
-(`/tmp/control_test`, same `ANYAICAM_TRUSTED_HOSTS` override, output to
-`/tmp/control_output.txt`) as a same-environment control. If the control
-run shows a similarly elevated failure count with the same file
-clustering, that confirms these are pre-existing environment/fixture gaps
-in this test-running method, not something the reconciliation introduced.
-If the control comes back close to the 37-38 baseline, the gap between it
-and the reconciled branch's 231 needs individual attribution before this
-branch can be called clean. *(In progress — do not treat this section as
-final until the control run's numbers are recorded below.)*
+**Control run**: to separate "caused by reconciliation" from "caused by
+running tests inside a container configured for real staging traffic"
+without hand-verifying every one of the 231 failures individually, the
+*currently-deployed* code (copied directly from the running container's
+`/app`, since no `git` binary is available inside it to check out a
+specific commit) was run through the identical harness (`/tmp/control_test`,
+same `ANYAICAM_TRUSTED_HOSTS` override, output to `/tmp/control_output.txt`)
+as a same-environment control: **230 failed, 1295 passed, 22 skipped**, in
+1025s.
+
+**Conclusion: the reconciled branch is not the cause of the elevated
+failure count.** 230 (currently-deployed) vs. 231 (reconciled) is,
+functionally, the same number under this harness — and the exact per-test
+diff explains the difference completely:
+
+- **Only failing in the reconciled branch** (3 tests, all in
+  `tests/test_event_media_outbox.py`): this test file doesn't exist in the
+  currently-deployed code at all — it tests this session's new motion-cloud
+  event-media outbox feature. It fails for the exact
+  `ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`-unset reason already root-caused
+  above, not because of anything the merge did to it.
+- **Only failing in the currently-deployed control, not in the reconciled
+  branch** (2 tests, `tests/test_camera_numbers_phantom_fallback.py`): the
+  reconciled branch's merge of both `/ready` fixes (customer-provisioning's
+  `camera_status(request=None)` and staging's `_legacy_camera_status()`,
+  see above) **fixes** two tests that fail against currently-deployed code.
+  This is a real, positive difference, not a regression.
+- The remaining 228 failures are identical in both runs, byte-for-byte —
+  including the `total_camera_slots()`-returns-0 issue and the whole
+  camera-discovery/notification/login/analytics cluster from the corrected
+  run above. All pre-existing, unrelated to reconciliation.
+- The reconciled branch's extra 120 passing tests (1415 vs. 1295) are
+  simply the additional test files the merged branches bring in that don't
+  exist in currently-deployed code at all — new coverage, not a discrepancy.
+
+**On the 37-38-failure baseline**: given 230 failures reproduce against the
+*currently-deployed* code under this exact harness, that number was
+evidently produced by a different test-execution method (e.g., a fixture
+or CI environment with these cloud-feature flags and Host allowlist set up
+for testing) than "run pytest inside the live production-configured
+container." This session's methodology cannot reproduce that baseline
+number for either branch — the fair, apples-to-apples comparison is
+reconciled-vs-currently-deployed under one consistent harness, which is
+what the 230-vs-231 comparison above provides.
 
 ## Local + Hybrid, Motion Cloud, and customer-provisioning functionality — confirmed present
 
