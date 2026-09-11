@@ -520,6 +520,103 @@ throughout.
 
 ---
 
+## Staging live cutover — ATTEMPTED, STOPPED before any container change (2026-09-11)
+
+**A live cutover was approved and started, then deliberately stopped at
+a real, unexpected finding — before the running container was ever
+touched.** Live staging is unaffected: `anyaicam-staging-portal` is
+still running the exact same old container it was before this attempt
+began, confirmed via `/health` (200) and `claim/begin` (still 404,
+proving it's genuinely the untouched old code), immediately before this
+section was written.
+
+**What actually happened, before this session's own review caught a
+tooling defect and stopped the whole approach:**
+
+1. A CRLF-corruption defect was found and fixed in the deployment
+   artifact itself before any live write: a raw `git archive` (used for
+   both the rehearsal and the first attempt at a live-deployment
+   tarball) silently re-introduced CRLF line endings on this Windows
+   dev machine's `core.autocrlf=true` config — the exact defect class
+   `installer/build_release_installer.py`'s own `run_git()` already
+   works around for the *installer* path, but this manual `git archive`
+   invocation for the *staging* deployment path did not use that same
+   `-c core.autocrlf=false` guard. Rebuilt with the guard; the corrected
+   artifact (`ed5da71850eaa0b8471272a0bf89e8f9a548165b7c428dbbfdd7ff55b508a69c`)
+   was verified byte-for-byte identical to `git show` for every checked
+   file before use. The CRLF-corrupted artifact and its extraction were
+   deleted.
+2. Fresh pre-cutover DB backup taken and verified:
+   `/var/lib/anyaicam-staging/db/staging-pre-cutover-backup-20260911T224358Z.db`,
+   SHA-256 `7a997d95b72bff3a7838967dbcc29479243dd037047c231bb8fe4b35ada416ce`
+   — identical to every earlier backup taken during this session's
+   investigation, confirming zero live writes occurred throughout.
+3. Host source tree backed up before any write:
+   `/opt/anyaicam-staging-source-backup-pre-claim-flow-20260911T224358Z.tar.gz`,
+   SHA-256 `6d52356d7c6b5ca763515550363e8710b5e530be1a5432abff6fd41e36dfc346`.
+4. `app/`, `requirements.txt`, `requirements-cpu.txt`, `Dockerfile` were
+   mirrored from the corrected golden artifact into `/opt/anyaicam-staging/`
+   (`rsync -a --delete` for `app/`) — verified via `diff -rq` (exit 0,
+   exact match). **This step is live and NOT reverted** (see below for
+   why that's safe). `deploy/` and `storefront/` confirmed untouched
+   (mtimes unchanged).
+5. `docker compose build portal` succeeded, producing a new
+   `deploy-portal:latest` image (manifest
+   `sha256:0c4a3b7cebf8db5168fa851b98bc3bbe367f021bf19f17750f74838518048a57`).
+   **This image was never deployed to any container.**
+6. **Stopped here.** Attempting to pin the old running image
+   (`sha256:8e31af166a1ef080509aea986f3668a177570b26002471d6d190d0f051603206`)
+   as an explicit rollback tag failed: `docker tag` returned "No such
+   image" — the image's top-level record was gone from `docker images
+   -a` entirely (not even dangling), even though the container using it
+   was still running fine. `docker commit` on the still-running
+   container was tried as a fallback and *also* failed: "NotFound:
+   content digest ...: not found." **Root cause: this host's Docker uses
+   a containerd-snapshotter image store (`Storage Driver: overlayfs`,
+   `driver-type: io.containerd.snapshotter.v1`), which appears to
+   garbage-collect an image's content-store blobs once its tag is
+   reassigned by a new build — even while a running container still
+   holds a live lease on that image's already-materialized layers (which
+   is why the container keeps running/serving correctly regardless).**
+
+**Durable finding for any future deployment attempt on this exact
+host**: the previously-assumed rollback mechanism ("tag the old image
+before rebuilding, swap back if needed") **does not work** here once
+`docker compose build` has run against the same tag. Neither `docker
+tag` nor `docker commit` can rescue it afterward — the image must be
+pinned (tagged or committed) **before** the build that would replace its
+tag runs, not after. A future attempt should either pin the running
+image *before* any build step, or use a genuinely separate
+container/tag (blue-green: run the new code under a different
+name/port, verify, then swap Caddy's upstream) so the running old
+container is never dependent on the image store's tag bookkeeping for
+its own rollback safety.
+
+**Why leaving `/opt/anyaicam-staging/app/` on the golden source (step 4
+above) is safe to leave as-is despite stopping**: the running container
+was built from the OLD source at an earlier point in time and has that
+old code baked into its own image layers — Docker containers are
+self-contained once built; changing files on the host filesystem after
+a container is built and running does not affect it. `docker ps`/`/health`/
+`claim/begin` (404) all confirm the live service is still running the
+old code, completely independent of what's currently sitting in the
+host's `app/` directory. Reverting that directory back to the old
+source would itself be an additional write action, not a "stop" — left
+as verified golden source, ready for the next attempt to simply
+continue from Step 5 (rollback-image-pinning) onward, once a
+rollback-safe mechanism is agreed for this host.
+
+**State to resume from, next session**: pre-cutover DB and host-source
+backups exist and are verified (see above). Host `app/`/`requirements*.txt`/
+`Dockerfile` already reflect the golden commit `4ade2352b1ea6da9c56a339650773c01879c0b98`.
+A built (but undeployed) golden image exists as `deploy-portal:latest`.
+The live container is still running the old, pre-claim-flow code,
+completely unaffected. Do not repeat the git-archive-without-
+`core.autocrlf=false` mistake — the corrected artifact/procedure is
+recorded above.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
