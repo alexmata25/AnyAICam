@@ -805,6 +805,50 @@ CURL_READY_MOCK_EXIT=0
 assert_exit "malformed/non-JSON response body -> FAIL" 1 ready_endpoint_self_test_ok
 
 echo
+echo "== validate.sh: anyaicam-agent.service must be enabled AND active =="
+
+# Confirmed live on Ryzen (2026-09-11): validate.sh checked
+# `anyaicam-agent.service is enabled` but never `is-active` -- a unit
+# stuck crash-looping under `Restart=always` (see appliance-agent/
+# scripts/uninstall.sh's own stale-drop-in incident writeup) IS enabled
+# (systemd keeps retrying it forever, by design) but was never actually
+# running, and validate.sh reported PASS the entire time regardless.
+# Exercises the real check()/FAILURES machinery validate.sh itself
+# uses (already sourced above), with `systemctl` locally overridden to
+# answer is-enabled/is-active independently and controllably for
+# anyaicam-agent.service specifically -- the global systemctl() shadow
+# earlier in this harness always returns 0 for everything, which can't
+# distinguish "enabled" from "active" the way this defect requires.
+systemctl() {
+    case "$*" in
+        "is-enabled --quiet anyaicam-agent.service") return "${AGENT_ENABLED_MOCK_EXIT:-0}" ;;
+        "is-active --quiet anyaicam-agent.service") return "${AGENT_ACTIVE_MOCK_EXIT:-0}" ;;
+        *) return 0 ;;
+    esac
+}
+
+FAILURES=0
+AGENT_ENABLED_MOCK_EXIT=0
+AGENT_ACTIVE_MOCK_EXIT=0
+check "anyaicam-agent.service is enabled" systemctl is-enabled --quiet anyaicam-agent.service
+check "anyaicam-agent.service is active" systemctl is-active --quiet anyaicam-agent.service
+assert_eq "enabled + active -> both checks pass, zero failures" "0" "$FAILURES"
+
+FAILURES=0
+AGENT_ENABLED_MOCK_EXIT=0
+AGENT_ACTIVE_MOCK_EXIT=1
+check "anyaicam-agent.service is enabled" systemctl is-enabled --quiet anyaicam-agent.service
+check "anyaicam-agent.service is active" systemctl is-active --quiet anyaicam-agent.service
+assert_eq "enabled + inactive/crash-looping -> the new is-active check fails validation" "1" "$FAILURES"
+
+FAILURES=0
+AGENT_ENABLED_MOCK_EXIT=1
+AGENT_ACTIVE_MOCK_EXIT=1
+check "anyaicam-agent.service is enabled" systemctl is-enabled --quiet anyaicam-agent.service
+check "anyaicam-agent.service is active" systemctl is-active --quiet anyaicam-agent.service
+assert_eq "neither enabled nor active -> existing enabled check still catches it too (2 failures, not silently reduced to 1)" "2" "$FAILURES"
+
+echo
 echo "== uninstall.sh: agent inline-fallback drop-in removal (structural check) =="
 
 # The agent's inline-fallback branch (installer/uninstall.sh's own
@@ -817,6 +861,13 @@ echo "== uninstall.sh: agent inline-fallback drop-in removal (structural check) 
 # instead of a behavioral run, matching that established precedent.
 assert_exit "installer/uninstall.sh's agent fallback removes the .service.d drop-in directory" 0 \
     grep -q 'rm -rf /etc/systemd/system/anyaicam-agent.service.d' "$INSTALLER_DIR/uninstall.sh"
+
+# Confirms run_validate() itself actually wires in the new is-active
+# check proven correct in isolation above -- not just that the
+# check()/systemctl mechanism CAN detect this, but that validate.sh's
+# real check list actually calls it.
+assert_exit "run_validate() itself calls the new anyaicam-agent.service is-active check" 0 \
+    grep -q 'check "anyaicam-agent.service is active" systemctl is-active --quiet anyaicam-agent.service' "$INSTALLER_DIR/validate.sh"
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="

@@ -80,6 +80,18 @@ run_validate() {
     check "quarantine directory is owned by anyaicam" test "$(stat -c %U "$QUARANTINE_DIR" 2>/dev/null)" = "anyaicam"
     check "quarantine directory permissions are protected (0750)" test "$(stat -c %a "$QUARANTINE_DIR" 2>/dev/null)" = "750"
     check "anyaicam-agent.service is enabled" systemctl is-enabled --quiet anyaicam-agent.service
+    # Confirmed live on Ryzen (2026-09-11): a stale systemd drop-in
+    # (see appliance-agent/scripts/uninstall.sh's own fix/incident
+    # writeup) crash-looped anyaicam-agent.service 600+ times on a
+    # freshly-installed, otherwise-passing RC3 -- and validate.sh
+    # reported PASS the whole time, because it only ever checked
+    # is-enabled, never is-active. A unit stuck in `Restart=always`
+    # crash-loop hell IS enabled (systemd re-attempts it forever, by
+    # design) but is never actually doing its job; VMS_SERVICE_FILE's
+    # own check below already covers both is-enabled AND is-active for
+    # exactly this reason, and the agent unit needs the identical
+    # coverage, not a narrower one.
+    check "anyaicam-agent.service is active" systemctl is-active --quiet anyaicam-agent.service
     check "anyaicam-vms.service is enabled" systemctl is-enabled --quiet anyaicam-vms.service
     check "anyaicam-vms.service is active" systemctl is-active --quiet anyaicam-vms.service
     check "system suspend/hibernate is disabled (appliance must stay online 24/7)" suspend_targets_masked
