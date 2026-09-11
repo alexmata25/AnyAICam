@@ -670,6 +670,28 @@ assert_exit "VMS data-config directory still exists after default uninstall" 0 t
 assert_exit "appliance identity file still exists after default uninstall" 0 test -f "$IDENTITY_FILE"
 assert_eq "appliance identity is byte-identical after default uninstall" "$IDENTITY_HASH_BEFORE" "$(sha256sum "$IDENTITY_FILE" 2>/dev/null | cut -d' ' -f1)"
 
+# 26a. Concrete defect found live on Ryzen (2026-09-11): run_uninstall()
+#      removed the VMS unit FILE but never its `.service.d/` drop-in
+#      DIRECTORY -- a stale drop-in from any prior source (hand-created,
+#      an old installer version, anything) survives uninstall untouched
+#      and silently reattaches to the fresh unit the next install
+#      writes under the same name. This crash-looped the agent unit
+#      600+ times on real hardware before being noticed (see
+#      appliance-agent/scripts/uninstall.sh's own fix and full incident
+#      writeup); this covers the VMS unit against the identical defect
+#      class, using the one occurrence of this bug this harness can
+#      exercise behaviorally (VMS_SERVICE_FILE is fixture-redirected;
+#      the agent's own inline-fallback equivalent uses a hardcoded
+#      absolute /etc path and is covered by a structural check below,
+#      same testing tradeoff already established for this script family
+#      -- see appliance-agent/tests/test_uninstall_script_removes_drop_ins.py).
+reset_fixture
+make_fake_agent_payload
+mkdir -p "$(dirname "$VMS_SERVICE_FILE")" "${VMS_SERVICE_FILE}.d"
+echo "[Service]" > "${VMS_SERVICE_FILE}.d/stale-dropin.conf"
+assert_exit "run_uninstall removes a stale VMS unit drop-in directory" 0 run_uninstall
+assert_exit "VMS service drop-in directory is gone after uninstall" 1 test -d "${VMS_SERVICE_FILE}.d"
+
 echo
 echo "== run_uninstall() --purge-all =="
 
@@ -781,6 +803,20 @@ reset_fixture
 CURL_READY_MOCK_BODY='<html><body>502 Bad Gateway</body></html>'
 CURL_READY_MOCK_EXIT=0
 assert_exit "malformed/non-JSON response body -> FAIL" 1 ready_endpoint_self_test_ok
+
+echo
+echo "== uninstall.sh: agent inline-fallback drop-in removal (structural check) =="
+
+# The agent's inline-fallback branch (installer/uninstall.sh's own
+# `else` clause, used only when neither wrapped agent uninstall script
+# exists) removes /etc/systemd/system/anyaicam-agent.service by a
+# hardcoded absolute path, not a fixture-redirected variable -- the same
+# testing constraint already documented in
+# appliance-agent/tests/test_uninstall_script_removes_drop_ins.py for
+# that script's own agent-unit removal. A structural source-text check
+# instead of a behavioral run, matching that established precedent.
+assert_exit "installer/uninstall.sh's agent fallback removes the .service.d drop-in directory" 0 \
+    grep -q 'rm -rf /etc/systemd/system/anyaicam-agent.service.d' "$INSTALLER_DIR/uninstall.sh"
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="
