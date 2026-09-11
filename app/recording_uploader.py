@@ -366,6 +366,24 @@ def _ensure_client(camera_number: int, session: dict):
         return client
     if boto3 is None:
         return None
+    if not AWS_REGION:
+        # Confirmed live twice now (Phase C's real-hardware validation,
+        # then independently again in live_relay_uploader.py): an empty
+        # AWS_REGION/AWS_DEFAULT_REGION silently builds
+        # https://s3..amazonaws.com (the double dot is the empty region)
+        # and every upload fails with a cryptic "Invalid endpoint" deep
+        # inside boto3, with no indication why. Fail loud and specific
+        # here instead, before ever constructing the client -- the
+        # appliance's own operator/logs get an unambiguous configuration
+        # error the moment upload is attempted, not a mysterious network
+        # failure.
+        raise RuntimeError(
+            "AWS_REGION (or AWS_DEFAULT_REGION) is not configured. "
+            "Refusing to construct an S3 client with an empty region -- "
+            "this would otherwise build an invalid https://s3..amazonaws.com "
+            "endpoint and fail uploads with no clear reason. Set AWS_REGION "
+            "in this appliance's environment before enabling recording upload."
+        )
     creds = session["credentials"]
     client = boto3.client(
         "s3",

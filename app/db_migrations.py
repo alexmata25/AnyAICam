@@ -264,6 +264,19 @@ def apply_migrations():
                            if backend()=='sqlite' else
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
         if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')
+        # appliance_cloud.py's heartbeat() has referenced restart_count
+        # since restart-detection was added, but no migration ever
+        # created the column -- confirmed live: every heartbeat that
+        # detected a restart (restarted=True) crashed with
+        # sqlite3.OperationalError: no such column: restart_count,
+        # a 500 masquerading as a client-side failure, for every
+        # appliance on any database that had never had this column
+        # added by hand. A fresh database built from this file alone
+        # (a new customer environment, a rebuilt staging DB, Samsung's
+        # own database) hit this identically -- see
+        # test_appliance_restart_count_migration.py for the fresh-
+        # database-upgrade regression coverage this closes.
+        if 'restart_count' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN restart_count INTEGER DEFAULT 0')
 
         # Appliance identity contract (see appliance_identity.py):
         # authorization_version_at_login records the identity's
