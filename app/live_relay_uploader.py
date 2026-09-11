@@ -339,6 +339,24 @@ def _remember_uploaded(camera_number: int, segment_name: str) -> None:
 def _upload_segment(session: dict, local_path: Path) -> str:
     if boto3 is None:
         raise RuntimeError("boto3 is not installed.")
+    if not AWS_REGION:
+        # Confirmed live twice now (Phase C's real-hardware validation
+        # of recording_uploader.py, then independently again here): an
+        # empty AWS_REGION/AWS_DEFAULT_REGION silently builds
+        # https://s3..amazonaws.com (the double dot is the empty region)
+        # and every upload fails with a cryptic "Invalid endpoint" deep
+        # inside boto3, with no indication why -- the exact failure mode
+        # _relay_camera_once()'s own log line
+        # (live_relay.segment_upload_failed) reported with no further
+        # context. Fail loud and specific here instead, before ever
+        # constructing the client.
+        raise RuntimeError(
+            "AWS_REGION (or AWS_DEFAULT_REGION) is not configured. "
+            "Refusing to construct an S3 client with an empty region -- "
+            "this would otherwise build an invalid https://s3..amazonaws.com "
+            "endpoint and fail uploads with no clear reason. Set AWS_REGION "
+            "in this appliance's environment before enabling live relay."
+        )
     creds = session["credentials"]
     client = boto3.client(
         "s3",
