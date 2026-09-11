@@ -230,6 +230,17 @@ source "$INSTALLER_DIR/uninstall.sh"
 set +e
 set -uo pipefail
 
+# shellcheck source=../validate.sh
+# Same re-source/set -e caveat as uninstall.sh above -- validate.sh's
+# own actual check-running (run_validate()) is guarded behind a
+# BASH_SOURCE-is-the-entrypoint check, so sourcing it here only defines
+# its functions (ready_endpoint_self_test_ok() is what this harness
+# actually exercises below); it never runs a real validation pass
+# against this machine.
+source "$INSTALLER_DIR/validate.sh"
+set +e
+set -uo pipefail
+
 assert_eq() {
     local description="$1" expected="$2" actual="$3"
     if [[ "$expected" == "$actual" ]]; then
@@ -702,6 +713,74 @@ assert_eq "masks exactly the four sleep/suspend/hibernate targets" \
 reset_fixture
 disable_system_suspend >/dev/null 2>&1
 assert_exit "running it again (repair/reinstall) is still safe" 0 disable_system_suspend
+
+echo
+echo "== ready_endpoint_self_test_ok() (installer/validate.sh) =="
+
+# Confirmed live on Ryzen (2026-09-11, golden-foundation-rc1 -> rc2): a
+# clean, correctly-installed, unclaimed appliance with zero cameras --
+# exactly the state every brand-new appliance is in right after
+# install.sh, before claim/activation or camera discovery ever run --
+# legitimately returns HTTP 503 from GET /ready (main.py's
+# readiness_snapshot(): for RUNTIME_ROLE=edge, `ready` requires
+# recording>0, structurally impossible before any camera exists). The
+# OLD validate.sh check (`curl -fsS ... /ready`) used curl's -f flag,
+# which treats ANY non-2xx status as failure, so validate.sh could
+# never pass on a genuinely fresh install. ready_endpoint_self_test_ok()
+# fixes this by checking main.py's own self_test.ok field directly
+# (fetched without -f, so a 503 still yields its body) instead of the
+# HTTP status code -- self_test.ok is what "the VMS started correctly"
+# actually means; `ready` is deliberately a stricter, business-state
+# check validate.sh was never meant to require.
+#
+# `curl` is shadowed the same way `id`/`docker`/`df` are shadowed above
+# -- ready_endpoint_self_test_ok() is called directly (not through
+# run_validate(), which would also require every other check's real
+# system state), so only calls to the literal word `curl` inside that
+# one function are exercised here.
+curl() {
+    printf '%s' "$CURL_READY_MOCK_BODY"
+    return "${CURL_READY_MOCK_EXIT:-0}"
+}
+
+reset_fixture
+# 1. The exact Ryzen/RC2 clean-install shape: self_test.ok=true, but
+#    HTTP 503 because ready=false (zero cameras). Must PASS.
+CURL_READY_MOCK_BODY='{"ready":false,"environment":"production","runtime_role":"edge","self_test":{"ok":true,"checks":[]},"cameras_online":0,"cameras_total":0,"recording_workers":0}'
+CURL_READY_MOCK_EXIT=0
+assert_exit "self_test.ok=true with HTTP 503 (fresh, zero-camera install) -> PASS" 0 ready_endpoint_self_test_ok
+
+reset_fixture
+# 2. The exact RC1 real defect shape: self_test.ok=false (critical
+#    configuration_valid failure). Must still FAIL -- this fix must not
+#    paper over an actually-broken VMS.
+CURL_READY_MOCK_BODY='{"ready":false,"environment":"production","runtime_role":"edge","self_test":{"ok":false,"checks":[]},"cameras_online":0,"cameras_total":0,"recording_workers":0}'
+CURL_READY_MOCK_EXIT=0
+assert_exit "self_test.ok=false (RC1's real defect) -> FAIL" 1 ready_endpoint_self_test_ok
+
+reset_fixture
+# 3. A fully ready appliance (cameras already recording, HTTP 200) must
+#    still PASS -- this fix only widens what's accepted, it never
+#    narrows the previously-passing case.
+CURL_READY_MOCK_BODY='{"ready":true,"environment":"production","runtime_role":"edge","self_test":{"ok":true,"checks":[]},"cameras_online":5,"cameras_total":5,"recording_workers":5}'
+CURL_READY_MOCK_EXIT=0
+assert_exit "self_test.ok=true with HTTP 200 (fully ready) -> PASS" 0 ready_endpoint_self_test_ok
+
+reset_fixture
+# 4. The VMS is genuinely unreachable (connection refused/timeout) --
+#    curl itself fails and produces no body. Must still FAIL: this fix
+#    must not turn "the app never started" into a false pass.
+CURL_READY_MOCK_BODY=''
+CURL_READY_MOCK_EXIT=7
+assert_exit "curl connection failure (VMS unreachable) -> FAIL" 1 ready_endpoint_self_test_ok
+
+reset_fixture
+# 5. A malformed/unexpected body (e.g. an HTML error page from a crash
+#    outside FastAPI's own handler) has no matching self_test.ok
+#    substring. Must FAIL.
+CURL_READY_MOCK_BODY='<html><body>502 Bad Gateway</body></html>'
+CURL_READY_MOCK_EXIT=0
+assert_exit "malformed/non-JSON response body -> FAIL" 1 ready_endpoint_self_test_ok
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="
