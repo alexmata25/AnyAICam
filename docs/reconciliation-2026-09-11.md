@@ -229,12 +229,53 @@ run the same way, too.
 `testserver,localhost,127.0.0.1` for the pytest subprocess's own
 environment only (not written to the container's persistent env, not
 affecting the real staging service, which keeps serving
-`portal-staging.anyaicam.com` throughout):
+`portal-staging.anyaicam.com` throughout): **231 failed, 1415 passed, 22
+skipped**, in 787s. Confirmed via `/proc/<pid>/environ` that the override
+actually reached the real pytest process, not just a separate `docker
+exec` shell — down from 379, but still far above the 37-38 baseline, so
+this needed further investigation rather than being accepted at face
+value.
 
-*(In progress at `/tmp/recon_full_output2.txt` on `anyaicam-staging` —
-being tracked live. Fill in the final pass/fail/skip counts and compare
-against the 37-38-failure baseline once a `DONE_EXIT_` marker is observed;
-do not treat this section as final until then.)*
+**Second cause found: several cloud-feature flags are unset on the real
+`anyaicam-staging-portal` container right now.**
+`ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`, `ANYAICAM_ANALYTICS_SYNC_ENABLED`,
+`ANYAICAM_RECORDING_UPLOAD_ENABLED`, and `ANYAICAM_CLOUD_UPLOAD_ENABLED`
+are all empty in the container's actual environment. Sample failure
+(`tests/test_event_media_outbox.py`) confirmed the mechanism directly:
+`retry_pending_event_media()` in `event_media_uploader.py` has an early
+`if not EVENT_MEDIA_UPLOAD_ENABLED: return {"attempted": 0, "completed":
+0, ...}` guard, so with the flag off it always reports nothing happened —
+exactly the `0 != 1` pattern seen in the failures. This directly matches
+established project history that these flags must stay enabled and be
+explicitly re-enabled if ever found off. **This was not changed by
+reconciliation and has not been changed by this session** — flipping a
+live feature flag on the currently-working staging container is exactly
+the kind of staging modification the operative instruction says not to
+make yet ("do not modify the currently working staging environment yet"),
+so it is reported here, not acted on.
+
+A second, unrelated cause was also found in the same failure set: some
+`test_camera_discovery_provisioning.py` failures trace to
+`customer_entitlements.total_camera_slots()` returning `0` for a test
+fixture's customer, which is a fixture/entitlement-seeding question, not a
+feature-flag question — flagged for further investigation, not yet
+root-caused.
+
+**Control run in progress**: to separate "caused by reconciliation" from
+"caused by running tests inside a container configured for real staging
+traffic" without hand-verifying every one of the 231 failures individually,
+the *currently-deployed* code (copied directly from the running
+container's `/app`, since no `git` binary is available inside it to check
+out a specific commit) is being run through the identical harness
+(`/tmp/control_test`, same `ANYAICAM_TRUSTED_HOSTS` override, output to
+`/tmp/control_output.txt`) as a same-environment control. If the control
+run shows a similarly elevated failure count with the same file
+clustering, that confirms these are pre-existing environment/fixture gaps
+in this test-running method, not something the reconciliation introduced.
+If the control comes back close to the 37-38 baseline, the gap between it
+and the reconciled branch's 231 needs individual attribution before this
+branch can be called clean. *(In progress — do not treat this section as
+final until the control run's numbers are recorded below.)*
 
 ## Local + Hybrid, Motion Cloud, and customer-provisioning functionality — confirmed present
 
