@@ -306,6 +306,21 @@ def apply_migrations():
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
         if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')
 
+        # RDM4 heartbeat restart-detection (appliance_cloud.py's heartbeat()):
+        # a restart is inferred from uptime_seconds dropping, never self-
+        # reported, and this counter is what commands.py's diagnostics()
+        # comment already documents as tracked "through the separate,
+        # existing RDM3 heartbeat/upload-worker pipeline" -- confirmed by
+        # heartbeat() unconditionally executing
+        # 'UPDATE appliances SET restart_count=...' the moment it detects
+        # one, which raised sqlite3.OperationalError: no such column on
+        # any database that only ever ran the migrations above this line
+        # (live_relay_pilot's own release never added it). Live on real
+        # Samsung hardware: every restart-shaped heartbeat -- including an
+        # offline-queued heartbeat replayed after connectivity is restored
+        # -- 500'd here instead of registering the restart and moving on.
+        if 'restart_count' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0')
+
         # Appliance identity contract (see appliance_identity.py):
         # authorization_version_at_login records the identity's
         # authorization_version at the moment this session was
