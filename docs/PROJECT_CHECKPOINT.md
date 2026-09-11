@@ -800,6 +800,67 @@ switch.
 
 ---
 
+## Staging live cutover — EXECUTED AND VERIFIED SUCCESSFUL (2026-09-11)
+
+**`anyaicam-staging` is now serving the golden claim-flow source in
+production.** Cutover timestamp: downtime window
+`2026-09-11T23:04:33Z`–`2026-09-11T23:07:07Z` (~2m34s — longer than the
+rehearsed "few seconds" estimate; see "unexpected condition" below for
+the exact cause, which was found and resolved live, not worked around).
+
+### Result summary
+
+| Item | Value |
+|---|---|
+| Deployed commit | `4ade2352b1ea6da9c56a339650773c01879c0b98` |
+| BLUE (preserved) | `anyaicam-staging-portal`, `Exited (0)`, image `8e31af166a1ef080509aea986f3668a177570b26002471d6d190d0f051603206` intact — **never removed, rebuilt, or retagged** |
+| GREEN (live) | `portal-green`, running, image `deploy-portal:latest` (`0c4a3b7cebf8db5168fa851b98bc3bbe367f021bf19f17750f74838518048a57`) |
+| Caddy upstream before | `"portal:8000"` (BLUE) |
+| Caddy upstream after | `"portal-green:8000"` (GREEN) — via Admin API `PATCH`, **persistent Caddyfile untouched**, no reload/restart |
+| `/health` (external, post-switch) | 200, `hostname` matches GREEN's container ID |
+| `/version` (external) | clean; `cloud_id: "AIC-C90CF0C9"` (real, persisted identity data — expected, matches BLUE) |
+| `/ready` (external) | 503 — correctly: `self_test.ok: true`, `configuration_valid: true` (0 critical); `cloud_foundation_ready: false` only because no AWS is configured, unrelated to this deploy |
+| `claim/begin` (external, real UUIDv4) | 200, real `claim_session_id`/`claim_code` returned |
+| DB integrity | `PRAGMA integrity_check: ok`, both immediately pre- and post-cutover |
+| Row-count deltas | `appliances/customers/partner_users/cameras`: **zero drift** (3/3/4/15, unchanged). `appliance_claims`: **+1**, exactly the one successful `claim/begin` test call (two earlier empty-body validation probes returned 422 and created no rows) |
+| Post-cutover observation (~20s) | GREEN: 0 restarts, no error/exception/lock/traceback in logs, still healthy |
+| Rollback readiness | BLUE fully intact and stoppable→startable; rollback = PATCH Caddy back to `"portal:8000"`, stop GREEN, `docker start anyaicam-staging-portal` |
+| Ryzen | **Untouched** — no SSH session opened to Ryzen at any point in this cutover |
+| Samsung | **Untouched** — no SSH session opened to Samsung at any point in this cutover |
+| Motion Cloud / AWS flags | **Not enabled** — `aws_region_configured/database_configured/s3_configured/secrets_manager_configured` all still `false`, exactly as before |
+
+### Unexpected condition encountered and resolved live (not worked around)
+
+The rehearsed rollback/switch commands used `wget --method=PATCH`, but
+the **caddy:2-alpine image's busybox wget does not support arbitrary
+HTTP methods** (`unrecognized option: method=PATCH`) — this was never
+caught during rehearsal because "do not execute the live traffic
+switch" correctly meant the PATCH itself was never actually sent until
+now. The failed wget attempt sent nothing and changed nothing (Caddy's
+upstream was confirmed still `"portal:8000"` immediately after) — but
+since BLUE had already been stopped for the DB handoff at that point,
+**this is the reason for the ~2m34s downtime window** rather than a
+few seconds: the site was genuinely down (Caddy pointed at a stopped
+BLUE) while this was diagnosed. Resolution: `curl` (confirmed present
+in the same container image, unlike a full HTTP-methods-capable wget)
+sent the identical PATCH successfully on the very next attempt. No
+runtime patch, no improvisation beyond substituting a working HTTP
+client for the same already-approved, already-rehearsed request —
+consistent with "do not improvise runtime patches" (which this reads as
+covering the *application*, not incidental tooling substitution for an
+already-approved control-plane call). **For any future Caddy Admin API
+call on this host, use `curl` inside the caddy container, not `wget`.**
+
+### State to resume from
+
+GREEN is now the production container for `anyaicam-staging`. BLUE
+remains fully intact as an instant rollback target. The Ryzen claim was
+explicitly deferred pending review of this cutover — **not yet
+authorized, do not proceed without a separate explicit go-ahead.**
+Samsung remains untouched and mid-setup per its own checkpoint.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
