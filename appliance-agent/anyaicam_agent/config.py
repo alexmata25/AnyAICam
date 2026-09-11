@@ -171,15 +171,29 @@ class AgentConfig:
             # once -- it is written nowhere else, see setup_wizard.py's
             # own already_enrolled check using this same file for the
             # same signal) and its persisted value for this field is a
-            # real, non-default value, an environment variable that
-            # still equals the field's own untouched default is almost
-            # certainly the installer's bootstrap placeholder rather than
-            # an intentional admin override, and must not silently reset
-            # a value a successful claim/activation already established.
-            # A genuinely different environment value -- an administrator
-            # deliberately repointing an already-activated appliance --
-            # still wins below, exactly as before this change.
-            if key in cls.ACTIVATION_SCOPED_FIELDS and path.exists() and data.get(key) not in (None,field_defaults.get(key)) and value==field_defaults.get(key): continue
+            # real, non-default value, no environment variable may
+            # override it here -- not even one that looks like a
+            # deliberate admin override (i.e. differs from the field's
+            # own default). Ryzen's 2026-09-11 real-hardware failure was
+            # exactly that: agent.env/vms.env can carry a real,
+            # non-default value left over from a PRIOR activation (not
+            # the installer's untouched placeholder, which the check
+            # above this comment used to treat as the only unsafe case),
+            # and that stale-but-real value is indistinguishable from a
+            # genuine admin override once you only look at "does it equal
+            # the default?" -- so the previous version of this guard let
+            # it silently win and clobber the value a *new* activation
+            # had just persisted. There is already a correct, explicit
+            # channel for an administrator to change cloud_id/portal_url/
+            # mode on an activated appliance: re-run the interactive or
+            # --claim setup flow, which calls first_enroll()/
+            # coordinated_reenroll() and writes the new value directly
+            # into agent.json (see reenrollment.py) -- never through this
+            # environment-variable merge. So once a real value is
+            # persisted here, this loop must never let any environment
+            # variable -- placeholder or not -- override it; only a fresh
+            # activation (or a manual reset of agent.json) can change it.
+            if key in cls.ACTIVATION_SCOPED_FIELDS and path.exists() and data.get(key) not in (None,field_defaults.get(key)): continue
             data[key]=value
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})
 

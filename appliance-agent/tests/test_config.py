@@ -5,7 +5,21 @@ ANYAICAM_AGENT_MODE=development, sourced by anyaicam-agent.service on every
 start/restart/reboot) was silently overriding a portal URL a successful
 claim/activation had already persisted into agent.json, because
 AgentConfig.load() let any set environment variable win unconditionally.
-See config.py's ACTIVATION_SCOPED_FIELDS/load() comments for the fix."""
+See config.py's ACTIVATION_SCOPED_FIELDS/load() comments for the fix.
+
+Also covers PROJECT_CHECKPOINT.md defect #3, found real on Ryzen
+(2026-09-11): the first fix above only protected against an environment
+value that still equals the field's own untouched default. It did nothing
+for a real, non-default value left over in agent.env/vms.env from a PRIOR
+activation -- indistinguishable, by a "does it equal the default?" check,
+from a deliberate admin override, so it could still silently clobber a
+value a NEW activation had just persisted. The fix removes that escape
+hatch entirely: once agent.json holds a real value for an
+activation-scoped field, no environment variable overrides it, full stop.
+The only supported way to change cloud_id/portal_url/mode on an already-
+activated appliance is to re-run setup (first_enroll()/
+coordinated_reenroll()), which writes the new value directly into
+agent.json -- never through this environment-variable merge."""
 import json, os, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -43,14 +57,30 @@ class LoadPrecedenceTests(unittest.TestCase):
   with patch.dict(os.environ,{'ANYAICAM_PORTAL_URL':BOOTSTRAP_PORTAL_URL}):
    self.assertEqual(AgentConfig.load(self.path).portal_url,CLAIMED_PORTAL_URL)
 
- def test_administrator_override_still_wins(self):
-  """A genuinely different environment value -- an administrator
-  deliberately repointing an already-activated appliance -- must still
-  take effect, exactly as before this fix."""
+ def test_stale_real_env_value_no_longer_wins_over_a_newer_activation(self):
+  """Defect #3 (docs/PROJECT_CHECKPOINT.md), reproduced: agent.env/
+  vms.env holds a real, non-default value left over from a PRIOR
+  activation (not the installer's untouched placeholder -- this is
+  exactly what made it look like a deliberate admin override before
+  this fix). agent.json has since been updated by a NEWER activation.
+  The newer persisted value must win; the stale env value must not."""
+  stale_env_value='https://old-activation-control-plane.example:8000'
   self._write(portal_url=CLAIMED_PORTAL_URL)
-  override='https://migrated-control-plane.example:8000'
-  with patch.dict(os.environ,{'ANYAICAM_PORTAL_URL':override}):
-   self.assertEqual(AgentConfig.load(self.path).portal_url,override)
+  with patch.dict(os.environ,{'ANYAICAM_PORTAL_URL':stale_env_value}):
+   self.assertEqual(AgentConfig.load(self.path).portal_url,CLAIMED_PORTAL_URL)
+
+ def test_administrator_cannot_repoint_an_activated_appliance_via_env_alone(self):
+  """An environment variable is no longer a way to change cloud_id/
+  portal_url/mode on an already-activated appliance, even when someone
+  intends it as a deliberate override -- config.py's load() cannot tell
+  that apart from the stale-leftover-value case above by inspecting the
+  value alone. The only supported channel is re-running setup, which
+  goes through first_enroll()/coordinated_reenroll() and writes agent.
+  json directly (see the EnrollmentIntegrationTests below)."""
+  self._write(portal_url=CLAIMED_PORTAL_URL)
+  intended_override='https://migrated-control-plane.example:8000'
+  with patch.dict(os.environ,{'ANYAICAM_PORTAL_URL':intended_override}):
+   self.assertEqual(AgentConfig.load(self.path).portal_url,CLAIMED_PORTAL_URL)
 
  def test_claimed_mode_survives_bootstrap_env_after_activation(self):
   self._write(mode='production')
@@ -135,6 +165,31 @@ class EnrollmentIntegrationTests(unittest.TestCase):
   reenrollment.coordinated_reenroll(new_config,self.a,expected_cloud_id='AIC-NEW',vms_identity_path=vms_path,restart_service=lambda:None,verify_authentication=lambda _:True)
   self.assertEqual(json.loads(self.ap.read_text())['portal_url'],CLAIMED_PORTAL_URL)
   with patch.dict(os.environ,{'ANYAICAM_PORTAL_URL':BOOTSTRAP_PORTAL_URL}):
+   self.assertEqual(AgentConfig.load(self.ap).portal_url,CLAIMED_PORTAL_URL)
+
+ def test_reenrollment_to_a_new_portal_survives_a_stale_real_env_value(self):
+  """Reproduces Ryzen's exact 2026-09-11 failure end-to-end: agent.env/
+  vms.env holds a REAL, non-default portal URL left over from a prior
+  activation (not the installer's untouched placeholder -- a stale value
+  is what actually broke on Ryzen). A fresh coordinated_reenroll() then
+  activates against a DIFFERENT, newer portal. The next agent restart
+  must see the new activation's portal, not the stale env leftover --
+  and the only correct way to have changed it was the re-enrollment
+  call itself, not the environment."""
+  stale_env_value='https://old-activation-control-plane.example:8000'
+  old=AgentConfig(cloud_id='AIC-OLD',portal_url=stale_env_value,config_dir=str(self.e),state_dir=str(self.s),log_dir=str(self.e/'log'),vms_recordings_path=str(self.v))
+  vms_path=self.v/'appliance_identity.json'; credential_path=old.credential_file
+  self.ap.write_text(json.dumps(old.__dict__))
+  credential_path.write_text(json.dumps({'appliance_id':'old','credential_id':'old-id','credential':'old-secret'}))
+  vms_path.write_text(json.dumps({'appliance_id':'old','cloud_id':'AIC-OLD','credential':'old-secret','customer_id':'old-c','site_id':'old-s','partner_id':'old-p','activated_at':'old','activation_version':1}))
+  new_config=AgentConfig(cloud_id='AIC-OLD',portal_url=CLAIMED_PORTAL_URL,config_dir=str(self.e),state_dir=str(self.s),log_dir=str(self.e/'log'),vms_recordings_path=str(self.v))
+  reenrollment.coordinated_reenroll(new_config,self.a,expected_cloud_id='AIC-NEW',vms_identity_path=vms_path,restart_service=lambda:None,verify_authentication=lambda _:True)
+  self.assertEqual(json.loads(self.ap.read_text())['portal_url'],CLAIMED_PORTAL_URL)
+  # agent.env/vms.env was never touched by re-enrollment -- it still has
+  # the stale real value from the OLD activation. This is Ryzen's exact
+  # condition: a real, non-default, but outdated env value coexisting
+  # with a freshly-persisted, newer agent.json.
+  with patch.dict(os.environ,{'ANYAICAM_PORTAL_URL':stale_env_value}):
    self.assertEqual(AgentConfig.load(self.ap).portal_url,CLAIMED_PORTAL_URL)
 
 
