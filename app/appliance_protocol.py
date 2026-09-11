@@ -69,6 +69,41 @@ def decrypt_camera_credentials(token):
     except Exception: return None
 
 
+def claim_flow_secret_key() -> bytes | None:
+    """Same shared-secret-key shape as camera_credential_key() above,
+    for a different trust domain: ephemeral secrets the non-interactive
+    claim flow (appliance_claims.py) needs to recover in plaintext for
+    a short, bounded window (claim_proof between confirm and complete;
+    the one-time credential between complete and a retried complete) --
+    see appliance_claims.py's own module docstring for why storing
+    those raw was the Phase 1 security-hardening checkpoint's finding.
+    Deliberately a separate env var/key from ANYAICAM_CAMERA_CREDENTIAL_KEY
+    rather than reusing it: these are different secrets with different
+    lifetimes and blast radii, and tying them to one key would mean a
+    leak of either purpose's key exposes the other's data too."""
+    raw = os.environ.get('ANYAICAM_CLAIM_FLOW_SECRET_KEY', '').strip()
+    return raw.encode() if raw else None
+
+
+def encrypt_claim_flow_secret(value: str) -> str | None:
+    """Fails closed (returns None) exactly like encrypt_camera_
+    credentials() does when the key is unset -- callers must treat
+    None as "encryption unavailable" and refuse to fall back to
+    storing the raw value, not silently proceed without it."""
+    key = claim_flow_secret_key()
+    if not key: return None
+    from cryptography.fernet import Fernet
+    return Fernet(key).encrypt(value.encode()).decode()
+
+
+def decrypt_claim_flow_secret(token) -> str | None:
+    key = claim_flow_secret_key()
+    if not key or not token: return None
+    from cryptography.fernet import Fernet
+    try: return Fernet(key).decrypt(token.encode() if isinstance(token, str) else bytes(token)).decode()
+    except Exception: return None
+
+
 def health_state(payload: dict) -> tuple[str,list[str]]:
     warnings=[]
     if float(payload.get('disk_capacity',0)) and float(payload.get('disk_used',0))/float(payload['disk_capacity']) >= .9: warnings.append('low_disk')

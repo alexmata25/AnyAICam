@@ -1,5 +1,17 @@
 [Unit]
 Description=Watch for AnyAiCam privileged action requests (reboot/VMS restart)
+# StartLimitIntervalSec=0: confirmed live -- this .path unit has its
+# OWN independent start-limit, separate from anyaicam-privileged-
+# watcher.service's own (see that unit file's matching comment for the
+# full story: unknown/malformed markers are deliberately left in place,
+# so repeated directory-empty<->non-empty transitions while one is
+# still present can retrigger rapidly). Once EITHER unit hits its
+# limit and goes `failed`, it stops reacting to anything -- including a
+# real, legitimate restart_vms/reboot request queued afterward -- until
+# an operator runs `systemctl reset-failed`. Both units disable their
+# limit for the same reason: nothing this design does on any single
+# trigger is expensive, stateful, or unsafe to repeat without bound.
+StartLimitIntervalSec=0
 
 [Path]
 # Fires whenever the agent-writable pending_actions directory goes from

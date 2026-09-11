@@ -6,7 +6,7 @@ from pathlib import Path,PurePosixPath
 
 from cloud_config import settings
 
-ALLOWED_CATEGORIES={'snapshots','thumbnails','clips','documents','partner-materials'}
+ALLOWED_CATEGORIES={'snapshots','thumbnails','clips','documents','partner-materials','updates'}
 
 
 def safe_key(category: str,key: str) -> str:

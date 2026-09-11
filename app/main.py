@@ -15367,7 +15367,16 @@ def readiness_snapshot() -> dict:
 
 
 
-    statuses = camera_status().get("cameras", [])
+    # _legacy_camera_status(), not camera_status(): none of this file's
+    # three request-less callers (readiness_snapshot(), health_monitor(),
+    # site_monitoring_summary()) have an HTTP request/customer-session to
+    # scope by -- that's what camera_status(request)'s customer-portal
+    # branch needs. Calling camera_status() with no arguments at all is
+    # what crashed GET /ready with a 500 (TypeError: missing required
+    # argument 'request') -- confirmed live on a fresh install. The
+    # legacy, appliance-wide camera listing is exactly what a system-
+    # level status check wants regardless of who (if anyone) is logged in.
+    statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -38851,7 +38860,16 @@ async def health_monitor() -> None:
 
 
 
-        statuses = camera_status().get("cameras", [])
+        # _legacy_camera_status(), not camera_status(): none of this file's
+        # three request-less callers (readiness_snapshot(), health_monitor(),
+        # site_monitoring_summary()) have an HTTP request/customer-session to
+        # scope by -- that's what camera_status(request)'s customer-portal
+        # branch needs. Calling camera_status() with no arguments at all is
+        # what crashed GET /ready with a 500 (TypeError: missing required
+        # argument 'request') -- confirmed live on a fresh install. The
+        # legacy, appliance-wide camera listing is exactly what a system-
+        # level status check wants regardless of who (if anyone) is logged in.
+        statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -47231,6 +47249,7 @@ from partner_workspace import register_partner_workspace_routes, render_partner_
 
 
 from appliance_cloud import register_appliance_cloud_routes
+from appliance_claims import register_appliance_claim_routes
 from notification_settings_page import register_notification_settings_routes
 from live_playlist import register_live_playlist_routes
 from live_view_sessions import register_live_view_session_routes
@@ -47346,6 +47365,17 @@ register_customer_registration_routes(app, page_shell, current_user, is_master_a
 # route first fixes that; nothing about either route's own behavior
 # changed.
 register_appliance_cloud_routes(app, page_shell, current_user)
+# Phase 1 of the non-interactive/self-service claim flow (see
+# docs/non-interactive-activation-phase1-plan.md) -- a fully separate,
+# additive route set from the admin-driven activation routes just
+# registered above. No shared route paths with either
+# register_appliance_cloud_routes() or register_partner_workspace_routes(),
+# so registration order relative to those two does not matter here.
+# page_shell (Phase 2A) renders the one new customer-facing page,
+# GET /customer/claim-appliance -- not shadowed by anything registered
+# before or after this line (no /customer/{...} wildcard exists
+# anywhere in this codebase).
+register_appliance_claim_routes(app, page_shell)
 # Registered before register_partner_workspace_routes() runs the
 # generic @app.get("/settings/{settings_slug}") catch-all it (or later
 # code in this file) may match against -- see that route's own handling
@@ -127745,7 +127775,16 @@ def site_monitoring_summary() -> dict:
 
 
 
-    statuses = camera_status().get("cameras", [])
+    # _legacy_camera_status(), not camera_status(): none of this file's
+    # three request-less callers (readiness_snapshot(), health_monitor(),
+    # site_monitoring_summary()) have an HTTP request/customer-session to
+    # scope by -- that's what camera_status(request)'s customer-portal
+    # branch needs. Calling camera_status() with no arguments at all is
+    # what crashed GET /ready with a 500 (TypeError: missing required
+    # argument 'request') -- confirmed live on a fresh install. The
+    # legacy, appliance-wide camera listing is exactly what a system-
+    # level status check wants regardless of who (if anyone) is logged in.
+    statuses = _legacy_camera_status().get("cameras", [])
 
 
 

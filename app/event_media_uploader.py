@@ -187,6 +187,32 @@ def upload_motion_event_media(
         )
         return False
 
+    # Per-camera entitlement gate: cameras.cloud_recording_mode, the same
+    # column POST /api/admin/cameras/{id}/cloud-recording-mode sets and
+    # GET /api/appliance/configuration already exposes -- read here off
+    # the cached camera map exactly the way main.py's
+    # people_counting_worker() already reads its own per-camera
+    # entitlement (people_counting_enabled) off that identical map.
+    # Checked AFTER the appliance-wide EVENT_MEDIA_UPLOAD_ENABLED gate
+    # above, never before it: the appliance-wide flag is the master
+    # switch and must be able to disable every camera's upload
+    # regardless of individual eligibility, not the other way around.
+    #
+    # Deliberately 'motion' only -- NOT 'continuous'. 'continuous' is
+    # the separate Cloud 24/7 product, served entirely by
+    # recording_uploader.py's own continuous-recording upload path;
+    # this module's uploads (motion-event clips/thumbnails) are Cloud
+    # Motion's own distinct entitlement and are never inferred from a
+    # camera's continuous-recording eligibility.
+    if identity.get("cloud_recording_mode") != "motion":
+        logger.info(
+            "event_media.camera_ineligible event_id=%s camera=%s cloud_recording_mode=%s",
+            event_id,
+            camera_number,
+            identity.get("cloud_recording_mode"),
+        )
+        return False
+
     camera_id = identity["camera_id"]
     session = recording_upload._ensure_session(camera_number, camera_id)
 

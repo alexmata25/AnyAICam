@@ -241,10 +241,19 @@ def _control_plane_get(path: str) -> dict | None:
 
 def _refresh_camera_map() -> None:
     """Polls the existing, unchanged GET /api/appliance/configuration for
-    this appliance's own camera_number -> camera_id/site_id mapping.
-    Never writes anything; a failed/unreachable poll just leaves the
-    previous mapping in place, so a transient network blip never stops
-    already-known cameras from continuing to upload."""
+    this appliance's own camera_number -> camera_id/site_id/cloud_recording_
+    mode mapping. Never writes anything; a failed/unreachable poll just
+    leaves the previous mapping in place, so a transient network blip
+    never stops already-known cameras from continuing to upload.
+
+    cloud_recording_mode is carried through here (aliased as
+    'recording_mode' in the API response -- see appliance_cloud.py's
+    appliance_configuration()) because it's this camera's own per-camera
+    cloud-upload entitlement, read live off this same cached map by
+    event_media_uploader.upload_motion_event_media() exactly the way
+    main.py's people_counting_worker() already reads its own per-camera
+    entitlement (people_counting_enabled) off this identical map -- one
+    shared cache, not a second one."""
     response = _control_plane_get("/api/appliance/configuration")
     if not isinstance(response, dict):
         return
@@ -264,7 +273,12 @@ def _refresh_camera_map() -> None:
             continue
         if not isinstance(site_id, str) or not site_id.strip():
             continue
-        mapping[camera_number] = {"camera_id": camera_id, "site_id": site_id}
+        cloud_recording_mode = item.get("recording_mode")
+        mapping[camera_number] = {
+            "camera_id": camera_id,
+            "site_id": site_id,
+            "cloud_recording_mode": cloud_recording_mode if isinstance(cloud_recording_mode, str) else None,
+        }
     with _lock:
         _camera_map.clear()
         _camera_map.update(mapping)

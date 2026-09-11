@@ -36,9 +36,23 @@ GRACE_SECONDS = 10  # re-checked below: a deliberate pause before acting,
 # The ONLY actions this script can ever take, full stop. A marker whose
 # `type` isn't a key here is ignored (logged, marker left in place) --
 # never guessed at, never passed to a shell.
+#
+# restart_vms is deliberately `docker compose ... up -d`, NOT
+# `docker restart anyaicam-vms` -- confirmed live on a fresh appliance
+# install: `docker restart` reuses the container's already-baked-in
+# environment from whenever it was last created and never re-reads
+# /etc/anyaicam/vms.env, so setup_wizard.py's own ANYAICAM_CLOUD_URL
+# write (the entire reason this action gets queued after activation)
+# would silently never take effect. `docker compose up -d` diffs the
+# resolved service config (env_file included) against the running
+# container and recreates it only when something actually changed --
+# confirmed live to pick up a vms.env edit within one call. --project-
+# directory is explicit rather than relying on this process's inherited
+# working directory, which this fixed-argv/no-shell design must never
+# depend on.
 DISPATCH = {
     'reboot': ['systemctl', 'reboot'],
-    'restart_vms': ['docker', 'restart', 'anyaicam-vms'],
+    'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
 }
 
 log = logging.getLogger('anyaicam.privileged_watcher')
@@ -76,6 +90,18 @@ def process_marker(path: Path, dry_run: bool, grace_seconds: float = GRACE_SECON
         return None
     command_id = marker.get('command_id')
     action_type = marker.get('type')
+    # isinstance check BEFORE the DISPATCH.get() lookup below -- confirmed
+    # by test: an unhashable `type` (e.g. a list, dict, or set, whether
+    # malformed input or a deliberate attempt to crash the watcher) raised
+    # an unhandled TypeError out of dict.get() instead of being rejected
+    # the same safe way every other unknown type already is. A crashed
+    # oneshot service run can leave OTHER pending markers unprocessed
+    # until the next trigger and, depending on systemd's own failure
+    # handling, the unit sitting in a failed state -- exactly the "unsafe
+    # failure behavior" this design's docstring promises never happens.
+    if not isinstance(action_type, str):
+        log.warning('Ignoring marker %s with non-string type=%r', path, action_type)
+        return None
     if not command_id or not isinstance(command_id, str):
         log.warning('Ignoring marker %s with missing/invalid command_id', path)
         return None

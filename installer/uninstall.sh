@@ -39,6 +39,15 @@ run_uninstall() {
     if [[ "$purge" -eq 1 ]]; then
         log "PURGE requested: removing all preserved state."
         rm -rf "$CONFIG_DIR" /var/lib/anyaicam /var/log/anyaicam
+        # Confirmed live: without this, detect_install_state() never
+        # reports 0/5 ("clean") again after a purge -- `id -u anyaicam`
+        # still succeeds, so the very next install run goes through the
+        # existing/repair path (with its much looser storage-preflight
+        # floor) instead of the strict 100GB clean-install check, even
+        # though every other trace of the appliance is genuinely gone.
+        # A true "start over from scratch" reinstall needs the system
+        # user gone too, not just its data.
+        userdel anyaicam 2>/dev/null || true
     else
         log "Software removed. Preserved: $CONFIG_DIR, /var/lib/anyaicam, /var/log/anyaicam."
     fi

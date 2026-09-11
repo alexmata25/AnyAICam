@@ -386,6 +386,47 @@ CREATE TABLE IF NOT EXISTS pending_analytics_links(
 );
 CREATE INDEX IF NOT EXISTS idx_pending_analytics_links_email_status ON pending_analytics_links(normalized_email,status);
 '''),
+    ('20260910_appliance_update_results','''
+CREATE TABLE IF NOT EXISTS appliance_update_results(
+    update_id TEXT NOT NULL,
+    appliance_id TEXT NOT NULL,
+    from_version TEXT,
+    to_version TEXT,
+    state TEXT NOT NULL,
+    error TEXT,
+    rollback_from TEXT,
+    duration_seconds REAL,
+    reported_at TEXT NOT NULL,
+    PRIMARY KEY(update_id,appliance_id),
+    FOREIGN KEY(appliance_id) REFERENCES appliances(id)
+);
+'''),
+    ('20260910_appliance_claims','''
+CREATE TABLE IF NOT EXISTS appliance_claims(
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    claim_session_id TEXT UNIQUE NOT NULL,
+    claim_code_hash TEXT NOT NULL,
+    claim_proof_hash TEXT,
+    claim_proof_plaintext TEXT,
+    status TEXT NOT NULL,
+    customer_id TEXT,
+    site_id TEXT,
+    claimed_by TEXT,
+    appliance_id TEXT,
+    proof_expires_at TEXT,
+    expires_at TEXT NOT NULL,
+    claimed_at TEXT,
+    completed_at TEXT,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(site_id) REFERENCES sites(id),
+    FOREIGN KEY(appliance_id) REFERENCES appliances(id)
+);
+CREATE INDEX IF NOT EXISTS idx_appliance_claims_device_id ON appliance_claims(device_id);
+CREATE INDEX IF NOT EXISTS idx_appliance_claims_status ON appliance_claims(status);
+'''),
 ]
 
 
@@ -547,6 +588,21 @@ def apply_migrations():
                               {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='pending_customer_links'").fetchall()})
         if 'stripe_price_id' not in pending_link_columns: db.execute('ALTER TABLE pending_customer_links ADD COLUMN stripe_price_id TEXT')
 
+        # RDM4 heartbeat restart-detection (appliance_cloud.py's heartbeat()):
+        # a restart is inferred from uptime_seconds dropping, never self-
+        # reported, and this counter is what commands.py's diagnostics()
+        # comment already documents as tracked "through the separate,
+        # existing RDM3 heartbeat/upload-worker pipeline" -- confirmed by
+        # heartbeat() unconditionally executing
+        # 'UPDATE appliances SET restart_count=...' the moment it detects
+        # one, which raised sqlite3.OperationalError: no such column on
+        # any database that only ever ran the migrations above this line
+        # (live_relay_pilot's own release never added it). Live on real
+        # Samsung hardware: every restart-shaped heartbeat -- including an
+        # offline-queued heartbeat replayed after connectivity is restored
+        # -- 500'd here instead of registering the restart and moving on.
+        if 'restart_count' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0')
+
         # Appliance identity contract (see appliance_identity.py):
         # authorization_version_at_login records the identity's
         # authorization_version at the moment this session was
@@ -559,3 +615,29 @@ def apply_migrations():
                          if backend()=='sqlite' else
                          {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='user_sessions'").fetchall()})
         if 'authorization_version_at_login' not in session_columns: db.execute('ALTER TABLE user_sessions ADD COLUMN authorization_version_at_login INTEGER')
+
+        # Phase 1 security-hardening checkpoint (see
+        # docs/non-interactive-activation-phase1-security-hardening-report.md):
+        # claim_proof_plaintext (the original Phase 1 column) is left in
+        # place -- never dropped, per this file's own established
+        # convention -- but new code never writes to it again. These
+        # three replace it:
+        #   claim_proof_encrypted: the confirmed claim_proof, encrypted
+        #     at rest (appliance_protocol.encrypt_claim_flow_secret())
+        #     instead of stored raw, so a DB-file-level read no longer
+        #     hands out a live, redeemable secret the way a plaintext
+        #     column would.
+        #   completed_credential_encrypted / credential_recovery_expires_at:
+        #     the ONE-TIME credential claim/complete mints, held
+        #     encrypted for a short recovery window so a retry after a
+        #     lost response can recover the SAME credential instead of
+        #     permanently losing enrollment or minting a second one.
+        claim_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliance_claims)').fetchall()}
+                       if backend()=='sqlite' else
+                       {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliance_claims'").fetchall()})
+        for name,definition in (
+            ('claim_proof_encrypted','TEXT'),
+            ('completed_credential_encrypted','TEXT'),
+            ('credential_recovery_expires_at','TEXT'),
+        ):
+            if name not in claim_columns: db.execute(f'ALTER TABLE appliance_claims ADD COLUMN {name} {definition}')

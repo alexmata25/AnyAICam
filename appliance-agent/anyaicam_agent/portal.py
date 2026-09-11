@@ -46,3 +46,24 @@ class PortalClient:
         except (urllib.error.URLError,TimeoutError,OSError,json.JSONDecodeError) as error: raise PortalError(str(error)) from error
     def test(self): return self.request('GET','/api/appliance/config',authenticated=False)
     def activate(self,cloud_id,token): return self.request('POST','/api/appliance/activate',{'cloud_id':cloud_id,'activation_token':token},authenticated=False)
+    # Phase 1 of the non-interactive/self-service claim flow (see
+    # docs/non-interactive-activation-phase1-plan.md and
+    # app/appliance_claims.py's own module docstring for the cloud-side
+    # half these three methods talk to). Unauthenticated, exactly like
+    # activate() above -- the device has no credential yet at any point
+    # during this exchange, by definition. claim_code/claim_session_id/
+    # claim_proof are bearer-equivalent secrets and, like credential and
+    # activation_token above, are never added to FORBIDDEN: sanitize()
+    # exists to strip camera-credential-shaped keys that should never
+    # reach the wire through this generic path at all (see provisioning.py's
+    # own comment on it being a second, independent layer of defense),
+    # not to scrub values this exchange legitimately has to send. "No
+    # secrets in logs" is satisfied the same way activate() already
+    # satisfies it: nothing in this module logs a payload or a response,
+    # and no caller of these three methods exists yet -- wiring the
+    # interactive wizard (the only current call site pattern to follow)
+    # to actually use this flow is explicitly deferred to a later phase,
+    # so there is no logging call site to get wrong in this one.
+    def claim_begin(self,device_id): return self.request('POST','/api/appliance/claim/begin',{'device_id':device_id},authenticated=False)
+    def claim_status(self,claim_session_id): return self.request('POST','/api/appliance/claim/status',{'claim_session_id':claim_session_id},authenticated=False)
+    def claim_complete(self,claim_session_id,claim_proof): return self.request('POST','/api/appliance/claim/complete',{'claim_session_id':claim_session_id,'claim_proof':claim_proof},authenticated=False)

@@ -35,7 +35,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_release_installer import INSTALLER_RUNTIME_FILES, run_git, write_deterministic_tar  # noqa: E402
+from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
 
 
 class RunGitAutocrlfOverrideTests(unittest.TestCase):
@@ -129,6 +129,142 @@ class DeterministicTarExecutableBitTests(unittest.TestCase):
         self.assertIn("validate.sh", expected)
         self.assertIn("uninstall.sh", expected)
         self.assertNotIn("README.md", expected)
+
+
+class DockerfileCopySourcesAreAllReleasedTests(unittest.TestCase):
+    """A third confirmed-live release blocker, same family as the two
+    above (both caught only by actually running the built package on a
+    real target, never by this test file): REQUIRED_RELEASE_PATHS
+    listed requirements.txt but not requirements-cpu.txt, even though
+    both Dockerfile and Dockerfile.production COPY it -- a release built
+    from that allowlist always failed `docker compose build` on a real
+    Linux/Docker host with 'requirements-cpu.txt: not found', confirmed
+    live on a fresh disposable EC2 instance. REQUIRED_RELEASE_PATHS now
+    includes it; this test parses both real repo-root Dockerfiles for
+    every top-level COPY source and asserts each one is covered by
+    REQUIRED_RELEASE_PATHS or OPTIONAL_RELEASE_PATHS, so a Dockerfile
+    referencing a new root-level file without updating that allowlist
+    fails here instead of only being discovered by a live install."""
+
+    _COPY_RE = __import__("re").compile(r"^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+\s*$", __import__("re").MULTILINE)
+
+    def _copy_sources(self, dockerfile: Path) -> set[str]:
+        text = dockerfile.read_text(encoding="utf-8")
+        sources = set()
+        for match in self._COPY_RE.finditer(text):
+            src = match.group(1).lstrip("./")
+            # Directory copies (e.g. "app", "./app") are covered by the
+            # "app" entry itself; only bare top-level file names are
+            # relevant here.
+            top_level = src.split("/", 1)[0]
+            sources.add(top_level)
+        return sources
+
+    def test_every_dockerfile_copy_source_is_in_the_release_allowlist(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        allowlisted = set(REQUIRED_RELEASE_PATHS) | set(OPTIONAL_RELEASE_PATHS)
+        for name in ("Dockerfile", "Dockerfile.production"):
+            dockerfile = repo_root / name
+            if not dockerfile.is_file():
+                continue
+            for source in self._copy_sources(dockerfile):
+                self.assertIn(
+                    source, allowlisted,
+                    f"{name} COPYs {source!r} but it is not in REQUIRED_RELEASE_PATHS or "
+                    "OPTIONAL_RELEASE_PATHS -- a built release package would be missing it.",
+                )
+
+    def test_requirements_cpu_txt_is_required(self):
+        self.assertIn("requirements-cpu.txt", REQUIRED_RELEASE_PATHS)
+
+
+class PrivilegedWatcherIsPackagedTests(unittest.TestCase):
+    """A fourth confirmed-live blocker, found while fixing restart_vms's
+    own dispatched command: appliance-agent/system/ (privileged_watcher.
+    py plus its two systemd units) is a completely different directory
+    from appliance-agent/systemd/ (only anyaicam-agent.service) -- the
+    similar name is exactly why this had never been noticed by
+    inspection. AGENT_RELEASE_PATHS only ever packaged the latter, so
+    restart_vms/reboot_appliance could never function on any real
+    installed appliance, independent of the dispatched command itself
+    being correct. See docs/phase1-edge-validation-report.md."""
+
+    def test_appliance_agent_system_directory_is_packaged(self):
+        self.assertIn("appliance-agent/system", AGENT_RELEASE_PATHS)
+
+    def test_appliance_agent_systemd_directory_is_still_separately_packaged(self):
+        # Regression guard against "fixing" this by renaming/merging the
+        # two directories instead of listing both -- anyaicam-agent.
+        # service (appliance-agent/systemd/) must keep shipping too.
+        self.assertIn("appliance-agent/systemd", AGENT_RELEASE_PATHS)
+
+    def test_the_packaged_directory_actually_contains_the_watcher_and_both_units(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        system_dir = repo_root / "appliance-agent" / "system"
+        self.assertTrue((system_dir / "privileged_watcher.py").is_file())
+        self.assertTrue((system_dir / "anyaicam-privileged-watcher.path").is_file())
+        self.assertTrue((system_dir / "anyaicam-privileged-watcher.service").is_file())
+
+    def test_service_unit_execstart_matches_where_the_installer_actually_puts_the_script(self):
+        """These two facts live in different files (the unit's ExecStart=
+        here, the installed path in scripts/lib-privileged-watcher.sh's
+        own default) with nothing enforcing they agree -- this test is
+        that enforcement, so a future edit to either one alone fails
+        here instead of shipping a unit that points at a path the
+        installer never actually populates."""
+        repo_root = Path(__file__).resolve().parents[2]
+        unit_text = (repo_root / "appliance-agent" / "system" / "anyaicam-privileged-watcher.service").read_text(encoding="utf-8")
+        lib_text = (repo_root / "appliance-agent" / "scripts" / "lib-privileged-watcher.sh").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/opt/anyaicam-agent/privileged/watcher.py", unit_text)
+        self.assertIn("/opt/anyaicam-agent/privileged", lib_text)
+
+    def test_both_units_disable_the_systemd_start_rate_limit(self):
+        """Confirmed live on a real disposable EC2 instance: leaving a
+        handful of unknown/malformed markers in the pending_actions
+        directory (privileged_watcher.py deliberately never deletes
+        them, so an operator can inspect what was rejected) caused
+        BOTH anyaicam-privileged-watcher.path and its .service to hit
+        systemd's default start-rate-limit and go `failed` after only a
+        few closely-spaced triggers -- and a FAILED unit is never
+        retriggered again until an operator runs `systemctl reset-
+        failed`, silently disabling restart_vms/reboot_appliance for
+        any real request queued after the block, with no crash and no
+        bad exit code to point at. Both units must set
+        StartLimitIntervalSec=0 (this test cannot exercise real systemd
+        rate-limiting itself -- no real systemd is available in this
+        test environment -- so it locks in the config line the live
+        finding actually required)."""
+        repo_root = Path(__file__).resolve().parents[2]
+        for unit_name in ("anyaicam-privileged-watcher.path", "anyaicam-privileged-watcher.service"):
+            unit_text = (repo_root / "appliance-agent" / "system" / unit_name).read_text(encoding="utf-8")
+            self.assertIn(
+                "StartLimitIntervalSec=0", unit_text,
+                f"{unit_name} must disable systemd's start-rate-limit, or a burst of "
+                "unknown/malformed markers can permanently block real requests.",
+            )
+
+    def test_uninstall_removes_what_install_creates(self):
+        """Found while reviewing the full fresh-install/uninstall/
+        reinstall workflow ahead of Samsung deployment (not from a live
+        run this time -- a straight reading of the two scripts): install.
+        sh calls install_privileged_watcher(), which creates two systemd
+        units and a script directory, but scripts/uninstall.sh never
+        called anything to remove them -- confirmed by the absence of
+        `uninstall_privileged_watcher` anywhere in it before this fix.
+        A default (non-purge) uninstall left the .path unit enabled and
+        watching a directory with no watcher script left to run it.
+        This test only proves the call site exists and is wired to the
+        same lib both scripts already share; appliance-agent/tests/
+        test_privileged_watcher_install.sh proves the function's own
+        behavior (units actually disabled and files actually removed)
+        against a fixture root."""
+        repo_root = Path(__file__).resolve().parents[2]
+        install_text = (repo_root / "appliance-agent" / "scripts" / "install.sh").read_text(encoding="utf-8")
+        uninstall_text = (repo_root / "appliance-agent" / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+        self.assertIn("install_privileged_watcher", install_text)
+        self.assertIn("source", uninstall_text)
+        self.assertIn("lib-privileged-watcher.sh", uninstall_text)
+        self.assertIn("uninstall_privileged_watcher", uninstall_text)
 
 
 if __name__ == "__main__":

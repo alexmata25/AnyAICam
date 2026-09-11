@@ -202,6 +202,42 @@ def test_readiness_reports_the_real_count_for_dynamic_cameras(monkeypatch):
     assert snapshot["cameras_total"] == 2
 
 
+# =============================================================== GET /ready over real HTTP -- confirmed live on a fresh appliance install
+
+
+def test_ready_endpoint_responds_200_not_500(tmp_path):
+    """readiness_snapshot() (and health_monitor()/site_monitoring_summary(),
+    the same call shape) used to call camera_status() with zero
+    arguments, but camera_status(request: Request) requires one --
+    confirmed live via `docker exec anyaicam-vms curl -s http://127.0.0.1:
+    8000/ready` on a freshly installed edge appliance: every call 500'd
+    with `TypeError: camera_status() missing 1 required positional
+    argument: 'request'`. Fixed to call _legacy_camera_status() directly
+    (no request/customer-session context exists at any of these three
+    call sites -- that's what camera_status(request)'s customer-portal
+    branch needs). This test hits the real route over HTTP, not just the
+    underlying function, closing the gap the two tests above (which call
+    readiness_snapshot() directly) left open."""
+    from fastapi.testclient import TestClient
+
+    from database_backend import override_target
+    from partner_db import initialize_database
+
+    with override_target(sqlite_path=tmp_path / "test_ready_endpoint.db"):
+        initialize_database()
+        with TestClient(main.app) as client:
+            response = client.get("/ready")
+
+    # 200 (ready) or 503 (legitimately not-ready-yet, e.g. startup_self_
+    # test() finding incomplete config in this bare test DB) are both
+    # real, intentional outcomes computed by readiness_snapshot() -- the
+    # property this test exists to prove is that it computes one at all
+    # instead of raising: 500 (an unhandled TypeError) is what the arity
+    # bug actually produced.
+    assert response.status_code in (200, 503)
+    assert response.json()["cameras_total"] == 0
+
+
 # =============================================================== downstream UI surfaces: no fake Camera 1-4 selectors
 
 
