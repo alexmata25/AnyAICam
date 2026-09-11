@@ -54,23 +54,39 @@ This branch merges, with deliberate conflict resolution (not a blind merge):
   offline, malformed JS template literal), AWS_REGION fail-loud guard,
   `restart_count` migration
 
-**This branch has been built and tested (golden-foundation-rc1, see below),
-but as of this writing has NOT been deployed anywhere** (not staging, not
-Ryzen, not Samsung). It exists only in the isolated worktree
-`AnyAiCam-VMS-reconciliation`. Do not treat it as deployed until a specific
-deploy record says otherwise, added below.
+**RC1 was deployed to Ryzen (2026-09-11, clean install) and failed
+validation** — see "RC1 → RC2 on Ryzen" below. **RC2 fixes that defect and
+has been built + locally smoke-tested but NOT yet deployed to Ryzen** (or
+anywhere else — not staging, not Samsung). Do not treat RC2 as deployed
+until a specific deploy record says otherwise, added below.
 
 ```
-GOLDEN BUILD: golden-foundation-rc1 — commit 1dfcbf2
-  (full sha 1dfcbf24b704ac4a523560ba7f9441838815fe53)
+GOLDEN BUILD: golden-foundation-rc2 — commit 34d9d5c
+  (full sha 34d9d5ca96b674f0d4a7212bbf7996d52f063fa0)
 Built: 2026-09-11, from `reconcile/golden-foundation-20260911` worktree
   `AnyAiCam-VMS-reconciliation`, via the repo's own `Dockerfile` (the same
   one deploy/docker-compose.*.example.yml reference — NOT Dockerfile.production,
   which nothing in this repo actually deploys with).
 VMS container image digest (local build, not yet pushed to a registry):
+  sha256:6ff38cc2c81f6398ce6b95abf42ce5056a8f9eec5a67258dd1f2cb06e9f930af
+  tags: anyaicam-vms:golden-rc2, anyaicam-vms:34d9d5c
+Installer artifact (the actual thing to deploy — built via
+  installer/build_release_installer.py --vms-commit 34d9d5ca96b674f0d4a7212bbf7996d52f063fa0):
+  anyaicam-appliance-installer-1.1.0-vms-34d9d5ca96b6.tar.gz
+  artifact sha256: 8912bcd17041cad1ad0cbf813a5dcb148b23deb2dd1e0c7b1da17893a3283566
+  embedded source sha256: b04b976979f41baa6f27e8e1d4ed670745981f45c7f3b3a626110a29656bc51d
+Local smoke test (Windows dev machine, disposable container, NOT Ryzen):
+  ANYAICAM_RUNTIME_ROLE=edge + ANYAICAM_ENV=production + zero cameras ->
+  self_test.ok=true, configuration_valid 0 critical (was 6). ready=false
+  still, correctly, because recording_workers=0 (edge role legitimately
+  requires recording>0) -- expected until cameras are discovered.
+
+Prior build (RC1, failed validation — kept for history, do not deploy):
+GOLDEN BUILD: golden-foundation-rc1 — commit 1dfcbf2
+  (full sha 1dfcbf24b704ac4a523560ba7f9441838815fe53)
+VMS container image digest:
   sha256:ac680f4201bb7324b135db09559a8c52e584cf5e333bfdf01c6890df23fceff7
   (image config sha256:254524377ad50667be006fdcc646c03221cf02164b03c4cc49bd7499f9c11d67)
-  tags: anyaicam-vms:golden-rc1, anyaicam-vms:1dfcbf2
 appliance-agent package (anyaicam-appliance-agent 0.1.0), built separately --
   it ships to appliance hosts via the installer, not inside the VMS image:
   wheel sha256: 266b649779cb13f55302cbdb740c76c59d2e34acff92aa3caf2f109c32016473
@@ -78,7 +94,8 @@ appliance-agent package (anyaicam-appliance-agent 0.1.0), built separately --
 Tested: 2026-09-11, disposable Docker Desktop environment on the Dell/
   OneDrive dev machine (no Ryzen/Samsung/staging/AWS touched). See
   "RC1 validation" below for full results.
-Deployed to: nowhere yet.
+Deployed to: Ryzen (2026-09-11), then wiped after validate.sh failed --
+  see "RC1 → RC2 on Ryzen" below. No longer running anywhere.
 ```
 
 Note on reproducibility: the image build is NOT byte-for-byte deterministic
@@ -89,6 +106,53 @@ packaging, six, etc.) float to whatever's current on PyPI at build time.
 The build IS reproducible in the sense that mattered for this exercise: it
 completes from a clean `docker build` with zero manual runtime patches, on
 every attempt, from this exact source commit.
+
+---
+
+## RC1 → RC2 on Ryzen (2026-09-11)
+
+RC1 (`1dfcbf2`) was deployed to Ryzen as a genuine clean install (Ryzen's
+prior AnyAiCam state -- recordings, activation, agent install -- was
+explicitly wiped first, per direct instruction, via `installer/
+uninstall.sh --purge-all`'s own target list; disk was reclaimed from 100%
+full/0 bytes free down to 346GB free first). This was deliberately the
+first-ever zero-manual-patch validation of a truly clean install:
+`installer/build_release_installer.py` built a self-contained installer
+artifact from the exact commit, transferred via `scp`, SHA-256-verified on
+both ends before running, then `sudo bash install.sh` — no hand-copied
+source, no runtime edits.
+
+Install itself succeeded (`detected state=clean`, exact commit verified,
+both systemd units enabled/active, real appliance identity issued). The
+installer's own `validate.sh` then failed: `GET /ready` returned 503.
+
+**Root cause (confirmed via source read + live diagnostics, not
+guesswork):** `configuration_issues()` in `app/main.py` required
+`AWS_REGION`/external database/S3/public URL/Secrets Manager to be
+configured directly on the VMS container whenever `ANYAICAM_ENV=production`
+— with no check of `ANYAICAM_RUNTIME_ROLE` at all. This contradicted
+`readiness_snapshot()`'s own deliberate role scoping (cloud requirements
+only apply to `cloud`/`combined` roles, never `edge`), so every
+production-edge appliance was permanently un-ready regardless of
+camera/claim state. `ANYAICAM_FORCE_HTTPS` had the identical shape against
+its own already-role-aware default (`_default_force_https()`). No prior
+Ryzen session ever caught this because AWS_REGION etc. were always
+already hand-patched into `vms.env` from earlier, unrelated motion-cloud
+validation work — this was the first truly clean install ever checked
+against `GET /ready`.
+
+**Fixed in commit `34d9d5c`** (on top of `1dfcbf2`): both checks are now
+gated on `RUNTIME_ROLE` the same way `readiness_snapshot()` already is.
+Cloud/combined production behavior is completely unchanged. Regression
+coverage: `app/tests/test_ready_endpoint_role_aware_configuration.py` (10
+tests). Full `app/tests` re-run shows zero new failures from this change.
+Locally smoke-tested (see GOLDEN BUILD block above): `self_test.ok`
+flips true, `configuration_valid` critical count 6 → 0, for the exact
+production+edge+zero-cloud-config shape Ryzen hit.
+
+**Not yet re-deployed to Ryzen.** RC2 (`34d9d5c`) is built and locally
+verified only. Camera discovery/claim on Ryzen was never reached (blocked
+by the RC1 failure) — still pending.
 
 ---
 
