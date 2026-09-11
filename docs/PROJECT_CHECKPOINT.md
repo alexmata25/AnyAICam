@@ -429,6 +429,97 @@ bug and re-invent a fix:
 
 ---
 
+## Staging (`anyaicam-staging`) — deployment rehearsal complete, GO (2026-09-11)
+
+`anyaicam-staging`'s real, running source (last built 2026-09-10 01:59,
+**never rebuilt since** — confirmed by comparing every rollback checkpoint
+container's image ID, all four identical) predates the claim flow
+entirely: `app/appliance_claims.py` doesn't exist on disk there, and
+`POST /api/appliance/claim/begin` genuinely 404s (`{"detail":"Not
+Found"}`, the FastAPI app's own 404, not an infra/proxy issue). The
+`claim-key`/`live-relay`/`secret-fix` rollback checkpoints from the last
+~16h were config/secret rotations only, never source rebuilds.
+
+**Staging's real database is SQLite** (`/var/lib/anyaicam-staging/db/
+staging.db`), not PostgreSQL — the `deploy/.env.staging.example` template
+in this repo doesn't reflect the real deployed config (`ANYAICAM_DATABASE_BACKEND`/
+`ANYAICAM_DATABASE_URL` are unset there; defaults to sqlite).
+**Staging has no AWS credentials/region/S3 configured anywhere** —
+confirmed both from the real env file and from the live app's own
+`startup.complete` log line (`aws_region_configured:false,
+s3_configured:false, cloud_foundation_ready:false`). Motion Cloud/S3/
+CloudFront/STS integrations are not currently active on this
+environment, contrary to an initial review's assumptions — there was
+nothing live to "preserve" on that front.
+
+**Backup**: `/var/lib/anyaicam-staging/db/staging-pre-claim-deploy-backup-20260911T222105Z.db`,
+SHA-256 `7a997d95b72bff3a7838967dbcc29479243dd037047c231bb8fe4b35ada416ce`,
+1,703,936 bytes, `PRAGMA integrity_check: ok`, 69 tables/97 indexes, real
+data confirmed (3 appliances, 3 customers, 4 partner_users, 15 cameras).
+Created via SQLite's own online backup API, source opened read-only.
+
+**Disposable rehearsal** (entirely separate from live: `~/golden-rehearsal-4ade235/`
+on the staging host, disposable copies of the backup, containers bound
+to `127.0.0.1` only, never touching `/opt/anyaicam-staging` or
+`/var/lib/anyaicam-staging/db/staging.db`):
+- **Schema is already 100% caught up**: staging's `schema_migrations`
+  has all 22 golden migrations applied already (diffed exactly against
+  `app/db_migrations.py`'s full list — identical sets). `appliance_claims`'s
+  live schema is a byte-for-byte match to the golden migration (0 missing/
+  extra columns) — someone already ran `apply_migrations()` directly
+  against the live DB recently (`20260910_appliance_claims` applied
+  `2026-09-11T16:55:43`), without ever deploying the route code that uses
+  it.
+- Running the golden migration path (`partner_db.initialize_database()`)
+  against the disposable copy produced a **byte-identical file** before
+  and after (same SHA-256) — full confirmation of idempotency, zero
+  migration risk remaining.
+- Golden commit `4ade2352b1ea6da9c56a339650773c01879c0b98`'s image
+  started cleanly against the migrated disposable DB with staging-equivalent,
+  secrets-scrubbed config (`ANYAICAM_ENV=staging`, `ANYAICAM_RUNTIME_ROLE=cloud`,
+  real non-secret URLs/flags copied from the live env file, throwaway
+  `ANYAICAM_APP_SECRETS`). `/health` 200, `/ready` 503 with `self_test.ok:
+  true`/`configuration_valid: true` (correct — `cloud` role needs
+  `cloud_foundation_ready`, which is false only because AWS isn't
+  configured, matching live reality, not a defect). **`POST /api/appliance/claim/begin`
+  returned HTTP 200 with a real `claim_session_id`/`claim_code`** — the
+  claim flow works end-to-end against the real migrated data.
+  `live_relay_idle_sweep_task` started correctly (cloud/combined-role
+  gated); no edge-only worker started under `RUNTIME_ROLE=cloud`.
+- **Old-image rollback test**: the currently-live image (`8e31af166a1e`)
+  starts and serves `/health` cleanly against the migrated schema, and
+  correctly 404s on claim/begin (confirming it's genuinely the old,
+  pre-claim code) — **image-only rollback after a golden deploy remains
+  viable.**
+- **Independent finding, not caused by this rehearsal**: the old image's
+  `/ready` throws `TypeError: camera_status() missing 1 required
+  positional argument: 'request'` — the exact bug the golden branch's
+  `_legacy_camera_status()` already fixes. **Confirmed this is a live,
+  standing defect on real `https://portal-staging.anyaicam.com/ready`
+  right now** (read-only GET, checked directly) — not a rehearsal
+  artifact, not something a rollback would newly introduce.
+
+**Rsync scope for the eventual live sync** (exact mirror, not yet
+executed): mirror only `/opt/anyaicam-staging/{app,requirements.txt,requirements-cpu.txt,Dockerfile}`
+against the golden commit's tracked files. **Must never be touched**:
+`/opt/anyaicam-staging/storefront/` (a completely separate service/image,
+unrelated to the VMS portal) and `/opt/anyaicam-staging/deploy/` (the
+real, live, tuned `docker-compose.yml`/`Caddyfile` — root-owned, actively
+used; the repo's own `deploy/*.example.yml` are generic templates, not
+what's actually running, and must not overwrite them). No runtime-generated
+files were found under the live `app/` tree (no `__pycache__`, no stray
+directories) — every subdirectory there matches golden's own tracked
+structure exactly, so an exact-mirror sync scoped to those four paths is
+safe.
+
+**GO for live deployment**, pending final review of the exact live
+procedure (build → rollback-checkpoint rename → `docker compose up -d
+portal` → verify → confirm no data-count drift). Live deployment has
+**not** been executed — this rehearsal only. Ryzen and Samsung untouched
+throughout.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
