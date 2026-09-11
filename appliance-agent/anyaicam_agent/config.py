@@ -128,13 +128,44 @@ class AgentConfig:
     @property
     def trusted_public_key_file(self): return Path(self.config_dir)/'trusted_signing_key.pem'
 
+    # The three fields first_enroll()/coordinated_reenroll() write into
+    # agent.json as part of a completed activation -- not general runtime
+    # tuning knobs like checkin_seconds/camera_capacity/etc. below. See
+    # load()'s own comment on why these three specifically need
+    # protection from environment-variable override once activated.
+    ACTIVATION_SCOPED_FIELDS={'cloud_id','portal_url','mode'}
+
     @classmethod
     def load(cls,path: str|Path|None=None):
         path=Path(path or os.getenv('ANYAICAM_CONFIG_FILE',DEFAULT_CONFIG_DIR/'agent.json')); data={}
         if path.exists(): data=json.loads(path.read_text(encoding='utf-8'))
         aliases={'cloud_id':'ANYAICAM_CLOUD_ID','portal_url':'ANYAICAM_PORTAL_URL','mode':'ANYAICAM_AGENT_MODE','checkin_seconds':'ANYAICAM_CHECKIN_SECONDS','camera_capacity':'ANYAICAM_CAMERA_CAPACITY','recording_path':'ANYAICAM_RECORDING_PATH','vms_hls_path':'ANYAICAM_VMS_HLS_PATH','vms_recordings_path':'ANYAICAM_VMS_RECORDINGS_PATH','vms_status_freshness_seconds':'ANYAICAM_VMS_STATUS_FRESHNESS_SECONDS','vms_recording_freshness_seconds':'ANYAICAM_VMS_RECORDING_FRESHNESS_SECONDS','update_target':'ANYAICAM_UPDATE_TARGET','update_channel':'ANYAICAM_UPDATE_CHANNEL','update_check_interval_seconds':'ANYAICAM_UPDATE_CHECK_INTERVAL_SECONDS','vms_local_health_url':'ANYAICAM_VMS_LOCAL_HEALTH_URL'}
+        # field_defaults doubles as "the installer's own bootstrap
+        # placeholder" for portal_url/mode: appliance-agent/scripts/
+        # install.sh writes /etc/anyaicam/agent.env (sourced by
+        # anyaicam-agent.service on every start/restart/reboot) with
+        # ANYAICAM_PORTAL_URL=http://127.0.0.1:8000 and
+        # ANYAICAM_AGENT_MODE=development -- the exact same literals as
+        # these fields' own dataclass defaults below, so no separate
+        # constant is needed to recognize an untouched placeholder.
+        field_defaults={name:field.default for name,field in cls.__dataclass_fields__.items()}
         for key,environment in aliases.items():
-            if os.getenv(environment) is not None: data[key]=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','vms_status_freshness_seconds','vms_recording_freshness_seconds','update_check_interval_seconds'} else os.environ[environment]
+            if os.getenv(environment) is None: continue
+            value=int(os.environ[environment]) if key in {'checkin_seconds','camera_capacity','vms_status_freshness_seconds','vms_recording_freshness_seconds','update_check_interval_seconds'} else os.environ[environment]
+            # Once agent.json exists (activation has completed at least
+            # once -- it is written nowhere else, see setup_wizard.py's
+            # own already_enrolled check using this same file for the
+            # same signal) and its persisted value for this field is a
+            # real, non-default value, an environment variable that
+            # still equals the field's own untouched default is almost
+            # certainly the installer's bootstrap placeholder rather than
+            # an intentional admin override, and must not silently reset
+            # a value a successful claim/activation already established.
+            # A genuinely different environment value -- an administrator
+            # deliberately repointing an already-activated appliance --
+            # still wins below, exactly as before this change.
+            if key in cls.ACTIVATION_SCOPED_FIELDS and path.exists() and data.get(key) not in (None,field_defaults.get(key)) and value==field_defaults.get(key): continue
+            data[key]=value
         return cls(**{key:value for key,value in data.items() if key in cls.__dataclass_fields__})
 
     def save(self,path: str|Path|None=None):
