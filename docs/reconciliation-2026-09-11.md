@@ -187,14 +187,54 @@ moment. See the appliance checkpoints for what's runtime-only vs. sourced.
 ## Test results
 
 Full relevant automated suite run against the complete reconciled state,
-isolated inside the real `anyaicam-staging-portal` container (not the local
+isolated inside the real `anyaicam-staging-portal` container on the actual
+staging EC2 host (`anyaicam-staging`, `34.194.19.113`) — not the local
 Docker Desktop `anyaicam-vms` container, which is an unrelated, long-stale
-local artifact from 2026-08-06 and was not used for any of this testing).
+local artifact from 2026-08-06 and was not used for any of this testing.
 
-*(Fill in once the background run at `/tmp/recon_full_output.txt` on
-`anyaicam-staging` completes — being tracked live; do not treat this
-section as final until a `DONE_EXIT_0` or equivalent marker has actually
-been observed.)*
+**First run** (`/tmp/recon_full_output.txt`, stage-1 staging-merge-only copy
+and then the complete reconciled copy) both completed:
+- Stage-1 (staging merge only): 370 failed, 1243 passed, 22 skipped.
+- Full reconciled state: **379 failed, 1267 passed, 22 skipped**, in 1021s.
+
+Both numbers are far above the known pre-reconciliation baseline
+("Failure count moved from 37 to 38" per staging's own commit `50bdd6e`),
+which needed investigation before being trusted either way — a difference
+this large could mean a real reconciliation regression, or it could mean
+the test harness itself was invalid.
+
+**Root cause found: test-harness artifact, not a reconciliation
+regression.** The isolated copies were run *inside* the real
+`anyaicam-staging-portal` container to reuse its installed dependencies,
+which means they also inherited its real, production-shaped environment:
+`ANYAICAM_TRUSTED_HOSTS=portal-staging.anyaicam.com`,
+`ANYAICAM_ENV=staging`, `RUNTIME_ROLE` unset (so `edge_production` is
+`False` and the edge exemption in `cloud_config.py`'s
+`effective_trusted_hosts` never applies). `main.py` installs
+`TrustedHostMiddleware` with that value, and Starlette's `TestClient`
+sends `Host: testserver` by default — a host the real staging domain
+allowlist correctly does not include. Every test that made an HTTP request
+through `TestClient` got a blanket `400 Bad Request` ("Invalid host
+header") regardless of what it was actually testing, which is exactly the
+uniform, cross-cutting `assert 400 == <expected>` pattern seen across
+unrelated files (`test_admin_customer_management.py`,
+`test_notification_settings.py`, `test_website_partner_session_nav_links.py`,
+etc.) — a real regression in the merged code would cluster in the files
+that were actually touched, not spread evenly across the whole suite. This
+is a flaw in *how the test was run*, not in the reconciled source, and it
+would have affected a from-scratch checkout of the pre-reconciliation code
+run the same way, too.
+
+**Corrected run**, with `ANYAICAM_TRUSTED_HOSTS` overridden to
+`testserver,localhost,127.0.0.1` for the pytest subprocess's own
+environment only (not written to the container's persistent env, not
+affecting the real staging service, which keeps serving
+`portal-staging.anyaicam.com` throughout):
+
+*(In progress at `/tmp/recon_full_output2.txt` on `anyaicam-staging` —
+being tracked live. Fill in the final pass/fail/skip counts and compare
+against the 37-38-failure baseline once a `DONE_EXIT_` marker is observed;
+do not treat this section as final until then.)*
 
 ## Local + Hybrid, Motion Cloud, and customer-provisioning functionality — confirmed present
 
