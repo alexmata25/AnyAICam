@@ -7560,6 +7560,11 @@ class HardwareCheckoutCreateModel(BaseModel):
     # browser can never submit an arbitrary Price ID.
     sku: str
     quantity: int = 1
+class CameraSlotCheckoutModel(BaseModel):
+    plan_type: str
+    tier_label: str
+
+
 class StripeCheckoutCreateModel(BaseModel):
 
 
@@ -111108,6 +111113,98 @@ def create_stripe_checkout(
 
 
     }
+
+
+@app.post("/api/customer/camera-slots/checkout")
+def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Request) -> dict:
+    """Provisioning Phase 8: the customer-facing checkout that was
+    missing for camera-slot capacity. customer_entitlements.PLAN_TIERS
+    already has real, configured Stripe test-mode Price IDs, and the
+    webhook side (resolve_tier()/_sync_checkout_completed()/
+    upsert_entitlement()) already correctly turns a completed session
+    into a real entitlement -- but nothing in this app ever CREATED a
+    Checkout Session for one of those prices. The only purchase button
+    that existed, create_stripe_checkout() above, is for the unrelated
+    starter/professional/enterprise LICENSE tiers (stripe_price_map()),
+    a completely different product line. Confirmed live on
+    anyaicam-staging (2026-09-12): a real, newly-activated appliance
+    with zero configured cameras was refused at its very first camera
+    provisioning attempt with "Camera limit reached... licensed for 0
+    camera(s)" -- total_camera_slots() was correctly summing zero real
+    entitlement rows, because there was never a way to create one.
+
+    mode=subscription (a recurring camera-slot plan, matching create_
+    stripe_checkout()'s own mode -- NOT mode=payment like the one-time
+    create_hardware_checkout() below). The tier is resolved server-side
+    only from PLAN_TIERS, never from a browser-submitted price_id --
+    the same discipline every other checkout endpoint in this file
+    already applies. customer_owner identity is REQUIRED here (not
+    optional the way the older two endpoints treat it), so metadata[
+    anyaicam_customer_id] is always present: _sync_checkout_completed()
+    only falls back to email-based pending_customer_links reconciliation
+    when that's missing, and an already-authenticated customer buying
+    capacity for their own account should never need that fallback.
+    """
+    from partner_portal import partner_identity as _authoritative_identity
+    identity = _authoritative_identity(request)
+    if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
+        raise HTTPException(status_code=403, detail="Customer owner permission required.")
+    from customer_entitlements import PLAN_TIERS
+    plan_type = payload.plan_type.strip().lower()
+    tier_label = payload.tier_label.strip()
+    tier = next((t for t in PLAN_TIERS if t[0] == plan_type and t[1] == tier_label), None)
+    if not tier:
+        raise HTTPException(status_code=400, detail="Unknown camera-slot tier.")
+    _, _, _, _, camera_slot_maximum, _, env_var = tier
+    price_id = os.environ.get(env_var, "").strip()
+    if not price_id:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {plan_type} {tier_label}.")
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    customer_id = identity["customer_id"]
+    fields = [
+        ("mode", "subscription"),
+        ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=cancelled"),
+        ("client_reference_id", customer_id),
+        ("line_items[0][price]", price_id),
+        # Fixed-tier subscription -- always exactly one, never a
+        # customer-submitted multiplier (see create_stripe_checkout()'s
+        # own comment on this same discipline).
+        ("line_items[0][quantity]", "1"),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_customer_id]", customer_id),
+        ("metadata[anyaicam_camera_slot_plan_type]", plan_type),
+        ("metadata[anyaicam_camera_slot_tier_label]", tier_label),
+        ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
+        ("subscription_data[metadata][anyaicam_customer_id]", customer_id),
+        ("allow_promotion_codes", "true"),
+    ]
+    if identity.get("email"):
+        fields.append(("customer_email", str(identity["email"])))
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+    structured_log(
+        "stripe.camera_slot_checkout_created",
+        session_id=session_id,
+        customer_id=customer_id,
+        plan_type=plan_type,
+        tier_label=tier_label,
+        camera_slot_maximum=camera_slot_maximum,
+    )
+    return {
+        "status": "complete",
+        "session_id": session_id,
+        "checkout_url": checkout_url,
+        "plan_type": plan_type,
+        "tier_label": tier_label,
+        "camera_slot_maximum": camera_slot_maximum,
+        "message": "Stripe Checkout Session created.",
+    }
+
 
 
 
