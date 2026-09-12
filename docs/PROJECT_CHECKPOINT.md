@@ -58,38 +58,78 @@ This branch merges, with deliberate conflict resolution (not a blind merge):
 validation** — see "RC1 → RC2 on Ryzen" below. **RC2 fixed that source
 defect and was deployed to Ryzen, where its own `validate.sh` surfaced a
 second, independent, installer-only defect** — see "RC2 → RC3 on Ryzen"
-below. **RC3 fixes that and has been deployed to Ryzen (repair-path
-install over the existing RC2 install) and PASSED validate.sh with 0
-failures** — see "RC3 on Ryzen — PASSED" below. RC3 is the first golden
-build to pass its own installer's full validation on real hardware.
+below. **RC3 fixed that and passed `validate.sh` with 0 failures, but
+that validator itself had a blind spot: it never checked whether
+`anyaicam-agent.service` was actually *active*, only *enabled* — which
+let RC3's own agent silently crash-loop 600+ times, undetected, the
+entire time it was "PASSED."** See "RC3 on Ryzen — PASSED" and "RC4 on
+Ryzen — the agent-service crash loop" below for the full history. **RC4
+fixes both the validator blind spot and the underlying agent lifecycle
+bug it was hiding, and has been deployed to Ryzen (repair-path install)
+and passed the now-more-complete `validate.sh` with 0 failures** — see
+"RC4 on Ryzen — PASSED" below. RC4 is the first golden build to pass
+validation while the agent is both enabled *and* stably active.
 **Claim/activation and camera discovery have NOT been performed yet** —
 do not treat those as done.
 
 ```
+GOLDEN BUILD: golden-foundation-rc4 — commit 087e455
+  (full sha 087e45587856e7525210d0f9498c3add644d7658)
+Built: 2026-09-11, from `reconcile/golden-foundation-20260911` worktree
+  `AnyAiCam-VMS-reconciliation`, using the corrected
+  `git -c core.autocrlf=false` protection (already built into
+  installer/build_release_installer.py's own run_git() helper).
+VMS container image: source-identical to RC2/RC3 -- `git diff --stat
+  4ade235 087e455 -- app/ Dockerfile requirements.txt requirements-cpu.txt`
+  is empty; this lineage only changed `appliance-agent/` and `installer/`.
+  Rebuilt anyway for a fresh digest (Docker's manifest hash includes
+  build metadata/timestamps even for a 100%-cache-hit `COPY ./app /app`
+  layer, so the digest differs from RC2/RC3's despite identical content --
+  confirmed via direct file-hash comparison, not assumed):
+  digest sha256:476ff7dd964b3ab6f1591697448a869edab365f5959fb6a2732eb9a2034c7cf9
+  tags: anyaicam-vms:golden-rc4, anyaicam-vms:087e455
+appliance-agent package (anyaicam-appliance-agent 0.1.0) -- rebuilt
+  because service.py changed (25e2fc1):
+  wheel sha256: da7a5aabe60ffeb958cbd05652af066b6678f59cbf8432e978254c77d9a31dbe
+  sdist sha256: 89f83260708ac8d0e2a3c85fb92cd6196fa4ff3ef4fb33a46295404342b9a32e
+Installer artifact (the actual thing deployed — built via
+  installer/build_release_installer.py --vms-commit 087e45587856e7525210d0f9498c3add644d7658):
+  anyaicam-appliance-installer-1.1.0-vms-087e45587856.tar.gz
+  artifact sha256: 706e29e7d8d777ae8a27ea4c8a3b04543401d2e43761d7704b5c4fe76024ba82
+  embedded source sha256: 31e6a7bff70d49afdda64cc17145334ed5ffbbd549fa0133d4cc51d62775010c
+Content-fidelity verified directly (not just trusted): extracted
+  app/appliance_claims.py, Dockerfile, appliance-agent/scripts/uninstall.sh,
+  installer/uninstall.sh, installer/validate.sh, and
+  appliance-agent/anyaicam_agent/service.py all hash-matched `git show`
+  of the exact commit, byte for byte.
+Tested: appliance-agent/tests -- 483 passed (478 baseline + 5 new for
+  the activation-wait fix), same 3 pre-existing Windows-platform-only
+  failures. installer/tests/run_tests.sh -- 73 passed (69 + 4 new for
+  the is-active validator fix), same 11 pre-existing unrelated failures.
+  installer/tests/test_build_release_installer.py -- 12 passed, 1
+  pre-existing skip. Local RC4 VMS image smoke test: /health and
+  /version clean.
+Deployed to: Ryzen (2026-09-11), repair-path install over the existing
+  RC3 install (detect_install_state() correctly reported 5/5 markers ->
+  existing). validate.sh PASSED: 0 failures, including the new
+  anyaicam-agent.service is-active check -- see "RC4 on Ryzen — PASSED"
+  below for the full physical-hardware result.
+
+Prior build (RC3, source defects fixed, but validate.sh had an
+undetected blind spot that masked a real agent crash loop — see
+"RC3 on Ryzen — PASSED" and "RC4 on Ryzen" below):
 GOLDEN BUILD: golden-foundation-rc3 — commit 4ade235
   (full sha 4ade2352b1ea6da9c56a339650773c01879c0b98)
-Built: 2026-09-11, from `reconcile/golden-foundation-20260911` worktree
-  `AnyAiCam-VMS-reconciliation`.
-VMS container image: IDENTICAL to RC2's -- `git diff --stat 34d9d5c 4ade235
-  -- app/ appliance-agent/ Dockerfile requirements.txt requirements-cpu.txt`
-  is empty; this commit only changes `installer/validate.sh` and
-  `installer/tests/run_tests.sh`. No new VMS image was built; RC3's
-  installer, when run, produces the exact same VMS image RC2's did
-  (digest sha256:6ff38cc2c81f6398ce6b95abf42ce5056a8f9eec5a67258dd1f2cb06e9f930af,
-  tags anyaicam-vms:golden-rc2/golden-rc3/34d9d5c/4ade235 all equivalent).
-Installer artifact (the actual thing to deploy — built via
-  installer/build_release_installer.py --vms-commit 4ade2352b1ea6da9c56a339650773c01879c0b98):
-  anyaicam-appliance-installer-1.1.0-vms-4ade2352b1ea.tar.gz
+VMS container image digest: sha256:6ff38cc2c81f6398ce6b95abf42ce5056a8f9eec5a67258dd1f2cb06e9f930af
+  (tags anyaicam-vms:golden-rc2/golden-rc3/34d9d5c/4ade235 all equivalent
+  in content, identical to RC2's)
+Installer artifact: anyaicam-appliance-installer-1.1.0-vms-4ade2352b1ea.tar.gz
   artifact sha256: f8797d627a580363f2f1807c9a7d9b91f29c73df84a4348b30fee49afc56e5c7
-  embedded source sha256: 051236ff6cd14821019e711e66f97ae061c5a6e539b84b6c631553ff74a3fa21
-Tested: installer/tests/run_tests.sh (66 passed incl. 5 new
-  ready_endpoint_self_test_ok() cases, same 11 pre-existing unrelated
-  failures as the unmodified script) + installer/tests/test_build_release_installer.py
-  (12 passed, 1 pre-existing skip).
 Deployed to: Ryzen (2026-09-11), repair-path install over the existing
-  RC2 install (detect_install_state() correctly reported 5/5 markers ->
-  existing, not clean). validate.sh PASSED: 0 failures -- see "RC3 on
-  Ryzen — PASSED" below for the full result.
+  RC2 install. validate.sh PASSED 0 failures at the time -- **later found
+  to have been an incomplete check**: the agent was silently
+  crash-looping 600+ times the entire time, undetected. Superseded by
+  RC4 above; no longer the current live software on Ryzen.
 
 Prior build (RC2, source defect fixed, but its own installer's validate.sh
 had a second, independent defect — see "RC2 → RC3 on Ryzen" below):
@@ -266,11 +306,106 @@ This physically confirms both the `34d9d5c` role-aware-configuration fix
 and the `4ade235` `validate.sh` fix on real hardware, not just in
 regression tests or a disposable local container.
 
-**Ryzen's current real state:** RC3 installed and running, `validate.sh`
-clean. **Still unclaimed, zero cameras** — no claim/activation and no
-camera discovery have been performed. No runtime patches applied at any
-point in the RC1→RC2→RC3 sequence. See `docs/checkpoints/RYZEN.md` for
-the exact current state before the next session acts on it.
+**Ryzen's current real state at the time:** RC3 installed and running,
+`validate.sh` clean. **Still unclaimed, zero cameras** — no claim/
+activation and no camera discovery have been performed. No runtime
+patches applied at any point in the RC1→RC2→RC3 sequence. **This state
+did not stay accurate** — see "RC4 on Ryzen — the agent-service crash
+loop" immediately below.
+
+---
+
+## RC4 on Ryzen — the agent-service crash loop, root-caused, fixed, and PASSED (2026-09-11)
+
+Before attempting Ryzen's claim, a read-only check that had never been
+run before (`systemctl show anyaicam-agent.service -p NRestarts`)
+revealed the agent unit crash-looping — **600+ restarts**, continuous
+since the RC3 install completed. RC3's own `validate.sh` had reported 0
+failures the entire time; it simply never checked whether the agent was
+*active*, only *enabled* (unlike the VMS unit, which already checked
+both). Two independent, real root causes, found in this order:
+
+**1. Stale systemd drop-in.** `/etc/systemd/system/anyaicam-agent.service.d/vms-paths.conf`,
+dated **2026-08-19** — nearly a month before this reconciliation branch
+existed — from an unrelated local-dev session, bind-mounting
+`/home/alejandro-mata/projects/AnyAICam/{app/static/hls,recordings}`
+onto `/var/lib/anyaicam/vms/{hls,recordings}`. One bind source no longer
+existed. Confirmed by reading every uninstall code path directly:
+neither `installer/uninstall.sh` nor `appliance-agent/scripts/uninstall.sh`
+ever removed drop-in *directories*, only base unit *files* — so this
+survived the full `--purge-all` + RC1/RC2/RC3 reinstall cycle untouched
+and silently reattached to each fresh unit. Confirmed isolated (no other
+`.service.d` for any other `anyaicam-*` unit, no other file anywhere
+under `/etc/systemd/system/` referencing these paths). **Fixed in
+`88c87a1`** (both uninstall scripts, both VMS and agent units, for the
+general defect class) and removed from Ryzen directly (one-time manual
+cleanup of pre-existing cruft that predates any golden source, not a
+patch to golden software): `sudo rm -rf
+/etc/systemd/system/anyaicam-agent.service.d && sudo systemctl
+daemon-reload`.
+
+**2. After removing the drop-in, the agent kept crash-looping** — a
+second, different, genuinely pre-existing lifecycle defect in
+`service.py` itself, unrelated to the drop-in: `run()` raised
+`RuntimeError('Appliance is not activated...')` unconditionally whenever
+no credential existed yet, and the unit's `Restart=always`/
+`RestartSec=10` turned that into a permanent loop. `install.sh` enables
+and starts this unit unconditionally, *before* claim ever happens —
+"installed but not yet claimed" is the FIRST real state of every fresh
+appliance, and exactly the state `validate.sh` runs in. **This defect
+predates the entire reconciliation effort** — always present, masked
+first by the drop-in's own unrelated crash, never surfaced because
+nothing checked `is-active` until this same session. **Fixed in
+`25e2fc1`**: `run()` now calls `_await_activation()`, which returns
+immediately if already credentialed (zero change to the normal case) or
+polls `credential.json` directly every 10s, logging once, until
+activation completes — no crash, no restart, no change to
+`Restart=always` (simply never triggered by this condition again).
+**Also confirmed `55fa281`'s own `validate.sh` is-active fix (made
+*before* this second defect was found) needed no adjustment** — it was
+correct in intent from the start; it only became achievable once
+`service.py` stopped treating "not yet claimed" as fatal.
+
+**RC4 (`087e455`) bundles all three fixes and was verified end-to-end on
+real Ryzen hardware:**
+- Pre-install: appliance identity confirmed `637ad320-daaa-436e-89c9-70a84f4f54a9`,
+  `credential.json`/`agent.json`/`cameras.json` all confirmed absent
+  (genuinely unclaimed, zero cameras), VMS `/health`/`/version`/`/ready`
+  captured as baseline.
+- Repair-path install (`detect_install_state()` → `existing`, 5/5
+  markers, identity/state preserved — no wipe, no new identity
+  generated).
+- **Journal shows the exact transition, byte-for-byte matching the
+  source fix**: the last old-code crash at `19:53:28`
+  (`status=1/FAILURE`), the RC4 process starting at `19:53:38` and
+  immediately logging `"Appliance is not activated yet; waiting for
+  anyaicam-setup (interactive or --claim) to complete..."` — the literal
+  string from `25e2fc1` — then **zero restarts since**, confirmed stable
+  across multiple activation-poll intervals (`NRestarts` unchanged,
+  `ActiveState=active`/`SubState=running`/`ExecMainStatus=0` throughout).
+- `sudo bash validate.sh` → **PASSED, 0 failures**, including the new
+  `anyaicam-agent.service is active` check — the first golden build to
+  pass validation while the agent is both enabled *and* stably active,
+  on real hardware, genuinely unclaimed.
+- `/health` 200, `/version` reports exact commit `087e45587856...`,
+  `cloud_id: null` (still unclaimed) — matches baseline. `/ready` 503
+  correctly (`self_test.ok: true`, 0 critical — only the same 3
+  pre-existing harmless warnings as before). No AWS/cloud/Motion Cloud
+  flags enabled (`aws_region_configured` etc. all still `false`,
+  unchanged from baseline). Stale drop-in directory confirmed absent;
+  `systemctl cat` shows only the clean base unit, no drop-in merged.
+- **No runtime patches at any point** — every fix went through
+  BUG FOUND → FIX SOURCE → REGRESSION TEST → COMMIT → BUILD → DEPLOY →
+  VERIFY; the only direct action taken on Ryzen itself was the one-time
+  removal of the pre-existing (non-golden) stale drop-in, explicitly
+  authorized as cleanup of cruft that predates this project's own
+  source, not a patch to it.
+
+**Ryzen's current real state:** RC4 installed and running, `validate.sh`
+clean (agent enabled+active, not just enabled). **Still unclaimed, zero
+cameras** — no claim/activation and no camera discovery have been
+performed; both remain explicitly deferred pending separate
+authorization. See `docs/checkpoints/RYZEN.md` for further detail.
 
 ---
 

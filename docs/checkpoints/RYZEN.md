@@ -109,47 +109,51 @@ verified this). Two, independent, real defects, found in this order:
    `credential.json` directly every 10s) instead of raising; an
    already-activated appliance's behavior is completely unchanged.
 
-**Three source commits now exist that have NOT been applied to Ryzen's
-currently-running software**: `88c87a1`, `55fa281`, `25e2fc1`. Ryzen's
-`/opt/anyaicam-agent` venv still runs the pre-`25e2fc1` code — the
-stale-drop-in cleanup was applied directly (see above), but the
-`service.py` fix has not been. **Practical implication, reasoned through
-but not yet acted on**: claiming Ryzen right now, even on this
-not-yet-updated agent code, would very likely still work — the crash
-loop is specific to the *pre-claim* window (`__init__` re-reads
-`credential.json` fresh on every process start, so once a real claim
-completes and `_finish_enrollment()` restarts the service, the OLD code's
-own `if not credential: raise` check already passes cleanly, same as it
-must have on every prior successful activation across this whole
-project). What remains genuinely unresolved is *how* to get `25e2fc1`
-onto Ryzen: a new RC + real repair-path install (matching this project's
-own established discipline), vs. some faster in-place package update —
-this has not been decided and needs an explicit decision, not an
-assumption, before claim proceeds.
+**RESOLVED (2026-09-12): RC4 (`087e455`) bundles all three fixes and has
+been deployed to Ryzen via a repair-path install** (5/5 markers →
+`existing`, identity and all persistent state preserved, no wipe). Full
+physical verification passed:
+- Journal confirms the exact transition: last old-code crash at
+  `19:53:28`, RC4 process starting at `19:53:38` and logging the exact
+  new string (`"Appliance is not activated yet; waiting for
+  anyaicam-setup (interactive or --claim) to complete..."`), then **zero
+  restarts since**, confirmed stable across multiple activation-poll
+  intervals (`NRestarts` unchanged, `ActiveState=active`/
+  `SubState=running`/`ExecMainStatus=0`).
+- `sudo bash validate.sh` → **PASSED, 0 failures**, including the new
+  `anyaicam-agent.service is active` check.
+- `/health` 200, `/version` reports exact commit `087e45587856...`,
+  `cloud_id: null` (still unclaimed). `/ready` 503 correctly (0
+  critical). No AWS/cloud flags enabled. Stale drop-in directory
+  confirmed absent; `systemctl cat` shows only the clean base unit.
+- No runtime patches at any point — full BUG FOUND → FIX SOURCE →
+  REGRESSION TEST → COMMIT → BUILD → DEPLOY → VERIFY cycle for all three
+  fixes; the only direct Ryzen action was the one-time removal of the
+  pre-existing (non-golden) stale drop-in.
 
-**Appliance identity has changed again**, independent of any of the
-above: the RC3 install's own identity is `637ad320-daaa-436e-89c9-70a84f4f54a9`
-(distinct from RC1's `99c44cb8-...`) — read live via `sudo cat
-/etc/anyaicam/appliance_identity.json` to reconfirm before use, per this
-file's own standing rule that a value which can change with a future
-install isn't safe to trust without re-checking.
+See `docs/PROJECT_CHECKPOINT.md`'s "RC4 on Ryzen — the agent-service
+crash loop, root-caused, fixed, and PASSED" section for the complete
+narrative, all commit hashes, and all artifact digests.
+
+**Appliance identity confirmed preserved** through the repair install:
+`637ad320-daaa-436e-89c9-70a84f4f54a9` (unchanged from before RC4).
 
 ## Exact next step
 
-1. **Decide how `25e2fc1` (and the already-two-commits-behind `88c87a1`/`55fa281`)
-   reach Ryzen** before claiming — build a new RC and do a real
-   repair-path install (consistent with every other fix this project has
-   made), or make an explicit, deliberate decision to claim first on the
-   current (not-yet-updated) agent code, reasoned through above as very
-   likely still safe for the claim step itself. This is a real decision
-   point, not something to default silently in either direction.
-2. Proceed through the actual claim/activation flow (`anyaicam-setup
-   --claim` or interactive) — this establishes a **new** cloud identity;
-   do not attempt to reuse any prior `cloud_id`/`customer_id` from before
-   either wipe (RC1's `99c44cb8-428d-44e4-a1bf-41f95fd2e268` installer
-   identity, or the pre-reconciliation real activation
-   `AIC-C90CF0C9`/`4efaf5153f` -- neither applies to this appliance
-   anymore).
+1. **Ryzen is now ready for claim, pending separate explicit
+   authorization** — every source-level blocker found this session
+   (the RC1 `configuration_issues()` defect, the RC2 `validate.sh`
+   ready-endpoint defect, the stale systemd drop-in, and the
+   `service.py` activation-wait defect) is fixed, deployed, and verified
+   on real hardware. **Do not claim without that separate go-ahead** —
+   this checkpoint records readiness, not authorization.
+2. Once authorized, proceed through the actual claim/activation flow
+   (`anyaicam-setup --claim` or interactive) — this establishes a
+   **new** cloud identity; do not attempt to reuse any prior
+   `cloud_id`/`customer_id` from before either wipe (RC1's
+   `99c44cb8-428d-44e4-a1bf-41f95fd2e268` installer identity, or the
+   pre-reconciliation real activation `AIC-C90CF0C9`/`4efaf5153f` --
+   neither applies to this appliance anymore).
 3. Reconnect the 5 physical cameras through the supported discovery
    workflow (not manual CAMERA{n}_* env vars).
 4. Validate, in order: recording, motion detection/event media, Motion
