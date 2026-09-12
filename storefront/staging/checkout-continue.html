@@ -24,6 +24,9 @@ p{color:#61708c;margin:0 0 1.25rem}
 .error{color:#8b1730;background:#fff0f2;padding:.75rem 1rem;border-radius:10px;font-weight:700}
 .done-icon{font-size:2.5rem}
 a.button{display:inline-block;margin-top:1rem;background:linear-gradient(135deg,#bf2a91,#5a72d8);color:#fff;text-decoration:none;font-weight:800;padding:.8rem 1.4rem;border-radius:999px}
+a.button.secondary{background:#fff;color:#5a72d8;border:2px solid #5a72d8;padding:calc(.8rem - 2px) calc(1.4rem - 2px)}
+.next-step{margin-top:1.5rem;padding-top:1.25rem;border-top:1px solid #dde3f0;text-align:left}
+.next-step p{margin:0 0 .75rem;font-size:.92rem}
 </style>
 </head>
 <body>
@@ -34,6 +37,19 @@ a.button{display:inline-block;margin-top:1rem;background:linear-gradient(135deg,
 </div>
 
 <script>
+// Storefront->customer-registration handoff (2026-09-12): before this
+// fix, the final "purchase complete" state below had no path onward at
+// all -- a brand-new customer had just paid and had no way to learn
+// where to create the AnyAiCam account their purchase is waiting to be
+// attached to (see customer_entitlements.py's/hardware_orders.py's own
+// checkout-before-registration pending-link mechanism, keyed by this
+// exact email, unchanged by this fix). No live storefront exists yet
+// (this whole page says so in its own header comment), so this is
+// hardcoded to the current staging portal rather than read from a
+// config file the way BASE_URL in stripe-config.php is -- update this
+// one line when a real portal domain exists to point the storefront at.
+const PORTAL_REGISTER_URL = 'https://portal-staging.anyaicam.com/customer-register';
+
 function params() {
   const url = new URL(location.href);
   return Object.fromEntries(url.searchParams.entries());
@@ -51,11 +67,17 @@ async function run() {
   }
 
   if (remainingLegs.length === 0) {
+    const email = p.customer_email || '';
+    const registerUrl = email ? `${PORTAL_REGISTER_URL}?email=${encodeURIComponent(email)}` : PORTAL_REGISTER_URL;
     card.innerHTML = `
       <div class="done-icon">✅</div>
       <h1>Sandbox test purchase complete</h1>
       <p>"${completedLabel}" was the last item -- every selected item now has its own completed Stripe TEST Checkout Session. No real money was charged (Stripe TEST mode only).</p>
-      <a class="button" href="build-your-system.html">Build another test order</a>`;
+      <div class="next-step">
+        <p><strong>Next step:</strong> create your AnyAiCam account${email ? ` using <strong>${email}</strong> (the same email you just checked out with)` : ''}, so your purchase can be attached to it. A partner/administrator still needs to approve the new account before you can sign in -- this is not automatic.</p>
+        <a class="button" href="${registerUrl}">Create your AnyAiCam account</a>
+      </div>
+      <a class="button secondary" href="build-your-system.html">Build another test order</a>`;
     return;
   }
 
