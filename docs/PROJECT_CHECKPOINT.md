@@ -1311,6 +1311,31 @@ Safe to retry Camera 1's provisioning through the customer portal now. No creden
 
 ---
 
+## 2026-09-12: Camera 1 provisioning blocked again — "Camera limit reached: 0 camera(s)" — traced to a genuinely missing customer-facing checkout, built and deployed
+
+Re-attempting Camera 1 after the credential-key fix hit a *different* wall: `customer_entitlements.total_camera_slots('4efaf5153f')` correctly summed **zero** real entitlement rows — the customer had never had one. Traced every candidate source: `customer_entitlements` table (0 rows), the legacy `plans` table (1 row, `camera_quantity: 5`, `status: 'quote'`, explicitly documented as untrustworthy for billing), no Stripe purchase ever recorded. Then traced every checkout-creation call site in the app and found the real gap: `customer_entitlements.PLAN_TIERS` has 8 real, staging-configured Stripe test-mode Price IDs (confirmed non-empty, e.g. `ANYAICAM_STRIPE_PRICE_LOCAL_1_8`) and the webhook side (`resolve_tier()`/`_sync_checkout_completed()`/`upsert_entitlement()`) is fully wired and correct — but **no code path in the entire app ever created a Checkout Session using one of those prices**. The only existing purchase button, `POST /api/payments/checkout`, is for a completely unrelated product line (starter/professional/enterprise software license tiers). Not a config/deployment gap like the two secret keys earlier this session — a genuinely missing source component. No entitlement was manually inserted, no capacity check bypassed, no one-off transaction created.
+
+### Fix built (`d269413`)
+
+- **`POST /api/customer/camera-slots/checkout`** (`app/main.py`), mirroring `create_hardware_checkout()`'s clean shape. `mode=subscription`; tier resolved server-side only from `PLAN_TIERS` by `(plan_type, tier_label)` — never a browser-submitted price id; `customer_owner` identity required (403 otherwise) so `metadata[anyaicam_customer_id]` is always set, matching exactly what the existing webhook expects.
+- **UI**: the customer setup wizard's "Camera plan" line now offers a tier picker + "Buy camera capacity" button (only tiers with a real configured Price ID are listed), redirecting to the real Stripe Checkout URL.
+- **Tests**: `app/tests/test_camera_slot_checkout.py` (new, 11 cases) — full metadata on success, cross-tier tampering guard (hybrid never resolves to local's price), ownership enforcement (401 unauthenticated / 403 wrong role including `customer_viewer`, Stripe never called), tier/price validation (unknown tier → 400; real-but-unconfigured tier → 503 `PRICE_ID_REQUIRED`), a submitted `price_id`/`camera_slot_maximum` in the body is ignored, and two webhook-integration tests proving this endpoint's exact metadata is genuinely compatible with the existing, unmodified `sync_entitlement_from_stripe_event()`.
+- **Full regression run**: 85 passed / 1 pre-existing failure (`test_real_failed_provisioning_leaves_a_retryable_no_camera_state` — the same "0 camera(s)" gap this commit fixes, unrelated to this diff, pre-existing per earlier git-stash confirmation this session) across every appliance-claims/customer-setup/Stripe-checkout/hardware/camera-discovery test file. Zero new regressions.
+
+### Deployed to staging
+
+- **Commit**: `d26941372e5a79ce92c1646690688f21bd437023`
+- **Image**: `deploy-portal:d269413`, digest `sha256:7cb5dc162b94f1c45fc439dd563578e3921f8affff9e8e65e481e6391b25504f`
+- **Source tarball SHA-256**: `af5747c8b120fa87e6d24ffb7280352c6aab882993a6a284258b1bfc573f399c`, verified identical before and after transfer
+- **Pre-deploy backups**: source `/opt/anyaicam-staging-source-backup-pre-camera-slot-checkout-20260912T050028Z.tar.gz` (SHA-256 `42a03f17de326e3bee452b9cb7ef2b4517fabe16a020e118615a8d6307b41f52`); DB `/var/lib/anyaicam-staging/db/staging-pre-camera-slot-checkout-20260912T050028Z.db` (SHA-256 `f0d27095aca4ce7b06df9f40f2820c30f212573b227c3d440daa8e79a1d7da36`)
+- **Verified**: `main.py`/`partner_workspace.py` hashed inside the running container match `git show d269413` exactly; `/health` `200 ok` (internal + public); `/version` correct, `aws_region: null`; DB integrity `ok`; exactly one portal container running; `customer_entitlements` for `4efaf5153f` still `0` rows (deployment itself grants nothing — a real checkout completion is still required)
+
+### State to resume from — STOP before initiating any checkout
+
+The customer-facing action is now live: on the setup wizard's Step 6 "Review your account" panel, the "Camera plan" line now shows a tier selector (only real, purchasable tiers listed) and a **"Buy camera capacity"** button. For the 5-camera Ryzen lab, select **Local 1-8** and click it — this redirects to a real Stripe **test-mode** Checkout Session. No checkout has been initiated. No entitlement exists yet. Camera 1 provisioning remains blocked until a real completed checkout produces one.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
