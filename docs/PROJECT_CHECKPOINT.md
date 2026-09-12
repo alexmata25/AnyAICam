@@ -1219,6 +1219,48 @@ Ryzen now has the corrected appliance-agent installed and verified. The second s
 
 ---
 
+## 2026-09-12: Controlled cleanup of the second stranded Ryzen claim records — DONE
+
+Identical procedure to the first cleanup: pre-verification, backup, FK/dependency scan, exact-id-only transaction, full post-cleanup verification. No other appliance/claim/credential/customer/site touched, Ryzen/appliance identity untouched, no new claim started, Samsung untouched, no Motion Cloud/AWS enabled.
+
+### Pre-cleanup verification
+
+All three target rows re-read fresh and confirmed exact: `appliance_claims id=73c06c0805a1510950feb8f3a59e67aa` (`device_id=637ad320-...`, `customer_id=4efaf5153f`, `site_id=4de6186be8`, `appliance_id=0ca39d9d45d34fbcc6c641924912045c`, `status=completed`), `appliances id=0ca39d9d45d34fbcc6c641924912045c` (`cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9`, same customer/site), `appliance_credentials id=f1032092ee7cb5b0` (`appliance_id=0ca39d9d...`). FK/dependency scan across all 14 tables referencing `appliance_id` found exactly one dependent row anywhere — the target credential itself. `PRAGMA integrity_check: ok` immediately before mutation.
+
+### Backup
+
+`/var/lib/anyaicam-staging/db/staging-pre-ryzen-claim2-cleanup-20260912T035620Z.db`, SHA-256 `da40ec781047a7acde2fe2d4e32c83793f8c802a65ea6c65927947157608d961`.
+
+### What was changed — one transaction, exact-id + every other field re-checked, never by `customer_id`/`site_id` alone
+
+1. `DELETE FROM appliance_credentials WHERE id='f1032092ee7cb5b0' AND appliance_id='0ca39d9d45d34fbcc6c641924912045c'` — removed the second claim's real, unused credential.
+2. `UPDATE appliance_claims SET revoked_at=<now>, appliance_id=NULL, completed_credential_encrypted=NULL, credential_recovery_expires_at=NULL WHERE id='73c06c0805a1510950feb8f3a59e67aa' AND device_id='637ad320-...' AND customer_id='4efaf5153f' AND site_id='4de6186be8' AND appliance_id='0ca39d9d...' AND status='completed'` — row kept for history, revoked and detached, exactly the same treatment as the first cleanup's `48e3f8f0...` row.
+3. `DELETE FROM appliances WHERE id='0ca39d9d45d34fbcc6c641924912045c' AND cloud_id='637AD320-...' AND customer_id='4efaf5153f' AND site_id='4de6186be8'` — removed the row blocking `claim_begin()`.
+
+Each statement asserted `rowcount==1` inside the transaction before commit; committed once, cleanly.
+
+### Post-cleanup verification — all passed
+
+| Check | Result |
+|---|---|
+| No appliance row for `cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9` | `0` rows — **Cloud ID is free for a fresh claim** |
+| Credential gone | `appliance_credentials id=f1032092...` — `0` rows |
+| Claim row revoked/sanitized | `revoked_at` set, `appliance_id=NULL`, recovery material cleared, `status` left `completed` for history (same convention as the first cleanup) |
+| Customer account | `alexmata25@gmail.com` / `customers[4efaf5153f]` — unchanged, active |
+| Ryzen Home Site | `sites[4de6186be8]` — unchanged, present |
+| All 5 `appliance_claims` rows for this device_id | Both stranded claims (`48e3f8f0...`, `73c06c0805a1...`) now correctly revoked; the 2 `expired` and 1 `pending` rows untouched |
+| Unrelated table counts | `appliances: 3`, `appliance_credentials: 3`, `partner_users/customers/sites: 4/3/3` — unchanged |
+| Historical `AIC-C90CF0C9` file | Byte-identical to every prior read this session |
+| DB integrity | `ok`, before and after |
+| `/health` / `/version` | `200 ok`; still `deploy-portal:b8bdf2c` — no restart performed for this pure data operation |
+| Containers | Exactly one portal container (`portal-green`), unchanged |
+
+### State to resume from
+
+Cloud ID `637ad320-daaa-436e-89c9-70a84f4f54a9` is genuinely unclaimed in staging again, and Ryzen now has the corrected appliance-agent installed and verified (previous section). **Cleared for one fresh end-to-end claim attempt**, pending separate authorization — this one should finally exercise the cloud-side fix (defect 1, already proven twice) together with the appliance-side fixes (defects 2-3, now actually installed) for the first time.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
