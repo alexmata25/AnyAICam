@@ -1476,6 +1476,49 @@ Remaining blocker to a complete storefront->purchase->registration->activation->
 
 ---
 
+## 2026-09-12: Ryzen install attempt -- verification shows the release was NOT actually applied; correction, and read-only unclaim/reset procedure proposed
+
+**Authorized and attempted**: install the versioned `aa4dc2e` artifact (hash-verified before transfer: `4478f13a...` local == post-transfer == the recorded build record) onto Ryzen via its own supported `install.sh`, repair path, no manual patching. The user reported the installer completed successfully; **post-install verification, done immediately after, does not support that** -- every observable fact on the box is byte-for-byte identical to the pre-install baseline captured just before the install was requested:
+
+| Check | Pre-install baseline | Post-install (now) | Changed? |
+|---|---|---|---|
+| `/version` `build_id` | `b8bdf2cf98c716067024bdf471d834ce5cd602e1` | `b8bdf2cf98c716067024bdf471d834ce5cd602e1` | **No** |
+| `anyaicam-vms` image id | `anyaicam-vms:latest` `73f83ae7f695` | same, `73f83ae7f695` | **No** |
+| `anyaicam-vms.service` last (re)start | -- | `Fri 2026-09-11 22:47:46` (systemd unit), container process started `2026-09-12T04:04:16` -- both hours before this install was even requested | **No** |
+| `anyaicam-agent.service` `ActiveEnterTimestamp` / `NRestarts` | -- | `Fri 2026-09-11 23:04:04`, `NRestarts=0`, 10h uptime | **No** |
+| `pending_camera_credentials` table | doesn't exist (old code) | **still doesn't exist** | **No** -- conclusive: the new migration never ran |
+| Local `cameras`/`camera_credentials`/`camera_provisioning_requests` | 0/0/0 | 0/0/0 | **No** |
+| `appliance_identity.json` SHA-256 | `9d18b86c...` | `9d18b86c...` | No (expected -- preserved either way) |
+| `journalctl --since '30 minutes ago'` | -- | only routine SSH/tailscale/healthcheck-restart entries; nothing resembling an install run | -- |
+
+**This is not a partial success or a cosmetic mismatch -- no evidence exists anywhere on the box that `install.sh` executed a deploy in this session's timeframe.** The most conclusive single fact: `pending_camera_credentials` (this fix's own new table) does not exist, which is only possible if the old `db_migrations.py` is still what's running. Everything else (identity preserved, no data loss, no AWS/Motion-Cloud flags enabled) is also true, but only because nothing changed at all, not because a careful upgrade preserved it.
+
+**Not diagnosed further** -- no sudo access on this box (by design, per this project's own credential-handling rule), so I cannot read `/etc/anyaicam/installed_version`, `vms_release.json`, or `install.sh`'s own run output. Possibilities include: the run exited early on an error not visible to a non-root read, `03-detect-install.sh` mis-detected install state, or the reported "completed successfully" referred to a different run/target than this appliance. **Needs the actual terminal output of the `sudo ./install.sh` run to diagnose** -- please share it (or re-run and capture it) before a second install attempt.
+
+### Read-only investigation: supported procedure to return Ryzen to an unclaimed state (NOT executed)
+
+No self-service "unclaim"/"release appliance"/"factory reset" API exists anywhere in `app/` -- searched. The only real precedent in this project's own history is the "controlled cleanup of a stranded claim" procedure, already used twice for this exact device_id (`docs/PROJECT_CHECKPOINT.md`'s own earlier entries) -- adapted here for a claim that is NOT stranded (it durably completed, milestone PASSED) but needs to be released on purpose.
+
+**Current exact cloud-side state for this device** (`637ad320-daaa-436e-89c9-70a84f4f54a9`), read-only:
+- Live claim: `appliance_claims id=2b7a1fb8452cfbbee722093c967428ea`, `status=completed`, `revoked_at=NULL`, `customer_id=4efaf5153f`, `appliance_id=7844ceab86e7fab2845125cffeb8ad10` -- the one to revoke. (5 earlier claim attempts for this device are already `expired`/`revoked` history -- leave untouched.)
+- `appliances id=7844ceab86e7fab2845125cffeb8ad10`, `cloud_id=637AD320-...` -- must be deleted to free the cloud_id for a fresh `claim_begin()`.
+- `appliance_credentials id=ffdf68c39378f4e9`, not revoked -- must be removed.
+- Dependent rows tied to this `appliance_id` (FK/dependency scan): `cameras`=3 (the real provisioned cameras -- `7e34833a37`/`ca9d8c53d0`/`2e1a9a64bc`), `camera_provisioning_requests`=5 (3 succeeded + 2 failed on license-cap), `camera_scan_jobs`=7, `appliance_camera_status`=3, `appliance_commands`=30, `appliance_health_history`=692, `appliance_request_nonces`=61. `customer_setup_drafts` for `4efaf5153f` also references this `appliance_id` in its saved JSON (harmless if left -- the wizard already falls back gracefully when a saved appliance_id no longer matches).
+
+**Proposed cloud-side procedure** (mirrors the exact discipline already used twice for this device: pre-verify every target row fresh, full DB backup + hash, FK/dependency scan, one transaction, exact-id-scoped deletes that re-check every field -- never by customer_id/site_id alone, post-verify, confirm `PRAGMA integrity_check`, confirm the historical customer's OTHER appliance/entitlement/cameras are completely untouched):
+1. Delete `camera_credentials` for the 3 camera ids above.
+2. Delete `cameras`, `camera_provisioning_requests`, `camera_scan_jobs`, `appliance_camera_status`, `appliance_commands`, `appliance_health_history`, `appliance_request_nonces` WHERE `appliance_id='7844ceab86e7fab2845125cffeb8ad10'`.
+3. Delete `appliance_credentials id=ffdf68c39378f4e9`.
+4. `UPDATE appliance_claims SET revoked_at=<now>, appliance_id=NULL WHERE id='2b7a1fb8452cfbbee722093c967428ea' AND status='completed' AND revoked_at IS NULL` -- kept, revoked, never hard-deleted (same convention as every prior cleanup here).
+5. `DELETE FROM appliances WHERE id='7844ceab86e7fab2845125cffeb8ad10' AND cloud_id='637AD320-DAAA-436E-89C9-70A84F4F54A9' AND customer_id='4efaf5153f'`.
+6. Verify: 0 rows remain anywhere for this `appliance_id`; no `appliances` row for this `cloud_id` (so `claim_begin()` accepts it fresh); customer `4efaf5153f`'s account, entitlement (8 slots, unchanged), and its OTHER appliance (`AIC-C90CF0C9`, 5 historical cameras) are byte-for-byte unaffected; `PRAGMA integrity_check: ok`.
+
+**Local (Ryzen) side -- recommend the surgical path, not a full wipe**: `appliance-agent/anyaicam_agent/reenrollment.py`'s `coordinated_reenroll()` exists specifically to replace an already-enrolled appliance's identity with a new one, atomically, with rollback -- this is the actual supported mechanism for "re-claim an already-claimed box," not `uninstall.sh`. Since Ryzen's local `cameras`/`camera_credentials` are already empty (nothing to clear there), the expected flow is: after the cloud-side cleanup above, run `anyaicam-setup`'s claim flow again as the new test customer; `setup_wizard.py` should detect the existing identity files and route through `coordinated_reenroll()` rather than `first_enroll()`, replacing the old identity once the new claim completes. **This has not been read through to its exact trigger conditions in full** (time-boxed this pass) -- worth a careful read of `setup_wizard.py`'s own branch logic before relying on it, or falling back to `sudo ./uninstall.sh --purge-all` (confirmed to remove `/etc/anyaicam`, `/var/lib/anyaicam`, `/var/log/anyaicam`, and the `anyaicam` system user, while leaving Docker/networking/SSH/Tailscale untouched -- the exact same procedure already used once before on this box for the RC1 clean-install validation) followed by a fresh `install.sh` if `coordinated_reenroll()` turns out not to apply cleanly.
+
+**Not executed.** No local or cloud changes were made by this investigation. Samsung untouched.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
