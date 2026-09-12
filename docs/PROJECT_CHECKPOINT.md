@@ -1519,6 +1519,32 @@ No self-service "unclaim"/"release appliance"/"factory reset" API exists anywher
 
 ---
 
+## 2026-09-12: Ryzen re-install (manual, by the operator) VERIFIED -- `aa4dc2e` now live; edge_camera_sync confirmed running; one expected, real limitation found
+
+The operator re-ran `sudo ./install.sh` manually (this session's own automated attempt had silently not applied -- see the entry above). Full post-install verification, read-only:
+
+| Check | Result |
+|---|---|
+| `/version` `build_id` | `aa4dc2edb135e379631a9d17db8923e56a202ed9` -- **matches exactly** |
+| `anyaicam-vms` container | new container, started `2026-09-12T15:13:56`, `docker ps` shows `Up ... (healthy)` |
+| `/health` | `200 ok` |
+| `/ready` | `503` (`ready:false`) -- correctly so: only the same 3 pre-existing non-critical config warnings (`ANYAICAM_ADMIN_EMAIL`/`_PASSWORD`/`ANYAICAM_PORTAL_SECRET`, unrelated to this fix) plus `cloud_foundation_ready:false` (AWS still unconfigured, as intended) |
+| `anyaicam-agent.service` | `active`/`running`, `NRestarts=0`, clean stop/start cycle in the journal (no crash loop) |
+| Cloud heartbeat | confirmed both directions: agent log `Entitlement refreshed camera_slot_quantity=8`; cloud-side `appliances.last_check_in=2026-09-12T15:15:54` (fresh), `restart_count` incremented 15->16 (one legitimate restart, expected) |
+| `edge_camera_sync` | **confirmed running**: startup log line `edge_camera_sync.worker_started`; **and working** -- local `cameras` table went from 0 to 3 rows, correctly populated with camera_number/device_key/onvif_endpoint matching the cloud exactly |
+| `pending_camera_credentials` table | now exists (new migration applied) |
+| Appliance identity | `appliance_identity.json` SHA-256 unchanged (`9d18b86c...`) -- byte-for-byte preserved, same appliance_id/cloud_id/customer_id/site_id |
+| AWS / Motion Cloud flags | none set (`cloud_upload_enabled:false`, `upload_worker:disabled`, all `missing_cloud_requirements` still missing) -- unchanged, nothing enabled |
+| Local data | `/app/recordings/camera{1,2,3}` and `/app/static/hls` still empty (expected -- see limitation below); no recordings/media lost or altered |
+
+**One real, expected limitation found, not a defect**: `camera_credentials` is still `0` locally (and `pending_camera_credentials` is `0` too). These 3 cameras were provisioned *before* this fix existed on either side -- the one-time in-memory credential handoff (agent -> local VMS, at the moment of provisioning) already happened and passed, long before there was anywhere local to receive it. `edge_camera_sync` correctly synced their metadata (camera_number/device_key/onvif_endpoint) but has no credential to move, because none was ever captured. Confirmed via `_provisioned_camera_stream()`'s own logic: it requires *both* a `cameras` row and a `camera_credentials` row -- with the credential missing, `camera_url()` still raises `CameraNotConfiguredError` for these three, so they will **not** start streaming/recording from this install alone. This was already flagged as a known scope boundary when Option B was designed ("does not by itself support recovering a lost local credential... without a fresh provisioning action") -- not re-provisioned here, per instruction. A **fresh** camera provisioned from this point forward (after both sides already have the fix) will capture its credential correctly the first time.
+
+Minor, harmless observation: `/app/recordings/` now also has empty `camera5`/`camera6`/`camera7` directories and an `in_app_alerts.jsonl` file that weren't present before -- no data in them, not a loss, most likely idle-supervisor-slot pre-creation reacting to the local camera count changing from 0 to 3. Not investigated further; nothing to act on.
+
+**No cameras provisioned, no credentials changed, Ryzen not reset/unclaimed, Samsung untouched.**
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
