@@ -1569,6 +1569,34 @@ Cloud-side, `637AD320-DAAA-436E-89C9-70A84F4F54A9` is genuinely unclaimed and re
 
 ---
 
+## 2026-09-12: `anyaicamtest@gmail.com` old staging/sandbox contamination removed; today's real storefront purchases re-homed via the real pending-purchase mechanism -- DONE, verified
+
+**First real-customer-journey attempt hit a registration failure**: after a genuine storefront purchase (2 Stripe TEST checkouts: AnyAiCam Starter hardware + Local 1-8 camera-slot subscription) under `anyaicamtest@gmail.com`, `/customer-register` returned "That email is already registered." Traced, read-only, before touching anything: this email already belonged to a fully-set-up staging/sandbox account (`customers id=2a6cb00a6b`, created 2026-09-10, activated appliance `71bf8b39fd`/`AIC-2FC1F54F`, 1 camera, full login history) -- **confirmed NOT the physical Samsung device** (Samsung's own checkpoint records it as never claimed/activated anywhere; this record was fully activated with 1,091 health-history rows -- an unrelated, disposable sandbox record that happened to share the email). `create_pending_registration()`'s duplicate-email check was working exactly as designed; the registration architecture itself had no defect. Today's purchase had been correctly attached by `sync_hardware_order_from_stripe_event()`/its entitlement equivalent directly to the *existing* customer (matched by email) rather than held as a pending link, since a customer with that email already existed at webhook time -- also correct, existing behavior, not a bug.
+
+**Verified against live Stripe (read-only `GET`) before reconstructing anything**: today's hardware checkout (`cs_test_a1zkCOEn93SJV9114oW8vsC1BidgWebWmFb66Vu7AFejTLe0BSdeaYg2dY`) actually charged `amount_total=50` cents; the entitlement checkout (`cs_test_a1DbvwZW5578AQY49pAZLCQkps7LC0s0EWTOmV0Lyz7RbhoQp8EWJW6wc5`) charged `amount_total=60` cents -- both `usd`, `livemode:false`, `customer=cus_VFNjUsvnstQzaq`, `paid`. This caught a real discrepancy before it was written anywhere: the `hardware_orders` row's own `amount_cents` (124999) did **not** match the real Stripe charge -- see the separate tech-debt item below.
+
+### Cleanup executed
+
+Backup: `/var/lib/anyaicam-staging/db/staging-pre-anyaicamtest-cleanup-20260912T160848Z.db`, SHA-256 `ea462141fdf228b09082292d9bf694b19f3822985949fc45f20b4c79e4d94ee7`.
+
+**Phase 1 -- preserve today's purchases via the real, existing, unmodified application functions** (never hand-written INSERTs): called `hardware_orders.create_pending_link(...)` and `customer_entitlements.create_pending_link(...)` directly with the Stripe-verified values (hardware: `amount_cents=50`, not the stale `124999`; entitlement: `camera_slot_quantity=8`, `price_id=price_1UD2xKGllhK80H2nFJwtFJvw`) -- both committed independently, before any deletion: `pending_hardware_order_links id=d12c4134c1b44c9cbbb0c63dadc176bf`, `pending_customer_links id=d082345105174149af3debb50e4cef45`, both `status='pending'`.
+
+**Phase 2 -- remove the old contamination**, one transaction, every target re-verified fresh immediately before mutating, every delete's rowcount asserted: `cameras`(1), `appliance_camera_status`(1), `appliance_health_history`(1091), `appliance_activation_tokens`(2), `appliance_credentials`(1), `appliances`(1), `hardware_orders`(2 -- the old Sept-10 row and today's now-redundant row), `customer_entitlements`(1), `analytics_subscriptions`(3), `plans`(1), `quotes`(1), `invitations`(1), `service_history`(2), `customer_setup_drafts`(1), the 5 old already-`resolved` `pending_*_links` rows (their own historical audit trail, tied to the customer being removed), `sites`(1), `identity_grants`(1), `user_sessions`(6), `partner_users`(1), `customers`(1). Every rowcount matched exactly. Committed.
+
+### Post-cleanup verification -- all passed
+
+`customers`/`partner_users`/`customer_registration_requests` for this email: `0`/`0`/`0`. Old appliance/camera/site: `0`/`0`/`0`. Today's pending links: exactly one `pending_hardware_order_links` row (`amount_cents=50`, correct Price ID/session/Stripe customer) and exactly one `pending_customer_links` row (`camera_slot_quantity=8`, correct Price ID/session), both `status='pending'`, `resolved_customer_id=NULL`. Zero `pending_analytics_links` remain (none from today). Zero `customer_entitlements`/`hardware_orders` rows reference the deleted customer_id (**no entitlement was fabricated for a nonexistent customer**). Unrelated data confirmed untouched: `alexmata25@gmail.com` (`4efaf5153f`) still `active`; historical appliance `AIC-C90CF0C9` still `activated` with its own 5 cameras; `Sandbox Test Customer` (`6d8e437804`) unchanged; Ryzen (`637AD320-...`) still has zero `appliances` rows -- **still cleanly unclaimed**, unaffected by this cleanup. Table deltas match exactly (`customers` 3->2, `partner_users` 4->3, `appliances` 3->2, `cameras` 15->14, `sites` 3->2). `PRAGMA integrity_check: ok`. Ryzen and Samsung: no command issued to either this pass.
+
+### Tech debt recorded, not fixed this pass
+
+`hardware_orders.sync_hardware_order_from_stripe_event()` computes the stored `amount_cents` from the server-side `HARDWARE_CATALOG` constant (`hardware["amount_cents"] * quantity`), never from the checkout session's real `amount_total` -- so `hardware_orders.amount_cents` has never actually recorded what Stripe charged, for any order this table has ever held (confirmed: the Sept-10 contamination row had the identical stale `124999`). Does not affect entitlement/grant correctness (hardware orders don't grant recurring access), but makes the column an unreliable audit trail of the real transaction amount. Recommend a future, deliberate fix: read `session_obj.get("amount_total")` instead of (or in addition to, for cross-checking) the catalog constant.
+
+### State to resume from
+
+`anyaicamtest@gmail.com` is now eligible for `/customer-register` as a genuinely new customer. When registration is submitted and later approved, `approve_registration()`'s existing, unmodified calls to `resolve_pending_links_for_customer()`/`resolve_pending_hardware_links()` will find the two pending links created above and attach today's real purchases to the new customer automatically -- no manual entitlement work needed at that point. **Registration was deliberately not submitted and no approval was performed this pass.**
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
