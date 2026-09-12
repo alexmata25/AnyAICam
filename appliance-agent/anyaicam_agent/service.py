@@ -23,6 +23,15 @@ from .updater.health import make_health_check
 from .updater.restart import make_restart_signal
 from .updater.s3_source import make_manifest_source
 
+# How often run()'s pre-activation wait re-checks for a real credential.
+# Deliberately a short, fixed interval, not config.checkin_seconds (a
+# normal OPERATIONAL polling knob that has no defined meaning before
+# activation even establishes cloud_id/mode) -- matches the systemd
+# unit's own RestartSec=10, so a technician watching a freshly installed
+# appliance sees the same responsiveness whether the agent is waiting or
+# (as it used to, before this fix) crash-looping.
+ACTIVATION_POLL_INTERVAL_SECONDS = 10
+
 
 class ApplianceAgent:
     def __init__(self,config):
@@ -379,8 +388,54 @@ class ApplianceAgent:
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
     def cycle(self):
         self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement()
+    def _await_activation(self):
+        """Waits for `anyaicam-setup` (interactive or --claim) to write a
+        real credential, instead of treating a freshly-installed,
+        not-yet-claimed appliance as a fatal error.
+
+        Confirmed live on Ryzen (2026-09-11): installer/scripts/
+        install.sh enables and (re)starts this service unconditionally,
+        before claim/activation ever runs -- "installed but not yet
+        claimed" is the FIRST real state of every fresh appliance, and
+        is exactly the state installer/validate.sh runs in (see that
+        script's own is-active check on this unit). The previous
+        behavior here -- raise RuntimeError immediately -- combined with
+        this unit's `Restart=always`/`RestartSec=10` turned that
+        entirely normal, expected, intentional state into a permanent
+        crash loop: confirmed via journalctl showing 600+ restarts on a
+        correctly installed, deliberately-still-unclaimed Ryzen, with
+        every single restart logging the identical "Appliance is not
+        activated" traceback. A missing credential before claim is not a
+        misconfiguration to fail loudly on -- it is the appliance
+        correctly waiting for a step of its own documented lifecycle
+        that has not happened yet.
+
+        Logs once on entry and once on success; every retry in between
+        is silent (an unclaimed appliance can sit here for a long time
+        by design -- Samsung's own checkpoint records exactly this
+        state persisting across sessions -- so this must never become a
+        second, quieter crash loop in the journal).
+
+        Re-reads credential.json directly (not just relies on
+        `_finish_enrollment()`'s own `restart_service()` call) so a
+        single long-running process can transition cleanly from waiting
+        to active the moment `anyaicam-setup` completes, without
+        depending on that restart succeeding or racing it.
+        """
+        if self.client.credential: return
+        self.log.info('Appliance is not activated yet; waiting for anyaicam-setup (interactive or --claim) to complete...')
+        while not self.stop_event.is_set():
+            credential=load_credential(self.config)
+            if credential and credential.get('credential'):
+                self.client.appliance_id=credential.get('appliance_id'); self.client.credential=credential.get('credential')
+                self.log.info('Appliance activation detected; resuming normal operation cloud_id=%s',self.config.cloud_id)
+                return
+            self.stop_event.wait(ACTIVATION_POLL_INTERVAL_SECONDS)
     def run(self):
-        if not self.client.credential: raise RuntimeError('Appliance is not activated. Run anyaicam-setup first.')
+        self._await_activation()
+        if self.stop_event.is_set():
+            self.log.info('AnyAiCam appliance agent stopped (still waiting for activation)')
+            return
         self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',self.config.cloud_id,self.config.mode)
         self.resolve_update_state()
         while not self.stop_event.is_set():
