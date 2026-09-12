@@ -67,18 +67,92 @@ language applies again.
   validated against RC3 -- blocked behind claim + camera discovery,
   neither of which has happened yet.
 
+## 2026-09-11 (later same day): agent-service crash loop found and fixed in source, two separate root causes, appliance identity changed again
+
+Immediately before the claim attempt, `anyaicam-agent.service` was found
+crash-looping (600+ restarts) via a **read-only check that had never been
+run before** (`systemctl show ... NRestarts` — the checkpoint above never
+verified this). Two, independent, real defects, found in this order:
+
+1. **Stale systemd drop-in** (`/etc/systemd/system/anyaicam-agent.service.d/vms-paths.conf`,
+   dated 2026-08-19 — nearly a month before this reconciliation work
+   started, from an unrelated local-dev session, bind-mounting
+   `/home/alejandro-mata/projects/AnyAICam/{app/static/hls,recordings}`
+   onto `/var/lib/anyaicam/vms/{hls,recordings}`). One of its two bind
+   sources no longer existed, and neither `installer/uninstall.sh` nor
+   `appliance-agent/scripts/uninstall.sh` ever removed drop-in
+   *directories* — only base unit *files* — so this survived the full
+   `--purge-all` + RC1/RC2/RC3 reinstall cycle untouched and silently
+   reattached to the fresh unit each time. **Fixed in commit `88c87a1`**
+   (both uninstall scripts, both the VMS and agent units, for the general
+   defect class). Removed from Ryzen directly (one-time manual cleanup of
+   pre-existing cruft, not a golden-source patch): `sudo rm -rf
+   /etc/systemd/system/anyaicam-agent.service.d && sudo systemctl
+   daemon-reload`.
+2. **After removing the drop-in, the agent kept crash-looping** — a
+   second, different, genuinely pre-existing defect in `service.py`
+   itself: `run()` raised `RuntimeError('Appliance is not activated...')`
+   unconditionally whenever no credential existed yet, and the systemd
+   unit's `Restart=always`/`RestartSec=10` turned that into a permanent
+   loop. `install.sh` enables+starts this unit unconditionally, *before*
+   claim ever happens — "installed but not yet claimed" is the FIRST real
+   state of every fresh appliance, and exactly the state
+   `installer/validate.sh` runs in. **This defect predates this entire
+   reconciliation effort** — it was always there, just never surfaced,
+   because `validate.sh` never checked the agent's `is-active` state
+   until earlier the same day. Along the way, this also meant commit
+   `55fa281` (the `validate.sh` is-active fix, made *before* this second
+   defect was found) was validated as correct-in-intent but not
+   sufficient alone — it needed `service.py`'s own fix alongside it to be
+   achievable on any fresh install. **Fixed in commit `25e2fc1`**:
+   `run()` now waits for activation (`_await_activation()`, polling
+   `credential.json` directly every 10s) instead of raising; an
+   already-activated appliance's behavior is completely unchanged.
+
+**Three source commits now exist that have NOT been applied to Ryzen's
+currently-running software**: `88c87a1`, `55fa281`, `25e2fc1`. Ryzen's
+`/opt/anyaicam-agent` venv still runs the pre-`25e2fc1` code — the
+stale-drop-in cleanup was applied directly (see above), but the
+`service.py` fix has not been. **Practical implication, reasoned through
+but not yet acted on**: claiming Ryzen right now, even on this
+not-yet-updated agent code, would very likely still work — the crash
+loop is specific to the *pre-claim* window (`__init__` re-reads
+`credential.json` fresh on every process start, so once a real claim
+completes and `_finish_enrollment()` restarts the service, the OLD code's
+own `if not credential: raise` check already passes cleanly, same as it
+must have on every prior successful activation across this whole
+project). What remains genuinely unresolved is *how* to get `25e2fc1`
+onto Ryzen: a new RC + real repair-path install (matching this project's
+own established discipline), vs. some faster in-place package update —
+this has not been decided and needs an explicit decision, not an
+assumption, before claim proceeds.
+
+**Appliance identity has changed again**, independent of any of the
+above: the RC3 install's own identity is `637ad320-daaa-436e-89c9-70a84f4f54a9`
+(distinct from RC1's `99c44cb8-...`) — read live via `sudo cat
+/etc/anyaicam/appliance_identity.json` to reconfirm before use, per this
+file's own standing rule that a value which can change with a future
+install isn't safe to trust without re-checking.
+
 ## Exact next step
 
-1. Proceed through the actual claim/activation flow (`anyaicam-setup
+1. **Decide how `25e2fc1` (and the already-two-commits-behind `88c87a1`/`55fa281`)
+   reach Ryzen** before claiming — build a new RC and do a real
+   repair-path install (consistent with every other fix this project has
+   made), or make an explicit, deliberate decision to claim first on the
+   current (not-yet-updated) agent code, reasoned through above as very
+   likely still safe for the claim step itself. This is a real decision
+   point, not something to default silently in either direction.
+2. Proceed through the actual claim/activation flow (`anyaicam-setup
    --claim` or interactive) — this establishes a **new** cloud identity;
    do not attempt to reuse any prior `cloud_id`/`customer_id` from before
    either wipe (RC1's `99c44cb8-428d-44e4-a1bf-41f95fd2e268` installer
    identity, or the pre-reconciliation real activation
    `AIC-C90CF0C9`/`4efaf5153f` -- neither applies to this appliance
    anymore).
-2. Reconnect the 5 physical cameras through the supported discovery
+3. Reconnect the 5 physical cameras through the supported discovery
    workflow (not manual CAMERA{n}_* env vars).
-3. Validate, in order: recording, motion detection/event media, Motion
+4. Validate, in order: recording, motion detection/event media, Motion
    Cloud upload (once camera + cloud identity + AWS config all exist),
    customer portal camera mapping/status, Live View (both grid and
    dedicated single-camera pages), restart persistence, and specifically
@@ -87,6 +161,6 @@ language applies again.
    closed in source as of `1dfcbf2`, but has never been checked against
    Ryzen's *actual* real hardware/restart behavior, only against the
    regression test suite).
-4. Update this file again once any of the above changes real state on
+5. Update this file again once any of the above changes real state on
    Ryzen — a checkpoint that isn't updated is worse than none, per
    `docs/PROJECT_CHECKPOINT.md`'s own standing rule.
