@@ -123,5 +123,43 @@ class CustomerRegistrationLifecycleTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as db:db.execute("CREATE TRIGGER fail_request_audit BEFORE INSERT ON audit_logs WHEN NEW.action='customer_registration.requested' BEGIN SELECT RAISE(ABORT,'forced failure'); END")
         with self.assertRaises(Exception):create_pending_registration("N","audit@example.test","correct-horse-battery-staple")
         self.assertEqual(self.rows("SELECT * FROM customer_registration_requests"),[])
+    # -------------------------------------------------- GET /customer-registration-requests (HTML page)
+    #
+    # Regression coverage for a real 500 hit live on staging: requests_page()
+    # called page_shell(title, active, content, current_user(request),
+    # scripts=scripts) -- page_shell()'s real signature is (title, active,
+    # content, scripts="") with no user parameter at all, so the extra
+    # positional argument landed in scripts' own slot and collided with the
+    # scripts= keyword right behind it -- "page_shell() got multiple values
+    # for argument 'scripts'" on every single load, for every administrator,
+    # with no prior test ever exercising this HTML route to catch it (the
+    # existing tests above only ever hit the JSON API). The page itself
+    # renders client-side -- its own <script> fetches
+    # /api/customer-registration-requests after load, exactly like every
+    # other page_shell()-based admin page in this app -- so full coverage
+    # here means both halves: the HTML route no longer crashes, and the
+    # exact JSON endpoint its own script calls still returns the seeded
+    # pending request correctly.
+    def test_administrator_can_load_the_registration_requests_page(self):
+        item=self.pending()
+        self.client.cookies.set(partner_portal.SESSION_COOKIE,partner_portal._token("master@example.test","administrator","partner-a",None,None))
+        page=self.client.get("/customer-registration-requests")
+        self.assertEqual(page.status_code,200)
+        self.assertIn("Registration requests",page.text)
+        self.assertIn("/api/customer-registration-requests",page.text)
+        api=self.client.get("/api/customer-registration-requests")
+        self.assertEqual(api.status_code,200)
+        requests=api.json()["requests"]
+        self.assertEqual(len(requests),1)
+        self.assertEqual(requests[0]["email"],item["email"])
+    def test_partner_owner_can_also_load_the_page(self):
+        self.pending()
+        self.client.cookies.set(partner_portal.SESSION_COOKIE,partner_portal._token("owner@a.test","partner_owner","partner-a",None,None))
+        page=self.client.get("/customer-registration-requests")
+        self.assertEqual(page.status_code,200)
+    def test_unauthenticated_page_request_is_still_rejected(self):
+        r=self.client.get("/customer-registration-requests")
+        self.assertEqual(r.status_code,303)
+        self.assertTrue(r.headers["location"].startswith("/customer-login.html"))
 
 if __name__=="__main__":unittest.main()
