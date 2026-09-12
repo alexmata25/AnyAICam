@@ -1,0 +1,283 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AnyAiCam VMS | Edge Video Management, Recording & AI</title><meta name="description" content="Learn how AnyAiCam VMS combines an edge appliance, local recording, remote access, event search, optional cloud storage and modular AI analytics for compatible security cameras."><link rel="icon" href="favicon.png"><link rel="stylesheet" href="vms-product.css">
+<style id="aic-unified-sticky-footer-v1">
+/* AnyAiCam unified navigation/footer enhancement - public VMS pages */
+.stage-header{
+  position:sticky;
+  top:0;
+  z-index:1000;
+  box-shadow:0 12px 28px rgba(2,8,29,.20);
+}
+.site-header{
+  z-index:1000 !important;
+}
+.aic-footer-actions{
+  padding:2rem 1rem;
+  background:#f4f8fc;
+  border-top:1px solid #d9e4f2;
+}
+.aic-footer-actions-inner{
+  width:min(1120px,100%);
+  margin:0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:1.25rem;
+  flex-wrap:wrap;
+}
+.aic-footer-actions-copy h2{
+  margin:0 0 .35rem;
+  color:#071032;
+  font-size:clamp(1.35rem,3vw,1.9rem);
+}
+.aic-footer-actions-copy p{
+  margin:0;
+  color:#52627a;
+  line-height:1.6;
+}
+.aic-footer-actions-buttons{
+  display:flex;
+  gap:.65rem;
+  flex-wrap:wrap;
+}
+.aic-quick-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:44px;
+  padding:.72rem 1rem;
+  border-radius:999px;
+  text-decoration:none !important;
+  font-weight:850;
+  border:1px solid #0b2b4f;
+  background:#fff;
+  color:#0b2b4f !important;
+}
+.aic-quick-btn.primary{
+  border:0;
+  color:#fff !important;
+  background:linear-gradient(90deg,#cc3b96,#23c7d5);
+}
+.aic-unified-footer{
+  background:#071032;
+  color:#dce6ff;
+  padding:3rem 1rem 1.4rem;
+}
+.aic-unified-footer a{
+  color:#dce6ff;
+  text-decoration:none;
+}
+.aic-unified-footer a:hover,
+.aic-unified-footer a:focus-visible{
+  color:#68d7df;
+  text-decoration:underline;
+}
+.aic-footer-grid{
+  width:min(1180px,100%);
+  margin:0 auto;
+  display:grid;
+  grid-template-columns:1.35fr 1fr 1fr 1fr;
+  gap:2rem;
+}
+.aic-footer-brand img{
+  display:block;
+  width:min(210px,100%);
+  height:auto;
+  margin-bottom:1rem;
+}
+.aic-footer-brand p{
+  margin:.45rem 0;
+  color:#c8d5ee;
+  line-height:1.6;
+}
+.aic-unified-footer h3{
+  margin:.15rem 0 .8rem;
+  color:#fff;
+  font-size:1rem;
+}
+.aic-footer-links{
+  display:grid;
+  gap:.5rem;
+}
+.aic-footer-contact{
+  margin-top:1rem;
+  display:grid;
+  gap:.35rem;
+  font-size:.92rem;
+}
+.aic-footer-bottom{
+  width:min(1180px,100%);
+  margin:2rem auto 0;
+  padding-top:1rem;
+  border-top:1px solid rgba(255,255,255,.13);
+  display:flex;
+  justify-content:space-between;
+  gap:1rem;
+  flex-wrap:wrap;
+  color:#9fb0cf;
+  font-size:.86rem;
+}
+.aic-footer-policies{
+  display:flex;
+  gap:1rem;
+  flex-wrap:wrap;
+}
+@media(max-width:900px){
+  .aic-footer-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media(max-width:620px){
+  .aic-footer-grid{grid-template-columns:1fr;}
+  .aic-footer-actions-buttons{width:100%;display:grid;grid-template-columns:1fr;}
+  .aic-quick-btn{width:100%;}
+}
+</style>
+
+<link rel="stylesheet" href="header-standard.css">
+
+<style id="aic-stage-nav-no-underline-final">
+header.stage-header nav.stage-nav a,
+header.stage-header nav.stage-nav a:link,
+header.stage-header nav.stage-nav a:visited,
+header.stage-header nav.stage-nav a:hover,
+header.stage-header nav.stage-nav a:active,
+header.stage-header nav.stage-nav a:focus {
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: 0 !important;
+}
+</style>
+
+</head><body>
+
+<header class="stage-header"><div class="stage-header-inner"><a href="index.html"><img src="full-logo-transparent.png" alt="ANY AI CAM"></a><nav class="stage-nav" aria-label="Primary"><a href="index.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Home</a><a href="vms.html" aria-current="page" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">VMS</a><a href="vms-features.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Features</a><a href="edge-appliance.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Edge Appliance</a><a href="face-access.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">AAC Face Access</a><a href="customer-setup.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Setup</a><a href="hardware.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Hardware</a><a href="build-your-system.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Build System</a><a href="sales-partner-login.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Sales Partners</a><a href="vms-support.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Support</a><a href="vms-contact.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Contact</a></nav></div></header>
+<main><section class="section white"><div class="wrap"><div class="notice"><strong>Hardware choice:</strong> standard VMS customers use the MINISFORUM AI X1-255 — Ryzen 7 255 or MINISFORUM AI X1 — Ryzen AI 9 HX 470. The premium AI Access Edge is reserved for integrated AAC Face Access with a supported provider API. The Numato relay is a separate standalone access-control product, not a VMS appliance requirement.</div></div></section>
+<section class="hero"><div class="wrap hero-grid"><div><div class="eyebrow">AnyAiCam VMS</div><h1>Your cameras. Your edge appliance. One video system.</h1><p>AnyAiCam VMS is designed to operate compatible security cameras from an AnyAiCam Edge appliance. The appliance handles the local camera connection, recording and core VMS services while optional cloud services extend remote access, protected storage and analytics.</p><div class="button-row"><a class="button primary" href="#free-vms-download">Free VMS Software</a><a class="button light" href="build-your-system.html">Build My System</a><a class="button light" href="customer-setup.html">See Setup Process</a></div></div><aside class="hero-panel"><div class="tagline">How the system fits together</div><div class="flow"><div class="flow-item"><span class="flow-num">1</span><span>Compatible IP cameras connect on your network</span></div><div class="flow-arrow">↓</div><div class="flow-item"><span class="flow-num">2</span><span>AnyAiCam Edge discovers, records and manages them</span></div><div class="flow-arrow">↓</div><div class="flow-item"><span class="flow-num">3</span><span>Your account provides live view, playback and events</span></div><div class="flow-arrow">↓</div><div class="flow-item"><span class="flow-num">4</span><span>Optional cloud storage and licensed AI extend the system</span></div></div></aside></div></section>
+
+<section class="section white" id="free-vms-download">
+  <div class="wrap">
+    <div class="eyebrow" style="color:#16778b">Free AnyAiCam VMS Software</div>
+    <h2>Use the AnyAiCam VMS software for free.</h2>
+    <p class="lead">The AnyAiCam VMS software itself is intended to be a free download. Customers can use the VMS software without paying a software-download fee, then add the hardware, camera capacity, storage, cloud/hybrid services, analytics or AAC Face Access options they actually need.</p>
+
+    <div class="grid" style="margin-top:1.4rem">
+      <article class="card">
+        <span class="pill">Free</span>
+        <h3>AnyAiCam VMS for Windows 0.1.3</h3>
+        <p>Download the signed AnyAiCam VMS installer for a compatible Windows PC.</p>
+        <style>
+          .vms-download-actions{display:flex;gap:.75rem;align-items:stretch;flex-wrap:wrap;margin:1rem 0 0}
+          .vms-download-option{display:flex;flex:1 1 140px;flex-direction:column;min-width:0}
+          .vms-download-option .button{box-sizing:border-box;display:flex;align-items:center;justify-content:center;min-height:48px;width:100%}
+          .vms-download-meta{font-size:.9rem;color:#64748b;margin:.55rem 0 0;text-align:center;line-height:1.45}
+          @media(max-width:640px){.vms-download-actions{flex-direction:column}.vms-download-option{flex-basis:auto;width:100%}}
+        </style>
+        <div class="vms-download-actions">
+          <div class="vms-download-option">
+            <a class="button primary" href="https://github.com/alexmata25/AnyAICam/releases/download/v0.1.3/AnyAiCam-VMS-Setup-0.1.3-ec5272f.exe">Download for Windows</a>
+            <p class="vms-download-meta">Windows 0.1.3 · Signed installer</p>
+          </div>
+          <div class="vms-download-option">
+            <a class="button primary" href="https://github.com/alexmata25/AnyAICam/releases/download/v0.1.3/anyaicam-vms_0.1.3%2Bec5272f-1_amd64.deb">Download for Linux</a>
+            <p class="vms-download-meta">Ubuntu 24.04 LTS · amd64</p>
+          </div>
+        </div>
+        <p style="font-size:.9rem;color:#64748b;margin-top:.5rem"><strong>Linux installation:</strong> Internet access is required during initial installation for Ubuntu and runtime dependencies.</p>
+        <p style="font-size:.9rem;color:#64748b;margin-top:.8rem"><strong>Current Windows release:</strong> version 0.1.3, signed and ready to install.</p>
+      </article>
+
+      <article class="card">
+        <span class="pill">Optional / paid</span>
+        <h3>Add only what the site needs</h3>
+        <p>Edge appliance hardware, recording storage, purchased camera slots, Hybrid services, cloud retention, licensed analytics and AAC Face Access are separate from the free software download.</p>
+      </article>
+
+      <article class="card">
+        <span class="pill">Bring your own PC</span>
+        <h3>DIY Windows deployment</h3>
+        <p>Customers who already have a suitable Windows computer can start with the software path instead of purchasing an AnyAiCam Edge appliance. Download the signed Windows installer above.</p>
+      </article>
+    </div>
+
+    <div class="notice" style="margin-top:1.2rem">
+      <strong>Important:</strong> this is the AnyAiCam VMS software, not the separate Videoloft Software Bridge. The public installer above is the verified AnyAiCam VMS 0.1.3 release; old internal appliance archives are not customer downloads.
+    </div>
+  </div>
+</section>
+
+<section class="section white"><div class="wrap"><div class="eyebrow" style="color:#16778b">VMS appliance choices</div><h2>Choose the VMS appliance that matches the site workload</h2><div class="grid"><article class="card"><img src="aac-vms-edge-x1-255-ryzen7.jpg" alt="MINISFORUM AI X1-255 — Ryzen 7 255 AnyAiCam VMS Edge" loading="lazy" style="display:block;width:100%;height:220px;object-fit:contain;background:#fff;border-radius:12px;margin-bottom:1rem"><span class="pill">Standard VMS</span><h3>MINISFORUM AI X1-255 — Ryzen 7 255</h3><p>Standard VMS appliance for local recording, live view, playback and approved analytics. Recording storage is sized separately from the 1 TB system SSD.</p></article><article class="card"><img src="aac-vms-edge-x1-ryzen9.jpg" alt="MINISFORUM AI X1 — Ryzen AI 9 HX 470 AnyAiCam VMS Edge" loading="lazy" style="display:block;width:100%;height:220px;object-fit:contain;background:#fff;border-radius:12px;margin-bottom:1rem"><span class="pill">Performance VMS</span><h3>MINISFORUM AI X1 — Ryzen AI 9 HX 470</h3><p>Higher-performance VMS appliance for heavier analytics, concurrent workload or planned expansion. Recording storage is sized separately.</p></article><article class="card"><img src="aac-ai-access-edge.webp" alt="MINISFORUM candidate for integrated AnyAiCam AAC Face Access" loading="lazy" style="display:block;width:100%;height:220px;object-fit:contain;background:#fff;border-radius:12px;margin-bottom:1rem"><span class="pill future">Integrated Face Access</span><h3>AI Access Edge</h3><p>Use this higher-performance tier when AAC Face Access is integrated with a supported access-control provider API. It is not the default VMS box.</p></article></div></div></section>
+<section class="section white"><div class="wrap"><div class="eyebrow" style="color:#16778b">What it does</div><h2>A complete operating layer for compatible cameras</h2><p class="lead">The VMS is the software that turns a group of compatible cameras into one managed security system instead of a collection of separate devices.</p><div class="grid"><article class="card"><div class="icon">◉</div><h3>Live View</h3><p>Open authorized cameras from the AnyAiCam interface and see the current scene without logging into every camera separately.</p></article><article class="card"><div class="icon">▶</div><h3>Recording & Playback</h3><p>Record video on the edge appliance and review footage by camera and time. Hybrid cloud options can add off-site protection.</p></article><article class="card"><div class="icon">⚡</div><h3>Events</h3><p>Surface motion and AI-generated events with event media so customers can move from an alert to the related video quickly.</p></article><article class="card"><div class="icon">AI</div><h3>Modular Analytics</h3><p>Enable licensed analytics per camera or camera slot rather than forcing every camera into the same feature package.</p></article><article class="card"><div class="icon">☁</div><h3>Hybrid Cloud</h3><p>Keep the appliance as the operating center while using cloud services for customer access, selected media, entitlements and optional retention.</p></article><article class="card"><div class="icon">⌁</div><h3>Remote Management</h3><p>Associate customers, sites, appliances and camera entitlements so the system can be supported without rebuilding it for every new installation.</p></article></div></div></section>
+<section class="section"><div class="wrap"><div class="eyebrow" style="color:#16778b">Local-first architecture</div><h2>The edge appliance stays in the middle of the design</h2><p class="lead">The website sells and provisions the system. The edge appliance performs the local camera work. That separation is important: a public website should not try to scan a customer's private LAN directly.</p><div class="diagram"><div class="node">Customer cameras</div><div class="connector">→</div><div class="node">AnyAiCam Edge</div><div class="connector">→</div><div class="node">AnyAiCam account / cloud services</div></div><div class="notice" style="margin-top:1.2rem"><strong>Simple installation target:</strong> connect the appliance to the network, sign in or activate it, discover cameras, enter authorized camera credentials, assign cameras to purchased slots, name them, and finish commissioning.</div></div></section>
+<section class="section white"><div class="wrap"><div class="eyebrow" style="color:#16778b">What customers buy</div><h2>Hardware plus the services they actually need</h2><div class="grid"><article class="card"><span class="pill">Required</span><h3>AnyAiCam Edge Appliance</h3><p>The always-on local system that connects to cameras, runs VMS services and stores local video according to the selected system design.</p></article><article class="card"><span class="pill">Per-camera</span><h3>Camera Slots & Features</h3><p>Purchased camera capacity is assigned as logical slots. Features can be licensed per slot, making camera replacement easier without repurchasing the whole system.</p></article><article class="card"><span class="pill">Optional</span><h3>Cloud Retention</h3><p>Select hybrid/off-site storage and a retention target when the site requires cloud-protected video in addition to local recording.</p></article><article class="card"><span class="pill future">Premium / future</span><h3>AAC Facial Recognition + Door Access</h3><p>Pair the AI Access Edge with a supported access-control provider API so an authorized face match can pass through an access policy and request a door unlock. <a href="face-access.html" style="font-weight:900;color:#16778b">See AAC Face Access →</a></p></article></div></div></section>
+<section class="section"><div class="wrap"><div class="eyebrow" style="color:#16778b">Customer journey</div><h2>From checkout to cameras online</h2><div class="timeline"><div class="step"><strong>01</strong><h3>Build</h3><p>Choose camera count, appliance sizing, recording, storage and analytics.</p></div><div class="step"><strong>02</strong><h3>Checkout</h3><p>Stripe confirms payment server-to-server.</p></div><div class="step"><strong>03</strong><h3>Provision</h3><p>AnyAiCam creates the customer, site, appliance reservation and entitlements.</p></div><div class="step"><strong>04</strong><h3>Connect</h3><p>Customer receives the edge appliance and connects power and network.</p></div><div class="step"><strong>05</strong><h3>Discover</h3><p>Activate, scan cameras, enter credentials, assign slots and finish setup.</p></div></div></div></section>
+<section class="cta"><div class="wrap"><div><h2>Ready to plan an AnyAiCam system?</h2><p>Use the public system planner to choose the VMS tier and features that fit the site. Online VMS hardware checkout is not enabled on this page yet.</p></div><div class="button-row"><a class="button primary" href="build-your-system.html">Start System Wizard</a><a class="button light" href="vms-features.html">Explore Features</a><a class="button light" href="face-access.html">AAC Face Access</a></div></div></section>
+</main>
+<section class="aic-footer-actions" aria-label="Quick actions">
+  <div class="aic-footer-actions-inner">
+    <div class="aic-footer-actions-copy">
+      <h2>Ready for the next step?</h2>
+      <p>Go straight to system planning, VMS features, Face Access, or support without scrolling back to the top.</p>
+    </div>
+    <div class="aic-footer-actions-buttons">
+      <a class="aic-quick-btn primary" href="build-your-system.html">Start Setup Wizard</a>
+      <a class="aic-quick-btn" href="vms-features.html">Explore VMS Features</a>
+      <a class="aic-quick-btn" href="face-access.html">AAC Face Access</a>
+      <a class="aic-quick-btn" href="vms-support.html">Contact Support</a>
+    </div>
+  </div>
+</section>
+
+
+<footer class="aic-unified-footer" id="about">
+  <div class="aic-footer-grid">
+    <div class="aic-footer-brand">
+      <a href="index.html" aria-label="ANY AI CAM home"><img src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection"></a>
+      <p>Local-first video, optional hybrid cloud services, modular AI analytics, and AAC Face Access for compatible security systems.</p>
+      <div class="aic-footer-contact">
+        <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        <a href="tel:+13465544699">(346) 554-4699</a>
+        <a href="/cdn-cgi/l/email-protection#f2939f938693b2939c8b939b91939fdc919d9f"><span class="__cf_email__" data-cfemail="d8b9b5b9acb998b9b6a1b9b1bbb9b5f6bbb7b5">[email&#160;protected]</span></a>
+      </div>
+    </div>
+    <div>
+      <h3>AnyAiCam VMS</h3>
+      <div class="aic-footer-links">
+        <a href="vms.html">VMS Overview</a>
+        <a href="vms-features.html">VMS Features</a>
+        <a href="edge-appliance.html">Edge Appliance</a>
+        <a href="build-your-system.html">Build Your System</a>
+        <a href="customer-setup.html">Customer Setup</a>
+      </div>
+    </div>
+    <div>
+      <h3>AI Access & Hardware</h3>
+      <div class="aic-footer-links">
+        <a href="face-access.html">AAC Face Access</a>
+        <a href="edge-appliance.html">AI Edge Appliance</a>
+        <a href="hardware.html">Hardware Selector</a>
+        <a href="analytics.html">Analytics Catalog</a>
+        <a href="/camera-compatibility-check.html">Camera Readiness</a>
+      </div>
+    </div>
+    <div>
+      <h3>Cloud, Account & Support</h3>
+      <div class="aic-footer-links">
+        <a href="/cloud-setup-wizard.html">Videoloft Cloud Setup</a>
+        <a href="signin.html">Account Dashboard</a>
+        <a href="sales-partner-login.html">Sales Partner Login</a>
+        <a href="vms-partner-apply.html">Become a VMS / AAC Sales Partner</a>
+        <a href="vms-support.html">Live Tech Support</a>
+        <a href="vms-contact.html">Contact Us</a>
+        <a href="plans.html">Plan Explainer</a>
+      </div>
+    </div>
+  </div>
+  <div class="aic-footer-bottom">
+    <span>© 2026 ANY AI CAM. All rights reserved.</span>
+    <div class="aic-footer-policies">
+      <a href="/privacy-policy.html">Privacy Policy</a>
+      <a href="/terms.html">Terms of Service</a>
+      <a href="/shipping-returns.html">Shipping &amp; Returns</a>
+    </div>
+  </div>
+</footer>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body></html>

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Checkout in progress (STAGING TEST) | ANY AI CAM</title>
+<!--
+  STAGING/REVIEW COPY -- NOT the live Bluehost file. New page: the
+  landing page checkout-session.php's success_url points every leg's
+  Stripe Checkout Session at. Reads the completed leg + remaining legs +
+  the reused Stripe Customer id back out of the query string (all set by
+  checkout-session.php, never trusted for price resolution here --
+  checkout-session.php re-validates every leg's price_id server-side
+  before creating the next Checkout Session), then either continues the
+  journey or shows the final sandbox-purchase confirmation.
+-->
+<style>
+body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;color:#182443;background:#f5f7fc;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:1rem}
+.card{background:#fff;border:1px solid #dde3f0;border-radius:16px;padding:2rem;max-width:520px;width:100%;text-align:center}
+h1{font-size:1.3rem;margin:0 0 .5rem}
+p{color:#61708c;margin:0 0 1.25rem}
+.spinner{width:34px;height:34px;border:4px solid #dde3f0;border-top-color:#5a72d8;border-radius:50%;margin:0 auto 1rem;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.error{color:#8b1730;background:#fff0f2;padding:.75rem 1rem;border-radius:10px;font-weight:700}
+.done-icon{font-size:2.5rem}
+a.button{display:inline-block;margin-top:1rem;background:linear-gradient(135deg,#bf2a91,#5a72d8);color:#fff;text-decoration:none;font-weight:800;padding:.8rem 1.4rem;border-radius:999px}
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="spinner"></div>
+  <h1>Completing your sandbox test purchase…</h1>
+  <p id="status-text">Just a moment.</p>
+</div>
+
+<script>
+function params() {
+  const url = new URL(location.href);
+  return Object.fromEntries(url.searchParams.entries());
+}
+
+async function run() {
+  const p = params();
+  const card = document.getElementById('card');
+  const completedLabel = p.completed_leg_label || 'this item';
+  let remainingLegs = [];
+  try {
+    remainingLegs = p.remaining_legs ? JSON.parse(atob(p.remaining_legs)) : [];
+  } catch (error) {
+    remainingLegs = [];
+  }
+
+  if (remainingLegs.length === 0) {
+    card.innerHTML = `
+      <div class="done-icon">✅</div>
+      <h1>Sandbox test purchase complete</h1>
+      <p>"${completedLabel}" was the last item -- every selected item now has its own completed Stripe TEST Checkout Session. No real money was charged (Stripe TEST mode only).</p>
+      <a class="button" href="build-your-system.html">Build another test order</a>`;
+    return;
+  }
+
+  document.getElementById('status-text').textContent = `"${completedLabel}" is done. Starting the next item (${remainingLegs.length} remaining)…`;
+
+  try {
+    const response = await fetch('checkout-session.php', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        customer_email: p.customer_email || '',
+        stripe_customer_id: p.stripe_customer_id || '',
+        legs: remainingLegs,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Could not continue to the next checkout item.');
+    }
+    location.href = data.checkout_url;
+  } catch (error) {
+    card.innerHTML = `
+      <h1>Could not continue</h1>
+      <p class="error">${error.message}</p>
+      <a class="button" href="build-your-system.html">Back to Build Your System</a>`;
+  }
+}
+
+run();
+</script>
+</body>
+</html>
