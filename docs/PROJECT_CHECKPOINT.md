@@ -1297,6 +1297,20 @@ Camera reconnection, reboot-persistence validation, and Live Relay/Motion Cloud/
 
 ---
 
+## 2026-09-12: Camera discovery verified end to end; provisioning blocked by a second never-provisioned secret (`ANYAICAM_CAMERA_CREDENTIAL_KEY`) — found and fixed
+
+**Discovery, fully verified working through the real cloud path.** The customer setup wizard defaulted to the wrong appliance at first (Step 3 showed the historical `AIC-C90CF0C9` as "degraded") — root-caused to `customer_first_setup()`'s appliance query having no `ORDER BY`, so with two appliances on one customer account it silently defaults to whichever SQLite returns first (insertion order put the older, stale test appliance ahead of the live Ryzen one). Not fixed in source this session (flagged for a future explicit fix); the supported workaround — manually selecting the correct appliance from the dropdown — works today and was used. Once Ryzen was selected, the customer-portal scan job (`camera_scan_jobs id=b4eb032898ee`) correctly triggered the agent's real `poll_discovery()`, found the same 5 cameras (by count and ONVIF/RTSP capability) the direct on-appliance scan found minutes earlier, all with stable ONVIF device-key identities, IP/raw-endpoint correctly redacted before leaving the appliance.
+
+**Provisioning Camera 1 then hit a second missing secret**: `POST /api/customer/cameras/provision` requires `ANYAICAM_CAMERA_CREDENTIAL_KEY` to encrypt submitted camera credentials before storage; `encrypt_camera_credentials()` fails closed (by design, same Fernet pattern as `ANYAICAM_CLAIM_FLOW_SECRET_KEY`) when it's unset, producing the 503 "Camera credential handling is not configured." Confirmed: this key was simply never provisioned for staging — identical defect *class* to the claim-flow-secret incident earlier tonight, a completely separate key by design (so a leak of one never exposes the other), just never set up either. Not a source defect, not an undeployed component — the code is correct and working exactly as designed. Confirmed no trace of the failed attempt was ever stored: `cameras`/`camera_provisioning_requests` for this appliance both `0` rows — the 503 fires before any write.
+
+**Fixed**: generated via the container's own `Fernet.generate_key()`, appended by name only (value never displayed) to both `/etc/anyaicam-staging/vms-staging.env` and `~/blue-green-rehearsal/green.env`; `portal-green` recreated from the **same already-deployed image** (`deploy-portal:b8bdf2c`, digest unchanged, no rebuild, no source change). Verified: `ANYAICAM_CAMERA_CREDENTIAL_KEY` present by name (count 1) in the running container; `ANYAICAM_CLAIM_FLOW_SECRET_KEY` unaffected (still present); `/health`/`/version` correct (internal + public, `200 ok`); Ryzen's appliance row shows `online_status=online` with a fresh `last_check_in` spanning the recreation (no disruption to the existing activation/heartbeat — Ryzen itself was never touched); the one existing credential (`ffdf68c39378f4e9`) still valid, not revoked; DB integrity `ok`; zero cameras or provisioning requests exist for this appliance (confirmed nothing was provisioned as a side effect of either the failed attempt or this fix).
+
+### State to resume from
+
+Safe to retry Camera 1's provisioning through the customer portal now. No credentials were recovered, injected, or reused — you'll re-enter Camera 1's username/password fresh. Cameras 2-5, Motion Cloud/AWS, Ryzen configuration, and Samsung remain untouched throughout.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
