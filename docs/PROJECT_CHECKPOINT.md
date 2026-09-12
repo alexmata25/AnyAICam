@@ -1545,6 +1545,30 @@ Minor, harmless observation: `/app/recordings/` now also has empty `camera5`/`ca
 
 ---
 
+## 2026-09-12: Ryzen released cloud-side (unclaimed) -- DONE. Local Ryzen deliberately NOT touched -- coordinated_reenroll() cannot run standalone; not falling back to --purge-all
+
+**Source trace, before touching anything**: `coordinated_reenroll(config, activation_response, ...)` (`appliance-agent/anyaicam_agent/reenrollment.py`) requires an already-obtained `activation_response` -- it *replaces* one identity with a new one, atomically, with rollback. There is no code path from "claimed" to "no identity" other than this (which needs a fresh claim already completed -- not available this turn, claiming being explicitly out of scope) or `uninstall.sh`'s `--purge-all` (a full wipe). **Conclusion: the supported mechanism cannot accomplish a standalone "return to unclaimed" right now** -- so, per instruction, Ryzen's local software/identity was left completely untouched this pass; no `--purge-all`, nothing invented.
+
+### Cloud-side release -- executed, verified
+
+Pre-verified every target row fresh (immediately before mutating, inside the same transaction) against: `appliances id=7844ceab86e7fab2845125cffeb8ad10`/`cloud_id=637AD320-...`/`customer_id=4efaf5153f`/`site_id=4de6186be8`; `appliance_credentials id=ffdf68c39378f4e9`; `appliance_claims id=2b7a1fb8452cfbbee722093c967428ea` (`status=completed`, `revoked_at IS NULL`). Backup: `/var/lib/anyaicam-staging/db/staging-pre-ryzen-unclaim-20260912T152133Z.db`, SHA-256 `109f5337dffc406b5f45cb1441d895212c4b6c0108fdb9c93a29d835bd60b4f1`.
+
+One transaction, exact-id-scoped, each statement's rowcount asserted before commit: deleted `camera_credentials`(3) for this appliance's own camera ids, `cameras`(3), `camera_provisioning_requests`(5), `camera_scan_jobs`(7), `appliance_camera_status`(3), `appliance_commands`(42), `appliance_health_history`(712), `appliance_request_nonces`(86), `appliance_credentials`(1, the live one); revoked (not deleted) `appliance_claims id=2b7a1fb8452cfbbee722093c967428ea` (`revoked_at` set, `appliance_id` cleared, `status` left `completed` for history -- same convention as every prior cleanup on this device); deleted `appliances id=7844ceab86e7fab2845125cffeb8ad10`. Committed once, cleanly.
+
+**Post-verify, all passed**: zero `appliances` rows for `cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9` (a fresh `claim_begin()` for this device will now be accepted); zero rows anywhere for the old `appliance_id`; the claim record kept, revoked, `appliance_id=NULL`. **Historical customer/appliance/entitlement byte-for-byte unaffected**: `customers[4efaf5153f]` still `active`; `appliances[5e76625989]` (`AIC-C90CF0C9`) still `activated` with its own 5 cameras, untouched; `customer_entitlements` still `camera_slot_quantity=8`/`active`, unchanged. Overall table deltas exactly match the deletes (`appliances` 4->3, `cameras` 18->15, everything else unchanged). `PRAGMA integrity_check: ok`. One harmless leftover, deliberately not touched: `customer_setup_drafts` for `4efaf5153f` still has the now-gone `appliance_id` in its saved JSON -- the wizard already falls back gracefully when a saved appliance_id no longer matches any of the customer's remaining appliances (confirmed in source during the earlier journey audit).
+
+### Ryzen itself -- confirmed still healthy, correctly reacting, deliberately unchanged
+
+`anyaicam-vms.service`/`anyaicam-agent.service` both still `active`, `NRestarts=0` (no crash loop from the credential revocation). VMS `/health` still `200 ok`, `build_id` still `aa4dc2edb135e379631a9d17db8923e56a202ed9` (aa4dc2e install from the previous entry, unaffected -- this was a pure cloud-side data operation, no redeploy, no restart). Agent log now correctly shows graceful, expected degradation: `WARNING:anyaicam.agent:Queued offline update path=/api/appliance/heartbeat error=Appliance is revoked or unknown.` (and the same for `/api/appliance/cameras`) -- exactly the fail-safe-and-queue behavior this agent was already built with, not a new failure mode. `appliance_identity.json` SHA-256 unchanged (`9d18b86c...`) -- still shows the old `cloud_id`/`customer_id`, deliberately, since no new claim has completed to give `coordinated_reenroll()` something to swap in. Local `cameras` table still has 3 orphaned rows (device_key/onvif_endpoint, no credentials -- already `0` credentials before this pass, so no new local leftover was created) -- left alone with the identity, for the same reason.
+
+### What this means for resuming the new-customer test
+
+Cloud-side, `637AD320-DAAA-436E-89C9-70A84F4F54A9` is genuinely unclaimed and ready for a fresh `claim_begin()`. Locally, Ryzen keeps running its already-installed `aa4dc2e` software with its old identity in place; the expected, correct sequence when a NEW customer's claim actually completes (a later, separately-authorized step) is for the agent's own `setup_wizard.py` to detect the existing identity files, route through `coordinated_reenroll()` (not `first_enroll()`), and atomically replace the old identity with the new one -- the exact supported mechanism, exercised at the moment it's actually designed for, not forced early. This has not been dry-run end-to-end; worth watching closely the first time it actually happens.
+
+**Not done this pass**: no new customer created, nothing purchased, appliance not claimed, no cameras provisioned, Samsung untouched.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
