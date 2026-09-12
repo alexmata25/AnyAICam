@@ -1119,6 +1119,49 @@ Source rsync'd into `/opt/anyaicam-staging/{app,requirements.txt,requirements-cp
 
 ---
 
+## 2026-09-12: Controlled cleanup of the three stranded Ryzen claim records — DONE
+
+Narrowly-scoped cleanup only, exactly as authorized. No new claim started, `anyaicam-setup` not run on Ryzen, no other appliance/claim/credential/customer/site touched, historical `AIC-C90CF0C9` file untouched, staging config/secrets untouched, Ryzen filesystem/Samsung/cameras/AWS untouched.
+
+### Pre-cleanup verification
+
+All three target rows re-read fresh and confirmed to match exactly before touching anything: `appliance_claims id=48e3f8f0ddab9340fbc131ef30ff222d` (`customer_id=4efaf5153f`, `site_id=4de6186be8`, `appliance_id=cc481658689945c7796a69b80821baad`, `status=completed`), `appliances id=cc481658689945c7796a69b80821baad` (`cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9`, same customer/site), `appliance_credentials id=e8fb41263d61beae` (`appliance_id=cc481658...`). FK/dependency scan across every one of the 14 tables in this schema that reference `appliance_id` found exactly one dependent row anywhere — the target `appliance_credentials` row itself; nothing else in the entire database points at this appliance_id. `PRAGMA integrity_check: ok` immediately before mutation.
+
+### Backup
+
+`/var/lib/anyaicam-staging/db/staging-pre-ryzen-claim-cleanup-20260912T032638Z.db`, SHA-256 `7952c5e9697d490ef14fcc5315587365787b16f4feb0ebefe14828f94bd85c04` (identical to the deployment phase's own pre-deploy backup hash — confirms zero incidental DB writes occurred between deployment and this cleanup).
+
+### What was actually changed — one transaction, every statement scoped by exact row id plus every other field re-checked, never by `customer_id`/`site_id` alone
+
+1. `DELETE FROM appliance_credentials WHERE id='e8fb41263d61beae' AND appliance_id='cc481658689945c7796a69b80821baad'` — removed the one real, usable (though never-delivered) credential from the failed claim.
+2. `UPDATE appliance_claims SET revoked_at=<now>, appliance_id=NULL, completed_credential_encrypted=NULL, credential_recovery_expires_at=NULL WHERE id='48e3f8f0ddab9340fbc131ef30ff222d' AND device_id='637ad320-...' AND customer_id='4efaf5153f' AND site_id='4de6186be8' AND appliance_id='cc481658...' AND status='completed'` — the historical row is kept (not deleted, preserving the audit trail of what happened) but explicitly revoked and detached from the appliance row being removed next; its already-expired recovery material is also explicitly cleared rather than left to a TTL. `status` intentionally left as `completed` (accurate history) rather than inventing a new status value never otherwise used in this table (`completed`/`expired`/`pending` are the only three ever written) — `revoked_at` is the existing, schema-provided signal for "this is dead, do not act on it further."
+3. `DELETE FROM appliances WHERE id='cc481658689945c7796a69b80821baad' AND cloud_id='637AD320-...' AND customer_id='4efaf5153f' AND site_id='4de6186be8'` — removed the provisioned-appliance row, which is the *only* thing `claim_begin()` actually checks (`SELECT id FROM appliances WHERE cloud_id=?`) before refusing a new claim for this device.
+
+Each statement asserted `rowcount==1` inside the same transaction before committing; a real re-check of all three rows' values ran again immediately before the writes, inside the transaction. All three assertions passed; committed once, cleanly.
+
+### Post-cleanup verification — all passed
+
+| Check | Result |
+|---|---|
+| No appliance row for `cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9` | `0` rows — **this is the literal query `claim_begin()` runs**, proving a fresh claim for this exact Cloud ID will no longer be refused |
+| No usable credential from the failed claim | `appliance_credentials id=e8fb4126...` — `0` rows, gone |
+| Stranded claim cannot be reused | `revoked_at` set, `appliance_id=NULL`, `completed_credential_encrypted=NULL`, `credential_recovery_expires_at=NULL` — even if its plaintext claim_proof still existed anywhere (it doesn't), there's no longer any recovery material or appliance link left to recover into |
+| Customer account | `alexmata25@gmail.com` / `customers[4efaf5153f]` — unchanged, `active` |
+| Ryzen Home Site | `sites[4de6186be8]` — unchanged, present |
+| Other claim rows for this device_id | The 2 pre-existing `expired` rows and the 1 `pending` (already-TTL-stale, out of this cleanup's scope) row — every field identical to before, untouched |
+| Unrelated table counts | `appliances: 3` (was 4, now correctly missing only the one removed), `appliance_credentials: 3` (same), `partner_users/customers/sites: 4/3/3` — all unchanged from pre-cleanup baseline |
+| Historical `AIC-C90CF0C9` file | Re-read post-cleanup: byte-identical to every prior read this session |
+| DB integrity | `PRAGMA integrity_check: ok`, post-cleanup |
+| `/health` | `200 ok` |
+| `/version` | Still `deploy-portal:b8bdf2c` / `sha256:bc35dba1...` — confirmed via `docker inspect`; container never restarted for this cleanup (pure data operation, no redeploy) |
+| Container count | Exactly one portal container (`portal-green`), unchanged |
+
+### State to resume from
+
+Ryzen's Cloud ID (`637ad320-daaa-436e-89c9-70a84f4f54a9`) is now genuinely unclaimed in staging — no `appliances` row, no credential, nothing to block a fresh `claim_begin()`. **No new claim has been started.** `anyaicam-setup` has not been run on Ryzen. The next step — one new end-to-end Ryzen claim exercising all three source fixes together — needs separate explicit authorization.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
