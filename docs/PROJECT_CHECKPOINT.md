@@ -1162,6 +1162,63 @@ Ryzen's Cloud ID (`637ad320-daaa-436e-89c9-70a84f4f54a9`) is now genuinely uncla
 
 ---
 
+## 2026-09-12: Second stranded Ryzen claim — the appliance-agent fix was never on Ryzen at all
+
+The "one new end-to-end Ryzen claim" from the previous section was attempted. **The old `AIC-C90CF0C9` conflict did not recur** (defect 1, deployed to `app/`/staging, worked correctly), but local enrollment failed again with the *exact same* symptom as before: a `systemd1.manage-units` polkit prompt, then `Failed to restart anyaicam-agent.service: Connection timed out`, then `First-time appliance enrollment failed; no identity was left behind (CalledProcessError)`.
+
+**Root cause: a deployment-process gap, not a code defect.** `bd633a2`/`2b6bc9e` were deployed to `anyaicam-staging` (a Docker Compose target built directly from `app/`) but Ryzen's `appliance-agent` package is an entirely separate deployable artifact — installed via `installer/build_release_installer.py`'s combined VMS+agent tarball, last built at RC4 (`087e455`), predating both fixes. Ryzen's `setup_wizard.py`/`privileged_watcher.py` were simply never rebuilt or reinstalled. The observed polkit prompt is conclusive proof by itself: `2b6bc9e`'s `restart_service()` never calls `systemctl` directly at all (it only writes a marker file), so a polkit prompt appearing means the pre-fix code ran.
+
+Server-side, this second claim completed and committed cleanly, exactly once, with exactly one credential — proving defect 1's fix works correctly end-to-end on the cloud side:
+```
+appliance_claims id=73c06c0805a1510950feb8f3a59e67aa   status=completed
+  customer_id=4efaf5153f  site_id=4de6186be8  appliance_id=0ca39d9d45d34fbcc6c641924912045c
+appliances id=0ca39d9d45d34fbcc6c641924912045c   cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9
+appliance_credentials id=f1032092ee7cb5b0   not revoked
+```
+Ryzen's local state: with very high confidence (inferred from the confirmed-old code path, not yet directly file-verified), `claim_state.json` was cleared again by the same pre-`2b6bc9e` unconditional ordering — the plaintext claim_proof needed to use the server's still-open recovery window is gone. This second claim is now **stranded for the identical reason as the first, not a new defect** — cleanup has **not yet been performed**, awaiting separate authorization (see below).
+
+**Durable release-process lesson, recorded per explicit request**: a fix that spans `app/` and `appliance-agent/` is not "deployed" merely because the staging cloud container was rebuilt. These are two independent deployment targets with two independent pipelines (staging: direct Docker Compose build from `app/`; edge appliances: `installer/build_release_installer.py`'s combined tarball, installed via `install.sh`). **Any future release checklist touching both directories must explicitly identify and deploy every affected target** — checking off "staging redeployed" must never be read as "the fix is live everywhere."
+
+## 2026-09-12: Corrected appliance-agent release built and installed on Ryzen — VERIFIED
+
+Built a new versioned installer from the same corrected commit already live on staging, and installed it on Ryzen via the proven repair path — closing the release-process gap above.
+
+### Release artifact record
+
+- **VMS release commit**: `b8bdf2cf98c716067024bdf471d834ce5cd602e1` (full 40-char SHA)
+- **Installer filename**: `anyaicam-appliance-installer-1.1.0-vms-b8bdf2cf98c7.tar.gz`
+- **Installer SHA-256**: `17880eaf85b4db4e42815ff637798cd1cf6cb2331875c3d8c75bf42d97c098c0` — verified identical before and after `scp` to Ryzen
+- **VMS release payload archive SHA-256** (from `release-manifest.json`): `79fd6371a2973a21151ca288412f56e3dd53cda8336181100849e5173a0a562b`
+- **appliance-agent wheel**: `anyaicam_appliance_agent-0.1.0-py3-none-any.whl`, SHA-256 `dfb79dd8783f700165f934af1ae89f1b3305678e0f2381ae96628b446a7f7c6c` (from the `pip install` build log — this pipeline builds no other named wheel artifact)
+- **VMS Docker image**: `anyaicam-vms:latest`, digest `sha256:73f83ae7f69567450dce5522fc1e2a2e64ff467a44551d81fa0e77f93fa96b3d`, built fresh on Ryzen from this exact payload
+- Byte-for-byte verified (by me, before transfer): `appliance-agent/anyaicam_agent/setup_wizard.py`, `appliance-agent/system/privileged_watcher.py`, and all 3 fixed `app/` files inside the built artifact match `git show b8bdf2c` exactly
+
+### Install
+
+Repair path (`03-detect-install.sh`: 5/5 markers → `existing`), same proven procedure as RC2-RC4. Installer's own log confirms: VMS rebuilt from the exact release payload with persistent state untouched; appliance-agent package rebuilt and reinstalled (`pip uninstall` of the old `0.1.0` wheel, install of the new one — same version number, different content, matching this project's pre-1.0 versioning); **appliance identity preserved, not regenerated** (`sha256=1b418261861b4b91b4ab540ecd17f5c49a4a266399ee00315a7593221a0be288`, confirmed unchanged); installed release stamped as `b8bdf2cf98c716067024bdf471d834ce5cd602e1`.
+
+### Verification — full chain, source to runtime
+
+| Check | Result |
+|---|---|
+| `/version` (Ryzen, checked directly) | `build_id: "b8bdf2cf98c716067024bdf471d834ce5cd602e1"` — the running edge process reports the exact commit |
+| Official validator | `validate.sh`: **0 failures**, exact release `b8bdf2cf98c716067024bdf471d834ce5cd602e1` |
+| Installed source content | User-confirmed direct read: `setup_wizard.py` calls `_queue_privileged_action(config,'restart_agent',{'confirmed':True})`; `privileged_watcher.py`'s `DISPATCH` contains `restart_agent`; no remaining unprivileged direct `systemctl restart` in the enrollment path |
+| `anyaicam-agent.service` | `active`/`running`, `NRestarts: 0` (reset by the install's own restart), first log line: `"Appliance is not activated yet; waiting for anyaicam-setup (interactive or --claim) to complete..."` — clean, no heartbeat/"revoked" noise since |
+| `anyaicam-vms.service` | `active`/`exited` (correct for this oneshot unit), enabled |
+| `/health` | `200 ok` |
+| `/ready` | `503` — correct, appliance still unclaimed |
+| Appliance identity | `637ad320-daaa-436e-89c9-70a84f4f54a9` — preserved, confirmed by the installer's own identity-file hash check |
+| Cameras | Zero, untouched |
+| Motion Cloud / AWS | `aws_region: null`, no flags |
+| Manual/runtime patches | None — only the versioned installer ran |
+
+### State to resume from
+
+Ryzen now has the corrected appliance-agent installed and verified. The second stranded staging claim (`appliance_claims 73c06c0805a1...`, `appliances 0ca39d9d45d3...`, `appliance_credentials f1032092ee7c...`) has **not** been cleaned up yet — awaiting separate authorization, same exact-id-scoped pattern as the first cleanup. No new claim has been started. Once that cleanup runs, a third end-to-end claim attempt should finally exercise all three fixes correctly on both sides.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
