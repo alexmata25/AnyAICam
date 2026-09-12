@@ -1261,6 +1261,42 @@ Cloud ID `637ad320-daaa-436e-89c9-70a84f4f54a9` is genuinely unclaimed in stagin
 
 ---
 
+## 2026-09-12: Third claim attempt — SUCCEEDED. Ryzen is genuinely, durably activated. Milestone PASSED.
+
+Claim code `FA89A9EC`, confirmed by the customer for Ryzen Home Site, camera discovery declined (`n`). No polkit prompt, no `AIC-C90CF0C9` conflict, no rollback. `_finish_enrollment()` printed both of its success lines (`"Configuration saved securely."` / `"AnyAiCam service restarted and authenticated during identity commit."`) for the first time this entire incident.
+
+### Cloud side (staging, read-only)
+
+```
+appliance_claims id=2b7a1fb8452cfbbee722093c967428ea   status=completed   revoked_at=None
+  customer_id=4efaf5153f   site_id=4de6186be8   appliance_id=7844ceab86e7fab2845125cffeb8ad10
+appliances: exactly 1 row for cloud_id 637AD320-DAAA-436E-89C9-70A84F4F54A9
+  online_status=online   last_check_in=2026-09-12T04:05:24 (seconds-fresh at check time)
+  software_version=0.1.0   camera_capacity=0
+appliance_credentials: exactly 1 row (ffdf68c39378f4e9), not revoked -- no duplicate credential
+DB integrity: ok
+```
+
+### Ryzen (checked directly, read-only)
+
+- `/health`: `200 ok`, `build_id: b8bdf2cf98c716067024bdf471d834ce5cd602e1` — exact deployed release
+- `/version`: `cloud_id: 637AD320-DAAA-436E-89C9-70A84F4F54A9` — genuinely activated
+- `/ready`: `503`, correctly so — `self_test.ok: true` (0 critical); only 3 non-critical warnings (`ANYAICAM_ADMIN_EMAIL`/`ANYAICAM_ADMIN_PASSWORD`/`ANYAICAM_PORTAL_SECRET` missing, expected/unrelated to claim); `cameras_total: 0`; every `cloud.*` AWS/S3/Motion-Cloud flag `false`/unconfigured
+- Agent: `active`/`running`, `NRestarts: 0`, journal: `"AnyAiCam appliance agent started cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9 mode=production"` then a successful `"Entitlement refreshed camera_slot_quantity=0"` — genuine authenticated traffic
+- **No polkit prompt** — confirms the `restart_agent` privileged-watcher fix fired correctly this time
+- One benign, self-healing race observed and worth recording: the long-running daemon (still mid-poll from the prior manual restart) briefly picked up the freshly-written `credential.json` moments before the real privileged-watcher restart fired (its own ~10s grace period), logging one harmless "revoked or unknown" attempt before being cleanly replaced by a new process that authenticated correctly on its first real attempt. No manual intervention, no lasting effect — exactly the kind of transient this design already tolerates.
+- Claim-state cleanup timing: confirmed by direct correlation — the terminal's two final success lines only print if `_finish_enrollment()` returns without raising, and per the confirmed-installed `2b6bc9e` source, `clear_claim_state()` runs strictly after that return. Cleared only after genuine success, not before.
+
+### Verdict
+
+**Claim/activation milestone: PASSED.** All three source fixes (`bd633a2` cloud-side, `2b6bc9e` appliance-side) proven correct together, for the first time, end to end, on real hardware against real staging. Appliance identity `637ad320-daaa-436e-89c9-70a84f4f54a9` preserved throughout every attempt tonight. Zero cameras, no Motion Cloud/AWS, no manual/runtime patches, Samsung untouched.
+
+### Exact next step
+
+Camera reconnection, reboot-persistence validation, and Live Relay/Motion Cloud/customer-portal camera-mapping checks remain — same as every prior RC checkpoint's own "exact next step" — and were explicitly deferred again this session. Update `docs/checkpoints/RYZEN.md` before starting any of that work.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary

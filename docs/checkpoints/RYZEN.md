@@ -138,22 +138,18 @@ narrative, all commit hashes, and all artifact digests.
 **Appliance identity confirmed preserved** through the repair install:
 `637ad320-daaa-436e-89c9-70a84f4f54a9` (unchanged from before RC4).
 
+## 2026-09-12 (later): CLAIMED — cloud_id `637AD320-DAAA-436E-89C9-70A84F4F54A9`
+
+After two stranded attempts (a cloud-side single-tenant `persist_activation()` defect, then a separate appliance-agent deployment gap — see `docs/PROJECT_CHECKPOINT.md`'s own dated sections for the full incident), a third claim (code `FA89A9EC`) succeeded end to end. Ryzen is now genuinely activated against `anyaicam-staging`: `customer_id=4efaf5153f` (Alejandro Mata), `site_id=4de6186be8` (Ryzen Home Site), one real credential issued and durably used (`appliance_credentials id=ffdf68c39378f4e9`), agent authenticating and heartbeating successfully (`online_status=online`, live `last_check_in`), no polkit failure, no rollback. Installed release: `b8bdf2cf98c716067024bdf471d834ce5cd602e1` (confirmed via `/version`'s `build_id` and `validate.sh`). `/ready` is `503` — correctly, since AWS/Motion Cloud remain deliberately unconfigured and zero cameras are attached yet; `self_test.ok: true`, 0 critical issues. See `docs/PROJECT_CHECKPOINT.md`'s "Third claim attempt — SUCCEEDED" section for the complete verification.
+
+**Do not reuse or reference the two now-revoked stranded claim/appliance/credential rows from earlier tonight (`appliance_claims 48e3f8f0...`/`73c06c0805a1...`) — they are dead, cleaned-up history, not this appliance's live record.**
+
 ## Exact next step
 
-1. **Ryzen is now ready for claim, pending separate explicit
-   authorization** — every source-level blocker found this session
-   (the RC1 `configuration_issues()` defect, the RC2 `validate.sh`
-   ready-endpoint defect, the stale systemd drop-in, and the
-   `service.py` activation-wait defect) is fixed, deployed, and verified
-   on real hardware. **Do not claim without that separate go-ahead** —
-   this checkpoint records readiness, not authorization.
-2. Once authorized, proceed through the actual claim/activation flow
-   (`anyaicam-setup --claim` or interactive) — this establishes a
-   **new** cloud identity; do not attempt to reuse any prior
-   `cloud_id`/`customer_id` from before either wipe (RC1's
-   `99c44cb8-428d-44e4-a1bf-41f95fd2e268` installer identity, or the
-   pre-reconciliation real activation `AIC-C90CF0C9`/`4efaf5153f` --
-   neither applies to this appliance anymore).
+Claim/activation is now complete (see above) — items 1-2 below are
+done. Remaining, pending separate explicit authorization same as
+always:
+
 3. Reconnect the 5 physical cameras through the supported discovery
    workflow (not manual CAMERA{n}_* env vars).
 4. Validate, in order: recording, motion detection/event media, Motion
