@@ -38829,6 +38829,7 @@ import recording_uploader
 import recording_retention_sweep
 import analytics_sync
 import event_media_uploader
+import edge_camera_sync
 import lpr
 import ppe
 import smart_motion
@@ -39179,6 +39180,17 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and event_media_uploader.EVENT_MEDIA_UPLOAD_ENABLED
         else None
     )
+    # Cloud->edge camera-configuration sync: unconditional for every edge/
+    # combined appliance, unlike the AWS/Motion-Cloud-adjacent workers
+    # above -- this is core local-VMS plumbing (making a successfully
+    # cloud-provisioned camera actually streamable/recordable locally),
+    # never an optional cloud-upload feature, so it is never gated behind
+    # an ANYAICAM_*_ENABLED flag the way those are.
+    camera_config_sync_task = (
+        asyncio.create_task(edge_camera_sync.camera_configuration_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
 
 
 
@@ -39342,6 +39354,8 @@ async def lifespan(app: FastAPI):
             recording_retention_sweep_task.cancel()
         if event_media_retry_task:
             event_media_retry_task.cancel()
+        if camera_config_sync_task:
+            camera_config_sync_task.cancel()
 
 
 
@@ -39442,6 +39456,8 @@ async def lifespan(app: FastAPI):
             pending.append(recording_retention_sweep_task)
         if event_media_retry_task:
             pending.append(event_media_retry_task)
+        if camera_config_sync_task:
+            pending.append(camera_config_sync_task)
 
 
 
@@ -47535,6 +47551,78 @@ def version_endpoint() -> dict:
 
 
     }
+
+
+@app.post("/api/local/provisioned-camera-credential")
+def provisioned_camera_credential(request: Request, payload: dict) -> dict:
+    """Cloud->edge camera-configuration sync (2026-09-12), local half.
+
+    The appliance-agent already legitimately receives one camera's
+    plaintext RTSP credential, once, in memory, during provisioning
+    (poll_provisioning()'s job payload -- unchanged, pre-existing
+    behavior; see appliance-agent/anyaicam_agent/service.py). That
+    credential was never persisted anywhere before this endpoint existed
+    -- this is the first and only place it is ever written to disk, and
+    it is written encrypted, never plaintext.
+
+    Deliberately NOT a cloud API: this route only ever makes sense called
+    by this exact process's own appliance-agent, over loopback, on the
+    same box -- there is no cloud_id path segment, no cross-appliance
+    routing, nothing for a remote caller to address. Two independent
+    checks enforce that boundary (both required, neither sufficient
+    alone):
+      1. request.client.host must be a loopback address -- this
+         container's port is published on 0.0.0.0, not restricted to
+         loopback at the Docker layer, so this check is load-bearing,
+         not redundant.
+      2. The request must carry this exact appliance's own activation
+         credential (own_appliance_identity()) as a bearer token -- the
+         SAME secret the agent already holds and already uses to
+         authenticate to the cloud, reused here rather than inventing a
+         second local-only secret. An appliance with no completed
+         activation yet (own_appliance_identity() returns None) has
+         nothing valid to compare against, so the endpoint fails closed.
+
+    Stores only ciphertext (appliance_protocol.encrypt_camera_credentials()
+    using this appliance's own local ANYAICAM_CAMERA_CREDENTIAL_KEY) into
+    pending_camera_credentials, keyed by device_key -- camera_number/
+    camera_id are not yet known to the agent at this exact moment (the
+    cloud assigns them only after receiving the agent's success report,
+    which happens after this call). edge_camera_sync.sync_provisioned_
+    cameras() later moves this into the real camera_credentials table
+    once GET /api/appliance/configuration reports the assigned camera_id
+    for this device_key.
+
+    Never logs, returns, or echoes username/password in any form -- the
+    response and every error path below carry only a message string."""
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="This endpoint is only reachable from the appliance's own loopback interface.")
+
+    identity = own_appliance_identity()
+    if not identity:
+        raise HTTPException(status_code=403, detail="This appliance has no completed activation identity.")
+    presented = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not presented or presented != identity["credential"]:
+        raise HTTPException(status_code=403, detail="Invalid local credential.")
+
+    device_key = str(payload.get("device_key") or "").strip()
+    username = str(payload.get("username") or "")
+    password = str(payload.get("password") or "")
+    if not device_key or not (username or password):
+        raise HTTPException(status_code=400, detail="device_key and at least one of username/password are required.")
+
+    from appliance_protocol import encrypt_camera_credentials
+    from partner_db import connection
+    encrypted_blob = encrypt_camera_credentials(username, password)
+    now = datetime.now().isoformat()
+    with connection() as db:
+        db.execute(
+            "INSERT INTO pending_camera_credentials(device_key,encrypted_blob,created_at) VALUES(?,?,?) "
+            "ON CONFLICT(device_key) DO UPDATE SET encrypted_blob=excluded.encrypted_blob,created_at=excluded.created_at",
+            (device_key, encrypted_blob, now),
+        )
+    return {"message": "Credential received and stored encrypted."}
 
 
 

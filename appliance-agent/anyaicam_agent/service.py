@@ -4,6 +4,8 @@ import logging.handlers
 import signal
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 from .commands import execute
@@ -290,6 +292,58 @@ class ApplianceAgent:
                 # the only place ONVIF resolution is ever attempted
                 # with a credential.
                 self._resolve_media_uri_after_provisioning(job.get('device_key',''),job.get('credentials'))
+                # Cloud->edge camera-configuration sync (2026-09-12):
+                # same reuse principle as the ONVIF resolution call just
+                # above -- the ONE plaintext credential this job payload
+                # ever carries, handed once, locally, to the VMS this
+                # exact box also runs, so it can encrypt-and-persist it
+                # into its own local camera_credentials table (see
+                # main.py's provisioned_camera_credential() for the
+                # receiving half). Best-effort by design: this agent
+                # still never persists the credential itself, in any
+                # form, at any point -- a failed local delivery here is
+                # logged and otherwise ignored, never retried from this
+                # method (a customer who reprovisions, or a future
+                # explicit re-sync, is the natural recovery path -- not
+                # a queued retry of a plaintext secret).
+                self._deliver_credential_to_local_vms(job.get('device_key',''),job.get('credentials'))
+    def _deliver_credential_to_local_vms(self,device_key,credentials):
+        if not device_key or not isinstance(credentials,dict):
+            return
+        username=str(credentials.get('username') or '')
+        password=str(credentials.get('password') or '')
+        if not username and not password:
+            return
+        # Deliberately raw urllib, not self.client.request(): PortalClient.
+        # request() runs every payload through portal.sanitize(), which
+        # strips exactly the username/password keys this one call exists
+        # to deliver -- correct for every OTHER call this agent makes
+        # (nothing else should ever carry a camera credential over the
+        # wire to the cloud), wrong for this one intentional exception.
+        # vms_local_health_url's own host:port (127.0.0.1:8000 by
+        # default) is reused rather than a second config field -- same
+        # box, same process this box's own /health already targets.
+        base_url=self.config.vms_local_health_url.rsplit('/health',1)[0]
+        body=json.dumps({'device_key':device_key,'username':username,'password':password}).encode()
+        request=urllib.request.Request(
+            base_url+'/api/local/provisioned-camera-credential',
+            data=body,
+            headers={
+                'Content-Type':'application/json',
+                'Authorization':'Bearer '+(self.client.credential or ''),
+            },
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(request,timeout=self.config.checkin_seconds or 10):
+                pass
+        except (urllib.error.URLError,TimeoutError,OSError) as error:
+            # Never logs device_key alongside anything credential-shaped
+            # (it isn't -- device_key is a non-secret ONVIF identifier,
+            # same as every other log line in this method already logs),
+            # and never logs the credential itself under any
+            # circumstance, matching this file's existing discipline.
+            self.log.warning('Local VMS credential handoff failed device_key=%s error=%s',device_key,error)
     def _resolve_media_uri_after_provisioning(self,device_key,credentials):
         # Deliberately the ONLY caller of resolve_media_uri() that ever
         # passes a username/password -- and only the exact plaintext

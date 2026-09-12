@@ -427,6 +427,34 @@ CREATE TABLE IF NOT EXISTS appliance_claims(
 CREATE INDEX IF NOT EXISTS idx_appliance_claims_device_id ON appliance_claims(device_id);
 CREATE INDEX IF NOT EXISTS idx_appliance_claims_status ON appliance_claims(status);
 '''),
+    # Cloud->edge camera-configuration sync (2026-09-12): closes the gap
+    # where a camera successfully provisioned through the cloud (RTSP
+    # DESCRIBE already verified by the appliance-agent) never reached the
+    # edge VMS's own camera_credentials table, so process_supervisor()
+    # never had a credential to start the stream with -- see
+    # app/edge_camera_sync.py's own module docstring for the full trace.
+    # This table exists ONLY on an edge appliance's local database
+    # (RUNTIME_ROLE=edge/combined); the cloud database never uses it.
+    # Keyed by device_key (known to the appliance-agent immediately,
+    # before the cloud has necessarily assigned this camera a
+    # camera_number/camera_id it could otherwise be keyed by), holding
+    # only an already-encrypted blob -- the local POST endpoint that
+    # writes this row (main.py's provisioned_camera_credential()) encrypts
+    # before this row is ever created; nothing in this codebase ever
+    # writes a plaintext value here. edge_camera_sync.sync_provisioned_
+    # cameras() moves a row from here into the real camera_credentials
+    # table (keyed by camera_id) the moment it learns this device_key's
+    # assigned camera_id from GET /api/appliance/configuration, then
+    # deletes it from here -- so this table only ever holds a credential
+    # that arrived locally before the cloud-assigned camera_id was known
+    # yet, never a permanent second copy.
+    ('20260912_pending_camera_credentials','''
+CREATE TABLE IF NOT EXISTS pending_camera_credentials(
+    device_key TEXT PRIMARY KEY,
+    encrypted_blob TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+'''),
 ]
 
 
