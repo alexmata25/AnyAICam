@@ -1015,6 +1015,66 @@ Root cause, confirmed by direct read-only inspection: `green.env`'s `ANYAICAM_PA
 
 ---
 
+## 2026-09-12: Ryzen claim completed server-side, stranded locally — three real defects, source-fixed, NOT yet deployed
+
+A real, independent Ryzen claim (device_id `637ad320-daaa-436e-89c9-70a84f4f54a9`, code `3254B9D3`) reached customer confirmation successfully and durably completed server-side, but local enrollment on Ryzen failed and left the appliance unactivated. Full read-only trace (staging DB + Ryzen journal, no sudo needed) found **three independent real defects**, all now fixed in source and unit/end-to-end tested. **Nothing has been deployed. Nothing has been cleaned up in staging's database. Ryzen has not been touched.** This section is the authoritative record of exactly what's fixed, what's still stranded, and what the next three phases (deploy → cleanup → verify → one new claim) need to do.
+
+### Root cause 1 — cloud claim_complete() called a single-tenant mechanism it should never have touched
+
+`appliance_claims.py`'s `claim_complete()` handler committed the claim's `appliance_claims`/`appliances`/`appliance_credentials` rows successfully, then unconditionally called `appliance_activation.persist_activation()` — a mechanism built for exactly one appliance to remember its own identity in a local file (`/app/recordings/appliance_identity.json`, `RUNTIME_ROLE` edge/combined's own concept of "this box's identity"). On the shared, multi-tenant `anyaicam-staging` cloud process, that file already held `cloud_id: AIC-C90CF0C9` from an unrelated activation test the day before (2026-09-11T07:23:02) — completely unrelated to Ryzen, but `persist_activation()` saw a different cloud_id already recorded and raised `ActivationConflict`, which `claim_complete()` turned into a 409 the caller received *after* its own database transaction had already durably committed. **Fixed** in `app/appliance_activation.py`/`app/appliance_claims.py`/`app/appliance_cloud.py`, commit `bd633a2`: a new `local_activation_tracking_applies()` gate (reads `ANYAICAM_RUNTIME_ROLE`, true only for edge/combined) now skips `persist_activation()` entirely for a cloud deployment, at both call sites (`claim_complete()` and `activate_appliance()`). Edge/combined behavior is completely unchanged and still fail-closed — proven by a new regression test.
+
+### Why re-imaging or wiping Ryzen would not have fixed this
+
+This defect lives entirely in **staging's own local filesystem state** (`/app/recordings/appliance_identity.json` inside the `portal-green` container, i.e. `/var/lib/anyaicam-staging/recordings/appliance_identity.json` on the staging host) — not anywhere on Ryzen. Ryzen was already freshly wiped and clean-installed earlier this session (RC1→RC4); that state is completely unrelated to and untouched by this defect. Wiping Ryzen again would generate a *new* `device_id`, and the very next claim attempt for that new device would hit the exact same conflict against the exact same stale staging file — the appliance being claimed is irrelevant to this bug; the shared cloud process's own leftover single-tenant file is the entire cause.
+
+### Root cause 2 — claim_state.json (the only copy of the plaintext claim proof) was deleted before enrollment was confirmed durable
+
+`setup_wizard.py`'s `claim_main()` called `clear_claim_state()` immediately after `claim_complete()` returned successfully — before `_finish_enrollment()` (identity files + restart) was even attempted. `claim_state.json` is the *only* place the plaintext `claim_proof` for this device ever lived (the server only ever stores its one-way hash). When local enrollment then failed, the server's own retry-safety recovery window (`claim_complete()`'s `status=='completed'` branch, `CREDENTIAL_RECOVERY_TTL_MINUTES=15`) was still open but unreachable — recovering it requires presenting that exact plaintext proof again, and it was already gone. **Fixed** in `appliance-agent/anyaicam_agent/setup_wizard.py`, commit `2b6bc9e`: `clear_claim_state()` moved to the end of `claim_main()`, after `_finish_enrollment()` returns. A future failure now leaves `claim_state.json` in place, so a retry correctly *resumes* the same session (no new `claim_begin`, no re-polling) and recovers the identical credential via the server's existing retry path.
+
+### Root cause 3 — enrollment's own restart step needed a privilege it doesn't have
+
+`_finish_enrollment()`'s `restart_service()` ran `systemctl restart anyaicam-agent.service` directly via `subprocess.run(check=True)`. `anyaicam-setup` is documented (`appliance-agent/scripts/install.sh`) to run as `sudo -u anyaicam ...anyaicam-setup` — the unprivileged `anyaicam` system user, which owns `/etc/anyaicam`/`/var/lib/anyaicam` but has no authority to restart a system unit and no interactive desktop session for polkit to authenticate through. Confirmed live: this is exactly what produced "systemd restart authentication failed/timed out," which `first_enroll()` correctly treated as fatal and rolled back — compounding root cause 2's damage by discarding the one local escape hatch (retrying the same enrollment) that would otherwise have worked. **Fixed**, same commit `2b6bc9e`: `restart_service()` now queues the restart through the existing root-owned privileged-watcher marker mechanism (`privileged_watcher.py`'s fixed `DISPATCH` table, already used for `restart_vms`) instead of a raw unprivileged call — no new sudoers/polkit rule invented. A failure to queue or run it is now only a warning, never fatal: RC4's `_await_activation()` already makes the agent pick up a freshly written `credential.json` on its own within ~10 seconds, and `verify_authentication()` (a direct HTTPS call with the new credential) is what actually proves activation worked — neither depends on this restart succeeding.
+
+### Current staging server-side state for Ryzen (as of this investigation — not modified since)
+
+```
+appliance_claims id=48e3f8f0ddab9340fbc131ef30ff222d  status=completed
+  device_id=637ad320-daaa-436e-89c9-70a84f4f54a9  customer_id=4efaf5153f  site_id=4de6186be8
+  appliance_id=cc481658689945c7796a69b80821baad
+  claimed_at=2026-09-12T02:38:32  completed_at=2026-09-12T02:38:34
+  credential_recovery_expires_at=2026-09-12T02:53:34  (this window has since passed — the
+    encrypted recovery material is lazily nulled by _recover_completed_result() on its next
+    touch, if not already; irrelevant either way, since recovering it always required the
+    plaintext claim_proof that was already gone before this window mattered)
+appliances id=cc481658689945c7796a69b80821baad  cloud_id=637AD320-DAAA-436E-89C9-70A84F4F54A9
+  customer_id=4efaf5153f  site_id=4de6186be8  activation_status=pending
+appliance_credentials id=e8fb41263d61beae  appliance_id=cc481658...  not revoked
+  (real, hashed, currently un-deliverable-to-Ryzen credential)
+```
+`customers[4efaf5153f]` = Alejandro Mata / alexmata25@gmail.com, `status: active` — confirmed the correct real account, not a stale/wrong identity. `sites[4de6186be8]` = "Ryzen Home Site" — correct. **`claim_begin()` will refuse any new claim for this device_id** with `409 "This device is already provisioned. Use the existing activation flow."` (it checks `appliances.cloud_id` before ever opening a session) — this is a clean, safe refusal, not corruption, but it does mean a fresh claim cannot succeed until these three rows are cleared.
+
+Staging's own unrelated `/app/recordings/appliance_identity.json` is unchanged and untouched: `cloud_id: AIC-C90CF0C9`, `appliance_id: 5e76625989`, `customer_id: 4efaf5153f`, `site_id: 4de6186be8`, `activated_at: 2026-09-11T07:23:02`. Per this phase's instructions, **not altered** — and with the source fix deployed, cloud role will never read or write it again regardless, so it can be left in place indefinitely without further risk once the fix ships.
+
+### Current Ryzen local state
+
+`anyaicam-agent.service`: still `active (running)`, same PID/start time as RC4's original deploy, zero crashes/restarts from this incident — confirmed via `journalctl`/`systemctl status` (no sudo needed). Per `first_enroll()`'s own documented rollback-on-failure behavior (source-confirmed, not independently re-verified on Ryzen's filesystem — those paths are root-owned and this session does not request or handle sudo passwords): `agent.json`, `credential.json`, and the VMS's own `appliance_identity.json` should all have been deleted again after the failed restart step, leaving Ryzen exactly as unactivated as before the attempt. `claim_state.json` is gone (deleted by the pre-fix `clear_claim_state()` ordering, root cause 2 above) — **this specific already-lost file is not retroactively recoverable by tonight's source fix**; the fix only prevents this exact loss from happening again on a *future* attempt.
+
+### Source fixes, tests, commits
+
+- `bd633a2` — `local_activation_tracking_applies()` gate; `app/appliance_activation.py`, `app/appliance_claims.py`, `app/appliance_cloud.py`. Tests: `app/tests/test_appliance_activation_local_tracking_gate.py` (new, 6 cases), `app/tests/test_claim_flow_end_to_end.py` (+3 real end-to-end cases: claim completes despite an unrelated conflicting local file reproducing the exact staging incident; two independent devices both claimable against one shared identity file; edge role still enforces the original conflict correctly).
+- `2b6bc9e` — `clear_claim_state()` reordering + `restart_service()` privileged-marker fix; `appliance-agent/anyaicam_agent/setup_wizard.py`, `appliance-agent/system/privileged_watcher.py`. Tests: `appliance-agent/tests/test_setup_wizard_claim.py` (+1 case: claim_state survives a failed enrollment and correctly resumes), `appliance-agent/tests/test_finish_enrollment_restart_privilege.py` (new, 4 cases), `appliance-agent/tests/test_rdm4_privileged_actions.py` (updated for the new `restart_agent` DISPATCH entry).
+
+**Full test results**: `app/tests` — every file touching `appliance_cloud`/`appliance_claims`/`appliance_activation` (34 files) run: **385 passed**, 28 failed — confirmed via `git stash` comparison to be **pre-existing, unrelated, platform-specific** (camera-provisioning/talk-relay tests already failing identically on the unmodified codebase in this Windows dev environment; none touch the files changed here). `appliance-agent/tests` — full suite: **488 passed**, 3 failed — likewise confirmed pre-existing/unrelated (Windows-vs-POSIX filesystem-error-semantics mismatches in the updater's own tests, untouched by this work). **Zero new regressions.** Installer/packaging tests not run — no installer files were touched this phase.
+
+### Explicit recovery plan (separately authorized, not started)
+
+1. **Deploy** commits `bd633a2`+`2b6bc9e` to `anyaicam-staging` (rebuild `deploy-portal` image, recreate `portal-green`) so any *future* claim gets all three fixes.
+2. **Controlled staging cleanup** — after the fix is live, delete/reset exactly these three stranded rows for device `637ad320-...`: `appliance_claims` id `48e3f8f0ddab9340fbc131ef30ff222d`, `appliances` id `cc481658689945c7796a69b80821baad`, `appliance_credentials` id `e8fb41263d61beae`. Nothing else. Staging's unrelated `AIC-C90CF0C9` file stays untouched (see above — it's inert once the fix is live).
+3. **Verify** — `/health`/`/version` on the redeployed golden image, confirm the three rows are gone and `claim_begin()` no longer refuses this device_id, confirm no unrelated data changed.
+4. **One new end-to-end Ryzen claim** — same appliance identity `637ad320-daaa-436e-89c9-70a84f4f54a9`, full claim → confirm → complete → enroll cycle, this time exercising all three fixes together.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
