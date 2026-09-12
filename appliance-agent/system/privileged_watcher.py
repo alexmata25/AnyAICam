@@ -50,9 +50,24 @@ GRACE_SECONDS = 10  # re-checked below: a deliberate pause before acting,
 # directory is explicit rather than relying on this process's inherited
 # working directory, which this fixed-argv/no-shell design must never
 # depend on.
+#
+# restart_agent: queued by setup_wizard.py's _finish_enrollment() after
+# a successful first-time enrollment or re-enrollment. anyaicam-setup is
+# documented to run as the unprivileged `anyaicam` system user (see
+# appliance-agent/scripts/install.sh), which owns /etc/anyaicam and
+# /var/lib/anyaicam but has no authority to restart a system unit and no
+# interactive desktop session for polkit to prompt through -- confirmed
+# live on Ryzen (2026-09-12) as a hung/failed CalledProcessError from a
+# bare, unprivileged `systemctl restart`. This is the same root-owned,
+# fixed-argv path restart_vms already uses, not a new privilege grant.
+# Unlike restart_vms, a failure to queue or run this is never fatal to
+# enrollment -- see restart_service()'s own docstring in setup_wizard.py
+# for why anyaicam-agent.service does not actually need this restart to
+# pick up a freshly written credential.json.
 DISPATCH = {
     'reboot': ['systemctl', 'reboot'],
     'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
+    'restart_agent': ['systemctl', 'restart', 'anyaicam-agent.service'],
 }
 
 log = logging.getLogger('anyaicam.privileged_watcher')

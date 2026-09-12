@@ -142,10 +142,17 @@ class DiagnosticsTests(unittest.TestCase):
 
 
 class WatcherDispatchTests(unittest.TestCase):
-    def test_dispatch_table_is_exactly_two_fixed_actions(self):
+    def test_dispatch_table_is_exactly_three_fixed_actions(self):
+        # restart_agent added 2026-09-12: setup_wizard.py's own
+        # _finish_enrollment() now queues an anyaicam-agent.service
+        # restart through this same fixed-argv mechanism instead of an
+        # unprivileged direct systemctl call -- see
+        # test_finish_enrollment_restart_privilege.py for the fix this
+        # entry supports.
         self.assertEqual(watcher.DISPATCH, {
             'reboot': ['systemctl', 'reboot'],
             'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
+            'restart_agent': ['systemctl', 'restart', 'anyaicam-agent.service'],
         })
 
     def _write_marker(self, tmp_path, marker):

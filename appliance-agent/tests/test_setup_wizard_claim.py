@@ -270,6 +270,50 @@ class ClaimMainOrchestrationTests(unittest.TestCase):
         self.assertEqual(finished_with[0]['appliance_id'], 'a1')
         self.assertIsNone(load_claim_state(self.config), 'claim state must be cleared once enrollment is handed off')
 
+    def test_claim_state_survives_a_failed_finish_enrollment_for_retry(self):
+        """The core claim-state lifecycle fix: if server-side completion
+        succeeds but local enrollment fails, claim_state.json (the only
+        local copy of the plaintext claim_proof) must survive so a
+        retry can resume and recover the SAME already-issued credential
+        via claim_complete()'s own server-side retry-safety path --
+        never call claim_begin again. Confirmed live on Ryzen
+        (2026-09-12): clear_claim_state() ran immediately after
+        claim_complete() succeeded, before _finish_enrollment() was even
+        attempted -- when that step then failed, the already-issued
+        credential became permanently unrecoverable even though the
+        server's own recovery window was still open."""
+        client = FakePortalClient(
+            begin=[{'claim_session_id': 'sess-1', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'poll_interval_seconds': 5, 'resumed': False}],
+            status=[{'status': 'claimed', 'claim_proof': 'the-proof'}],
+            complete=[{'appliance_id': 'a1', 'cloud_id': '11111111-1111-4111-8111-111111111111'.upper(), 'credential': 'cred', 'credential_id': 'cid', 'customer_id': 'cust-1', 'site_id': 'site-1', 'partner_id': None}],
+        )
+        with patch.object(setup_wizard, 'AgentConfig') as agent_config_cls, \
+             patch.object(setup_wizard, 'PortalClient', return_value=client), \
+             patch.object(setup_wizard, '_finish_enrollment', side_effect=SystemExit('First-time appliance enrollment failed; the appliance remains unactivated.')), \
+             patch('builtins.input', return_value=''):
+            agent_config_cls.load.return_value = self.config
+            with self.assertRaises(SystemExit):
+                setup_wizard.claim_main()
+
+        persisted = load_claim_state(self.config)
+        self.assertIsNotNone(persisted, 'claim_state.json must survive a local enrollment failure so the credential can still be recovered')
+        self.assertEqual(persisted['claim_session_id'], 'sess-1')
+        self.assertEqual(persisted['claim_proof'], 'the-proof')
+
+        # A fresh anyaicam-setup --claim now correctly RESUMES this exact
+        # session (never opens a new one -- client.begin_calls stays at
+        # its one original entry, proving claim_begin was never called
+        # again) and reuses the already-known proof without re-polling
+        # (client.status_calls stays empty) -- the two properties that
+        # together let the already-issued credential still be recovered
+        # through claim_complete()'s own status=='completed' retry path.
+        resumed = setup_wizard._open_or_resume_claim(client, self.config, '11111111-1111-4111-8111-111111111111')
+        self.assertEqual(resumed['claim_session_id'], 'sess-1')
+        self.assertEqual(client.begin_calls, ['11111111-1111-4111-8111-111111111111'])
+        proof = setup_wizard._wait_for_claim_proof(client, self.config, resumed, sleep_fn=_no_sleep)
+        self.assertEqual(proof, 'the-proof')
+        self.assertEqual(len(client.status_calls), 1, 'must not re-poll during resume -- the one entry here is from the original attempt before it failed; the proof was already known from the surviving claim_state.json')
+
     def test_customer_double_confirm_is_transparent_to_the_appliance(self):
         # The customer double-clicking "Confirm" in the portal produces
         # no appliance-visible difference at all -- claim/status simply

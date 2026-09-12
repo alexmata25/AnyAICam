@@ -49,8 +49,36 @@ def _finish_enrollment(config:AgentConfig,activated:dict) -> None:
     docstring on this), so this one function serves both entry points
     rather than duplicating it. Extracted unchanged from the original
     single-flow main() -- first_enroll()/coordinated_reenroll() and
-    everything else here is exactly as it was, not redesigned."""
-    def restart_service(): subprocess.run(['systemctl','restart','anyaicam-agent.service'],check=True)
+    everything else here is exactly as it was, not redesigned.
+
+    restart_service() no longer runs `systemctl restart` directly. That
+    called it as the unprivileged `anyaicam` system user this tool is
+    documented to run as (see appliance-agent/scripts/install.sh's own
+    "Run: sudo -u anyaicam ...anyaicam-setup"), which has no authority
+    to restart a system unit and no interactive desktop session for
+    polkit to prompt through -- confirmed live on Ryzen (2026-09-12):
+    the restart hung/failed with a CalledProcessError, which
+    first_enroll() correctly treated as fatal and rolled back, even
+    though the credential itself had already been issued and could
+    never be recovered afterward (see claim_main()'s own comment on
+    clear_claim_state() for that half of the incident). It now queues
+    the restart through the same root-owned privileged-watcher marker
+    mechanism already used a few lines below for restart_vms --
+    appliance-agent/system/privileged_watcher.py's fixed DISPATCH table,
+    the one thing on this device actually allowed to touch systemd/
+    Docker -- rather than inventing a new sudoers or polkit rule. And
+    unlike a raised exception, a failure here is only a warning, never
+    fatal: RC4's own _await_activation() already makes anyaicam-agent.
+    service pick up a freshly written credential.json on its own within
+    ANYAICAM_ACTIVATION_POLL_INTERVAL_SECONDS (10s) without needing a
+    restart at all, and verify_authentication() below proves the new
+    credential actually works against the portal directly -- neither
+    depends on this restart succeeding, so failing enrollment over it
+    would reject a genuinely successful activation for no reason."""
+    def restart_service():
+        status,_,error=_queue_privileged_action(config,'restart_agent',{'confirmed':True})
+        if status!='completed':
+            print(f'WARNING: could not queue an anyaicam-agent restart automatically ({error}); the service will pick up the new credential on its own within about 10 seconds -- no manual action needed.')
     def verify_authentication(identity):
         check=PortalClient(config.portal_url,identity['appliance_id'],identity['credential'])
         check.request('GET','/api/appliance/commands')
@@ -218,9 +246,31 @@ def claim_main():
     state=_open_or_resume_claim(client,config,device_id)
     _wait_for_claim_proof(client,config,state)
     activated=_complete_claim_with_retry(client,config,state)
-    clear_claim_state(config)
     print('Assigned customer:',activated.get('customer_id')); print('Assigned site:',activated.get('site_id'))
     _finish_enrollment(config,activated)
+    # Only cleared here, after local enrollment has actually succeeded --
+    # never right after claim_complete() returns. claim_state.json is the
+    # ONLY place the plaintext claim_proof this device would need to
+    # retry claim/complete ever lives (the server only ever stores its
+    # one-way hash). Clearing it before enrollment is confirmed durable
+    # strands an already-issued, already-paid-for credential the instant
+    # _finish_enrollment() fails for any local reason -- confirmed live
+    # on Ryzen (2026-09-12): claim/complete succeeded and minted a real
+    # credential, but the CLI's own restart_service() step then failed,
+    # and this file was already gone by then. The server's own retry-
+    # safety recovery path (claim_complete()'s status=='completed'
+    # branch, bounded by CREDENTIAL_RECOVERY_TTL_MINUTES) requires
+    # presenting that exact plaintext claim_proof, so it was unreachable
+    # even though its recovery window was still open. If _finish_
+    # enrollment() now raises SystemExit, this line is simply never
+    # reached and claim_state.json (mode 0600, holding only this one
+    # claim's session id + proof) stays on disk -- rerunning
+    # anyaicam-setup --claim then correctly RESUMES via
+    # _open_or_resume_claim()/_wait_for_claim_proof()'s own
+    # already-have-a-claim_proof short-circuit and recovers the exact
+    # same credential through claim_complete()'s existing retry path --
+    # no new claim, no second credential, no second appliance record.
+    clear_claim_state(config)
 
 
 def main():
