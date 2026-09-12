@@ -1336,6 +1336,25 @@ The customer-facing action is now live: on the setup wizard's Step 6 "Review you
 
 ---
 
+## 2026-09-12: Clicking "Buy camera capacity" failed — "Stripe is not configured" — traced to the same green.env drift class, restored from the existing (not new) Stripe setup
+
+Same root cause family as every earlier missing-secret incident tonight, but this time nothing needed generating: `ANYAICAM_STRIPE_SECRET_KEY` and `ANYAICAM_STRIPE_WEBHOOK_SECRET` were both already present in the canonical `/etc/anyaicam-staging/vms-staging.env` — confirmed independently in a prior session's own investigation (`docs/phase1-staging-repair-report.md`), consistent with this being the pre-existing Stripe setup from earlier (Samsung-era) testing, not something recreated tonight. Both were simply never mirrored into `green.env`, the file `portal-green` actually runs from — identical drift to the DB-path and both prior secret-key incidents. No new Stripe account, secret key, product, or price was created; both values were copied, never regenerated.
+
+**Fixed**: both secrets copied (values never displayed) from `vms-staging.env` into `green.env`; `portal-green` recreated from the same already-deployed image (`deploy-portal:d269413`, no rebuild). Verified: both variables present by name only; `/health`/`/version` correct (internal + public); Ryzen still `online` with a fresh check-in, undisturbed; DB integrity `ok`; zero entitlements/cameras/provisioning requests created as a side effect.
+
+**Local 1-8 price, verified directly against the real Stripe API** (one read-only `GET /v1/prices/{id}`, expanded to include the product — no checkout, nothing purchased or mutated):
+```
+id: price_1UD2xKGllhK80H2nFJwtFJvw   livemode: false   active: true
+product: prod_VDTvNADoxZ3vPL "AnyAiCam Local VMS — 1–8 Camera Slots"   active: true
+```
+Definitively confirmed test-mode straight from Stripe itself (stronger than the earlier `sk_test_`-prefix inference). Note for the record: `docs/AI_HANDOFF.md` (an earlier session's doc) describes this same key loosely as "live Stripe keys configured" — that phrasing means "actually present/configured," not literally Stripe live-mode; this live API check is the authoritative answer.
+
+### State to resume from
+
+Cleared to click **"Buy camera capacity"** (Step 6, **Local 1-8** tier) — the checkout should now work end to end using the pre-existing, already-tested Stripe test-mode setup.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
