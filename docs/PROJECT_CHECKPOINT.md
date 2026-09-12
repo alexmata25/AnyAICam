@@ -1073,6 +1073,50 @@ Staging's own unrelated `/app/recordings/appliance_identity.json` is unchanged a
 3. **Verify** — `/health`/`/version` on the redeployed golden image, confirm the three rows are gone and `claim_begin()` no longer refuses this device_id, confirm no unrelated data changed.
 4. **One new end-to-end Ryzen claim** — same appliance identity `637ad320-daaa-436e-89c9-70a84f4f54a9`, full claim → confirm → complete → enroll cycle, this time exercising all three fixes together.
 
+**Step 1 of this plan is now done — see the next section.** Steps 2-4 remain pending separate authorization.
+
+---
+
+## 2026-09-12: Deployed the three-defect fix (`bd633a2`, `2b6bc9e`, checkpoint `b8bdf2c`) to staging — VERIFIED
+
+Deployment only. No database cleanup, no Ryzen, no Samsung, no hot-patching — exactly as authorized. Followed the golden process: source committed → build versioned artifact → record hash/digest → deploy → verify exact version → health/regression smoke tests → checkpoint → stop.
+
+### Versioned artifact
+
+- **Git commit deployed**: `b8bdf2c` (ancestry includes `bd633a2`, `2b6bc9e`) — clean working tree, no uncommitted changes, confirmed via `git log`/`git status` immediately before packaging.
+- **Source packaging**: `git -c core.autocrlf=false archive b8bdf2c` (the CRLF-safe flag this doc's own earlier cutover found the hard way is required) → `app/`, `requirements.txt`, `requirements-cpu.txt`, `Dockerfile` tarred into `staging-deploy-b8bdf2c.tar.gz`, SHA-256 `e18c9cc41f13ccec0557092ded74f06709f8ef5d196843cc2fa988469dcd6503` — verified identical after `scp` transfer to the staging host.
+- **Byte-for-byte pre-transfer verification** (every changed file, `git show b8bdf2c:<path>` vs. the archived copy): `app/appliance_activation.py`, `app/appliance_claims.py`, `app/appliance_cloud.py`, `appliance-agent/anyaicam_agent/setup_wizard.py`, `appliance-agent/system/privileged_watcher.py` — all five **MATCH** exactly.
+- **Image tag**: `deploy-portal:b8bdf2c` — a real, distinct, immutable tag, **not** `:latest`. This is a deliberate improvement over the earlier live cutover's own approach (which rebuilt directly under `:latest` and thereby made the *old* running image unrecoverable once containerd's snapshotter reassigned its tag — see the "Staging live cutover" section's own durable finding above). Building under a brand-new tag instead means the previous image, `sha256:0c4a3b7cebf8db5168fa851b98bc3bbe367f021bf19f17750f74838518048a57` under `deploy-portal:latest`, was **never touched** and remains a fully intact, instantly-usable rollback target.
+- **New image digest**: `sha256:bc35dba1afc648c83a30fa7112228cb74e0fba1ce7062ba1d734b0505ca1c200`.
+- **Pre-deploy backups** (taken before any write, matching this doc's own established pattern): source tree `/opt/anyaicam-staging-source-backup-pre-defect-fix-deploy-20260912T031947Z.tar.gz` (SHA-256 `b9ddb5cb104b92c8a667e34f411ee68a0a7481da7856f0b0767045f5293d7e7b`); DB `/var/lib/anyaicam-staging/db/staging-pre-defect-fix-deploy-20260912T031947Z.db` (SHA-256 `7952c5e9697d490ef14fcc5315587365787b16f4feb0ebefe14828f94bd85c04`).
+
+### Deployment path
+
+Source rsync'd into `/opt/anyaicam-staging/{app,requirements.txt,requirements-cpu.txt,Dockerfile}` (verified `diff -rq` exit 0 after; `deploy/` and `storefront/` mtimes confirmed unchanged). Built via `docker build -t deploy-portal:b8bdf2c` from that tree. `portal-green` recreated in place (`docker stop && docker rm && docker run` with the **identical** `--env-file /home/ubuntu/blue-green-rehearsal/green.env`, identical volume mounts for `db`/`recordings`/`hls`/`data-config`, identical `deploy_default` network) — the exact same low-risk recreation procedure already used twice earlier tonight for the secret-key and DB-path fixes, chosen over a fresh blue/green pair specifically to avoid a second SQLite writer against the live DB (this codebase's `live_relay_idle_sweep_worker` and other background workers start at process boot regardless of whether Caddy is routing traffic to a container, so two simultaneously-running containers sharing the DB volume is unsafe even before any traffic cutover). Caddy's upstream (`portal-green:8000`) needed no change — same container name, Docker's own embedded DNS resolves it to the new container automatically. Total downtime: a few seconds, consistent with the two prior same-session recreations.
+
+### Post-deployment verification — all passed
+
+| Check | Result |
+|---|---|
+| `/health` (internal + public) | `200 ok`, `runtime_role: cloud` |
+| `/version` (public) | Correct; `cloud_id: AIC-C90CF0C9` (still reported — see below), `aws_region: null` |
+| Deployed image | `sha256:bc35dba1afc648c83a30fa7112228cb74e0fba1ce7062ba1d734b0505ca1c200`, tag `deploy-portal:b8bdf2c` — confirmed via `docker inspect` |
+| Exact deployed commit | `sha256sum` of `appliance_activation.py`/`appliance_claims.py`/`appliance_cloud.py` **inside the running container** matches `git show b8bdf2c:...` byte-for-byte, all three files |
+| Fix is live and functionally correct | `local_activation_tracking_applies()` called directly inside the running container with its real ambient `ANYAICAM_RUNTIME_ROLE=cloud` returns `False` (skips `persist_activation()`, as intended); manually forced to `edge` returns `True` (original protection intact) |
+| Real staging DB in use (before AND after, per this phase's explicit ask) | Pre-deploy: `ANYAICAM_PARTNER_DB=/app/data/staging.db` confirmed in the outgoing container. Post-deploy: identical value confirmed in the new container, plus a live query returning real, correct data (below) — never the `/rehearsal/green-disposable.db` path from the earlier config-drift incident |
+| `ANYAICAM_CLAIM_FLOW_SECRET_KEY` | Present by name only (`count=1`), value never displayed, both before and after |
+| Customer login page | `/customer-login.html` → `200` (page itself verified reachable; no login was attempted on the user's behalf) |
+| Customer/site data intact | `alexmata25@gmail.com` row unchanged (`account_status: active`, `approved: 1`, `created_at` unchanged since 2026-09-11); `partner_users=4`, `customers=3`, `sites=3` — all unchanged from pre-deploy baseline |
+| Stranded Ryzen rows unchanged | `appliance_claims id=48e3f8f0...` (`status=completed`, same `customer_id`/`site_id`/`appliance_id`/timestamps), `appliances id=cc481658...` (same `cloud_id`/`activation_status=pending`), `appliance_credentials id=e8fb4126...` (`revoked_at: None`) — every field identical to the pre-deploy read, confirmed **not** touched by this deployment |
+| Historical `AIC-C90CF0C9` file | Re-read post-deploy (excluding the credential field): identical to the pre-deploy read — `appliance_id: 5e76625989`, `customer_id: 4efaf5153f`, `site_id: 4de6186be8`, `activation_version: 1`, `activated_at: 2026-09-11T07:23:02` — untouched, as instructed |
+| AWS / Motion Cloud | No change — `aws_region: null`, same as every prior check this session |
+| DB integrity | `PRAGMA integrity_check: ok`, post-deploy |
+| No duplicate writers | `docker ps`: exactly one portal container (`portal-green`, new image) running; the old container was fully stopped and removed, never left running alongside the new one |
+
+### State to resume from
+
+`anyaicam-staging` is now running the fixed source (`b8bdf2c`) under image `deploy-portal:b8bdf2c` (`sha256:bc35dba1...`). The stranded Ryzen claim/appliance/credential rows are exactly as they were — **cleanup has not been performed** and needs separate authorization, per the recovery plan above (steps 2-4). Ryzen and Samsung were not touched at any point in this deployment. No new claim was started.
+
 ---
 
 ## Appliance checkpoints
