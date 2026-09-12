@@ -18,14 +18,25 @@ activated appliance where that permanent credential lives at rest --
 see _atomic_write() for the permission hardening applied to it.
 
 Where activation is actually triggered from today: appliance_cloud.py's
-POST /api/appliance/activate calls persist_activation() as its last
+POST /api/appliance/activate and appliance_claims.py's POST /api/
+appliance/claim/complete both call persist_activation() as their last
 step, on the theory that in this monolith (cloud and appliance code
 colocated, same as provisioning_service.MockProvisioningBackend's own
 documented simplification) a box's own local process handling its own
 activation call *is* that box activating itself. A real, separate
-appliance agent calling an external cloud's /api/appliance/activate
-over HTTPS would call persist_activation() itself, locally, from its
-own response handler -- same function, different call site.
+appliance agent calling an external cloud's /api/appliance/activate (or
+completing a claim against it) over HTTPS would call persist_activation()
+itself, locally, from its own response handler -- same function,
+different call site.
+
+That "this box IS the appliance" theory is only true for a genuinely
+single-tenant deployment (RUNTIME_ROLE edge or combined) -- see
+local_activation_tracking_applies() below, and both call sites' own use
+of it. A RUNTIME_ROLE=="cloud" deployment activates/claims many
+independent appliances from one shared process; for it, this module's
+single-file "am I already activated as someone else" concept doesn't
+apply at all, and both call sites must skip it entirely rather than let
+it block every device after the first one they ever process.
 """
 from __future__ import annotations
 
@@ -37,6 +48,41 @@ from pathlib import Path
 ACTIVATION_IDENTITY_FILE = Path(os.getenv("ANYAICAM_APPLIANCE_IDENTITY_FILE", "/app/recordings/appliance_identity.json"))
 
 _REQUIRED_FIELDS = {"appliance_id", "cloud_id", "credential", "customer_id", "site_id", "partner_id", "activated_at", "activation_version"}
+
+
+def local_activation_tracking_applies() -> bool:
+    """True only when this process genuinely represents a single
+    appliance's own identity (RUNTIME_ROLE edge or combined) -- the one
+    case persist_activation()'s "am I already durably activated as a
+    DIFFERENT cloud_id" conflict check is meaningful. A RUNTIME_ROLE==
+    "cloud" deployment activates/claims many independent appliances from
+    one shared process; for it, the appliances/appliance_credentials DB
+    rows created by the caller (not this module's single local file)
+    are already the durable, authoritative, per-appliance record, and
+    this check would incorrectly reject every device after the first
+    one this shared process ever activates or completes a claim for.
+
+    Confirmed live on anyaicam-staging (2026-09-12): claim_complete()
+    for a real, independent Ryzen appliance was rejected with "This
+    appliance is already activated as 'AIC-C90CF0C9'" -- a leftover
+    local identity file from an unrelated, EARLIER activation test
+    against that same shared cloud process the day before, which had
+    nothing to do with the device actually being claimed. The claim had
+    already durably completed in the database by the time this 409 was
+    raised (see claim_complete()'s own comment on transaction ordering),
+    so the appliance was left holding an unrecoverable, already-issued
+    credential it could never retrieve -- purely because of this
+    single-tenant check running somewhere it was never meant to.
+
+    Reads ANYAICAM_RUNTIME_ROLE directly (same env var and same "edge"
+    default cloud_config.Settings.runtime_role and main.py's own
+    RUNTIME_ROLE constant both already use) rather than importing
+    cloud_config.settings -- that instance is a frozen dataclass fixed
+    at import time, which would make this impossible for a test to
+    override per-case without replacing the whole module-level
+    singleton. A plain, fresh os.environ read has no such problem and
+    needs no cross-module dependency at all."""
+    return os.getenv("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower() in {"edge", "combined"}
 
 
 class ActivationConflict(ValueError):

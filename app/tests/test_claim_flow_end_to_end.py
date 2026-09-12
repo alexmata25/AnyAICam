@@ -451,6 +451,101 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         status, body = self._confirm(session['claim_code'])
         self.assertEqual(status, 200, body)
 
+    # --- Cloud multi-tenant claim_complete()/persist_activation() gating ---
+    # Confirmed live on anyaicam-staging (2026-09-12): a real, independent
+    # Ryzen claim completed its DB transaction successfully (appliances +
+    # appliance_credentials rows both committed) but the HTTP response was
+    # then discarded with a 409 "This appliance is already activated as
+    # 'AIC-C90CF0C9'" -- a leftover single-tenant local identity file from
+    # an unrelated activation test against that same shared cloud process
+    # the day before. persist_activation()/ActivationConflict is only
+    # meaningful for a genuinely single-tenant process (RUNTIME_ROLE edge
+    # or combined) -- see appliance_activation.local_activation_tracking_
+    # applies()'s own docstring. Unlike every other test in this file,
+    # these three deliberately do NOT let setUp() give them a fresh,
+    # unique ACTIVATION_IDENTITY_FILE -- reproducing a shared-file
+    # collision across two different device_ids is the entire point.
+
+    def test_claim_completes_despite_unrelated_local_identity_file_from_earlier_activation(self):
+        identity_path = Path(self.tmp.name) / 'shared_cloud_identity.json'
+        identity_path.write_text(json.dumps({
+            'appliance_id': 'earlier-appliance', 'cloud_id': 'AIC-UNRELATED0', 'credential': 'unrelated-secret',
+            'customer_id': 'earlier-cust', 'site_id': 'earlier-site', 'partner_id': None,
+            'activated_at': '2026-09-11T07:23:02', 'activation_version': 1,
+        }), encoding='utf-8')
+        appliance_activation.ACTIVATION_IDENTITY_FILE = identity_path
+        session = self._begin()
+        status, _ = self._confirm(session['claim_code'])
+        self.assertEqual(status, 200)
+        status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+        claim_proof = status_body['claim_proof']
+
+        with patch.dict(os.environ, {'ANYAICAM_RUNTIME_ROLE': 'cloud'}):
+            status, body = _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': claim_proof})
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['cloud_id'], self.device_id.upper())
+        # The unrelated file is untouched -- a cloud deployment never
+        # writes to it at all, let alone overwrites someone else's entry.
+        self.assertEqual(json.loads(identity_path.read_text())['cloud_id'], 'AIC-UNRELATED0')
+
+    def test_second_independent_device_can_be_claimed_after_first_leaves_local_identity_file(self):
+        identity_path = Path(self.tmp.name) / 'shared_cloud_identity.json'
+        appliance_activation.ACTIVATION_IDENTITY_FILE = identity_path
+        device_a = self.device_id
+        device_b = f'22222222-2222-4222-8222-{ClaimFlowEndToEndTests._counter:012d}'
+        with connection() as db:
+            db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (self.site_id + '-b', self.customer_id, 'E2E Site B', '2026-09-10T00:00:00'))
+
+        def _claim(device_id, site_id):
+            session = self._begin(device_id)
+            status, _ = self._confirm(session['claim_code'], site_id=site_id)
+            self.assertEqual(status, 200)
+            status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+            with patch.dict(os.environ, {'ANYAICAM_RUNTIME_ROLE': 'cloud'}):
+                status, body = _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': status_body['claim_proof']})
+            self.assertEqual(status, 200, body)
+            return body
+
+        result_a = _claim(device_a, self.site_id)
+        # If device A's completion had (incorrectly) written a local
+        # identity file, it would exist here, with device A's cloud_id --
+        # and a naive fix that merely widened the conflict check instead
+        # of skipping it for cloud role would reject device B below.
+        result_b = _claim(device_b, self.site_id + '-b')
+
+        self.assertNotEqual(result_a['cloud_id'], result_b['cloud_id'])
+        with connection() as db:
+            count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id IN (?,?)", (device_a.upper(), device_b.upper())).fetchone()['n']
+        self.assertEqual(count, 2, 'both independent devices must have their own durable appliances row')
+
+    def test_edge_role_still_enforces_activation_conflict_against_a_different_cloud_id(self):
+        """Regression guard for the fix itself: RUNTIME_ROLE edge/combined
+        (a genuinely single-tenant process) must keep the ORIGINAL
+        fail-closed behavior unchanged -- this gate must only ever widen
+        what's ALLOWED for cloud role, never silently remove the
+        protection a real single-tenant appliance still depends on."""
+        identity_path = Path(self.tmp.name) / 'shared_cloud_identity.json'
+        appliance_activation.ACTIVATION_IDENTITY_FILE = identity_path
+        device_a = self.device_id
+        device_b = f'33333333-3333-4333-8333-{ClaimFlowEndToEndTests._counter:012d}'
+        with connection() as db:
+            db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (self.site_id + '-b', self.customer_id, 'E2E Site B', '2026-09-10T00:00:00'))
+
+        def _claim(device_id, site_id):
+            session = self._begin(device_id)
+            self._confirm(session['claim_code'], site_id=site_id)
+            status, status_body = _http_post('/api/appliance/claim/status', {'claim_session_id': session['claim_session_id']})
+            with patch.dict(os.environ, {'ANYAICAM_RUNTIME_ROLE': 'edge'}):
+                return _http_post('/api/appliance/claim/complete', {'claim_session_id': session['claim_session_id'], 'claim_proof': status_body['claim_proof']})
+
+        status_a, body_a = _claim(device_a, self.site_id)
+        self.assertEqual(status_a, 200, body_a)
+        status_b, body_b = _claim(device_b, self.site_id + '-b')
+
+        self.assertEqual(status_b, 409, body_b)
+        self.assertIn('already activated', body_b.get('detail', ''))
+
 
 if __name__ == '__main__':
     unittest.main()

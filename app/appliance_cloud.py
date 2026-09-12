@@ -92,10 +92,17 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         cloud_id=str(payload.get('cloud_id','')).strip().upper(); token=str(payload.get('activation_token','')).strip(); appliance=row('SELECT * FROM appliances WHERE cloud_id=?',(cloud_id,))
         if not appliance or not token: raise HTTPException(status_code=403,detail='Invalid activation request.')
         # Conflict check before the token is touched or a credential is minted -- see appliance_activation.py.
-        from appliance_activation import ActivationConflict, load_persisted_identity
-        existing_identity=load_persisted_identity()
-        if existing_identity and existing_identity['cloud_id']!=cloud_id:
-            raise HTTPException(status_code=409,detail=f"This appliance is already activated as {existing_identity['cloud_id']!r}. Reset the local activation identity before activating as a different appliance.")
+        # Only meaningful for a genuinely single-tenant process (RUNTIME_
+        # ROLE edge/combined) -- see local_activation_tracking_applies()'s
+        # own docstring for why a cloud deployment (many independent
+        # appliances, one shared process) must skip this entirely rather
+        # than let one appliance's local identity block every other
+        # device's activation.
+        from appliance_activation import ActivationConflict, load_persisted_identity, local_activation_tracking_applies
+        if local_activation_tracking_applies():
+            existing_identity=load_persisted_identity()
+            if existing_identity and existing_identity['cloud_id']!=cloud_id:
+                raise HTTPException(status_code=409,detail=f"This appliance is already activated as {existing_identity['cloud_id']!r}. Reset the local activation identity before activating as a different appliance.")
         token_rows=rows('SELECT * FROM appliance_activation_tokens WHERE appliance_id=? AND used_at IS NULL AND revoked_at IS NULL ORDER BY created_at DESC',(appliance['id'],)); now=datetime.now(); match=None
         for candidate in token_rows:
             try: valid_time=datetime.fromisoformat(candidate['expires_at'])>now
@@ -109,12 +116,13 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             db.execute('INSERT INTO appliance_credentials(id,appliance_id,credential_hash,created_at,created_by) VALUES(?,?,?,?,?)',(credential_id,appliance['id'],password_hash(credential),now_text,'activation'))
             db.execute("UPDATE appliances SET activation_status='activated',state='offline',partner_id=COALESCE(partner_id,(SELECT partner_id FROM customers WHERE id=appliances.customer_id)) WHERE id=?",(appliance['id'],))
         appliance=row('SELECT * FROM appliances WHERE id=?',(appliance['id'],))
-        # Durable persistence (gap #1) -- see appliance_activation.py. Can still raise on a genuine race (two activations at once).
-        try:
-            from appliance_activation import persist_activation
-            persist_activation(appliance_id=appliance['id'],cloud_id=cloud_id,credential=credential,customer_id=appliance['customer_id'],site_id=appliance['site_id'],partner_id=appliance.get('partner_id'))
-        except ActivationConflict as error:
-            raise HTTPException(status_code=409,detail=str(error)) from error
+        # Durable persistence (gap #1) -- see appliance_activation.py. Can still raise on a genuine race (two activations at once). Skipped entirely for a cloud deployment -- see the conflict-check comment above.
+        if local_activation_tracking_applies():
+            try:
+                from appliance_activation import persist_activation
+                persist_activation(appliance_id=appliance['id'],cloud_id=cloud_id,credential=credential,customer_id=appliance['customer_id'],site_id=appliance['site_id'],partner_id=appliance.get('partner_id'))
+            except ActivationConflict as error:
+                raise HTTPException(status_code=409,detail=str(error)) from error
         audit({'email':cloud_id,'role':'appliance'},'appliance.activated','appliance',appliance['id']); logger.info('Appliance activated cloud_id=%s',cloud_id)
         return {'appliance_id':appliance['id'],'cloud_id':cloud_id,'credential':credential,'credential_id':credential_id,'partner_id':appliance.get('partner_id'),'customer_id':appliance['customer_id'],'site_id':appliance['site_id'],'message':'Store this permanent credential securely; it will not be shown again.'}
 

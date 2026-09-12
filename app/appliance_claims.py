@@ -567,23 +567,36 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
                 (recovery_ciphertext, recovery_expires_at, claim['id']),
             )
         appliance = row('SELECT * FROM appliances WHERE id=?', (appliance_id,))
-        # Same durable-persistence call activate_appliance() makes as
-        # its own last step -- see appliance_activation.py. Untouched,
-        # unmodified; this is the entire "one-time exchange into the
-        # existing enrollment/credential mechanism" the Phase 1 plan
-        # asked for.
-        from appliance_activation import ActivationConflict, persist_activation
-        try:
-            persist_activation(
-                appliance_id=appliance_id,
-                cloud_id=cloud_id,
-                credential=credential,
-                customer_id=appliance['customer_id'],
-                site_id=appliance['site_id'],
-                partner_id=appliance.get('partner_id'),
-            )
-        except ActivationConflict as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
+        # Same durable-persistence call activate_appliance() makes as its
+        # own last step -- see appliance_activation.py. Only meaningful
+        # for a genuinely single-tenant process (RUNTIME_ROLE edge/
+        # combined); a cloud deployment claims many independent
+        # appliances from one shared process, so it must skip this
+        # entirely -- see local_activation_tracking_applies()'s own
+        # docstring. Confirmed live on anyaicam-staging (2026-09-12):
+        # without this gate, a real, independent Ryzen claim completed
+        # successfully in the transaction above (appliances/
+        # appliance_credentials rows both committed) but the response
+        # below was then discarded with a 409 "already activated as
+        # AIC-C90CF0C9" -- an unrelated EARLIER activation test's local
+        # identity file on this same shared staging process, which has
+        # nothing to do with the device actually being claimed. The
+        # claim itself was already durably completed by that point;
+        # only this now-skipped call ever stood in the way of returning
+        # its result.
+        from appliance_activation import ActivationConflict, local_activation_tracking_applies, persist_activation
+        if local_activation_tracking_applies():
+            try:
+                persist_activation(
+                    appliance_id=appliance_id,
+                    cloud_id=cloud_id,
+                    credential=credential,
+                    customer_id=appliance['customer_id'],
+                    site_id=appliance['site_id'],
+                    partner_id=appliance.get('partner_id'),
+                )
+            except ActivationConflict as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
         audit({'email': cloud_id, 'role': 'appliance'}, 'appliance_claim.completed', 'appliance', appliance_id)
         logger.info('Claim completed appliance_id=%s cloud_id=%s', appliance_id, cloud_id)
         return {
