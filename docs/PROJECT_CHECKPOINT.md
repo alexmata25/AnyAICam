@@ -1389,6 +1389,47 @@ Return to the customer setup wizard with **Ryzen (`637AD320-DAAA-436E-89C9-70A84
 
 ---
 
+## 2026-09-12: Same isolation defect found in two more call sites (`/customer-account`, `/customer-live`) -- audited, fixed, tested, deployed, proven against real data
+
+**Reported live**: `/customer-account` showed "8 of 8 cameras configured" with duplicate Camera 1/2/3 entries; `/customer-live` showed 8 tiles, all black, with the same duplicate labels. Both are the identical defect class the previous entry fixed, in two call sites that audit missed: `partner_workspace.customer_account()`'s own `all_customer_cameras` query and `live_view_page._customer_live_cameras()` both queried `cameras WHERE customer_id=?` with no `appliance_id` filter.
+
+**Real state had moved on since the previous entry, and this matters**: between that entry and this one, the customer used the *already-fixed*, appliance-scoped setup wizard themselves (per that entry's own "exact customer action" above) and genuinely discovered + provisioned **3 real cameras on Ryzen** (`urn:uuid:...` ONVIF device keys, real `camera_credentials` rows, created `2026-09-12T05:50-05:52`). So the account now has 5 (historical) + 3 (Ryzen) = 8 real camera rows -- exactly matching "8 of 8" and exactly why both appliances' `camera_number` 1/2/3 collided visually. **This was not new provisioning performed this session and was not undone or altered** -- read-only confirmed, then left exactly as found.
+
+**Correction to the previous entry's own expectation**: that entry's in-process proof showed Ryzen at `configured=0`. That was correct *at the time*, before the customer's own subsequent, legitimate use of the (already-fixed) wizard. It is **no longer the current state** and must not be treated as a citable fact going forward -- see the fresh in-process proof below, which shows Ryzen at 3, not 0.
+
+**Also confirmed and important on its own**: Ryzen's 3 real cameras report `appliance_camera_status.online=0`, `recording=0`, `last_error='vms_stream_offline'` for all three -- this is why `/customer-live`'s tiles are black. This is a real, separate, already-partially-investigated RTSP/streaming defect (see the `fix(appliance-agent)` commits on this same branch re: RTSP Digest auth / FFmpeg session shape), **not evidence the cameras aren't provisioned, and not something this phase touched or fixed**. Do not read "black tile" as "not provisioned" in any future session -- confirm against `appliance_camera_status`/`camera_credentials` directly, the way this entry did.
+
+### Fix
+
+Both routes now accept an optional `appliance_id` query parameter, mirroring `GET /api/customer/cameras`'s existing pattern exactly: when passed, verified to belong to the customer (404 otherwise, same as every other appliance-scoped customer route), and the page/grid is scoped to only that appliance's cameras.
+
+**Blocker found and reported, not resolved -- read this before assuming either page can be "scoped to the selected appliance" today**: neither `/customer-account` nor `/customer-live` has any appliance-selection UI of its own. Searched thoroughly: no dropdown, no cookie, no session field, nothing read from either route today that could carry "which appliance is the customer currently looking at." The *only* persisted appliance-selection signal anywhere in the app is `customer_setup_drafts.data_json.appliance_id` -- but that belongs to the setup wizard's own step-rehydration (see `customer_first_setup()`), not a deliberate choice made on either dashboard page, and it was deliberately **not** wired in here as a silent default (it can be stale, absent, or simply mean something else -- "the appliance I was last configuring," not "the appliance I want to view now"). Per this phase's explicit instruction: do not invent a new selector, do not silently choose an appliance to represent the whole account. **So today, with no `appliance_id` supplied (every real browser request), both pages render every appliance's cameras -- grouped and labeled under their own appliance heading, never merged into one indistinguishable list, but with no way for the customer to pick "just Ryzen" or "just historical" as a persistent view.** Building that selector (a dropdown, a link per appliance, a persisted "current appliance" concept shared with the wizard) is a real, separate product decision for a future phase, requiring explicit authorization -- not something this fix invented or silently resolved.
+
+### Tests and deployment
+
+`app/tests/test_camera_multi_appliance_isolation.py` (+6 cases, same `_seed_world` fixture): `/customer-account` and `/customer-live` each scope correctly to an explicit `appliance_id`, reject a foreign customer's `appliance_id` (404, not leaked), and with no `appliance_id` render both appliances' cameras grouped under separate headings rather than merged. Full regression: 1621 passed / 79 failed / 22 skipped -- confirmed via git-stash A/B comparison that all 79 are pre-existing and identical to the failure list without this diff (79 failed / 1615 passed baseline; the only delta is the 6 new tests). Zero new regressions.
+
+Deployed: commit `5f36eee` (`5f36eee9...`, full ancestry on `reconcile/golden-foundation-20260911`), image `deploy-portal:5f36eee` (id `sha256:c69b1a6e74cdaf44abfb018f162a9f8fe1ce9fb538ae16c2b6f9c828344f1785`), source tarball SHA-256 `b7cd7c36d2f59af2a663f1bef2661a7ebea8c5e55b6143face4809f0a4d686dd` verified identical before/after transfer. Pre-deploy backups: source `/opt/anyaicam-staging-source-backup-pre-camera-isolation-2-fix-20260912T131206Z.tar.gz` (SHA-256 `6ac101e2bf957248f356db4ce509b57718e41b4a0c200df98030ad0cb71c1801`); DB `/var/lib/anyaicam-staging/db/staging-pre-camera-isolation-2-fix-20260912T131206Z.db` (SHA-256 `5a5735636b67edee62e56edf67c26115864f22ee6f798e757b461e93e8fe4365`). `app/live_view_page.py` and `app/partner_workspace.py` hashed inside the running container match `git show 5f36eee` exactly, byte for byte. `/health` `200 ok`, `/version` correct, DB integrity `ok`, exactly one `portal-green` container, row counts unchanged (`customers=3`, `appliances=4`, `cameras=18`).
+
+**Proven against real production data** (in-process, read-only query using the exact fixed SQL -- no session minted, no HTTP call, no mutation):
+```
+appliance_id=7844ceab... (Ryzen):        cameras=[7e34833a37,ca9d8c53d0,2e1a9a64bc]  count=3
+appliance_id=5e76625989 (historical):    cameras=[01aad49341,d3e67c74b6,810dde938d,
+                                                   7327f73df8,11c8b00156]              count=5
+overlap between the two lists: False
+```
+Isolation confirmed correct. **Ryzen is at 3 configured, not 0** -- see the correction above for why that's the true current state, not a regression or an incomplete fix.
+
+### Preserved exactly as instructed
+
+The 8-slot Stripe entitlement (unchanged, unaffected by this fix). The five historical `AIC-C90CF0C9` camera records (untouched). Ryzen's 3 real camera records (untouched -- not provisioned by this session, found already provisioned, left exactly as found). No cameras provisioned by this phase. Ryzen/Samsung/camera credentials/Motion Cloud/AWS/appliance identities untouched.
+
+### State to resume from -- STOP before Camera 1 provisioning or Live View testing
+
+Both dashboard pages now correctly isolate cameras by appliance whenever an `appliance_id` is supplied, and never merge appliances together even when one isn't. The still-open item is the appliance-selection blocker above -- a real product decision, not a bug, and not something to resolve without separate explicit authorization. Ryzen's black Live View tiles are a known, separate `vms_stream_offline` streaming defect (RTSP-auth family, already partially tracked in this branch's own commit history) -- explicitly out of scope for this phase and not investigated further here. No Camera 1 (re-)provisioning and no Live View troubleshooting were performed.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
