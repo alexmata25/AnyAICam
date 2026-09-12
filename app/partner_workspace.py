@@ -582,9 +582,33 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # signal /api/customer/cameras already uses for its own configured
         # count.
         camera_rows=''.join(f'<tr><td>{escape(c["name"])}</td><td><input class="setup-camera-name" data-id="{c["id"]}" value="{escape(c["name"],quote=True)}"></td><td><select class="setup-camera-site">'+''.join(f'<option value="{s["id"]}" {"selected" if s["id"]==c["site_id"] else ""}>{escape(s["name"])}</option>' for s in sites)+'</select></td><td>'+(f'<span class="pill">Licensed slot &middot; not yet discovered</span>' if not c.get('device_key') else escape(c.get('status') or 'pending'))+'</td></tr>' for c in cameras) or '<tr><td colspan="4">No cameras discovered or preconfigured yet.</td></tr>'
+        # Self-service Cloud ID provisioning bridge (2026-09-12): precomputed
+        # as its own variable, not inlined into the f-string below, purely to
+        # avoid nesting a second triple-quoted string inside content's own
+        # triple-quoted f-string. Intentionally absent (not merely hidden)
+        # whenever this customer already has an appliance -- see the
+        # Step 2 HTML comment just below for the full rationale.
+        provision_first_appliance_panel='' if appliances else '<div id="provision-first-appliance" class="panel" style="margin-bottom:14px"><h3 style="margin-top:0">Provision your first appliance</h3><p class="health-detail">Uses your account\'s own purchased hardware order and camera-slot entitlement -- no separate purchase happens here.</p><label>Site name<input id="provision-site-name" placeholder="Main location" value="Primary site"></label><label>Site address (optional)<input id="provision-site-address" placeholder="123 Main St"></label><button class="action-button" id="provision-appliance-button">Provision appliance</button><p id="provision-message" class="health-detail"></p><div id="provision-result" hidden><p class="health-detail"><strong>Cloud ID and activation token generated below have been filled in for you.</strong> To activate the physical appliance itself, run <code>anyaicam-setup</code> on it and paste the QR value shown here when prompted (or type the Cloud ID and token manually) -- this token is shown only once.</p><label>Provisioning QR value (paste into anyaicam-setup)<input id="provision-qr-value" readonly></label></div></div>'
         content=f'''<header class="topbar"><div><p class="eyebrow">First-time customer onboarding</p><h1>Welcome, {escape(customer['name'])}</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header><p class="health-detail" id="customer-setup-outer-step">AnyAiCam customer setup &middot; Step <strong>6</strong> of 7 (Customer portion)</p><section class="panel"><div class="workspace-tabs" id="customer-setup-tabs" style="grid-template-columns:repeat(7,minmax(120px,1fr));overflow:auto"><button class="workspace-tab active">1 Welcome</button><button class="workspace-tab">2 Add appliance</button><button class="workspace-tab">3 Status</button><button class="workspace-tab">4 Discover</button><button class="workspace-tab">5 Cameras</button><button class="workspace-tab">6 Review</button><button class="workspace-tab">7 Confirm</button></div>
         <div class="customer-setup-step" data-step="1"><h2>Welcome to AnyAiCam</h2><p>This setup links your appliance, requests camera discovery from that appliance, and saves your camera and subscription settings.</p><div class="mock-banner">The browser does not scan the local network. Camera discovery runs on the assigned appliance.</div></div>
         <div class="customer-setup-step" data-step="2" hidden><h2>Add appliance</h2>
+        <!-- Self-service Cloud ID provisioning bridge (2026-09-12): a
+        customer who purchased hardware + a camera-slot plan through the
+        storefront and was approved via /customer-registration-requests
+        (never through the partner-run "Customer onboarding" wizard)
+        reached this step with no site and no appliance -- Cloud ID +
+        activation token below had nothing to link against. This panel
+        is the missing first step for exactly that customer: it creates
+        their first site and provisions exactly one Cloud-ID appliance
+        through the same authoritative provisioning_service.py backend
+        the admin-run wizard already uses, sized from their own real
+        camera-slot entitlement (never hardcoded). It is intentionally
+        absent -- not merely hidden -- whenever this customer already has
+        an appliance (admin-onboarded, or already self-provisioned), so
+        it never offers to provision a second one. Cloud ID + activation
+        token remain the canonical identity either way: this panel only
+        auto-fills the same two fields below and never bypasses them. -->
+        {provision_first_appliance_panel}
         <!-- Confirmed live: browsers/password managers were autofilling the
         signed-in customer's account EMAIL into the bare Cloud ID text input,
         because it sits immediately before a type="password" field with no
@@ -613,7 +637,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         appliance_json=json.dumps(appliances).replace('</','<\\/')
         scripts=f'''<script>let setupStep={initial_step},scanJob=null;const setupSteps=[...document.querySelectorAll('.customer-setup-step')],setupTabs=[...document.querySelectorAll('#customer-setup-tabs .workspace-tab')],appliances={appliance_json};function selectedAppliance(){{return document.getElementById('customer-appliance').value}}function escapeHtml(v){{return String(v==null?'':v).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c])}}function showSetup(){{setupSteps.forEach(x=>x.hidden=Number(x.dataset.step)!==setupStep);setupTabs.forEach((x,i)=>x.classList.toggle('active',i===setupStep-1));document.getElementById('customer-setup-back').hidden=setupStep===1;document.getElementById('customer-setup-next').hidden=setupStep===7;document.getElementById('customer-setup-outer-step').innerHTML=`AnyAiCam customer setup &middot; Step <strong>${{setupStep<=3?6:7}}</strong> of 7 (Customer portion)`;if(setupStep===5){{refreshCameraProgress()}}if(setupStep===3){{const a=appliances.find(x=>x.id===selectedAppliance())||{{}};document.getElementById('appliance-status').innerHTML=`<div class="health-row"><span>Cloud ID</span><strong>${{a.cloud_id||'—'}}</strong></div><div class="health-row"><span>Software</span><strong>${{a.software_version||'Not installed'}}</strong></div><div class="health-row"><span>Status</span><strong>${{a.online_status||'offline'}}</strong></div><div class="health-row"><span>Last check-in</span><strong>${{a.last_check_in||'Never'}}</strong></div><div class="health-row"><span>Assigned site</span><strong>${{a.site_id||'—'}}</strong></div>`}}}}async function refreshCameraProgress(){{const response=await fetch(`/api/customer/cameras?appliance_id=${{encodeURIComponent(selectedAppliance())}}`),r=await response.json();document.getElementById('camera-progress').textContent=`${{r.configured_camera_count}} of ${{r.expected_camera_count||'?'}} cameras configured`;}}
         async function loadLatestScan(){{const applianceId=selectedAppliance();document.getElementById('scan-message').textContent='';document.getElementById('scan-progress').style.width='0%';document.getElementById('scan-results').innerHTML='';scanJob=null;if(!applianceId)return;const response=await fetch(`/api/customer/appliances/${{applianceId}}/scans/latest`),r=await response.json();if(r.job_id){{scanJob=r.job_id;pollScan()}}}}
-        async function saveProgress(){{await fetch('/api/customer/setup/progress',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{current_step:setupStep,data:{{appliance_id:selectedAppliance(),scan_job:scanJob}}}})}})}}document.getElementById('customer-setup-next').onclick=async()=>{{await saveProgress();setupStep++;showSetup()}};document.getElementById('customer-setup-back').onclick=()=>{{setupStep--;showSetup()}};document.getElementById('customer-appliance').onchange=async()=>{{await saveProgress();location.reload()}};document.getElementById('link-customer-appliance').onclick=async()=>{{const response=await fetch('/api/customer/appliances/link',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{cloud_id:document.getElementById('customer-cloud-id').value,activation_token:document.getElementById('customer-activation-token').value}})}}),r=await response.json();document.getElementById('link-message').textContent=response.ok?r.message:r.detail;if(response.ok)location.reload()}};document.getElementById('customer-qr-file').onchange=async event=>{{if(!('BarcodeDetector'in window))return showToast('QR image scanning is unavailable in this browser. Enter the Cloud ID and token manually.');const bitmap=await createImageBitmap(event.target.files[0]),codes=await new BarcodeDetector({{formats:['qr_code']}}).detect(bitmap);if(!codes.length)return showToast('No QR code found.');const parts=codes[0].rawValue.split('|');document.getElementById('customer-cloud-id').value=parts[0]||'';document.getElementById('customer-activation-token').value=parts[1]||'';showToast('QR provisioning details loaded.')}};document.getElementById('start-camera-scan').onclick=async()=>{{const response=await fetch(`/api/customer/appliances/${{selectedAppliance()}}/scan`,{{method:'POST'}}),r=await response.json();scanJob=r.job_id;document.getElementById('scan-message').textContent=r.message;document.getElementById('scan-progress').style.width=`${{r.progress}}%`;if(scanJob)setTimeout(pollScan,1200)}};async function pollScan(){{const response=await fetch(`/api/customer/camera-scans/${{scanJob}}`),r=await response.json();document.getElementById('scan-message').textContent=r.message;document.getElementById('scan-progress').style.width=`${{r.progress}}%`;document.getElementById('scan-results').innerHTML=(r.results||[]).map(x=>{{const address=x.ip_address||x.ip||x.onvif_endpoint||'';const label=x.name||[x.manufacturer,x.model].filter(Boolean).join(' ')||'Discovered device';return `<div class="health-row" data-device-key="${{x.device_key||''}}" data-onvif="${{x.onvif_endpoint||''}}" data-ip="${{x.ip_address||x.ip||''}}" data-manufacturer="${{x.manufacturer||''}}" data-model="${{x.model||''}}"><span><strong>${{escapeHtml(label)}}</strong> &middot; ${{escapeHtml(x.manufacturer||'Unknown manufacturer')}} ${{escapeHtml(x.model||'')}} &middot; ${{escapeHtml(address||'no address reported')}}<br><span class="health-detail">Device key: <code>${{escapeHtml(x.device_key||'none')}}</code></span></span><button type="button" class="ghost-button provision-camera-button">Add this camera</button></div>`}}).join('')||'<div class="empty">No cameras found yet.</div>';if(['queued','running'].includes(r.status))setTimeout(pollScan,1500)}}function showProvisioningError(message){{const el=document.getElementById('scan-message');el.textContent=message;el.style.color='#b91c1c';showToast(message)}}
+        async function saveProgress(){{await fetch('/api/customer/setup/progress',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{current_step:setupStep,data:{{appliance_id:selectedAppliance(),scan_job:scanJob}}}})}})}}document.getElementById('customer-setup-next').onclick=async()=>{{await saveProgress();setupStep++;showSetup()}};document.getElementById('customer-setup-back').onclick=()=>{{setupStep--;showSetup()}};document.getElementById('customer-appliance').onchange=async()=>{{await saveProgress();location.reload()}};const provisionApplianceButton=document.getElementById('provision-appliance-button');if(provisionApplianceButton)provisionApplianceButton.onclick=async()=>{{provisionApplianceButton.disabled=true;provisionApplianceButton.textContent='Provisioning…';const messageEl=document.getElementById('provision-message');messageEl.textContent='';messageEl.style.color='';let response,r;try{{response=await fetch('/api/customer/appliances/provision',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{site_name:document.getElementById('provision-site-name').value,site_address:document.getElementById('provision-site-address').value}})}});r=await response.json()}}catch(error){{provisionApplianceButton.disabled=false;provisionApplianceButton.textContent='Provision appliance';messageEl.style.color='#b91c1c';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}}if(!response.ok){{provisionApplianceButton.disabled=false;provisionApplianceButton.textContent='Provision appliance';messageEl.style.color='#b91c1c';messageEl.textContent=r.detail||`Could not provision an appliance (error ${{response.status}}).`;return}}document.getElementById('customer-cloud-id').value=r.cloud_id||'';if(r.activation_token)document.getElementById('customer-activation-token').value=r.activation_token;const resultBox=document.getElementById('provision-result');if(resultBox){{resultBox.hidden=false;const qrField=document.getElementById('provision-qr-value');if(qrField)qrField.value=r.provisioning_qr_payload||''}}provisionApplianceButton.textContent='Provisioned';messageEl.textContent=r.status==='already_provisioned'?'An appliance was already provisioned for this account.':`Provisioned Cloud ID ${{r.cloud_id}} for ${{r.camera_capacity||'?'}} camera slot(s). Cloud ID and activation token are filled in below.`}};document.getElementById('link-customer-appliance').onclick=async()=>{{const response=await fetch('/api/customer/appliances/link',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{cloud_id:document.getElementById('customer-cloud-id').value,activation_token:document.getElementById('customer-activation-token').value}})}}),r=await response.json();document.getElementById('link-message').textContent=response.ok?r.message:r.detail;if(response.ok)location.reload()}};document.getElementById('customer-qr-file').onchange=async event=>{{if(!('BarcodeDetector'in window))return showToast('QR image scanning is unavailable in this browser. Enter the Cloud ID and token manually.');const bitmap=await createImageBitmap(event.target.files[0]),codes=await new BarcodeDetector({{formats:['qr_code']}}).detect(bitmap);if(!codes.length)return showToast('No QR code found.');const parts=codes[0].rawValue.split('|');document.getElementById('customer-cloud-id').value=parts[0]||'';document.getElementById('customer-activation-token').value=parts[1]||'';showToast('QR provisioning details loaded.')}};document.getElementById('start-camera-scan').onclick=async()=>{{const response=await fetch(`/api/customer/appliances/${{selectedAppliance()}}/scan`,{{method:'POST'}}),r=await response.json();scanJob=r.job_id;document.getElementById('scan-message').textContent=r.message;document.getElementById('scan-progress').style.width=`${{r.progress}}%`;if(scanJob)setTimeout(pollScan,1200)}};async function pollScan(){{const response=await fetch(`/api/customer/camera-scans/${{scanJob}}`),r=await response.json();document.getElementById('scan-message').textContent=r.message;document.getElementById('scan-progress').style.width=`${{r.progress}}%`;document.getElementById('scan-results').innerHTML=(r.results||[]).map(x=>{{const address=x.ip_address||x.ip||x.onvif_endpoint||'';const label=x.name||[x.manufacturer,x.model].filter(Boolean).join(' ')||'Discovered device';return `<div class="health-row" data-device-key="${{x.device_key||''}}" data-onvif="${{x.onvif_endpoint||''}}" data-ip="${{x.ip_address||x.ip||''}}" data-manufacturer="${{x.manufacturer||''}}" data-model="${{x.model||''}}"><span><strong>${{escapeHtml(label)}}</strong> &middot; ${{escapeHtml(x.manufacturer||'Unknown manufacturer')}} ${{escapeHtml(x.model||'')}} &middot; ${{escapeHtml(address||'no address reported')}}<br><span class="health-detail">Device key: <code>${{escapeHtml(x.device_key||'none')}}</code></span></span><button type="button" class="ghost-button provision-camera-button">Add this camera</button></div>`}}).join('')||'<div class="empty">No cameras found yet.</div>';if(['queued','running'].includes(r.status))setTimeout(pollScan,1500)}}function showProvisioningError(message){{const el=document.getElementById('scan-message');el.textContent=message;el.style.color='#b91c1c';showToast(message)}}
 async function pollProvisioning(jobId,button){{const response=await fetch(`/api/customer/camera-provisioning/${{jobId}}`);let r;try{{r=await response.json()}}catch(error){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError('The camera could not be added: no response from the server. Check the connection and try again.')}}if(!response.ok){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError(r.detail||`The camera could not be added (error ${{response.status}}). Try again or contact support.`)}}if(r.status==='provisioned'){{document.getElementById('scan-message').style.color='';showToast('Camera added.');button.textContent='Added';button.disabled=true;refreshCameraProgress();return}}if(r.status==='failed'){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError(r.message||'The camera could not be added. Try again.')}}setTimeout(()=>pollProvisioning(jobId,button),1500)}}
         document.getElementById('scan-results').addEventListener('click',async event=>{{const button=event.target.closest('.provision-camera-button');if(!button)return;const row=button.closest('[data-device-key]'),deviceKey=row.dataset.deviceKey;if(!deviceKey)return showToast('This device has no stable identifier and cannot be added yet.');const name=prompt('Name this camera (you can rename it later):','Camera')||'Camera';const username=prompt('Camera ONVIF/RTSP username (leave blank if none):','')||'';const password=username?(prompt('Camera ONVIF/RTSP password:','')||''):'';button.disabled=true;button.textContent='Adding…';let response,r;try{{response=await fetch('/api/customer/cameras/provision',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{appliance_id:selectedAppliance(),device_key:deviceKey,name,onvif_endpoint:row.dataset.onvif,ip_address:row.dataset.ip,manufacturer:row.dataset.manufacturer,model:row.dataset.model,username,password}})}});r=await response.json()}}catch(error){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError('The camera could not be added: no response from the server. Check the connection and try again.')}}if(!response.ok){{button.disabled=false;button.textContent='Add this camera';return showProvisioningError(r.detail||`The camera could not be added (error ${{response.status}}). Try again or contact support.`)}}document.getElementById('scan-message').style.color='';document.getElementById('scan-message').textContent=r.message||'Provisioning request queued for the appliance.';pollProvisioning(r.job_id,button);}});
         document.getElementById('save-camera-setup').onclick=async()=>{{const cameras=[...document.querySelectorAll('.setup-camera-name')].map((input,index)=>({{id:input.dataset.id,name:input.value,site_id:document.querySelectorAll('.setup-camera-site')[index].value,resolution:'{escape(str(plan.get('resolution','2mp')))}',status:'configured'}})),response=await fetch('/api/customer/cameras',{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{appliance_id:selectedAppliance(),cameras}})}}),r=await response.json();showToast(r.message)}};document.getElementById('confirm-customer-setup').onclick=async()=>{{const response=await fetch('/api/customer/setup/confirm',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{appliance_id:selectedAppliance()}})}}),r=await response.json();if(response.ok)location.href=r.redirect;else showToast(r.detail)}};
@@ -694,6 +718,122 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                 'Failed to send Getting Started email after appliance link for customer %s', identity['customer_id']
             )
         return {'message':'Appliance linked to customer account.','appliance_id':appliance['id'],'camera_slots_purchased':total_camera_slots(identity['customer_id'])}
+
+    @app.post('/api/customer/appliances/provision')
+    def provision_customer_appliance(request: Request,payload: dict) -> dict:
+        """Self-service bridge for the gap this session's real customer-
+        journey audit found: a customer who purchased hardware + a
+        camera-slot plan through the storefront and was approved via
+        /customer-registration-requests (never through the partner-run
+        "Customer onboarding" wizard) reaches Customer Setup Step 2 with
+        no site, no appliance, and nothing for Cloud ID + activation
+        token to link against -- POST /api/customer/appliances/link's
+        own precondition (an appliances row already scoped to this
+        customer_id) was simply never created for them.
+
+        Deliberately reuses the exact same authoritative mechanism
+        partner_workspace.onboard_customer() already uses for the
+        admin-run channel -- get_provisioning_backend().provision(), the
+        one seam allowed to mint a Cloud ID/activation token (see
+        provisioning_service.py's own docstring) -- rather than inventing
+        a second provisioning backend or a second notion of appliance
+        identity. This endpoint only supplies what a self-service
+        customer has that an admin-run onboarding call already had: their
+        own site details, and their own real, already-purchased
+        entitlement to size camera capacity from. Everything downstream
+        (Cloud ID format, activation-token hashing/expiry/single-use
+        redemption via the unmodified POST /api/appliance/activate, the
+        provisioning_qr_payload shape, first_enroll()/coordinated_
+        reenroll()) is completely unchanged -- this is a new front door
+        onto the existing house, not a new house.
+
+        Cloud ID remains canonical; the separate claim-code flow
+        (appliance_claims.py, /customer/claim-appliance,
+        anyaicam-setup --claim) is untouched by this endpoint and stays
+        available as its own additive bootstrap option -- see this
+        session's own architecture-decision checkpoint entry."""
+        identity=customer_owner(request)
+        try: require_permission(identity,'appliance.self.link')
+        except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
+        customer_id=identity['customer_id']
+
+        # Idempotent short-circuit: nothing to do if this customer already
+        # has an appliance, from this action or any other (admin
+        # onboarding, a prior successful call here). Never re-provision,
+        # never re-expose a token that may already have been consumed.
+        existing=row('SELECT * FROM appliances WHERE customer_id=? ORDER BY created_at ASC LIMIT 1',(customer_id,))
+        if existing:
+            return {'status':'already_provisioned','message':'An appliance has already been provisioned for this account.',
+                    'appliance_id':existing['id'],'cloud_id':existing['cloud_id'],'site_id':existing['site_id']}
+
+        from hardware_orders import get_orders_for_customer
+        if not any(o['status']=='paid' for o in get_orders_for_customer(customer_id)):
+            raise HTTPException(status_code=403,detail='No paid hardware order found for this account. Purchase hardware before provisioning an appliance.')
+
+        # total_camera_slots() is the one authoritative source for camera
+        # capacity anywhere in this codebase (customer_entitlements.py's
+        # own docstring: "never a hard-coded constant") -- never a
+        # payload-supplied quantity, never a partner-typed plans.*
+        # column. A customer with an 8-slot Local entitlement gets
+        # exactly 8 camera placeholders; a different customer's own
+        # purchase drives their own number identically.
+        from customer_entitlements import total_camera_slots
+        camera_count=total_camera_slots(customer_id)
+        if camera_count<1:
+            raise HTTPException(status_code=403,detail='No active camera-slot entitlement found for this account. Purchase a camera plan before provisioning an appliance.')
+
+        customer=row('SELECT * FROM customers WHERE id=?',(customer_id,))
+        if not customer: raise HTTPException(status_code=404,detail='Customer account not found.')
+
+        site_name=str(payload.get('site_name') or '').strip() or 'Primary site'
+        site_address=str(payload.get('site_address') or '').strip()
+        candidate_site_id=secrets.token_hex(5)
+        now=datetime.now().isoformat()
+        order={
+            'customer_id':customer_id,'site_id':candidate_site_id,
+            'customer_name':customer.get('name',''),'company':customer.get('company',''),
+            'email':customer.get('email',''),'phone':customer.get('phone',''),'status':customer.get('status','active'),
+            'site_name':site_name,
+            'appliance_type':'AnyAiCam mini PC',
+            'camera_count':camera_count,'resolution':'2mp','recording_mode':'motion','retention_days':30,
+            'analytics_addons':[],'deployment_mode':'local','order_reference':f'self-service:{customer_id}',
+        }
+        # idempotency_key is scoped to this customer alone (never the
+        # candidate_site_id above, which is only ever used on a genuine
+        # first call) -- exactly so a retry after any partial failure
+        # below calls provision() again and gets back the SAME cloud_id/
+        # appliance_id/site_id/token already on record, never a second
+        # Cloud ID for one customer's one self-service appliance.
+        try: provisioning=get_provisioning_backend().provision(order,idempotency_key=f'self-service-provision:{customer_id}')
+        except ProvisioningBackendUnavailable as error: raise HTTPException(status_code=503,detail='Provisioning service is temporarily unavailable. Try again shortly.') from error
+
+        cloud_id=provisioning['cloud_id']; activation_token=provisioning['activation_token']; appliance_id=provisioning['appliance_id']; site_id=provisioning['site_id']
+
+        # Every INSERT below is guarded by a fresh existence check
+        # immediately before it, inside the same transaction -- not
+        # because SQLite itself needs it, but because a retry that
+        # reached provision() again (the branch above already returned
+        # the SAME ids from the backend's own idempotency_index) must
+        # never attempt a duplicate-primary-key insert for a row a prior,
+        # partially-failed attempt already committed.
+        with connection() as db:
+            if not row('SELECT id FROM sites WHERE id=?',(site_id,)):
+                db.execute('INSERT INTO sites(id,customer_id,name,address,site_type,created_at) VALUES(?,?,?,?,?,?)',(site_id,customer_id,site_name,site_address,'Customer site',now))
+            if not row('SELECT id FROM appliances WHERE id=?',(appliance_id,)):
+                db.execute('INSERT INTO appliances(id,customer_id,site_id,cloud_id,appliance_type,serial_number,software_version,last_check_in,online_status,ip_address,cpu,memory,disk,camera_capacity,activation_token_hash,activation_token_created_at,shipping_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(appliance_id,customer_id,site_id,cloud_id,'AnyAiCam mini PC','Pending','Not installed',None,'offline','Not connected',0,0,0,max(16,camera_count),password_hash(activation_token),now,'not_ordered',now))
+            if not row('SELECT id FROM appliance_activation_tokens WHERE appliance_id=? AND used_at IS NULL AND revoked_at IS NULL',(appliance_id,)):
+                db.execute('INSERT INTO appliance_activation_tokens(id,appliance_id,token_hash,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?)',(secrets.token_hex(6),appliance_id,password_hash(activation_token),(datetime.now()+timedelta(hours=24)).isoformat(),now,identity.get('email','')))
+            if (row('SELECT COUNT(*) AS n FROM cameras WHERE appliance_id=?',(appliance_id,)) or {'n':0})['n']==0:
+                for camera_number in range(1,camera_count+1):
+                    db.execute('INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,resolution,status,created_at) VALUES(?,?,?,?,?,?,?,?)',(secrets.token_hex(5),customer_id,site_id,appliance_id,f'Camera {camera_number}','2mp','pending_installation',now))
+            db.execute('INSERT INTO service_history(customer_id,event,details,created_at,created_by) VALUES(?,?,?,?,?)',(customer_id,'Self-service appliance provisioned',f'Cloud ID {cloud_id} provisioned via self-service Customer Setup for {camera_count} camera slot(s).',now,identity.get('email','')))
+        audit(identity,'appliance.self_provisioned','appliance',appliance_id)
+        return {
+            'status':'provisioned','appliance_id':appliance_id,'cloud_id':cloud_id,'site_id':site_id,
+            'activation_token':activation_token,'provisioning_qr_payload':provisioning['provisioning_qr_payload'],
+            'camera_capacity':camera_count,
+            'message':'Appliance provisioned. Store this activation token securely -- enter it (or paste the QR value below) on the physical appliance during anyaicam-setup; it will not be shown again after you leave this page.',
+        }
 
     # Real state lifecycle for a scan job -- a customer must always get
     # honest feedback, never an indefinite silent "queued". Terminal
