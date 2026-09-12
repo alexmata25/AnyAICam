@@ -275,13 +275,27 @@ def _talk_down_state(supported) -> dict:
     return {"enabled": False, "tooltip": "Talk-down capability not verified"}
 
 
-def _customer_live_cameras(db, identity: dict) -> list[dict]:
+def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[dict]:
     """Every camera this identity may view live, scoped to identity's own
     customer_id: the full fleet for customer_owner, or only the subset
     explicitly granted can_live for customer_viewer -- same ownership/
     permission rule _authorized_camera() applies to one camera_id from a
     URL, evaluated here for the whole fleet at once so /customer-live can
     render a grid instead of picking a single camera to redirect to.
+
+    Multi-appliance isolation fix (2026-09-12): this used to return every
+    camera for the customer with no appliance attribution at all -- the
+    same defect class already fixed elsewhere (see partner_workspace.py's
+    customer_account() for the full trace). Confirmed live on anyaicam-
+    staging: a customer with two appliances saw both appliances' cameras
+    tiled together with colliding camera_number-derived labels ("Camera 1"
+    from one appliance indistinguishable from "Camera 1" from the other).
+    `appliance_id` is optional and backward compatible (omitted -> every
+    camera this identity may view, exactly as before); when given, the
+    caller (customer_live_landing()) has already verified it belongs to
+    this customer, so it is trusted here as a plain filter. Every returned
+    row now also carries appliance_id/appliance_cloud_id so the caller can
+    group tiles by appliance without a second query.
 
     Each returned dict also carries talk_enabled/talk_tooltip -- the
     server-persisted camera CAPABILITY state (talk_down_supported),
@@ -302,9 +316,12 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
     if identity.get('role') == 'customer_owner':
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT id, name, camera_number, talk_down_supported FROM cameras WHERE customer_id=? '
-                'ORDER BY camera_number, id',
-                (identity['customer_id'],),
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.appliance_id, '
+                'a.cloud_id AS appliance_cloud_id FROM cameras c '
+                'LEFT JOIN appliances a ON a.id=c.appliance_id '
+                'WHERE c.customer_id=?'+(' AND c.appliance_id=?' if appliance_id else '')+
+                ' ORDER BY c.camera_number, c.id',
+                (identity['customer_id'], appliance_id) if appliance_id else (identity['customer_id'],),
             ).fetchall()
         ]
     else:
@@ -317,11 +334,13 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
 
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported FROM cameras c '
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.appliance_id, '
+                'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
-                'WHERE c.customer_id=? AND p.can_live=1 '
-                'ORDER BY c.camera_number, c.id',
-                (user['id'], identity['customer_id']),
+                'LEFT JOIN appliances a ON a.id=c.appliance_id '
+                'WHERE c.customer_id=? AND p.can_live=1'+(' AND c.appliance_id=?' if appliance_id else '')+
+                ' ORDER BY c.camera_number, c.id',
+                (user['id'], identity['customer_id'], appliance_id) if appliance_id else (user['id'], identity['customer_id']),
             ).fetchall()
         ]
 
@@ -389,13 +408,27 @@ def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
 
 def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     @app.get('/customer-live', response_class=HTMLResponse)
-    def customer_live_landing(request: Request):
+    def customer_live_landing(request: Request, appliance_id: str = ''):
         identity = partner_identity(request)
         if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
             return RedirectResponse('/partner-login', status_code=303)
 
+        # Multi-appliance isolation fix (2026-09-12): appliance_id is
+        # optional and backward compatible (see _customer_live_cameras()'s
+        # own docstring for the full trace); when given it is verified to
+        # belong to this customer before use, same own-tenant check every
+        # other appliance-scoped customer route already applies.
+        if appliance_id:
+            with connection() as db:
+                owned = db.execute(
+                    'SELECT id FROM appliances WHERE id=? AND customer_id=?',
+                    (appliance_id, identity['customer_id']),
+                ).fetchone()
+            if not owned:
+                raise HTTPException(status_code=404, detail='Appliance not found.')
+
         with connection() as db:
-            cameras = _customer_live_cameras(db, identity)
+            cameras = _customer_live_cameras(db, identity, appliance_id)
 
         if not cameras:
             # No cameras at all, or (customer_viewer) none explicitly
@@ -407,8 +440,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         columns = 1 if len(cameras) == 1 else 2 if len(cameras) <= 4 else 3 if len(cameras) <= 9 else 4
         camera_ids = [camera['id'] for camera in cameras]
 
-        tiles = ''.join(
-            f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
+        def _tile(camera: dict) -> str:
+            return f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
               <div class="camera-view" style="border-radius:10px">
                 <video id="live-grid-video-{escape(camera['id'], quote=True)}" muted playsinline></video>
                 <div class="camera-placeholder" id="live-grid-placeholder-{escape(camera['id'], quote=True)}">
@@ -428,8 +461,27 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 </div>
               </div>
             </article>'''
-            for camera in cameras
-        )
+
+        # Multi-appliance isolation fix (2026-09-12), continued: with no
+        # appliance_id given, `cameras` can legitimately span more than one
+        # appliance -- this page has no appliance-selector control of its
+        # own (same gap reported for /customer-account). Rather than
+        # tiling them together indistinguishably (the actual reported
+        # defect: two appliances' "Camera 1" tiles looked identical), each
+        # appliance's tiles are grouped under their own full-width heading
+        # (their cloud_id). When appliance_id was passed, or the account
+        # only has one appliance, this is a single group and renders
+        # exactly as before (no heading, no visual change).
+        distinct_appliance_ids = list(dict.fromkeys(c['appliance_id'] for c in cameras)) if not appliance_id else []
+        if len(distinct_appliance_ids) > 1:
+            tiles = ''.join(
+                f'<div class="live-grid-appliance-heading" style="grid-column:1/-1;font-weight:600;margin-top:14px">'
+                f'{escape(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid) or "Appliance")}</div>'
+                + ''.join(_tile(c) for c in cameras if c['appliance_id'] == aid)
+                for aid in distinct_appliance_ids
+            )
+        else:
+            tiles = ''.join(_tile(camera) for camera in cameras)
 
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p><h1>Your cameras</h1></div>'

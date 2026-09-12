@@ -299,3 +299,127 @@ def test_live_view_start_rejects_a_camera_id_that_does_not_exist(client, db_path
     _seed_world(db_path)
     response = client.post("/api/customer/cameras/does-not-exist/live/start", cookies={"anyaicam_partner_session": _owner_cookie()})
     assert response.status_code == 404
+
+
+def _activate(db_path, appliance_id: str) -> None:
+    """/customer-account and /customer-live (unlike the API routes above)
+    gate on at least one activation_status='activated' appliance existing
+    for the customer -- _seed_world() leaves both test appliances 'pending'
+    (matching cust-1's real appl-ryzen state), so these two page-level
+    tests need the historical appliance activated first, matching real
+    production data (AIC-C90CF0C9 is activation_status='activated' on
+    anyaicam-staging; only the newer Ryzen claim is still 'pending')."""
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE appliances SET activation_status='activated' WHERE id=?", (appliance_id,))
+        conn.commit()
+
+
+# ---------------------------------------------------------- /customer-account
+#
+# Same defect class, a call site 0a92bea's audit missed: this dashboard's own
+# `all_customer_cameras` query was `WHERE customer_id=?` with no appliance
+# filter at all. Confirmed live on anyaicam-staging: a customer with two
+# appliances saw both rendered as one undifferentiated grid, with the other
+# appliance's "Camera 1"/"Camera 2"/"Camera 3" indistinguishable from this
+# appliance's own. This page has no appliance-selector control of its own
+# (no dropdown, no persisted "current appliance"), so an explicit
+# appliance_id query param is verified/scoped exactly like GET
+# /api/customer/cameras, and the no-appliance_id default groups by appliance
+# instead of merging.
+
+
+def test_customer_account_scoped_to_selected_appliance_excludes_other_appliance(client, db_path):
+    _seed_world(db_path)
+    _activate(db_path, "appl-old")
+    cookie = {"anyaicam_partner_session": _owner_cookie()}
+
+    ryzen = client.get("/customer-account", params={"appliance_id": "appl-ryzen"}, cookies=cookie)
+    assert ryzen.status_code == 200, ryzen.text
+    assert "Ryzen Camera 1" in ryzen.text
+    for n in range(1, 6):
+        assert f">Camera {n}<" not in ryzen.text
+    assert "1 of 8 camera" in ryzen.text
+
+    old = client.get("/customer-account", params={"appliance_id": "appl-old"}, cookies=cookie)
+    assert old.status_code == 200, old.text
+    assert "Ryzen Camera 1" not in old.text
+    for n in range(1, 6):
+        assert f">Camera {n}<" in old.text
+    assert "5 of 8 camera" in old.text
+
+
+def test_customer_account_cross_customer_appliance_id_is_rejected_not_leaked(client, db_path):
+    _seed_world(db_path)
+    _activate(db_path, "appl-old")
+    response = client.get(
+        "/customer-account", params={"appliance_id": "appl-other"},
+        cookies={"anyaicam_partner_session": _owner_cookie()},
+    )
+    assert response.status_code == 404
+    assert "Other Camera" not in response.text
+
+
+def test_customer_account_without_appliance_id_groups_by_appliance_never_merges(client, db_path):
+    """The exact live incident, reproduced end-to-end: with no selector,
+    both appliances' real cameras must still both appear (nothing hidden,
+    nothing silently chosen), but grouped under their own appliance
+    heading rather than tiled together indistinguishably."""
+    _seed_world(db_path)
+    _activate(db_path, "appl-old")
+    response = client.get("/customer-account", cookies={"anyaicam_partner_session": _owner_cookie()})
+    assert response.status_code == 200, response.text
+    assert "Ryzen Camera 1" in response.text
+    for n in range(1, 6):
+        assert f">Camera {n}<" in response.text
+    # Both appliances' own cloud_id headings must appear, clearly attributing
+    # each group -- proof the two appliances' cameras were never merged into
+    # one indistinguishable list.
+    assert "637AD320-DAAA-436E-89C9-70A84F4F54A9" in response.text
+    assert "AIC-C90CF0C9" in response.text
+    # The account-wide entitlement total is unaffected by grouping.
+    assert "6 of 8 camera" in response.text
+
+
+# ------------------------------------------------------------- /customer-live
+
+
+def test_customer_live_scoped_to_selected_appliance_excludes_other_appliance(client, db_path):
+    _seed_world(db_path)
+    _activate(db_path, "appl-old")
+    cookie = {"anyaicam_partner_session": _owner_cookie()}
+
+    ryzen = client.get("/customer-live", params={"appliance_id": "appl-ryzen"}, cookies=cookie)
+    assert ryzen.status_code == 200, ryzen.text
+    assert "Ryzen Camera 1" in ryzen.text
+    for n in range(1, 6):
+        assert f">Camera {n}<" not in ryzen.text
+
+    old = client.get("/customer-live", params={"appliance_id": "appl-old"}, cookies=cookie)
+    assert old.status_code == 200, old.text
+    assert "Ryzen Camera 1" not in old.text
+    for n in range(1, 6):
+        assert f">Camera {n}<" in old.text
+
+
+def test_customer_live_cross_customer_appliance_id_is_rejected_not_leaked(client, db_path):
+    _seed_world(db_path)
+    _activate(db_path, "appl-old")
+    response = client.get(
+        "/customer-live", params={"appliance_id": "appl-other"},
+        cookies={"anyaicam_partner_session": _owner_cookie()},
+    )
+    assert response.status_code == 404
+    assert "Other Camera" not in response.text
+
+
+def test_customer_live_without_appliance_id_groups_tiles_by_appliance_never_merges(client, db_path):
+    _seed_world(db_path)
+    _activate(db_path, "appl-old")
+    response = client.get("/customer-live", cookies={"anyaicam_partner_session": _owner_cookie()})
+    assert response.status_code == 200, response.text
+    assert "Ryzen Camera 1" in response.text
+    for n in range(1, 6):
+        assert f">Camera {n}<" in response.text
+    assert "637AD320-DAAA-436E-89C9-70A84F4F54A9" in response.text
+    assert "AIC-C90CF0C9" in response.text

@@ -319,7 +319,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         return shell('Customer detail','partner',content,scripts)
 
     @app.get('/customer-account',response_class=HTMLResponse)
-    def customer_account(request: Request):
+    def customer_account(request: Request,appliance_id: str=''):
         identity=partner_identity(request)
         if not identity or identity.get('role') not in {'customer_owner','customer_viewer'}:
             return RedirectResponse('/partner-login',status_code=303)
@@ -332,6 +332,31 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             "SELECT id FROM appliances WHERE customer_id=? AND activation_status='activated'",
             (customer['id'],)
         )
+
+        # Multi-appliance isolation fix (2026-09-12): this page used to query
+        # cameras `WHERE customer_id=?` alone, exactly the same defect class
+        # 0a92bea already fixed for GET /api/customer/cameras and the setup
+        # wizard's own Step 5 table -- this call site was missed in that
+        # audit. Confirmed live on anyaicam-staging: a customer with two
+        # appliances saw both appliances' cameras rendered as one
+        # undifferentiated list, with colliding camera_number-derived labels
+        # ("Camera 1" from one appliance indistinguishable from "Camera 1"
+        # from the other). An explicit appliance_id (mirroring the same
+        # optional, backward-compatible, own-tenant-verified parameter GET
+        # /api/customer/cameras already accepts) scopes the whole page to
+        # that appliance alone. This page has no appliance-selector control
+        # of its own yet (no dropdown, no persisted "current appliance" --
+        # see the module-level note below), so when appliance_id is omitted
+        # -- every real browser request today -- cameras from more than one
+        # appliance are never merged into one indistinguishable list; they
+        # are grouped and labeled by their own appliance instead (see
+        # `distinct_appliance_ids` below). The shared account-wide Stripe
+        # entitlement (licensed_slots) is unaffected either way.
+        if appliance_id:
+            owned_appliance=row('SELECT id FROM appliances WHERE id=? AND customer_id=?',(appliance_id,customer['id']))
+            if not owned_appliance:
+                raise HTTPException(status_code=404,detail='Appliance not found.')
+
         # "Installed/configured" reflects real appliance-reported state
         # (appliance_camera_status, written by the appliance's own live
         # heartbeat -- POST /api/appliance/cameras), not only whether the
@@ -344,12 +369,15 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # wizard, has real, online, recording cameras that must show as
         # installed without ever touching that wizard.
         all_customer_cameras=rows(
-            'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,'
+            'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,c.appliance_id,'
+            'a.cloud_id AS appliance_cloud_id,'
             'MAX(COALESCE(acs.online,0)) AS appliance_online,'
             'MAX(COALESCE(acs.recording,0)) AS appliance_recording '
             'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
-            'WHERE c.customer_id=? GROUP BY c.id,c.name,c.camera_number,c.status,c.device_key ORDER BY c.camera_number',
-            (customer['id'],)
+            'LEFT JOIN appliances a ON a.id=c.appliance_id '
+            'WHERE c.customer_id=?'+(' AND c.appliance_id=?' if appliance_id else '')+
+            ' GROUP BY c.id,c.name,c.camera_number,c.status,c.device_key,c.appliance_id,a.cloud_id ORDER BY c.camera_number',
+            (customer['id'],appliance_id) if appliance_id else (customer['id'],)
         )
         for camera in all_customer_cameras:
             camera['has_recording']=bool(row('SELECT 1 FROM recordings WHERE camera_id=?',(camera['id'],)))
@@ -387,8 +415,8 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         if identity['role']=='customer_owner' and not (activated and (cameras or licensed_slots>0)):
             return RedirectResponse('/customer/setup',status_code=303)
 
-        real_camera_cards=''.join(
-            f'''<article class="feature-card">
+        def _camera_card(camera: dict) -> str:
+            return f'''<article class="feature-card">
                 <div class="feature-icon">▣</div>
                 <h2>{escape(camera.get("name") or f"Camera {camera.get('camera_number') or ''}")}</h2>
                 <p>{escape(camera_status_label(
@@ -400,8 +428,28 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                 ))}</p>
                 <a class="action-button" href="/customer/cameras/{escape(camera['id'],quote=True)}/live">Live view</a>
             </article>'''
-            for camera in cameras
-        )
+
+        # Multi-appliance isolation fix (2026-09-12), continued: with no
+        # appliance_id given, `cameras` above can legitimately span more
+        # than one appliance. Rather than rendering them as one
+        # undifferentiated grid (the actual reported defect -- two
+        # appliances' "Camera 1" looked identical and uncountable as
+        # belonging to different appliances), each appliance's cameras are
+        # grouped under their own full-width heading (their cloud_id) --
+        # still one page, nothing hidden or merged, no camera silently
+        # attributed to the wrong appliance. When appliance_id was passed,
+        # or the account only has one appliance, this is a single group and
+        # renders exactly as before (no heading, no visual change).
+        distinct_appliance_ids=list(dict.fromkeys(c['appliance_id'] for c in cameras)) if not appliance_id else []
+        if len(distinct_appliance_ids)>1:
+            real_camera_cards=''.join(
+                f'<div class="camera-appliance-group-heading" style="grid-column:1/-1;font-weight:600;margin-top:14px">'
+                f'{escape(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid) or "Appliance")}</div>'
+                +''.join(_camera_card(c) for c in cameras if c['appliance_id']==aid)
+                for aid in distinct_appliance_ids
+            )
+        else:
+            real_camera_cards=''.join(_camera_card(camera) for camera in cameras)
         # Every licensed slot beyond the real, discovered cameras is
         # shown honestly as unused/not-yet-discovered -- no Live view, no
         # Playback, no implication it's online or configured -- while the
