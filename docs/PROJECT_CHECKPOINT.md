@@ -1355,6 +1355,40 @@ Cleared to click **"Buy camera capacity"** (Step 6, **Local 1-8** tier) — the 
 
 ---
 
+## 2026-09-12: Multi-appliance camera isolation defect — audited, fixed, tested, deployed, proven against real data
+
+After the Stripe checkout succeeded (8 real camera slots granted), the customer dashboard showed "5 of 8 cameras configured" for the Ryzen appliance -- but read-only verification proved all 5 belonged to the *historical* `AIC-C90CF0C9` appliance (synthetic pre-existing device_keys, zero real provisioning requests, zero agent-reported camera status for Ryzen). Root cause: `GET /api/customer/cameras` and the setup wizard's own Step 5 camera-table render both queried `cameras WHERE customer_id=?` with no `appliance_id` filter -- correct for a customer with one appliance, wrong for this account, which genuinely has two.
+
+**Full audit performed** across every customer-facing surface touching cameras/provisioning/discovery/Live View (`app/partner_workspace.py`, `app/live_view_sessions.py`, `app/camera_mapping.py`, `app/appliance_cloud.py`). Two real gaps found and fixed:
+1. `GET /api/customer/cameras` -- now accepts an optional `appliance_id`; when given, verifies it belongs to the customer (404 otherwise) and scopes both the camera list and `configured_camera_count` to it. `expected_camera_count` (the Stripe entitlement) correctly stays account-wide.
+2. `customer_first_setup()`'s Step 5 camera-table render -- now filtered to `initial_appliance_id`. The appliance dropdown's `onchange` now saves progress and reloads the page so this (and Step 4's discovery state) always reflects the newly selected appliance.
+
+Hardened `PUT /api/customer/cameras` (defense in depth: verifies each camera also belongs to the passed `appliance_id` before updating it, when one is provided).
+
+**Confirmed already correct, no fix needed** (locked in with new regression tests): `POST /api/customer/appliances/{id}/scan` and `POST /api/customer/cameras/provision` already verify `appliances WHERE id=? AND customer_id=?` -- a customer can never use another customer's appliance_id. Live View (`POST /api/customer/cameras/{id}/live/start`) resolves and queues its relay command against the camera's *own* `appliance_id` read from its own DB row -- never a client-supplied value -- via `camera_mapping.resolve_camera_number()`, itself explicitly appliance+customer scoped.
+
+**Preserved exactly as instructed**: the shared 8-slot Stripe entitlement (unchanged, correctly account-wide by design); the five historical `AIC-C90CF0C9` camera records (untouched, kept as regression evidence); no cameras provisioned; Ryzen/Samsung/camera credentials/Motion Cloud/AWS/appliance identities untouched.
+
+### Tests and deployment
+
+`app/tests/test_camera_multi_appliance_isolation.py` (new, 14 cases): one customer owning two appliances (modeled directly on the live incident) plus a second customer for cross-tenant checks -- proves listing/counting/setup-render/save/provisioning/scan/Live-View all correctly isolate by appliance, and reject a foreign customer's appliance_id or camera_id outright. Full regression: 78 passed / 27 pre-existing unrelated failures (the same "Camera limit reached: 0 camera(s)" gap, already confirmed pre-existing this session). Zero new regressions.
+
+Deployed: commit `0a92bea2e0ab87abbba20c30947f1af063e0726b`, image `deploy-portal:0a92bea` (digest `sha256:26dc4815df3e7e194b5e5762bd2f3a714be82dffcdcf741cade0acbe086a8164`), source tarball SHA-256 `84d7ef8e3624a78dc76192eda47d762f250eb06f87b1120b5eb5e803c4ecde92` verified identical before/after transfer, pre-deploy backups recorded (source and DB, both hashed). `partner_workspace.py` hashed inside the running container matches `git show 0a92bea` exactly. `/health` `200 ok` (internal + public), DB integrity `ok`, exactly one portal container.
+
+**Proven against real production data** (in-process call to the actual, unmodified route function -- no session minted, no HTTP call, no mutation):
+```
+appliance_id=7844ceab... (Ryzen):        cameras=[]                                 configured=0  expected=8
+appliance_id=5e76625989 (historical):    cameras=[01aad49341,d3e67c74b6,810dde938d, configured=5  expected=8
+                                                   7327f73df8,11c8b00156]
+```
+Exactly the corrected behavior the fix was built for.
+
+### Exact customer action to resume real Ryzen provisioning
+
+Return to the customer setup wizard with **Ryzen (`637AD320-DAAA-436E-89C9-70A84F4F54A9`) selected** in the appliance dropdown, go to **Step 4 "Discover cameras"**, click **"Request appliance scan"** again (the discovery results from earlier are still valid -- Ryzen's LAN hasn't changed), and provision **Camera 1** through the same "Add this camera" flow as before, entering its real ONVIF/RTSP credentials yourself when prompted. The dashboard will now correctly show progress against Ryzen specifically, starting from 0 of 8.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
