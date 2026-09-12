@@ -1597,6 +1597,30 @@ Backup: `/var/lib/anyaicam-staging/db/staging-pre-anyaicamtest-cleanup-20260912T
 
 ---
 
+## 2026-09-12: `/customer-registration-requests` 500 fixed -- `page_shell()` called with a stray extra argument -- DONE, deployed, verified
+
+**BUG** (found investigating the prior "500 while logged in as sandbox-admin" report): `requests_page()`, the `GET /customer-registration-requests` handler in `app/customer_registration.py`, called `page_shell("Customer registrations", "business-users", content, current_user(request), scripts=scripts)`. `page_shell()`'s real signature (`app/main.py`) is `page_shell(title, active, content, scripts="")` -- there is no `user` parameter. The stray `current_user(request)` positional argument landed in `scripts`'s slot, and the explicit `scripts=scripts` keyword then collided with it: `TypeError: page_shell() got multiple values for argument 'scripts'`, on every single load of the route. Confirmed live via `anyaicam-staging` container logs. All 10+ other `page_shell()` call sites in the codebase already pass exactly 4 positional arguments -- this was the only broken caller.
+
+**FIX** (`app/customer_registration.py`, one line): dropped the stray `current_user(request)` argument.
+
+**Regression tests added** (`app/tests/test_customer_registration_csrf.py`, 3 new tests, existing 21 unchanged): administrator can `GET /customer-registration-requests` and gets 200 with the seeded pending registration rendered; `partner_owner` can also load the page; unauthenticated request is still redirected to `/customer-login.html` (pre-existing, unrelated middleware behavior, unchanged by this fix -- not a 403 as initially assumed). Focused suite: **24/24 passed**.
+
+**Full-suite regression verification** -- an apparent 79-vs-84-failure discrepancy was fully isolated before proceeding: the source fix **alone** (no test additions) reproduces the established baseline exactly, **79 failed / 1642 passed / 22 skipped**, byte-for-byte identical to a clean stash of the change. Only with the 3 new tests *also* present does the run show 5 additional failures, in `test_operations_rdm.py`, `test_p05_mobile_poll_js.py`, and `test_playback_autoplay_most_recent.py` -- files with no code relationship to this change. All 5 pass individually in isolation (5/5 passed, 6.06s). Conclusion: this is pre-existing order/state-dependent test-isolation debt already latent in the suite (adding any tests earlier in the alphabetical run shifts which cross-test pollution surfaces) -- not a regression introduced by this fix or its tests. Left unfixed as out of scope, per explicit instruction not to make unrelated fixes.
+
+**Commit**: `3f161dc` (`app/customer_registration.py`, `app/tests/test_customer_registration_csrf.py`).
+
+**Deployed to `anyaicam-staging`**: source tarball `git -c core.autocrlf=false archive 3f161dc` -> SHA-256 `ae95781694da0eaebf51f49f08f0c317da53220effeef3f2725086aec23b912e`, verified identical after `scp`. Pre-deploy backups: source `/opt/anyaicam-staging-source-backup-pre-registration-page-fix-20260912T175559Z.tar.gz` (SHA-256 `f4e575c641923ca40ca0b186db8403e49278dbc88e1874d2a464f8dec5b09647`); DB `/var/lib/anyaicam-staging/db/staging-pre-registration-page-fix-20260912T175559Z.db` (SHA-256 `57fcce74bb6c124f2dab3ccecf5aaf9bad48ae973494f03d8c18e3582ea7f285`). `app/` rsync'd into `/opt/anyaicam-staging/` (`diff -rq` confirmed identical after; `deploy/`/`storefront/` untouched). Built `deploy-portal:3f161dc` (image id `sha256:5a5e1962db9ebeb76cb3ca61eadeed2b197ea4933044bf67e47ca46bdfed2878`). Before recreating `portal-green`, diffed `green.env` against the live container's actual running environment (the safeguard this doc itself recommended after the earlier stale-env incidents) -- identical except Python/Docker base-image built-ins, safe to reuse. `portal-green` recreated (`docker stop`/`rm`/`run`, identical `--env-file green.env`, identical `db`/`recordings`/`hls`/`data-config` mounts, identical `deploy_default` network).
+
+**Verified**: `/health` `200 ok`; `/version` correct; `customer_registration.py` hashed inside the running container (`1873dfcb491fbc28ab0a66d829c9f5205d73498255fa5196e3537e3b8b40335e`) matches `git show 3f161dc:app/customer_registration.py` byte-for-byte; DB `integrity_check: ok`; exactly one `portal-green` container. **Route verification against the real public endpoint** (minted a genuine administrator session token inside the container using `partner_portal._token()`/its own signing key, sent through Caddy to `https://portal-staging.anyaicam.com` with the real `anyaicam_partner_session` cookie -- not `TestClient`, which isn't installed in the production image): `GET /customer-registration-requests` -> **200**, page contains "Registration requests" and the `/api/customer-registration-requests` script reference; `GET /api/customer-registration-requests` -> **200**, returns exactly one pending request (`anyaicamtest@gmail.com`, `status=pending`).
+
+**Customer-state verification (read-only, unchanged by this deploy)**: `anyaicamtest@gmail.com`'s registration request (`id=69de64fe4a4db87dff5f7f9a40ded6ee`) still `status=pending`. Both pending links from the prior cleanup untouched: `pending_hardware_order_links id=d12c4134c1b44c9cbbb0c63dadc176bf` (`status=pending`, `amount_cents=50`); `pending_customer_links id=d082345105174149af3debb50e4cef45` (`status=pending`, `camera_slot_quantity=8`, `stripe_amount_total_verified=60` recorded in its own `raw_event_json`). **No approval was performed. Ryzen and Samsung were not touched.**
+
+### State to resume from
+
+The `/customer-registration-requests` administrator UI is now repaired and live on `anyaicam-staging`. `anyaicamtest@gmail.com` remains pending, exactly as left by the prior cleanup, ready to be approved through this now-working UI whenever the user chooses to do so.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
