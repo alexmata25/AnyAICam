@@ -177,6 +177,50 @@ every attempt, from this exact source commit.
 
 ---
 
+## Architecture decision: Cloud ID is canonical; claim code is additive
+
+**Read this before touching either provisioning path — a recurring source of
+confusion across sessions.** This codebase has exactly two, deliberately
+separate, ways for an appliance to become associated with a customer:
+
+1. **Cloud ID (`AIC-XXXXXXXX`) + activation token** — `provisioning_service.py`
+   (`get_provisioning_backend().provision()`) is the *only* place allowed to
+   mint one. This is the **canonical, permanent appliance identity** for the
+   life of the appliance: every appliance row, every activation-token hash,
+   every camera placeholder, and every downstream cloud feature (heartbeat,
+   entitlement refresh, camera sync) is keyed off this identity. It is
+   produced by exactly two front doors onto the *same* backend, never a
+   second provisioning system: `partner_workspace.onboard_customer()` (an
+   admin/partner runs "Add New Customer" and provisions on the customer's
+   behalf) and `partner_workspace.provision_customer_appliance()` (a
+   self-service customer who already has a paid hardware order + active
+   camera-slot entitlement provisions their own first appliance from
+   Customer Setup Step 2, added 2026-09-12 — see the dated entry below).
+   Redeemed via the unmodified `POST /api/appliance/activate` and
+   `POST /api/customer/appliances/link`.
+2. **Claim code** (`appliance_claims.py`, `POST /customer/claim-appliance`,
+   `anyaicam-setup --claim`) — a short-lived, human-readable pairing code an
+   *unclaimed physical device* generates locally and a customer types into
+   the portal to bind it to their account for the first time, validated by
+   Samsung. This is a **bootstrap/pairing mechanism**, not an identity
+   system: once a claim completes, the device still ends up with a real
+   Cloud ID underneath it (via `coordinated_reenroll()`/`first_enroll()` in
+   the appliance agent) — the claim code itself is never stored as, or
+   treated as, the appliance's permanent identity.
+
+**Do not merge these, replace one with the other, or treat a self-service
+Cloud ID provisioning action as "the same feature" as claim code.** They
+solve different problems (issuing a brand-new identity for hardware that has
+no appliance row yet, vs. pairing an already-manufactured physical device
+that already has its own local identity bootstrap) and both must keep
+working independently. If a future session is asked to "fix appliance
+linking" or "add self-service provisioning," confirm which of the two gaps
+is actually being reported before writing code — see the 2026-09-12
+self-service provisioning entry below for a concrete example of the two
+coexisting without either being touched.
+
+---
+
 ## RC1 → RC2 on Ryzen (2026-09-11)
 
 RC1 (`1dfcbf2`) was deployed to Ryzen as a genuine clean install (Ryzen's
@@ -1618,6 +1662,30 @@ Backup: `/var/lib/anyaicam-staging/db/staging-pre-anyaicamtest-cleanup-20260912T
 ### State to resume from
 
 The `/customer-registration-requests` administrator UI is now repaired and live on `anyaicam-staging`. `anyaicamtest@gmail.com` remains pending, exactly as left by the prior cleanup, ready to be approved through this now-working UI whenever the user chooses to do so.
+
+---
+
+## 2026-09-12: Self-service Cloud ID provisioning bridge — the real gap once `anyaicamtest@gmail.com` was approved — DONE, deployed, verified
+
+**Confirmed real customer state before writing any code** (read-only, against `anyaicam-staging`'s live `staging.db`): the customer had since been approved through the now-fixed `/customer-registration-requests` UI — `customer_registration_requests` `status=approved`, `decided_by=sandbox-admin@anyaicam-staging.test`; `customers id=d75bdbecdd4887de4d2b89a9fcea9092` `status=active`; `partner_users id=99bdbe03c4e5628c3624a8eeb8e44416` `role=customer_owner`, `approved=1`; `hardware_orders id=251b6a8922b04f27bee28c467a90ef3b` `status=paid`; `customer_entitlements id=6538be5c6a054678a416427fe8cb05b3` `product=camera_slots_local`, `camera_slot_quantity=8`, `status=active`; and exactly **zero** `sites`/`appliances`/`cameras` rows for this customer. Ryzen (`637AD320-...`) confirmed still unclaimed (zero `appliances` rows). This matches the architecture decision above exactly: the customer had a real, paid entitlement and nowhere for Customer Setup Step 2's Cloud ID field to point — not a claim-code gap, not a registration gap (already fixed above).
+
+**FIX** — `app/partner_workspace.py`, one new route: `POST /api/customer/appliances/provision`. Authenticates via the existing `customer_owner()` + `'appliance.self.link'` permission check (same as `link_customer_appliance()`); confirms a `hardware_orders` row with `status='paid'`; reads capacity from `customer_entitlements.total_camera_slots()` (never a hardcoded number, never a payload-supplied quantity — resolves to `8` for this real customer from their real entitlement, and independently to whatever a different customer's own entitlement sums to); creates the customer's first `sites` row from customer-entered `site_name`/`site_address`; provisions exactly one appliance through the *same* `get_provisioning_backend().provision()` seam `onboard_customer()` already uses — identical Cloud ID format, identical activation-token hashing/expiry/single-use redemption via the unmodified `POST /api/appliance/activate`, identical `provisioning_qr_payload` shape; creates camera placeholders sized from the real entitlement quantity. Idempotent by design: a customer who already has an appliance short-circuits to `already_provisioned`; a retry that reaches the backend a second time (partial local failure) recovers the backend's own idempotency-keyed Cloud ID/site/appliance instead of minting a second one. Customer Setup Step 2 gained a "Provision your first appliance" panel — present only when the customer has no appliance yet — that calls this endpoint and auto-fills the existing Cloud ID/activation-token fields (and the QR-paste value) so the customer flows straight into the existing, completely unmodified `link_customer_appliance()` flow. The claim-code flow (`appliance_claims.py`) was not touched.
+
+**Tests** (`app/tests/test_self_service_appliance_provisioning.py`, 12 new, all passing): full journey (paid hardware + 8-slot entitlement → first site → Cloud ID appliance → activation token/QR → exactly 8 camera placeholders → existing, unmodified link flow accepts it); unauthenticated and wrong-role (`customer_viewer`) both rejected 403; a payload-supplied `customer_id` can never redirect the provisioned records to another customer's account (cross-tenant isolation proven with two real, separate entitlements seeded simultaneously); no hardware order, an unpaid (`status='pending'`) hardware order, no entitlement, and an inactive (`status='cancelled'`) entitlement all fail closed with 403 and write nothing; retrying the same call twice is idempotent (exactly one site/appliance/8 cameras/1 unused activation-token row; the first call's site name survives a retry that supplies a different name); a retry after the backend already committed its idempotency record (simulating the process dying before the local SQL transaction ran) recovers the exact same Cloud ID/site/appliance rather than minting a second identity; entitlement quantity — not a constant — controls camera capacity (a 3-slot customer gets exactly 3 cameras; multiple active entitlements for one customer sum correctly, 8+8=16).
+
+**Regression proof**: `git stash` isolation — the full suite's failing-test set is byte-for-byte identical with and without this change (84 pre-existing, unrelated failures either side, same list); this change turns exactly the 12 new tests from failing (route not yet registered) to passing and touches nothing else. `appliance_claims.py`'s own 47-test suite and the admin/partner onboarding suites (`test_onboarding_wizard_flow.py`, `test_cloud_id_alignment.py`) confirmed still passing, unmodified.
+
+**Commit**: `8b07dc1` (`app/partner_workspace.py`, `app/tests/test_self_service_appliance_provisioning.py`).
+
+**Deployed to `anyaicam-staging`**: pre-deploy backups — DB `/var/lib/anyaicam-staging/db/staging-pre-self-service-provisioning-fix-20260912T205215Z.db` (SHA-256 `55755a65b601177a04b784d521d51bc2021367a812e629c95dc20a770017de59`); source `/opt/anyaicam-staging-source-backup-pre-self-service-provisioning-fix-20260912T205215Z.tar.gz` (SHA-256 `71597d844b82ccb81327a24c2b6b577f5a65168eecf191a0e31773f7948b6f29`). Source tarball `git -c core.autocrlf=false archive 8b07dc1 -- app` → SHA-256 `e6b1a9438e787c6fee93bbdafdec00479aefc5592420e521c8fbdd92fd5e2c32`, verified identical after `scp`; `app/` rsync'd into `/opt/anyaicam-staging/` with `--delete`, `diff -rq` confirmed identical after (`deploy/`/`storefront/` untouched). Built `deploy-portal:8b07dc1`. **Env-file drift check** (per the safeguard this doc's own `green.env` config-drift entry recommends): diffed both `~/blue-green-rehearsal/green-live.env` and `/etc/anyaicam-staging/vms-staging.env` against `portal-green`'s actual running environment before recreating — **neither file matched** (both `ANYAICAM_ADMIN_PASSWORD` and `ANYAICAM_APP_SECRETS` differ from what's actually live; `vms-staging.env` is also missing `ANYAICAM_DATABASE_BACKEND=sqlite`). Rather than reuse either stale file, captured the running container's own real environment directly (`docker inspect portal-green`, minus container/build-time built-ins: `PATH`/`HOSTNAME`/`HOME`/`LANG`/`GPG_KEY`/`PYTHON_VERSION`/`PYTHON_SHA256`) into a new file, `~/blue-green-rehearsal/green-live-8b07dc1.env`, and recreated `portal-green` from that — so this redeploy preserves the exact live secrets/session-signing state already in production use and does not silently invalidate sessions or the admin password the way blindly reusing either stale file would have. **Neither `green.env`/`green-live.env`/`vms-staging.env` was edited** — recorded here as tech debt, not fixed, matching this doc's own recommendation to add a mandatory pre-flight diff rather than trust either file blindly.
+
+**Verified**: exactly one `portal-green` container, `Up`, image `deploy-portal:8b07dc1`; `https://portal-staging.anyaicam.com/health` → `200 ok`; `/version` unchanged (`cloud_id: AIC-C90CF0C9`, no AWS/Motion Cloud flags); `partner_workspace.py` hashed inside the running container (`b063e5772dab3a75d366da2ee9ae4de7fc580e8ea94cc67b56553ef3995fe7d2`) matches `git show 8b07dc1:app/partner_workspace.py` byte-for-byte; DB `integrity_check: ok`. **Route verification**: introspected the live app's own route table inside the running container — `POST /api/customer/appliances/provision` is registered. (Did not mint a session for, or otherwise touch, the real `anyaicamtest@gmail.com` account to exercise the endpoint end-to-end through the public path — that would have provisioned it, which was explicitly out of scope this pass; the 12-test suite above already proves the endpoint end-to-end against the identical code path.)
+
+**Customer-state verification (read-only, unchanged by this deploy)**: `anyaicamtest@gmail.com` (`d75bdbecdd4887de4d2b89a9fcea9092`) still has **zero** `sites`/`appliances`/`cameras` rows; `hardware_orders` still `status=paid`; `customer_entitlements` still `camera_slot_quantity=8`/`status=active`. **No provisioning was performed against the real account. Ryzen and Samsung were not touched.**
+
+### State to resume from
+
+The self-service provisioning bridge is live on `anyaicam-staging`. `anyaicamtest@gmail.com` is approved, has a paid hardware order and an active 8-slot entitlement, and has not been provisioned — the next action is the customer (or whoever is driving this test) opening Customer Setup, clicking "Provision your first appliance," and continuing through the existing, unmodified Cloud ID link/activation flow themselves.
 
 ---
 
