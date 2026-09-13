@@ -78,6 +78,21 @@ ensure_vms_env() {
     grep -q '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null || \
         printf '%s\n' 'ANYAICAM_ENV=production' >> "$VMS_ENV_FILE"
 
+    # Live View staging transport (2026-09-13): the existing S3/CloudFront
+    # live-relay worker (app/live_relay_uploader.py) already self-gates on
+    # this flag and defaults OFF in the app if the key is absent entirely
+    # -- this line only makes that default explicit and present in every
+    # installed appliance's own env file, the same way ANYAICAM_RUNTIME_
+    # ROLE/ANYAICAM_ENV above do, so a future repair-install never has to
+    # guess whether an existing appliance already has an opinion here.
+    # Never overwrites an existing value -- flipping this to true for a
+    # specific pilot appliance (alongside setting AWS_REGION and the
+    # cloud-side live_relay_pilot DB flag) is a separate, explicit,
+    # per-appliance decision, not something this installer makes for
+    # every appliance by default.
+    grep -q '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf '%s\n' 'ANYAICAM_LIVE_RELAY_ENABLED=false' >> "$VMS_ENV_FILE"
+
     # Generated once, per appliance, the first time this file has no
     # value yet -- and, like ANYAICAM_ENV/ANYAICAM_RUNTIME_ROLE above
     # (never like the always-refreshed build-identity keys below), NEVER

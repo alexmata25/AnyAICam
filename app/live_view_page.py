@@ -312,14 +312,38 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
     trusts what a page merely rendered. A viewer lacking can_talk still
     sees an enabled-looking mic for a capable camera and gets a real
     403 the moment they try to use it -- a UX gap acceptable for this
-    foundation, not a security one."""
+    foundation, not a security one.
+
+    Live-tile grid fix (2026-09-13): `c.camera_number IS NOT NULL` on
+    both branches below -- confirmed live on anyaicam-staging (8-slot
+    entitlement, 5 physical cameras discovered): this query used to
+    return every `cameras` row for the customer with no distinction
+    between a real, discovered camera and a licensed-but-undiscovered
+    onboarding placeholder (device_key IS NULL, camera_number IS NULL),
+    so the grid rendered one dead "Starting live view..." tile per
+    placeholder alongside the real cameras (8 tiles for 5 real cameras).
+    `camera_number IS NOT NULL` -- not `device_key IS NOT NULL` -- is the
+    signal used here deliberately: it is the exact same "has an assigned
+    relay slot" check live_view_sessions.start_live_view() and
+    live_playlist.py's own authorized_camera() already gate a live
+    session on (resolve_camera_number() returning None -> 409), so a
+    camera that would 409 on /live/start can never even reach a tile
+    that tries to call it, and an installer/technician-provisioned
+    camera that has a real camera_number but no self-service-discovery
+    device_key (see partner_workspace.camera_is_installed()'s own
+    broader "installed" definition -- device_key is one signal among
+    several there, never the only one) still correctly renders a tile.
+    Licensed-but-unused capacity is an entitlement number shown
+    elsewhere (customer_entitlements.total_camera_slots(), e.g.
+    "5 of 8 cameras configured / 3 licenses available"), never a video
+    tile with nothing behind it."""
     if identity.get('role') == 'customer_owner':
         cameras = [
             dict(camera) for camera in db.execute(
                 'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.appliance_id, '
                 'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'LEFT JOIN appliances a ON a.id=c.appliance_id '
-                'WHERE c.customer_id=?'+(' AND c.appliance_id=?' if appliance_id else '')+
+                'WHERE c.customer_id=? AND c.camera_number IS NOT NULL'+(' AND c.appliance_id=?' if appliance_id else '')+
                 ' ORDER BY c.camera_number, c.id',
                 (identity['customer_id'], appliance_id) if appliance_id else (identity['customer_id'],),
             ).fetchall()
@@ -338,7 +362,7 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
                 'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'LEFT JOIN appliances a ON a.id=c.appliance_id '
-                'WHERE c.customer_id=? AND p.can_live=1'+(' AND c.appliance_id=?' if appliance_id else '')+
+                'WHERE c.customer_id=? AND p.can_live=1 AND c.camera_number IS NOT NULL'+(' AND c.appliance_id=?' if appliance_id else '')+
                 ' ORDER BY c.camera_number, c.id',
                 (user['id'], identity['customer_id'], appliance_id) if appliance_id else (user['id'], identity['customer_id']),
             ).fetchall()

@@ -441,6 +441,23 @@ printf 'ANYAICAM_ENV=staging\n' > "$VMS_ENV_FILE"
 ensure_vms_env >/dev/null 2>&1
 assert_eq "an existing, customized ANYAICAM_ENV value is preserved across reinstall" "ANYAICAM_ENV=staging" "$(grep '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null)"
 
+# 14d2. Live View staging transport (2026-09-13): ANYAICAM_LIVE_RELAY_ENABLED
+#      defaults to false on a fresh env file -- the S3/CloudFront relay
+#      worker must never attempt to run on a brand-new appliance that has
+#      no AWS configuration and is not part of the pilot -- and, like
+#      ANYAICAM_ENV/RUNTIME_ROLE above, an operator-flipped true is never
+#      clobbered back to false by a later reinstall/repair.
+reset_fixture
+ensure_vms_env >/dev/null 2>&1
+assert_eq "ANYAICAM_LIVE_RELAY_ENABLED=false is written to a fresh env file" "1" "$(grep -c '^ANYAICAM_LIVE_RELAY_ENABLED=false$' "$VMS_ENV_FILE" 2>/dev/null)"
+
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+printf 'ANYAICAM_LIVE_RELAY_ENABLED=true\n' > "$VMS_ENV_FILE"
+ensure_vms_env >/dev/null 2>&1
+assert_eq "an operator-enabled ANYAICAM_LIVE_RELAY_ENABLED=true is preserved across reinstall" "ANYAICAM_LIVE_RELAY_ENABLED=true" "$(grep '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
+assert_eq "exactly one ANYAICAM_LIVE_RELAY_ENABLED line exists (never duplicated)" "1" "$(grep -c '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null)"
+
 # 14e/14f. ANYAICAM_BUILD_ID and ANYAICAM_VMS_COMMIT are installer-owned
 #      build identity -- unlike ANYAICAM_ENV/RUNTIME_ROLE, these two ARE
 #      meant to be refreshed on every reinstall/repair (a repair with a

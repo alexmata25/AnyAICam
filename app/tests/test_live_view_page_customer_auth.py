@@ -198,3 +198,70 @@ def test_customer_viewer_role_is_still_accepted_same_as_before(client, db_path):
     )
     assert response.status_code == 200
     assert "Customer A Camera" in response.text
+
+
+# --------------------------------------------------- 5. Live grid excludes licensed-but-undiscovered placeholders
+
+
+def test_live_grid_renders_exactly_five_tiles_for_an_eight_slot_customer_with_five_real_cameras(client, db_path):
+    """Confirmed live on anyaicam-staging (2026-09-13): an 8-slot
+    entitlement with only 5 physical cameras discovered rendered 8
+    /customer-live tiles -- 5 real plus 3 dead ones for the remaining
+    licensed-but-undiscovered placeholders (device_key IS NULL,
+    camera_number IS NULL), each stuck on "Starting live view..."
+    forever since there is no camera behind them at all. The fix scopes
+    _customer_live_cameras() to `camera_number IS NOT NULL` -- the same
+    "has an assigned relay slot" signal /live/start's own 409 check
+    already uses, deliberately not device_key (an installer/technician-
+    provisioned camera can be real with a camera_number and no
+    self-service-discovery device_key -- see camera_is_installed()'s own
+    broader definition). This proves the grid renders exactly the 5 real
+    cameras and none of the 3 placeholders, while the 8-slot entitlement
+    itself is left completely untouched (this test never reads or
+    asserts on it -- see customer_entitlements.total_camera_slots() for
+    where "5 of 8 configured / 3 available" is shown instead, unrelated
+    to this page).
+
+    The base fixture's own cam-a (camera_number=1, no device_key) is
+    deleted first -- it is itself a legitimately "real" camera under the
+    corrected signal, which would otherwise make the "exactly 5" count
+    ambiguous about what's actually being proven here."""
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import connection
+        with connection() as conn:
+            conn.execute("DELETE FROM cameras WHERE id='cam-a'")
+            # camera_number starts at 11 -- (appliance_id,camera_number) is
+            # uniquely indexed, and _seed_two_customers's base fixture
+            # already put cam-a at camera_number=1 on this same appliance.
+            for n in range(11, 16):
+                conn.execute(
+                    "INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,camera_number,device_key,status,name,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (f"cam-a-real-{n}", "cust-a", "site-a", "appl-a", n, f"urn:uuid:fake-real-{n}", "configured", f"Camera {n}", "2026-01-01"),
+                )
+            for n in range(16, 19):
+                conn.execute(
+                    "INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,camera_number,device_key,status,name,created_at) "
+                    "VALUES(?,?,?,?,NULL,NULL,'pending_installation',?,?)",
+                    (f"cam-a-placeholder-{n}", "cust-a", "site-a", "appl-a", f"Camera slot {n}", "2026-01-01"),
+                )
+            conn.commit()
+
+    response = client.get(
+        "/customer-live",
+        cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a", "owner-a@example.test")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 200
+    # The exact tile opening tag, not the bare "live-grid-tile" substring
+    # -- that string alone also appears a fixed number of times in this
+    # page's own CSS/JS (selectors, hover rules), unrelated to how many
+    # camera tiles were actually rendered.
+    assert response.text.count('<article class="live-grid-tile"') == 5
+    for n in range(11, 16):
+        assert f"cam-a-real-{n}" in response.text
+    for n in range(16, 19):
+        assert f"cam-a-placeholder-{n}" not in response.text
+    # cam-a itself (from _seed_two_customers's base fixture) carries no
+    # device_key either, so it is correctly excluded too -- the "exactly
+    # 5" count above is only the 5 newly-seeded real cameras.
