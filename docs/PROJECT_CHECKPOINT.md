@@ -1719,6 +1719,34 @@ Both fixes are live. The customer (or whoever is driving this test) can now safe
 
 ---
 
+## 2026-09-13: Step 4 "Request appliance scan" backlog/pileup defect — source-fixed, DONE, deployed, verified (customer journey continues from Step 4)
+
+**Reported symptom**: on the real account, clicking "Request appliance scan" (Step 4) "did not appear to start/complete a scan or return the 5 cameras."
+
+**Traced read-only first** (prior turn, no code touched): the full chain — browser → `POST /api/customer/appliances/{id}/scan` → `camera_scan_jobs` row → `GET /api/appliance/{cloud_id}/scan-jobs` (claims it) → Ryzen's `poll_discovery()` → real `scan()` → `POST /api/appliance/{cloud_id}/scan-jobs/{job_id}` → browser `pollScan()` — was found to work correctly end to end at every stage; `aa4dc2edb135e379631a9d17db8923e56a202ed9` (confirmed an ancestor of this branch, `service.py`/`discovery.py`/`reenrollment.py` byte-identical since) fully supports and executes discovery. **Real root cause**: `request_camera_scan()` (`app/partner_workspace.py`) created a brand-new `camera_scan_jobs` row on every call with no de-duplication. The real account had been clicked 6 times in 49 seconds, and Ryzen's `poll_discovery()` claims and works through every non-terminal job for one appliance strictly sequentially — one real `scan()` per job, ~24s each — so the backlog took over 3 minutes to fully drain, and the browser's `pollScan()` always re-reads the mutable global `scanJob` (the newest click), meaning the customer was watching the *last*-clicked job sit at the back of an ever-growing queue. Every job still completed correctly with the expected 5 discovered devices (confirmed: all 6, and 4 more created before this fix was deployed, ended up `status=complete` with correct results) — this was a latency/pileup defect, not a broken chain.
+
+**FIX 1** (`app/partner_workspace.py`, authoritative): `request_camera_scan()` now looks up an existing `camera_scan_jobs` row for the same appliance whose status is not in `CAMERA_SCAN_TERMINAL_STATES` and returns it instead of inserting another. The found job is run through the existing `_maybe_time_out_scan_job()` first, so a genuinely abandoned job still correctly frees up a new scan. Terminal jobs (`complete`/`error`/`timed_out`/`cancelled`) never block a new request.
+
+**FIX 2** (`app/partner_workspace.py`, UX only): "Request appliance scan" is disabled and relabeled "Discovery in progress…" for as long as `pollScan()` reports a non-terminal status (on the initial click and every poll tick, so a mid-scan page reload via `loadLatestScan()` also reflects it correctly), and re-enabled the moment a terminal status is reached. Purely a safeguard — Fix 1 is what actually prevents duplicate jobs regardless of client behavior.
+
+**Tests** (`app/tests/test_camera_discovery_provisioning.py`, 7 new, all passing): repeated requests while `queued`/`waiting_for_appliance`/`running` each return the identical `job_id`; 6 repeated requests (matching the exact count confirmed live) create exactly one DB row; a terminal (`complete`) job correctly allows a new scan (DB then holds exactly two rows); a genuinely timed-out job also correctly frees up a new scan via the existing lazy-timeout helper; an already-completed job's real 5-device results remain fully intact and correctly readable after the guard creates a follow-up job for the same appliance.
+
+**Regression proof**: full suite before/after — byte-for-byte identical 84 pre-existing, unrelated failures (confirmed via `git stash` isolation); 1663 passed (+7). (Running `test_camera_discovery_provisioning.py` alone showed 26 unrelated camera-provisioning-test failures — confirmed pre-existing test-order-dependent isolation debt already on record in this doc, identical with and without this change, not caused by it.)
+
+**Commit**: `9a4d31b` (`app/partner_workspace.py`, `app/tests/test_camera_discovery_provisioning.py`).
+
+**Deployed to `anyaicam-staging`**: pre-deploy backups — DB `/var/lib/anyaicam-staging/db/staging-pre-scan-idempotency-fix-20260913T020443Z.db` (SHA-256 `00e037f8a3fc012ca8e079d56e1cf42460089d879063ce85872f8fd636d0decf`); source `/opt/anyaicam-staging-source-backup-pre-scan-idempotency-fix-20260913T020443Z.tar.gz` (SHA-256 `8910ecb4e747f3d07d4d90a642849df06da1314e95e037820c0b153c28c4df1a`). Source tarball hash verified identical after `scp`; `app/` rsync'd with `--delete`, `diff -rq` confirmed identical after. Built `deploy-portal:9a4d31b`. Env-file drift check: captured `portal-green`'s actual running env fresh and diffed against the last known-good file (`green-live-8b07dc1.env`) — byte-for-byte identical, no drift, same file reused. `portal-green` recreated with `deploy-portal:9a4d31b`, identical mounts/network/env-file.
+
+**Verified**: exactly one `portal-green`, `Up`; `/health` → `200 ok` (one transient empty response ~15s after `docker run`, before the container fully warmed up — expected, resolved on the next check); `partner_workspace.py` hashed inside the container matches `git show 9a4d31b:app/partner_workspace.py` byte-for-byte; DB `integrity_check: ok`; `/api/customer/appliances/{appliance_id}/scan` and `/scans/latest` confirmed registered. Container logs show real Ryzen appliance traffic (heartbeat/cameras/commands/scan-jobs/provisioning-jobs) succeeding immediately after the recreate — no interruption to the live appliance.
+
+**Customer-state verification (read-only, unaltered by this deploy)**: `AIC-C814766E`'s `camera_scan_jobs` now shows 10 rows total (the original 6 from the diagnosis pass, plus 4 more the customer created before this fix went live) — every single one `status=complete`/`progress=100` with its own correct discovery results; none were modified, re-run, or deleted. `customer_entitlements` still `camera_slot_quantity=8`/`active`; `cameras` still 8 (all still placeholders, `device_key=NULL` — Fix 1 only changes job *creation*, never touches `cameras`). **No physical scan was re-run, no cameras were provisioned, and no existing discovery result was modified during this deployment or its verification. Ryzen and Samsung were not touched; Motion Cloud was not enabled.**
+
+### State to resume from
+
+The idempotency guard and UI protection are live. The customer can resume from Step 4 now: clicking "Request appliance scan" will either reuse whichever job (if any) is still in flight from the earlier pileup, or — since all 10 existing jobs are already `complete` — open a fresh one that behaves normally and completes in ~24s, with the button correctly disabled/labeled while it runs. The 5 already-discovered devices are unchanged and available for the customer to review before choosing to add any of them (Step 4's "Add this camera" flow) — not touched by this pass.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
