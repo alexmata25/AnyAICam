@@ -101,6 +101,37 @@ logger = logging.getLogger("anyaicam.recording_uploader")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
 RECORDING_UPLOAD_ENABLED = os.environ.get("ANYAICAM_RECORDING_UPLOAD_ENABLED", "false").strip().lower() == "true"
+# Unset (the default, None) means "no restriction" -- this must never
+# narrow existing behavior for a caller that doesn't set it. A comma-
+# separated allowlist (e.g. "1") lets a single camera be validated in
+# production before this is widened to the rest -- a camera_number
+# outside this set is skipped entirely in recording_upload_worker()'s
+# own loop below, before _ensure_session() is ever called for it, so an
+# out-of-scope camera generates zero credential/upload traffic of any
+# kind. Mirrors analytics_sync.py's own SYNC_CAMERA_SCOPE exactly.
+_raw_camera_scope = os.environ.get("ANYAICAM_RECORDING_UPLOAD_CAMERAS", "").strip()
+RECORDING_UPLOAD_CAMERA_SCOPE: frozenset[int] | None = (
+    frozenset(int(item) for item in _raw_camera_scope.split(",") if item.strip().isdigit())
+    if _raw_camera_scope
+    else None
+)
+# Unset (the default, None) means "no total limit" -- existing production
+# behavior (drain the whole backlog over time) is completely unchanged
+# for anyone who doesn't set this. When set, this is a HARD, total,
+# process-lifetime cap per camera -- unlike RECORDING_UPLOAD_MAX_FILES_
+# PER_SCAN below (which only bounds one scan's own attempt count, so an
+# indefinitely-running worker still eventually drains an entire
+# backlog), this makes recording_upload_worker() stop calling
+# _relay_camera_once() for a camera entirely, for the rest of this
+# process's life, the moment _uploaded_files already has this many
+# successfully-uploaded filenames recorded for it -- regardless of how
+# many scans run or how long the worker keeps running. Built for exactly
+# one purpose: a controlled, one-recording validation window that
+# can't accidentally sweep up a historical backlog even if left running
+# longer than intended.
+RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA = (
+    int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA", "").strip() or 0) or None
+)
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
@@ -750,6 +781,19 @@ def _remember_uploaded(camera_number: int, filename: str) -> None:
     del uploaded[:-MAX_TRACKED_FILES_PER_CAMERA]
 
 
+def _camera_at_or_over_total_cap(camera_number: int) -> bool:
+    """See RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA's own comment --
+    None (unset) always returns False here, so this is a pure no-op for
+    every existing caller that doesn't set the env var. Reuses
+    _uploaded_files, the same bookkeeping _remember_uploaded() already
+    maintains on every real success -- no new persistent state, and the
+    count this checks is exactly "files this process has actually
+    uploaded and cataloged so far," never an estimate."""
+    if RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA is None:
+        return False
+    return len(_uploaded_files.get(camera_number, [])) >= RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA
+
+
 def _create_recording_thumbnail(mp4_path: Path, camera_number: int) -> Path | None:
     """Extract a small JPEG preview from the already-prepared cloud MP4.
 
@@ -980,6 +1024,10 @@ async def recording_upload_worker() -> None:
                 await asyncio.to_thread(_refresh_camera_map)
                 last_config_refresh = now
             for camera_number in _known_camera_numbers():
+                if RECORDING_UPLOAD_CAMERA_SCOPE is not None and camera_number not in RECORDING_UPLOAD_CAMERA_SCOPE:
+                    continue
+                if _camera_at_or_over_total_cap(camera_number):
+                    continue
                 identity = _camera_identity(camera_number)
                 if not identity:
                     continue
