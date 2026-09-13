@@ -1747,6 +1747,48 @@ The idempotency guard and UI protection are live. The customer can resume from S
 
 ---
 
+## 2026-09-13: Camera 1 blockers source-fixed (commit `6d6dcd5`) — deployed to `anyaicam-staging`; Ryzen artifact built, hash-verified, and staged — **install still pending the operator's own hands**
+
+Three fixes traced from Camera 1 (`AIC-C814766E`, `dfba6a63ec`) provisioning fully on the cloud but never becoming functional locally, and consuming a 9th camera row instead of one of the 8 licensed placeholders:
+
+1. `app/main.py`: `/api/local/provisioned-camera-credential` added to `PUBLIC_PATH_PREFIXES` (same defect class, same fix already used once for `/api/provisioning/refresh` — confirmed live: every call was rejected 401 by `authentication_middleware` before the route's own checks ever ran).
+2. `app/main.py`: new `_docker_bridge_gateway_ip()` (reads `/proc/net/route`, cached) — the endpoint's own loopback check now also accepts this one dynamically-resolved address, accounting for Docker's hairpin-NAT rewrite of a host-originated call to its own published port (confirmed live: arrives as `172.18.0.1`, not `127.0.0.1`) without trusting any subnet or broader RFC1918 range. The mandatory appliance bearer-credential check is unchanged.
+3. `app/appliance_cloud.py`, `appliance_submit_provisioning()`: a genuinely new `device_key` now consumes the oldest available same-customer/site/appliance placeholder (`device_key IS NULL`, `status='pending_installation'`) instead of always inserting a new row; falls back to insert only when none exists; the pre-existing "already-known device_key" reprovision branch is untouched and still checked first.
+
+**Tests**: 9 new (5 in `test_local_provisioned_camera_credential_endpoint.py`, 4 in `test_camera_discovery_provisioning.py`) — gateway-address acceptance/rejection scoping, bearer-credential still mandatory from the trusted address, fails-closed when the gateway can't be resolved, `PUBLIC_PATH_PREFIXES` regression; placeholder consumption, idempotent reprovision (no second placeholder consumed), cross-tenant isolation, no-placeholder fallback. All pass. Full suite: identical 84 pre-existing failures before/after (empty diff of sorted `FAILED` lists), 1672 passed (+9).
+
+**Deployed to `anyaicam-staging`** (`portal-green`, `deploy-portal:6d6dcd5`) — pre-deploy DB/source backups taken, source hash verified end-to-end, env confirmed byte-identical to the prior known-good deploy before reuse. Post-deploy: exactly one `portal-green`, `/health` 200, `main.py`/`appliance_cloud.py` hashes match the commit byte-for-byte, DB integrity ok, route registered and `PUBLIC_PATH_PREFIXES` entry confirmed present. Read-only re-check: Camera 1, all 8 placeholders, and the entitlement completely unchanged by this deploy.
+
+### Ryzen — versioned artifact built and staged, install NOT yet run
+
+`/api/local/provisioned-camera-credential` and its auth logic run inside **Ryzen's own `anyaicam-vms` container** (edge role), not on `anyaicam-staging` — deploying to staging alone does not fix Camera 1's local delivery. Per this project's own standing rule (no sudo access by design; every prior real install on this box — including `aa4dc2e` itself, see the 2026-09-12 "manual, by the operator" entry above — was run by the operator, never by an automated session), the actual `install.sh` run must be done by the operator, not driven here.
+
+Built via the established versioned pipeline (`installer/build_release_installer.py --vms-commit 6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c --vms-repo .`):
+- **Artifact**: `anyaicam-appliance-installer-1.1.0-vms-6d6dcd5d6e66.tar.gz`
+- **Artifact SHA-256**: `168fdb44fd9601258df1e2fe5ba0095829bfa1a2a0bdcfbe0e7ada389e074357` — verified identical after `scp` to Ryzen (`/home/alejandro-mata/anyaicam-appliance-installer-1.1.0-vms-6d6dcd5d6e66.tar.gz`) and after extraction to `~/anyaicam-install-6d6dcd5/` on Ryzen.
+- **VMS release commit**: `6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c`; `release_source_sha256=0089a1d909b21d659ced6be499f292a97a8e3a7d388bfe5033fbff8caf13535a`.
+- Appliance-agent bundled unchanged (this fix touches only `app/main.py`/`app/appliance_cloud.py`) — a repair install is expected to be a no-op for the agent side.
+
+**Pre-install baseline captured (read-only), for post-install comparison**:
+
+| Check | Value |
+|---|---|
+| `/version` `build_id` | `aa4dc2edb135e379631a9d17db8923e56a202ed9` |
+| `/version` `cloud_id` | `AIC-C814766E` |
+| `anyaicam-vms` container image id | `sha256:3d3cfefd0c40a4...` |
+| `anyaicam-vms` container started | `2026-09-12T15:13:52Z` |
+| `anyaicam-agent.service` `ActiveEnterTimestamp` / `NRestarts` | `Sat 2026-09-12 16:33:38 CDT` / `0` |
+| Local `cameras` / `camera_credentials` / `pending_camera_credentials` | `12` / `0` / `0` |
+| `appliance_identity.json` SHA-256 | `2c32127ffb097195a66d8332698506ede1f7059bfdbe3d9ce9212eed21cc24be` |
+
+**Not executed**: `sudo ./install.sh` (repair path) on Ryzen — this requires the operator's own hands. The artifact is staged and hash-verified at `~/anyaicam-install-6d6dcd5/` on Ryzen, ready to run.
+
+### State to resume from
+
+Once the operator runs the install and reports the result, complete the read-only post-install verification against the baseline above (build_id now `6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c`, appliance stays `AIC-C814766E`, agent re-authenticates, heartbeat resumes, `pending_camera_credentials`/`camera_credentials` counts unchanged since no reprovisioning happens as part of this install, `appliance_identity.json` hash unchanged, `/api/local/provisioned-camera-credential` present and gated by both the gateway-IP check and the bearer credential). Camera 1 reprovisioning and the placeholder reconciliation both remain explicitly not-yet-authorized next steps.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
