@@ -825,11 +825,44 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         (job['camera_name'],appliance['id'],job['site_id'],camera_id),
                     )
                 else:
-                    camera_id=secrets.token_hex(5)
-                    db.execute(
-                        'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
-                        (camera_id,job['customer_id'],job['site_id'],appliance['id'],job['device_key'],job['camera_name'],'configured',now),
-                    )
+                    # Placeholder-consumption fix (confirmed live,
+                    # 2026-09-13): a customer's purchased camera-slot
+                    # entitlement is represented up front as N placeholder
+                    # `cameras` rows (device_key IS NULL, status=
+                    # 'pending_installation'; see partner_workspace.py's
+                    # provision_customer_appliance()/onboard_customer(),
+                    # one INSERT per licensed slot) -- created precisely so
+                    # Step 5/6 and /api/customer/cameras have something to
+                    # count against before any real device is discovered.
+                    # Before this fix, a genuinely new device_key always
+                    # inserted a brand-new row here regardless, leaving
+                    # every placeholder as a permanent, never-consumed dead
+                    # row: an 8-slot customer who provisions 1 real camera
+                    # ended up with 9 total rows (8 placeholders + 1 real),
+                    # not 8. The entitlement cap above still correctly
+                    # bounded how many rows could ever get a real
+                    # device_key -- this only fixes which row that
+                    # device_key lands on. Scoped to this exact customer/
+                    # site/appliance -- a placeholder belonging to any
+                    # other tenant, site, or appliance is never touched or
+                    # selected. Oldest-first (created_at) purely for
+                    # determinism; every placeholder is otherwise identical.
+                    placeholder=db.execute(
+                        "SELECT id FROM cameras WHERE customer_id=? AND site_id=? AND appliance_id=? AND device_key IS NULL AND status='pending_installation' ORDER BY created_at LIMIT 1",
+                        (job['customer_id'],job['site_id'],appliance['id']),
+                    ).fetchone()
+                    if placeholder:
+                        camera_id=placeholder['id']
+                        db.execute(
+                            "UPDATE cameras SET device_key=?,name=?,status='configured' WHERE id=?",
+                            (job['device_key'],job['camera_name'],camera_id),
+                        )
+                    else:
+                        camera_id=secrets.token_hex(5)
+                        db.execute(
+                            'INSERT INTO cameras(id,customer_id,site_id,appliance_id,device_key,name,status,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                            (camera_id,job['customer_id'],job['site_id'],appliance['id'],job['device_key'],job['camera_name'],'configured',now),
+                        )
                 # A camera provisioned through this appliance-driven async
                 # path previously never received a camera_number at all --
                 # confirmed live on Samsung: live-view start requests 409'd

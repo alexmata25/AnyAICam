@@ -40536,6 +40536,18 @@ PUBLIC_PATH_PREFIXES = (
     # (provisioning_api.py) is deliberately browser-session-authenticated
     # (_customer_owner()) and must stay behind this middleware.
     "/api/provisioning/refresh",
+    # Same exact defect, same fix, confirmed live (2026-09-13): the
+    # appliance-agent's own one-time local credential handoff (POST
+    # .../provisioned-camera-credential, see main.py's own
+    # provisioned_camera_credential()) got a generic 401 "Authentication
+    # required" from THIS middleware, and its own loopback+bearer checks
+    # were never reached at all -- confirmed via a real failed delivery
+    # in anyaicam-vms's own access log (Camera 1, AIC-C814766E). An
+    # exact-path entry, same reasoning as /api/provisioning/refresh
+    # above: this is the only route under /api/local/, so a broader
+    # prefix isn't needed, and an exact path is the more conservative
+    # choice regardless if that ever changes.
+    "/api/local/provisioned-camera-credential",
 
 
 
@@ -47553,6 +47565,60 @@ def version_endpoint() -> dict:
     }
 
 
+_DOCKER_GATEWAY_IP_CACHE: dict = {}
+
+
+def _docker_bridge_gateway_ip() -> str | None:
+    """This container's own default-route gateway, read fresh from
+    /proc/net/route and cached in-process (the route doesn't change
+    during a container's lifetime, so one read is enough).
+
+    Exists for exactly one reason: confirmed live (2026-09-13) that a
+    genuine call from the appliance-agent -- a host-level systemd
+    process on Ryzen -- to this exact box's own published loopback port
+    (http://127.0.0.1:8000/...) arrives inside the anyaicam-vms
+    container with source address 172.18.0.1, not 127.0.0.1. This is
+    standard Docker behavior, not a misconfiguration: port publishing
+    only needs to rewrite ("hairpin NAT") the source address to the
+    bridge gateway for the specific case of the HOST talking to its own
+    published port on localhost, because the container's own network
+    namespace has no route back to a literal 127.0.0.1 peer -- the
+    gateway address is the one the container CAN route a reply through.
+    A genuinely external LAN or remote caller hitting this same
+    published port (0.0.0.0:8000, confirmed not loopback-restricted at
+    the Docker layer -- see this endpoint's own docstring) is not
+    subject to this rewrite at all: their own real source address
+    reaches the container untouched, since there is no localhost-
+    loopback ambiguity for Docker to resolve in that case.
+
+    Trusting this ONE dynamically-read address (never a subnet, never
+    127.0.0.0/8 broadened, never an arbitrary RFC1918 range) is
+    therefore exactly as narrow as trusting literal loopback was always
+    meant to be on a non-containerized host: it identifies "this exact
+    box, via Docker's own hairpin path to itself," never "anything else
+    on this network." Returns None (never a wildcard) if the route
+    can't be determined, in which case only literal loopback is
+    accepted -- failing closed, not open."""
+    if "value" in _DOCKER_GATEWAY_IP_CACHE:
+        return _DOCKER_GATEWAY_IP_CACHE["value"]
+    gateway = None
+    try:
+        with open("/proc/net/route", "r", encoding="ascii") as handle:
+            next(handle, None)  # header row
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 3 or fields[1] != "00000000":
+                    continue
+                hex_gateway = fields[2]
+                if len(hex_gateway) == 8:
+                    gateway = ".".join(str(int(hex_gateway[i:i + 2], 16)) for i in (6, 4, 2, 0))
+                break
+    except (OSError, ValueError, IndexError):
+        gateway = None
+    _DOCKER_GATEWAY_IP_CACHE["value"] = gateway
+    return gateway
+
+
 @app.post("/api/local/provisioned-camera-credential")
 def provisioned_camera_credential(request: Request, payload: dict) -> dict:
     """Cloud->edge camera-configuration sync (2026-09-12), local half.
@@ -47596,7 +47662,11 @@ def provisioned_camera_credential(request: Request, payload: dict) -> dict:
     Never logs, returns, or echoes username/password in any form -- the
     response and every error path below carry only a message string."""
     client_host = request.client.host if request.client else None
-    if client_host not in ("127.0.0.1", "::1", "localhost"):
+    allowed_hosts = {"127.0.0.1", "::1", "localhost"}
+    gateway_ip = _docker_bridge_gateway_ip()
+    if gateway_ip:
+        allowed_hosts.add(gateway_ip)
+    if client_host not in allowed_hosts:
         raise HTTPException(status_code=403, detail="This endpoint is only reachable from the appliance's own loopback interface.")
 
     identity = own_appliance_identity()

@@ -138,3 +138,77 @@ def test_missing_device_key_is_rejected(db_path):
         _call(db_path, "127.0.0.1", "Bearer self-credential", {"device_key": "", "username": "admin", "password": "hunter2"})
     assert getattr(excinfo.value, "status_code", None) == 400
     assert _pending_rows(db_path) == []
+
+
+# --------------------------------------------- Docker hairpin-NAT gateway (2026-09-13)
+#
+# Confirmed live: the appliance-agent's own call to this exact box's
+# published loopback port (http://127.0.0.1:8000/...) arrives inside the
+# anyaicam-vms container with source address 172.18.0.1, not 127.0.0.1 --
+# standard Docker hairpin-NAT behavior for "the host talking to its own
+# published port", not a misconfiguration. main._docker_bridge_gateway_ip()
+# is monkeypatched directly rather than relying on a real /proc/net/route
+# (not present on every test-running OS, and irrelevant to what these
+# tests actually verify: that trusting the resolved gateway is narrow,
+# not a broadened subnet/RFC1918 allowance).
+
+
+def test_the_resolved_docker_gateway_ip_is_accepted_with_correct_credential(db_path, monkeypatch):
+    monkeypatch.setattr(main, "_docker_bridge_gateway_ip", lambda: "172.18.0.1")
+    result = _call(db_path, "172.18.0.1", "Bearer self-credential", {"device_key": "urn:uuid:gw1", "username": "admin", "password": "hunter2"})
+    assert "message" in result
+    assert len(_pending_rows(db_path)) == 1
+
+
+def test_a_different_nonlocal_address_is_still_rejected_even_with_a_gateway_configured(db_path, monkeypatch):
+    """Proves the fix is exactly one dynamically-resolved address, never a
+    broadened subnet or arbitrary RFC1918 allowance: a real LAN/remote
+    address distinct from the one true gateway must still be refused."""
+    monkeypatch.setattr(main, "_docker_bridge_gateway_ip", lambda: "172.18.0.1")
+    with pytest.raises(Exception) as excinfo:
+        _call(db_path, "192.168.0.55", "Bearer self-credential", {"device_key": "urn:uuid:gw2", "username": "admin", "password": "hunter2"})
+    assert getattr(excinfo.value, "status_code", None) == 403
+    assert _pending_rows(db_path) == []
+
+
+def test_gateway_address_without_the_correct_bearer_credential_is_still_rejected(db_path, monkeypatch):
+    """The bearer credential remains the actual authority even from the
+    trusted gateway address -- the IP check narrows WHERE a call can come
+    from, it never substitutes for WHO is allowed to call."""
+    monkeypatch.setattr(main, "_docker_bridge_gateway_ip", lambda: "172.18.0.1")
+    with pytest.raises(Exception) as excinfo:
+        _call(db_path, "172.18.0.1", "Bearer wrong-credential", {"device_key": "urn:uuid:gw3", "username": "admin", "password": "hunter2"})
+    assert getattr(excinfo.value, "status_code", None) == 403
+    assert _pending_rows(db_path) == []
+
+
+def test_when_the_gateway_cannot_be_determined_only_literal_loopback_is_accepted(db_path, monkeypatch):
+    """Fails closed, never open: if /proc/net/route can't be read or
+    parsed, no address is silently trusted beyond literal loopback."""
+    monkeypatch.setattr(main, "_docker_bridge_gateway_ip", lambda: None)
+    with pytest.raises(Exception) as excinfo:
+        _call(db_path, "172.18.0.1", "Bearer self-credential", {"device_key": "urn:uuid:gw4", "username": "admin", "password": "hunter2"})
+    assert getattr(excinfo.value, "status_code", None) == 403
+    result = _call(db_path, "127.0.0.1", "Bearer self-credential", {"device_key": "urn:uuid:gw4", "username": "admin", "password": "hunter2"})
+    assert "message" in result
+
+
+# ------------------------------------- exempt from the global session-auth middleware
+
+
+def test_route_is_exempt_from_the_global_browser_auth_middleware():
+    """Regression for the actual confirmed-live bug: this file's own
+    _call() helper invokes provisioned_camera_credential() directly, so
+    every test above it passes even when the real deployed app would 401
+    every appliance-agent request before this route's own loopback+bearer
+    checks are ever reached. Confirmed via a real failed delivery in
+    anyaicam-vms's own access log (Camera 1, AIC-C814766E): a genuine
+    loopback call with the correct bearer credential got a generic 401
+    "Authentication required" from main.authentication_middleware, not
+    from this route. Fixed the same way /api/provisioning/refresh was:
+    an exact-path entry in PUBLIC_PATH_PREFIXES, not a broader "/api/local/"
+    prefix (this is currently the only route under that prefix, but an
+    exact path is the more conservative choice regardless)."""
+    assert "/api/local/provisioned-camera-credential" in main.PUBLIC_PATH_PREFIXES
+    covered = lambda path: any(path == prefix or path.startswith(prefix) for prefix in main.PUBLIC_PATH_PREFIXES)
+    assert covered("/api/local/provisioned-camera-credential")

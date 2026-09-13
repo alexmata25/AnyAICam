@@ -654,6 +654,130 @@ def test_reprovisioning_the_same_device_key_updates_not_duplicates(db_path, monk
     assert cameras[0][0] == "Front Door Renamed"
 
 
+# --------------------------------------- placeholder consumption (confirmed-live
+# bug, 2026-09-13): an 8-slot customer's purchased entitlement is
+# represented up front as 8 placeholder `cameras` rows (device_key IS
+# NULL, status='pending_installation'). Before this fix, a genuinely new
+# device_key always inserted a brand-new row regardless, leaving every
+# placeholder dead and forever un-consumed -- an 8-slot customer who
+# provisioned 1 real camera ended up with 9 total rows, not 8.
+
+
+def _seed_placeholder_cameras(conn, count, customer_id="cust-1", site_id=None, appliance_id="appl-1", start=1):
+    site_id = site_id or f"site-{customer_id}"
+    for i in range(start, start + count):
+        conn.execute(
+            "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at) VALUES(?,?,?,?,?,?,?)",
+            (f"placeholder-{customer_id}-{i}", customer_id, site_id, appliance_id, f"Camera {i}", "pending_installation", f"2026-01-01T00:00:{i:02d}"),
+        )
+    conn.commit()
+
+
+def test_provisioning_a_new_device_consumes_an_available_placeholder_not_a_new_row(db_path, monkeypatch):
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 8)
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        _seed_placeholder_cameras(conn, 8)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-new", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": True, "message": "Verified."})
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+        total = conn2.execute("SELECT COUNT(*) c FROM cameras WHERE customer_id='cust-1'").fetchone()["c"]
+        configured = conn2.execute("SELECT * FROM cameras WHERE device_key='onvif-uuid-new'").fetchone()
+        remaining_placeholders = conn2.execute("SELECT COUNT(*) c FROM cameras WHERE customer_id='cust-1' AND device_key IS NULL").fetchone()["c"]
+    assert total == 8  # never 9 -- a placeholder was consumed, not appended to
+    assert configured is not None
+    assert configured["status"] == "configured"
+    assert configured["name"] == "Front Door"
+    assert configured["id"].startswith("placeholder-cust-1-")  # the placeholder row itself, reused
+    assert remaining_placeholders == 7
+
+
+def test_reprovisioning_the_same_device_key_does_not_consume_a_second_placeholder(db_path, monkeypatch):
+    """Idempotency by device_key: the pre-existing 'existing device_key'
+    branch must still take priority over placeholder consumption -- a
+    reprovision of an already-known camera is not a new camera and must
+    never eat a second placeholder slot."""
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 8)
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        _seed_placeholder_cameras(conn, 8)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job1 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-new", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job1["job_id"], {"success": True})
+        job2 = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-new", "name": "Front Door Renamed"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job2["job_id"], {"success": True})
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+        total = conn2.execute("SELECT COUNT(*) c FROM cameras WHERE customer_id='cust-1'").fetchone()["c"]
+        remaining_placeholders = conn2.execute("SELECT COUNT(*) c FROM cameras WHERE customer_id='cust-1' AND device_key IS NULL").fetchone()["c"]
+    assert total == 8
+    assert remaining_placeholders == 7  # still 7, not 6 -- the second call never touched another one
+
+
+def test_placeholder_consumption_never_crosses_customer_site_or_appliance_boundaries(db_path, monkeypatch):
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 8)
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, customer_id="cust-1", appliance_id="appl-1", cloud_id="AIC-TEST1")
+        _seed(conn, customer_id="cust-2", appliance_id="appl-2", cloud_id="AIC-TEST2")
+        _seed_placeholder_cameras(conn, 1, customer_id="cust-1", appliance_id="appl-1")
+        _seed_placeholder_cameras(conn, 1, customer_id="cust-2", appliance_id="appl-2")
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity(customer_id="cust-1"))
+        job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-new", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers(appliance_id="appl-1")), "AIC-TEST1", job["job_id"], {"success": True})
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+        cust2_placeholder = conn2.execute("SELECT * FROM cameras WHERE customer_id='cust-2'").fetchone()
+        cust1_total = conn2.execute("SELECT COUNT(*) c FROM cameras WHERE customer_id='cust-1'").fetchone()["c"]
+    # cust-2's own placeholder is completely untouched -- never selected,
+    # never consumed, regardless of it being the "oldest" or only one
+    # matching by coincidence of naming.
+    assert cust2_placeholder["device_key"] is None
+    assert cust2_placeholder["status"] == "pending_installation"
+    assert cust1_total == 1  # cust-1's own single placeholder, consumed in place
+
+
+def test_no_placeholder_available_falls_back_to_creating_a_new_row(db_path, monkeypatch):
+    """Never breaks the case this fix doesn't apply to: a customer with
+    no (or no more) placeholder rows -- e.g. admin-onboarded before this
+    architecture existed -- must still be able to provision a real
+    camera via a plain new row, exactly as before this fix."""
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 1)
+    request_camera_provisioning = _route("/api/customer/cameras/provision", "POST")
+    appliance_submit_provisioning = _route("/api/appliance/{cloud_id}/provisioning-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)  # zero placeholders seeded
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job = request_camera_provisioning(_fake_request(), {"appliance_id": "appl-1", "device_key": "onvif-uuid-new", "name": "Front Door"})
+        appliance_submit_provisioning(_fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"], {"success": True})
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+        camera = conn2.execute("SELECT * FROM cameras WHERE device_key='onvif-uuid-new'").fetchone()
+        total = conn2.execute("SELECT COUNT(*) c FROM cameras WHERE customer_id='cust-1'").fetchone()["c"]
+    assert camera is not None
+    assert camera["status"] == "configured"
+    assert total == 1
+
+
 # ------------------------------------------------- camera_number assignment
 #
 # Regression coverage for the confirmed-live Samsung gap: this async,
