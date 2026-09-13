@@ -2039,3 +2039,30 @@ While the 5-camera check was in progress, the operator reported a real, reproduc
 ### State to resume from
 
 **Stopping here, as instructed.** The operator needs to reproduce, in their own browser: Camera 1 playing -> double-click/enlarge -> return to grid -> confirm Camera 1 automatically resumes without a manual refresh. The 5-camera concurrent load/CPU/RAM/relay-health check (started, then paused for this bug) resumes only after that reconnect behavior is confirmed. Cameras 2-5's relays are, as of this writing, still running (confirmed via advancing manifest sequences at the moment of the last check) -- their own individual browser-side verification and the concurrent-load check remain the explicit next step, not yet done.
+
+---
+
+## 2026-09-13 (later): HLS reconnect fix `171409a` USER-CONFIRMED in browser. Five-camera concurrent Live Relay measured -- all healthy, no errors, one real capacity/latency finding recorded for a future pass, no action taken.
+
+**Fix `171409a` (HLS.js fatal-error auto-recovery) is USER-CONFIRMED.** The operator personally reproduced the exact prior failure sequence -- Camera 1 playing, double-click/enlarge, return to grid -- and confirmed Camera 1's video now resumes automatically with no manual refresh.
+
+**Five-camera concurrent Live Relay: measured, not optimized, per explicit instruction.** All five cameras' relays were already running (activated in the prior session entry); this pass is a pure read-only snapshot of their concurrent health.
+
+**Relay/manifest health -- all 5 confirmed simultaneously healthy:**
+- Cloud `appliance_camera_status` for all five: `online=1`, `recording=1`, `last_error=None`, identical fresh `updated_at`.
+- `anyaicam-agent.service`: `NRestarts=0`, active/running. `anyaicam-vms` Docker container: `RestartCount=0`, `healthy`. No crash-looping anywhere.
+- Zero `WARNING`/`ERROR` lines from `live_relay_uploader` in the most recent 5-minute window.
+- No dropped-frame growth observed live (Camera 5 had a small, non-growing historical count of 99 dropped frames out of ~110,000 -- ~0.09%, accumulated at some earlier point and stable, not currently degrading; Cameras 1/4 similarly small and stable).
+
+**Ryzen-side resource usage (server-side only -- has zero relationship to the operator's own remote viewing connection; see note below):**
+- Host: 8 cores, `load average 31.05, 30.35, 29.39` (1/5/15-min) -- high relative to core count, but **not new and not caused by Live Relay**: traced to the pre-existing per-camera pipeline that was already running identically before Live Relay was ever enabled -- for each of the 5 cameras, one HLS-transcode `ffmpeg` (libx264, the highest-CPU process per camera), one stream-copy recording `ffmpeg`, and two low-res grayscale motion-analysis `ffmpeg` extracts (20 `ffmpeg` processes total), plus the one shared `uvicorn` process (66.7% CPU) that Live Relay's own upload work runs inside of. **Live Relay itself spawns no new `ffmpeg` process at all** -- it only reads `.ts` files the existing per-camera encoder already produces and uploads them via boto3/S3, adding Python-level HTTP+S3 work inside the already-running app process, not new encode load.
+- Memory: 12GiB total, ~1GiB free, 7.7GiB in buff/cache (reclaimable), **1.2GiB swapped** -- worth watching, not acted on.
+- Real, Ryzen-side-only upload latency measured directly (local segment file mtime vs. the cloud manifest's own `received_at` for the same segment, both timestamps taken independent of any browser): under all-five-concurrent load, per-camera freshness **oscillates roughly 1-34 seconds** rather than holding a steady ~2-4 second cadence, because `live_relay_uploader.py`'s single worker loop services all 5 cameras **serially** in one tick, each involving a real network round trip (session mint/reuse + S3 PutObject + segment-available notify) -- so the effective per-camera update interval under 5-camera concurrency is meaningfully longer than the ~2-second segment duration, occasionally brushing the `STALE_MANIFEST_SECONDS=30` threshold. This is a real, measured capacity/latency finding worth a future optimization pass (e.g. concurrent per-camera uploads instead of serial) -- **not acted on in this pass**, per explicit instruction that this was measurement only.
+
+**Distinguishing Ryzen-side from the operator's own remote-viewing connection (explicitly requested):** every metric above -- CPU, RAM, load average, frame drops, and the upload-latency measurement -- was captured entirely between Ryzen and AWS (S3 write + a cloud DB/API read), with no dependency whatsoever on the operator's own browser or their described unusually-slow remote internet connection. The upload path (Ryzen -> S3 -> CloudFront) and the operator's own viewing/download path (their browser -> CloudFront) are two independent network legs; nothing measured here can be affected by the operator's own connection speed, and nothing about the operator's own connection speed can be inferred from these numbers. Any choppiness or delay the operator personally observes while watching is happening on the CloudFront-to-browser leg, not the leg measured in this pass.
+
+No optimization change, AWS resource change, camera configuration change, or code change was made during this measurement pass.
+
+### State to resume from
+
+Both the reconnect fix and the five-camera concurrent relay are now verified -- one in-browser by the operator, one server-side by this session. The one real, non-urgent finding recorded above (serial per-camera upload latency under 5-camera concurrency) is available for a future, separately-authorized optimization pass whenever the operator wants to take it up. No other camera, credential, binding, provisioning, AWS, Samsung, or Motion Cloud item was touched.
