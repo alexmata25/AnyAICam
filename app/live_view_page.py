@@ -590,8 +590,11 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }};
   }});
 
+  const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
+
   function setStatus(id,text){{tiles[id].status.textContent=text}}
   function stopPolling(id){{if(tiles[id].pollTimer){{clearTimeout(tiles[id].pollTimer);tiles[id].pollTimer=null}}}}
+  function destroyHls(id){{const tile=tiles[id];if(tile.hls){{try{{tile.hls.destroy()}}catch(e){{}}tile.hls=null}}}}
 
   async function stopSession(id,isUnload){{
     const tile=tiles[id];
@@ -623,16 +626,37 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     tile.pollTimer=setTimeout(()=>pollPlaylist(id,deadline),pollIntervalMs);
   }}
 
+  function handleFatalError(id,data){{
+    // Fatal-error recovery (2026-09-13): mirrors the single-camera
+    // page's own handleFatalError() -- see that function's own comment
+    // for the full root-cause trace. Scoped per-tile via `tiles[id]` so
+    // one camera's error/recovery cycle can never affect another's.
+    const tile=tiles[id];
+    if(tile.stopped)return;
+    tile.recoveryAttempts=(tile.recoveryAttempts||0)+1;
+    if(tile.recoveryAttempts<=MAX_INPLACE_RECOVERY_ATTEMPTS){{
+      setStatus(id,'Reconnecting…');
+      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){{tile.hls.startLoad();return}}
+      if(data.type===Hls.ErrorTypes.MEDIA_ERROR){{tile.hls.recoverMediaError();return}}
+    }}
+    destroyHls(id);
+    tile.placeholder.hidden=false;
+    setStatus(id,'Reconnecting…');
+    stopPolling(id);
+    pollPlaylist(id,Date.now()+pollTimeoutMs);
+  }}
+
   function attachPlayer(id,playlistUrl){{
     const tile=tiles[id];
     stopPolling(id);
+    destroyHls(id);  // guards against ever running two instances at once
     setStatus(id,'Connecting…');
     if(window.Hls&&Hls.isSupported()){{
       tile.hls=new Hls();
       tile.hls.loadSource(playlistUrl);
       tile.hls.attachMedia(tile.video);
-      tile.hls.on(Hls.Events.MANIFEST_PARSED,()=>{{tile.placeholder.hidden=true;tile.video.play().catch(()=>{{}})}});
-      tile.hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)setStatus(id,'Reconnecting…')}});
+      tile.hls.on(Hls.Events.MANIFEST_PARSED,()=>{{tile.placeholder.hidden=true;tile.recoveryAttempts=0;tile.video.play().catch(()=>{{}})}});
+      tile.hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(id,data)}});
     }}else if(tile.video.canPlayType('application/vnd.apple.mpegurl')){{
       tile.video.src=playlistUrl;
       tile.video.addEventListener('loadedmetadata',()=>{{tile.placeholder.hidden=true;tile.video.play().catch(()=>{{}})}});
@@ -643,7 +667,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   async function startSession(id){{
     const tile=tiles[id];
-    tile.stopped=false;setStatus(id,'Starting live view…');
+    tile.stopped=false;tile.recoveryAttempts=0;setStatus(id,'Starting live view…');
     let response;
     try{{response=await fetch(`/api/customer/cameras/${{id}}/live/start`,{{method:'POST'}})}}catch(e){{showUnavailable(id);return}}
     if(!response.ok){{showUnavailable(id);return}}
@@ -947,10 +971,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const bookmarkButton=document.getElementById('live-view-bookmark');
   const stopButton=document.getElementById('live-view-stop');
   const retryButton=document.getElementById('live-view-retry');
-  let sessionId=null, hls=null, pollTimer=null, stopped=false;
+  let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
+  const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
 
   function setStatus(text){{statusLabel.textContent=text}}
   function stopPolling(){{if(pollTimer){{clearTimeout(pollTimer);pollTimer=null}}}}
+  function destroyHls(){{if(hls){{try{{hls.destroy()}}catch(e){{}}hls=null}}}}
 
   async function stopSession(isUnload){{
     if(!sessionId||stopped)return;
@@ -985,15 +1011,50 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     pollTimer=setTimeout(()=>pollPlaylist(deadline),pollIntervalMs);
   }}
 
+  function handleFatalError(data){{
+    // Fatal-error recovery (2026-09-13): confirmed live -- a brief,
+    // already-self-healing relay/upload gap (the same transient-blip
+    // category documented elsewhere in this project) briefly starved
+    // this camera's manifest, hls.js surfaced that as a fatal error, and
+    // the ONLY thing that used to happen here was setStatus('Reconnecting…')
+    // -- a label change with no actual recovery action, so the player
+    // stayed dead forever even once the underlying stream had fully
+    // recovered server-side. NETWORK_ERROR/MEDIA_ERROR get hls.js's own
+    // documented in-place recovery calls first (bounded by
+    // MAX_INPLACE_RECOVERY_ATTEMPTS, reset on the next successful
+    // MANIFEST_PARSED, so a persistently broken stream doesn't retry
+    // forever in place); anything else -- or exhausting those attempts --
+    // falls back to a full teardown and reattachment through the exact
+    // same bounded playlist-poll flow a fresh page load already uses.
+    // The still-valid live_view_session/relay is never restarted here --
+    // only the browser-side player -- and pollPlaylist's own
+    // pollTimeoutMs deadline is what eventually shows "unavailable" if
+    // the stream genuinely never returns, so no separate give-up path is
+    // needed in this function.
+    if(stopped)return;
+    recoveryAttempts++;
+    if(recoveryAttempts<=MAX_INPLACE_RECOVERY_ATTEMPTS){{
+      setStatus('Reconnecting…');
+      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();return}}
+      if(data.type===Hls.ErrorTypes.MEDIA_ERROR){{hls.recoverMediaError();return}}
+    }}
+    destroyHls();
+    placeholder.hidden=false;
+    setStatus('Reconnecting…');
+    stopPolling();
+    pollPlaylist(Date.now()+pollTimeoutMs);
+  }}
+
   function attachPlayer(){{
     stopPolling();
+    destroyHls();  // guards against ever running two instances at once
     setStatus('Connecting…');
     if(window.Hls&&Hls.isSupported()){{
       hls=new Hls();
       hls.loadSource(playlistUrl);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
-      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)setStatus('Reconnecting…')}});
+      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;recoveryAttempts=0;video.play().catch(()=>{{}})}});
+      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(data)}});
     }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
       video.src=playlistUrl;
       video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
@@ -1003,7 +1064,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   }}
 
   async function startSession(){{
-    stopped=false;retryButton.hidden=true;setStatus('Starting live view…');
+    stopped=false;recoveryAttempts=0;retryButton.hidden=true;setStatus('Starting live view…');
     let response;
     try{{response=await fetch(startUrl,{{method:'POST'}})}}catch(e){{showUnavailable();return}}
     if(!response.ok){{showUnavailable();return}}
@@ -1031,7 +1092,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   shareButton.addEventListener('click',()=>comingSoon('Share'));
   analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
   bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
-  stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
+  stopButton.addEventListener('click',()=>{{stopPolling();destroyHls();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
 
   // Real browser fullscreen (double-click on desktop, double-tap on
