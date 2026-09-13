@@ -19,7 +19,7 @@ from object_storage import get_storage
 from partner_db import audit, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
-from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, recording_s3_prefix, recording_session_name, recording_session_policy
+from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
 from event_media_policy import allows_event_media
 
 try:
@@ -53,10 +53,11 @@ LIVE_RELAY_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION',''))
 live_manifest_store=LiveManifestStore(Path(os.getenv('ANYAICAM_LIVE_MANIFEST_FILE','/app/recordings/live_manifest.json')))
 # R1 (recording-pipeline roadmap): independent flag/role/bucket from live
 # relay, deliberately not defaulted to the live bucket/role -- see
-# docs/r1-recording-iam.md. All three are unset until that IAM design is
-# actually applied, so recording_upload_credentials() below fails closed
-# with 503 even if ANYAICAM_RECORDING_UPLOAD_ENABLED were ever set true
-# ahead of that.
+# docs/r1-recording-iam.md (its "designed, not yet applied" framing is
+# stale -- the role/bucket are real and already applied; see
+# recording_credentials.py's own module docstring). If none of these
+# three are configured, recording_upload_credentials() below still
+# fails closed with 503 regardless of which flag authorized the request.
 RECORDING_UPLOAD_ENABLED=os.getenv('ANYAICAM_RECORDING_UPLOAD_ENABLED','false').strip().lower()=='true'
 RECORDING_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_RECORDING_UPLOAD_ROLE_ARN','').strip()
 RECORDING_S3_BUCKET=os.getenv('ANYAICAM_RECORDING_S3_BUCKET','').strip()
@@ -65,6 +66,17 @@ RECORDING_AWS_REGION=os.getenv('AWS_REGION',os.getenv('AWS_DEFAULT_REGION','')).
 # upload -- deliberately independently toggleable). No AWS/STS involved at
 # all; this only ever writes to the detection_events SQL table.
 ANALYTICS_SYNC_ENABLED=os.getenv('ANYAICAM_ANALYTICS_SYNC_ENABLED','false').strip().lower()=='true'
+# 2026-09-13: event-media (motion-event thumbnail/clip) upload needs the
+# same short-lived S3 credentials recording_upload_credentials() below
+# already issues, but must never require the much bigger bulk/continuous
+# recording-upload feature (RECORDING_UPLOAD_ENABLED) to be turned on --
+# that flag also starts a real, continuous, unrelated appliance-side
+# upload worker for every completed recording on every camera. This is
+# its own independent read of the same edge-side env var name
+# (ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED already governs
+# event_media_uploader.py's own edge-side gate) so the credentials route
+# can be authorized by EITHER feature without coupling them.
+EVENT_MEDIA_UPLOAD_ENABLED=os.getenv('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED','false').strip().lower()=='true'
 
 
 def _bearer(request: Request) -> str:
@@ -419,21 +431,38 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
     def recording_upload_credentials(request: Request,camera_id: str) -> dict:
         # R1 (recording-pipeline roadmap): mirrors live_relay_session()
         # above exactly, for a separate `recordings/` prefix and a
-        # separate flag/role -- see recording_credentials.py and
-        # docs/r1-recording-iam.md. RECORDING_UPLOAD_ROLE_ARN/
-        # RECORDING_S3_BUCKET are unset until the IAM design in that doc
-        # is actually applied, so this returns 503 even if the flag
-        # alone were ever set true ahead of that -- fails closed the
-        # same way Phase 2 did for live relay before Phase 1's IAM was
-        # applied. Nothing calls this route yet (that's R3); nothing
-        # reads what it would let an appliance write (that's R2/R4).
+        # separate flag/role -- see recording_credentials.py. If
+        # RECORDING_UPLOAD_ROLE_ARN/RECORDING_S3_BUCKET are ever unset,
+        # this still returns 503 regardless of which flag authorized the
+        # request -- fails closed the same way Phase 2 did for live
+        # relay before Phase 1's IAM was applied.
+        #
+        # 2026-09-13: authorized by EITHER RECORDING_UPLOAD_ENABLED
+        # (bulk/continuous recording upload) OR EVENT_MEDIA_UPLOAD_ENABLED
+        # (motion-event thumbnail/clip upload) -- deliberately an OR, not
+        # a shared single flag, so either feature can be enabled/disabled
+        # completely independently of the other. Which flag actually
+        # authorized the request also picks the *scope* of the issued
+        # credential: RECORDING_UPLOAD_ENABLED gets the existing,
+        # unchanged, whole-camera-prefix policy (bulk upload needs to
+        # write anywhere under a camera's recording prefix); the
+        # event-media-only path gets the narrower events-only policy
+        # instead (see event_media_session_policy()'s own docstring). A
+        # request authorized by both simply prefers the broader,
+        # already-established bulk policy -- there is nothing for the
+        # narrower one to additionally restrict in that case, and this
+        # keeps existing bulk-recording behavior completely unchanged
+        # when that flag is the one in use.
         appliance=authenticate_appliance(request)
-        if not RECORDING_UPLOAD_ENABLED:
+        if not (RECORDING_UPLOAD_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED):
             raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
         if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
             raise HTTPException(status_code=503,detail='Recording upload is not configured.')
-        policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        if RECORDING_UPLOAD_ENABLED:
+            policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
+        else:
+            policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         session_name=recording_session_name(appliance['id'],camera_id)
         try:
             sts=boto3.client('sts',region_name=RECORDING_AWS_REGION)
