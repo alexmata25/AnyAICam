@@ -1886,6 +1886,41 @@ Camera 1 (`AIC-C814766E`, `dfba6a63ec`) is now fully functional end to end: clou
 
 ---
 
+## 2026-09-13: Cameras 2–5 provisioned through Customer Setup Step 4 — all five real cameras now live simultaneously. DONE, verified, read-only throughout.
+
+Following the same self-service Step 4 "Add this camera" flow validated for Camera 1, the operator added Cameras 2–5 one at a time; each addition was independently, read-only verified immediately afterward (provisioning request, RTSP/DESCRIBE, placeholder consumption, credential handoff, self-healing bind, live FFmpeg/HLS, cloud status) before the next camera was added. No source changes were needed for any of them — the whole chain of fixes from the Camera 1 passes above (placeholder consumption, `PUBLIC_PATH_PREFIXES`/Docker-hairpin-NAT credential handoff, and the stale-binding self-healing) worked unmodified for four more physical cameras in a row.
+
+| Camera | Cloud camera ID | device_key suffix | Physical MAC | Placeholder consumed | Result |
+|---|---|---|---|---|---|
+| 1 | `dfba6a63ec` | `...a2f6af` | `14:2f:fd:a2:f6:af` | (pre-dates this batch) | `online=1/recording=1/last_error=None` |
+| 2 | `dc7a226120` | `...60a285` | `14:2f:fd:60:a2:85` | yes (8→7 placeholders) | `online=1/recording=1/last_error=None` |
+| 3 | `5c689a0c0e` | `...606e23` | `14:2f:fd:60:6e:23` | yes (6→5) | `online=1/recording=1/last_error=None` |
+| 4 | `55bdd715ea` | `...a08360` | `14:2f:fd:a0:83:60` | yes (5→4) | `online=1/recording=1/last_error=None` |
+| 5 | `41dc80c85e` | `...a2f57b` | `14:2f:fd:a2:f5:7b` | yes (4→3) | `online=1/recording=1/last_error=None` |
+
+**Two transient, self-resolved convergence delays observed, neither a defect:**
+- During Camera 2's credential sync, `edge_camera_sync` logged one `control_plane_unreachable` (`[Errno 101] Network is unreachable`) at `04:55:24Z`; the very next ~60s sync cycle succeeded normally. No other camera's convergence hit this.
+- Camera 5's cloud `appliance_camera_status` briefly reported `online=0/recording=0/last_error=camera_not_bound` at `05:26:42Z` — read moments after the placeholder was consumed but before that camera's credential had finished its normal ~60s sync/bind cycle. Re-read (pure read, no action) 2 minutes later at `05:28:32Z` confirmed full convergence: `online=1/recording=1/last_error=None`. This is expected pipeline latency (provisioning → credential sync → auto-bind → next heartbeat), not the `camera_not_bound` defect fixed earlier in this doc (that one never cleared on its own across many cycles; this one cleared on the very next cycle).
+
+**Final five-camera system state, all verified simultaneously (read-only):**
+- Cloud: 8 total camera rows for the customer — 5 configured (`camera_number` 1–5, all distinct cloud camera IDs) + 3 remaining generic placeholders (`8f2e4ce58a`, `c60062fd80`, `eff9704054`). Matches the 8-slot entitlement exactly.
+- Both cloud-side and Ryzen-local `pending_camera_credentials` empty; both sides' `camera_credentials` hold exactly 5 rows (one per real camera) — contents never read, only `camera_id`/timestamps.
+- `docker logs anyaicam-vms` in a single 2-minute window showed all five `[camera1]`–`[camera5]` tags actively logging FFmpeg progress concurrently; fresh `.ts` HLS segments confirmed on disk for each, all modified within the same minute as a live `date -u` read.
+- `appliance_camera_status` for all five cameras: `online=1, recording=1, last_error=None`, identical fresh `updated_at`.
+- `customer_entitlements` still `camera_slot_quantity=8/active`; `customers`/`sites`/`appliances` rows unchanged throughout (`anyaicamtest@gmail.com`, `f67fa371cd` Primary site, `AIC-C814766E` activated).
+- `anyaicam-agent.service`: `NRestarts=0`, `ActiveState=active`/`SubState=running` throughout all five additions — no crash-loop. `anyaicam-vms` Docker container: `healthy`, `RestartCount=0`.
+- Resource utilization with all five streams running: container `409% CPU` / `2.18GiB RAM (17.3%)` on an 8-core/12GiB host; host `load average 16.39/12.28/8.39` (1/5/15-min) — elevated but trending down over the 15-minute window, consistent with five concurrent RTSP→H.264 re-encodes; not investigated further or acted on per instruction (no stress test, no workload change).
+- `PRAGMA integrity_check: ok` on the cloud DB.
+- The one item still not directly read this pass: `/var/lib/anyaicam/camera_bindings.json` remains sudo-gated (`sudo -n` correctly refuses without prompting) — per standing instruction, not read via any workaround. All available indirect evidence (`last_error=None` for every camera, which `reconcile_cloud_cameras()` can only report when a real bind exists) is consistent with all five bindings being correct, but this is inference, not a direct file read.
+
+No credential value was ever printed/logged/exposed (the one RTSP URL fragment that appeared in raw `docker logs` output during Camera 5's diagnosis, which embeds the camera's own onboard password, was read internally to confirm streaming and was not repeated in this doc or reported to the operator). No discovery was re-run, no camera credentials were re-entered, no database/binding file was manually edited, Samsung and Motion Cloud were not touched.
+
+### State to resume from
+
+All 8 licensed camera slots for `anyaicamtest@gmail.com` / `AIC-C814766E` are now accounted for: 5 real, fully functional, streaming cameras (1–5) + 3 remaining generic placeholders. The full self-service journey — Cloud ID provisioning → activation → discovery → per-camera Step 4 add → credential handoff → auto-bind → live streaming → cloud status reporting — is now validated end to end for a real customer on real Ryzen hardware, five times over, with zero source changes required beyond what earlier sections of this doc already fixed. No further camera-provisioning work is pending for this customer. Any next step (placeholder cleanup for the 3 remaining generic rows, Live View validation, motion/event-media, Motion Cloud) is separately, explicitly not-yet-authorized.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
