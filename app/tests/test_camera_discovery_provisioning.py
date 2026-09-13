@@ -114,6 +114,154 @@ def test_scan_job_waits_for_appliance_when_offline(db_path, monkeypatch):
     assert result["status"] == "waiting_for_appliance"
 
 
+# --------------------- idempotency guard (confirmed-live bug, 2026-09-13):
+# repeated clicks on "Request appliance scan" each created a brand-new
+# camera_scan_jobs row; the appliance-side agent works through every
+# non-terminal job for one appliance strictly sequentially (one real
+# scan() at a time), so a burst of clicks (confirmed: 6 in 49 seconds on
+# a real account) built an unbounded backlog that took minutes to drain.
+# Every job still completed correctly -- this closes the pileup at the
+# source instead.
+
+
+def test_repeated_scan_requests_while_queued_return_the_same_job_id(db_path, monkeypatch):
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, online="online")
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        first = request_camera_scan(_fake_request(), "appl-1")
+        second = request_camera_scan(_fake_request(), "appl-1")
+        third = request_camera_scan(_fake_request(), "appl-1")
+    assert first["status"] == "queued"
+    assert second["job_id"] == first["job_id"]
+    assert third["job_id"] == first["job_id"]
+
+
+def test_repeated_scan_requests_while_waiting_for_appliance_return_the_same_job_id(db_path, monkeypatch):
+    # 'waiting_for_appliance' (appliance offline at request time) is just
+    # as non-terminal as 'queued' -- must be covered by the same guard.
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, online="offline")
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        first = request_camera_scan(_fake_request(), "appl-1")
+        second = request_camera_scan(_fake_request(), "appl-1")
+    assert first["status"] == "waiting_for_appliance"
+    assert second["job_id"] == first["job_id"]
+
+
+def test_repeated_scan_requests_while_running_return_the_same_job_id(db_path, monkeypatch):
+    # 'running' (appliance already claimed it via secure_scan_jobs()) is
+    # the state a real backlog actually piles up in -- the exact
+    # scenario confirmed live.
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    secure_scan_jobs = _route("/api/appliance/{cloud_id}/scan-jobs", "GET")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        first = request_camera_scan(_fake_request(), "appl-1")
+        secure_scan_jobs(_fake_request(_appliance_auth_headers()), "AIC-TEST1")  # claims it -> 'running'
+        second = request_camera_scan(_fake_request(), "appl-1")
+    assert second["job_id"] == first["job_id"]
+    assert second["status"] == "running"
+
+
+def test_repeated_scan_requests_create_only_one_db_row(db_path, monkeypatch):
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, online="online")
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        for _ in range(6):  # matches the exact repeated-click count confirmed live
+            request_camera_scan(_fake_request(), "appl-1")
+        conn2 = sqlite3.connect(db_path)
+        count = conn2.execute("SELECT COUNT(*) FROM camera_scan_jobs").fetchone()[0]
+    assert count == 1
+
+
+def test_new_scan_can_be_created_after_a_terminal_job(db_path, monkeypatch):
+    """Terminal jobs (complete/error/timed_out/cancelled) must never
+    block a legitimate follow-up scan -- the guard only ever collapses
+    concurrent duplicates of one still-in-flight request."""
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    secure_scan_results = _route("/api/appliance/{cloud_id}/scan-jobs/{job_id}", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        first = request_camera_scan(_fake_request(), "appl-1")
+        secure_scan_results(
+            _fake_request(_appliance_auth_headers()), "AIC-TEST1", first["job_id"],
+            {"status": "complete", "progress": 100, "message": "Discovered 5 compatible camera endpoints.",
+             "results": [{"device_key": f"urn:uuid:cam-{i}", "ip": f"192.168.1.{50+i}"} for i in range(5)]},
+        )
+        second = request_camera_scan(_fake_request(), "appl-1")
+        conn2 = sqlite3.connect(db_path)
+        count = conn2.execute("SELECT COUNT(*) FROM camera_scan_jobs").fetchone()[0]
+    assert second["job_id"] != first["job_id"]
+    assert second["status"] == "queued"
+    assert count == 2
+
+
+def test_new_scan_can_be_created_after_a_job_that_timed_out(db_path, monkeypatch):
+    """A genuinely abandoned job (past CAMERA_SCAN_ACTIVE_TIMEOUT_SECONDS)
+    must be lazily timed out -- via the same _maybe_time_out_scan_job()
+    every other read path already uses -- and free up a new scan,
+    never stay stuck forever."""
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn, online="online")
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        first = request_camera_scan(_fake_request(), "appl-1")
+        stale = (datetime.now() - timedelta(seconds=700)).isoformat()
+        conn2 = sqlite3.connect(db_path)
+        conn2.execute("UPDATE camera_scan_jobs SET updated_at=? WHERE id=?", (stale, first["job_id"]))
+        conn2.commit()
+        second = request_camera_scan(_fake_request(), "appl-1")
+        conn3 = sqlite3.connect(db_path)
+        count = conn3.execute("SELECT COUNT(*) FROM camera_scan_jobs").fetchone()[0]
+    assert second["job_id"] != first["job_id"]
+    assert count == 2
+
+
+def test_existing_completed_job_results_still_render_correctly_after_the_guard(db_path, monkeypatch):
+    """The idempotency guard only changes job CREATION -- reading back a
+    completed job's real results must be completely unaffected."""
+    request_camera_scan = _route("/api/customer/appliances/{appliance_id}/scan", "POST")
+    secure_scan_results = _route("/api/appliance/{cloud_id}/scan-jobs/{job_id}", "POST")
+    camera_scan_status = _route("/api/customer/camera-scans/{job_id}", "GET")
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed(conn)
+        monkeypatch.setattr(partner_workspace, "partner_identity", lambda request: _owner_identity())
+        job = request_camera_scan(_fake_request(), "appl-1")
+        five_results = [{"device_key": f"urn:uuid:cam-{i}", "ip": f"192.168.1.{50+i}", "manufacturer": "Hikvision"} for i in range(5)]
+        secure_scan_results(
+            _fake_request(_appliance_auth_headers()), "AIC-TEST1", job["job_id"],
+            {"status": "complete", "progress": 100, "message": "Discovered 5 compatible camera endpoints.", "results": five_results},
+        )
+        # A follow-up request correctly opens a NEW job (terminal case)...
+        request_camera_scan(_fake_request(), "appl-1")
+        # ...and the original, already-completed job's results are
+        # still exactly what the appliance submitted -- untouched.
+        status = camera_scan_status(_fake_request(), job["job_id"])
+    assert status["status"] == "complete"
+    assert status["progress"] == 100
+    assert len(status["results"]) == 5
+    assert {r["device_key"] for r in status["results"]} == {f"urn:uuid:cam-{i}" for i in range(5)}
+
+
 def test_appliance_polling_moves_queued_job_to_running(db_path, monkeypatch):
     # Canonical vocabulary: 'running', not the old dead-code '-legacy'
     # path's 'scanning'.
