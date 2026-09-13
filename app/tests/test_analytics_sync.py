@@ -985,3 +985,35 @@ async def test_worker_reports_connected_and_resets_backoff_once_sends_succeed(tm
     assert asy.analytics_sync_state["connectivity"] == "connected"
     assert asy.analytics_sync_state["consecutive_failures"] == 0
     assert asy.analytics_sync_state["pending_count"] == 0
+
+
+def test_sync_state_file_default_is_the_writable_data_config_directory_not_the_read_only_state_dir(monkeypatch):
+    """Regression lock for the real, live defect found 2026-09-13:
+    SYNC_STATE_FILE used to default under STATE_DIR (/var/lib/anyaicam),
+    which is mounted read-only into the anyaicam-vms container --
+    every persist attempt failed with "OSError: [Errno 30] Read-only
+    file system". The correct, already-mounted-read-write, already-
+    persistent-across-repair-installs home is /opt/anyaicam/data/config
+    (see this constant's own module-level comment). This must never
+    silently drift back under STATE_DIR, and STATE_DIR itself
+    (CREDENTIAL_FILE's real home, read by live_relay_uploader.py and
+    recording_uploader.py) must remain completely unaffected.
+
+    This module's own autouse fixture (above) monkeypatches
+    SYNC_STATE_FILE to a tmp_path for every test's isolation -- reload
+    the module with the override env var cleared to see the real
+    default, matching this file's own established
+    test_flag_defaults_false()/test_notify_flag_defaults_false()
+    pattern, then reload again to restore clean state afterward."""
+    monkeypatch.delenv("ANYAICAM_ANALYTICS_SYNC_STATE_FILE", raising=False)
+    import importlib
+    reloaded = importlib.reload(asy)
+    try:
+        assert str(reloaded.SYNC_STATE_FILE).replace("\\", "/") == "/opt/anyaicam/data/config/analytics_sync_state.json"
+        assert not str(reloaded.SYNC_STATE_FILE).replace("\\", "/").startswith("/var/lib/anyaicam")
+        assert str(reloaded.STATE_DIR).replace("\\", "/") == "/var/lib/anyaicam", \
+            "STATE_DIR itself must stay pointed at the real, read-only-mounted directory -- " \
+            "CREDENTIAL_FILE and every other consumer of STATE_DIR depends on this being unchanged"
+        assert str(reloaded.CREDENTIAL_FILE).replace("\\", "/") == "/var/lib/anyaicam/credential.json"
+    finally:
+        importlib.reload(asy)  # restore a clean module state for subsequent tests

@@ -78,3 +78,17 @@ def test_retention_candidate_includes_event_media_with_the_customer_plan(tmp_pat
             db.execute("INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,created_at) VALUES(?,?,?,?,?,?,?,?)", ("media", "event", "cust", "cam", "recordings/c", "2026-01-01T00:00:00", now, now))
             candidates = sweep._expired_candidates(db, datetime(2026, 1, 9))
     assert candidates == [{"id": "media", "customer_id": "cust", "s3_key": "recordings/c", "started_at": "2026-01-01T00:00:00", "kind": "event_media"}]
+
+
+def test_outbox_file_default_is_the_writable_data_config_directory_not_the_read_only_var_lib():
+    """Regression lock for the real, live defect found 2026-09-13:
+    OUTBOX_FILE used to default to /var/lib/anyaicam/event_media_outbox.json,
+    but /var/lib/anyaicam is mounted read-only into the anyaicam-vms
+    container -- every real event's media upload failed with
+    "OSError: [Errno 30] Read-only file system", confirmed live on
+    Ryzen. The correct, already-mounted-read-write, already-persistent-
+    across-repair-installs home is /opt/anyaicam/data/config (see this
+    constant's own module-level comment) -- must never silently drift
+    back under /var/lib/anyaicam."""
+    assert str(outbox.OUTBOX_FILE).replace("\\", "/") == "/opt/anyaicam/data/config/event_media_outbox.json"
+    assert not str(outbox.OUTBOX_FILE).replace("\\", "/").startswith("/var/lib/anyaicam")

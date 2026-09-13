@@ -71,9 +71,26 @@ CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
 # Persisted synced-event-id set (the failure-safe cursor -- see module
-# docstring). Overridable purely for tests, matching recording_uploader.py's
-# own CUTOFF_FILE precedent -- production always uses the default.
-SYNC_STATE_FILE = Path(os.environ.get("ANYAICAM_ANALYTICS_SYNC_STATE_FILE", str(STATE_DIR / "analytics_sync_state.json")))
+# docstring). Deliberately NOT under STATE_DIR: /var/lib/anyaicam
+# itself is mounted read-only into the anyaicam-vms container by
+# design (only the host-side anyaicam-agent.service, which owns
+# identity/credentials, is meant to write there) -- confirmed live
+# 2026-09-13 when this file's own previous default there caused every
+# persist attempt to fail with "OSError: [Errno 30] Read-only file
+# system". /opt/anyaicam/data/config is the correct home instead: a
+# separate, already-mounted-read-write, already-persistent-across-
+# repair-installs directory the installer itself documents as being
+# for exactly this kind of protected config/state data
+# (05-provision-users-dirs.sh), and -- unlike /app/recordings, the
+# other writable option -- not served to anyone via main.py's
+# unauthenticated `/recordings` static mount. STATE_DIR itself is
+# intentionally untouched: CREDENTIAL_FILE above still correctly reads
+# credential.json from the real /var/lib/anyaicam (written by the
+# host-side agent), and live_relay_uploader.py/recording_uploader.py's
+# own STATE_DIR-derived read paths must keep working unchanged.
+# Overridable purely for tests, matching recording_uploader.py's own
+# CUTOFF_FILE precedent -- production always uses the default.
+SYNC_STATE_FILE = Path(os.environ.get("ANYAICAM_ANALYTICS_SYNC_STATE_FILE", "/opt/anyaicam/data/config/analytics_sync_state.json"))
 # RECORDINGS_FOLDER/ANALYTICS_EVENTS_FILE are intentionally hardcoded to
 # match main.py's own constants exactly -- this must always agree with
 # where save_yolo_events()/append_analytics_event() actually write, not be
