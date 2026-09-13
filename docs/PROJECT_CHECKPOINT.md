@@ -1837,6 +1837,37 @@ Deployment to Ryzen (build the same way as `6d6dcd5` was: versioned artifact →
 
 ---
 
+## 2026-09-13: `1893a72` installed on Ryzen — Camera 1 self-healed exactly as predicted, fully automatically. camera_not_bound cleared. DONE, verified.
+
+**Deployed**: `anyaicam-appliance-installer-1.1.0-vms-1893a7279586.tar.gz`, SHA-256 `063e862a5417a38b6969e752872694b64177bee42d00e95503b3b92508d02fff` — verified identical after `scp` to Ryzen, extracted, then the operator ran `sudo ./install.sh --repair` themselves (never hot-patched, never run by this session).
+
+**Post-install verification, all read-only, all PASSED:**
+
+| Check | Baseline (`6d6dcd5`) | Now | Result |
+|---|---|---|---|
+| `/version` `build_id` | `6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c` | **`1893a727958678ed88ecfbcc6f2ea61a46123698`** | exact match |
+| `cloud_id` | `AIC-C814766E` | `AIC-C814766E` | unchanged |
+| `appliance_identity.json` SHA-256 | `2c32127f...` | `2c32127f...` | **byte-for-byte unchanged** |
+| `anyaicam-vms` container | image `sha256:024fa4b5...` | new image `sha256:2afbe39e...`, `Up ... (healthy)`, exactly one container | clean recreate |
+| `anyaicam-agent.service` | `ActiveEnterTimestamp` `22:44:21 CDT`, `NRestarts=0` | new `ActiveEnterTimestamp` `23:37:58 CDT` (one clean restart from the install), `NRestarts=0` | clean, not a crash loop |
+| Agent re-auth / heartbeat | — | restarted 23:37:58/23:37:59 → `Entitlement refreshed camera_slot_quantity=8` at 23:38:01 (2s later) | resumed immediately |
+| `discovered_cameras.json` | 5 devices, `updated_at=2026-09-13T01:43:57...` | **byte-identical**, same `updated_at`, same 5 devices including `...a2f6af`/MAC `14:2f:fd:a2:f6:af` | intact, untouched |
+| `camera_bindings.json` — stale `7e34833a37` binding | present (`camera_number=1`, MAC `...a2f6af`) | **gone** — superseded | self-healed |
+| `camera_bindings.json` — `dfba6a63ec` (Camera 1) | absent | **present**: `camera_number=1`, `mac_address=14:2f:fd:a2:f6:af`, `approved_at=2026-09-13T04:37:59...` (seconds after the agent restart — the very first `sync_configuration()` cycle) | **bound automatically, no scan, no new credential** |
+| `camera_bindings.json` — the other two old bindings (`ca9d8c53d0`→2, `2e1a9a64bc`→3) | present | **still present, untouched** | correct — nothing currently claims those slots, so they were never touched; the fix only supersedes a binding when a real, current camera actually needs to claim the same MAC/number |
+| Local `camera_credentials` for `dfba6a63ec` | 1 row, 140-byte blob | unchanged: 1 row, 140-byte blob | credential preserved |
+| Camera 1 streaming | active `[camera1]` FFmpeg → HLS | **still active**, ~3.5 min continuous, frame count climbing normally | uninterrupted |
+| Cloud `appliance_camera_status` for `dfba6a63ec` | `online=0`, `recording=0`, `last_error=camera_not_bound` | **`online=1`, `recording=1`, `last_error=None`** | **camera_not_bound fully cleared** |
+| Cloud/local camera + placeholder counts | cloud 9 total (8 placeholders + Camera 1) / local 12 | **unchanged**: cloud 9/8 placeholders, local 12 | **no new camera or placeholder row created or consumed** |
+
+No credential value was printed/logged/exposed; `camera_bindings.json` was not manually edited; no discovery was re-run; Camera 1's credentials were not re-entered; Cameras 2–5 were not added; the extra placeholder was not touched; Samsung and Motion Cloud were not touched.
+
+### State to resume from
+
+Camera 1 (`AIC-C814766E`, `dfba6a63ec`) is now fully functional end to end: cloud-provisioned, locally credentialed, actively streaming, correctly bound, and correctly reported (`online`/`recording`/`last_error` all healthy) — the entire chain traced and fixed across this session's last several passes is closed. Two items remain separately, explicitly not-yet-authorized: (1) provisioning Cameras 2–5 through the same now-fully-working Step 4 flow, and (2) the one-time placeholder-count reconciliation (cloud still shows 9 total rows — 8 placeholders + Camera 1 — for an 8-slot entitlement; deleting one placeholder was designed earlier in this doc but never executed).
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
