@@ -56,6 +56,65 @@ class Tests(unittest.TestCase):
  def test_no_secret_logs(self):
   s=io.StringIO();l=logging.getLogger(str(id(self)));l.handlers=[logging.StreamHandler(s)];l.setLevel(logging.INFO);self.perform(logger=l);self.assertNotIn('new-secret',s.getvalue());self.assertNotIn('old-secret',s.getvalue())
 
+ # ---- camera-binding lifecycle fix (2026-09-13): a genuine identity swap
+ # (this whole class's own AIC-OLD -> AIC-NEW scenario) must reset
+ # camera_bindings.json atomically alongside agent.json/credential.json/
+ # appliance_identity.json -- confirmed live: an appliance re-enrolled
+ # under a brand-new cloud_id kept its PRIOR identity's bindings forever,
+ # permanently blocking a new customer's camera from binding to the same
+ # physical hardware (see camera_binding.py's own self-healing fix for
+ # the other half of this).
+
+ def _seed_bindings(self,content=None):
+  self.bp=Path(self.c.camera_bindings_file); self.bp.parent.mkdir(parents=True,exist_ok=True)
+  content=content if content is not None else {'version':1,'bindings':[{'cloud_camera_id':'old-cam-1','camera_number':1,'mac_address':'14:2f:fd:a2:f6:af','approved_at':'old'}]}
+  self.bp.write_text(json.dumps(content)); self.orig[self.bp]=self.bp.read_bytes(); return content
+
+ def test_successful_reenroll_clears_old_camera_bindings(self):
+  self._seed_bindings()
+  self.perform()
+  self.assertEqual(json.loads(self.bp.read_text()),{'version':1,'bindings':[]})
+
+ def test_successful_reenroll_backs_up_the_prior_bindings(self):
+  original=self._seed_bindings()
+  z=self.perform()
+  backed_up=json.loads((Path(z['backup_dir'])/self.bp.name).read_text())
+  self.assertEqual(backed_up,original)
+
+ def test_failed_reenroll_restores_previous_bindings(self):
+  original=self._seed_bindings()
+  with self.assertRaises(reenrollment.ReenrollmentError):self.perform(verify_authentication=lambda _:False)
+  self.assertEqual(json.loads(self.bp.read_text()),original)
+  self.rolled()  # identity files also correctly rolled back -- atomicity is not weakened
+
+ def test_failed_reenroll_with_no_prior_bindings_leaves_none_behind(self):
+  """No camera_bindings.json existed before the attempt -- on failure,
+  the file this attempt staged must be removed, not left behind as a
+  stray empty binding store."""
+  self.bp=Path(self.c.camera_bindings_file)
+  self.assertFalse(self.bp.exists())
+  with self.assertRaises(reenrollment.ReenrollmentError):self.perform(verify_authentication=lambda _:False)
+  self.assertFalse(self.bp.exists())
+
+ def test_discovered_cameras_file_survives_identity_replacement(self):
+  """discovered_cameras.json is physical-network evidence, not identity-
+  scoped -- it must never be touched by a reenroll, successful or not."""
+  dp=Path(self.c.discovered_cameras_file); dp.parent.mkdir(parents=True,exist_ok=True)
+  content={'version':1,'cameras':[{'device_key':'urn:uuid:b3464000-5074-11b4-82cc-142ffda2f6af','mac_address':'14:2f:fd:a2:f6:af','ip':'192.168.0.38'}]}
+  dp.write_text(json.dumps(content))
+  self.perform()
+  self.assertEqual(json.loads(dp.read_text()),content)
+
+ def test_reenroll_with_the_same_cloud_id_preserves_existing_bindings(self):
+  """A bare credential refresh for the SAME cloud_id (not a genuine
+  identity swap) must never discard bindings that are still completely
+  valid."""
+  original=self._seed_bindings()
+  same_cloud_activation=dict(self.a); same_cloud_activation['cloud_id']='AIC-OLD'
+  z=reenrollment.coordinated_reenroll(self.c,same_cloud_activation,expected_cloud_id='AIC-OLD',vms_identity_path=self.vp,restart_service=self.restart,verify_authentication=lambda _:True,backup_root=self.r/'backup2')
+  self.assertFalse(z['camera_bindings_reset'])
+  self.assertEqual(json.loads(self.bp.read_text()),original)
+
 
 class FirstEnrollTests(unittest.TestCase):
  """coordinated_reenroll() requires all three identity files to already

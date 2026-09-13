@@ -70,6 +70,27 @@ def coordinated_reenroll(config:AgentConfig,activation_response:dict,*,expected_
     if any(not p.is_file() for p in paths): raise ValueError("Every existing identity file must be present before re-enrollment.")
     originals={p:p.read_bytes() for p in paths}; metadata={p:p.stat() for p in paths}; previous=_read(vms_path); version=previous.get("activation_version",0)
     if not isinstance(version,int) or version<0: raise ValueError("Existing VMS activation version is invalid.")
+    # Camera-binding lifecycle fix (2026-09-13): camera_bindings.json
+    # (camera_binding.CameraBindingStore) records which physical MAC
+    # address is approved for which cloud camera_id -- a mapping that is
+    # only ever meaningful for the identity that created it. Confirmed
+    # live: an appliance re-enrolled under a brand-new customer/cloud_id
+    # kept its PRIOR identity's bindings forever (nothing ever cleared
+    # them), permanently blocking a new customer's camera from ever
+    # binding to the same physical hardware -- CameraBindingStore.bind()'s
+    # own MAC/camera_number collision check has no way to know the old
+    # binding's cloud_camera_id no longer exists anywhere. Reset here,
+    # atomically, alongside the rest of the identity swap this function
+    # already performs -- not on every call (a bare credential refresh
+    # for the SAME cloud_id keeps bindings that are still completely
+    # valid), only when the cloud_id is genuinely changing. Absence of
+    # this file is not an error (a box that has never discovered/bound a
+    # camera simply doesn't have one yet) -- nothing to back up or reset
+    # in that case, and none is invented.
+    bindings_path=Path(config.camera_bindings_file); bindings_existed=bindings_path.is_file()
+    if bindings_existed:
+        originals[bindings_path]=bindings_path.read_bytes(); metadata[bindings_path]=bindings_path.stat()
+    reset_bindings=previous.get("cloud_id")!=activation["cloud_id"]
     agent=asdict(config); agent["cloud_id"]=activation["cloud_id"]
     credential={"appliance_id":activation["appliance_id"],"credential_id":activation["credential_id"],"credential":activation["credential"]}
     vms={"appliance_id":activation["appliance_id"],"cloud_id":activation["cloud_id"],"credential":activation["credential"],"customer_id":activation["customer_id"],"site_id":activation["site_id"],"partner_id":activation["partner_id"],"activated_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),"activation_version":version+1}
@@ -78,19 +99,34 @@ def coordinated_reenroll(config:AgentConfig,activation_response:dict,*,expected_
         for p,value in ((agent_path,agent),(credential_path,credential),(vms_path,vms)): staged[p]=_stage(p,value)
         a,c,v=(_read(staged[p]) for p in paths)
         if {(a.get("cloud_id"),c.get("appliance_id")),(v.get("cloud_id"),v.get("appliance_id")),(activation["cloud_id"],activation["appliance_id"])}.__len__()!=1 or c.get("credential")!=v.get("credential"): raise ValueError("Staged identity documents do not agree.")
+        if reset_bindings: staged[bindings_path]=_stage(bindings_path,{"version":1,"bindings":[]},prefix="reenroll-bindings")
         backup.mkdir(parents=True,exist_ok=False); os.chmod(backup,0o700)
         for p in paths: q=backup/p.name; q.write_bytes(originals[p]); os.chmod(q,0o600)
+        if bindings_existed: q=backup/bindings_path.name; q.write_bytes(originals[bindings_path]); os.chmod(q,0o600)
         for p in paths:
             if hasattr(os,"chown"): os.chown(staged[p],metadata[p].st_uid,metadata[p].st_gid)
             replace_file(staged[p],p); os.chmod(p,0o600); touched=True
+        if reset_bindings:
+            if bindings_existed and hasattr(os,"chown"): os.chown(staged[bindings_path],metadata[bindings_path].st_uid,metadata[bindings_path].st_gid)
+            replace_file(staged[bindings_path],bindings_path); os.chmod(bindings_path,0o600)
         restart_service()
         if not verify_authentication(activation): raise RuntimeError("Control-plane authentication failed after re-enrollment.")
     except Exception as error:
-        if touched or any(p.exists() and p.read_bytes()!=originals[p] for p in paths):
+        binding_touched=bindings_path.exists() and (not bindings_existed or bindings_path.read_bytes()!=originals.get(bindings_path))
+        if touched or binding_touched or any(p.exists() and p.read_bytes()!=originals[p] for p in paths):
             failures=[]
             for p in paths:
                 try:_restore(p,originals[p],replace_file,metadata[p])
                 except Exception as e:failures.append(f"{p.name}: {type(e).__name__}")
+            if bindings_existed:
+                try:_restore(bindings_path,originals[bindings_path],replace_file,metadata[bindings_path])
+                except Exception as e:failures.append(f"{bindings_path.name}: {type(e).__name__}")
+            elif bindings_path.exists():
+                # Never existed before this attempt -- remove what got
+                # staged/replaced rather than "restore" it to nothing.
+                try: bindings_path.unlink()
+                except FileNotFoundError: pass
+                except Exception as e: failures.append(f"{bindings_path.name}: {type(e).__name__}")
             try:restart_service()
             except Exception as e:failures.append(f"service: {type(e).__name__}")
             if failures: raise ReenrollmentError("Re-enrollment failed and rollback was incomplete: "+", ".join(failures)) from error
@@ -101,7 +137,7 @@ def coordinated_reenroll(config:AgentConfig,activation_response:dict,*,expected_
             try:p.unlink()
             except FileNotFoundError:pass
     log.info("Appliance re-enrollment completed and control-plane authentication succeeded.")
-    return {"cloud_id":activation["cloud_id"],"appliance_id":activation["appliance_id"],"backup_dir":str(backup)}
+    return {"cloud_id":activation["cloud_id"],"appliance_id":activation["appliance_id"],"backup_dir":str(backup),"camera_bindings_reset":reset_bindings}
 
 def first_enroll(config:AgentConfig,activation_response:dict,*,expected_cloud_id:str,vms_identity_path:str|Path,restart_service:Callable[[],None],verify_authentication:Callable[[dict],bool],replace_file:Callable=os.replace,logger=None):
     """First-ever activation of a fresh appliance: agent.json, credential.json,

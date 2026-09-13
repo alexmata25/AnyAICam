@@ -136,7 +136,7 @@ class CameraBindingStore:
         payload = _load_json(self.path, {'version': 1, 'bindings': []})
         return payload.get('bindings', []) if isinstance(payload, dict) else []
 
-    def bind(self, cloud_camera_id: str, camera_number: int, mac_address: str) -> dict:
+    def bind(self, cloud_camera_id: str, camera_number: int, mac_address: str, *, valid_cloud_camera_ids: set[str] | None = None) -> dict:
         cloud_camera_id = str(cloud_camera_id).strip()
         if not cloud_camera_id:
             raise ValueError('cloud_camera_id is required.')
@@ -147,9 +147,26 @@ class CameraBindingStore:
         for item in self.bindings():
             if item.get('cloud_camera_id') == cloud_camera_id:
                 continue
-            if normalize_mac(item.get('mac_address', '')) == mac_address:
-                raise ValueError('This physical camera is already bound to another cloud camera.')
-            if item.get('camera_number') == camera_number:
+            if normalize_mac(item.get('mac_address', '')) == mac_address or item.get('camera_number') == camera_number:
+                # Orphan self-healing (2026-09-13): a binding is only a
+                # genuine collision if the cloud camera it names is still
+                # part of THIS appliance's own current, authoritative
+                # camera configuration. Confirmed live: an appliance
+                # re-enrolled under a brand-new customer/cloud_id kept its
+                # PRIOR identity's bindings forever, permanently blocking
+                # a real, currently-valid camera from ever claiming the
+                # same physical hardware, because this check had no way
+                # to know the old binding's cloud_camera_id no longer
+                # exists anywhere. valid_cloud_camera_ids is only trusted
+                # when the caller actually supplies it (auto_bind_
+                # discovered_cameras() always does) -- a direct call that
+                # omits it keeps the original, strictly conservative
+                # "always a collision" behavior, so nothing that already
+                # depends on bind() raising here is weakened.
+                if valid_cloud_camera_ids is not None and item.get('cloud_camera_id') not in valid_cloud_camera_ids:
+                    continue  # orphaned binding, superseded -- not retained
+                if normalize_mac(item.get('mac_address', '')) == mac_address:
+                    raise ValueError('This physical camera is already bound to another cloud camera.')
                 raise ValueError('This local camera number is already bound to another cloud camera.')
             retained.append(item)
         binding = {
@@ -194,6 +211,15 @@ def auto_bind_discovered_cameras(cloud_cameras: list[dict], discovered_cameras: 
         if device_key:
             discovered_by_device_key[device_key] = camera
     existing_by_cloud_id = {item.get('cloud_camera_id'): item for item in binding_store.bindings()}
+    # The current, authoritative set of cloud camera ids this appliance
+    # actually has -- passed to bind() so it can tell a genuine, still-
+    # relevant collision (a currently valid cloud camera also claims this
+    # MAC/camera_number) apart from an orphaned one (the conflicting
+    # binding's own cloud_camera_id isn't in this set at all, e.g. left
+    # over from a prior customer/identity this appliance no longer
+    # represents). See CameraBindingStore.bind()'s own docstring for the
+    # full self-healing contract.
+    valid_cloud_camera_ids = {str(camera.get('id', '')).strip() for camera in cloud_cameras if str(camera.get('id', '')).strip()}
     bound = []
     for cloud_camera in cloud_cameras:
         cloud_id = str(cloud_camera.get('id', '')).strip()
@@ -212,10 +238,10 @@ def auto_bind_discovered_cameras(cloud_cameras: list[dict], discovered_cameras: 
         if existing and existing.get('camera_number') == camera_number and existing.get('mac_address') == mac_address:
             continue  # already correctly bound
         try:
-            binding_store.bind(cloud_id, camera_number, mac_address)
+            binding_store.bind(cloud_id, camera_number, mac_address, valid_cloud_camera_ids=valid_cloud_camera_ids)
             bound.append(cloud_id)
         except ValueError:
-            continue  # camera_number or MAC already claimed by a different cloud camera's binding
+            continue  # camera_number or MAC still genuinely claimed by another currently-valid cloud camera
     return bound
 
 
@@ -257,7 +283,11 @@ class LocalVmsStatusReader:
 def reconcile_cloud_cameras(cloud_cameras: list[dict], discovered_cameras: list[dict],
                             bindings: list[dict], status_reader: LocalVmsStatusReader) -> list[dict]:
     discovered_by_mac = {}
+    discovered_by_device_key = {}
     for camera in discovered_cameras:
+        device_key = str(camera.get('device_key') or '').strip()
+        if device_key:
+            discovered_by_device_key[device_key] = camera
         try:
             discovered_by_mac[normalize_mac(camera.get('mac_address', ''))] = camera
         except ValueError:
@@ -270,6 +300,20 @@ def reconcile_cloud_cameras(cloud_cameras: list[dict], discovered_cameras: list[
         safe = {key: value for key, value in cloud_camera.items() if key.lower() not in LOCAL_ONLY_KEYS}
         safe.update({'online': False, 'recording': False, 'analytics': False,
                      'last_recording_at': None, 'last_error': 'camera_not_bound'})
+        if not binding:
+            # Diagnostic narrowing (2026-09-13): distinguishes "genuinely
+            # never seen on this network" from "we can see it, but
+            # something is blocking the bind" (e.g. a still-active MAC/
+            # camera_number collision bind() correctly refused to
+            # override) -- without this, both looked identical from the
+            # cloud, hiding a real, actionable condition behind the same
+            # generic string a camera that simply isn't plugged in yet
+            # also shows. Narrowly scoped: only ever overrides the
+            # default when this exact device_key genuinely has discovery
+            # evidence on file; never changes anything else here.
+            device_key = str(cloud_camera.get('device_key') or '').strip()
+            if device_key and device_key in discovered_by_device_key:
+                safe['last_error'] = 'camera_binding_conflict'
         if binding:
             camera_number = binding.get('camera_number')
             safe['camera_number'] = camera_number
