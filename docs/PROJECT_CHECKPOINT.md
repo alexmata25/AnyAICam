@@ -1868,6 +1868,24 @@ Camera 1 (`AIC-C814766E`, `dfba6a63ec`) is now fully functional end to end: clou
 
 ---
 
+## 2026-09-13: One-row placeholder reconciliation executed for `anyaicamtest@gmail.com` — DONE, verified. Cloud camera-row count now matches the 8-slot entitlement exactly.
+
+**Authorized, narrowly scoped, executed with the same discipline as every prior real-data mutation in this doc**: delete exactly one of the 8 leftover generic placeholder rows for this one customer/site/appliance, left over only because Camera 1 was originally provisioned before the placeholder-consumption source fix existed.
+
+**Backup**: `/var/lib/anyaicam-staging/db/staging-pre-placeholder-reconciliation-20260913T044526Z.db`, SHA-256 `d00a2230e2b6d2f25dbc9c016249f49359fbcde8766143dcad6228633dad06a4`. `PRAGMA integrity_check: ok` confirmed immediately before mutating.
+
+**Target identification**: `SELECT ... FROM cameras WHERE customer_id='d75bdbecdd4887de4d2b89a9fcea9092' AND site_id='f67fa371cd' AND appliance_id='2f941627b4' AND device_key IS NULL AND status='pending_installation' ORDER BY created_at ASC, id ASC` returned exactly 8 rows, confirming the expected count before touching anything. All 8 share the identical `created_at` (`2026-09-12T21:10:54.746225` — inserted in the same loop at provisioning time), so `id ASC` was the deterministic tiebreaker; every one of the 8 is functionally identical (no device_key, no camera_number, never renamed) so the specific choice carries no significance. Target: `id=1322c4f996` ("Camera 3" placeholder — the generic label was never meaningfully assigned to anything). Only non-secret metadata recorded (id/name/status/camera_number/created_at) — nothing else existed on a never-configured placeholder to expose.
+
+**Deletion**: re-verified the target row fresh, inside the same connection, immediately before mutating (customer/site/appliance/`device_key IS NULL`/`status` all re-checked); `DELETE FROM cameras WHERE id=? AND customer_id=? AND site_id=? AND appliance_id=? AND device_key IS NULL AND status='pending_installation'`, scoped by every field, not by id alone; `cur.rowcount==1` asserted before commit. Committed once, cleanly.
+
+**Post-mutation verification, all passed**: total `cameras` for this customer `9 → 8`; placeholders `8 → 7`; deleted row confirmed gone. **Camera 1 (`dfba6a63ec`) completely unaffected**: same `device_key`/`status=configured`/`camera_number=1`/customer/site/appliance, `camera_credentials` row still present, `appliance_camera_status` still `online=1`/`recording=1`/`last_error=None` with a fresh `updated_at` (heartbeat uninterrupted). `customer_entitlements` still `camera_slot_quantity=8`/`active`; `hardware_orders` still `paid`; `camera_provisioning_requests` count unchanged (2); `customers`/`sites`/`appliances` rows byte-identical aside from the one intended delete. `PRAGMA integrity_check: ok`. Ryzen confirmed still healthy and unaffected: `[camera1]` FFmpeg still actively logging (60 fresh lines in the prior minute), agent `NRestarts=0`, `active/running`. Ryzen's own local stale/orphan camera rows, `camera_bindings.json`, Samsung, and Motion Cloud were not touched.
+
+### State to resume from
+
+`anyaicamtest@gmail.com`'s cloud camera-row count now exactly matches their 8-slot entitlement: 1 fully functional real camera (`dfba6a63ec`) + 7 remaining generic placeholders, ready to be consumed the same way if Cameras 2–5 are provisioned later. That provisioning (through the now-fully-working Customer Setup Step 4 flow) is the only remaining, separately not-yet-authorized step for this customer.
+
+---
+
 ## Appliance checkpoints
 
 - `docs/checkpoints/RYZEN.md` — the real 5-camera physical appliance, primary
