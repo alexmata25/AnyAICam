@@ -208,6 +208,60 @@ def test_a_closed_target_loop_is_logged_not_silently_swallowed(monkeypatch, tmp_
     assert "could not schedule" in captured.out
 
 
+def test_clip_build_exception_is_logged_not_silently_swallowed(
+    monkeypatch, tmp_path, capsys, background_loop
+):
+    """This is the test that would have caught the real, live defect
+    found in production on 2026-09-13: build_motion_event_clip()
+    raising was previously completely unguarded. The coroutine is
+    scheduled via asyncio.run_coroutine_threadsafe() (see the big
+    comment at its call site in main.py), and nothing ever retrieves
+    the resulting concurrent.futures.Future's result/exception --
+    unlike asyncio.create_task(), whose Task at least logs "exception
+    was never retrieved" when garbage-collected, an unretrieved Future
+    here logs nothing at all. A real Camera 1 detection produced a
+    thumbnail and a correctly-tagged local record (event_clip pointed
+    at the expected path) but the clip file itself never appeared,
+    with zero trace anywhere in the logs -- exactly the silent-failure
+    shape this test reproduces and now requires to be logged."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+
+    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
+        raise RuntimeError("ffmpeg exited with code 1")
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+    _standard_mocks(monkeypatch, tmp_path)
+
+    result_holder = {}
+
+    def worker():
+        result_holder["events"] = main.save_yolo_events(165, _fake_result("person"))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert "events" in result_holder and len(result_holder["events"]) == 1, \
+        "a clip-build failure must not break analytics event creation itself"
+    event_id = result_holder["events"][0]["id"]
+
+    captured_text = ""
+
+    def _clip_failure_logged():
+        nonlocal captured_text
+        captured_text += capsys.readouterr().out
+        return "clip build failed" in captured_text
+
+    assert _wait_until(_clip_failure_logged, timeout=5), (
+        "expected the clip-build exception to be logged, not silently "
+        f"swallowed; captured stdout so far: {captured_text!r}"
+    )
+    assert event_id in captured_text, "diagnostic log must include the event id"
+    assert "165" in captured_text, "diagnostic log must include the camera number"
+    assert "RuntimeError" in captured_text, "diagnostic log must include the exception type"
+    assert "ffmpeg exited with code 1" in captured_text, "diagnostic log must include the exception message"
+
+
 def test_ai_person_detector_captures_the_loop_exactly_once(monkeypatch):
     monkeypatch.setattr(main, "_ai_event_media_loop", None)
     # This is a loop-capture unit test, not a startup-stagger test.  Its

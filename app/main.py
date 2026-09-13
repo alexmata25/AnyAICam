@@ -36984,9 +36984,35 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             )
 
             async def build_and_upload_ai_event_media() -> None:
-                clip_url = await build_motion_event_clip(
-                    event_group_id, camera_number, now, now
-                )
+                try:
+                    clip_url = await build_motion_event_clip(
+                        event_group_id, camera_number, now, now
+                    )
+                except Exception as error:
+                    # Diagnostic-only guard: this call used to be
+                    # unguarded, so a raised exception here was silently
+                    # swallowed. This coroutine is scheduled via
+                    # asyncio.run_coroutine_threadsafe() (see below) and
+                    # nothing ever retrieves the resulting
+                    # concurrent.futures.Future's result/exception --
+                    # unlike asyncio.create_task(), whose Task at least
+                    # logs "exception was never retrieved" on garbage
+                    # collection, an unretrieved Future here logs
+                    # nothing at all. Fail open exactly like the
+                    # scheduling try/except below already does -- the
+                    # analytics event itself and its existing
+                    # linked_recording fallback are unaffected -- but
+                    # LOGGED with enough detail (event id, camera
+                    # number, exception type and message) to actually
+                    # diagnose the real failure instead of guessing at
+                    # it. Not a behavior change: this is the same
+                    # "no clip" outcome the `if not clip_url: return`
+                    # branch below already produces.
+                    print(
+                        f"AI event {event_group_id} camera {camera_number}: "
+                        f"clip build failed: {type(error).__name__}: {error}"
+                    )
+                    return
                 if not clip_url:
                     return
                 try:
