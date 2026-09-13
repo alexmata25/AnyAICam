@@ -1783,9 +1783,31 @@ Built via the established versioned pipeline (`installer/build_release_installer
 
 **Not executed**: `sudo ./install.sh` (repair path) on Ryzen — this requires the operator's own hands. The artifact is staged and hash-verified at `~/anyaicam-install-6d6dcd5/` on Ryzen, ready to run.
 
+### Post-install verification — operator ran `sudo ./install.sh --repair` — PASSED, all read-only
+
+| Check | Baseline (`aa4dc2e`) | Post-install (now) | Result |
+|---|---|---|---|
+| `/version`/`/health` `build_id` | `aa4dc2edb135e379631a9d17db8923e56a202ed9` | `6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c` | **exact match to target** |
+| `/version` `cloud_id` | `AIC-C814766E` | `AIC-C814766E` | unchanged |
+| `anyaicam-vms` container | `sha256:3d3cfefd...`, started `2026-09-12T15:13:52Z` | new image `sha256:024fa4b5...`, started `2026-09-13T03:44:25Z`, `Up ... (healthy)`, exactly one container | expected clean recreate |
+| `main.py`/`appliance_cloud.py` inside the running container | -- | SHA-256 matches `git show 6d6dcd5:app/{main.py,appliance_cloud.py}` byte-for-byte | **exact** |
+| `appliance_identity.json` SHA-256 | `2c32127ffb097195a66d8332698506ede1f7059bfdbe3d9ce9212eed21cc24be` | `2c32127ffb097195a66d8332698506ede1f7059bfdbe3d9ce9212eed21cc24be` | **byte-for-byte unchanged** — identity/activation state fully preserved |
+| `anyaicam-agent.service` | `ActiveEnterTimestamp` `16:33:38 CDT`, `NRestarts=0` | new `ActiveEnterTimestamp` `22:44:21 CDT` (one clean restart triggered by the install), `NRestarts=0` | clean restart, not a crash loop |
+| `anyaicam-vms.service` | -- | `active (exited)` (normal for this compose-wrapper unit), `NRestarts=0`, one `ActiveEnterTimestamp` matching the install | clean, no loop |
+| Agent re-auth / heartbeat | -- | Agent log: restarted `22:44:21`, `Entitlement refreshed camera_slot_quantity=8` at `22:44:24` (3s later); cloud `appliances.last_check_in` `2026-09-13T03:45:25` (24s old at check time), `restart_count` incremented once (32, expected for a genuine restart) | **re-authenticated, heartbeat resumed immediately** |
+| Docker / network / Tailscale | -- | Docker Server Version `29.1.3`, `overlayfs`; `eno1` LAN `192.168.0.228`, `tailscale0` `100.77.253.28` (matches the given target), bridge `br-2753aa1c930c` gateway `172.18.0.1`; `tailscale status` shows this device active alongside the other known fleet devices (Samsung correctly still offline/untouched) | healthy |
+| `/api/local/provisioned-camera-credential` | 401 from `authentication_middleware` before the route ever ran (the bug) | route registered; `'/api/local/provisioned-camera-credential' in main.PUBLIC_PATH_PREFIXES` → `True` | **fixed, confirmed live** |
+| `_docker_bridge_gateway_ip()` | n/a (didn't exist) | called live inside the running container → resolves to `172.18.0.1`, exactly matching the real bridge gateway independently confirmed via `ip addr` on this box | **works correctly on this actual Ryzen/Docker network** |
+| Endpoint's bearer-credential requirement | -- | verified via `inspect.getsource()` of the live, running function (not a live call, to stay read-only and never touch/expose the real credential) — the `presented != identity["credential"]` check is present and unconditional, unchanged from source | **still mandatory** |
+| Local `cameras` / `camera_credentials` / `pending_camera_credentials` | `12` / `0` / `0` | `12` / `0` / `0` | **unchanged** — no reprovisioning happened as a side effect of the install |
+| Camera 1 (`dfba6a63ec` local, `7e34833a37` is the separate pre-existing old-identity orphan sharing the same physical device_key — unrelated, already documented) | `status=configured`, no local credential | identical: `status=configured`, `camera_number=1`, `customer_id` unchanged, still no local credential | **unchanged** |
+| Cloud `appliance_camera_status` for `dfba6a63ec` | `last_error=camera_not_bound` | `last_error=camera_not_bound`, fresh `updated_at` (heartbeat still correctly reporting it) | **unchanged, exactly the expected state** |
+
+No credential or token value was printed, logged, or exposed at any point during this verification. Nothing was reprovisioned, no discovery was re-run, no placeholder was touched, Samsung was not touched, Motion Cloud was not enabled.
+
 ### State to resume from
 
-Once the operator runs the install and reports the result, complete the read-only post-install verification against the baseline above (build_id now `6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c`, appliance stays `AIC-C814766E`, agent re-authenticates, heartbeat resumes, `pending_camera_credentials`/`camera_credentials` counts unchanged since no reprovisioning happens as part of this install, `appliance_identity.json` hash unchanged, `/api/local/provisioned-camera-credential` present and gated by both the gateway-IP check and the bearer credential). Camera 1 reprovisioning and the placeholder reconciliation both remain explicitly not-yet-authorized next steps.
+Ryzen is now genuinely running commit `6d6dcd5d6e665bfb74ab76cb6dd1fb2bc3c01d6c`, fully verified, with identity/activation/camera state completely preserved. Both source fixes for Camera 1's local credential handoff are live on both sides (`anyaicam-staging` and Ryzen). The two remaining, explicitly not-yet-authorized next steps are unchanged: (1) reprovision Camera 1 through the normal Customer Setup Step 4 "Add this camera" flow (reusing the existing discovery results, no new scan needed) to actually deliver its credential locally now that the fix is live, and (2) the one-time placeholder-count reconciliation for this customer (delete exactly one of the 8 untouched placeholder rows) once Camera 1's reprovision is confirmed working.
 
 ---
 
