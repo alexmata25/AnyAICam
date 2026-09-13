@@ -84,11 +84,12 @@ def client(db_path):
             yield test_client
 
 
-def _configure(monkeypatch, *, recording_enabled=False, event_media_enabled=False,
+def _configure(monkeypatch, *, recording_enabled=False, event_media_enabled=False, pilot_cameras=frozenset(),
                role_arn="arn:aws:iam::880690594006:role/anyaicam-recording-upload-role",
                bucket="anyaicam-recordings-prod-20260820", region="us-east-1"):
     monkeypatch.setattr(appliance_cloud, "RECORDING_UPLOAD_ENABLED", recording_enabled)
     monkeypatch.setattr(appliance_cloud, "EVENT_MEDIA_UPLOAD_ENABLED", event_media_enabled)
+    monkeypatch.setattr(appliance_cloud, "RECORDING_UPLOAD_PILOT_CAMERAS", frozenset(pilot_cameras))
     monkeypatch.setattr(appliance_cloud, "RECORDING_UPLOAD_ROLE_ARN", role_arn)
     monkeypatch.setattr(appliance_cloud, "RECORDING_S3_BUCKET", bucket)
     monkeypatch.setattr(appliance_cloud, "RECORDING_AWS_REGION", region)
@@ -293,3 +294,125 @@ def _issue_and_get_resource(client, camera_id, appliance_id, credential) -> str:
     response = client.post(f"/api/appliance/recordings/{camera_id}/credentials", headers=_auth_headers(appliance_id, credential))
     assert response.status_code == 200
     return _FakeSTS.last_policy["Statement"][0]["Resource"]
+
+
+# ------------------------------------------- pilot-camera allowlist (Phase 2)
+
+
+def test_pilot_camera_allowlist_unset_restricts_nothing():
+    assert appliance_cloud.RECORDING_UPLOAD_PILOT_CAMERAS == frozenset()
+
+
+def test_pilot_listed_camera_gets_the_broad_bulk_policy_with_the_global_flag_off(client, db_path, monkeypatch):
+    """The real scenario this mechanism exists for: RECORDING_UPLOAD_ENABLED
+    stays globally false, but one explicitly-approved camera still gets
+    the real bulk-recording session scope."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True, pilot_cameras={"cam-1"})
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1",
+                  customer_id="cust-1", site_id="site-1")
+
+    resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
+
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
+    assert "/events/" not in resource
+    assert appliance_cloud.RECORDING_UPLOAD_ENABLED is False
+
+
+def test_a_non_pilot_camera_still_gets_the_narrow_event_media_policy(client, db_path, monkeypatch):
+    """Regression lock: listing one camera must not widen scope for any
+    other camera, even on the same appliance."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True, pilot_cameras={"cam-1"})
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-2",
+                  customer_id="cust-1", site_id="site-1")
+
+    resource = _issue_and_get_resource(client, "cam-2", "appl-1", "cred")
+
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-2/*/events/*"
+
+
+def test_pilot_listed_camera_can_catalog_a_recording_with_the_global_flag_off(client, db_path, monkeypatch):
+    """recording_available() (R2) must also accept a pilot-listed
+    camera_id even while RECORDING_UPLOAD_ENABLED stays globally false --
+    without this, the credential above would be issued but every
+    catalog call would still 404."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=False, pilot_cameras={"cam-1"})
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1",
+                  customer_id="cust-1", site_id="site-1")
+
+    response = client.post(
+        "/api/appliance/recordings/cam-1/available",
+        json={"s3_key": "recordings/cust-1/site-1/appl-1/cam-1/2026/09/13/x.mp4", "started_at": "2026-09-13T00:00:00", "ended_at": "2026-09-13T00:00:10"},
+        headers=_auth_headers("appl-1", "cred"),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+
+
+def test_a_non_pilot_camera_still_404s_on_available_with_the_global_flag_off(client, db_path, monkeypatch):
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=False, pilot_cameras={"cam-1"})
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-2")
+
+    response = client.post(
+        "/api/appliance/recordings/cam-2/available",
+        json={"s3_key": "recordings/cust-1/site-1/appl-1/cam-2/2026/09/13/x.mp4", "started_at": "2026-09-13T00:00:00", "ended_at": "2026-09-13T00:00:10"},
+        headers=_auth_headers("appl-1", "cred"),
+    )
+    assert response.status_code == 404
+
+
+def test_status_route_still_reports_only_the_global_flag_unaffected_by_the_pilot_list(client, db_path, monkeypatch):
+    """The pilot list changes credential scope and the catalog gate only
+    -- it must never make /status claim bulk recording is broadly on."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=False, pilot_cameras={"cam-1"})
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1")
+
+    status = client.get("/api/appliance/recordings/status", headers=_auth_headers("appl-1", "cred"))
+    assert status.json() == {"enabled": False}
+
+
+def test_pilot_camera_on_another_appliance_still_rejects_an_unauthorized_caller(client, db_path, monkeypatch):
+    """Ownership is checked independently of pilot-list membership --
+    being on the allowlist never substitutes for actually owning the
+    camera."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=True, pilot_cameras={"cam-1"})
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1", other_appliance=True)
+
+    response = client.post("/api/appliance/recordings/cam-1/credentials", headers=_auth_headers("appl-other", "other-credential"))
+    assert response.status_code == 403
+
+    available = client.post(
+        "/api/appliance/recordings/cam-1/available",
+        json={"s3_key": "recordings/cust-1/site-1/appl-1/cam-1/2026/09/13/x.mp4", "started_at": "2026-09-13T00:00:00", "ended_at": "2026-09-13T00:00:10"},
+        headers=_auth_headers("appl-other", "other-credential"),
+    )
+    assert available.status_code == 403
+
+
+def test_bulk_recording_globally_enabled_behavior_is_unchanged_regardless_of_pilot_list(client, db_path, monkeypatch):
+    """Regression lock: a camera that's both pilot-listed AND covered by
+    the global flag behaves exactly as it always did under the global
+    flag -- the pilot list adds a second door, it doesn't change what's
+    behind the existing one."""
+    _configure(monkeypatch, recording_enabled=True, event_media_enabled=False, pilot_cameras={"cam-1"})
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1",
+                  customer_id="cust-1", site_id="site-1")
+
+    resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"

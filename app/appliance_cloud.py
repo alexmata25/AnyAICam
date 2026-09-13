@@ -77,6 +77,23 @@ ANALYTICS_SYNC_ENABLED=os.getenv('ANYAICAM_ANALYTICS_SYNC_ENABLED','false').stri
 # event_media_uploader.py's own edge-side gate) so the credentials route
 # can be authorized by EITHER feature without coupling them.
 EVENT_MEDIA_UPLOAD_ENABLED=os.getenv('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED','false').strip().lower()=='true'
+# 2026-09-13 (Phase 2, Historical Playback validation): a controlled,
+# explicit, camera_id-keyed allowlist -- unset/empty (the default) means
+# no pilot cameras and zero behavior change for every existing caller,
+# same convention as analytics_sync.SYNC_CAMERA_SCOPE and
+# recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE. Lets exactly one
+# already-approved camera exercise the real bulk-recording credential
+# scope and catalog route (recording_upload_credentials()/
+# recording_available() below) without turning on RECORDING_UPLOAD_
+# ENABLED globally, which would also activate those same two routes for
+# every other appliance/customer in the system. Deliberately does NOT
+# touch cameras.cloud_recording_mode -- that column is a single value
+# per camera already meaning 'motion' for this same camera's proven
+# event-media entitlement; reusing it for this would silently break
+# that pipeline, which is exactly why this is a separate mechanism.
+RECORDING_UPLOAD_PILOT_CAMERAS: frozenset[str] = frozenset(
+    item.strip() for item in os.getenv('ANYAICAM_RECORDING_UPLOAD_PILOT_CAMERAS','').split(',') if item.strip()
+)
 
 
 def _bearer(request: Request) -> str:
@@ -459,7 +476,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         camera=_authorized_camera(appliance,camera_id)
         if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
             raise HTTPException(status_code=503,detail='Recording upload is not configured.')
-        if RECORDING_UPLOAD_ENABLED:
+        if RECORDING_UPLOAD_ENABLED or camera['id'] in RECORDING_UPLOAD_PILOT_CAMERAS:
             policy=recording_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
         else:
             policy=event_media_session_policy(RECORDING_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
@@ -493,8 +510,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # migration) instead of the ephemeral live manifest. Nothing
         # calls this route yet (that's R3's appliance-side uploader);
         # nothing reads what it catalogs (that's R4).
+        #
+        # 2026-09-13: also accepts a pilot-listed camera_id (see
+        # RECORDING_UPLOAD_PILOT_CAMERAS's own comment) even while
+        # RECORDING_UPLOAD_ENABLED stays globally false -- checked
+        # against the raw path param, before _authorized_camera() runs
+        # below; a caller not actually authorized for this camera is
+        # still rejected there exactly as before, unaffected by this.
         appliance=authenticate_appliance(request)
-        if not RECORDING_UPLOAD_ENABLED: raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
+        if not (RECORDING_UPLOAD_ENABLED or camera_id in RECORDING_UPLOAD_PILOT_CAMERAS):
+            raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
         safe=sanitize_appliance_payload(payload)
         s3_key=str(safe.get('s3_key','')).strip()
