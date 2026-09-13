@@ -29,6 +29,23 @@ except ImportError:
 
 logger=logging.getLogger('anyaicam.appliance')
 request_limiter=RateLimiter(120,60); activation_limiter=RateLimiter(10,300)
+# Live Relay per-camera rate limit (2026-09-13): confirmed live under real
+# 5-camera concurrent load that /live/{camera_id}/segment-available's own
+# legitimate traffic (~30 requests/minute per actively-relayed camera --
+# one per 2-second HLS segment) already exceeds the shared request_limiter's
+# 120/60 budget on its own math at just 5 cameras, and would be roughly 2x
+# over budget at the current 8-camera Starter entitlement -- worse at any
+# larger future tier. Deliberately NOT a second appliance-wide ceiling sized
+# for one particular tier (that just relocates the same "wrong number for
+# some fleet size" problem) -- keyed by camera_id instead of appliance_id,
+# so the effective allowed aggregate for an appliance scales automatically
+# with however many cameras it actually has actively relaying (N cameras x
+# 60/min), always ~2x the ~30/min legitimate cadence at any fleet size,
+# while still bounding a single malfunctioning camera's own runaway traffic
+# independently of every other camera and of the appliance's own unrelated
+# control-plane traffic (heartbeat/commands/configuration/etc., which stay
+# on the original, completely unchanged request_limiter).
+live_relay_camera_limiter=RateLimiter(60,60)
 LIVE_RELAY_ENABLED=os.getenv('ANYAICAM_LIVE_RELAY_ENABLED','false').strip().lower()=='true'
 LIVE_UPLOAD_ROLE_ARN=os.getenv('ANYAICAM_LIVE_UPLOAD_ROLE_ARN','').strip()
 LIVE_RELAY_S3_BUCKET=os.getenv('ANYAICAM_S3_BUCKET','').strip()
@@ -54,13 +71,26 @@ def _bearer(request: Request) -> str:
     return request.headers.get('authorization','').removeprefix('Bearer ').strip()
 
 
-def authenticate_appliance(request: Request) -> dict:
+def authenticate_appliance(request: Request, *, limiter: "RateLimiter | None" = request_limiter) -> dict:
+    # `limiter` defaults to the module-level request_limiter -- every
+    # existing call site (all ~21 of them) calls authenticate_appliance(
+    # request) with no argument and is completely unaffected by this
+    # parameter's existence. Only live_relay_session()/
+    # live_relay_segment_available() pass limiter=None, to skip this
+    # appliance-wide check entirely for those two routes -- their own
+    # traffic is rate-limited per-camera instead (live_relay_camera_limiter,
+    # checked after camera-ownership authorization, inside each of those
+    # two routes) precisely so high-volume, legitimate live-relay traffic
+    # can never crowd out or be crowded out by the same appliance's
+    # heartbeat/commands/configuration budget. limiter=None never skips
+    # identity, credential, timestamp, or replay-nonce verification below --
+    # only this one rate-limit check.
     appliance_id=request.headers.get('x-appliance-id','').strip(); timestamp=request.headers.get('x-request-timestamp',''); nonce=request.headers.get('x-request-nonce','').strip(); credential=_bearer(request)
     if not appliance_id or not timestamp or len(nonce)<16 or not credential: raise HTTPException(status_code=401,detail='Appliance authentication headers are required.')
     try: request_timestamp=int(timestamp)
     except ValueError as error: raise HTTPException(status_code=401,detail='Invalid request timestamp.') from error
     if not validate_request_time(request_timestamp): raise HTTPException(status_code=401,detail='Request timestamp is outside the allowed window.')
-    if not request_limiter.allow(appliance_id): raise HTTPException(status_code=429,detail='Appliance request rate exceeded.')
+    if limiter is not None and not limiter.allow(appliance_id): raise HTTPException(status_code=429,detail='Appliance request rate exceeded.')
     appliance=row('SELECT * FROM appliances WHERE id=?',(appliance_id,))
     if not appliance or appliance.get('state')=='revoked': raise HTTPException(status_code=403,detail='Appliance is revoked or unknown.')
     credentials=rows('SELECT * FROM appliance_credentials WHERE appliance_id=? AND revoked_at IS NULL',(appliance_id,))
@@ -342,10 +372,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.post('/api/appliance/live/{camera_id}/session')
     def live_relay_session(request: Request,camera_id: str) -> dict:
-        appliance=authenticate_appliance(request)
+        appliance=authenticate_appliance(request,limiter=None)
         if not LIVE_RELAY_ENABLED or not appliance.get('live_relay_pilot'):
             raise HTTPException(status_code=404,detail='Live relay is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
+        if not live_relay_camera_limiter.allow(camera_id):
+            raise HTTPException(status_code=429,detail='Live relay request rate exceeded.')
         if boto3 is None or not LIVE_UPLOAD_ROLE_ARN or not LIVE_RELAY_S3_BUCKET or not LIVE_RELAY_AWS_REGION:
             raise HTTPException(status_code=503,detail='Live relay is not configured.')
         policy=live_relay_session_policy(LIVE_RELAY_S3_BUCKET,camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
@@ -682,9 +714,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.post('/api/appliance/live/{camera_id}/segment-available')
     def live_relay_segment_available(request: Request,camera_id: str,payload: dict) -> dict:
-        appliance=authenticate_appliance(request)
+        appliance=authenticate_appliance(request,limiter=None)
         if not LIVE_RELAY_ENABLED: raise HTTPException(status_code=404,detail='Live relay is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
+        if not live_relay_camera_limiter.allow(camera_id):
+            raise HTTPException(status_code=429,detail='Live relay request rate exceeded.')
         safe=sanitize_appliance_payload(payload); segment_key=str(safe.get('segment_key','')).strip()
         if not segment_key: raise HTTPException(status_code=400,detail='segment_key is required.')
         expected_prefix=live_relay_s3_prefix(camera['customer_id'],camera['site_id'],appliance['id'],camera_id)
