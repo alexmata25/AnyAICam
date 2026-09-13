@@ -2148,3 +2148,25 @@ Full regression: `app/` 86 failed/1741 passed/22 skipped -- reconciles exactly a
 ### State to resume from
 
 Once the operator runs the Ryzen install, next steps per explicit instruction: (1) verify all 5 cameras and Cloud Live remain healthy post-install: (2) perform or request one more fresh Camera 1 detection; (3) capture the now-actually-logged clip-generation exception; (4) STOP and report the real underlying error before implementing any functional fix. Do not change clip-generation behavior itself until that real error is known and a fix is separately approved.
+
+## 2026-09-13 (later): The captured clip-generation exception cleared `build_motion_event_clip()` entirely -- real root cause is one stage downstream, in the pre-existing (already-logging) `upload_motion_event_media()` outbox write; fixed, tested, deployed to staging and Ryzen (commit `95d476d`)
+
+**The diagnostic fix (`8bdf790`) worked exactly as intended and exonerated the function it was watching**: zero "clip build failed" lines ever appeared. `build_motion_event_clip()` was never the problem.
+
+**Real root cause, found by re-reading a previously-misread log line at full width**: nine other real events (Cameras 2/3's ongoing traffic) hit the *pre-existing* `upload_motion_event_media()` try/except and were already logging correctly all along -- `OSError: [Errno 30] Read-only file system: '/var/lib/anyaicam/event_media_outbox.tmp'`. `/var/lib/anyaicam` is mounted read-only into `anyaicam-vms` by design (only the host-side `anyaicam-agent.service` writes there); `event_media_outbox.py`'s `OUTBOX_FILE` and `analytics_sync.py`'s `SYNC_STATE_FILE` both defaulted under it anyway.
+
+**Fix, approved after a design-review proposal that explicitly rejected widening the read-only mount**: both files now default to `/opt/anyaicam/data/config` instead -- an existing, already-read-write-mounted, already-persistent-across-repair-installs directory the installer's own `05-provision-users-dirs.sh` documents as being for exactly this kind of "protected customer/config data." No new Docker mount/volume/permission change was needed. `/app/recordings` (the other writable option) was deliberately ruled out -- it's served unauthenticated at `/recordings` via `main.py`'s `StaticFiles` mount, so anything placed there is potentially URL-fetchable. `STATE_DIR` itself is completely untouched -- `CREDENTIAL_FILE` still reads `credential.json` from the real, read-only `/var/lib/anyaicam`, and `live_relay_uploader.py`/`recording_uploader.py` (read-only consumers of `STATE_DIR`, never writers) are unaffected.
+
+**Tests**: two new regression-locks (`test_analytics_sync.py`, `test_event_media_outbox.py`) asserting each file's real default now resolves under `/opt/anyaicam/data/config` and never starts with `/var/lib/anyaicam`; the analytics-sync one also locks `STATE_DIR`/`CREDENTIAL_FILE` unchanged, using this file's own established `importlib.reload()` pattern to see the true default past its own autouse tmp_path-override fixture.
+
+Full regression: `app/` 86 failed/1743 passed/22 skipped -- failure set diffed byte-for-byte identical to the established 86-failure baseline; 1743 = 1741 + 2 new tests, zero new regressions.
+
+**Deployed**: staging `portal-green` recreated on `deploy-portal:95d476d`, byte-verified, DB integrity `ok`, counts unchanged, all 5 cameras still healthy (staging runs `RUNTIME_ROLE=cloud`, so this worker code never actually activates there -- redeployed purely for source-commit consistency). Ryzen artifact built (`anyaicam-appliance-installer-1.1.0-vms-95d476d21d04.tar.gz`), SHA-256 verified after `scp`, extracted to `~/anyaicam-install-95d476d`, manifest confirms `vms_release_commit=95d476d21d04c206cdcfe721b0e517dca1d88ead` -- **install on Ryzen still pending the operator's own `sudo ./install.sh --repair`**.
+
+**Explicitly not addressed by this fix, and not assumed to be resolved by it**: the two specific fresh Camera 1 events from the prior pass (`f3fda44abee7`, `647b779d3447`) that never reached the media-upload stage at all -- no clip file, no diagnostic log line of any kind, from either the new clip-build guard or this pre-existing upload try/except. That remains open and needs its own separate investigation once this fix is verified on Ryzen with a fresh detection.
+
+**Historical Playback remains explicitly unproven** -- untouched by any of this work.
+
+### State to resume from
+
+Once the operator runs the Ryzen install: (1) verify commit, all 5 cameras, agent, and Cloud Live Relay are healthy; (2) verify `/var/lib/anyaicam` is still mounted read-only (proof the security boundary wasn't widened); (3) perform or request one more fresh Camera 1 detection; (4) determine whether the thumbnail/clip actually reach AWS and are retrievable through the customer-facing VMS, not just that DB rows exist; (5) separately re-investigate why the two specific Camera-1 events never reached the uploader at all, without assuming this fix explains or resolves it. STOP and report before any further functional change if anything new fails.
