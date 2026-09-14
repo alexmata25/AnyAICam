@@ -942,6 +942,22 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     for local_path in pending:
         if attempted >= RECORDING_UPLOAD_MAX_FILES_PER_SCAN:
             break  # remainder stays pending -- picked up on a later scan, never dropped
+        # Real, live defect found and fixed 2026-09-14: RECORDING_UPLOAD_
+        # MAX_TOTAL_FILES_PER_CAMERA used to be checked only once, by the
+        # worker loop, before this whole function was ever called -- so a
+        # fresh/just-restarted camera (an empty _uploaded_files entry)
+        # could still have this single call upload an entire
+        # RECORDING_UPLOAD_MAX_FILES_PER_SCAN-sized batch (5 by default)
+        # before the cap was ever re-checked, regardless of a total cap
+        # of 1. Re-checked here, inside the loop, immediately after every
+        # completed iteration (successful or not) via _remember_uploaded()
+        # updating _uploaded_files -- so a total cap of 1 now makes it
+        # impossible for this single call to ever complete a second
+        # upload, no matter how large RECORDING_UPLOAD_MAX_FILES_PER_SCAN
+        # is. Unset (None, the default) is unaffected -- see
+        # _camera_at_or_over_total_cap()'s own docstring.
+        if _camera_at_or_over_total_cap(camera_number):
+            break  # remainder stays pending -- never dropped, just not attempted this call
 
         if not local_path.exists():
             continue

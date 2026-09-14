@@ -628,3 +628,91 @@ def test_wrapped_failure_next_attempt_requests_fresh_credentials(monkeypatch, tm
     ru._relay_camera_once(camera_number, "cam-19-id")
 
     assert len(credentials_calls) == 2, "the second pass must fetch credentials again after a wrapped credential failure, not reuse anything stale"
+
+
+# ---------------------------------------------------------------------------
+# 20-22. RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA enforced INSIDE the
+# per-file loop, not only once between scan cycles (2026-09-14 fix).
+#
+# Real, live defect this fixes: the hard cap was previously checked only
+# by recording_upload_worker(), once, before calling _relay_camera_once()
+# at all. On a fresh/just-restarted camera (_uploaded_files empty), that
+# one check passed, and the single call then ran its own internal
+# RECORDING_UPLOAD_MAX_FILES_PER_SCAN-sized batch (5 by default) to
+# completion before the cap was ever re-checked -- confirmed live on
+# Ryzen: a configured total cap of 1 still uploaded 5 real Camera 1
+# recordings in one pass. The fix re-checks the cap at the top of every
+# loop iteration, immediately after each file's own _remember_uploaded()
+# call, so it can now also stop mid-batch, not just between calls.
+# ---------------------------------------------------------------------------
+
+def test_total_cap_stops_mid_batch_even_when_per_scan_cap_is_larger(monkeypatch, tmp_path):
+    camera_number = 20
+    monkeypatch.setattr(ru, "AWS_REGION", "us-east-1")
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_MAX_FILES_PER_SCAN", 5)
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA", 1)
+    pending = _seed_pending_files(tmp_path, camera_number, count=3)
+    assert len(pending) == 3
+
+    _install_fake_prepare_cloud_copy(monkeypatch, tmp_path)
+    _install_fake_control_plane(monkeypatch)
+    fake_boto3 = _install_fake_boto3(monkeypatch)
+
+    ru._relay_camera_once(camera_number, "cam-20-id")
+
+    assert len(ru._uploaded_files.get(camera_number, [])) == 1, \
+        "a configured total cap of 1 must make it impossible to upload more than one recording in this single call"
+    assert fake_boto3.clients_created[0]._recording_call_count == 1, \
+        "only one real recording upload attempt must actually happen -- the rest of the batch is never even tried"
+    for path in pending:
+        assert path.exists(), f"{path} must never be deleted, uploaded or not"
+
+
+def test_total_cap_still_blocks_a_second_direct_call_in_the_same_process(monkeypatch, tmp_path):
+    """Proves the fix holds across multiple scan iterations too, not
+    just within one -- a second call (simulating the next scan tick)
+    must not upload anything further once the camera is already at its
+    configured total."""
+    camera_number = 21
+    monkeypatch.setattr(ru, "AWS_REGION", "us-east-1")
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_MAX_FILES_PER_SCAN", 5)
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA", 1)
+    pending = _seed_pending_files(tmp_path, camera_number, count=3)
+
+    _install_fake_prepare_cloud_copy(monkeypatch, tmp_path)
+    _install_fake_control_plane(monkeypatch)
+    fake_boto3 = _install_fake_boto3(monkeypatch)
+
+    ru._relay_camera_once(camera_number, "cam-21-id")
+    assert len(ru._uploaded_files.get(camera_number, [])) == 1
+
+    ru._relay_camera_once(camera_number, "cam-21-id")
+
+    assert len(ru._uploaded_files.get(camera_number, [])) == 1, \
+        "a second call must not upload a second recording once the total cap is already reached"
+    assert fake_boto3.clients_created[0]._recording_call_count == 1, \
+        "no further upload attempt of any kind on the second call"
+    for path in pending:
+        assert path.exists()
+
+
+def test_total_cap_unset_preserves_the_existing_full_batch_behavior(monkeypatch, tmp_path):
+    """Regression lock: production's existing behavior (drain up to
+    RECORDING_UPLOAD_MAX_FILES_PER_SCAN files per call when no total cap
+    is configured) must be completely unchanged by this fix."""
+    camera_number = 22
+    assert ru.RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA is None
+    monkeypatch.setattr(ru, "AWS_REGION", "us-east-1")
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_MAX_FILES_PER_SCAN", 5)
+    pending = _seed_pending_files(tmp_path, camera_number, count=8)
+
+    _install_fake_prepare_cloud_copy(monkeypatch, tmp_path)
+    _install_fake_control_plane(monkeypatch)
+    _install_fake_boto3(monkeypatch)
+
+    ru._relay_camera_once(camera_number, "cam-22-id")
+
+    assert len(ru._uploaded_files.get(camera_number, [])) == 5, \
+        "with no total cap configured, a full per-scan batch must still upload exactly as before this fix"
+    for path in pending:
+        assert path.exists()
