@@ -53062,6 +53062,151 @@ def _customer_detection_events(request: Request, *, limit: int | None = None) ->
     ]
 
 
+# Module-level (not local to _customer_investigate_events()) so tests
+# can monkeypatch them down to a small number and prove the "smart_motion
+# is never crowded out of the window by ordinary events" property at a
+# fast, direct scale, without needing to seed thousands of rows.
+INVESTIGATE_SMART_MOTION_CEILING = 2000
+INVESTIGATE_OTHER_EVENTS_CEILING = 500
+
+
+def _customer_investigate_events(request: Request) -> list[dict] | None:
+    """Investigate's own event feed -- NOT a call to
+    _customer_detection_events() with no limit, on purpose.
+
+    Root cause (2026-09-14 Investigate reliability phase): Investigate
+    was the one remaining caller still using _customer_detection_
+    events()'s unbounded branch directly (every other caller either
+    passes a real limit or, like /api/analytics/events and
+    /api/analytics/summary, genuinely needs the customer's complete
+    history to compute correct filtered/aggregated results and so
+    keeps that branch as-is here). For a customer with a large real
+    event history this meant embedding this customer's *entire*
+    detection_events table into the rendered page HTML, then keeping
+    only the 500 most recent rows *overall* for client-side filtering.
+
+    Measured against real production data (customer with 13,796 total
+    events, 361 of them smart_motion): the naive "500 most recent
+    overall" window contained only 16 of those 361 smart_motion events
+    -- 345 (95.6%) were silently unreachable by any Investigate search
+    or filter, indistinguishable from "no such event exists," because
+    smart_motion is a small fraction of this customer's total event
+    volume (dominated by ordinary YOLO detections) and a purely-recency
+    window starves it out almost completely. This is Investigate's own
+    defect, not a redesign of the shared analytics-events query other
+    callers correctly still rely on.
+
+    Fix: two separate, always-SQL-bounded queries -- every smart_motion
+    event (LIMIT high enough that this ceiling is never realistically
+    hit; smart_motion volume is inherently a small fraction of total
+    detections in this system) merged with the most recent ordinary
+    (non-smart_motion) events, same window size Investigate has always
+    shown for that majority case. Every real detection_events row this
+    customer owns is still visible on the Events page (whose own
+    bounded polling already has its own correct limit) -- this only
+    changes which slice of a large history Investigate itself embeds
+    for browsing.
+
+    Deterministic tie-break: ORDER BY event_timestamp DESC, id DESC --
+    a correlated Motion+Smart Motion pair always shares the exact same
+    event_timestamp (see appliance_cloud.py's own parent-correlation
+    design), so ties are a real, common occurrence here, not a
+    theoretical edge case; a plain ORDER BY on timestamp alone does not
+    guarantee the same relative order across repeated page loads.
+
+    Same identity/role/camera-permission scoping and None/[]-vs-list
+    contract as _customer_detection_events() -- customer_id/camera
+    scope always comes from the authenticated identity, never from any
+    request parameter."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+
+    select = (
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'dem.thumbnail_s3_key AS thumbnail_s3_key '
+        'FROM detection_events de '
+        'JOIN cameras c ON c.id = de.camera_id '
+        'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
+    )
+    from partner_db import connection
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            rows = db.execute(
+                select + "WHERE de.customer_id = ? AND de.event_type = 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (identity["customer_id"], INVESTIGATE_SMART_MOTION_CEILING),
+            ).fetchall()
+            rows += db.execute(
+                select + "WHERE de.customer_id = ? AND de.event_type != 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (identity["customer_id"], INVESTIGATE_OTHER_EVENTS_CEILING),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            permission_join = (
+                'JOIN customer_camera_permissions p ON p.camera_id = de.camera_id AND p.user_id = ? '
+            )
+            rows = db.execute(
+                select + permission_join
+                + "WHERE de.customer_id = ? AND p.can_playback = 1 AND de.event_type = 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (user["id"], identity["customer_id"], INVESTIGATE_SMART_MOTION_CEILING),
+            ).fetchall()
+            rows += db.execute(
+                select + permission_join
+                + "WHERE de.customer_id = ? AND p.can_playback = 1 AND de.event_type != 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (user["id"], identity["customer_id"], INVESTIGATE_OTHER_EVENTS_CEILING),
+            ).fetchall()
+
+    events = [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
+            "site": row["site_name"],
+            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "event_type": row["event_type"],
+            "direction": None,
+            "timestamp": row["event_timestamp"],
+            "confidence": row["confidence"],
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
+            "linked_recording": None,
+            "has_event_clip": bool(row["has_event_clip"]),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "plate_number": None,
+            "vehicle_color": None,
+            "mock": False,
+        }
+        for row in rows
+    ]
+    # Merging two independently-LIMIT-ed queries can interleave out of
+    # strict order (each half is only sorted within itself) -- one
+    # final, deterministic sort over the merged, already-bounded set
+    # restores it. id is a real column on every row here (never
+    # missing), so this sort is always fully deterministic, matching
+    # the two queries' own ORDER BY tie-break.
+    events.sort(key=lambda event: (event["timestamp"], event["id"]), reverse=True)
+    return events
+
+
 def _customer_notifications(request: Request, *, camera_number: int | None = None, limit: int = 100) -> list[dict] | None:
     """This portal customer's own real notifications rows for the
     customer-facing Smart Alerts page, or None when the caller isn't a
@@ -79532,8 +79677,16 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     PUT /api/analytics/events/{id}/review is kept (it stays scoped to
     events this identity was already shown), and evidence export stays
     a pure client-side JSON download of the same already-authorized
-    events -- neither call touches another customer's data."""
-    events = _customer_detection_events(request) or []
+    events -- neither call touches another customer's data.
+
+    events comes from _customer_investigate_events(), NOT the generic
+    _customer_detection_events() with no limit -- see that function's
+    own docstring for why: a plain most-recent-500-overall window
+    measurably starves out the large majority of a real customer's
+    smart_motion events once their total history grows past a few
+    hundred events, which is not a hypothetical edge case in this
+    system's real usage pattern."""
+    events = _customer_investigate_events(request) or []
 
     camera_options = "".join(
         f'<option value="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</option>'
@@ -79561,8 +79714,14 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
             "rule": event.get("rule_name") or "",
             "review": load_json_file(EVENT_REVIEWS_FILE, {}).get(event["id"], {}),
         })
-    normalized.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
-    investigation_data = json.dumps(normalized[:500], default=str)
+    # id tie-break for the same reason _customer_investigate_events()
+    # already sorts this way: a correlated Motion+Smart Motion pair
+    # shares an identical timestamp, so a timestamp-only sort key does
+    # not guarantee the same relative order across repeated renders.
+    # Stable re-sort over an already-bounded (<= 2500) list -- no new
+    # truncation happens here, only the display order is fixed.
+    normalized.sort(key=lambda item: (item.get("timestamp", ""), item.get("id", "")), reverse=True)
+    investigation_data = json.dumps(normalized, default=str)
 
     if not cameras:
         content = (
