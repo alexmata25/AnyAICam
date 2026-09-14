@@ -2423,3 +2423,25 @@ cd ~/anyaicam-install-818f07f
 sudo ./install.sh --repair
 ```
 After that install completes, the next step (not yet approved) is post-install verification matching this project's own established pattern (runtime commit, byte-verified source, agent/VMS health, all 5 cameras, Live Relay, analytics/event-media queues, `RECORDING_UPLOAD_ENABLED=false`, historical Playback's 5 rows, `/var/lib/anyaicam` read-only) -- and, separately, real-world confirmation that a naturally-occurring correlated Smart Motion event's media now completes without its own independent encode. Every safeguard remains intact: `RECORDING_UPLOAD_ENABLED=false` everywhere, `EVENT_CLIP_ENCODE_MAX_CONCURRENCY` unchanged at `1`, Live Relay/ffmpeg thread settings untouched, AI/YOLO media behavior untouched, Playback and the 5 historical recording rows untouched, Smart Motion correlation/settings untouched, entitlements/RDM/AWS policies untouched, Samsung untouched. No Smart Motion event was intentionally generated.
+
+## 2026-09-14 (later): POST-INSTALL PASS -- Ryzen genuinely running `818f07fd0c6e4fba0a14723e811871d9b4ab9c73`, every safeguard confirmed intact, both sides healthy
+
+The operator reported the `sudo ./install.sh --repair` completed successfully. Full read-only post-install verification performed (plain `docker`/`systemctl`, no `sudo`), no configuration/service change, no Smart Motion event generated:
+
+- **Runtime commit**: `ANYAICAM_VMS_COMMIT=ANYAICAM_BUILD_ID=818f07fd0c6e4fba0a14723e811871d9b4ab9c73`, exact match.
+- **Source verified**: both `/app/main.py` and `/app/event_media_uploader.py` inside the running container hash byte-for-byte identical to `git show 818f07f`.
+- **Agent/VMS health, no unexpected restarts**: `anyaicam-agent.service` active/running, `NRestarts=0`. `anyaicam-vms` container `Health=healthy`, `RestartCount=0`. `anyaicam-vms.service` `Result=success`/`exited`.
+- **All 5 real cameras online and recording**: `online=true`/`recording=true`/`last_error=null` for all 5.
+- **Live Relay healthy**: `live_relay.worker_started status=running` logged cleanly at startup, zero Live Relay errors in the following 10 minutes.
+- **Analytics/event-media health**: `analytics_sync.scan_tick_begin` cycling cleanly (scans 1-3+ observed); outbox holds only its normal single freshly-arrived pending item (`attempts=0`); real `event_media.registered` successes observed for fresh base-Motion events (cameras 1 and 2) within minutes of restart. Zero `smart_motion` log lines anywhere -- confirms no Smart Motion event has occurred or been triggered. Zero errors/tracebacks since install.
+- **Appliance identity / camera bindings unchanged**: `credential.json` still `appliance_id=2f941627b4`; `camera_bindings.json` still lists all 5 cameras with their original `approved_at` timestamps.
+- **`/var/lib/anyaicam` still read-only**: `ro,relatime` confirmed.
+- **`RECORDING_UPLOAD_ENABLED=false`** confirmed. **`EVENT_CLIP_ENCODE_MAX_CONCURRENCY` still absent** (default `1`, unchanged, as required).
+- **Historical Playback's 5 catalog rows unchanged**: staging `recordings` table still the same exact 5 rows.
+- **Staging remains healthy on `818f07f`**: `portal-green` still `Up` on `deploy-portal:818f07f`, `/health` -> `200 ok`.
+
+**POST-INSTALL PASS.** The shared-clip-artifact fix (`818f07f`) is now live and verified healthy on both `anyaicam-staging` and Ryzen, with every safeguard confirmed intact and zero configuration/service changes made. No Smart Motion event has been generated yet.
+
+### State to resume from
+
+Both sides are confirmed on the new build and fully healthy. Next step, approved in principle but not yet executed: a controlled, real-data validation that a fresh Motion + Smart Motion pair produces two independent analytics events, two independent `detection_event_media` rows, the SAME shared `s3_key`/`thumbnail_s3_key`, and exactly one physical encode/upload -- plus measuring the resulting queue behavior (informational only; no further performance changes to be made in that pass).
