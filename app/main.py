@@ -139847,7 +139847,7 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
     return added
 
 
-def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, near: str | None = None) -> list[dict]:
+def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, before_id: str | None = None, near: str | None = None) -> list[dict]:
     """Recording METADATA only -- {id, start, end, name}, no presigned
     URL -- the bounded, cheap counterpart _customer_camera_recordings()
     never was: that function signs every single matching row up front
@@ -139868,16 +139868,27 @@ def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before
     - limit: most recent N rows, returned oldest-first (matching the
       ordering _customer_camera_recordings() and the frontend's own
       clips[clips.length-1]-is-newest convention already use).
-    - before: only rows that started strictly before this ISO
-      timestamp -- pagination for "load older recordings" once the
-      initial bounded page has been exhausted. Ignored if near is set.
+    - before / before_id: pagination for "load older recordings" once
+      the initial bounded page has been exhausted -- rows strictly
+      after (started_at, id) in the same DESC, DESC order this query
+      itself uses, i.e. started_at<before, OR (started_at==before AND
+      id<before_id). before_id is optional and purely additive: a
+      caller passing before alone (the pre-existing contract, still
+      honored exactly as before) gets a plain started_at<before
+      comparison, which is correct as long as no two of this camera's
+      rows ever share an identical started_at. In real operation that
+      is already true (recordings are ~5 minutes apart), but it is not
+      a database constraint, so the id tie-break is here to make
+      "never duplicated, never skipped" a guarantee rather than an
+      assumption -- the one real gap the plain single-column cursor
+      had. Ignored if near is set.
     - near: returns at most the single recording that covers this
       timestamp, or the closest one within 5 minutes -- the exact same
       "covering, else nearest within 5 min" contract findClipNear() in
       the page's own JS already implements client-side, so an
       event-to-playback deep link lands on the same recording whether
       or not it happens to already be in the initially-loaded page.
-      Ignores limit/before."""
+      Ignores limit/before/before_id."""
     _catalog_local_recordings_for_camera(camera_id)
     from partner_db import connection
     with connection() as db:
@@ -139916,10 +139927,13 @@ def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before
 
         query = "SELECT id, s3_key, started_at, ended_at FROM recordings WHERE camera_id=? AND status='available'"
         params: list = [camera_id]
-        if before:
+        if before and before_id:
+            query += " AND (started_at<? OR (started_at=? AND id<?))"
+            params.extend([before, before, before_id])
+        elif before:
             query += " AND started_at<?"
             params.append(before)
-        query += " ORDER BY started_at DESC"
+        query += " ORDER BY started_at DESC, id DESC"
         if limit:
             query += " LIMIT ?"
             params.append(limit)
@@ -140156,7 +140170,7 @@ def customer_clip_status(job_id: str, request: Request) -> dict:
 
 
 @app.get("/api/customer/recordings/{camera_id}")
-def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, near: str | None = None, date: str | None = None, limit: int = 50) -> dict:
+def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, before_id: str | None = None, near: str | None = None, date: str | None = None, limit: int = 50) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     # date= is a distinct, whole-day query mode -- returns every segment
@@ -140172,8 +140186,20 @@ def customer_recordings_metadata(camera_id: str, request: Request, before: str |
         except ValueError:
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD.")
         return {"clips": _customer_recordings_for_date(camera_id, date)}
+    # A malformed cursor must fail cleanly (400) rather than being
+    # passed straight into a raw SQL text comparison, where a garbage
+    # string would silently produce wrong -- not erroring -- results
+    # (before is a plain, unsigned ISO timestamp; camera_id scoping,
+    # already enforced above, is what actually prevents any cross-
+    # camera/cross-customer authorization bypass through this
+    # parameter, not the format check here).
+    if before is not None:
+        try:
+            datetime.fromisoformat(before)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="before must be an ISO timestamp.")
     limit = max(1, min(200, limit))
-    return {"clips": _customer_recording_rows(camera_id, limit=limit, before=before, near=near)}
+    return {"clips": _customer_recording_rows(camera_id, limit=limit, before=before, before_id=before_id, near=near)}
 
 
 @app.get("/api/customer/recordings/{camera_id}/dates")
@@ -141259,18 +141285,30 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // is metadata only (id/start/end/name) -- see this route's own
   // Python docstring (_render_customer_playback) for why. A URL is
   // only ever requested for the one recording actually selected.
+  //
+  // Returns null on a genuine fetch failure (network error or a
+  // non-2xx response) and [] only for a confirmed, successful, empty
+  // result -- these are NOT the same thing to a caller doing
+  // pagination: conflating them (the previous behavior) made a single
+  // transient network blip indistinguishable from "no more older
+  // recordings," permanently hiding the Load older button for the
+  // rest of the session even though older history still existed. See
+  // loadOlderButton's own click handler and ensureClipsLoaded() below,
+  // both of which now treat null as retryable and [] as final.
+  // === PAGINATION_FETCH_START ===
   async function fetchClipsMetadata(cameraId,params){{
     const query=new URLSearchParams(params||{{}});
     try{{
       const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}?${{query}}`);
-      if(!response.ok)return [];
+      if(!response.ok)return null;
       const data=await response.json();
-      return Array.isArray(data.clips)?data.clips:[];
+      return Array.isArray(data.clips)?data.clips:null;
     }}catch(error){{
       debugLog(`metadata fetch failed: ${{error && error.message}}`);
-      return [];
+      return null;
     }}
   }}
+  // === PAGINATION_FETCH_END ===
   async function fetchCameraEvents(cameraId){{
     try{{
       const response=await fetch(`/api/customer/events/${{encodeURIComponent(cameraId)}}`);
@@ -141835,12 +141873,26 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     loadOlderButton.hidden=clips.length===0;
   }}
 
-  loadOlderButton.addEventListener('click',async()=>{{
-    const clips=recordingsByCamera[selectedCameraId]||[];
+  // === PAGINATION_CORE_START ===
+  // Named (not an inline arrow) so it can be extracted and exercised
+  // directly by test_playback_pagination_core.mjs against the exact
+  // deployed source -- see that file for the null-vs-empty and
+  // camera-switch-race regression tests this handler exists to pass.
+  async function handleLoadOlderClick(){{
+    // Captured once, up front: selectedCameraId can change while this
+    // handler is suspended at the await below (the customer is free
+    // to click a different camera tile mid-fetch -- nothing else on
+    // this page blocks that). Every use below reads this local
+    // constant, never selectedCameraId directly, so a camera switch
+    // in flight can never write one camera's older page into another
+    // camera's cache/render -- the same cameraId-capture guard this
+    // file already uses for renderAvailableDates()/loadRecordingsForDate().
+    const cameraId=selectedCameraId;
+    const clips=recordingsByCamera[cameraId]||[];
 
     if(visibleRecordingCount<clips.length){{
       visibleRecordingCount+=6;
-      renderClipList(selectedCameraId,clips);
+      renderClipList(cameraId,clips);
       return;
     }}
 
@@ -141851,38 +141903,74 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     loadOlderButton.textContent='Loading…';
 
     const older=await fetchClipsMetadata(
-      selectedCameraId,
-      {{before:oldest.start,limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}}
+      cameraId,
+      {{before:oldest.start,before_id:oldest.id,limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}}
     );
 
     loadOlderButton.disabled=false;
     loadOlderButton.textContent='Load older recordings';
+
+    if(older===null){{
+      // A genuine fetch failure -- not confirmed end-of-history.
+      // Leave the button visible/enabled exactly as it was so the
+      // customer's next click (or the next automatic call once this
+      // camera is reselected) can simply retry; hiding it here would
+      // permanently and incorrectly present a transient error as "no
+      // older recordings exist."
+      debugLog('load older recordings: fetch failed, will allow retry');
+      return;
+    }}
+
+    if(cameraId!==selectedCameraId){{
+      // The customer switched to a different camera while this fetch
+      // was in flight. The page they're now looking at belongs to a
+      // different camera entirely, so re-rendering here would show
+      // camera A's older recordings under camera B's tile. Still
+      // commit the successful result into cameraId's own cache entry
+      // (so the work isn't wasted and Load older behaves correctly
+      // next time this camera is reselected), but do not touch the
+      // currently-visible UI.
+      if(older.length)recordingsByCamera[cameraId]=[...older,...clips];
+      return;
+    }}
 
     if(!older.length){{
       loadOlderButton.hidden=true;
       return;
     }}
 
-    recordingsByCamera[selectedCameraId]=[...older,...clips];
+    recordingsByCamera[cameraId]=[...older,...clips];
     visibleRecordingCount+=older.length;
     renderClipList(
-      selectedCameraId,
-      recordingsByCamera[selectedCameraId]
+      cameraId,
+      recordingsByCamera[cameraId]
     );
     // Deliberately not re-rendering the timeline for older pages: the
     // timeline is a single day's 0-24h axis (see timelinePercent()),
     // so a recording from a previous day has no meaningful position on
     // it -- Browse recordings' own list, extended here, is the correct
     // place for older history, exactly as the task called for.
-  }});
+  }}
+  loadOlderButton.addEventListener('click',handleLoadOlderClick);
+  // === PAGINATION_CORE_END ===
 
+  // === PAGINATION_ENSURE_START ===
   async function ensureClipsLoaded(cameraId){{
     if(recordingsLoaded.has(cameraId))return recordingsByCamera[cameraId]||[];
     const clips=await fetchClipsMetadata(cameraId,{{limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}});
+    if(clips===null){{
+      // A genuine fetch failure, not a confirmed empty catalog --
+      // deliberately NOT marked as loaded, so the next time this
+      // camera is selected (or ensureClipsLoaded is otherwise called
+      // again) a fresh attempt is made instead of permanently treating
+      // a transient error as "this camera has zero recordings."
+      return recordingsByCamera[cameraId]||[];
+    }}
     recordingsByCamera[cameraId]=clips;
     recordingsLoaded.add(cameraId);
     return clips;
   }}
+  // === PAGINATION_ENSURE_END ===
 
   async function ensureEventsLoaded(cameraId){{
     if(analyticsLoaded.has(cameraId))return analyticsByCamera[cameraId]||[];
@@ -141982,7 +142070,12 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     createClipButton.disabled=true;
     placeholder.hidden=false;
     status.textContent=`Loading recordings for ${{date}}\u2026`;
-    const clips=await fetchClipsMetadata(cameraId,{{date}});
+    // null (a genuine fetch failure -- see fetchClipsMetadata's own
+    // docstring) is normalized to [] here: this date-mode view has no
+    // separate retry affordance of its own the way loadOlderButton
+    // does, so a failed load simply renders as "no recordings for
+    // this date" rather than throwing on the array operations below.
+    const clips=(await fetchClipsMetadata(cameraId,{{date}}))||[];
     if(cameraId!==selectedCameraId||date!==viewingDate){{
       debugLog('[date-mode] aborted: camera or date changed while loading');
       return;
@@ -142153,7 +142246,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       // forwarding seekTimestamp itself, since that may now be an
       // epoch-ms number (see initialTimestamp above) that the server
       // route was never meant to parse directly.
-      const nearby=findClipNear(clips,seekTimestamp)||(await fetchClipsMetadata(cameraId,{{near:playbackDate(seekTimestamp).toISOString().replace('Z','')}}))[0];
+      const nearby=findClipNear(clips,seekTimestamp)||((await fetchClipsMetadata(cameraId,{{near:playbackDate(seekTimestamp).toISOString().replace('Z','')}}))||[])[0];
       if(cameraId!==selectedCameraId){{debugLog('[checkpoint 2] aborted: camera changed while resolving nearby clip');return}}
       debugLog(`[checkpoint 2] nearby=${{nearby?nearby.id:'null'}}${{nearby?(' start='+nearby.start+' end='+nearby.end):''}}`);
       if(nearby){{
