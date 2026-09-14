@@ -332,11 +332,19 @@ def test_notifications_viewer_with_one_of_five_cameras_sees_only_that_camera(mon
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA foreign_keys=ON")
         camera_ids = _seed_fleet(conn, "cust-1", "site-1", "appl-1", "AIC-1", 5)
-        _seed_owner(conn, "owner-1", "owner@example.com", "cust-1")
-        for index, camera_id in enumerate(camera_ids, start=1):
-            _seed_notification(conn, f"notif-{camera_id}", "owner-1", "cust-1", "site-1", camera_id,
-                                "motion", "info", "Motion detected", f"2026-08-2{index}T00:00:00")
         _seed_viewer(conn, "viewer-1", "viewer@example.com", "cust-1", camera_ids_with_playback=[camera_ids[3]])
+        # Notifications Reliability Phase (2026-09-14) fix: the notifications
+        # table is per-recipient (fanout_appliance_event() inserts one row
+        # per real customer_owner/customer_viewer), so this viewer's own
+        # notifications must be seeded under their own user_id, not
+        # "owner-1" -- seeding every camera's row under the owner's id (as
+        # this test previously did) only ever exercised the camera-scoping
+        # half of viewer isolation, silently relying on a real gap (no
+        # n.user_id filter at all) that let a viewer see a different
+        # recipient's own rows. That gap is now closed.
+        for index, camera_id in enumerate(camera_ids, start=1):
+            _seed_notification(conn, f"notif-{camera_id}", "viewer-1", "cust-1", "site-1", camera_id,
+                                "motion", "info", "Motion detected", f"2026-08-2{index}T00:00:00")
         conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _viewer_identity("cust-1", "viewer@example.com"))
         result = main._customer_notifications(object())
@@ -349,12 +357,14 @@ def test_notifications_viewer_with_three_of_ten_cameras_sees_only_those_three(mo
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA foreign_keys=ON")
         camera_ids = _seed_fleet(conn, "cust-1", "site-1", "appl-1", "AIC-1", 10)
-        _seed_owner(conn, "owner-1", "owner@example.com", "cust-1")
-        for index, camera_id in enumerate(camera_ids, start=1):
-            _seed_notification(conn, f"notif-{camera_id}", "owner-1", "cust-1", "site-1", camera_id,
-                                "motion", "info", "Motion detected", f"2026-08-2{index % 9 + 1}T00:00:00")
         granted = [camera_ids[0], camera_ids[5], camera_ids[9]]
         _seed_viewer(conn, "viewer-1", "viewer@example.com", "cust-1", camera_ids_with_playback=granted)
+        # Same fix, same reason as the 1-of-5 test above: seeded under this
+        # viewer's own user_id, matching fanout_appliance_event()'s real
+        # per-recipient row shape.
+        for index, camera_id in enumerate(camera_ids, start=1):
+            _seed_notification(conn, f"notif-{camera_id}", "viewer-1", "cust-1", "site-1", camera_id,
+                                "motion", "info", "Motion detected", f"2026-08-2{index % 9 + 1}T00:00:00")
         conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _viewer_identity("cust-1", "viewer@example.com"))
         result = main._customer_notifications(object())
