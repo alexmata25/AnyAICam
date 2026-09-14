@@ -2270,3 +2270,31 @@ The hard-cap defect is fixed and regression-clean in source, but **not yet deplo
 ### State to resume from
 
 Golden Foundation on Ryzen is now fully current: HLS reconnect (`171409a`) -> bounded Live Relay concurrency (`f4b640a`) -> per-camera rate limiter (`1e8ae22`, cloud-only) -> clip-build diagnostic (`8bdf790`) -> outbox/analytics-sync relocation (`95d476d`) -> event-media credential OR-gate (`b7387c0`, cloud-only) -> camera-scope/hard-cap mechanism (`1d336b3`) -> cloud pilot-camera allowlist (`471a535`, cloud-only) -> hard-cap-in-loop fix (`1d024c7`, this entry). Historical Playback stays PROVEN (5 real Camera 1 recordings in place, untouched). `RECORDING_UPLOAD_ENABLED` remains `false` everywhere. Next: Smart Motion validation, per explicit instruction -- not started yet.
+
+## 2026-09-14 (later): Smart Motion read-only customer-facing trace classified 5 of 7 layers PROVEN, 2 GAP/DEFECT -- Events-visibility gap fixed and regression-clean (`0190dff`); Smart Motion media remains open, not started
+
+**Read-only trace (no code/config/entitlement/DB/service changes)**, following up on the already-established real-data evidence (193 real `event_type='smart_motion'` rows across all 5 cameras, cloud analytics sync confirmed working): traced several real Camera 1 Smart Motion rows through the actual customer-facing APIs/rendering functions and classified each layer strictly from that evidence, never from code presence alone.
+
+| Layer | Classification |
+|---|---|
+| Detection | PROVEN |
+| Cloud synchronization | PROVEN |
+| Investigate | PROVEN |
+| Analytics panel | PROVEN -- `ANALYTIC_LABELS["smart_motion"]=("Smart Motion",("motion","person","vehicle"))` confirmed intentional broader-aggregation design (explicit source comment), not a bug |
+| Notifications / in-app delivery | PROVEN |
+| Events visibility | **GAP/DEFECT** -- root cause: the desktop Events page's camera filter only ever filtered the single, globally-capped 200-row fleet-wide result already delivered to the browser; a low-volume camera's real event(s) could be silently crowded out of that window by higher-volume cameras, making it unreachable by selecting that camera |
+| Media (thumbnail/clip) | **GAP/DEFECT**, separate root cause -- `store_motion_event()`'s smart_motion creation path never schedules a real clip build/upload. Explicitly NOT fixed this pass, per instruction |
+
+**Approved and fixed this pass: Events visibility only.** `_customer_recent_events_bounded()` and its `/api/customer/events/recent/{camera_id}` route were reused completely unchanged (pre-existing, already tenant/camera-authorized, already comprehensively tested -- originally built for the mobile Playback per-camera poll); the fix is entirely new desktop-page client-side JS in `_render_customer_events()`: selecting exactly one camera (out of more than one total) now also fetches that camera's own bounded server-side window and merges any not-yet-seen events in via the same `reconcileDesktopEvent()` row builder the fleet-wide poll already uses -- so Smart Motion (and every event type) renders with zero special-casing. The normal all-cameras view is completely unaffected and stays bounded exactly as before.
+
+**Also fixed, found while writing this fix's own regression test**: a real, pre-existing, unrelated defect in the same line this fix already had to touch -- the desktop `typeLabel` formatter's `\b\w` word-boundary regex was written inside a non-raw Python triple-quoted string, and unlike this file's other, harmless `\d` occurrences (not a valid Python escape, stays literal), `\b` *is* a valid Python escape (backspace) and was being silently converted to a real backspace byte at import time. The shipped JS regex was therefore inert, so any multi-word event type -- including `smart_motion` -- rendered unchanged as "smart motion" instead of "Smart Motion". Fixed by escaping the backslash in the Python source (`\\b\\w`); single-word types (motion, person, vehicle) were unaffected.
+
+**Tests**: 7 new cases in the existing real-DOM Node.js harness for this exact class of code (`app/tests/js/desktop_event_poll.test.mjs`, executed via `test_p05_desktop_poll_js.py` against the actual extracted, rendered source -- confirmed Node v24.18.0 is available locally, so this suite now runs and is verified locally, not only in CI): single-camera selection reveals a crowded-out event; the fleet-wide view never triggers a per-camera fetch; a single-camera customer (already the whole fleet) never triggers one either; re-applying the same filter doesn't re-fetch; an event already in the fleet-wide window is reconciled in place, never duplicated; a smart_motion event renders with the correct generic "Smart Motion" label (this is the test that caught the `\b` regex defect above); an unauthorized camera's 403/failure leaves the row absent, never crashes. No new backend tests needed -- `test_p05_bounded_recent_events.py` already covers the reused route and passes unchanged.
+
+Full regression: `app/` 86 failed/1777 passed/22 skipped -- failure set diffed against the established `fd8d199` baseline: same count, same files, including the same already-documented pre-existing test-order-dependent flakiness (`test_p05_mobile_poll_js.py`/`test_operations_rdm.py`/`test_playback_autoplay_most_recent.py`). None of the Events-fix files appear in the failure list. Zero new regressions.
+
+**Not deployed in this pass** -- per explicit instruction, source/tests/commit/checkpoint only. Cloud-only rendering change (`_render_customer_events()` in `main.py`); no edge-side code touched, no Ryzen artifact/repair-install needed once deployed.
+
+### State to resume from
+
+Smart Motion: 5 of 7 layers PROVEN, Events visibility now fixed (source-complete, regression-clean, not yet deployed), Smart Motion media remains the one open GAP/DEFECT -- explicitly not started, per instruction ("Do not begin the Smart Motion media fix yet"). Does not touch detection, correlation, analytics-panel aggregation, notifications, event-media, Live Relay, Playback, recording upload, entitlements, or RDM. Everything from the prior entry (Historical Playback PROVEN, hard-cap fix `1d024c7` deployed/verified on Ryzen, `RECORDING_UPLOAD_ENABLED=false` everywhere) remains unchanged.
