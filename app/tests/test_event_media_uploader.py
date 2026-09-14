@@ -228,3 +228,97 @@ def test_retry_after_prior_success_is_duplicate_safe(monkeypatch, fake_s3):
 
     assert _call() is True
     assert _call() is True  # a second retry behaves identically
+
+
+# ------------------------------------------------------------- shared_media_out (2026-09-14)
+#
+# A correlated Smart Motion event (main.py's store_motion_event()) awaits
+# this exact call's own task and reuses its result via
+# register_shared_event_media() instead of independently re-encoding and
+# re-uploading the identical physical window. These tests cover the new,
+# purely-additive shared_media_out parameter itself -- save_yolo_events()
+# and every pre-existing test above never pass it, and are all
+# unaffected (confirmed by every test above still passing unchanged).
+
+
+def test_shared_media_out_is_populated_on_real_success(monkeypatch, fake_s3, _local_files):
+    identity = _eligible_identity(cloud_recording_mode="motion")
+    _wire_happy_path(monkeypatch, identity, fake_s3)
+
+    shared_media_out = {}
+    result = event_media_uploader.upload_motion_event_media(
+        event_id="evt-1",
+        camera_number=1,
+        event_start=datetime(2026, 9, 10, 12, 0, 0),
+        event_end=datetime(2026, 9, 10, 12, 0, 10),
+        clip_url="/recordings/clips/motion/motion_evt-1.mp4",
+        thumbnail_url="/recordings/media/motion/thumb.jpg",
+        shared_media_out=shared_media_out,
+    )
+
+    assert result is True
+    assert shared_media_out["s3_key"].endswith("motion_evt-1.mp4")
+    assert shared_media_out["thumbnail_s3_key"].endswith("motion_evt-1.jpg")
+    assert shared_media_out["duration_seconds"] is not None
+    assert shared_media_out["size_bytes"] == len(b"fake-mp4-bytes")
+    # compute_clip_window() pads with pre-/post-roll -- these are the
+    # WINDOW's own start/end (matching the real payload sent to the
+    # control plane), not the raw event_start/event_end passed in.
+    from event_clips import compute_clip_window
+    window = compute_clip_window(datetime(2026, 9, 10, 12, 0, 0), datetime(2026, 9, 10, 12, 0, 10))
+    assert shared_media_out["started_at"] == window.start.isoformat()
+    assert shared_media_out["ended_at"] == window.end.isoformat()
+
+
+def test_shared_media_out_left_empty_on_ineligible_camera(monkeypatch, fake_s3):
+    """Every failure/no-op path must leave shared_media_out untouched --
+    a correlated Smart Motion event must see this as falsy (nothing to
+    share) and skip cleanly, never attempting its own independent
+    encode as a fallback."""
+    identity = _eligible_identity(cloud_recording_mode=None)
+    _wire_happy_path(monkeypatch, identity, fake_s3)
+
+    shared_media_out = {}
+    result = event_media_uploader.upload_motion_event_media(
+        event_id="evt-1",
+        camera_number=1,
+        event_start=datetime(2026, 9, 10, 12, 0, 0),
+        event_end=datetime(2026, 9, 10, 12, 0, 10),
+        clip_url="/recordings/clips/motion/motion_evt-1.mp4",
+        thumbnail_url="/recordings/media/motion/thumb.jpg",
+        shared_media_out=shared_media_out,
+    )
+
+    assert result is False
+    assert shared_media_out == {}
+
+
+def test_shared_media_out_left_empty_when_registration_ultimately_fails(monkeypatch, fake_s3):
+    identity = _eligible_identity()
+    _wire_happy_path(monkeypatch, identity, fake_s3)
+    monkeypatch.setattr(recording_upload, "_control_plane_post", lambda path, payload: None)
+    monkeypatch.setattr(event_media_uploader.time, "sleep", lambda seconds: None)
+
+    shared_media_out = {}
+    result = event_media_uploader.upload_motion_event_media(
+        event_id="evt-1",
+        camera_number=1,
+        event_start=datetime(2026, 9, 10, 12, 0, 0),
+        event_end=datetime(2026, 9, 10, 12, 0, 10),
+        clip_url="/recordings/clips/motion/motion_evt-1.mp4",
+        thumbnail_url="/recordings/media/motion/thumb.jpg",
+        shared_media_out=shared_media_out,
+    )
+
+    assert result is False
+    assert shared_media_out == {}
+
+
+def test_omitting_shared_media_out_is_completely_unaffected(monkeypatch, fake_s3, _local_files):
+    """save_yolo_events()'s own real call site never passes this
+    parameter -- confirms the default (None) path behaves exactly as
+    before this change, with no AttributeError or other side effect."""
+    identity = _eligible_identity(cloud_recording_mode="motion")
+    _wire_happy_path(monkeypatch, identity, fake_s3)
+
+    assert _call() is True

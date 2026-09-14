@@ -34334,7 +34334,19 @@ async def store_motion_event(
         # persistence/notifications. The builder waits until the configured
         # 5-second post-roll exists, then extracts:
         # 5s pre-roll + full event duration + 5s post-roll.
-        async def build_and_upload_event_media() -> None:
+        #
+        # Returns the shared-media reference (s3_key/thumbnail_s3_key/
+        # duration_seconds/size_bytes) on a full successful cloud upload,
+        # or None on any failure/no-op path (clip build failure, capture-
+        # only mode with no S3 key, any upload/registration failure) --
+        # a correlated Smart Motion event (scheduled below, only when
+        # classify_motion() fires) awaits THIS exact task and reuses that
+        # result instead of independently re-encoding and re-uploading
+        # the identical physical window. upload_motion_event_media()'s
+        # own return value/behavior is completely unchanged for every
+        # other caller (including save_yolo_events()) -- shared_media_out
+        # is a new, optional, purely-additive parameter nothing else passes.
+        async def build_and_upload_event_media() -> dict | None:
             clip_url = await build_motion_event_clip(
                 event_id,
                 camera_number,
@@ -34343,8 +34355,9 @@ async def store_motion_event(
             )
 
             if not clip_url:
-                return
+                return None
 
+            shared_media: dict = {}
             try:
                 from event_media_uploader import upload_motion_event_media
 
@@ -34356,12 +34369,16 @@ async def store_motion_event(
                     event_end=end_time,
                     clip_url=clip_url,
                     thumbnail_url=thumbnail,
+                    shared_media_out=shared_media,
                 )
             except Exception as error:
                 print(
                     f"Motion event {event_id}: media upload failed: "
                     f"{type(error).__name__}: {error}"
                 )
+                return None
+
+            return shared_media or None
 
         clip_task = asyncio.create_task(
             build_and_upload_event_media()
@@ -34574,53 +34591,69 @@ async def store_motion_event(
         smart_event["motion_event_id"] = event.id
         await asyncio.to_thread(append_analytics_event, smart_event)
 
-        # Smart Motion gets its own independent event-media artifacts,
-        # keyed by its own analytics-event id -- never the base Motion
-        # event's id (event.id, whose own media task above already
-        # owns and uploads its own separate artifacts under that id)
-        # and never a correlated YOLO event's event_group_id. Reuses
-        # the exact same proven build_motion_event_clip() +
-        # event_media_uploader.upload_motion_event_media() pair
-        # store_motion_event() already wires together for the base
-        # Motion event above (and save_yolo_events() wires identically
-        # for AI-classification events) -- never a second/parallel
-        # upload mechanism. upload_motion_event_media() only registers
-        # media against a detection_events row matching this exact id
-        # (see _ensure_detection_event_synced() in
-        # event_media_uploader.py), so this MUST be smart_event["id"]
-        # -- the same id just persisted into analytics_events.json
-        # above and synced to cloud detection_events.
+        # Smart Motion keeps its own independent event/media OWNERSHIP
+        # (its own detection_event_id, its own detection_event_media
+        # row) -- but a correlated Smart Motion event covers the exact
+        # same physical (camera, start_time, end_time) window as the
+        # base Motion event above, by construction, so re-encoding and
+        # re-uploading that identical footage a second time is pure
+        # waste (confirmed live: both produced byte-identical output).
+        # Instead of independently calling build_motion_event_clip()/
+        # upload_motion_event_media() a second time, this task simply
+        # AWAITS clip_task -- the base Motion event's own media task,
+        # already created above -- and reuses its result: the same
+        # s3_key/thumbnail_s3_key get registered a second time, under
+        # Smart Motion's own event id, via register_shared_event_media()
+        # (a registration-only call: no second ffmpeg encode, no second
+        # S3 PutObject). This is a genuine in-process dependency on an
+        # already-scheduled asyncio.Task -- never a DB poll and never a
+        # second queue -- so it costs nothing extra on the already-
+        # saturated event_clip_encode_semaphore.
+        #
+        # Safe failure behavior, explicit: if the base Motion event's
+        # own media task fails or produces nothing shareable (clip
+        # build failure, capture-only mode with no S3 key, upload/
+        # registration failure), clip_task resolves to None and this
+        # task logs that plainly and returns -- it never falls back to
+        # an independent Smart Motion re-encode. The Smart Motion
+        # analytics event itself is completely unaffected either way:
+        # append_analytics_event() above has already persisted it.
         smart_event_id = smart_event["id"]
 
         async def build_and_upload_smart_motion_media() -> None:
             try:
-                clip_url = await build_motion_event_clip(
-                    smart_event_id, camera_number, start_time, end_time,
-                )
+                shared_media = await clip_task
             except Exception as error:
                 print(
-                    f"Smart Motion event {smart_event_id}: clip build "
-                    f"failed: {type(error).__name__}: {error}"
+                    f"Smart Motion event {smart_event_id}: base Motion "
+                    f"media task failed: {type(error).__name__}: {error}"
                 )
                 return
-            if not clip_url:
+            if not shared_media:
+                print(
+                    f"Smart Motion event {smart_event_id}: no shared "
+                    f"media available from base Motion event {event_id} "
+                    f"-- skipping (no independent re-encode)."
+                )
                 return
             try:
-                from event_media_uploader import upload_motion_event_media
+                from event_media_uploader import register_shared_event_media
 
                 await asyncio.to_thread(
-                    upload_motion_event_media,
+                    register_shared_event_media,
                     event_id=smart_event_id,
                     camera_number=camera_number,
-                    event_start=start_time,
-                    event_end=end_time,
-                    clip_url=clip_url,
-                    thumbnail_url=thumbnail,
+                    s3_key=shared_media["s3_key"],
+                    thumbnail_s3_key=shared_media.get("thumbnail_s3_key"),
+                    duration_seconds=shared_media.get("duration_seconds"),
+                    size_bytes=shared_media.get("size_bytes"),
+                    started_at=shared_media.get("started_at"),
+                    ended_at=shared_media.get("ended_at"),
                 )
             except Exception as error:
                 print(
-                    f"Smart Motion event {smart_event_id}: media upload "
-                    f"failed: {type(error).__name__}: {error}"
+                    f"Smart Motion event {smart_event_id}: shared media "
+                    f"registration failed: {type(error).__name__}: {error}"
                 )
 
         # Scheduling itself is guarded too: a failure here must never
@@ -34637,7 +34670,7 @@ async def store_motion_event(
         except Exception as error:
             print(
                 f"Smart Motion event {smart_event_id}: could not schedule "
-                f"clip build/upload: {type(error).__name__}: {error}"
+                f"media registration: {type(error).__name__}: {error}"
             )
 
 

@@ -184,7 +184,22 @@ def upload_motion_event_media(
     event_end: datetime,
     clip_url: str,
     thumbnail_url: str | None,
+    shared_media_out: dict | None = None,
 ) -> bool:
+    # shared_media_out is a new, optional, purely-additive out-parameter:
+    # every existing caller (save_yolo_events()'s own AI-classification
+    # path, and every existing test) omits it and this function's
+    # observable behavior/return value is completely unchanged for them.
+    # When provided, it is populated with this event's own s3_key/
+    # thumbnail_s3_key/duration_seconds/size_bytes/window IF AND ONLY IF
+    # this call reaches the real cloud-registration success path below --
+    # left untouched (empty) on every other path (capture-only mode, any
+    # gate/session/credential failure, registration failure). A
+    # correlated Smart Motion event (main.py's store_motion_event())
+    # awaits this exact call's own task and reuses that dict to register
+    # its own, independent detection_event_media row against the SAME
+    # already-uploaded S3 object, instead of re-encoding and re-uploading
+    # the identical physical window a second time.
     # Upload historically caused the first durable outbox write.  Preserve
     # that behavior by making upload imply local capture, while allowing a
     # separately enabled local-only capture run to stop before every
@@ -389,6 +404,15 @@ def upload_motion_event_media(
                 thumbnail_key,
             )
             event_media_outbox.remove(event_id)
+            if shared_media_out is not None:
+                shared_media_out.update({
+                    "s3_key": clip_key,
+                    "thumbnail_s3_key": thumbnail_key,
+                    "duration_seconds": duration_seconds,
+                    "size_bytes": size_bytes,
+                    "started_at": payload["started_at"],
+                    "ended_at": payload["ended_at"],
+                })
             return True
 
         if attempt < 12:
@@ -400,6 +424,116 @@ def upload_motion_event_media(
         event_id,
         camera_number,
         clip_key,
+    )
+
+    return False
+
+
+def register_shared_event_media(
+    *,
+    event_id: str,
+    camera_number: int,
+    s3_key: str,
+    thumbnail_s3_key: str | None,
+    duration_seconds: float | None,
+    size_bytes: int | None,
+    started_at: str | None,
+    ended_at: str | None,
+) -> bool:
+    """Registers a SECOND, independently-owned detection_event_media row
+    (for `event_id`) against an S3 object ANOTHER event (the correlated
+    base Motion event) already uploaded -- no ffmpeg encode, no S3
+    PutObject, here. Exists specifically for a correlated Smart Motion
+    event, whose own window is always identical to its base Motion
+    event's by construction: main.py's store_motion_event() awaits the
+    base Motion event's own media task and passes this exact call the
+    s3_key/thumbnail_s3_key/duration_seconds/size_bytes/window it
+    already produced.
+
+    detection_event_media.s3_key carries no uniqueness constraint (only
+    detection_event_id does, confirmed against the live schema) -- two
+    independent rows safely referencing the same immutable clip is
+    already a fully supported shape, not a new one.
+
+    Deliberately never writes to event_media_outbox: that durable queue
+    exists to protect a LOCAL artifact that still needs (re)uploading;
+    there is no such artifact here, nothing local this call could lose
+    on a restart -- only a second, idempotent registration POST against
+    an object that's already safely in S3. A failure here is logged and
+    given up on retry-lessly rather than introducing a second queue,
+    per the same "reuse the result, never add another queue" design as
+    the asyncio.Task dependency in main.py that calls this."""
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        logger.info(
+            "event_media.shared_registration_skipped_disabled "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    recording_upload._refresh_camera_map()
+    identity = recording_upload._camera_identity(camera_number)
+
+    if not identity:
+        logger.warning(
+            "event_media.shared_registration_camera_unknown "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    camera_id = identity["camera_id"]
+
+    payload = {
+        "s3_key": s3_key,
+        "thumbnail_s3_key": thumbnail_s3_key,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration_seconds,
+        "size_bytes": size_bytes,
+    }
+
+    if not _ensure_detection_event_synced(event_id, camera_id):
+        logger.warning(
+            "event_media.shared_registration_deferred "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    for attempt in range(1, 13):
+        response = recording_upload._control_plane_post(
+            f"/api/appliance/analytics/"
+            f"{camera_id}/events/{event_id}/media",
+            payload,
+        )
+
+        if (
+            isinstance(response, dict)
+            and response.get("status") in {"accepted", "duplicate"}
+        ):
+            logger.info(
+                "event_media.registered_shared "
+                "event_id=%s camera=%s clip_key=%s thumbnail_key=%s",
+                event_id,
+                camera_number,
+                s3_key,
+                thumbnail_s3_key,
+            )
+            return True
+
+        if attempt < 12:
+            time.sleep(5)
+
+    logger.warning(
+        "event_media.shared_registration_failed "
+        "event_id=%s camera=%s clip_key=%s",
+        event_id,
+        camera_number,
+        s3_key,
     )
 
     return False
