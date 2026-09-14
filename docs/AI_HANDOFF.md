@@ -16,11 +16,16 @@ installer workstream and are stale relative to today.** The actively
 maintained, up-to-date state for this branch (`reconcile/golden-
 foundation-20260911`) is `docs/PROJECT_CHECKPOINT.md` -- read its own
 "read this first, every session" instructions and its latest dated entry.
-As of `73c09e1` (2026-09-14, partner-scoped-administrator tenant-
-confinement follow-up to the `c4d5f24` multi-tenant security remediation):
-committed, tested (zero new regressions, true before/after diff), and
-deployed to `anyaicam-staging` with a verified zero-downtime cutover
-(`portal-blue`, hash-verified against `73c09e1`). Ryzen/Samsung/AWS
+As of `22d969e` (2026-09-14, Notifications Reliability Phase -- camera-
+permission isolation, read/unread state, timestamp, and deep-link fixes
+to the real customer notification pipeline, built on top of `73c09e1`'s
+partner-scoped-administrator tenant-confinement follow-up to the
+`c4d5f24` multi-tenant security remediation): committed, tested (zero
+new regressions, true before/after diff), and deployed to
+`anyaicam-staging` with a verified zero-downtime cutover (`portal-green`,
+hash-verified against `22d969e`). External (email/SMS/push) delivery
+and the Dashboard's "Smart alerts" widget are confirmed disconnected
+from the real data, documented, not fixed this pass. Ryzen/Samsung/AWS
 infrastructure untouched. Full detail in `PROJECT_CHECKPOINT.md`'s own
 2026-09-14 entries. The rest of this file is retained for the older
 edge-installer history it documents, not as current status.
