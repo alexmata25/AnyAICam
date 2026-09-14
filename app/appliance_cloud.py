@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from appliance_protocol import ALLOWED_COMMANDS, LIVE_RELAY_SESSION_DURATION_SECONDS, RateLimiter, cloud_settings, decrypt_camera_credentials, health_state, live_relay_s3_prefix, live_relay_session_name, live_relay_session_policy, sanitize_appliance_payload, sanitize_discovery_results, validate_request_time
 from live_manifest import LiveManifestStore
 from object_storage import get_storage
-from partner_db import audit, connection, password_hash, row, rows, verify_password
+from partner_db import audit, authorize_appliance_tenant, connection, password_hash, row, rows, verify_password
 from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
@@ -1354,18 +1354,36 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         from partner_db import require_permission
         try: require_permission(identity,'appliance.action')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        # De-dup guard: an identical command already pending or delivered
-        # (not yet completed/failed/expired) for this appliance is returned
-        # as-is instead of queuing a second copy -- a partner double-
-        # clicking "Restart service", or a dashboard auto-refresh replaying
-        # the same request, must never queue N redundant restarts/reboots
-        # for one appliance to work through.
-        existing=row("SELECT id FROM appliance_commands WHERE appliance_id=? AND command=? AND status IN ('pending','delivered') ORDER BY created_at LIMIT 1",(appliance_id,command))
-        if existing: return {'id':existing['id'],'status':'pending','message':'An identical command is already queued for this appliance; not queuing a duplicate.'}
         command_id=secrets.token_hex(7); now=datetime.now(); expires=now+timedelta(minutes=max(5,min(1440,int(payload.get('expires_minutes',60)))))
-        with connection() as db: db.execute('INSERT INTO appliance_commands(id,appliance_id,command,payload_json,status,created_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?,?)',(command_id,appliance_id,command,json.dumps(sanitize_appliance_payload(payload.get('payload',{}))),'pending',now.isoformat(),expires.isoformat(),identity['email']))
-        if command=='install_update':
-            with connection() as db: db.execute("UPDATE appliances SET state='updating' WHERE id=?",(appliance_id,))
+        with connection() as db:
+            # HIGH fix (2026-09-14 multi-tenant security remediation,
+            # Codex tenant-isolation audit): this route previously
+            # required only the appliance.action permission itself,
+            # never that appliance_id belonged to the caller's own
+            # tenant -- any partner_owner/technician could queue a real
+            # remote command for another tenant's appliance just by
+            # naming its id. Resolved and tenant-verified BEFORE the
+            # de-dup lookup and any insert, in this same connection, so
+            # a denied cross-tenant request neither reveals whether a
+            # matching command is already queued for the foreign
+            # appliance nor queues one. Same 404 whether the id doesn't
+            # exist at all or simply isn't this caller's tenant -- see
+            # authorize_appliance_tenant()'s own docstring for why
+            # that's deliberate (no cross-tenant existence oracle).
+            if not authorize_appliance_tenant(db,identity,appliance_id):
+                raise HTTPException(status_code=404,detail='Appliance not found.')
+            # De-dup guard: an identical command already pending or
+            # delivered (not yet completed/failed/expired) for this
+            # appliance is returned as-is instead of queuing a second
+            # copy -- a partner double-clicking "Restart service", or a
+            # dashboard auto-refresh replaying the same request, must
+            # never queue N redundant restarts/reboots for one appliance
+            # to work through.
+            existing=db.execute("SELECT id FROM appliance_commands WHERE appliance_id=? AND command=? AND status IN ('pending','delivered') ORDER BY created_at LIMIT 1",(appliance_id,command)).fetchone()
+            if existing: return {'id':existing['id'],'status':'pending','message':'An identical command is already queued for this appliance; not queuing a duplicate.'}
+            db.execute('INSERT INTO appliance_commands(id,appliance_id,command,payload_json,status,created_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?,?)',(command_id,appliance_id,command,json.dumps(sanitize_appliance_payload(payload.get('payload',{}))),'pending',now.isoformat(),expires.isoformat(),identity['email']))
+            if command=='install_update':
+                db.execute("UPDATE appliances SET state='updating' WHERE id=?",(appliance_id,))
         audit(identity,'appliance.command_queued','appliance_command',command_id,{'command':command,'appliance_id':appliance_id}); return {'id':command_id,'status':'pending','message':'Authorized appliance command queued.'}
 
     @app.get('/partner/appliance-dashboard',response_class=HTMLResponse)

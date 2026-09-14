@@ -14,7 +14,7 @@ from partner_portal import partner_identity, require_partner_access, PARTNER_ROL
 from camera_install_state import camera_is_installed, camera_status_label
 from pricing_config import calculate_partner_quote, calculate_quote, load_pricing
 from appliance_protocol import encrypt_camera_credentials
-from partner_db import audit, connection, password_hash, require_permission, row, rows, verify_password
+from partner_db import audit, authorize_appliance_tenant, authorize_customer_tenant, connection, password_hash, require_permission, row, rows, verify_password
 from email_service import get_email_service
 from provisioning_service import get_provisioning_backend, ProvisioningBackendUnavailable
 
@@ -201,9 +201,23 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         identity=require_partner_access(request)
         try: require_permission(identity,'appliance.assign')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        if not row('SELECT id FROM appliances WHERE id=?',(appliance_id,)): raise HTTPException(status_code=404,detail='Appliance not found.')
         token=secrets.token_urlsafe(24); now=datetime.now(); now_text=now.isoformat()
         with connection() as db:
+            # HIGH fix (2026-09-14 multi-tenant security remediation,
+            # Codex tenant-isolation audit): this route previously only
+            # verified that appliance_id existed at all -- any
+            # partner_owner/technician could revoke a foreign appliance's
+            # real activation tokens and receive a usable replacement
+            # bearer token in the response, just by naming its id.
+            # Resolved and tenant-verified BEFORE any revoke/insert/
+            # update, inside this same connection, so a denied
+            # cross-tenant request touches none of the foreign
+            # appliance's existing tokens. Same 404 whether the id
+            # doesn't exist at all or simply isn't this caller's tenant
+            # -- see authorize_appliance_tenant()'s own docstring for why
+            # that's deliberate (no cross-tenant existence oracle).
+            if not authorize_appliance_tenant(db,identity,appliance_id):
+                raise HTTPException(status_code=404,detail='Appliance not found.')
             # The real verification path (POST /api/appliance/activate,
             # appliance_cloud.py) accepts ANY appliance_activation_tokens
             # row for this appliance_id that is still unused, unrevoked,
@@ -229,6 +243,17 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         try: require_permission(identity,'appliance.action')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
         if action not in {'restart','update'}: raise HTTPException(status_code=400,detail='Unsupported appliance action.')
+        # Directly-equivalent finding, same 2026-09-14 remediation pass:
+        # this route (a placeholder -- no real hardware action is wired
+        # up yet) had no tenant-ownership check of its own, letting any
+        # partner_owner/technician reference a foreign appliance_id in
+        # their own audit trail and receive a false "recorded" response
+        # for a tenant they don't own. Fixed with the same primitive used
+        # for the real RDM command-queue route above, before this real
+        # action wires up hardware execution.
+        with connection() as db:
+            if not authorize_appliance_tenant(db,identity,appliance_id):
+                raise HTTPException(status_code=404,detail='Appliance not found.')
         audit(identity,f'appliance.{action}_requested','appliance',appliance_id); return {'status':'placeholder','message':f'Appliance {action} request recorded; hardware execution is not connected yet.'}
 
     @app.post('/api/partner/customers/{customer_id}/notes')
@@ -256,8 +281,24 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         preview=f'Subject: AnyAiCam invitation\n\nYou were invited as {role.replace("_"," ")}.\nLogin: {email}\nTemporary password: {password}'
         try:
             with connection() as db:
+                if role in ('customer_owner','customer_viewer'):
+                    # CRITICAL fix (2026-09-14 multi-tenant security
+                    # remediation, Codex tenant-isolation audit): this
+                    # route previously trusted a caller-supplied
+                    # customer_id completely -- any user holding
+                    # user.invite (partner_owner OR customer_owner) could
+                    # mint a real customer_owner/customer_viewer identity
+                    # grant for ANY customer_id, including one owned by a
+                    # different partner entirely, by simply naming its
+                    # id. Resolved and tenant-verified BEFORE the first
+                    # INSERT, inside this same connection, so a denial
+                    # (404 -- never confirms whether the id exists at all)
+                    # creates no user, no grant, no invitation row: see
+                    # authorize_customer_tenant()'s own docstring.
+                    if not customer_id or not authorize_customer_tenant(db,identity,str(customer_id)):
+                        raise HTTPException(status_code=404,detail='Customer not found.')
                 db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,1)',(user_id,identity.get('partner_id') or 'anyaicam-primary',email,payload.get('name',''),role,password_hash(password),1,customer_id,now))
-                if role in ('customer_owner','customer_viewer') and customer_id:
+                if role in ('customer_owner','customer_viewer'):
                     # Same gap, same fix as the main onboarding flow above:
                     # an invited customer_owner/customer_viewer needs a live
                     # identity_grants row before the appliance's cloud-
@@ -266,6 +307,8 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
                     from appliance_identity import create_grant as _create_identity_grant
                     _create_identity_grant(db,user_id=user_id,role=role,scope_type='customer',scope_id=customer_id,granted_by=identity['email'],now=now)
                 db.execute('INSERT INTO invitations(id,email,role,customer_id,status,temporary_password_hash,email_preview,expires_at,created_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?)',(invitation_id,email,role,customer_id,'preview',password_hash(password),preview,None,now,identity['email']))
+        except HTTPException:
+            raise
         except Exception as error:
             raise HTTPException(status_code=409,detail='A user with this email may already exist.') from error
         audit(identity,'user.invited','partner_user',user_id,{'role':role}); audit(identity,'permission.changed','partner_user',user_id,{'role':role})
@@ -279,7 +322,17 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         try: quote=calculate_partner_quote(payload)
         except ValueError as error: raise HTTPException(status_code=409,detail=str(error)) from error
         now=datetime.now().isoformat(); plan_id=secrets.token_hex(5)
-        with connection() as db: db.execute('INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,monthly_recurring_profit,annual_total,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(plan_id,customer_id,quote['resolution'],quote['recording'],quote['retention_days'],quote['quantity'],quote['monthly_customer_revenue'],quote['monthly_partner_charge'],quote['monthly_recurring_profit'],quote['annual_total'],'pending_confirmation',now))
+        with connection() as db:
+            # HIGH fix (2026-09-14 multi-tenant security remediation,
+            # Codex tenant-isolation audit): this route authorized only
+            # the permission itself, never that customer_id belonged to
+            # the caller's own tenant -- the same gap add_customer_note()
+            # above already closes for its own nearby route. Resolved and
+            # tenant-verified BEFORE the insert, inside this same
+            # connection, so a denial creates no plan row.
+            if not authorize_customer_tenant(db,identity,customer_id):
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            db.execute('INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,monthly_recurring_profit,annual_total,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(plan_id,customer_id,quote['resolution'],quote['recording'],quote['retention_days'],quote['quantity'],quote['monthly_customer_revenue'],quote['monthly_partner_charge'],quote['monthly_recurring_profit'],quote['annual_total'],'pending_confirmation',now))
         audit(identity,'plan.changed','plan',plan_id,{'customer_id':customer_id}); return {'message':'Plan change estimate saved.','quote':quote}
 
     @app.get('/partner/onboarding',response_class=HTMLResponse)

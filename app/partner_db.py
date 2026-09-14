@@ -304,6 +304,90 @@ def require_permission(identity: dict, permission: str) -> None:
     if not allowed(identity,permission): raise PermissionError(f'Permission required: {permission}')
 
 
+def tenant_owns_partner(db, identity: dict, resource_partner_id: str | None) -> bool:
+    """True when resource_partner_id is within identity's own tenant
+    reach: either it equals identity's own partner_id, or identity
+    holds a genuine, live-verified GLOBAL administrator grant.
+
+    Deliberately never a bare identity.get('role')=='administrator'
+    shortcut (2026-09-14 multi-tenant security remediation, Codex
+    tenant-isolation audit -- see docs/PROJECT_CHECKPOINT.md's matching
+    dated entry): that field is only this user's own partner_users.role
+    value, and it is byte-identical whether their administrator grant
+    is scope_type='global' (true platform-wide reach, minted only by
+    partner_db.bootstrap_admin()/create_first_admin()) or scope_type=
+    'partner' (administrator of exactly one company, per appliance_
+    identity.py's own VALID_ROLE_SCOPES contract). Collapsing that
+    distinction back into a role-name check would let a partner-scoped
+    administrator silently reach every other tenant -- the exact class
+    of bug this remediation exists to close. See appliance_identity.
+    has_global_administrator_grant()'s own docstring for the full
+    rationale; that function is this codebase's one existing, already-
+    correct implementation of "is this really a global administrator,"
+    used here rather than reinvented.
+
+    resource_partner_id may be None (an appliance not yet backfilled
+    with its own partner_id column -- see appliance_cloud.py's
+    activation-time COALESCE backfill -- always has a real, non-null
+    owning customer's own partner_id available via a join instead;
+    callers resolving appliance ownership must pass THAT, never the
+    appliance row's own possibly-null partner_id column directly)."""
+    from appliance_identity import has_global_administrator_grant
+    if has_global_administrator_grant(db, email=identity.get('email', '')):
+        return True
+    if resource_partner_id is None:
+        return False
+    return resource_partner_id == (identity.get('partner_id') or 'anyaicam-primary')
+
+
+def authorize_customer_tenant(db, identity: dict, customer_id: str) -> dict | None:
+    """Resolves customer_id inside the caller's own already-open
+    connection and returns the full customers row only when it exists
+    AND is within identity's own tenant reach -- None in every other
+    case (unknown id, wrong tenant), on purpose, so a caller can raise
+    one uniform 404 for both and a cross-tenant probe can never tell
+    "no such customer" apart from "not yours" (matching this project's
+    own established customer_detail()/add_customer_note() convention).
+
+    A customer_owner/customer_viewer identity has no partner-wide reach
+    at all -- only self-service reach over its own account -- so for
+    those roles this additionally requires customer_id to equal
+    identity's own customer_id, never merely the same partner.
+
+    Callers MUST call this before any write, inside the same
+    transaction/connection as that write (pass the same db handle you
+    are about to INSERT/UPDATE with) -- a denial must never be followed
+    by a partial mutation."""
+    customer = db.execute('SELECT * FROM customers WHERE id=?', (customer_id,)).fetchone()
+    if not customer:
+        return None
+    customer = dict(customer)
+    if identity.get('role') in ('customer_owner', 'customer_viewer'):
+        return customer if customer_id == identity.get('customer_id') else None
+    return customer if tenant_owns_partner(db, identity, customer['partner_id']) else None
+
+
+def authorize_appliance_tenant(db, identity: dict, appliance_id: str) -> dict | None:
+    """Same contract and same call-before-any-write requirement as
+    authorize_customer_tenant(), resolved through the appliance's own
+    customer's partner_id -- never the appliance row's own partner_id
+    column, which is only backfilled at activation time (see
+    tenant_owns_partner()'s own docstring) and can legitimately be NULL
+    for an appliance this same tenant owns but has not yet activated,
+    which is exactly when activation-token generation is used."""
+    appliance = db.execute(
+        'SELECT a.*, c.partner_id AS owning_partner_id, c.id AS owning_customer_id '
+        'FROM appliances a JOIN customers c ON c.id = a.customer_id WHERE a.id=?',
+        (appliance_id,),
+    ).fetchone()
+    if not appliance:
+        return None
+    appliance = dict(appliance)
+    if identity.get('role') in ('customer_owner', 'customer_viewer'):
+        return appliance if appliance['owning_customer_id'] == identity.get('customer_id') else None
+    return appliance if tenant_owns_partner(db, identity, appliance['owning_partner_id']) else None
+
+
 def audit(actor: dict,action: str,entity_type: str='',entity_id: str='',details=None) -> None:
     with connection() as db: db.execute('INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)',(actor.get('email'),actor.get('role'),action,entity_type,entity_id,json.dumps(details or {}),datetime.now().isoformat()))
 

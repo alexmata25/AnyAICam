@@ -245,6 +245,28 @@ def test_command_endpoint_partner_only_session_is_completely_unaffected_by_the_b
     client, db_path = http_client
     conn = sqlite3.connect(db_path)
     _seed_appliance(conn, "appl-http-3", "partner-1", "cust-1", "AIC-HTTP-3")
+    # 2026-09-14 multi-tenant security remediation: this session's own
+    # partner_id is None (deliberately -- the point of this test is that
+    # a genuine, direct Partner Portal 'administrator' session works
+    # without needing the bridge at all), so it now needs a real,
+    # live-verified GLOBAL identity_grants row to be recognized as a
+    # true platform administrator by tenant_owns_partner() -- a bare
+    # role='administrator' claim on the session token is no longer
+    # sufficient on its own (see partner_db.tenant_owns_partner()'s own
+    # docstring for why: that claim is byte-identical for a true global
+    # administrator and a company-scoped one). Seeding this grant is
+    # the fix, not loosening the new check -- this is exactly the
+    # confirmed-safe, explicit, verifiable global authority path the
+    # remediation requires.
+    conn.execute(
+        "INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("admin-owner-1", "partner-1", "owner@example.test", "Admin", "administrator", "x", 1, "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO identity_grants(id,user_id,role,scope_type,scope_id,granted_at,granted_by,revoked_at) VALUES(?,?,?,?,?,?,?,NULL)",
+        ("grant-admin-owner-1", "admin-owner-1", "administrator", "global", None, "2026-01-01", "system:test"),
+    )
+    conn.commit()
     partner_token = partner_portal._token("owner@example.test", "administrator", None, None, None)
 
     response = client.post(

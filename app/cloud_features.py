@@ -13,7 +13,7 @@ from cloud_config import settings
 from cloud_security import consume_password_reset,create_password_reset
 from email_service import get_email_service
 from object_storage import LocalStorage,get_storage,safe_key
-from partner_db import audit,connection,row,rows
+from partner_db import audit,connection,row,rows,tenant_owns_partner
 from partner_portal import partner_identity,require_partner_access
 
 
@@ -203,6 +203,19 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
 
     @app.post('/api/partner/quotes/{quote_id}/deliver')
     def deliver_quote(request: Request,quote_id: str,payload: dict):
-        identity=require_partner_access(request); quote=row('SELECT * FROM quotes WHERE id=?',(quote_id,))
-        if not quote: raise HTTPException(status_code=404,detail='Quote not found.')
+        identity=require_partner_access(request)
+        # Directly-equivalent finding, same 2026-09-14 remediation pass:
+        # this route had no tenant-ownership check of its own -- any
+        # authenticated partner_owner/salesperson/technician could probe
+        # a foreign quote_id (200 vs 404 confirmed existence) and trigger
+        # a delivery email referencing it to an arbitrary attacker-chosen
+        # recipient address. quotes.partner_id is always populated at
+        # creation time (unlike appliances.partner_id), so this reuses
+        # the same core tenant_owns_partner() primitive directly rather
+        # than needing a join. Same 404 for "doesn't exist" and "not
+        # yours" -- no cross-tenant existence oracle.
+        with connection() as db:
+            quote=db.execute('SELECT * FROM quotes WHERE id=?',(quote_id,)).fetchone()
+            if not quote or not tenant_owns_partner(db,identity,quote['partner_id']):
+                raise HTTPException(status_code=404,detail='Quote not found.')
         recipient=str(payload.get('email','')).strip(); message=get_email_service().send('quote_delivery',recipient,'Your AnyAiCam quote','Your AnyAiCam quote is ready for review.',metadata={'quote_id':quote_id}); audit(identity,'quote.delivered','quote',quote_id,{'recipient':recipient,'provider':settings.email_backend}); return {'message':'Quote delivery processed.','status':message['status']}
