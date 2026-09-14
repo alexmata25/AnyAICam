@@ -287,9 +287,25 @@ def test_oldest_events_are_synced_first(tmp_path, monkeypatch):
 # --------------------------------------------------------- outgoing payload allowlist
 
 
-def test_payload_contains_only_the_six_allowlisted_fields(tmp_path):
+def test_payload_contains_only_the_seven_allowlisted_fields(tmp_path):
     payload = asy._build_payload(_event("evt-1"))
-    assert set(payload.keys()) == {"local_event_id", "event_type", "confidence", "object_count", "detections", "event_timestamp"}
+    assert set(payload.keys()) == {"local_event_id", "event_type", "confidence", "object_count", "detections", "event_timestamp", "parent_local_event_id"}
+
+
+def test_payload_forwards_parent_local_event_id_only_when_the_local_event_has_one(tmp_path):
+    """Set locally only on a real smart_motion event (main.py's
+    store_motion_event(), under the LOCAL field name motion_event_id)
+    -- None for every other event type, including an ordinary motion or
+    YOLO/AI-classification event that never has this key at all."""
+    smart_event = _event("smart-evt-1", event_type="smart_motion")
+    smart_event["motion_event_id"] = "base-motion-evt-1"
+    payload = asy._build_payload(smart_event)
+    assert payload["parent_local_event_id"] == "base-motion-evt-1"
+
+    ordinary_event = _event("evt-1", event_type="motion")
+    assert "motion_event_id" not in ordinary_event  # sanity: real events of this type never carry it
+    payload = asy._build_payload(ordinary_event)
+    assert payload["parent_local_event_id"] is None
 
 
 def test_payload_never_includes_thumbnail_or_linked_recording(tmp_path):

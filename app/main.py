@@ -34601,18 +34601,24 @@ async def store_motion_event(
         # Instead of independently calling build_motion_event_clip()/
         # upload_motion_event_media() a second time, this task simply
         # AWAITS clip_task -- the base Motion event's own media task,
-        # already created above -- and reuses its result: the same
-        # s3_key/thumbnail_s3_key get registered a second time, under
-        # Smart Motion's own event id, via register_shared_event_media()
-        # (a registration-only call: no second ffmpeg encode, no second
-        # S3 PutObject). This is a genuine in-process dependency on an
-        # already-scheduled asyncio.Task -- never a DB poll and never a
-        # second queue -- so it costs nothing extra on the already-
-        # saturated event_clip_encode_semaphore.
+        # already created above -- purely as a "did the base event's own
+        # media actually succeed" signal (clip_task's own truthy/falsy
+        # result), then calls register_shared_event_media() with ONLY
+        # this base Motion event's own LOCAL id (`event_id`) as
+        # `parent_local_event_id` -- never any S3 key, timing, duration,
+        # or size. The cloud independently re-resolves that id, verifies
+        # the full ownership chain (see appliance_cloud.py's
+        # analytics_event_media_shared()), and derives the approved
+        # clip/thumbnail/metadata itself from the parent's own already-
+        # registered media -- this call has no storage reference to
+        # supply even if it wanted to. This is a genuine in-process
+        # dependency on an already-scheduled asyncio.Task -- never a DB
+        # poll and never a second queue -- so it costs nothing extra on
+        # the already-saturated event_clip_encode_semaphore.
         #
         # Safe failure behavior, explicit: if the base Motion event's
         # own media task fails or produces nothing shareable (clip
-        # build failure, capture-only mode with no S3 key, upload/
+        # build failure, capture-only mode with no S3 upload, upload/
         # registration failure), clip_task resolves to None and this
         # task logs that plainly and returns -- it never falls back to
         # an independent Smart Motion re-encode. The Smart Motion
@@ -34643,12 +34649,7 @@ async def store_motion_event(
                     register_shared_event_media,
                     event_id=smart_event_id,
                     camera_number=camera_number,
-                    s3_key=shared_media["s3_key"],
-                    thumbnail_s3_key=shared_media.get("thumbnail_s3_key"),
-                    duration_seconds=shared_media.get("duration_seconds"),
-                    size_bytes=shared_media.get("size_bytes"),
-                    started_at=shared_media.get("started_at"),
-                    ended_at=shared_media.get("ended_at"),
+                    parent_local_event_id=event_id,
                 )
             except Exception as error:
                 print(

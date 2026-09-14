@@ -34,9 +34,16 @@ def daily_seconds_used(db, camera_id: str, event_at: datetime) -> float:
     day_start = event_at.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
     total = 0.0
+    # source_media_id IS NULL: count only ROOT media rows -- a shared
+    # row (a correlated Smart Motion event referencing its base Motion
+    # event's own already-uploaded clip, see appliance_cloud.py's
+    # analytics_event_media_shared()) references physical footage
+    # already counted once via its root, and must never be charged
+    # again for bytes that were never re-recorded or re-uploaded.
     rows = db.execute(
         "SELECT dem.duration_seconds,de.event_timestamp FROM detection_event_media dem "
-        "JOIN detection_events de ON de.id=dem.detection_event_id WHERE dem.camera_id=?",
+        "JOIN detection_events de ON de.id=dem.detection_event_id "
+        "WHERE dem.camera_id=? AND dem.source_media_id IS NULL",
         (camera_id,),
     ).fetchall()
     for row in rows:

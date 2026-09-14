@@ -1,20 +1,23 @@
-"""event_media_uploader.register_shared_event_media(): the registration-
-only path a correlated Smart Motion event uses to reference an already-
-uploaded S3 object (the base Motion event's own clip/thumbnail) under
+"""event_media_uploader.register_shared_event_media(): the parent-id-
+only registration path a correlated Smart Motion event uses to
+reference its base Motion event's own already-registered media, under
 its own, independent detection_event_id -- no ffmpeg encode, no S3
-PutObject, ever, from this function.
+PutObject, no S3 credential of any kind, ever, from this function
+(2026-09-14, Phase A revision after independent security review: the
+prior round forwarded S3 keys/timing/duration/size and hit a real,
+repeated HTTP 403 from the cloud's pre-existing anti-spoofing check;
+this function now sends ONLY the parent's own local id, and the cloud
+derives every approved value itself).
 
 Mocks recording_uploader's and analytics_sync's own module-level
 functions directly, matching test_event_media_uploader.py's own
 established pattern for upload_motion_event_media() -- this file
 exercises register_shared_event_media()'s own control flow only.
 """
-import types
-from datetime import datetime
-
 import pytest
 
 import analytics_sync
+import event_media_outbox
 import event_media_uploader
 import recording_uploader as recording_upload
 
@@ -22,6 +25,11 @@ import recording_uploader as recording_upload
 @pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
     monkeypatch.setattr(event_media_uploader, "EVENT_MEDIA_UPLOAD_ENABLED", True)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_outbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(event_media_outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
 
 
 def _wire_happy_path(monkeypatch, identity=None, media_status="accepted"):
@@ -46,12 +54,7 @@ def _call(**overrides):
     kwargs = {
         "event_id": "smart-evt-1",
         "camera_number": 1,
-        "s3_key": "cust-1/site-1/appl-1/cam-1/2026/09/14/events/motion_base-evt-1.mp4",
-        "thumbnail_s3_key": "cust-1/site-1/appl-1/cam-1/2026/09/14/events/motion_base-evt-1.jpg",
-        "duration_seconds": 15.6,
-        "size_bytes": 4153816,
-        "started_at": "2026-09-14T01:57:17.041509",
-        "ended_at": "2026-09-14T01:57:32.595207",
+        "parent_local_event_id": "base-evt-1",
     }
     kwargs.update(overrides)
     return event_media_uploader.register_shared_event_media(**kwargs)
@@ -66,6 +69,7 @@ def test_disabled_flag_skips_without_touching_anything(monkeypatch):
     monkeypatch.setattr(recording_upload, "_camera_identity", _should_not_be_called)
 
     assert _call() is False
+    assert event_media_outbox.load() == []
 
 
 def test_unknown_camera_returns_false(monkeypatch):
@@ -73,35 +77,31 @@ def test_unknown_camera_returns_false(monkeypatch):
     monkeypatch.setattr(recording_upload, "_camera_identity", lambda camera_number: None)
 
     assert _call() is False
+    assert event_media_outbox.load() == []
 
 
-def test_happy_path_registers_the_reused_key_verbatim_and_never_touches_s3(monkeypatch):
+def test_happy_path_sends_only_the_parent_local_event_id_and_never_touches_s3(monkeypatch):
     """No boto3/S3 client is ever constructed or referenced by this
     function at all -- confirmed by simply never patching/providing one
     and still succeeding, unlike upload_motion_event_media()'s own tests
-    which all require a fake S3 client."""
+    which all require a fake S3 client. The outgoing payload carries
+    ONLY the parent's own local id -- never a storage key of any kind,
+    the exact shape change this fix exists to make."""
     calls = _wire_happy_path(monkeypatch)
 
     result = _call()
 
     assert result is True
-    media_calls = [c for c in calls["control_plane_calls"] if c[0].endswith("/media")]
+    media_calls = [c for c in calls["control_plane_calls"] if c[0].endswith("/media/shared")]
     assert len(media_calls) == 1
     path, payload = media_calls[0]
-    assert path == "/api/appliance/analytics/cam-1/events/smart-evt-1/media"
-    # The exact s3_key/thumbnail_s3_key passed in are registered verbatim
-    # -- never re-derived from this call's own event_id.
-    assert payload["s3_key"] == "cust-1/site-1/appl-1/cam-1/2026/09/14/events/motion_base-evt-1.mp4"
-    assert payload["thumbnail_s3_key"] == "cust-1/site-1/appl-1/cam-1/2026/09/14/events/motion_base-evt-1.jpg"
-    assert payload["duration_seconds"] == 15.6
-    assert payload["size_bytes"] == 4153816
-    assert payload["started_at"] == "2026-09-14T01:57:17.041509"
-    assert payload["ended_at"] == "2026-09-14T01:57:32.595207"
+    assert path == "/api/appliance/analytics/cam-1/events/smart-evt-1/media/shared"
+    assert payload == {"parent_local_event_id": "base-evt-1"}
 
 
 def test_never_calls_ensure_session_or_boto3(monkeypatch):
-    """The whole point of this function: registering a second pointer to
-    an already-uploaded object requires no S3 credentials at all."""
+    """The whole point of this function: registering a reference to an
+    already-uploaded object requires no S3 credentials at all."""
     calls = _wire_happy_path(monkeypatch)
 
     session_calls = []
@@ -119,6 +119,12 @@ def test_registration_deferred_when_detection_event_not_yet_synced(monkeypatch):
     result = _call()
 
     assert result is False
+    # Durable intent still recorded -- a later resync of the still-
+    # unsynced child, followed by a retry, can recover this.
+    jobs = event_media_outbox.load()
+    assert len(jobs) == 1
+    assert jobs[0]["kind"] == "shared"
+    assert jobs[0]["parent_local_event_id"] == "base-evt-1"
 
 
 def test_control_plane_failure_retries_then_returns_false(monkeypatch):
@@ -129,6 +135,7 @@ def test_control_plane_failure_retries_then_returns_false(monkeypatch):
     result = _call()
 
     assert result is False
+    assert len(event_media_outbox.load()) == 1
 
 
 def test_duplicate_status_is_treated_as_success_and_idempotent(monkeypatch):
@@ -138,18 +145,106 @@ def test_duplicate_status_is_treated_as_success_and_idempotent(monkeypatch):
 
     assert _call() is True
     assert _call() is True
+    assert event_media_outbox.load() == []
 
 
-def test_never_writes_to_the_durable_outbox(monkeypatch):
-    """Deliberately does not introduce a second queue: there is no local
-    artifact for this call to protect, so it must never touch
-    event_media_outbox at all -- unlike upload_motion_event_media()'s
-    own put()/remove() calls."""
+# --------------------------------------------------------- durable recovery via the existing outbox
+
+
+def test_writes_a_durable_shared_entry_before_attempting_anything(monkeypatch):
+    """Unlike the old design (which never touched the outbox at all,
+    since it had nothing local to protect), this call is durable from
+    its very first line: a crash or restart mid-registration must never
+    silently lose the intent to share media for this event."""
+    calls = _wire_happy_path(monkeypatch)
+
+    _call()
+
+    jobs = event_media_outbox.load()
+    assert jobs == []  # removed again after a successful registration
+    assert calls["control_plane_calls"]  # but the attempt genuinely happened
+
+
+def test_successful_registration_removes_the_durable_entry(monkeypatch):
     _wire_happy_path(monkeypatch)
 
-    outbox_calls = []
-    monkeypatch.setattr(event_media_uploader.event_media_outbox, "put", lambda job: outbox_calls.append(("put", job)))
-    monkeypatch.setattr(event_media_uploader.event_media_outbox, "remove", lambda event_id: outbox_calls.append(("remove", event_id)))
-
     assert _call() is True
-    assert outbox_calls == []
+    assert event_media_outbox.load() == []
+
+
+def test_failed_registration_leaves_the_durable_entry_for_a_later_retry(monkeypatch):
+    monkeypatch.setattr(recording_upload, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(recording_upload, "_camera_identity", lambda camera_number: {"camera_id": "cam-1", "cloud_recording_mode": "motion"})
+    monkeypatch.setattr(analytics_sync, "_load_local_events", lambda: [])  # deferred
+
+    assert _call() is False
+
+    jobs = event_media_outbox.load()
+    assert len(jobs) == 1
+    assert jobs[0]["event_id"] == "smart-evt-1"
+    assert jobs[0]["camera_number"] == 1
+    assert jobs[0]["kind"] == "shared"
+    assert jobs[0]["parent_local_event_id"] == "base-evt-1"
+
+
+def test_retry_pending_event_media_recovers_a_shared_entry_without_any_encode_or_upload(monkeypatch):
+    """The actual recovery worker: a durable 'shared' outbox entry is
+    retried via register_shared_event_media() alone -- never via
+    upload_motion_event_media() or build_motion_event_clip()."""
+    event_media_outbox.put({
+        "event_id": "smart-evt-1",
+        "camera_number": 1,
+        "kind": "shared",
+        "parent_local_event_id": "base-evt-1",
+    })
+
+    register_calls = []
+
+    def fake_register(*, event_id, **kwargs):
+        register_calls.append({"event_id": event_id, **kwargs})
+        event_media_outbox.remove(event_id)  # matches the real function's own on-success contract
+        return True
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("a 'shared' outbox entry must never trigger an upload/encode retry")
+
+    monkeypatch.setattr(event_media_uploader, "register_shared_event_media", fake_register)
+    monkeypatch.setattr(event_media_uploader, "upload_motion_event_media", fail_if_called)
+
+    summary = event_media_uploader.retry_pending_event_media()
+
+    assert summary == {"attempted": 1, "completed": 1, "pending": 0}
+    assert register_calls == [{"event_id": "smart-evt-1", "camera_number": 1, "parent_local_event_id": "base-evt-1"}]
+
+
+def test_retry_pending_event_media_still_uses_upload_path_for_ordinary_upload_entries(monkeypatch):
+    """The pre-existing 'upload' kind (no 'kind' key at all, matching
+    every entry ever written before this change) is completely
+    unaffected -- still routed to upload_motion_event_media(), never to
+    the new shared-registration function."""
+    event_media_outbox.put({
+        "event_id": "evt-1",
+        "camera_number": 1,
+        "event_start": "2026-09-14T00:00:00",
+        "event_end": "2026-09-14T00:00:10",
+        "clip_url": "/recordings/clips/motion/motion_evt-1.mp4",
+        "thumbnail_url": None,
+    })
+
+    upload_calls = []
+
+    def fake_upload(*, event_id, **kwargs):
+        upload_calls.append({"event_id": event_id, **kwargs})
+        event_media_outbox.remove(event_id)  # matches the real function's own on-success contract
+        return True
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("an ordinary upload entry must never be routed to register_shared_event_media()")
+
+    monkeypatch.setattr(event_media_uploader, "upload_motion_event_media", fake_upload)
+    monkeypatch.setattr(event_media_uploader, "register_shared_event_media", fail_if_called)
+
+    summary = event_media_uploader.retry_pending_event_media()
+
+    assert summary == {"attempted": 1, "completed": 1, "pending": 0}
+    assert len(upload_calls) == 1

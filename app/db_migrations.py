@@ -669,3 +669,43 @@ def apply_migrations():
             ('credential_recovery_expires_at','TEXT'),
         ):
             if name not in claim_columns: db.execute(f'ALTER TABLE appliance_claims ADD COLUMN {name} {definition}')
+
+        # Smart Motion shared-media authorization (2026-09-14 Phase A --
+        # see appliance_cloud.py's analytics_event_available() and the
+        # new .../media/shared route). A CLOUD id -> CLOUD id foreign
+        # key, resolved exactly once at ingestion time from an
+        # appliance-submitted LOCAL id and frozen from then on -- never
+        # trusted again from any later request. NULL for every event
+        # except a real smart_motion one whose claimed Motion parent has
+        # already been independently resolved (same camera, same
+        # authenticated appliance, parent event_type='motion'). A
+        # smart_motion event with this column still NULL is deliberately
+        # unresolved and permanently ineligible for the shared-media
+        # route until a later resync succeeds -- never inferred from
+        # nearby timestamps or filenames, and never silently retrofitted
+        # onto a legacy row.
+        detection_event_columns=({item['name'] for item in db.execute('PRAGMA table_info(detection_events)').fetchall()}
+                                 if backend()=='sqlite' else
+                                 {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='detection_events'").fetchall()})
+        if 'parent_detection_event_id' not in detection_event_columns: db.execute('ALTER TABLE detection_events ADD COLUMN parent_detection_event_id TEXT REFERENCES detection_events(id)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_detection_events_parent ON detection_events(parent_detection_event_id)')
+
+        # Provenance for a shared (non-primary) detection_event_media
+        # row: NULL for a root row (the base Motion event's own real
+        # upload), set to that root row's own id for a child row sharing
+        # its bytes. This is the reference/owner distinction the
+        # retention sweep and daily-usage accounting both depend on --
+        # a non-null source_media_id row must never independently
+        # trigger an S3 delete and must never be counted as new physical
+        # footage (see recording_retention_sweep.py and
+        # event_media_policy.py). s3_key itself deliberately carries no
+        # uniqueness constraint (confirmed against the live schema) --
+        # two independently-owned rows safely referencing one immutable
+        # object was already a supported shape before this column
+        # existed; this just makes the relationship explicit and
+        # queryable instead of only inferable by matching key strings.
+        detection_event_media_columns=({item['name'] for item in db.execute('PRAGMA table_info(detection_event_media)').fetchall()}
+                                       if backend()=='sqlite' else
+                                       {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='detection_event_media'").fetchall()})
+        if 'source_media_id' not in detection_event_media_columns: db.execute('ALTER TABLE detection_event_media ADD COLUMN source_media_id TEXT REFERENCES detection_event_media(id)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_detection_event_media_source ON detection_event_media(source_media_id)')

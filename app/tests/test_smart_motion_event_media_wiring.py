@@ -1,4 +1,5 @@
-"""Smart Motion's own event-media wiring (2026-09-14, revised).
+"""Smart Motion's own event-media wiring (2026-09-14, Phase A revision
+after independent security review).
 
 Round 1 (commit 3d54556) gave a correlated Smart Motion event its own
 independent event-media by independently re-running build_motion_event_
@@ -10,23 +11,33 @@ time, end_time) by construction, so the second encode was pure,
 measured waste -- confirmed live: both independently-built clips were
 byte-for-byte identical.
 
-Round 2 (this file): the Smart Motion media task no longer independently
-encodes or uploads anything. It AWAITS clip_task -- the base Motion
-event's own already-scheduled media task -- and reuses its result (the
-s3_key/thumbnail_s3_key/duration_seconds/size_bytes an already-succeeded
-upload produced) to register a SECOND, independently-owned detection_
-event_media row via the new event_media_uploader.register_shared_event_
-media(), which does no ffmpeg encode and no S3 PutObject at all. This is
-a genuine in-process dependency on an already-scheduled asyncio.Task --
-never a database poll, never a second queue.
+Round 2 (commit 818f07f) had the Smart Motion task await the base
+Motion event's own media task and forward its resulting s3_key/
+thumbnail_s3_key/timing/duration/size to a new registration-only
+function. Real production validation of THAT design hit a real,
+repeated HTTP 403: the cloud's pre-existing anti-spoofing check
+requires a submitted key to be derived from the REGISTERING event's
+own id, which a shared key by definition never is. An independent
+security review (Codex) confirmed the root cause and required a
+narrower fix.
+
+Round 3 (this file, Phase A): the Smart Motion media task still awaits
+clip_task (the base Motion event's own already-scheduled media task) --
+now purely as a "did the base event's own media actually succeed"
+signal -- and calls register_shared_event_media() with ONLY the base
+Motion event's own LOCAL id (`parent_local_event_id`) -- never any S3
+key, timing, duration, or size. The cloud independently re-resolves
+that id (established once, immutably, at analytics-ingestion time),
+verifies the full ownership chain, and derives the approved clip/
+thumbnail/metadata itself from the parent's own already-registered
+media (see appliance_cloud.py's analytics_event_media_shared()).
 
 Ownership stays fully independent: base Motion and Smart Motion keep
-their own analytics events, their own event ids, and (per the real,
-live-verified schema -- detection_event_media.detection_event_id is
-UNIQUE, but s3_key carries no uniqueness constraint) their own
+their own analytics events, their own event ids, and their own
 detection_event_media rows -- which now intentionally reference the
-SAME s3_key/thumbnail_s3_key rather than two independently-uploaded
-copies of identical bytes.
+SAME s3_key/thumbnail_s3_key (via the new source_media_id provenance
+column) rather than two independently-uploaded copies of identical
+bytes.
 """
 
 import asyncio
@@ -44,31 +55,21 @@ import main
 def fake_media_pipeline(monkeypatch):
     """event_media_uploader.py exists only on the physical appliance --
     injects a fake module under that exact import name so both real call
-    sites resolve to real, call-recording, side-effect-accurate stand-
-    ins: `upload_motion_event_media` (the base Motion event's own path,
-    unchanged) and the new `register_shared_event_media` (the path a
-    correlated Smart Motion event now uses instead of a second encode/
-    upload). The fake upload mirrors the real function's own contract
-    exactly: shared_media_out is populated only on a successful
-    "upload", with an s3_key deterministically derived from the event_id
-    it was actually called with -- so a test can prove reuse (the
-    Smart Motion registration ends up carrying the BASE MOTION event's
-    own s3_key, not one derived from its own id) rather than merely
-    asserting two calls happened."""
+    sites resolve to real, call-recording stand-ins: `upload_motion_
+    event_media` (the base Motion event's own path, unchanged) and
+    `register_shared_event_media` (the parent-id-only path a correlated
+    Smart Motion event now uses instead of a second encode/upload). The
+    fake upload mirrors the real function's own contract: shared_media_
+    out is populated only on a successful "upload" -- main.py only ever
+    checks this dict's truthiness (as the "did the base event succeed"
+    signal), it never reads any specific key out of it anymore."""
     upload_calls = []
     register_calls = []
 
     def fake_upload_motion_event_media(*, shared_media_out=None, **kwargs):
         upload_calls.append(kwargs)
         if shared_media_out is not None:
-            shared_media_out.update({
-                "s3_key": f"events/motion_{kwargs['event_id']}.mp4",
-                "thumbnail_s3_key": f"events/motion_{kwargs['event_id']}.jpg",
-                "duration_seconds": 10.0,
-                "size_bytes": 123456,
-                "started_at": kwargs["event_start"].isoformat(),
-                "ended_at": kwargs["event_end"].isoformat(),
-            })
+            shared_media_out.update({"ok": True})
         return True
 
     def fake_register_shared_event_media(**kwargs):
@@ -173,7 +174,7 @@ def test_exactly_one_physical_upload_for_the_shared_artifact(monkeypatch, fake_m
     assert fake_media_pipeline.register_calls[0]["event_id"] == smart_event["id"]
 
 
-# --------------------------------------------------------- independent ownership, shared bytes
+# --------------------------------------------------------- independent ownership, parent-id-only
 
 
 def test_motion_and_smart_motion_retain_distinct_event_ids_and_media_ownership(monkeypatch, fake_media_pipeline):
@@ -201,14 +202,14 @@ def test_motion_and_smart_motion_retain_distinct_event_ids_and_media_ownership(m
     assert fake_media_pipeline.register_calls[0]["event_id"] == smart_event["id"]
 
 
-def test_smart_motion_media_record_references_the_same_s3_key_as_base_motion(monkeypatch, fake_media_pipeline):
-    """The requirement this whole change exists to satisfy: independent
-    logical ownership (different detection_event_id/event id), but the
-    SAME immutable S3 object -- proven here by checking the actual
-    VALUE of the reused key, not just that two calls happened, so a
-    regression that accidentally re-derives an independent (smart-
-    event-id-based) key instead of reusing the real one would be
-    caught."""
+def test_shared_registration_sends_only_the_parent_local_event_id_never_a_storage_key(monkeypatch, fake_media_pipeline):
+    """The requirement this whole redesign exists to satisfy: the
+    appliance sends ONLY the base Motion event's own LOCAL id -- never
+    an S3 key, bucket, timing, duration, or size. The cloud derives
+    every approved value itself from the verified parent's own media.
+    A regression that starts forwarding any storage field again (the
+    exact shape that produced the real HTTP 403 in production) would
+    be caught here by the exact-keys assertion."""
     analytics_events = _standard_motion_mocks(monkeypatch)
     _classify_as(monkeypatch, "vehicle")
 
@@ -221,20 +222,13 @@ def test_smart_motion_media_record_references_the_same_s3_key_as_base_motion(mon
     asyncio.run(_store_and_drain(4, now, now))
 
     motion_event = _by_event_type(analytics_events, "motion")
-    smart_event = _by_event_type(analytics_events, "smart_motion")
-
-    expected_shared_s3_key = f"events/motion_{motion_event['id']}.mp4"
-    expected_shared_thumbnail_key = f"events/motion_{motion_event['id']}.jpg"
 
     register_call = fake_media_pipeline.register_calls[0]
-    assert register_call["s3_key"] == expected_shared_s3_key
-    assert register_call["thumbnail_s3_key"] == expected_shared_thumbnail_key
-    # Never a key derived from Smart Motion's own id -- that would mean
-    # an independent (re-encoded/re-uploaded) object, not a shared one.
-    assert smart_event["id"] not in register_call["s3_key"]
+    assert set(register_call.keys()) == {"event_id", "camera_number", "parent_local_event_id"}
+    assert register_call["parent_local_event_id"] == motion_event["id"]
 
 
-def test_correct_camera_and_window_passed_into_the_shared_registration(monkeypatch, fake_media_pipeline):
+def test_correct_camera_passed_into_the_shared_registration(monkeypatch, fake_media_pipeline):
     analytics_events = _standard_motion_mocks(monkeypatch)
     _classify_as(monkeypatch, "vehicle")
 
@@ -249,10 +243,6 @@ def test_correct_camera_and_window_passed_into_the_shared_registration(monkeypat
 
     register_call = fake_media_pipeline.register_calls[0]
     assert register_call["camera_number"] == 5
-    assert register_call["started_at"] == start.isoformat()
-    assert register_call["ended_at"] == end.isoformat()
-    assert register_call["duration_seconds"] == 10.0
-    assert register_call["size_bytes"] == 123456
 
 
 def test_no_duplicate_smart_motion_media_scheduling_for_a_single_event(monkeypatch, fake_media_pipeline):

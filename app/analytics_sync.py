@@ -423,12 +423,26 @@ def _pending_events(max_count: int) -> list[tuple[dict, str]]:
 
 
 def _build_payload(event: dict) -> dict:
-    """Fixed six-field allowlist, matching the cloud route's own
+    """Fixed seven-field allowlist, matching the cloud route's own
     allowlist exactly -- fields read individually from the local
     event, never a pass-through of the raw dict. thumbnail and
     linked_recording (local-filesystem-only concepts) are deliberately
     never read here, so they cannot reach the cloud regardless of what
-    the local event contains."""
+    the local event contains.
+
+    parent_local_event_id (2026-09-14 Phase A): only ever set locally
+    on a real smart_motion event (see main.py's store_motion_event(),
+    which stores it under the LOCAL field name motion_event_id) --
+    None for every other event type here, forwarded as-is under this
+    explicitly-"local" wire name so the cloud never confuses it with
+    one of its own database ids (see appliance_cloud.py's
+    _resolve_parent_motion_event()). This field is advisory only at
+    ingestion time in the sense that the cloud independently re-
+    resolves and freezes it under its own authority (same camera, same
+    authenticated appliance, parent event_type='motion') -- never
+    trusted verbatim, and never trusted again from any later request.
+    See appliance_cloud.py's analytics_event_media_shared() for the
+    actual authorization decision this field ultimately enables."""
     detections = event.get("detections")
     payload_detections = detections if isinstance(detections, list) else None
     # PPE's hard_hat_present/safety_vest_present booleans are set as
@@ -453,6 +467,7 @@ def _build_payload(event: dict) -> dict:
         "object_count": event.get("object_count"),
         "detections": payload_detections,
         "event_timestamp": str(event.get("timestamp") or "").strip(),
+        "parent_local_event_id": (str(event["motion_event_id"]).strip() or None) if event.get("motion_event_id") else None,
     }
 
 

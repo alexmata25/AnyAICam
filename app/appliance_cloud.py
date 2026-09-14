@@ -139,6 +139,28 @@ def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     return camera
 
 
+def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_local_event_id: str) -> str | None:
+    """Resolves a submitted LOCAL parent id (an appliance's own
+    local_event_id, never a cloud id) to this exact appliance's own
+    cloud detection_events.id, scoped to the SAME camera and the SAME
+    authenticated appliance, and requiring the parent's own stored
+    event_type to be 'motion' -- never another smart_motion event, and
+    never anything on a different camera/appliance/customer/site (the
+    camera_id+appliance_id pair already IS that ownership boundary,
+    since a camera's own row can only ever belong to one appliance at a
+    time). Returns None (never raises) when the parent hasn't synced
+    yet, belongs to a different camera or appliance, or isn't a real
+    Motion event -- ingestion of the child event itself must never fail
+    just because its parent isn't resolvable yet; the child simply
+    stays unresolved (and therefore permanently ineligible for the
+    shared-media route) until a later resync succeeds."""
+    parent=db.execute(
+        'SELECT id FROM detection_events WHERE camera_id=? AND appliance_id=? AND local_event_id=? AND event_type=?',
+        (camera_id,appliance_id,parent_local_event_id,'motion'),
+    ).fetchone()
+    return parent['id'] if parent else None
+
+
 def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: Callable[[Request],dict] | None=None) -> None:
     @app.get('/api/appliance/config')
     def appliance_config() -> dict:
@@ -580,21 +602,51 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         object_count=safe.get('object_count')
         detections=safe.get('detections')
         detections_json=json.dumps(detections) if isinstance(detections,list) else None
+        # Smart Motion shared-media correlation (2026-09-14 Phase A): a
+        # LOCAL id (never a cloud id -- see _resolve_parent_motion_event()'s
+        # own docstring), meaningful only for a real smart_motion event.
+        # Resolved and frozen here, at ingestion time, never trusted again
+        # from the later .../media/shared request itself.
+        parent_local_event_id=str(safe.get('parent_local_event_id') or '').strip() or None
         event_id=secrets.token_hex(12); now=datetime.now().isoformat()
         with connection() as db:
+            parent_detection_event_id=(
+                _resolve_parent_motion_event(db,camera_id,appliance['id'],parent_local_event_id)
+                if event_type=='smart_motion' and parent_local_event_id else None
+            )
             try:
                 db.execute(
-                    'INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,confidence,object_count,detections_json,event_timestamp,created_at) '
-                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    'INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,confidence,object_count,detections_json,event_timestamp,parent_detection_event_id,created_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (event_id,camera['customer_id'],camera['site_id'],appliance['id'],camera_id,local_event_id,event_type,
                      float(confidence) if confidence is not None else None,
                      int(object_count) if object_count is not None else 1,
-                     detections_json,event_timestamp,now),
+                     detections_json,event_timestamp,parent_detection_event_id,now),
                 )
             except Exception:
-                existing=db.execute('SELECT id FROM detection_events WHERE camera_id=? AND local_event_id=?',(camera_id,local_event_id)).fetchone()
-                if existing: return {'status':'duplicate','event_id':existing['id']}
-                raise HTTPException(status_code=500,detail='Could not record this event.')
+                existing=db.execute(
+                    'SELECT id,event_type,event_timestamp,parent_detection_event_id FROM detection_events WHERE camera_id=? AND local_event_id=?',
+                    (camera_id,local_event_id),
+                ).fetchone()
+                if not existing:
+                    raise HTTPException(status_code=500,detail='Could not record this event.')
+                # Event identity (type, timestamp) is immutable once
+                # recorded -- a replay asserting a different one is a
+                # conflict, never a silent overwrite (closes the same
+                # class of "duplicate mutates" gap already confirmed on
+                # the media-registration route, here for event identity
+                # itself).
+                if existing['event_type']!=event_type or existing['event_timestamp']!=event_timestamp:
+                    raise HTTPException(status_code=409,detail='Event identity does not match the previously recorded event.')
+                if parent_detection_event_id is not None:
+                    if existing['parent_detection_event_id'] is None:
+                        # First-time completion of a previously-unresolved
+                        # relationship (e.g. the child synced before its
+                        # parent) -- allowed exactly once, never again.
+                        db.execute('UPDATE detection_events SET parent_detection_event_id=? WHERE id=?',(parent_detection_event_id,existing['id']))
+                    elif existing['parent_detection_event_id']!=parent_detection_event_id:
+                        raise HTTPException(status_code=409,detail='This event is already correlated with a different Motion event.')
+                return {'status':'duplicate','event_id':existing['id']}
         # 2026-09-04, Smart Alerts fix: this is the currently-active
         # event-ingestion path (the older POST /api/appliance/events ->
         # appliance_events route also calls fanout_appliance_event(),
@@ -762,6 +814,134 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             'detection_event_media',
             media_id,
             {'camera_id':camera_id,'local_event_id':local_event_id,'s3_key':s3_key},
+        )
+
+        return {'status':'accepted','media_id':media_id}
+
+    @app.post('/api/appliance/analytics/{camera_id}/events/{local_event_id}/media/shared')
+    def analytics_event_media_shared(request: Request,camera_id: str,local_event_id: str,payload: dict) -> dict:
+        # Registers a SECOND, independently-owned detection_event_media
+        # row for a correlated Smart Motion event, referencing its
+        # already-verified base Motion event's own already-registered
+        # media. Deliberately strict: this request's own schema has no
+        # s3_key/thumbnail_s3_key/timing/duration/size field at all, so
+        # an appliance cannot supply an arbitrary storage reference here
+        # even by mistake -- the only thing accepted is the parent's own
+        # LOCAL event id, independently re-resolved and cross-checked
+        # against this child's own already-frozen parent_detection_
+        # event_id (set once, at ingestion time, by analytics_event_
+        # available() above -- never by this route). Every approved
+        # clip/thumbnail/timing/duration/size value is copied verbatim
+        # from the verified parent's OWN detection_event_media row --
+        # never from this request. No ffmpeg encode, no S3 PutObject, no
+        # S3 credential of any kind is used or needed here.
+        appliance=authenticate_appliance(request)
+        if not ANALYTICS_SYNC_ENABLED:
+            raise HTTPException(status_code=404,detail='Analytics sync is not enabled.')
+
+        camera=_authorized_camera(appliance,camera_id)
+        if camera.get('cloud_recording_mode') != 'motion':
+            raise HTTPException(status_code=403,detail='Camera is not entitled to motion event recording.')
+        safe=sanitize_appliance_payload(payload)
+
+        local_event_id=str(local_event_id or '').strip()
+        parent_local_event_id=str(safe.get('parent_local_event_id') or '').strip()
+        if not local_event_id:
+            raise HTTPException(status_code=400,detail='local_event_id is required.')
+        if not parent_local_event_id:
+            raise HTTPException(status_code=400,detail='parent_local_event_id is required.')
+
+        now=datetime.now().isoformat()
+
+        with connection() as db:
+            child=db.execute(
+                'SELECT id,event_type,appliance_id,camera_id,customer_id,site_id,parent_detection_event_id '
+                'FROM detection_events WHERE camera_id=? AND local_event_id=?',
+                (camera_id,local_event_id),
+            ).fetchone()
+            if not child:
+                raise HTTPException(status_code=404,detail='Detection event has not reached the cloud yet.')
+            if child['event_type']!='smart_motion':
+                raise HTTPException(status_code=403,detail='Only a smart_motion event may use shared media registration.')
+            if child['appliance_id']!=appliance['id']:
+                raise HTTPException(status_code=403,detail='Event does not belong to this appliance.')
+            if child['customer_id']!=camera['customer_id'] or child['site_id']!=camera['site_id']:
+                raise HTTPException(status_code=403,detail="Event does not belong to this camera's current customer/site.")
+            if child['parent_detection_event_id'] is None:
+                raise HTTPException(status_code=409,detail='parent_media_pending: correlation not yet established.')
+
+            # Re-resolve the SUBMITTED parent id independently -- it must
+            # equal the child's own already-frozen, previously-verified
+            # correlation. A request can never silently reassign a
+            # different parent after the fact.
+            resolved_parent_id=_resolve_parent_motion_event(db,camera_id,appliance['id'],parent_local_event_id)
+            if resolved_parent_id is None or resolved_parent_id!=child['parent_detection_event_id']:
+                raise HTTPException(status_code=403,detail="parent_local_event_id does not match this event's established correlation.")
+
+            parent=db.execute(
+                'SELECT id,event_type,appliance_id,camera_id,customer_id,site_id FROM detection_events WHERE id=?',
+                (resolved_parent_id,),
+            ).fetchone()
+            if not parent:
+                raise HTTPException(status_code=404,detail='Claimed parent Motion event no longer exists.')
+            if parent['event_type']!='motion':
+                raise HTTPException(status_code=403,detail='parent_local_event_id does not identify a base Motion event.')
+            if parent['appliance_id']!=appliance['id']:
+                raise HTTPException(status_code=403,detail='Claimed parent Motion event does not belong to this appliance.')
+            if parent['camera_id']!=camera_id:
+                raise HTTPException(status_code=403,detail='Claimed parent Motion event is on a different camera.')
+            if parent['customer_id']!=child['customer_id'] or parent['site_id']!=child['site_id']:
+                raise HTTPException(status_code=403,detail='Claimed parent Motion event belongs to a different customer or site.')
+
+            parent_media=db.execute(
+                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes '
+                'FROM detection_event_media WHERE detection_event_id=?',
+                (parent['id'],),
+            ).fetchone()
+            if not parent_media:
+                raise HTTPException(status_code=409,detail='parent_media_pending: base Motion event has no registered media yet.')
+
+            existing=db.execute('SELECT id,source_media_id FROM detection_event_media WHERE detection_event_id=?',(child['id'],)).fetchone()
+            if existing:
+                if existing['source_media_id']==parent_media['id']:
+                    return {'status':'duplicate','media_id':existing['id']}
+                raise HTTPException(status_code=409,detail='This event already has different registered media.')
+
+            media_id=secrets.token_hex(12)
+            try:
+                db.execute(
+                    'INSERT INTO detection_event_media('
+                    'id,detection_event_id,customer_id,camera_id,s3_key,'
+                    'thumbnail_s3_key,started_at,ended_at,duration_seconds,'
+                    'size_bytes,source_media_id,created_at'
+                    ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (
+                        media_id,
+                        child['id'],
+                        camera['customer_id'],
+                        camera_id,
+                        parent_media['s3_key'],
+                        parent_media['thumbnail_s3_key'],
+                        parent_media['started_at'],
+                        parent_media['ended_at'],
+                        parent_media['duration_seconds'],
+                        parent_media['size_bytes'],
+                        parent_media['id'],
+                        now,
+                    ),
+                )
+            except Exception:
+                existing=db.execute('SELECT id,source_media_id FROM detection_event_media WHERE detection_event_id=?',(child['id'],)).fetchone()
+                if existing and existing['source_media_id']==parent_media['id']:
+                    return {'status':'duplicate','media_id':existing['id']}
+                raise HTTPException(status_code=500,detail='Could not record shared media.')
+
+        audit(
+            {'email':appliance['cloud_id'],'role':'appliance'},
+            'appliance.analytics_event_media_shared',
+            'detection_event_media',
+            media_id,
+            {'camera_id':camera_id,'local_event_id':local_event_id,'source_media_id':parent_media['id']},
         )
 
         return {'status':'accepted','media_id':media_id}

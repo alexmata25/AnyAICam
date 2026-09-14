@@ -433,36 +433,27 @@ def register_shared_event_media(
     *,
     event_id: str,
     camera_number: int,
-    s3_key: str,
-    thumbnail_s3_key: str | None,
-    duration_seconds: float | None,
-    size_bytes: int | None,
-    started_at: str | None,
-    ended_at: str | None,
+    parent_local_event_id: str,
 ) -> bool:
     """Registers a SECOND, independently-owned detection_event_media row
-    (for `event_id`) against an S3 object ANOTHER event (the correlated
-    base Motion event) already uploaded -- no ffmpeg encode, no S3
-    PutObject, here. Exists specifically for a correlated Smart Motion
-    event, whose own window is always identical to its base Motion
-    event's by construction: main.py's store_motion_event() awaits the
-    base Motion event's own media task and passes this exact call the
-    s3_key/thumbnail_s3_key/duration_seconds/size_bytes/window it
-    already produced.
+    (for `event_id`) referencing the correlated base Motion event's own
+    already-uploaded clip/thumbnail -- no ffmpeg encode, no S3
+    PutObject, no S3 credential of any kind, here. The ONLY thing sent
+    is the parent's own LOCAL event id (`parent_local_event_id`) --
+    never any storage key, timing, duration, or size. The cloud
+    independently re-resolves that id, verifies the full ownership
+    chain, and derives the approved clip/thumbnail/metadata itself from
+    the parent's own already-registered media row (see appliance_cloud.
+    py's analytics_event_media_shared()) -- this call has no S3 key to
+    supply even if it wanted to.
 
-    detection_event_media.s3_key carries no uniqueness constraint (only
-    detection_event_id does, confirmed against the live schema) -- two
-    independent rows safely referencing the same immutable clip is
-    already a fully supported shape, not a new one.
-
-    Deliberately never writes to event_media_outbox: that durable queue
-    exists to protect a LOCAL artifact that still needs (re)uploading;
-    there is no such artifact here, nothing local this call could lose
-    on a restart -- only a second, idempotent registration POST against
-    an object that's already safely in S3. A failure here is logged and
-    given up on retry-lessly rather than introducing a second queue,
-    per the same "reuse the result, never add another queue" design as
-    the asyncio.Task dependency in main.py that calls this."""
+    Durable: writes a "shared" registration-intent entry to the SAME
+    event_media_outbox a base upload uses (see retry_pending_event_
+    media() below), before attempting anything -- so a restart mid-
+    registration, or a parent whose own media isn't ready yet, can
+    always be recovered later WITHOUT this call, or its retry, ever
+    encoding or uploading anything. Removed from the outbox only on a
+    confirmed accepted/duplicate response."""
     if not EVENT_MEDIA_UPLOAD_ENABLED:
         logger.info(
             "event_media.shared_registration_skipped_disabled "
@@ -486,14 +477,12 @@ def register_shared_event_media(
 
     camera_id = identity["camera_id"]
 
-    payload = {
-        "s3_key": s3_key,
-        "thumbnail_s3_key": thumbnail_s3_key,
-        "started_at": started_at,
-        "ended_at": ended_at,
-        "duration_seconds": duration_seconds,
-        "size_bytes": size_bytes,
-    }
+    event_media_outbox.put({
+        "event_id": event_id,
+        "camera_number": camera_number,
+        "kind": "shared",
+        "parent_local_event_id": parent_local_event_id,
+    })
 
     if not _ensure_detection_event_synced(event_id, camera_id):
         logger.warning(
@@ -504,10 +493,12 @@ def register_shared_event_media(
         )
         return False
 
+    payload = {"parent_local_event_id": parent_local_event_id}
+
     for attempt in range(1, 13):
         response = recording_upload._control_plane_post(
             f"/api/appliance/analytics/"
-            f"{camera_id}/events/{event_id}/media",
+            f"{camera_id}/events/{event_id}/media/shared",
             payload,
         )
 
@@ -517,12 +508,12 @@ def register_shared_event_media(
         ):
             logger.info(
                 "event_media.registered_shared "
-                "event_id=%s camera=%s clip_key=%s thumbnail_key=%s",
+                "event_id=%s camera=%s parent_local_event_id=%s",
                 event_id,
                 camera_number,
-                s3_key,
-                thumbnail_s3_key,
+                parent_local_event_id,
             )
+            event_media_outbox.remove(event_id)
             return True
 
         if attempt < 12:
@@ -530,10 +521,10 @@ def register_shared_event_media(
 
     logger.warning(
         "event_media.shared_registration_failed "
-        "event_id=%s camera=%s clip_key=%s",
+        "event_id=%s camera=%s parent_local_event_id=%s",
         event_id,
         camera_number,
-        s3_key,
+        parent_local_event_id,
     )
 
     return False
@@ -552,12 +543,23 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
     for job in event_media_outbox.due()[:max(1, max_jobs)]:
         attempted += 1
         try:
-            succeeded = upload_motion_event_media(
-                event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
-                event_start=datetime.fromisoformat(str(job["event_start"])),
-                event_end=datetime.fromisoformat(str(job["event_end"])),
-                clip_url=str(job["clip_url"]), thumbnail_url=job.get("thumbnail_url"),
-            )
+            if job.get("kind") == "shared":
+                # Registration-only recovery for a correlated Smart
+                # Motion event: never re-encodes or re-uploads anything
+                # -- only re-attempts registering an already-uploaded
+                # (by its base Motion event) shared clip under this
+                # event's own id.
+                succeeded = register_shared_event_media(
+                    event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
+                    parent_local_event_id=str(job["parent_local_event_id"]),
+                )
+            else:
+                succeeded = upload_motion_event_media(
+                    event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
+                    event_start=datetime.fromisoformat(str(job["event_start"])),
+                    event_end=datetime.fromisoformat(str(job["event_end"])),
+                    clip_url=str(job["clip_url"]), thumbnail_url=job.get("thumbnail_url"),
+                )
             if succeeded:
                 completed += 1
             else:

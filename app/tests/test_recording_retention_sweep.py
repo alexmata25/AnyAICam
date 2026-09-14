@@ -208,6 +208,116 @@ def test_delete_object_fails_closed_when_bucket_unset(monkeypatch):
     assert rrs._delete_recording_object("recordings/cust-1/site-1/appl-1/cam-1/2026/08/21/clip.mkv") is False
 
 
+def _seed_detection_event(conn, event_id, customer_id, site_id, appliance_id, camera_id, event_type, local_event_id):
+    conn.execute(
+        "INSERT OR IGNORE INTO cameras(id,customer_id,site_id,appliance_id,name,created_at) VALUES(?,?,?,?,?,?)",
+        (camera_id, customer_id, site_id, appliance_id, "Camera", "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (event_id, customer_id, site_id, appliance_id, camera_id, local_event_id, event_type, "2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+    )
+
+
+def _seed_event_media(conn, media_id, detection_event_id, customer_id, camera_id, started_at, source_media_id=None):
+    s3_key = f"recordings/{customer_id}/site/appl/{camera_id}/2026/08/21/events/motion_{detection_event_id}.mp4"
+    ended_at = (datetime.fromisoformat(started_at) + timedelta(seconds=10)).isoformat()
+    conn.execute(
+        "INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,duration_seconds,source_media_id,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (media_id, detection_event_id, customer_id, camera_id, s3_key, started_at, ended_at, 10.0, source_media_id, started_at),
+    )
+    return s3_key
+
+
+# --------------------------------------------------------- shared (Smart Motion) event-media rows
+
+
+def test_shared_row_is_never_selected_as_its_own_deletion_candidate(db_path):
+    """A row with a non-null source_media_id (a correlated Smart Motion
+    event referencing its base Motion event's own clip) must never be
+    an independent candidate -- only its root can be."""
+    now = datetime(2026, 8, 21, 12, 0, 0)
+    started_at = (now - timedelta(days=3)).isoformat()
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_tenant(conn, "cust-shared", "sh")
+        _seed_plan(conn, "cust-shared", retention_days=2)
+        _seed_detection_event(conn, "evt-root", "cust-shared", "site-sh", "appl-sh", "cam-sh", "motion", "local-root")
+        _seed_detection_event(conn, "evt-child", "cust-shared", "site-sh", "appl-sh", "cam-sh", "smart_motion", "local-child")
+        _seed_event_media(conn, "media-root", "evt-root", "cust-shared", "cam-sh", started_at)
+        _seed_event_media(conn, "media-child", "evt-child", "cust-shared", "cam-sh", started_at, source_media_id="media-root")
+        conn.commit()
+        candidates = rrs._expired_candidates(conn, now)
+    ids = {c["id"] for c in candidates}
+    assert "media-root" in ids
+    assert "media-child" not in ids
+
+
+def test_deleting_a_root_cascades_to_its_shared_siblings_only_after_s3_delete_succeeds(db_path):
+    now = datetime(2026, 8, 21, 12, 0, 0)
+    started_at = (now - timedelta(days=3)).isoformat()
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_tenant(conn, "cust-shared2", "sh2")
+        _seed_plan(conn, "cust-shared2", retention_days=2)
+        _seed_detection_event(conn, "evt-root2", "cust-shared2", "site-sh2", "appl-sh2", "cam-sh2", "motion", "local-root2")
+        _seed_detection_event(conn, "evt-child2", "cust-shared2", "site-sh2", "appl-sh2", "cam-sh2", "smart_motion", "local-child2")
+        _seed_event_media(conn, "media-root2", "evt-root2", "cust-shared2", "cam-sh2", started_at)
+        _seed_event_media(conn, "media-child2", "evt-child2", "cust-shared2", "cam-sh2", started_at, source_media_id="media-root2")
+        conn.commit()
+
+        with patch.object(rrs, "_delete_recording_object", return_value=True) as mock_delete:
+            result = rrs.run_retention_sweep_tick(now=now)
+
+        conn2 = sqlite3.connect(db_path)
+        root_remaining = conn2.execute("SELECT COUNT(*) FROM detection_event_media WHERE id='media-root2'").fetchone()[0]
+        child_remaining = conn2.execute("SELECT COUNT(*) FROM detection_event_media WHERE id='media-child2'").fetchone()[0]
+
+    assert result == {"checked": 1, "deleted": 1}
+    assert root_remaining == 0
+    assert child_remaining == 0
+    # Exactly one S3 delete call -- the child's own bytes were never
+    # independently targeted; it has no S3 object of its own.
+    mock_delete.assert_called_once()
+
+
+def test_failed_root_s3_delete_preserves_both_root_and_shared_sibling_rows(db_path):
+    """The explicit ordering clarification: if physical S3 deletion is
+    not confirmed, no database record -- root or shared sibling -- may
+    be removed. Both stay intact for the next tick's retry."""
+    now = datetime(2026, 8, 21, 12, 0, 0)
+    started_at = (now - timedelta(days=3)).isoformat()
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_tenant(conn, "cust-shared3", "sh3")
+        _seed_plan(conn, "cust-shared3", retention_days=2)
+        _seed_detection_event(conn, "evt-root3", "cust-shared3", "site-sh3", "appl-sh3", "cam-sh3", "motion", "local-root3")
+        _seed_detection_event(conn, "evt-child3", "cust-shared3", "site-sh3", "appl-sh3", "cam-sh3", "smart_motion", "local-child3")
+        _seed_event_media(conn, "media-root3", "evt-root3", "cust-shared3", "cam-sh3", started_at)
+        _seed_event_media(conn, "media-child3", "evt-child3", "cust-shared3", "cam-sh3", started_at, source_media_id="media-root3")
+        conn.commit()
+
+        with patch.object(rrs, "_delete_recording_object", return_value=False):
+            result = rrs.run_retention_sweep_tick(now=now)
+
+        conn2 = sqlite3.connect(db_path)
+        root_remaining = conn2.execute("SELECT COUNT(*) FROM detection_event_media WHERE id='media-root3'").fetchone()[0]
+        child_remaining = conn2.execute("SELECT COUNT(*) FROM detection_event_media WHERE id='media-child3'").fetchone()[0]
+
+    assert result == {"checked": 1, "deleted": 0}
+    assert root_remaining == 1
+    assert child_remaining == 1
+
+
 def test_recording_exactly_at_the_retention_boundary_is_not_yet_expired(db_path):
     """timedelta(days=N) strictly greater-than -- a recording exactly N
     days old is not yet past its window, only one that's MORE than N
