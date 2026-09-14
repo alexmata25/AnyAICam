@@ -2333,3 +2333,27 @@ cd ~/anyaicam-install-3d54556
 sudo ./install.sh --repair
 ```
 After that install completes, the next step (not yet approved) is the real Camera 1 Smart Motion end-to-end validation both fixes exist to enable: confirm a real Smart Motion event appears correctly in customer Events even when crowded out of the global window, and that it now has real thumbnail/clip media -- the same rigor as Historical Playback's own real-data validation. Every safeguard from prior entries remains untouched: `RECORDING_UPLOAD_ENABLED=false` everywhere, historical Playback's 5 existing catalog rows untouched, Smart Motion correlation settings untouched, entitlements/customer plans untouched, Live Relay untouched, event-media credentials/S3 policy untouched, Samsung untouched.
+
+## 2026-09-14 (later): POST-INSTALL PASS -- Ryzen genuinely running `3d545564416b7cfdb420ec3b00d5c94c0c589084`, every safeguard confirmed intact, both sides healthy
+
+The operator reported the `sudo ./install.sh --repair` completed successfully. Full read-only post-install verification performed (plain `docker`/`systemctl`, no `sudo` -- no privileged credential requested, guessed, or used), no configuration/entitlement change, no Smart Motion event generated:
+
+- **Runtime commit**: `anyaicam-vms` container env reports `ANYAICAM_VMS_COMMIT=ANYAICAM_BUILD_ID=3d545564416b7cfdb420ec3b00d5c94c0c589084`, exactly the installed artifact's own `vms_release_commit`.
+- **Smart Motion media source verified**: `/app/main.py` inside the running container hashes `f7095d615d3301d4338ed465145bc0e7e8e148a0629e9a4a72dc911530e2d882`, byte-for-byte identical to `git show 3d54556:app/main.py` (the exact same hash already independently verified inside the artifact before transfer).
+- **Agent/VMS health, no unexpected restarts**: `anyaicam-agent.service` active/running, `NRestarts=0`, log shows a clean fresh start (`cloud_id=AIC-C814766E`, entitlement refreshed). `anyaicam-vms` container `Health=healthy`, `RestartCount=0`. `anyaicam-vms.service` (oneshot) `Result=success`/`exited`.
+- **All 5 real cameras online and recording**: `cameras.json` shows `online=true`/`recording=true`/`last_error=null` for all 5, each with a `last_recording_at` timestamp seconds old at check time.
+- **Cloud Live Relay healthy**: `live_relay.worker_started status=running` logged cleanly at startup, zero Live Relay errors in the following minutes; live HLS `.ts` segments actively being written for multiple cameras (the scattered ffmpeg `h264 ... concealing ... errors` lines are the same ordinary RTSP-decode noise present on every prior healthy check, unrelated to this deploy).
+- **Analytics sync healthy**: `analytics_sync.scan_tick_begin`/`http_call_begin`/`http_call_returned` cycling cleanly for all 5 cameras' endpoints, already at `scan_number=7` within the first 4 minutes after restart -- no errors, no stalls.
+- **Event-media pipeline healthy**: multiple real base-Motion events (cameras 1-4) `event_media.registered` successfully within minutes of restart; `event_media_outbox.json` is `[]` (fully drained, zero backlog). Zero `smart_motion` log lines anywhere since restart -- confirms no Smart Motion event has occurred or been triggered.
+- **Appliance identity / customer-site association / camera bindings preserved**: edge `credential.json` still `appliance_id=2f941627b4`; cloud `appliances` row for that id still `cloud_id=AIC-C814766E`, `customer_id=d75bdbecdd4887de4d2b89a9fcea9092`, `site_id=f67fa371cd`, `live_relay_pilot=1` -- all unchanged. `camera_bindings.json` still lists all 5 cameras with their original `approved_at` timestamps, unchanged.
+- **`/var/lib/anyaicam` still read-only**: container mount `RW=false`; `/proc/mounts` inside the container shows `ro,relatime` for that path (the four working directories under it -- `data-config`/`recordings`/`hls`/`app` -- remain separately writable, as designed).
+- **`RECORDING_UPLOAD_ENABLED=false`** confirmed in the container env; zero `recording_upload.*` log lines since restart.
+- **Historical Playback's 5 catalog rows unchanged**: staging `recordings` table still exactly the same 5 rows, same ids/`s3_key`s/`size_bytes`/`duration_seconds` as previously recorded -- byte-identical, no new row.
+- **No unintended historical uploads**: zero `recording_upload.*` activity on Ryzen since restart; `recordings` count on staging unchanged at 5.
+- **Staging remains healthy on `3d54556`**: `portal-green` still `Up` on `deploy-portal:3d54556` (no redeploy needed or performed this pass), `/health` -> `200 ok`; `detection_event_media` count grown to 399 (healthy organic growth, was 275 several passes ago), confirming the pipeline is actively and correctly working end to end on both sides.
+
+**POST-INSTALL PASS.** Both Smart Motion fixes (`0190dff` Events visibility, `3d54556` media) are now live and verified healthy on both `anyaicam-staging` and Ryzen, with every critical safeguard from the deployment-prep entry confirmed intact and zero configuration/entitlement changes made. No Smart Motion event has been generated yet.
+
+### State to resume from
+
+Both sides are confirmed on the new build and fully healthy. Next step, not yet approved: one controlled, real Camera 1 Smart Motion end-to-end validation -- confirm a real Smart Motion event appears correctly in customer Events (including when it would otherwise be crowded out of the global 200-row window) and that it now has real thumbnail/clip media, the same rigor as Historical Playback's own real-data validation.
