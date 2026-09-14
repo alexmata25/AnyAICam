@@ -8,7 +8,22 @@ other branches' earlier history but this branch's own lineage never carried
 it forward. Recreating it here so anyone (human or Claude) picking this work
 up next has one current starting point.
 
-## Status right now
+## Status right now (superseded -- read this note first)
+
+**This file's "Status right now" and "Repository orientation" sections below
+describe an older `staging/cloud-integration-repair` edge-appliance-
+installer workstream and are stale relative to today.** The actively
+maintained, up-to-date state for this branch (`reconcile/golden-
+foundation-20260911`) is `docs/PROJECT_CHECKPOINT.md` -- read its own
+"read this first, every session" instructions and its latest dated entry.
+As of `73c09e1` (2026-09-14, partner-scoped-administrator tenant-
+confinement follow-up to the `c4d5f24` multi-tenant security remediation):
+committed, tested (zero new regressions, true before/after diff), and
+deployed to `anyaicam-staging` with a verified zero-downtime cutover
+(`portal-blue`, hash-verified against `73c09e1`). Ryzen/Samsung/AWS
+infrastructure untouched. Full detail in `PROJECT_CHECKPOINT.md`'s own
+2026-09-14 entries. The rest of this file is retained for the older
+edge-installer history it documents, not as current status.
 
 Branch `staging/cloud-integration-repair` is **pushed to origin**, tip
 `8a83bf30a67b6a7434bed8fac44f16a9095d12ed`. Code and docs are staging-
