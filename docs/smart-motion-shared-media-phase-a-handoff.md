@@ -6,17 +6,18 @@ reconstructing this session's work. `docs/PROJECT_CHECKPOINT.md` carries
 the same information in the project's own running-log style; this file is
 the single-topic, fully-detailed version.
 
-## Update (2026-09-14, later): staging deployment complete, Ryzen still pending
+## Update (2026-09-14, later): Ryzen deployed and Smart Motion Phase A classified FULL END-TO-END PROVEN against real data
 
-Source commit `48992a5` is now deployed to `anyaicam-staging` (`deploy-portal:48992a5`)
-and fully verified — see the "Staging deployment" section near the end of
-this document for the complete record. **Ryzen has not been touched** and
-is still running the pre-Phase-A build (`818f07fd0c6e4fba0a14723e811871d9b4ab9c73`).
-Everything below this notice that describes the source/implementation
-itself is unchanged and still accurate; only the "Authoritative state",
-"Deployment status", "Working-tree status", and "Exact next recommended
-action" sections have moved forward, as reflected in the update below and
-the new closing section.
+Source commit `48992a5` is now deployed and fully verified on **both**
+`anyaicam-staging` (`deploy-portal:48992a5`) and Ryzen (`48992a51b91c`,
+installed by the operator's own `sudo ./install.sh --repair`). Two real,
+naturally-occurring Motion+Smart-Motion pairs were traced end to end and
+every required proof point passed — see "Real-data validation (2026-09-14,
+later)" near the end of this document for the complete record. Everything
+below this notice that describes the source/implementation itself is
+unchanged and still accurate; only "Authoritative state", "Deployment
+status", "Working-tree status", and "Exact next recommended action" have
+moved forward.
 
 ## Authoritative state
 
@@ -32,17 +33,16 @@ the new closing section.
   shared-media Phase A implemented, tested, committed (`48992a5`)..."*).
 - **Working tree status at handoff**: clean except this handoff file and the
   checkpoint-doc commits, both about to be committed.
-- **Deployment status**: **Deployed to staging only, as of 2026-09-14 (later).**
-  `anyaicam-staging` is live and verified on `deploy-portal:48992a5`. Ryzen is
-  still running `818f07fd0c6e4fba0a14723e811871d9b4ab9c73` (pre-Phase-A) and
-  has not been touched — building/staging/installing the Ryzen artifact is a
-  separate, not-yet-authorized gate. See "Staging deployment" below for the
-  full record.
-- **Environment/infra touched this task**: `anyaicam-staging` only (source
-  deploy + verification, detailed below). No Ryzen artifact build/install, no
-  AWS/S3 configuration change, no Samsung access. `RECORDING_UPLOAD_ENABLED`
-  was not changed anywhere and remains `false` everywhere per every prior
-  checkpoint.
+- **Deployment status**: **Fully deployed and fully proven, both sides.**
+  `anyaicam-staging` live and verified on `deploy-portal:48992a5`; Ryzen live
+  and verified on `48992a51b91c`. Two real Motion+Smart-Motion pairs traced
+  end to end with a PASS on every required proof point. See "Real-data
+  validation" below for the full record.
+- **Environment/infra touched this task**: `anyaicam-staging` and Ryzen only
+  (deploy + verification on both, detailed below). No AWS/S3 configuration
+  change (only the app's own already-provisioned S3 GET/PutObject calls it
+  already made), no Samsung access. `RECORDING_UPLOAD_ENABLED` was not
+  changed anywhere and remains `false` on both sides throughout.
 
 ## What Smart Motion Phase A was intended to fix
 
@@ -518,33 +518,77 @@ was made.
 
 **STAGING PHASE A: PASS. Ryzen was not touched.**
 
+## Real-data validation (2026-09-14, later) — FULL END-TO-END PROVEN
+
+Ryzen artifact `anyaicam-appliance-installer-1.1.0-vms-48992a51b91c.tar.gz`
+(SHA-256 `ce01e9a0b530395a1d07bc89c8e4bfb44e5abd20caf946e10312fa927f8c84dc`,
+`vms_release_commit=48992a51b91ce85f78dbce98dc90eec6f4bd1e96`) was built,
+independently byte-verified against `git show 48992a5` (all 7 changed
+files), transferred, and staged. Pre-deployment safety gate passed clean
+(identity, bindings, recordings, safety flags all confirmed unchanged with
+no drift). The operator ran `sudo ./install.sh --repair` themselves — this
+assistant never requests or handles sudo credentials. Post-install
+verification passed in full: runtime `48992a51b91c` exact match, all 7
+files byte-identical inside the running container, zero restarts either
+service, identity/bindings hashes unchanged, all 5 cameras confirmed
+actively recording, local recordings intact (zero deletion), Live Relay
+clean, ordinary Motion/YOLO media registration continuing normally,
+`RECORDING_UPLOAD_ENABLED=false` confirmed, no CPU/queue regression.
+
+**Two real, naturally-occurring Motion→Smart-Motion pairs** were then
+traced end to end (Camera 3, `5c689a0c0e`) — nothing was manufactured; a
+read-only background log monitor simply waited for the normal detection
+pipeline to produce them:
+
+| | Pair 1 | Pair 2 |
+|---|---|---|
+| Motion (local/cloud) | `c2b91148ec6d485785a154294d70163b` / `8b00f566772289e21818f26b` | `2354dd18b71c41679e9815040a825df8` / `32da87321cba50232235be9d` |
+| Smart Motion (local/cloud) | `586890418120` / `e019bf2b5cec6a57dcfe032a` | `53a750912ef3` / `11b1101b89233d79fe952838` |
+| Motion media row | `919a4e31ff3f6e6c01efb58d` | `1970be6a11698a41a77f02bd` |
+| Smart Motion media row | `4498f4e793f4a43e0095a155` | `62efa42acd7bdcbca2a7dd5a` |
+
+Every required proof point passed for both pairs:
+
+- **Correlation**: `parent_detection_event_id` resolved/frozen correctly on
+  both children, correct causal order (parent's own media registered
+  strictly before the child's shared registration).
+- **Physical media**: exactly one `created clip` line per pair (never a
+  Smart-Motion-specific encode), exactly one self-key `registered` line per
+  pair (the shared route never calls `client.upload_file()`).
+- **Cloud ownership / physical identity**: `s3_key`/`thumbnail_s3_key`
+  byte-identical between parent and child, child's `source_media_id` exactly
+  equals the parent's own media row id. **The old `818f07f` 403 is
+  RESOLVED** — two real `registered_shared` successes, zero 403s.
+- **Customer retrieval**: real `customer_owner` session, real HTTPS through
+  Caddy (not `TestClient`) — thumbnail `302`→`200` genuine JPEG, clip
+  `200` presigned URL → downloaded and `ffprobe`-validated (H.264/AAC,
+  duration and size exact matches, `probe_score=100`).
+- **Accounting**: proven empirically — `daily_seconds_used()` with vs.
+  without the shared-row exclusion showed a real `96.3s` double-count
+  across 6 real shared rows already accumulated today on that camera, which
+  Phase A correctly excludes.
+- **Idempotent retry**: replayed the identical real registration call
+  through the appliance's own legitimate code path — returned `True`, zero
+  row mutation (same `id`/`created_at`), no new encode.
+- **Performance**: CPU/load and queue depth after validation are consistent
+  with (not worse than) the pre-install baseline; nothing was changed.
+
+**SMART MOTION PHASE A REAL-DATA: PASS.** Both sides remain healthy. Full
+detail in `docs/PROJECT_CHECKPOINT.md`'s matching dated entry.
+
 ## Exact next recommended action
 
-1. ~~Deploy to staging~~ — **done**, see "Staging deployment" above. PASS.
-2. **Await separate authorization**, then build and stage the Ryzen
-   artifact (`installer/build_release_installer.py --vms-commit <full
-   48992a5 SHA> --vms-repo .`), hash-verify before and after transfer,
-   independently confirm the artifact contains the new code (e.g. `grep`
-   for `parent_local_event_id`/`register_shared_event_media` in the
-   extracted payload), stage at `~/anyaicam-install-<short-sha>/` on Ryzen.
-   **Do not run the install** — that is always the operator's own
-   `sudo ./install.sh --repair`.
-3. Once both sides are confirmed healthy on the new build (the same
-   POST-INSTALL PASS checklist pattern used for every prior deploy this
-   engagement), **do the controlled real-data validation**: wait for a fresh,
-   naturally-occurring Camera 1 Motion + Smart Motion pair (do not force one)
-   and confirm the full chain end to end — two independent analytics events,
-   two independent `detection_event_media` rows, the SAME `s3_key`/
-   `thumbnail_s3_key`, exactly one physical encode/upload, both events'
-   media retrievable through the normal authorized customer path, valid
-   playable clip and valid thumbnail. This is exactly the validation the
-   prior session attempted and found blocked — it should now succeed.
-4. Only after that real-data validation succeeds, consider whether/when to
-   revisit the Phase B items above, and separately, whether/when to begin
-   the AI/YOLO event-media workload optimization (a much larger, distinct
-   piece of work — see the Future Work section below).
+Phase A is now source-complete, deployed on both sides, and fully proven
+against real production data. Nothing further was authorized this pass.
+Future options — each requiring its own separate, explicit authorization,
+same as always in this engagement:
 
-**None of the above is authorized to begin automatically.** Each deploy step
+1. Revisit the deferred Phase B items above, if/when desired.
+2. Consider the AI/YOLO event-media workload optimization (a much larger,
+   distinct piece of work — see the Future Work section below).
+3. Any other roadmap item listed below is future work only, not proposed.
+
+**None of the above is authorized to begin automatically.** Each step
 follows this project's own standing "stop and report, wait for approval"
 discipline.
 
