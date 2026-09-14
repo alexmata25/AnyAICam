@@ -125,8 +125,20 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # no indication why.
         if row('SELECT id FROM partner_users WHERE email=?',(email,)): raise HTTPException(status_code=409,detail='This email is already associated with another account.')
         now=datetime.now().isoformat()
-        # Administrator = global scope; only an administrator may steer partner_id via the payload.
-        if identity.get('role')=='administrator' and str(payload.get('partner_id') or '').strip():
+        # HIGH fix (2026-09-14 partner-scoped-administrator follow-up,
+        # Codex tenant-isolation re-audit): identity.get('role')=='administrator'
+        # is byte-identical for a true platform-global administrator and a
+        # company-scoped one (see partner_db.tenant_owns_partner()'s own
+        # docstring) -- a bare role check here let a partner-scoped
+        # administrator steer partner_id to an arbitrary foreign partner via
+        # the payload and onboard a customer directly under it. Only a
+        # live-verified GLOBAL administrator grant may steer partner_id;
+        # every other identity (including a company-scoped 'administrator')
+        # is confined to its own tenant, exactly like every other role.
+        from appliance_identity import has_global_administrator_grant
+        with connection() as db:
+            is_global_admin=has_global_administrator_grant(db,email=identity.get('email',''))
+        if is_global_admin and str(payload.get('partner_id') or '').strip():
             partner_id=str(payload['partner_id']).strip()
         else:
             partner_id=identity.get('partner_id') or 'anyaicam-primary'
@@ -261,13 +273,22 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         identity=require_partner_access(request)
         try: require_permission(identity,'customer.edit')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        target=row('SELECT partner_id FROM customers WHERE id=?',(customer_id,))
-        if not target: raise HTTPException(status_code=404,detail='Customer not found.')
-        if identity.get('role')!='administrator' and target.get('partner_id')!=(identity.get('partner_id') or 'anyaicam-primary'):
-            raise HTTPException(status_code=404,detail='Customer not found.')
-        note=str(payload.get('note','')).strip()
-        if not note: raise HTTPException(status_code=400,detail='Note is required.')
-        with connection() as db: db.execute('INSERT INTO customer_notes(customer_id,note,created_at,created_by) VALUES(?,?,?,?)',(customer_id,note,datetime.now().isoformat(),identity['email']))
+        # HIGH fix (2026-09-14 partner-scoped-administrator follow-up,
+        # Codex tenant-isolation re-audit): identity.get('role')!='administrator'
+        # was a bare role-name shortcut -- byte-identical for a true
+        # platform-global administrator and a company-scoped one -- that let
+        # a partner-scoped administrator add notes to any foreign partner's
+        # customer just by naming its id. Resolved and tenant-verified
+        # BEFORE the insert, inside this same connection, via the same
+        # authorize_customer_tenant() primitive the rest of this module's
+        # 2026-09-14 remediation already established, so a denial (404 --
+        # never confirms whether the id exists at all) creates no note row.
+        with connection() as db:
+            if not authorize_customer_tenant(db,identity,customer_id):
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            note=str(payload.get('note','')).strip()
+            if not note: raise HTTPException(status_code=400,detail='Note is required.')
+            db.execute('INSERT INTO customer_notes(customer_id,note,created_at,created_by) VALUES(?,?,?,?)',(customer_id,note,datetime.now().isoformat(),identity['email']))
         audit(identity,'customer.note_added','customer',customer_id); return {'message':'Customer note saved.'}
 
     @app.post('/api/partner/users/invite')
@@ -352,17 +373,21 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         identity=_dual_mode_identity(request)
         try: require_permission(identity,'customer.view')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
-        customer=row('SELECT * FROM customers WHERE id=?',(customer_id,))
+        # HIGH fix (2026-09-14 partner-scoped-administrator follow-up,
+        # Codex tenant-isolation re-audit): this route's original fix
+        # (2026-09-14 multi-tenant security remediation) still compared
+        # identity.get('role')!='administrator' directly -- byte-identical
+        # for a true platform-global administrator and a company-scoped
+        # one, so a partner-scoped administrator could still open another
+        # partner's customer record just by knowing or guessing its id.
+        # Replaced with authorize_customer_tenant(), the same primitive
+        # this module's other routes already use, which only bypasses
+        # tenant ownership for a live-verified GLOBAL administrator grant.
+        # 404 (not 403) so this never confirms or denies whether an id
+        # exists to a caller who isn't authorized to see it.
+        with connection() as db:
+            customer=authorize_customer_tenant(db,identity,customer_id)
         if not customer: raise HTTPException(status_code=404,detail='Customer not found.')
-        # Administrator = global scope; every other role may only inspect
-        # a customer that actually belongs to their own partner_id -- this
-        # query previously had no such check at all, meaning any
-        # authenticated partner_owner/salesperson/technician could open
-        # another partner's customer record just by knowing or guessing
-        # its id. 404 (not 403) so this never confirms or denies whether
-        # an id exists to a caller who isn't authorized to see it.
-        if identity.get('role')!='administrator' and customer.get('partner_id')!=(identity.get('partner_id') or 'anyaicam-primary'):
-            raise HTTPException(status_code=404,detail='Customer not found.')
         sites=rows('SELECT * FROM sites WHERE customer_id=?',(customer_id,)); appliances=rows('SELECT * FROM appliances WHERE customer_id=?',(customer_id,)); cameras=rows('SELECT * FROM cameras WHERE customer_id=?',(customer_id,)); plans=rows('SELECT * FROM plans WHERE customer_id=? ORDER BY created_at DESC',(customer_id,)); analytics=rows('SELECT * FROM analytics_subscriptions WHERE customer_id=?',(customer_id,)); history=rows('SELECT * FROM service_history WHERE customer_id=? ORDER BY created_at DESC',(customer_id,)); notes=rows('SELECT * FROM customer_notes WHERE customer_id=? ORDER BY created_at DESC',(customer_id,))
         site_cards=''.join(f'<article class="feature-card"><h2>{escape(x["name"])}</h2><p>{escape(x.get("address") or "No address entered")}</p></article>' for x in sites) or '<div class="empty">No sites.</div>'
         appliance_rows=''.join(f'<tr><td>{escape(x["cloud_id"])}</td><td>{escape(x.get("serial_number") or "Pending")}</td><td>{escape(x.get("online_status") or "offline")}</td><td>{escape(x.get("software_version") or "Not installed")}</td><td>{escape(x.get("ip_address") or "Not connected")}</td><td>{x.get("cpu",0)} / {x.get("memory",0)} / {x.get("disk",0)}</td><td><button class="download appliance-action" data-id="{x["id"]}" data-action="restart">Restart</button> · <button class="download appliance-action" data-id="{x["id"]}" data-action="update">Update</button> · <button class="download regen-token-button" data-id="{x["id"]}">Regenerate activation token</button></td></tr>' for x in appliances) or '<tr><td colspan="7">No appliances.</td></tr>'
@@ -1226,14 +1251,23 @@ def render_partner_workspace(request: Request, shell: Callable):
     if not identity: return RedirectResponse('/partner-login',status_code=303)
     require_partner_access(request)
     partner_id=identity.get('partner_id') or 'anyaicam-primary'
-    # Administrator = global scope: an administrator identity (see
-    # ROLE_PERMISSIONS['administrator'] = {'*'} in partner_db.py) is not
-    # bound to a single partner_id the way every other bridgeable role
-    # is -- they must see customers across every partner, not only
-    # whichever partner_id happens to be on their own partner_users row.
-    # Every other role keeps the exact same partner_id-scoped query as
-    # before this change.
-    is_global = identity.get('role') == 'administrator'
+    # HIGH fix (2026-09-14 partner-scoped-administrator follow-up, Codex
+    # tenant-isolation re-audit): this listing previously used a bare
+    # identity.get('role')=='administrator' shortcut to decide whether to
+    # drop the partner_id filter entirely -- byte-identical for a true
+    # platform-global administrator and a company-scoped one (see partner_
+    # db.tenant_owns_partner()'s own docstring), so a partner-scoped
+    # administrator could enumerate every other partner's real customer
+    # records here, server-side, regardless of any UI filtering. Only a
+    # live-verified GLOBAL administrator grant (appliance_identity.
+    # has_global_administrator_grant(), the same primitive the rest of
+    # this module's 2026-09-14 remediation already established) may see
+    # customers across every partner; every other identity -- including a
+    # company-scoped 'administrator' -- keeps the exact same partner_id-
+    # scoped query as every other role.
+    from appliance_identity import has_global_administrator_grant
+    with connection() as db:
+        is_global = has_global_administrator_grant(db,email=identity.get('email',''))
     if is_global:
         customers=rows('SELECT * FROM customers ORDER BY created_at DESC')
     else:
@@ -1249,7 +1283,11 @@ def render_partner_workspace(request: Request, shell: Callable):
     filters=''.join(f'<label><input type="radio" name="customer-status" value="{key}" {"checked" if key=="active" else ""}> {label}</label>' for key,label in [('active','Active'),('pending_installation','Pending installation'),('trial','Trial'),('suspended','Suspended'),('cancelled','Cancelled'),('all','All')])
     tabs=[('getting-started','Getting Started'),('partner-details','Partner Details'),('customers','Customers'),('materials','Materials'),('pricing','Pricing'),('adapters','Cloud Adapters')]
     tab_buttons=''.join(f'<button class="portal-tab {"active" if key=="customers" else ""}" data-portal-tab="{key}">{label}</button>' for key,label in tabs)
-    admin_link='<a class="ghost-button" href="/customer-portal">Customer Portal</a><a class="ghost-button" href="/partner-applications">Partner applications</a>' if identity['role']=='administrator' else ''
+    # Reuses is_global (computed above) rather than a bare role check, for
+    # the same reason: these links lead to genuinely global tools (every
+    # partner's applications), so a company-scoped 'administrator' should
+    # see the same partner-scoped workspace every other role sees.
+    admin_link='<a class="ghost-button" href="/customer-portal">Customer Portal</a><a class="ghost-button" href="/partner-applications">Partner applications</a>' if is_global else ''
     # Reads the same SQL `appliances` table the real onboarding path
     # (onboard_customer(), the provisioning backend, /api/customer/setup/status)
     # writes to -- not the separate account_management.json-backed Appliance

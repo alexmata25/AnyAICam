@@ -1393,8 +1393,20 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         require_partner_access(request)
         stale_before=(datetime.now()-timedelta(minutes=3)).isoformat()
         with connection() as db: db.execute("UPDATE appliances SET state='offline',online_status='offline' WHERE state IN ('online','degraded') AND (last_check_in IS NULL OR last_check_in<?)",(stale_before,))
+        # HIGH fix (2026-09-14 partner-scoped-administrator follow-up,
+        # Codex tenant-isolation re-audit): sibling-audit finding, same
+        # pattern and same fix as partner_workspace.py's render_partner_
+        # workspace() customer listing -- identity['role']!='administrator'
+        # was a bare role-name shortcut that let a partner-scoped
+        # administrator drop the partner_id filter entirely and enumerate
+        # every other partner's real appliances here. Only a live-verified
+        # GLOBAL administrator grant may see appliances across every
+        # partner.
+        from appliance_identity import has_global_administrator_grant
+        with connection() as db:
+            is_global=has_global_administrator_grant(db,email=identity.get('email',''))
         clauses=['1=1']; params=[]
-        if identity['role']!='administrator': clauses.append('a.partner_id=?'); params.append(identity.get('partner_id') or 'anyaicam-primary')
+        if not is_global: clauses.append('a.partner_id=?'); params.append(identity.get('partner_id') or 'anyaicam-primary')
         for value,column in [(partner,'a.partner_id'),(customer,'a.customer_id'),(site,'a.site_id'),(status,'a.state'),(version,'a.software_version')]:
             if value: clauses.append(column+'=?'); params.append(value)
         appliances=rows('SELECT a.*,c.name customer_name,s.name site_name FROM appliances a LEFT JOIN customers c ON c.id=a.customer_id LEFT JOIN sites s ON s.id=a.site_id WHERE '+' AND '.join(clauses)+' ORDER BY a.last_check_in DESC',params)

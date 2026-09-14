@@ -83,6 +83,30 @@ def _administrator_identity():
     return {"role": "administrator", "email": "admin@example.test", "partner_id": None, "customer_id": None}
 
 
+def _seed_global_administrator_grant(conn, email="admin@example.test"):
+    """2026-09-14 partner-scoped-administrator follow-up (Codex tenant-
+    isolation re-audit): operations_rdm_page() no longer treats a bare
+    identity['role']=='administrator' claim as global reach (see main.py's
+    own fix comment at this route) -- a live, unrevoked identity_grants
+    row with scope_type='global' is required, the same primitive
+    partner_workspace.py's 2026-09-14 remediation already established.
+    _administrator_identity() above represents a genuine platform
+    administrator by intent, so every test exercising that intent now
+    seeds the real grant that backs it, matching the corrected,
+    intentional contract -- same fix test_admin_partner_bridge_
+    integration.py's own fixture already needed for the same reason."""
+    conn.execute(
+        "INSERT OR IGNORE INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (f"admin-user:{email}", "partner-1", email, "Admin", "administrator", "x", 1, "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO identity_grants(id,user_id,role,scope_type,scope_id,granted_at,granted_by,revoked_at) "
+        "SELECT ?,id,'administrator','global',NULL,'2026-01-01','system:test',NULL FROM partner_users WHERE email=?",
+        (f"grant:{email}", email),
+    )
+    conn.commit()
+
+
 def _technician_identity(partner_id):
     return {"role": "technician", "email": "tech@example.test", "partner_id": partner_id, "customer_id": None}
 
@@ -126,6 +150,7 @@ def test_shows_appliance_status_last_check_in_and_diagnostics(monkeypatch, db_pa
         _seed_camera_status(conn, "appl-1", "cam-1", online=1, recording=1)
         _seed_camera_status(conn, "appl-1", "cam-2", online=0, recording=0)
         conn.commit()
+        _seed_global_administrator_grant(conn)
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _administrator_identity())
         result = main.operations_rdm_page(_stub_request())
     assert "AIC-1234" in result
@@ -153,6 +178,7 @@ def test_action_buttons_present_for_role_with_appliance_action(monkeypatch, db_p
         initialize_database()
         conn = sqlite3.connect(db_path)
         _seed_appliance(conn, "appl-1", "partner-1", "cust-1", "AIC-1234")
+        _seed_global_administrator_grant(conn)
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _administrator_identity())
         result = main.operations_rdm_page(_stub_request())
     assert 'data-command="restart_vms"' in result
@@ -184,6 +210,7 @@ def test_both_destructive_commands_have_confirmation_warnings(monkeypatch, db_pa
         initialize_database()
         conn = sqlite3.connect(db_path)
         _seed_appliance(conn, "appl-1", "partner-1", "cust-1", "AIC-1234")
+        _seed_global_administrator_grant(conn)
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _administrator_identity())
         result = main.operations_rdm_page(_stub_request())
     assert "DISRUPTIVE_COMMAND_WARNINGS" in result
@@ -198,6 +225,7 @@ def test_submits_to_the_existing_command_endpoint_no_new_route_invented(monkeypa
         initialize_database()
         conn = sqlite3.connect(db_path)
         _seed_appliance(conn, "appl-1", "partner-1", "cust-1", "AIC-1234")
+        _seed_global_administrator_grant(conn)
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _administrator_identity())
         result = main.operations_rdm_page(_stub_request())
     # The exact route already registered in appliance_cloud.py
@@ -224,6 +252,30 @@ def test_non_administrator_only_sees_their_own_partners_appliances(monkeypatch, 
     assert "AIC-THEIRS" not in result
 
 
+def test_administrator_role_alone_no_longer_sees_every_partners_appliances(monkeypatch, db_path):
+    """2026-09-14 partner-scoped-administrator follow-up (Codex tenant-
+    isolation re-audit): this test used to prove the opposite -- that a
+    bare identity['role']=='administrator' claim, with no live global
+    grant behind it, saw every partner's appliances here. That was
+    exactly the bug this follow-up closes (a partner-scoped administrator
+    is byte-identical to a true platform administrator on the role claim
+    alone -- see partner_db.tenant_owns_partner()'s own docstring).
+    test_administrator_sees_every_partners_appliances below (a genuine
+    live global grant) is the correctly-scoped version of this test's
+    original intent."""
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed_appliance(conn, "appl-a", "partner-1", "cust-1", "AIC-A")
+        _seed_appliance(conn, "appl-b", "partner-2", "cust-2", "AIC-B")
+        conn.commit()
+        monkeypatch.setattr(main, "current_user", lambda request: _admin_portal_user())
+        monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _administrator_identity())
+        result = main.operations_rdm_page(_stub_request())
+    assert "AIC-A" not in result
+    assert "AIC-B" not in result
+
+
 def test_administrator_sees_every_partners_appliances(monkeypatch, db_path):
     with override_target(sqlite_path=db_path):
         initialize_database()
@@ -231,6 +283,7 @@ def test_administrator_sees_every_partners_appliances(monkeypatch, db_path):
         _seed_appliance(conn, "appl-a", "partner-1", "cust-1", "AIC-A")
         _seed_appliance(conn, "appl-b", "partner-2", "cust-2", "AIC-B")
         conn.commit()
+        _seed_global_administrator_grant(conn)
         monkeypatch.setattr(main, "current_user", lambda request: _admin_portal_user())
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _administrator_identity())
         result = main.operations_rdm_page(_stub_request())

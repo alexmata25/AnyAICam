@@ -124,6 +124,29 @@ def _admin_session_cookie(client_or_none=None, admin_id="admin-1", role="adminis
     return main.create_session(admin_id)
 
 
+def _seed_global_administrator_grant(conn, email="admin@example.test", partner_id="anyaicam-primary"):
+    """2026-09-14 partner-scoped-administrator follow-up (Codex tenant-
+    isolation re-audit): render_partner_workspace()/customer_detail()/
+    onboard_customer() no longer treat a bare identity['role']==
+    'administrator' claim (this file's partner_portal._token(...,
+    "administrator", ...) alone) as global scope -- a live, unrevoked
+    identity_grants row with scope_type='global' is now required, the
+    same primitive this file's own module docstring already described
+    as the intended "Administrator = global scope" contract. Every test
+    below exercising that contract seeds the real grant that backs it."""
+    _seed_partner(conn, partner_id)
+    conn.execute(
+        "INSERT OR IGNORE INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (f"admin-user:{email}", partner_id, email, "Admin", "administrator", "x", 1, "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO identity_grants(id,user_id,role,scope_type,scope_id,granted_at,granted_by,revoked_at) "
+        "SELECT ?,id,'administrator','global',NULL,'2026-01-01','system:test',NULL FROM partner_users WHERE email=?",
+        (f"grant:{email}", email),
+    )
+    conn.commit()
+
+
 # =============================================================== partner-role scoping (list + detail)
 
 
@@ -200,6 +223,7 @@ def test_administrator_sees_customers_across_every_partner(http_client):
     conn = sqlite3.connect(db_path)
     _seed_customer(conn, "cust-a", "partner-1", "CustomerA")
     _seed_customer(conn, "cust-b", "partner-2", "CustomerB")
+    _seed_global_administrator_grant(conn)
     token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
 
     response = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: token})
@@ -212,6 +236,7 @@ def test_administrator_can_view_any_partners_customer_detail(http_client):
     client, db_path = http_client
     conn = sqlite3.connect(db_path)
     _seed_customer(conn, "cust-b", "partner-2", "CustomerB")
+    _seed_global_administrator_grant(conn)
     token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
 
     response = client.get("/partner/customers/cust-b", cookies={partner_portal.SESSION_COOKIE: token})
@@ -221,7 +246,9 @@ def test_administrator_can_view_any_partners_customer_detail(http_client):
 
 def test_administrator_can_create_a_customer_for_an_explicit_partner_id(http_client):
     client, db_path = http_client
-    _seed_partner(sqlite3.connect(db_path), "partner-9")
+    conn = sqlite3.connect(db_path)
+    _seed_partner(conn, "partner-9")
+    _seed_global_administrator_grant(conn)
     token = partner_portal._token("admin@example.test", "administrator", "anyaicam-primary", None, None)
 
     response = client.post(

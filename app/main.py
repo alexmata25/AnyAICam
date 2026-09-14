@@ -50165,9 +50165,23 @@ def operations_rdm_page(request: Request) -> str:
                 'Link this account</button></section>'
             )
 
+    # HIGH fix (2026-09-14 partner-scoped-administrator follow-up, Codex
+    # tenant-isolation re-audit): sibling-audit finding, same pattern and
+    # same fix as partner_workspace.py's render_partner_workspace()
+    # customer listing and appliance_cloud.py's appliance_dashboard() --
+    # identity["role"] != "administrator" was a bare role-name shortcut,
+    # byte-identical for a true platform-global administrator and a
+    # company-scoped one linked in here via admin_partner_bridge. It let a
+    # partner-scoped administrator drop the partner_id filter entirely and
+    # enumerate every other partner's real appliances on this operations
+    # page. Only a live-verified GLOBAL administrator grant may see
+    # appliances across every partner.
+    from appliance_identity import has_global_administrator_grant
+    with partner_connection() as _grant_db:
+        identity_is_global = has_global_administrator_grant(_grant_db, email=identity.get("email", ""))
     clauses = ["1=1"]
     params: list = []
-    if identity["role"] != "administrator":
+    if not identity_is_global:
         clauses.append("a.partner_id=?")
         params.append(identity.get("partner_id") or "anyaicam-primary")
     appliances = partner_rows(
