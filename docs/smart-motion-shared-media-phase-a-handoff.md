@@ -6,6 +6,18 @@ reconstructing this session's work. `docs/PROJECT_CHECKPOINT.md` carries
 the same information in the project's own running-log style; this file is
 the single-topic, fully-detailed version.
 
+## Update (2026-09-14, later): staging deployment complete, Ryzen still pending
+
+Source commit `48992a5` is now deployed to `anyaicam-staging` (`deploy-portal:48992a5`)
+and fully verified — see the "Staging deployment" section near the end of
+this document for the complete record. **Ryzen has not been touched** and
+is still running the pre-Phase-A build (`818f07fd0c6e4fba0a14723e811871d9b4ab9c73`).
+Everything below this notice that describes the source/implementation
+itself is unchanged and still accurate; only the "Authoritative state",
+"Deployment status", "Working-tree status", and "Exact next recommended
+action" sections have moved forward, as reflected in the update below and
+the new closing section.
+
 ## Authoritative state
 
 - **Repo / worktree**: `alexmata25/AnyAICam`, checked out at
@@ -19,13 +31,18 @@ the single-topic, fully-detailed version.
   immediately following `48992a5` (checkpoint entry titled *"Smart Motion
   shared-media Phase A implemented, tested, committed (`48992a5`)..."*).
 - **Working tree status at handoff**: clean except this handoff file and the
-  checkpoint-doc commit itself, both about to be committed.
-- **Deployment status**: **NOT deployed anywhere.** Staging (`anyaicam-staging`)
-  and Ryzen are both still running `818f07fd0c6e4fba0a14723e811871d9b4ab9c73`.
-- **Environment/infra touched this task**: none. No staging deploy, no Ryzen
-  artifact build/install, no AWS/S3 configuration change, no Samsung access.
-  `RECORDING_UPLOAD_ENABLED` was not read or written by any command this task
-  ran, and remains `false` everywhere per every prior checkpoint.
+  checkpoint-doc commits, both about to be committed.
+- **Deployment status**: **Deployed to staging only, as of 2026-09-14 (later).**
+  `anyaicam-staging` is live and verified on `deploy-portal:48992a5`. Ryzen is
+  still running `818f07fd0c6e4fba0a14723e811871d9b4ab9c73` (pre-Phase-A) and
+  has not been touched — building/staging/installing the Ryzen artifact is a
+  separate, not-yet-authorized gate. See "Staging deployment" below for the
+  full record.
+- **Environment/infra touched this task**: `anyaicam-staging` only (source
+  deploy + verification, detailed below). No Ryzen artifact build/install, no
+  AWS/S3 configuration change, no Samsung access. `RECORDING_UPLOAD_ENABLED`
+  was not changed anywhere and remains `false` everywhere per every prior
+  checkpoint.
 
 ## What Smart Motion Phase A was intended to fix
 
@@ -405,23 +422,112 @@ their `parent_detection_event_id` will remain `NULL` forever unless a
 separately-approved reconciliation policy is designed later. This is
 intentional, not an oversight.
 
+## Staging deployment (2026-09-14, later) — PASS
+
+Authorized explicitly ("STAGING DEPLOYMENT AND VERIFICATION ONLY") and
+executed against `anyaicam-staging` following this project's own established
+versioned procedure.
+
+**Pre-deploy backups**: DB
+`/var/lib/anyaicam-staging/db/staging-pre-smart-motion-phase-a-deploy-20260914T123732Z.db`
+(SHA-256 `c4688c2d6cb72060663e0bd58f921e6689819c271f781859d73be7dd91c510ef`,
+integrity `ok`); source
+`/opt/anyaicam-staging-source-backup-pre-smart-motion-phase-a-deploy-20260914T123732Z.tar.gz`
+(SHA-256 `4c6c6a25c4af5b1ff51d81511db5d95a1b585e09bd88c159bd513b470c121f77`).
+
+**Pre-deploy baseline**: `customers=3`, `appliances=3`, `cameras=22`,
+`sites=3`, `partner_users=4`, `recordings=5`, `detection_events=12473`,
+`detection_event_media=1488`, integrity `ok`; `parent_detection_event_id`/
+`source_media_id` confirmed absent (Phase A not yet applied).
+
+**Deploy steps**: `git -c core.autocrlf=false archive 48992a5 -- app`
+(SHA-256 `238ca69b670acb45a90f4bc7a6ab36e8fac29a4c21877224c67ff470cdb2ffe8`),
+verified identical after `scp`; extracted and `rsync --delete`'d into
+`/opt/anyaicam-staging/app/`, `diff -rq` confirmed identical; built
+`deploy-portal:48992a5`; env-file drift check against the known-good
+`green-live-471a535-pilot-camera1.env` found only comment/blank-line and
+container-builtin (`GPG_KEY`/`LANG`/`PATH`/`PYTHON_SHA256`/`PYTHON_VERSION`)
+differences — every real variable identical, same file reused unchanged;
+`portal-green` recreated (same image name, mounts, network, env-file,
+command) via stop→rm→run.
+
+**Honest deviation from the prior (818f07f) deployment's "zero
+interruption" result**: this recreate was NOT a true parallel blue-green
+swap (no second container was brought up before the old one was retired),
+so there was a real, brief gap — 6 real pilot-appliance (`2f941627b4`)
+requests (analytics events, live-relay segment-available, appliance
+configuration) received `502` over roughly 5.7 seconds while the old
+container was down and the new one was starting, visible plainly in
+Caddy's own error log. Traffic resumed cleanly immediately afterward, with
+zero further `502`s or errors observed through the rest of the
+verification window; the appliance's own existing outbox/retry mechanisms
+are designed to absorb exactly this kind of transient failure, and nothing
+required manual recovery. Recorded here rather than glossed over.
+
+**Verified**: `portal-green` `Up`, `RestartCount=0`, stable, zero
+crashes/errors afterward. `/health` → `200 ok` both internally and via the
+real public URL; `/version` unchanged (`cloud_id: AIC-C90CF0C9`). All seven
+touched files (`main.py`, `appliance_cloud.py`, `event_media_uploader.py`,
+`event_media_policy.py`, `recording_retention_sweep.py`,
+`analytics_sync.py`, `db_migrations.py`) hashed inside the running
+container match `git show 48992a5` byte-for-byte.
+
+**Schema/migration**: applied automatically by the app's own existing
+startup migration mechanism (`db_migrations.apply_migrations()`, invoked
+from `partner_db`'s own init path) — no manual migration step was run.
+Post-deploy: both new columns and both new indexes present;
+`integrity_check` → `ok`.
+
+**Data-count verification**: `customers`/`appliances`/`cameras`/`sites`/
+`partner_users`/`recordings` all unchanged from the pre-deploy baseline.
+`detection_events` (`12473`→`12687`) and `detection_event_media`
+(`1488`→`1524`) grew only from real, continuous Ryzen traffic during the
+verification window (five real cameras generating ordinary events
+throughout) — not from any manual or unexpected change. The 5 pilot
+cameras' `customer_id`/`site_id`/`cloud_recording_mode`/`status`, and all 3
+appliances' `activation_status`/`state`/`credential_revoked_at`, confirmed
+byte-identical to the pre-deploy backup (including the pilot appliance's
+pre-existing `state=degraded`, which predates this deployment).
+
+**Ryzen↔staging traffic**: real pilot-appliance heartbeat, camera list,
+configuration, commands, live-relay segment-available, and analytics
+events all confirmed flowing with `200 OK` in the app's own logs
+immediately after the brief recreate-window gap, and error-free for the
+rest of the verification window.
+
+**Existing Motion/YOLO path unaffected**: real ordinary analytics events
+and real self-key media registrations (`POST .../events/{id}/media`, not
+`/media/shared`) observed succeeding with `200 OK` after the recreate.
+
+**New Smart Motion shared route present and healthy, no event
+manufactured**: confirmed present in the live FastAPI route table
+(inspected directly inside the running container) alongside the unchanged
+existing `/media` route; confirmed reachable end-to-end through the real
+public HTTPS path — an unauthenticated probe against a nonexistent event
+id returned a clean `401 {"detail":"Appliance authentication headers are
+required."}`, identical to the same probe against the existing unchanged
+route. No valid appliance credential was used and no Smart Motion event,
+real or synthetic, was created.
+
+**Safety flags confirmed unchanged**: `ANYAICAM_RECORDING_UPLOAD_ENABLED`
+absent (defaults false); `ANYAICAM_EVENT_CLIP_ENCODE_MAX_CONCURRENCY`
+absent (defaults `1`); `ANYAICAM_ANALYTICS_SYNC_ENABLED`/
+`ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`/`ANYAICAM_LIVE_RELAY_ENABLED` all
+still `true`, unchanged. No Samsung access. No AWS API call of any kind
+was made.
+
+**STAGING PHASE A: PASS. Ryzen was not touched.**
+
 ## Exact next recommended action
 
-1. **Deploy to staging** (`anyaicam-staging`) using the established
-   versioned procedure (pre-deploy DB+source backups, source tarball hash
-   verified before/after transfer, `deploy-portal:48992a5` built, env-drift
-   check, `portal-green` recreated, post-deploy health/byte-hash/DB-integrity/
-   row-count verification) — cloud-only pieces of this fix take effect
-   immediately; the edge-side pieces (main.py, event_media_uploader.py,
-   analytics_sync.py) will not functionally activate on staging itself
-   (`runtime_role=cloud`), matching this project's own established pattern
-   for edge-only fixes deployed to staging "for source-commit consistency."
-2. **Build and stage the Ryzen artifact** (`installer/build_release_installer.py
-   --vms-commit <full 48992a5 SHA> --vms-repo .`), hash-verify before and
-   after transfer, independently confirm the artifact contains the new code
-   (e.g. `grep` for `parent_local_event_id`/`register_shared_event_media` in
-   the extracted payload), stage at `~/anyaicam-install-<short-sha>/` on
-   Ryzen. **Do not run the install** — that is always the operator's own
+1. ~~Deploy to staging~~ — **done**, see "Staging deployment" above. PASS.
+2. **Await separate authorization**, then build and stage the Ryzen
+   artifact (`installer/build_release_installer.py --vms-commit <full
+   48992a5 SHA> --vms-repo .`), hash-verify before and after transfer,
+   independently confirm the artifact contains the new code (e.g. `grep`
+   for `parent_local_event_id`/`register_shared_event_media` in the
+   extracted payload), stage at `~/anyaicam-install-<short-sha>/` on Ryzen.
+   **Do not run the install** — that is always the operator's own
    `sudo ./install.sh --repair`.
 3. Once both sides are confirmed healthy on the new build (the same
    POST-INSTALL PASS checklist pattern used for every prior deploy this
