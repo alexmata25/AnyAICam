@@ -34574,6 +34574,72 @@ async def store_motion_event(
         smart_event["motion_event_id"] = event.id
         await asyncio.to_thread(append_analytics_event, smart_event)
 
+        # Smart Motion gets its own independent event-media artifacts,
+        # keyed by its own analytics-event id -- never the base Motion
+        # event's id (event.id, whose own media task above already
+        # owns and uploads its own separate artifacts under that id)
+        # and never a correlated YOLO event's event_group_id. Reuses
+        # the exact same proven build_motion_event_clip() +
+        # event_media_uploader.upload_motion_event_media() pair
+        # store_motion_event() already wires together for the base
+        # Motion event above (and save_yolo_events() wires identically
+        # for AI-classification events) -- never a second/parallel
+        # upload mechanism. upload_motion_event_media() only registers
+        # media against a detection_events row matching this exact id
+        # (see _ensure_detection_event_synced() in
+        # event_media_uploader.py), so this MUST be smart_event["id"]
+        # -- the same id just persisted into analytics_events.json
+        # above and synced to cloud detection_events.
+        smart_event_id = smart_event["id"]
+
+        async def build_and_upload_smart_motion_media() -> None:
+            try:
+                clip_url = await build_motion_event_clip(
+                    smart_event_id, camera_number, start_time, end_time,
+                )
+            except Exception as error:
+                print(
+                    f"Smart Motion event {smart_event_id}: clip build "
+                    f"failed: {type(error).__name__}: {error}"
+                )
+                return
+            if not clip_url:
+                return
+            try:
+                from event_media_uploader import upload_motion_event_media
+
+                await asyncio.to_thread(
+                    upload_motion_event_media,
+                    event_id=smart_event_id,
+                    camera_number=camera_number,
+                    event_start=start_time,
+                    event_end=end_time,
+                    clip_url=clip_url,
+                    thumbnail_url=thumbnail,
+                )
+            except Exception as error:
+                print(
+                    f"Smart Motion event {smart_event_id}: media upload "
+                    f"failed: {type(error).__name__}: {error}"
+                )
+
+        # Scheduling itself is guarded too: a failure here must never
+        # un-create or block the analytics event already persisted
+        # above -- append_analytics_event() has already returned by
+        # this point, so the Smart Motion event exists and is
+        # cloud-syncable regardless of what happens next.
+        try:
+            smart_motion_clip_task = asyncio.create_task(
+                build_and_upload_smart_motion_media()
+            )
+            clip_tasks.add(smart_motion_clip_task)
+            smart_motion_clip_task.add_done_callback(clip_tasks.discard)
+        except Exception as error:
+            print(
+                f"Smart Motion event {smart_event_id}: could not schedule "
+                f"clip build/upload: {type(error).__name__}: {error}"
+            )
+
 
 
 
