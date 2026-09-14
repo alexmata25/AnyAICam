@@ -380,7 +380,7 @@ function buildFixture() {
   globalDocumentRoot.appendChild(countPill1);
   globalDocumentRoot.appendChild(countPill2);
 
-  return { tbody, countPill1, countPill2 };
+  return { tbody, filters, search, countPill1, countPill2 };
 }
 
 function addRow(tbody, { id, camera = "1", type = "person", timestamp, hasClip = false, mediaState }) {
@@ -408,6 +408,15 @@ function addRow(tbody, { id, camera = "1", type = "person", timestamp, hasClip =
 
 function isoAgo(ms) {
   return new Date(Date.now() - ms).toISOString();
+}
+
+function addCameraFilter(filters, { cameraNumber, cameraId, checked = true }) {
+  const box = new FakeElement("input");
+  box.checked = checked;
+  box.dataset.camera = String(cameraNumber);
+  box.dataset.cameraId = cameraId;
+  filters.appendChild(box);
+  return box;
 }
 
 // ---------------------------------------------------------------- fetch fakes
@@ -462,7 +471,7 @@ function resetFakes() {
 // ---------------------------------------------------------------- load real source
 
 const factory = new Function(
-  `${preludeSource}\n${snippetSource}\nreturn { reconcileDesktopEvent, settleOverdueDesktopRows, scheduleEventPoll, mediaStateFor, isEventPending, anyDesktopRowStillProcessing };`
+  `${preludeSource}\n${snippetSource}\nreturn { reconcileDesktopEvent, settleOverdueDesktopRows, scheduleEventPoll, mediaStateFor, isEventPending, anyDesktopRowStillProcessing, apply };`
 );
 
 // Round 3: inspects the single currently-pending timer's own delay --
@@ -1007,6 +1016,143 @@ test("a transient error during settled (slow-cadence) polling does not permanent
   if (!tbody.querySelector('tr[data-event-id="ev-after-error"]')) {
     throw new Error("discovery must still find a real new event after recovering from a transient error");
   }
+});
+
+// ------------------------------------------------- 2026-09-14: Smart Motion Events crowd-out fix
+//
+// Root cause this fixes: the fleet-wide initial render and poll both
+// share one RECENT_EVENTS_POLL_LIMIT-bounded window across every
+// camera, so a low-volume camera's real event (confirmed live: a real
+// Camera 1 smart_motion event) can be crowded out of that shared
+// window by high-volume cameras and never appear, even though the
+// camera-filter checkboxes exist. apply() now performs a real,
+// server-side, camera-scoped fetch (the existing, already-authorized
+// /api/customer/events/recent/{camera_id} route built for the mobile
+// Playback poll, reused as-is) whenever the customer narrows the
+// filter down to exactly one specific camera, merging the result in
+// via the same reconcileDesktopEvent() every other row already goes
+// through -- so a low-volume camera's own real events become visible
+// without ever loading the customer's entire event history, and
+// without any special-casing for Smart Motion specifically.
+
+test("selecting exactly one camera fetches that camera's own bounded events, revealing one crowded-out event", async () => {
+  resetFakes();
+  const { tbody, filters } = buildFixture();
+  addCameraFilter(filters, { cameraNumber: 1, cameraId: "cam-1-id", checked: true });
+  addCameraFilter(filters, { cameraNumber: 2, cameraId: "cam-2-id", checked: false });
+  const mod = factory();
+
+  fetchQueue.push(jsonResponse(200, { events: [freshEvent("ev-crowded-out", { hasClip: false, ageMs: 1000, camera: "cam-1-id" })] }));
+  await mod.apply();
+
+  if (fetchCalls.length !== 1) throw new Error(`expected exactly 1 fetch call, got ${fetchCalls.length}`);
+  if (fetchCalls[0].url !== "/api/customer/events/recent/cam-1-id") {
+    throw new Error(`expected a fetch to the camera-scoped endpoint, got ${fetchCalls[0].url}`);
+  }
+  const row = tbody.querySelector('tr[data-event-id="ev-crowded-out"]');
+  if (!row) throw new Error("expected the previously crowded-out event to be inserted into the table");
+  if (row.hidden) throw new Error("expected the newly-fetched row to be visible -- it matches the one selected camera");
+});
+
+test("the normal fleet-wide view (more than one camera checked) never triggers a per-camera fetch", async () => {
+  resetFakes();
+  const { filters } = buildFixture();
+  addCameraFilter(filters, { cameraNumber: 1, cameraId: "cam-1-id", checked: true });
+  addCameraFilter(filters, { cameraNumber: 2, cameraId: "cam-2-id", checked: true });
+  const mod = factory();
+
+  await mod.apply();
+
+  if (fetchCalls.length !== 0) throw new Error(`expected zero fetch calls with multiple cameras checked, got ${fetchCalls.length}`);
+});
+
+test("a single checked camera when only one camera exists at all never triggers a per-camera fetch (already the whole fleet)", async () => {
+  resetFakes();
+  const { filters } = buildFixture();
+  addCameraFilter(filters, { cameraNumber: 1, cameraId: "cam-1-id", checked: true });
+  const mod = factory();
+
+  await mod.apply();
+
+  if (fetchCalls.length !== 0) throw new Error(`expected zero fetch calls -- the fleet-wide bounded query already covers this camera's whole fleet, got ${fetchCalls.length}`);
+});
+
+test("re-applying the same single-camera filter does not re-fetch", async () => {
+  resetFakes();
+  const { filters } = buildFixture();
+  addCameraFilter(filters, { cameraNumber: 1, cameraId: "cam-1-id", checked: true });
+  addCameraFilter(filters, { cameraNumber: 2, cameraId: "cam-2-id", checked: false });
+  const mod = factory();
+
+  fetchQueue.push(jsonResponse(200, { events: [] }));
+  await mod.apply();
+  if (fetchCalls.length !== 1) throw new Error("expected exactly 1 fetch on the first apply()");
+
+  await mod.apply();
+  if (fetchCalls.length !== 1) throw new Error(`expected no additional fetch when re-applying the same single-camera filter, got ${fetchCalls.length} total calls`);
+});
+
+test("an event already present in the fleet-wide window is reconciled in place, never duplicated, when the camera-scoped fetch also returns it", async () => {
+  resetFakes();
+  const { tbody, filters } = buildFixture();
+  addRow(tbody, { id: "ev-already-visible", camera: "1", timestamp: isoAgo(1000), hasClip: false, mediaState: "processing" });
+  addCameraFilter(filters, { cameraNumber: 1, cameraId: "cam-1-id", checked: true });
+  addCameraFilter(filters, { cameraNumber: 2, cameraId: "cam-2-id", checked: false });
+  const mod = factory();
+
+  fetchQueue.push(
+    jsonResponse(200, {
+      events: [
+        freshEvent("ev-crowded-out-2", { hasClip: true, ageMs: 2000, camera: "cam-1-id" }),
+        freshEvent("ev-already-visible", { hasClip: true, ageMs: 1000, camera: "cam-1-id" }),
+      ],
+    })
+  );
+  await mod.apply();
+
+  const ids = tbody.children.map((r) => r.dataset.eventId);
+  if (ids.filter((id) => id === "ev-already-visible").length !== 1) {
+    throw new Error(`expected exactly one row for the already-visible event, got ids=${ids.join(",")}`);
+  }
+  const existing = tbody.querySelector('tr[data-event-id="ev-already-visible"]');
+  if (existing.dataset.mediaState !== "ready") throw new Error("expected the already-visible row to be reconciled to ready in place, not replaced");
+  if (!tbody.querySelector('tr[data-event-id="ev-crowded-out-2"]')) throw new Error("expected the genuinely new crowded-out event to also be inserted");
+});
+
+test("a smart_motion event fetched via the camera-scoped path renders with the same generic label, no special-casing", async () => {
+  resetFakes();
+  const { tbody, filters } = buildFixture();
+  addCameraFilter(filters, { cameraNumber: 1, cameraId: "cam-1-id", checked: true });
+  addCameraFilter(filters, { cameraNumber: 2, cameraId: "cam-2-id", checked: false });
+  const mod = factory();
+
+  const smartMotionEvent = freshEvent("ev-smart-motion", { hasClip: false, ageMs: 1000, camera: "cam-1-id" });
+  smartMotionEvent.event_type = "smart_motion";
+  fetchQueue.push(jsonResponse(200, { events: [smartMotionEvent] }));
+  await mod.apply();
+
+  const row = tbody.querySelector('tr[data-event-id="ev-smart-motion"]');
+  if (!row) throw new Error("expected the smart_motion event to be inserted");
+  if (!row.textContent.includes("Smart Motion")) {
+    throw new Error(`expected the generic type-label formatter to render "Smart Motion", got row text: ${row.textContent}`);
+  }
+});
+
+test("a customer-viewer camera the caller is not authorized for is never merged in (a 403/network failure leaves the row absent, not crashes)", async () => {
+  resetFakes();
+  const { tbody, filters } = buildFixture();
+  addCameraFilter(filters, { cameraNumber: 3, cameraId: "cam-unauthorized-id", checked: true });
+  addCameraFilter(filters, { cameraNumber: 2, cameraId: "cam-2-id", checked: false });
+  const mod = factory();
+
+  // The real backend route (customer_events_recent_for_camera) 403s an
+  // unauthorized camera_id before this client-side code ever runs --
+  // simulated here as the fetch resolving with a non-2xx status, which
+  // must be treated as "nothing to show", never surfaced as new rows.
+  fetchQueue.push(jsonResponse(403, { detail: "Not authorized for this camera." }));
+  await mod.apply();
+
+  if (tbody.children.length !== 0) throw new Error("expected no rows to be inserted from a 403 response");
 });
 
 // ---------------------------------------------------------------- runner

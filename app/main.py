@@ -119175,7 +119175,8 @@ def _render_customer_events(request: Request) -> str:
     events_list = _customer_detection_events(request, limit=200) or []
 
     camera_options = "".join(
-        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}"> '
+        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}" '
+        f'data-camera-id="{escape(str(camera.get("id") or ""), quote=True)}"> '
         f'{escape(_camera_display_label(camera))}</label>'
         for camera in cameras
     )
@@ -119325,8 +119326,58 @@ def _render_customer_events(request: Request) -> str:
   // reconcileDesktopEvent()) is pushed onto this array so it
   // immediately participates in the existing camera/search filters
   // instead of silently bypassing them until the next full page load.
-  function apply(){
-    const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));
+
+  // Smart Motion Events-visibility fix (2026-09-14): the fleet-wide
+  // initial render (and the fleet-wide poll below) both share one
+  // RECENT_EVENTS_POLL_LIMIT-bounded window across every camera, so a
+  // low-volume camera's real event can be crowded out of that shared
+  // window by high-volume cameras (confirmed live: a real Camera 1
+  // smart_motion event ranked outside the top 200 of this customer's
+  // combined event history). When the customer narrows the filter down
+  // to exactly one specific camera, fetch that camera's OWN
+  // server-side-bounded recent events from the existing, already-
+  // authorized /api/customer/events/recent/{camera_id} route (built
+  // for the mobile Playback view's per-camera poll, reused here
+  // as-is -- no new backend route) and merge them in via the same
+  // reconcileDesktopEvent() every other row already goes through, so
+  // Smart Motion (and everything else) keeps rendering with the exact
+  // same generic label, no special-casing. Left completely untouched
+  // when more than one camera is checked -- the ordinary fleet-wide
+  // view keeps its existing bounded behavior exactly as before.
+  const cameraScopedEventsLoaded=new Set();
+  async function ensureCameraScopedEvents(cameraId){
+    if(!cameraId||cameraScopedEventsLoaded.has(cameraId))return;
+    cameraScopedEventsLoaded.add(cameraId);
+    try{
+      const response=await fetch(`/api/customer/events/recent/${encodeURIComponent(cameraId)}`,{cache:'no-store'});
+      if(!response.ok)return;
+      const payload=await response.json();
+      const tbody=document.querySelector('#events-table tbody');
+      [...(payload.events||[])].reverse().forEach(event=>{
+        try{
+          const newRow=reconcileDesktopEvent(event);
+          if(newRow&&tbody){
+            tbody.insertBefore(newRow,tbody.firstChild);
+            wireEventThumbPlayer(newRow);
+            rows.push(newRow);
+          }
+        }catch(eventError){
+          console.error('ensureCameraScopedEvents: failed to reconcile event',event&&event.id,eventError);
+        }
+      });
+    }catch(error){
+      // Transient network failure -- forget this camera was "loaded" so
+      // the next filter change (or a future retry) can try again,
+      // rather than permanently showing an incomplete result for it.
+      cameraScopedEventsLoaded.delete(cameraId);
+    }
+  }
+  async function apply(){
+    const checkedBoxes=[...filters.querySelectorAll('input:checked')];
+    const checked=new Set(checkedBoxes.map(box=>box.dataset.camera));
+    if(checkedBoxes.length===1&&filters.querySelectorAll('input').length>1){
+      await ensureCameraScopedEvents(checkedBoxes[0].dataset.cameraId);
+    }
     const query=(search.value||'').toLowerCase();
     rows.forEach(row=>{
       const cameraMatch=checked.has(row.dataset.eventCamera);
@@ -119533,7 +119584,7 @@ def _render_customer_events(request: Request) -> str:
     row.dataset.eventTimestamp=String(event.timestamp||'');
     row.dataset.eventHasClip=event.has_event_clip?'1':'0';
     row.dataset.mediaState=mediaState;
-    const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+    const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
     const confidence=event.confidence;
     const confidencePercent=(confidence===null||confidence===undefined)?'—':`${(confidence<=1?confidence*100:confidence).toFixed(1)}%`;
     row.innerHTML=`<td>${desktopEventDate(event.timestamp).toLocaleString()}</td>`+
