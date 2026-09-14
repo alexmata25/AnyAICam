@@ -2249,3 +2249,24 @@ Full regression: `app/` 86 failed/1777 passed/22 skipped -- failure set diffed b
 ### State to resume from
 
 The hard-cap defect is fixed and regression-clean in source, but **not yet deployed to Ryzen** (edge-side code -- needs a versioned artifact + repair-install like every other edge fix this session, whenever that's next requested). Until then, Ryzen is still running the pre-fix `1d336b3` build of `recording_uploader.py` -- functionally irrelevant right now since `RECORDING_UPLOAD_ENABLED` stays `false`, but worth remembering before any future bulk-recording validation is attempted: deploy this fix first. Everything else from the prior entry (Historical Playback PROVEN, 5 real Camera 1 recordings left in place, orphaned thumbnails, `plans`/pilot-camera formalization) remains exactly as it was.
+
+## 2026-09-14 (later): Hard-cap fix `1d024c7` deployed to Ryzen via repair-install -- verified healthy, classified FIXED/DEPLOYED
+
+**Deployed**: versioned artifact built and staged, SHA-256 verified after transfer, `recording_uploader.py` inside the payload byte-verified against `1d024c7` exactly. Operator ran `sudo ./install.sh --repair`.
+
+**Post-install verification, all read-only, all PASSED**:
+- Running commit byte-verified: `/app/recording_uploader.py` inside the container hashes identically to `git show 1d024c7`. `ANYAICAM_VMS_COMMIT`/`ANYAICAM_BUILD_ID` both confirm it.
+- `anyaicam-vms` container: healthy, `RestartCount=0`. `anyaicam-agent.service`: `NRestarts=0`, active/running. `anyaicam-vms.service` (the oneshot `docker compose up -d` unit): `active`/`exited`/`Result=success` -- its own correct steady state.
+- All 5 real cameras: `online=1/recording=1/last_error=None`.
+- Cloud Live Relay: `live_relay.worker_started` logged cleanly, zero errors of any kind in the following 10 minutes.
+- Motion-event/event-media pipeline: `EVENT_MEDIA_UPLOAD_ENABLED`/`ANALYTICS_SYNC_ENABLED` both still `true`; `detection_event_media` at a healthy, still-growing 275 rows (up from 237 two verification passes ago) -- actively working, completely unaffected.
+- Appliance identity confirmed preserved: `cloud_id=AIC-C814766E`, `customer_id=d75bdbecdd4887de4d2b89a9fcea9092`, `site_id=f67fa371cd`, all unchanged.
+- `/var/lib/anyaicam` confirmed still mounted read-only (`RW=false`); the other four mounts (`/app`, `/app/recordings`, `/app/static/hls`, `/opt/anyaicam/data/config`) all unchanged.
+- `ANYAICAM_RECORDING_UPLOAD_ENABLED=false` confirmed. Zero `recording_upload.*` log lines of any kind since the restart -- no new upload attempts, historical or otherwise.
+- `recordings` catalog table: stable at exactly 5 rows, all Camera 1 (`dfba6a63ec`), zero for Cameras 2-5 -- unchanged from before this deploy. No Playback test was performed or needed to confirm this (a stable row count is itself sufficient proof nothing new uploaded).
+
+**Hard-cap defect classification: FIXED, DEPLOYED, VERIFIED.** No functional test of the fix's real-world behavior was performed on Ryzen in this pass (correctly, per instruction -- `RECORDING_UPLOAD_ENABLED` was never re-enabled), since the fix's own correctness was already proven by its 3 new unit/integration tests against the real function; this pass only confirms the fixed code is genuinely what's running.
+
+### State to resume from
+
+Golden Foundation on Ryzen is now fully current: HLS reconnect (`171409a`) -> bounded Live Relay concurrency (`f4b640a`) -> per-camera rate limiter (`1e8ae22`, cloud-only) -> clip-build diagnostic (`8bdf790`) -> outbox/analytics-sync relocation (`95d476d`) -> event-media credential OR-gate (`b7387c0`, cloud-only) -> camera-scope/hard-cap mechanism (`1d336b3`) -> cloud pilot-camera allowlist (`471a535`, cloud-only) -> hard-cap-in-loop fix (`1d024c7`, this entry). Historical Playback stays PROVEN (5 real Camera 1 recordings in place, untouched). `RECORDING_UPLOAD_ENABLED` remains `false` everywhere. Next: Smart Motion validation, per explicit instruction -- not started yet.
