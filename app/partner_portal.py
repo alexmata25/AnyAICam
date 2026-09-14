@@ -281,7 +281,21 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.put('/api/admin/partner-pricing')
     def admin_update(request: Request, payload: dict) -> dict:
-        identity=_require(request, {'administrator'}); config=load_pricing(); partner=config['partner']
+        identity=_require(request, {'administrator'})
+        # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
+        # {'administrator'} above is only this codebase's role LABEL --
+        # byte-identical whether the grant behind it is scope_type=
+        # 'global' or scope_type='partner'. This is a direct global
+        # pricing WRITE path (central retail/partner pricing, margins,
+        # MAP, commercial settings), so it must require a live,
+        # unrevoked global administrator grant before any mutation, not
+        # just the role name. Same primitive as appliance_cloud.py's
+        # appliance_dashboard() and partner_workspace.py's tenant checks.
+        from appliance_identity import has_global_administrator_grant
+        with connection() as db:
+            if not has_global_administrator_grant(db,email=identity.get('email','')):
+                raise HTTPException(status_code=403,detail='Global administrator grant required.')
+        config=load_pricing(); partner=config['partner']
         for field in ('pricing_mode','percentage_discount','map_enabled'):
             if field in payload: partner[field]=payload[field]
         if 'trial_days' in payload: config['trial_days']=max(0,min(365,int(payload['trial_days'])))
@@ -344,6 +358,17 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         identity=_identity(request)
         if not identity: return RedirectResponse('/partner-login',status_code=303)
         if identity['role']!='administrator': raise HTTPException(status_code=403,detail='Administrator role required.')
+        # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
+        # the role check above is only a label -- a partner-scoped
+        # administrator carries it too. This page reveals central retail
+        # pricing, partner prices/costs, margins, MAP controls, and
+        # global commercial settings, so reaching it requires a live,
+        # unrevoked global administrator grant, checked before any
+        # pricing data is loaded. Same primitive as the PUT handler above.
+        from appliance_identity import has_global_administrator_grant
+        with connection() as db:
+            if not has_global_administrator_grant(db,email=identity.get('email','')):
+                raise HTTPException(status_code=403,detail='Global administrator grant required.')
         config=load_pricing(); p=config['partner']; tiers=''.join(f'<label>{t["label"]} discount %<input class="tier" data-index="{i}" type="number" min="0" max="100" step="0.01" value="{t["discount_percent"]}"></label>' for i,t in enumerate(p['volume_tiers']))
         term_inputs=''.join(f'<div class="panel"><strong>{key}</strong><label>Retail monthly price<input class="retail-term" data-key="{key}" type="number" min="0" step="0.01" value="{term.get("retail_monthly_price") if term.get("retail_monthly_price") is not None else ""}" required></label><label>Partner monthly price<input class="partner-term" data-key="{key}" data-field="partner_monthly_price" type="number" min="0" step="0.01" value="{term.get("partner_monthly_price") if term.get("partner_monthly_price") is not None else ""}"></label><label>Partner cost<input class="partner-term" data-key="{key}" data-field="partner_cost" type="number" min="0" step="0.01" value="{term.get("partner_cost") if term.get("partner_cost") is not None else ""}"></label><label>Suggested retail<input class="partner-term" data-key="{key}" data-field="suggested_retail_price" type="number" min="0" step="0.01" value="{term.get("suggested_retail_price") if term.get("suggested_retail_price") is not None else ""}"></label><label>Minimum advertised price<input class="partner-term" data-key="{key}" data-field="minimum_advertised_price" type="number" min="0" step="0.01" value="{term.get("minimum_advertised_price") if term.get("minimum_advertised_price") is not None else ""}"></label><label><input class="partner-check" data-key="{key}" data-field="map_enabled" type="checkbox" {"checked" if term.get("map_enabled") else ""}> Enforce MAP</label></div>' for key,term in p['plan_terms'].items())
         addon_inputs=''.join(f'<div class="panel"><strong>{config["addons"][key]["label"]}</strong><label>Retail price<input class="addon-term" data-key="{key}" data-field="retail_monthly_price" type="number" step="0.01" value="{term["retail_monthly_price"]}"></label><label>Partner price<input class="addon-term" data-key="{key}" data-field="partner_monthly_price" type="number" step="0.01" value="{term.get("partner_monthly_price") if term.get("partner_monthly_price") is not None else ""}"></label><label>Partner cost<input class="addon-term" data-key="{key}" data-field="partner_cost" type="number" step="0.01" value="{term.get("partner_cost") if term.get("partner_cost") is not None else ""}"></label><label>Suggested retail<input class="addon-term" data-key="{key}" data-field="suggested_retail_price" type="number" step="0.01" value="{term.get("suggested_retail_price") if term.get("suggested_retail_price") is not None else ""}"></label><label>MAP<input class="addon-term" data-key="{key}" data-field="minimum_advertised_price" type="number" step="0.01" value="{term.get("minimum_advertised_price") if term.get("minimum_advertised_price") is not None else ""}"></label><label><input class="addon-check" data-key="{key}" data-field="map_enabled" type="checkbox" {"checked" if term.get("map_enabled") else ""}> Enforce MAP</label></div>' for key,term in p['addon_terms'].items())

@@ -1391,8 +1391,6 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         identity=partner_identity(request)
         if not identity: return RedirectResponse('/partner-login',status_code=303)
         require_partner_access(request)
-        stale_before=(datetime.now()-timedelta(minutes=3)).isoformat()
-        with connection() as db: db.execute("UPDATE appliances SET state='offline',online_status='offline' WHERE state IN ('online','degraded') AND (last_check_in IS NULL OR last_check_in<?)",(stale_before,))
         # HIGH fix (2026-09-14 partner-scoped-administrator follow-up,
         # Codex tenant-isolation re-audit): sibling-audit finding, same
         # pattern and same fix as partner_workspace.py's render_partner_
@@ -1401,12 +1399,29 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # administrator drop the partner_id filter entirely and enumerate
         # every other partner's real appliances here. Only a live-verified
         # GLOBAL administrator grant may see appliances across every
-        # partner.
+        # partner. Resolved once, up front, so the stale-state housekeeping
+        # mutation and the command-history query below can reuse the exact
+        # same tenant boundary as the appliance-card query.
         from appliance_identity import has_global_administrator_grant
         with connection() as db:
             is_global=has_global_administrator_grant(db,email=identity.get('email',''))
+        owned_partner_id=identity.get('partner_id') or 'anyaicam-primary'
+        # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
+        # this housekeeping UPDATE previously ran unconditionally for
+        # every appliance on every partner's page load -- any
+        # authenticated partner could trigger a cross-tenant state
+        # mutation on appliances they don't own just by loading this
+        # dashboard. It's now confined to the same tenant boundary as
+        # the rest of this page; only a genuine global administrator's
+        # visit sweeps every partner's stale appliances.
+        stale_before=(datetime.now()-timedelta(minutes=3)).isoformat()
+        with connection() as db:
+            if is_global:
+                db.execute("UPDATE appliances SET state='offline',online_status='offline' WHERE state IN ('online','degraded') AND (last_check_in IS NULL OR last_check_in<?)",(stale_before,))
+            else:
+                db.execute("UPDATE appliances SET state='offline',online_status='offline' WHERE partner_id=? AND state IN ('online','degraded') AND (last_check_in IS NULL OR last_check_in<?)",(owned_partner_id,stale_before))
         clauses=['1=1']; params=[]
-        if not is_global: clauses.append('a.partner_id=?'); params.append(identity.get('partner_id') or 'anyaicam-primary')
+        if not is_global: clauses.append('a.partner_id=?'); params.append(owned_partner_id)
         for value,column in [(partner,'a.partner_id'),(customer,'a.customer_id'),(site,'a.site_id'),(status,'a.state'),(version,'a.software_version')]:
             if value: clauses.append(column+'=?'); params.append(value)
         appliances=rows('SELECT a.*,c.name customer_name,s.name site_name FROM appliances a LEFT JOIN customers c ON c.id=a.customer_id LEFT JOIN sites s ON s.id=a.site_id WHERE '+' AND '.join(clauses)+' ORDER BY a.last_check_in DESC',params)
@@ -1420,7 +1435,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             pending_count=item.get('upload_pending_count'); quarantined_count=item.get('upload_quarantined_count')
             backlog_text=f'{pending_count} pending · {quarantined_count} quarantined' if pending_count is not None else 'Not yet reported'
             cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('install_update','Install update'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
-        command_rows=rows('SELECT c.*,a.cloud_id FROM appliance_commands c JOIN appliances a ON a.id=c.appliance_id ORDER BY c.created_at DESC LIMIT 50')
+        # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
+        # this query previously had no tenant predicate at all, so any
+        # partner-scoped administrator saw every other partner's queued
+        # commands -- foreign cloud IDs, commands, statuses, timestamps,
+        # and errors. Same tenant boundary as the appliance-card query
+        # above (is_global / owned_partner_id).
+        command_clauses=['1=1']; command_params=[]
+        if not is_global: command_clauses.append('a.partner_id=?'); command_params.append(owned_partner_id)
+        command_rows=rows('SELECT c.*,a.cloud_id FROM appliance_commands c JOIN appliances a ON a.id=c.appliance_id WHERE '+' AND '.join(command_clauses)+' ORDER BY c.created_at DESC LIMIT 50',command_params)
         command_table=''.join(f'<tr><td>{escape(item["cloud_id"])}</td><td>{escape(item["command"].replace("_"," "))}</td><td><span class="pill">{escape(item["status"])}</span></td><td>{escape(item["created_at"])}</td><td>{escape(item.get("error") or "")}</td></tr>' for item in command_rows) or '<tr><td colspan="5">No remote actions have been queued.</td></tr>'
         content=f'''<header class="topbar"><div><p class="eyebrow">Secure appliance fleet</p><h1>Appliance dashboard</h1></div></header><form class="panel clip-form" method="get"><label>Partner<input name="partner" value="{escape(partner,quote=True)}"></label><label>Customer<input name="customer" value="{escape(customer,quote=True)}"></label><label>Site<input name="site" value="{escape(site,quote=True)}"></label><label>Status<select name="status"><option value="">All</option>{''.join(f'<option {"selected" if status==s else ""}>{s}</option>' for s in ['online','degraded','offline','updating','revoked'])}</select></label><label>Version<input name="version" value="{escape(version,quote=True)}"></label><button class="action-button">Filter</button></form><div class="account-grid" style="margin-top:18px">{''.join(cards) or '<div class="empty">No appliances match these filters.</div>'}</div><section class="panel" style="margin-top:18px;overflow:auto"><h2>Remote action history</h2><table class="data-table"><thead><tr><th>Appliance</th><th>Command</th><th>Status</th><th>Created</th><th>Error</th></tr></thead><tbody>{command_table}</tbody></table></section>'''
         scripts='''<script>const DISRUPTIVE_COMMAND_WARNINGS={reboot_appliance:'This reboots the physical appliance. All cameras and recording will be briefly interrupted.',restart_vms:'This restarts the AnyAiCam VMS service on this appliance. Live view and recording will be briefly interrupted.'};document.querySelectorAll('.queue-command').forEach(button=>button.onclick=async()=>{const warning=DISRUPTIVE_COMMAND_WARNINGS[button.dataset.command];if(!confirm(warning?`${warning} Continue?`:`Queue ${button.textContent} for this appliance?`))return;const response=await fetch(`/api/partner/appliances/${button.dataset.appliance}/commands`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:button.dataset.command,confirmed:true})}),r=await response.json();showToast(r.message||r.detail)})</script>'''

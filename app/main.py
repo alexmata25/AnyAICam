@@ -50231,9 +50231,22 @@ def operations_rdm_page(request: Request) -> str:
             ) + '</details></article>'
         )
 
+    # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex): this
+    # query previously had no tenant predicate at all, so any partner-
+    # scoped administrator who could reach this operations page (already
+    # scoped above for the appliance cards using the same
+    # identity_is_global / has_global_administrator_grant() result) saw
+    # every other partner's restart/reboot command history -- foreign
+    # appliance identifiers, command state, timestamps, and errors.
+    command_clauses = ["c.command IN ('restart_vms','reboot_appliance')"]
+    command_params: list = []
+    if not identity_is_global:
+        command_clauses.append("a.partner_id=?")
+        command_params.append(identity.get("partner_id") or "anyaicam-primary")
     command_rows = partner_rows(
         "SELECT c.*, a.cloud_id FROM appliance_commands c JOIN appliances a ON a.id=c.appliance_id "
-        "WHERE c.command IN ('restart_vms','reboot_appliance') ORDER BY c.created_at DESC LIMIT 20"
+        "WHERE " + " AND ".join(command_clauses) + " ORDER BY c.created_at DESC LIMIT 20",
+        command_params,
     )
     command_table = "".join(
         f'<tr><td>{escape(item["cloud_id"])}</td><td>{escape(item["command"].replace("_", " "))}</td>'
