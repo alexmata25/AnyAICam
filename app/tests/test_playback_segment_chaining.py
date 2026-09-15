@@ -72,7 +72,7 @@ def test_ended_event_triggers_chain_via_the_existing_unmodified_playclip(monkeyp
 
 def test_playclip_unmodified_recording_media_url_and_cloud_mp4_handling(monkeypatch):
     html = _render(monkeypatch)
-    idx = html.index("function playClip(cameraId,clip){")
+    idx = html.index("function playClip(cameraId,clip,options){")
     end_idx = html.index("\n  }", html.index("recordingMediaUrl(cameraId,clip.id)", idx))
     block = html[idx:end_idx]
     assert "const url=recordingMediaUrl(cameraId,clip.id);" in block
@@ -82,7 +82,7 @@ def test_playclip_unmodified_recording_media_url_and_cloud_mp4_handling(monkeypa
 
 def test_playclip_unmuted_then_muted_autoplay_fallback_unchanged(monkeypatch):
     html = _render(monkeypatch)
-    idx = html.index("function playClip(cameraId,clip){")
+    idx = html.index("function playClip(cameraId,clip,options){")
     end_idx = html.index("\n  }", html.index("video.play()", idx))
     block = html[idx:end_idx]
     assert "video.play().then(()=>{" in block, "unmuted (first) autoplay attempt must be unchanged"
@@ -113,17 +113,25 @@ def test_manual_clip_selection_unchanged(monkeypatch):
 
 
 def test_exact_timeline_seek_lands_in_the_correct_segment_and_offset(monkeypatch):
+    # 2026-09-15: the click handler itself now resolves through
+    # seekToTimelineFraction()/resolveScrubTarget() (the timeline-
+    # scrubbing feature's shared click/drag core -- see
+    # test_playback_timeline_scrubbing.py) rather than a standalone
+    # findClipNear() lookup, but still lands in the correct segment at
+    # the correct in-clip offset, still via the same currentClips state.
     html = _render(monkeypatch)
-    idx = html.index("timelineLane.addEventListener('click',(event)=>{")
-    end_idx = html.index("  });", idx)
-    block = html[idx:end_idx]
-    assert "const dayString=viewingDate||localDateStringOf(new Date());" in block
-    assert "const nearby=findClipNear(currentClips,target.getTime());" in block
-    assert "const offsetSeconds=(target.getTime()-playbackDate(nearby.start).getTime())/1000;" in block
-    assert "video.currentTime=offsetSeconds;" in block
+    assert "function resolveScrubTarget(clips,dayString,fraction,parseDate){" in html
+    idx = html.index("function resolveScrubTarget(clips,dayString,fraction,parseDate){")
+    block = html[idx: idx + 400]
+    assert "const covering=coveringClipAt(clips,targetMs,parseDate);" in block
+    assert "const offsetSeconds=Math.max(0,(targetMs-parseDate(covering.start).getTime())/1000);" in block
+    seek_idx = html.index("function seekToTimelineFraction(fraction,options){")
+    seek_block = html[seek_idx: seek_idx + 900]
+    assert "resolveScrubTarget(currentClips,dayString,fraction,playbackDate)" in seek_block
+    assert "video.currentTime=offsetSeconds;" in seek_block
     # The exact-seek path must not have been rerouted through the chain
     # planner -- it is a distinct, deliberate jump-to-time action.
-    assert "_planNextChainedClip" not in block
+    assert "_planNextChainedClip" not in seek_block
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +152,8 @@ def test_exact_timeline_seek_lands_in_the_correct_segment_and_offset(monkeypatch
 
 def test_stale_ended_event_cannot_hijack_a_newer_manual_selection(monkeypatch):
     html = _render(monkeypatch)
-    idx = html.index("function playClip(cameraId,clip){")
-    block = html[idx: idx + 400]
+    idx = html.index("function playClip(cameraId,clip,options){")
+    block = html[idx: idx + 1000]
     assert "selectedClip=clip;" in block
     assert "video.pause();" in block
     assert "video.src=url;" in block

@@ -141429,6 +141429,16 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.legend-dot.event-people_counting{background:#4dcf7a}'
         '.legend-dot.event-intrusion{background:#f0554d}'
         '.event-segment{cursor:pointer}'
+        # Playhead: a thin vertical indicator overlaid on the same
+        # position:relative lane the recording bars already draw into
+        # (see #playback-timeline-lane's own height rule below) --
+        # pointer-events:none so it never intercepts the drag/click
+        # handlers meant for the lane underneath it. --gap recolors it
+        # to signal "no recording here" without a second DOM element.
+        '.timeline-playhead{position:absolute;top:0;height:70px;width:2px;'
+        'background:#1c6dd0;pointer-events:none;z-index:5}'
+        '.timeline-playhead--gap{background:#9aa7b5}'
+        '#playback-timeline-lane{cursor:grab;touch-action:none}'
         # 2026-09-04 lane fix (v2): the 2026-09-03 attempt above set
         # #playback-timeline-lane's height to a hand-picked 88px, WITHOUT
         # !important -- and never actually took effect, because this
@@ -141668,6 +141678,17 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const datesLoaded=new Set();
 
   let selectedClip=null;
+  // True only while a genuine drag (past DRAG_THRESHOLD_PX) is in
+  // progress on the timeline -- see the pointerdown/pointermove/pointerup
+  // handlers and their own comments, further down this script.
+  let isScrubbing=false;
+  // The playhead is a single persistent element (not recreated by
+  // renderTimeline()'s own innerHTML clear-and-rebuild -- it's simply
+  // re-appended at the end of that function every time) so its own
+  // state/listeners never need re-wiring on every render.
+  const playheadEl=document.createElement('div');
+  playheadEl.className='timeline-playhead';
+  playheadEl.hidden=true;
   // Whichever clips array the timeline/clip-list are currently
   // showing -- the default (most-recent-page) view or a date-mode
   // view -- kept in sync at each renderTimeline() call site below,
@@ -141681,7 +141702,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let viewingDate=null;
   let selectedCameraId={json.dumps(first_camera_id)};
   const eventPlayer=AnyAiCamEventMedia.player({{video,status,isCurrent:cameraId=>cameraId===selectedCameraId,onReady:()=>{{
-    placeholder.hidden=true;selectedClip=null;timelinePlayButton.disabled=false;skipBackButton.disabled=false;skipForwardButton.disabled=false;revealClipPanel();
+    // playheadEl.hidden: an event clip is a different media identity
+    // than any recording in currentClips -- the recording-timeline
+    // playhead has nothing real to point at during event playback, so
+    // it's hidden rather than left showing a stale recording position.
+    placeholder.hidden=true;selectedClip=null;playheadEl.hidden=true;timelinePlayButton.disabled=false;skipBackButton.disabled=false;skipForwardButton.disabled=false;revealClipPanel();
   }}}});
   window.addEventListener('pagehide',()=>{{eventPlayer.cancel();stopMobileEventPoll();}});
 
@@ -141847,11 +141872,19 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   }}
   // === CHAIN_CORE_END ===
 
-  function playClip(cameraId,clip){{
+  function playClip(cameraId,clip,options){{
+    // options.autoplay (default true): every existing trigger (manual
+    // click, event marker, deep link, chain) omits this and gets the
+    // exact original always-play behavior, unchanged. false is used
+    // only by the new timeline scrub/seek path below, while a drag is
+    // actively in progress -- scrubbing must show the correct frame at
+    // the pointer's position without forcing playback (audio) to start
+    // on every intermediate position crossed.
+    const autoplay=!options||options.autoplay!==false;
     eventPlayer.cancel();
     placeholder.hidden=true;
     const url=recordingMediaUrl(cameraId,clip.id);
-    debugLog(`[checkpoint 4] playClip() invoked camera=${{cameraId}} recording=${{clip.name}} url=${{url}}`);
+    debugLog(`[checkpoint 4] playClip() invoked camera=${{cameraId}} recording=${{clip.name}} url=${{url}} autoplay=${{autoplay}}`);
     selectedClip=clip;
     video.pause();
     video.src=url;
@@ -141883,20 +141916,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // message pointing at it. This is a temporary, customer-
     // correctable fallback, never the permanent forced-mute the
     // original Playback/audio fix explicitly ruled out.
-    debugLog('[checkpoint 7] calling video.play() (unmuted, first attempt)');
-    video.play().then(()=>{{
-      debugLog('[checkpoint 7] video.play() resolved -- unmuted playback started');
-    }}).catch(error=>{{
-      debugLog(`[checkpoint 7] video.play() rejected: ${{error && error.name}} -- retrying muted`);
-      video.muted=true;
+    if(autoplay){{
+      debugLog('[checkpoint 7] calling video.play() (unmuted, first attempt)');
       video.play().then(()=>{{
-        debugLog('[checkpoint 7] muted video.play() resolved -- playback started muted');
-        status.textContent='Audio was blocked by the browser — tap the speaker icon on the player to unmute.';
-      }}).catch(mutedError=>{{
-        debugLog(`[checkpoint 7] muted video.play() ALSO rejected: ${{mutedError && mutedError.name}}`);
-        status.textContent='Autoplay was blocked by the browser — press Play to start.';
+        debugLog('[checkpoint 7] video.play() resolved -- unmuted playback started');
+      }}).catch(error=>{{
+        debugLog(`[checkpoint 7] video.play() rejected: ${{error && error.name}} -- retrying muted`);
+        video.muted=true;
+        video.play().then(()=>{{
+          debugLog('[checkpoint 7] muted video.play() resolved -- playback started muted');
+          status.textContent='Audio was blocked by the browser — tap the speaker icon on the player to unmute.';
+        }}).catch(mutedError=>{{
+          debugLog(`[checkpoint 7] muted video.play() ALSO rejected: ${{mutedError && mutedError.name}}`);
+          status.textContent='Autoplay was blocked by the browser — press Play to start.';
+        }});
       }});
-    }});
+    }}
     revealClipPanel();
   }}
 
@@ -142244,6 +142279,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   function renderTimeline(cameraId,clips,events,dayString){{
     renderMobileRecentEvents(cameraId,clips,events);
     timelineLane.innerHTML='';
+    // playheadEl is a single persistent element (see its own creation
+    // comment above) -- re-appended here every render since the
+    // innerHTML clear just above just discarded it along with the old
+    // segments/markers.
+    timelineLane.appendChild(playheadEl);
     const [dayY,dayM,dayD]=dayString.split('-').map(Number);
     const dayStartMs=new Date(dayY,dayM-1,dayD,0,0,0,0).getTime();
     const dayEndMs=dayStartMs+86400000;
@@ -142555,6 +142595,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     video.removeAttribute('src');
     video.load();
     selectedClip=null;
+    playheadEl.hidden=true;
     skipBackButton.disabled=true;
     timelinePlayButton.disabled=true;
     skipForwardButton.disabled=true;
@@ -142649,38 +142690,194 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   datePrevButton.addEventListener('click',()=>navigateByOneDay(-1));
   dateNextButton.addEventListener('click',()=>navigateByOneDay(1));
 
-  // Jump to an exact time on the currently shown date: a click
-  // anywhere on the empty ruler (event.target===timelineLane --
-  // an existing segment/event marker's own click never bubbles up
-  // as that exact target, so their own more specific handlers above
-  // are completely unaffected) is converted back from its pixel
-  // fraction of the ruler's width into a wall-clock time-of-day on
-  // the shown date, using the same LOCAL-hours/minutes/seconds axis
-  // timelinePercent() itself already plots clips onto. Reuses
-  // findClipNear()'s existing covering-else-nearest-within-5-minutes
-  // contract and the same seek-once-loadedmetadata-fires pattern the
-  // event-autoplay deep link already uses in renderCamera() below.
-  timelineLane.addEventListener('click',(event)=>{{
-    if(event.target!==timelineLane)return;
-    const rect=timelineLane.getBoundingClientRect();
-    if(rect.width<=0)return;
-    const fraction=Math.min(1,Math.max(0,(event.clientX-rect.left)/rect.width));
-    const dayString=viewingDate||localDateStringOf(new Date());
+  // Genuine feature added 2026-09-15 (customer request: "a true video
+  // scrubbing timeline, like a professional VMS"): click OR drag the
+  // playhead anywhere on the ruler to seek. Superseded the previous
+  // click-only exact-seek handler below it used to live in -- that
+  // handler's own findClipNear()-based "covering, else nearest within 5
+  // minutes" leniency was right for a one-off deep-link jump, but wrong
+  // for a scrub bar, whose whole point is showing real recording
+  // coverage: scrubbing into a genuine gap must say so, never silently
+  // snap to nearby footage. resolveScrubTarget() below is the single,
+  // pure, DOM-free decision core both click and drag now share.
+  //
+  // === SCRUB_CORE_START ===
+  // parseDate is injected (never closes over the outer playbackDate())
+  // so this block stays extractable/testable standalone, exactly like
+  // CHAIN_CORE above -- see test_playback_timeline_scrubbing_core.mjs.
+  function timelineFractionToLocalMs(dayString,fraction){{
     const [y,m,d]=dayString.split('-').map(Number);
-    const target=new Date(y,m-1,d,0,0,0,0);
-    target.setTime(target.getTime()+Math.round(fraction*86400000));
-    const nearby=findClipNear(currentClips,target.getTime());
-    if(!nearby){{
-      if(typeof showToast==='function')showToast('No recording available at that time.');
+    const dayStart=new Date(y,m-1,d,0,0,0,0).getTime();
+    return dayStart+Math.min(1,Math.max(0,fraction))*86400000;
+  }}
+  function coveringClipAt(clips,timestampMs,parseDate){{
+    return clips.find(clip=>timestampMs>=parseDate(clip.start).getTime()&&timestampMs<=parseDate(clip.end).getTime())||null;
+  }}
+  function resolveScrubTarget(clips,dayString,fraction,parseDate){{
+    const targetMs=timelineFractionToLocalMs(dayString,fraction);
+    const covering=coveringClipAt(clips,targetMs,parseDate);
+    if(!covering)return {{targetMs,covering:null,offsetSeconds:null}};
+    const offsetSeconds=Math.max(0,(targetMs-parseDate(covering.start).getTime())/1000);
+    return {{targetMs,covering,offsetSeconds}};
+  }}
+  // === SCRUB_CORE_END ===
+
+  function currentTimelineDayString(){{
+    return viewingDate||localDateStringOf(new Date());
+  }}
+
+  function positionPlayhead(fraction,hasCoverage){{
+    playheadEl.hidden=false;
+    playheadEl.style.left=(fraction*100)+'%';
+    playheadEl.classList.toggle('timeline-playhead--gap',!hasCoverage);
+  }}
+
+  function timelineFractionFromClientX(clientX){{
+    const rect=timelineLane.getBoundingClientRect();
+    if(rect.width<=0)return 0;
+    return Math.min(1,Math.max(0,(clientX-rect.left)/rect.width));
+  }}
+
+  // Drives one seek from a ruler fraction, for both click and drag.
+  // options.autoplay: whether to actually (re)start playback here --
+  // true for a plain click (the pre-existing "click always plays"
+  // behavior) and for a drag release that resumes what was already
+  // playing before the drag started, but deliberately false for every
+  // live in-progress drag position, so scrubbing shows the correct
+  // frame without forcing playback/audio to start on every intermediate
+  // position crossed. options.announceGap: whether a gap gets the
+  // existing toast -- suppressed during a live drag (status.textContent
+  // already updates continuously; a toast per intermediate position
+  // would be noise) but shown for a plain click or a drag's real
+  // release point, matching the pre-existing single-toast behavior.
+  function seekToTimelineFraction(fraction,options){{
+    const autoplay=Boolean(options&&options.autoplay);
+    const announceGap=Boolean(options&&options.announceGap);
+    const dayString=currentTimelineDayString();
+    const {{covering,offsetSeconds}}=resolveScrubTarget(currentClips,dayString,fraction,playbackDate);
+    positionPlayhead(fraction,Boolean(covering));
+    if(!covering){{
+      video.pause();
+      status.textContent='No recording available at this time.';
+      if(announceGap&&typeof showToast==='function')showToast('No recording available at that time.');
       return;
     }}
-    const offsetSeconds=(target.getTime()-playbackDate(nearby.start).getTime())/1000;
-    const clipDurationSeconds=(playbackDate(nearby.end).getTime()-playbackDate(nearby.start).getTime())/1000;
-    playClip(selectedCameraId,nearby);
-    if(Number.isFinite(offsetSeconds)&&offsetSeconds>=0&&offsetSeconds<=clipDurationSeconds){{
-      video.addEventListener('loadedmetadata',()=>{{video.currentTime=offsetSeconds;}},{{once:true}});
+    if(selectedClip&&selectedClip.id===covering.id){{
+      // Same file already loaded -- an instant, local seek, no reload.
+      video.currentTime=offsetSeconds;
+      if(autoplay&&video.paused)video.play().catch(()=>{{}});
+      return;
     }}
+    // Scrubbed into a different (possibly non-adjacent) recording file
+    // -- reuses the existing playClip() media-load path (never a second
+    // one), so the correct file is resolved and loaded automatically;
+    // the customer never has to pick an individual recording first.
+    playClip(selectedCameraId,covering,{{autoplay}});
+    video.addEventListener('loadedmetadata',()=>{{video.currentTime=offsetSeconds;}},{{once:true}});
+  }}
+
+  // Continuous sync while playing/paused: the playhead always reflects
+  // selectedClip's own real recording time + however far into it the
+  // video actually is -- not just wherever it was last explicitly
+  // seeked to. Skipped while a drag owns the playhead directly (below)
+  // to avoid the two fighting over its position on the same frame.
+  video.addEventListener('timeupdate',()=>{{
+    if(isScrubbing||!selectedClip)return;
+    const dayString=currentTimelineDayString();
+    const dayStartMs=timelineFractionToLocalMs(dayString,0);
+    const nowMs=playbackDate(selectedClip.start).getTime()+video.currentTime*1000;
+    const fraction=(nowMs-dayStartMs)/86400000;
+    if(fraction<0||fraction>1){{playheadEl.hidden=true;return}}  // playing clip isn't part of the day currently shown (e.g. a deep link to a different day)
+    positionPlayhead(fraction,true);
   }});
+
+  // Drag-to-scrub: pointerdown arms the gesture; only past
+  // SCRUB_DRAG_THRESHOLD_PX of real movement does this take over from
+  // an ordinary click (so a plain click on a segment/marker/the bare
+  // ruler is completely unaffected below the threshold -- their own
+  // click handlers still fire normally). rAF-throttled during the drag
+  // itself (scrubRafPending) so a fast, high-frequency pointermove burst
+  // never issues more than one seek/reload per animation frame; the
+  // final released position is always applied synchronously, never
+  // dropped by the throttle.
+  const SCRUB_DRAG_THRESHOLD_PX=3;
+  let scrubPointerId=null;
+  let scrubStartClientX=null;
+  let scrubHasDragged=false;
+  let scrubWasPlayingBeforeDrag=false;
+  let scrubRafPending=false;
+  let scrubLatestClientX=null;
+
+  timelineLane.addEventListener('pointerdown',(event)=>{{
+    if(event.isPrimary===false)return;
+    scrubPointerId=event.pointerId;
+    scrubStartClientX=event.clientX;
+    scrubHasDragged=false;
+    scrubWasPlayingBeforeDrag=!video.paused&&!video.ended;
+  }});
+
+  timelineLane.addEventListener('pointermove',(event)=>{{
+    if(scrubStartClientX===null||event.pointerId!==scrubPointerId)return;
+    if(!scrubHasDragged){{
+      if(Math.abs(event.clientX-scrubStartClientX)<SCRUB_DRAG_THRESHOLD_PX)return;
+      scrubHasDragged=true;
+      isScrubbing=true;
+      try{{timelineLane.setPointerCapture(scrubPointerId);}}catch(error){{}}
+    }}
+    event.preventDefault();
+    scrubLatestClientX=event.clientX;
+    if(scrubRafPending)return;
+    scrubRafPending=true;
+    requestAnimationFrame(()=>{{
+      scrubRafPending=false;
+      if(!isScrubbing)return;
+      seekToTimelineFraction(timelineFractionFromClientX(scrubLatestClientX),{{autoplay:false,announceGap:false}});
+    }});
+  }});
+
+  // Set the instant a real drag is detected (pointermove above), read
+  // and cleared by the capture-phase click guard below -- set here
+  // rather than read directly off scrubHasDragged from a second
+  // pointerup listener, since listener execution order would otherwise
+  // matter (this function already resets scrubHasDragged=false below
+  // before any second listener could see it).
+  let justDragged=false;
+
+  function endTimelineScrub(event){{
+    if(scrubStartClientX===null||(event&&event.pointerId!==scrubPointerId))return;
+    if(scrubHasDragged){{
+      justDragged=true;
+      // Always apply the exact release position synchronously -- never
+      // subject to the rAF throttle above, so the gesture's real
+      // endpoint is never silently dropped in favor of a stale frame.
+      // Resume playback only if it was already playing before the drag
+      // started -- a scrub-then-release must not silently start audio
+      // that wasn't already going.
+      seekToTimelineFraction(timelineFractionFromClientX(event.clientX),{{autoplay:scrubWasPlayingBeforeDrag,announceGap:true}});
+    }}
+    scrubPointerId=null;
+    scrubStartClientX=null;
+    scrubHasDragged=false;
+    isScrubbing=false;
+  }}
+  timelineLane.addEventListener('pointerup',endTimelineScrub);
+  timelineLane.addEventListener('pointercancel',endTimelineScrub);
+
+  // Click-to-seek on the bare ruler -- the exact pre-existing gesture,
+  // now routed through the same resolveScrubTarget() core the drag
+  // above uses. Capture phase + the justDragged guard above is what
+  // stops the browser's own trailing click (which always fires after
+  // pointerup, even after a real drag) from ALSO triggering here or
+  // re-triggering whichever segment/marker the drag happened to end on
+  // -- segment.addEventListener('click',...)/marker's own click stay
+  // completely unaffected for an ordinary (non-dragged) click, since
+  // capture-phase stopPropagation only ever fires when a drag actually
+  // just happened.
+  timelineLane.addEventListener('click',(event)=>{{
+    if(justDragged){{justDragged=false;event.stopPropagation();event.preventDefault();return;}}
+    if(event.target!==timelineLane)return;
+    seekToTimelineFraction(timelineFractionFromClientX(event.clientX),{{autoplay:true,announceGap:true}});
+  }},{{capture:true}});
 
   async function renderCamera(seekTimestamp){{
     debugLog(`[renderCamera] start cameraId=${{selectedCameraId}} seekTimestamp=${{seekTimestamp}}`);
@@ -142692,6 +142889,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     video.removeAttribute('src');
     video.load();
     selectedClip=null;
+    playheadEl.hidden=true;
     skipBackButton.disabled=true;
     timelinePlayButton.disabled=true;
     skipForwardButton.disabled=true;

@@ -161,21 +161,31 @@ def test_date_nav_core_markers_present_for_dst_js_tests(monkeypatch):
 # ---------------------------------------------------------------------------
 # 10. Exact timeline seek on a historical date -- the ruler click-to-
 #    exact-time handler was already date-aware before this change (it
-#    resolves the clicked pixel fraction against viewingDate, the same
+#    resolved the clicked pixel fraction against viewingDate, the same
 #    selected-date state loadRecordingsForDate()/Previous/Next Day all
-#    read and write) and is completely untouched by this change --
-#    confirmed byte-identical, not just "still present".
+#    read and write). 2026-09-15: superseded by the timeline-scrubbing
+#    feature's unified click/drag core (resolveScrubTarget(), see
+#    test_playback_timeline_scrubbing.py) -- the click gesture itself,
+#    and its date-mode awareness, are preserved; only the underlying
+#    resolution function changed (deliberately, gap-strict now, not
+#    findClipNear()'s "nearest within 5 minutes" leniency -- see that
+#    function's own updated docstring for why). currentTimelineDayString()
+#    is the exact same viewingDate-or-today expression this test always
+#    asserted, just factored into its own named function.
 # ---------------------------------------------------------------------------
 
-def test_exact_timeline_seek_unaffected_by_date_mode(monkeypatch):
+def test_exact_timeline_seek_still_resolves_against_the_viewed_date(monkeypatch):
     html = _render(monkeypatch)
-    assert "timelineLane.addEventListener('click',(event)=>{" in html
-    idx = html.index("timelineLane.addEventListener('click',(event)=>{")
-    block = html[idx: idx + 700]
-    assert "const dayString=viewingDate||localDateStringOf(new Date());" in block, (
-        "the seek base-day resolution (already reading viewingDate before this change) must be unchanged"
+    assert "function currentTimelineDayString(){" in html
+    idx = html.index("function currentTimelineDayString(){")
+    block = html[idx: idx + 120]
+    assert "return viewingDate||localDateStringOf(new Date());" in block, (
+        "the seek base-day resolution (already reading viewingDate before the original date-navigation change) must still be date-mode-aware"
     )
-    assert "findClipNear(currentClips,target.getTime())" in block
+    assert "timelineLane.addEventListener('click',(event)=>{" in html
+    click_idx = html.index("timelineLane.addEventListener('click',(event)=>{")
+    click_block = html[click_idx: click_idx + 400]
+    assert "seekToTimelineFraction(timelineFractionFromClientX(event.clientX),{autoplay:true,announceGap:true});" in click_block
 
 
 # ---------------------------------------------------------------------------
