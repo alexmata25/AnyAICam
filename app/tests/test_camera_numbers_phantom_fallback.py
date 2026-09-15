@@ -176,6 +176,68 @@ def test_real_dynamic_cameras_take_precedence_over_stray_legacy_env_vars(tmp_pat
         assert main.get_camera_numbers() == [1]
 
 
+def test_stale_row_from_a_released_customer_identity_still_lets_startup_deduplicate(tmp_path):
+    """2026-09-15: confirmed live on Ryzen. coordinated_reenroll() (an
+    edge appliance's identity swap to a new customer) resets
+    camera_bindings.json but has no equivalent for this VMS app's own
+    local `cameras` table -- an old, already-released customer's row for
+    a camera_number the NEW customer also uses can be left behind
+    indefinitely, so get_camera_numbers() (customer_id=None) genuinely
+    does return that camera_number twice -- confirmed live to spawn two
+    full, fully-redundant motion_detector() ffmpeg processes per
+    duplicated number (798% CPU / load average 48 on an otherwise-idle
+    8-core appliance, cameras 1-3 each duplicated, 4-5 not, exactly
+    matching two customer identities' overlapping camera_number ranges).
+
+    get_camera_numbers() itself is deliberately left returning the raw,
+    possibly-duplicated rows -- test_camera_count_tenant_scoping.py's
+    test_edge_role_callers_omitting_customer_id_are_completely_unchanged
+    documents real, relied-upon behavior elsewhere that legitimately
+    sums every row, including repeated camera_numbers across different
+    customers on a shared/cloud database. The actual fix lives at the
+    three per-camera startup-task call sites in lifespan() (main.py),
+    which now compute `camera_numbers = sorted(set(get_camera_numbers()))`
+    once and iterate that -- this test proves that exact expression
+    dedupes correctly against the real stale-row shape confirmed live."""
+    db_path = tmp_path / "stale_identity.db"
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("INSERT OR IGNORE INTO partners(id,name,created_at) VALUES('partner-1','Test Partner','2026-01-01')")
+        for customer_id in ("old-released-customer", "new-active-customer"):
+            conn.execute(
+                "INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,created_at) VALUES(?,?,?,?,?,?)",
+                (customer_id, "partner-1", "Customer", f"{customer_id}@example.com", "active", "2026-01-01"),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)",
+                (f"site-{customer_id}", customer_id, "Main Site", "2026-01-01"),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES(?,?,?,?,?)",
+                (f"appl-{customer_id}", customer_id, f"site-{customer_id}", "AIC-SHARED", "2026-01-01"),
+            )
+        # Old identity: cameras 1-3 (never cleaned up after the swap).
+        for number in (1, 2, 3):
+            conn.execute(
+                "INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,name,created_at) VALUES(?,?,?,?,?,?,?)",
+                (f"old-cam-{number}", "old-released-customer", "site-old-released-customer", "appl-old-released-customer", number, f"Camera {number}", "2026-01-01"),
+            )
+        # New identity: cameras 1-5, overlapping 1-3 with the stale rows above.
+        for number in (1, 2, 3, 4, 5):
+            conn.execute(
+                "INSERT INTO cameras(id,customer_id,site_id,appliance_id,camera_number,name,created_at) VALUES(?,?,?,?,?,?,?)",
+                (f"new-cam-{number}", "new-active-customer", "site-new-active-customer", "appl-new-active-customer", number, f"Camera {number}", "2026-01-01"),
+            )
+        conn.commit()
+        conn.close()
+    with override_target(sqlite_path=db_path):
+        raw = main.get_camera_numbers()
+        assert raw.count(1) == 2 and raw.count(2) == 2 and raw.count(3) == 2, "confirms the real stale-row shape: get_camera_numbers() itself still returns duplicates, unchanged"
+        assert sorted(set(raw)) == [1, 2, 3, 4, 5], "the deduplicated expression lifespan()'s startup loops now use must still produce exactly one task per real camera_number"
+
+
 # =============================================================== readiness_snapshot()'s cameras_total -- the exact field Samsung reported as 4
 
 

@@ -39115,6 +39115,33 @@ async def lifespan(app: FastAPI):
 
 
 
+        # 2026-09-15: computed once and deduplicated, then reused by all
+        # three per-camera startup loops below (motion, AI person
+        # detection, people counting) instead of each calling
+        # get_camera_numbers() separately. Confirmed live on Ryzen: an
+        # edge appliance's identity swap (coordinated_reenroll()) resets
+        # camera_bindings.json but has no equivalent cleanup for this
+        # VMS app's own local `cameras` table, so a released customer's
+        # old row for a camera_number the NEW customer also uses can be
+        # left behind indefinitely -- get_camera_numbers() then returns
+        # that camera_number twice. Before this fix, that meant TWO full,
+        # independent motion_detector() (and, had they been enabled,
+        # ai_person_detector()/people_counting_worker()) tasks per
+        # duplicated number -- confirmed live as two entirely redundant
+        # ffmpeg processes each for camera_number 1, 2, and 3 (the exact
+        # numbers the old and new customer identities both had), a real
+        # contributor to 798% CPU / load average 48 on an otherwise-idle
+        # 8-core appliance. get_camera_numbers() itself is deliberately
+        # NOT changed to deduplicate -- test_camera_count_tenant_scoping.
+        # py's test_edge_role_callers_omitting_customer_id_are_completely_
+        # unchanged documents that its unscoped call is relied on
+        # elsewhere to sum every row, including legitimately-repeated
+        # camera_numbers across different customers on a shared/cloud
+        # database -- this fix is scoped to exactly the edge-only,
+        # one-task-per-camera-slot startup pattern that stale local rows
+        # actually broke.
+        camera_numbers = sorted(set(get_camera_numbers()))
+
         if MOTION_DETECTION_ENABLED:
 
 
@@ -39142,7 +39169,7 @@ async def lifespan(app: FastAPI):
 
 
 
-                for camera_number in get_camera_numbers()
+                for camera_number in camera_numbers
 
 
 
@@ -39171,7 +39198,7 @@ async def lifespan(app: FastAPI):
 
             ai_tasks = [
                 asyncio.create_task(ai_person_detector(camera_number))
-                for camera_number in get_camera_numbers()
+                for camera_number in camera_numbers
             ]
 
         if PEOPLE_COUNTING_ENABLED:
@@ -39184,7 +39211,7 @@ async def lifespan(app: FastAPI):
             # anything to actually run.
             people_counting_tasks = [
                 asyncio.create_task(people_counting_worker(camera_number))
-                for camera_number in get_camera_numbers()
+                for camera_number in camera_numbers
             ]
 
 
