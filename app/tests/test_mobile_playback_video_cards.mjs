@@ -70,7 +70,7 @@ function run(scenarioName, { clips, events, filterCategoryImpl }) {
   };
   const EVENT_COLORS = {
     motion: "#f0b94d", person: "#4d9ef0", vehicle: "#a06df0",
-    lpr: "#3dbfae", people_counting: "#4dcf7a", intrusion: "#f0554d",
+    lpr: "#3dbfae", people_counting: "#4dcf7a", intrusion: "#f0954d",
   };
   const activeFilters = new Set(["motion", "person", "vehicle", "lpr", "people_counting", "intrusion"]);
   function filterCategory(eventType) {

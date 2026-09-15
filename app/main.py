@@ -141427,7 +141427,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.legend-dot.event-vehicle{background:#a06df0}'
         '.legend-dot.event-lpr{background:#3dbfae}'
         '.legend-dot.event-people_counting{background:#4dcf7a}'
-        '.legend-dot.event-intrusion{background:#f0554d}'
+        '.legend-dot.event-intrusion{background:#f0954d}'
         '.event-segment{cursor:pointer}'
         # Playhead: a thin vertical indicator overlaid on the same
         # position:relative lane the recording bars already draw into
@@ -141956,7 +141956,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // (see detection_events) collapsed to the filter/legend categories
   // this page's UI already ships -- "already supported" per this
   // integration's own scope, not a new filter category.
-  const EVENT_COLORS={{motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0554d'}};
+  const EVENT_COLORS={{motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d'}};
   function filterCategory(eventType){{
     if(eventType==='motion'||eventType==='smart_motion')return 'motion';
     if(eventType==='person')return 'person';

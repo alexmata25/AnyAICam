@@ -118,18 +118,22 @@ def test_horizontal_timestamp_positioning_unchanged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4. Colors are unchanged -- EVENT_COLORS, the legend, and the marker's own
-#    background assignment are all byte-identical to before this fix.
+# 4. Colors are unchanged BY THIS LANE FIX -- EVENT_COLORS, the legend, and
+#    the marker's own background assignment are all byte-identical to
+#    before this fix. (intrusion's own hex was later corrected from a red
+#    #f0554d to a true orange #f0954d by a separate change bringing it in
+#    line with this integration's explicit color spec -- unrelated to the
+#    lane-layout fix this file otherwise covers.)
 # ---------------------------------------------------------------------------
 
 def test_event_colors_and_legend_unchanged(monkeypatch):
     html = _render(monkeypatch)
-    assert "const EVENT_COLORS={motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0554d'};" in html
+    assert "const EVENT_COLORS={motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d'};" in html
     assert "marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';" in html
     assert "segment.style.background='#e8eef6';" in html, "recording-segment color must be unchanged"
     for dot, color in [
         ("motion", "#f0b94d"), ("person", "#4d9ef0"), ("vehicle", "#a06df0"),
-        ("lpr", "#3dbfae"), ("people_counting", "#4dcf7a"), ("intrusion", "#f0554d"),
+        ("lpr", "#3dbfae"), ("people_counting", "#4dcf7a"), ("intrusion", "#f0954d"),
     ]:
         assert f".legend-dot.event-{dot}{{background:{color}}}" in html
 
