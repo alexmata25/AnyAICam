@@ -39313,9 +39313,26 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # 2026-09-15: `or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE` added.
+    # Confirmed live on Ryzen during the Camera 1 recording-upload pilot: a
+    # second, independent instance of the exact same dead-code class 2672fb4
+    # fixed inside recording_upload_worker() itself -- that fix made the
+    # function's OWN top-of-body gate respect a pilot scope, but this
+    # call site, which decides whether the function is ever invoked as a
+    # task AT ALL, still checked RECORDING_UPLOAD_ENABLED alone. With
+    # RECORDING_UPLOAD_ENABLED correctly staying false, recording_upload_
+    # worker() was never scheduled, so 2672fb4's own fix could never run
+    # -- confirmed live: no "recording_upload.worker_started" log line
+    # ever appeared, even after the cloud-side credential-gate fix
+    # (71e911f) let a pilot camera's *event-media* uploads (a separate,
+    # already-working path -- event_media_uploader.py calls recording_
+    # uploader._ensure_session() directly, never through this task)
+    # succeed. RECORDING_UPLOAD_ENABLED=false still means every
+    # non-pilot camera is skipped by the per-camera scope check inside
+    # the function itself, unchanged.
     recording_upload_task = (
         asyncio.create_task(recording_uploader.recording_upload_worker())
-        if RUNTIME_ROLE in {"edge", "combined"} and recording_uploader.RECORDING_UPLOAD_ENABLED
+        if RUNTIME_ROLE in {"edge", "combined"} and (recording_uploader.RECORDING_UPLOAD_ENABLED or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE)
         else None
     )
     recording_retention_sweep_task = (
