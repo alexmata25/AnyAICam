@@ -121,6 +121,25 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         audit(identity,'customer_account.unlocked','partner_user',user_id,{'customer_id':customer_id,'lockout_cleared':bool(deleted)})
         return {'message':'Customer account lockout cleared. The password and customer access were not changed.','lockout_cleared':bool(deleted)}
 
+    @app.get('/api/partner/customer-accounts')
+    def customer_accounts(request: Request):
+        identity=require_partner_access(request)
+        try: require_permission(identity,'customer.edit')
+        except PermissionError as error: raise HTTPException(status_code=403,detail='Customer account management permission is required.') from error
+        with connection() as db:
+            customers=[dict(item) for item in db.execute('SELECT id,name,email,partner_id FROM customers ORDER BY name').fetchall()]
+            permitted=[item for item in customers if tenant_owns_partner(db,identity,item['partner_id'])]
+            accounts=[]
+            for customer in permitted:
+                for user in db.execute("SELECT id,email,name,role FROM partner_users WHERE customer_id=? AND role IN ('customer_owner','customer_viewer') ORDER BY email",(customer['id'],)).fetchall():
+                    account=dict(user); account['customer_id']=customer['id']; account['customer_name']=customer['name']; account['locked']=bool(db.execute('SELECT 1 FROM account_lockouts WHERE email=? AND locked_until>?',(account['email'].lower(),datetime.now().isoformat())).fetchone()); accounts.append(account)
+        return {'accounts':accounts}
+
+    @app.get('/partner/customer-accounts',response_class=HTMLResponse)
+    def customer_accounts_page(request: Request):
+        require_partner_access(request)
+        return HTMLResponse('''<!doctype html><html><head><meta charset="utf-8"><title>Customer accounts | AnyAiCam</title></head><body><main><h1>Customer account recovery</h1><p>Unlocking clears only temporary failed-login state. It never changes a password, plan, camera, site, appliance, subscription, or permission.</p><div id="accounts">Loading authorized customer accounts…</div><p id="result" role="status"></p></main><script>async function load(){const r=await fetch('/api/partner/customer-accounts'),b=await r.json(),box=document.getElementById('accounts');if(!r.ok){box.textContent=b.detail||'Unable to load customer accounts.';return}box.replaceChildren(...b.accounts.map(a=>{const d=document.createElement('div'),button=document.createElement('button');d.textContent=`${a.customer_name} — ${a.email} (${a.locked?'locked':'not locked'}) `;button.textContent='Unlock account';button.onclick=async()=>{if(!confirm(`Clear temporary lockout for ${a.email}? Password and customer access will not change.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/unlock`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.';if(x.ok)load()};d.append(button);return d}))}load()</script></body></html>''')
+
     @app.get('/forgot-password',response_class=HTMLResponse)
     def forgot_password_page():
         content='''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Forgot password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="forgot-form" class="rule-form"><label>Account email<input id="forgot-email" type="email" required></label><button class="action-button">Prepare reset message</button></form><p class="health-detail">Local development writes the reset message to the email-preview folder. Production uses the configured email provider.</p></section>'''; scripts='''<script>document.getElementById('forgot-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('forgot-email').value})}),r=await response.json();showToast(r.message)})</script>'''; return shell('Forgot password','users',content,scripts)
