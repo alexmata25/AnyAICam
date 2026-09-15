@@ -321,6 +321,43 @@ def test_pilot_listed_camera_gets_the_broad_bulk_policy_with_the_global_flag_off
     assert appliance_cloud.RECORDING_UPLOAD_ENABLED is False
 
 
+def test_pilot_listed_camera_reaches_credentials_with_both_global_flags_off(client, db_path, monkeypatch):
+    """2026-09-15: confirmed live as a real gap. Every pilot-camera test
+    above pairs pilot_cameras with event_media_enabled=True -- but the
+    real, intended production state for the Camera 1 recording pilot is
+    BOTH RECORDING_UPLOAD_ENABLED and EVENT_MEDIA_UPLOAD_ENABLED false,
+    relying on the pilot list alone. Before this fix the top-level gate
+    on this route checked only the two flags, never the pilot list, so
+    a pilot-listed camera 404'd here -- confirmed live on Ryzen/staging
+    -- even though recording_available() below already accepted it.
+    This is the actual scenario the Camera 1 pilot depends on."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=False, pilot_cameras={"cam-1"})
+    _install_fake_boto3(monkeypatch)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-1",
+                  customer_id="cust-1", site_id="site-1")
+
+    resource = _issue_and_get_resource(client, "cam-1", "appl-1", "cred")
+
+    assert resource == "arn:aws:s3:::anyaicam-recordings-prod-20260820/recordings/cust-1/site-1/appl-1/cam-1/*"
+    assert "/events/" not in resource
+
+
+def test_a_non_pilot_camera_still_404s_on_credentials_with_both_global_flags_off(client, db_path, monkeypatch):
+    """Regression lock, mirroring test_a_non_pilot_camera_still_404s_on_
+    available_with_the_global_flag_off below: being on the allowlist for
+    ONE camera must never open this route for any other camera."""
+    _configure(monkeypatch, recording_enabled=False, event_media_enabled=False, pilot_cameras={"cam-1"})
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, appliance_id="appl-1", cloud_id="AIC-TEST", credential="cred", camera_id="cam-2",
+                  customer_id="cust-1", site_id="site-1")
+
+    response = client.post("/api/appliance/recordings/cam-2/credentials", headers=_auth_headers("appl-1", "cred"))
+    assert response.status_code == 404
+
+
 def test_a_non_pilot_camera_still_gets_the_narrow_event_media_policy(client, db_path, monkeypatch):
     """Regression lock: listing one camera must not widen scope for any
     other camera, even on the same appliance."""

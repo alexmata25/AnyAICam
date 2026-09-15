@@ -493,7 +493,19 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # keeps existing bulk-recording behavior completely unchanged
         # when that flag is the one in use.
         appliance=authenticate_appliance(request)
-        if not (RECORDING_UPLOAD_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED):
+        # 2026-09-15: added `or camera_id in RECORDING_UPLOAD_PILOT_CAMERAS`
+        # -- confirmed live as a real gap between this route and
+        # recording_available() below: that route already lets a
+        # pilot-listed camera_id through even while both flags stay
+        # false (see its own 2026-09-13 comment), but this one -- the
+        # credential-issuance route a pilot camera must reach FIRST,
+        # before it can ever call recording_available() -- did not,
+        # making the /available pilot support unreachable in practice.
+        # Checked against the raw path param, same as recording_
+        # available()'s own pilot check, before _authorized_camera()
+        # runs below -- a caller not actually authorized for this
+        # camera is still rejected there exactly as before.
+        if not (RECORDING_UPLOAD_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED or camera_id in RECORDING_UPLOAD_PILOT_CAMERAS):
             raise HTTPException(status_code=404,detail='Recording upload is not enabled.')
         camera=_authorized_camera(appliance,camera_id)
         if boto3 is None or not RECORDING_UPLOAD_ROLE_ARN or not RECORDING_S3_BUCKET or not RECORDING_AWS_REGION:
