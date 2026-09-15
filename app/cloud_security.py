@@ -206,11 +206,25 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
 
 
 def login_blocked(email: str):
-    record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),)); return bool(record and record.get('locked_until') and datetime.fromisoformat(record['locked_until'])>datetime.now())
+    record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),))
+    if not record or not record.get('locked_until'):
+        return False
+    return datetime.fromisoformat(record['locked_until']) > datetime.now()
 
 
 def record_login_failure(email: str):
-    now=datetime.now(); record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),)); attempts=(record['attempts'] if record else 0)+1; locked=(now+timedelta(minutes=settings.login_lockout_minutes)).isoformat() if attempts>=settings.login_attempt_limit else None
+    now=datetime.now(); record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),)); attempts=0
+    if record:
+        # A lockout is a bounded security window, not a permanent strike
+        # counter.  Once its timer has elapsed, the next bad password starts
+        # a fresh window instead of immediately re-locking the customer.
+        last_attempt=record.get('last_attempt_at')
+        locked_until=record.get('locked_until')
+        expired_lock=bool(locked_until and datetime.fromisoformat(locked_until)<=now)
+        stale_attempt=bool(last_attempt and datetime.fromisoformat(last_attempt)<=now-timedelta(minutes=settings.login_lockout_minutes))
+        if not expired_lock and not stale_attempt:
+            attempts=record['attempts']
+    attempts+=1; locked=(now+timedelta(minutes=settings.login_lockout_minutes)).isoformat() if attempts>=settings.login_attempt_limit else None
     with connection() as db: db.execute('INSERT INTO account_lockouts(email,attempts,locked_until,last_attempt_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET attempts=excluded.attempts,locked_until=excluded.locked_until,last_attempt_at=excluded.last_attempt_at',(email.lower(),attempts,locked,now.isoformat()))
 
 
@@ -250,7 +264,16 @@ def consume_password_reset(raw: str,new_password: str):
     match=next((item for item in records if verify_password(raw,item['token_hash'])),None)
     if not match: return None
     with connection() as db:
+        now=datetime.now().isoformat()
+        # Claim the token atomically.  A concurrent reset cannot reuse a
+        # token after this update, and all other outstanding reset links for
+        # the account are invalidated as soon as the password changes.
+        claimed=db.execute('UPDATE password_reset_tokens SET used_at=? WHERE id=? AND used_at IS NULL',(now,match['id']))
+        if not claimed.rowcount:
+            return None
         db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0 WHERE id=?',(password_hash(new_password),match['user_id']))
-        db.execute('UPDATE password_reset_tokens SET used_at=? WHERE id=?',(datetime.now().isoformat(),match['id']))
+        db.execute('UPDATE password_reset_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL',(now,match['user_id']))
+        db.execute('DELETE FROM account_lockouts WHERE email=?',(match['email'].lower(),))
+        db.execute('UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',(now,match['user_id']))
         role_row=db.execute('SELECT role FROM partner_users WHERE id=?',(match['user_id'],)).fetchone()
     return role_row['role'] if role_row else None

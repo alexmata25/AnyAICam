@@ -11,10 +11,18 @@ from fastapi.responses import FileResponse,HTMLResponse,StreamingResponse
 
 from cloud_config import settings
 from cloud_security import consume_password_reset,create_password_reset
+from appliance_protocol import RateLimiter
 from email_service import get_email_service
 from object_storage import LocalStorage,get_storage,safe_key
-from partner_db import audit,connection,row,rows,tenant_owns_partner
+from partner_db import audit,authorize_customer_tenant,connection,require_permission,row,rows,tenant_owns_partner
 from partner_portal import partner_identity,require_partner_access
+
+
+# Anonymous recovery requests deliberately receive the same generic response
+# whether or not the account exists.  These limits bound email abuse while
+# leaving the lockout policy itself unchanged.
+_password_reset_email_limiter = RateLimiter(limit=3, window_seconds=900)
+_password_reset_ip_limiter = RateLimiter(limit=30, window_seconds=900)
 
 
 def deployment_status():
@@ -61,7 +69,9 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
 
     @app.post('/api/password-reset/request')
     def password_reset_request(payload: dict,request: Request):
-        email=str(payload.get('email','')).strip().lower(); user=row('SELECT id,email FROM partner_users WHERE email=?',(email,))
+        email=str(payload.get('email','')).strip().lower(); client_ip=(request.client.host if request.client else 'unknown')
+        allowed=_password_reset_email_limiter.allow(email) and _password_reset_ip_limiter.allow(client_ip)
+        user=row('SELECT id,email,role FROM partner_users WHERE email=?',(email,)) if allowed else None
         if user:
             raw=create_password_reset(user['id'],email)
             # Confirmed live on Samsung: settings.password_reset_url defaults
@@ -86,13 +96,30 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
             if settings.edge_production:
                 scheme=request.headers.get('x-forwarded-proto',request.url.scheme)
                 host=request.headers.get('host') or request.url.netloc
-                link=f'{scheme}://{host}/reset-password?token={raw}'
+                reset_path='/customer-reset-password' if user['role'] in ('customer_owner','customer_viewer') else '/reset-password'
+                link=f'{scheme}://{host}{reset_path}?token={raw}'
             else:
                 link=settings.password_reset_url+'?token='+raw
             message=get_email_service().send('password_reset',email,'Reset your AnyAiCam password',f'Use this one-hour password reset link:\n{link}',metadata={'expires_minutes':60})
             with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',email,message['status'],settings.email_backend,json.dumps({'expires_minutes':60}),datetime.now().isoformat()))
             audit({'email':email,'role':'account'},'password_reset.requested','partner_user',user['id'],{'provider':settings.email_backend})
         return {'message':'If the account exists, a password-reset message has been prepared.'}
+
+    @app.post('/api/partner/customers/{customer_id}/accounts/{user_id}/unlock')
+    def unlock_customer_account(request: Request,customer_id: str,user_id: str):
+        identity=require_partner_access(request)
+        try: require_permission(identity,'customer.edit')
+        except PermissionError as error: raise HTTPException(status_code=403,detail='Customer account management permission is required.') from error
+        with connection() as db:
+            customer=authorize_customer_tenant(db,identity,customer_id)
+            if not customer:
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            user=db.execute("SELECT id,email FROM partner_users WHERE id=? AND customer_id=? AND role IN ('customer_owner','customer_viewer')",(user_id,customer_id)).fetchone()
+            if not user:
+                raise HTTPException(status_code=404,detail='Customer account not found.')
+            deleted=db.execute('DELETE FROM account_lockouts WHERE email=?',(user['email'].lower(),)).rowcount
+        audit(identity,'customer_account.unlocked','partner_user',user_id,{'customer_id':customer_id,'lockout_cleared':bool(deleted)})
+        return {'message':'Customer account lockout cleared. The password and customer access were not changed.','lockout_cleared':bool(deleted)}
 
     @app.get('/forgot-password',response_class=HTMLResponse)
     def forgot_password_page():

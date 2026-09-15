@@ -56,6 +56,11 @@ def db_path(tmp_path):
 
 @pytest.fixture()
 def http_client(db_path):
+    # Recovery request throttling is process-local by design.  Each client
+    # fixture represents a fresh application test boundary, so do not leak
+    # earlier test requests into this independent scenario.
+    cloud_features._password_reset_email_limiter.events.clear()
+    cloud_features._password_reset_ip_limiter.events.clear()
     with override_target(sqlite_path=db_path):
         initialize_database()
         with TestClient(main.app) as test_client:
