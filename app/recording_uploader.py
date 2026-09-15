@@ -932,11 +932,25 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     already = set(_uploaded_files.get(camera_number, []))
     pending = _pending_recording_files(camera_number, already)
 
-    # Prioritize the newest completed recording so fresh Playback
-    # footage is not trapped behind historical upload backlog.
-    # Remaining recordings continue oldest-first so backlog still drains.
-    if len(pending) > 1:
-        pending = [pending[-1], *pending[:-1]]
+    # Newest-first, entirely (2026-09-15, staging pilot with
+    # RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA raised from 1 to 12):
+    # _pending_recording_files() returns oldest-first (its own sort is
+    # by filename, which is chronological for this project's fixed-width
+    # start_recording() naming). The previous fix here only promoted the
+    # single newest file to the front and left the rest oldest-first --
+    # correct when the total cap was 1 (that one promoted file was the
+    # only upload that could ever happen), but confirmed live on Ryzen
+    # to silently regress once the cap allows more than one upload per
+    # camera: of a 12-file allowance, only the first slot was ever the
+    # newest recording -- the remaining 11 still drained from the oldest
+    # end of the backlog (here, Sept 13), leaving current Playback
+    # analytics markers (Sept 15) with no uploaded recording underneath
+    # them most of the time. A full reverse keeps every file this
+    # function already considered eligible (nothing added, nothing
+    # dropped, nothing re-filtered) and does not change the first file
+    # selected in a single-upload pass -- reversed(pending)[0] is still
+    # pending[-1] -- only the order for the 2nd file onward changes.
+    pending = list(reversed(pending))
 
     attempted = 0
     for local_path in pending:
