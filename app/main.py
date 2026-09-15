@@ -140369,30 +140369,29 @@ def _local_date_bounds_to_utc(date: str) -> tuple[str, str]:
     return query_start, query_end
 
 
-def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
-    """All available recordings for one customer camera that overlap a
-    given customer-local calendar date, ordered oldest-first --
-    chronological order so a future continuous-playback phase can
-    chain adjacent segments directly off this list without re-sorting.
+def _recordings_overlapping_utc_range(camera_id: str, query_start: str, query_end: str) -> list[dict]:
+    """All available recordings for one customer camera whose
+    [started_at, ended_at) interval overlaps the given naive-UTC
+    [query_start, query_end) range, ordered oldest-first -- the shared
+    query body behind _customer_recordings_for_date() (bounds computed
+    server-side via the fixed APPLIANCE_TIMEZONE guess) and
+    customer_recordings_metadata()'s own day_start_utc/day_end_utc
+    request path (bounds computed in the customer's actual browser, the
+    only party that genuinely knows their real local timezone absent a
+    stored per-site one -- see that route's own comment).
 
     Catalogs local .mkv files for this camera before querying (see
-    _catalog_local_recordings_for_camera()) so a date whose Playback
-    page has never been opened before -- an old retained day -- is
-    still discoverable, without any new always-running background
-    service: the existing per-request catalog call this function
-    already makes (the same one _customer_recording_rows() has always
-    made) is sufficient, since it scans the camera's entire local
-    folder every time, not just recently-modified files.
+    _catalog_local_recordings_for_camera()) so a day whose Playback page
+    has never been opened before -- an old retained day -- is still
+    discoverable, without any new always-running background service.
 
-    Uses an interval-overlap test (started_at < day_end AND ended_at >
-    day_start), not a started_at-only bound -- a recording that starts
+    Uses an interval-overlap test (started_at < query_end AND ended_at >
+    query_start), not a started_at-only bound -- a recording that starts
     the previous day and runs past local midnight, or one that starts
-    within this day and runs into the next, must still appear here:
-    it genuinely overlaps this date's footage, even though its own
-    started_at may fall outside [day_start, day_end)."""
+    within this range and runs past its end, must still appear here: it
+    genuinely overlaps this range's footage, even though its own
+    started_at may fall outside [query_start, query_end)."""
     _catalog_local_recordings_for_camera(camera_id)
-
-    query_start, query_end = _local_date_bounds_to_utc(date)
 
     from partner_db import connection
     with connection() as db:
@@ -140404,6 +140403,26 @@ def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
             (camera_id, query_end, query_start),
         ).fetchall()
     return [_row_to_recording_metadata(row) for row in rows]
+
+
+def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
+    """All available recordings for one customer camera that overlap a
+    given customer-local calendar date, ordered oldest-first --
+    chronological order so a future continuous-playback phase can
+    chain adjacent segments directly off this list without re-sorting.
+
+    Fallback path only, for a caller that sends `date` alone (an older
+    client, or a direct API call) -- bounds are computed via the fixed
+    APPLIANCE_TIMEZONE below, which is not necessarily this particular
+    customer's/site's real timezone (there is no stored per-site
+    timezone yet). customer_recordings_metadata()'s day_start_utc/
+    day_end_utc path is authoritative whenever the caller (the page's
+    own JS) provides it, precisely to avoid this guess -- see that
+    route's own comment."""
+    _catalog_local_recordings_for_camera(camera_id)
+
+    query_start, query_end = _local_date_bounds_to_utc(date)
+    return _recordings_overlapping_utc_range(camera_id, query_start, query_end)
 
 
 def _customer_recording_dates(camera_id: str) -> list[str]:
@@ -140573,7 +140592,7 @@ def customer_clip_status(job_id: str, request: Request) -> dict:
 
 
 @app.get("/api/customer/recordings/{camera_id}")
-def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, before_id: str | None = None, near: str | None = None, date: str | None = None, limit: int = 50) -> dict:
+def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, before_id: str | None = None, near: str | None = None, date: str | None = None, day_start_utc: str | None = None, day_end_utc: str | None = None, limit: int = 50) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
     # date= is a distinct, whole-day query mode -- returns every segment
@@ -140588,6 +140607,24 @@ def customer_recordings_metadata(camera_id: str, request: Request, before: str |
             datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD.")
+        # 2026-09-15: day_start_utc/day_end_utc are optional, additive
+        # params the page's own JS now always sends alongside `date` --
+        # exact UTC instants for that LOCAL calendar day, computed in the
+        # customer's own browser (loadRecordingsForDate()'s own comment
+        # explains why: this appliance/product has no stored per-site
+        # timezone, so the browser's native Date -- which always knows
+        # its own real local offset, DST included -- is the only party
+        # that can compute this correctly, rather than the server
+        # guessing via the fixed APPLIANCE_TIMEZONE constant below).
+        # `date` itself is still validated/used as the fallback query for
+        # any older client or direct API caller that doesn't send them.
+        if day_start_utc and day_end_utc:
+            try:
+                datetime.fromisoformat(day_start_utc)
+                datetime.fromisoformat(day_end_utc)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="day_start_utc/day_end_utc must be ISO timestamps.")
+            return {"clips": _recordings_overlapping_utc_range(camera_id, day_start_utc, day_end_utc)}
         return {"clips": _customer_recordings_for_date(camera_id, date)}
     # A malformed cursor must fail cleanly (400) rather than being
     # passed straight into a raw SQL text comparison, where a garbage
@@ -142179,10 +142216,43 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const RECORDING_ROW_TOP_PX=Number(eventLaneTop(null).slice(0,-2))+EVENT_LANE_HEIGHT_PX+RECORDING_ROW_GAP_PX;
   // === LANE_CORE_END ===
 
-  function renderTimeline(cameraId,clips,events){{
+  // Genuine bug found 2026-09-15 (customer-reported: "recordings from
+  // last night appear on today's timeline"): this function used to plot
+  // every passed-in clip/event using only timelinePercent()'s time-of-day
+  // fraction, never checking which actual calendar day that clip/event
+  // falls on. That's correct only when every item in `clips`/`events`
+  // genuinely belongs to the one day the 00:00-24:00 axis represents --
+  // true for loadRecordingsForDate()'s own date=-scoped fetch, but NOT
+  // true for renderCamera()'s default view, whose `clips` are simply
+  // "the most recent N recordings" with no date filter at all (see
+  // ensureClipsLoaded()) -- e.g. first thing in the morning, before
+  // today has N recordings yet, that most-recent page is silently
+  // last night's footage, previously plotted onto an unlabeled axis that
+  // looked exactly like "today". `dayString` (every call site now passes
+  // one -- the viewed date, or today's/the deep-linked moment's own local
+  // date when none is explicitly selected) makes the day being
+  // represented explicit, and only clips/events whose real local time
+  // actually overlaps that one day are ever plotted -- an overlap test
+  // (start<dayEnd AND end>dayStart), not an exact-day match, so a
+  // recording that genuinely straddles local midnight still correctly
+  // appears (partially) on both of its adjacent days, matching this same
+  // overlap contract the server's own _customer_recordings_for_date()
+  // already uses. Computed here in the browser's own local time (native
+  // Date, via the already-existing playbackDate()) rather than any
+  // server-supplied timezone -- see loadRecordingsForDate()'s own
+  // comment for why no timezone needs to be guessed at all here.
+  function renderTimeline(cameraId,clips,events,dayString){{
     renderMobileRecentEvents(cameraId,clips,events);
     timelineLane.innerHTML='';
-    if(!clips.length&&!events.length){{timelineEmpty.hidden=false;return}}
+    const [dayY,dayM,dayD]=dayString.split('-').map(Number);
+    const dayStartMs=new Date(dayY,dayM-1,dayD,0,0,0,0).getTime();
+    const dayEndMs=dayStartMs+86400000;
+    const dayClips=clips.filter(clip=>playbackDate(clip.end).getTime()>dayStartMs&&playbackDate(clip.start).getTime()<dayEndMs);
+    const dayEvents=events.filter(event=>{{
+      const t=playbackDate(event.timestamp).getTime();
+      return t>=dayStartMs&&t<dayEndMs;
+    }});
+    if(!dayClips.length&&!dayEvents.length){{timelineEmpty.hidden=false;return}}
     timelineEmpty.hidden=true;
     // Every loaded recording gets its own proportional bar -- not just
     // the 6 most recent. Real recording data (traced 2026-09-02) shows
@@ -142194,7 +142264,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // sparse. Each bar's left/width still comes from the clip's own
     // real start/end -- true gaps stay visibly empty, nothing here
     // fabricates continuity.
-    [...clips].reverse().forEach(clip=>{{
+    [...dayClips].reverse().forEach(clip=>{{
       const startPct=timelinePercent(clip.start);
       const endPct=Math.max(startPct+0.3,timelinePercent(clip.end));
       const segment=document.createElement('div');
@@ -142208,7 +142278,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       segment.addEventListener('click',()=>playClip(cameraId,clip));
       timelineLane.appendChild(segment);
     }});
-    events.forEach(event=>{{
+    dayEvents.forEach(event=>{{
       const category=filterCategory(event.event_type);
       if(category&&!activeFilters.has(category))return;
       const pct=timelinePercent(event.timestamp);
@@ -142394,6 +142464,26 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     return `${{y}}-${{m}}-${{day}}`;
   }}
 
+  // Genuine bug found 2026-09-15: the server's own APPLIANCE_TIMEZONE
+  // (America/Chicago, hardcoded) is used to convert a plain `date=`
+  // string into UTC query bounds -- correct only for a customer/site
+  // that genuinely is in Central time, wrong for any other, and there is
+  // no stored per-customer/per-site timezone anywhere in this product
+  // yet to read instead. The browser itself always knows its own real
+  // local offset (DST included) via native Date, so it computes the
+  // exact UTC instant of this LOCAL date's own midnight-to-midnight
+  // bounds directly -- day_start_utc/day_end_utc below -- and sends
+  // those alongside `date`, instead of asking the server to guess a
+  // timezone at all. .slice(0,19) matches the naive (no trailing Z/
+  // milliseconds) UTC-ISO format started_at/ended_at are already stored
+  // and compared in everywhere else on this page.
+  function localDayBoundsToUtcNaiveIso(dateString){{
+    const [y,m,d]=dateString.split('-').map(Number);
+    const start=new Date(y,m-1,d,0,0,0,0);
+    const end=new Date(y,m-1,d+1,0,0,0,0);
+    return [start.toISOString().slice(0,19),end.toISOString().slice(0,19)];
+  }}
+
   // The already-loaded event cache is not itself date-scoped (it's the
   // existing recent-events list), so a date-mode timeline filters it
   // client-side rather than requesting a second, new events-by-date
@@ -142478,7 +142568,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // separate retry affordance of its own the way loadOlderButton
     // does, so a failed load simply renders as "no recordings for
     // this date" rather than throwing on the array operations below.
-    const clips=(await fetchClipsMetadata(cameraId,{{date}}))||[];
+    const [day_start_utc,day_end_utc]=localDayBoundsToUtcNaiveIso(date);
+    const clips=(await fetchClipsMetadata(cameraId,{{date,day_start_utc,day_end_utc}}))||[];
     if(cameraId!==selectedCameraId||date!==viewingDate){{
       debugLog('[date-mode] aborted: camera or date changed while loading');
       return;
@@ -142494,7 +142585,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
     timelineLabel.textContent=(activeTile?activeTile.textContent:'\u2014')+` \u2014 ${{date}}`;
     currentClips=clips;
-    renderTimeline(cameraId,clips,eventsForLocalDate(analyticsByCamera[cameraId]||[],date));
+    renderTimeline(cameraId,clips,eventsForLocalDate(analyticsByCamera[cameraId]||[],date),date);
     status.textContent=clips.length
       ?`${{clips.length}} recording(s) found for ${{date}}. Select one, or a point on the timeline, to play.`
       :`No recordings are available for ${{date}}.`;
@@ -142608,13 +142699,28 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     shareButton.disabled=true;
     createClipButton.disabled=true;
     placeholder.hidden=false;
+    // Genuine bug found 2026-09-15 (customer-reported: had to click the
+    // timeline before any recording became visible/accessible):
+    // renderClipList() below already populates #playback-clip-list with
+    // real data on every load, but the panel that actually contains it
+    // (#playback-clip-panel) starts `hidden` in the page's own markup
+    // and previously was only ever revealed by playClip() or the Browse
+    // button -- loadRecordingsForDate() (the date-picker path) already
+    // unconditionally reveals it; this default (just-opened-Playback)
+    // path must do the same, for the same reason.
+    clipPanel.hidden=false;
     status.textContent=clips.length?'Select a recording to play.':'No recordings available yet.';
     renderClipList(cameraId,clips);
     debugLog('[renderCamera] renderClipList done');
     const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
     timelineLabel.textContent=activeTile?activeTile.textContent:'—';
     currentClips=clips;
-    renderTimeline(cameraId,clips,events);
+    // dayString: the deep-linked moment's own local calendar date when
+    // one exists (so a deep link to an older event still shows that
+    // event's own day, not an empty "today" timeline), else today's --
+    // see renderTimeline()'s own docstring for why this is required now.
+    const dayString=seekTimestamp?localDateStringOf(playbackDate(seekTimestamp)):localDateStringOf(new Date());
+    renderTimeline(cameraId,clips,events,dayString);
     debugLog('[renderCamera] renderTimeline done, entering seekTimestamp branch check');
     // Deep-link landing: arrived here with a specific moment in mind
     // (e.g. from the focused Live View's own recent-activity list) --
@@ -142923,7 +143029,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       // timeline instead of silently reverting to the default
       // most-recent-page view. eventsForLocalDate() mirrors
       // loadRecordingsForDate()'s own date-scoping of the event markers.
-      renderTimeline(selectedCameraId,currentClips,viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):(analyticsByCamera[selectedCameraId]||[]));
+      renderTimeline(selectedCameraId,currentClips,viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):(analyticsByCamera[selectedCameraId]||[]),viewingDate||localDateStringOf(new Date()));
     }});
   }});
 
