@@ -228,6 +228,69 @@ async def test_worker_never_calls_relay_again_once_a_camera_hits_its_hard_total_
 
 
 @pytest.mark.anyio
+async def test_worker_starts_for_a_pilot_camera_even_when_globally_disabled(monkeypatch):
+    """2026-09-15: the exact defect confirmed live on Ryzen.
+    ANYAICAM_RECORDING_UPLOAD_CAMERAS=1 (RECORDING_UPLOAD_CAMERA_SCOPE)
+    was already configured there specifically to validate one pilot
+    camera without flipping RECORDING_UPLOAD_ENABLED globally -- see
+    that constant's own module-level comment -- but recording_upload_
+    worker()'s top-level gate checked RECORDING_UPLOAD_ENABLED alone,
+    before ever consulting the scope, so the worker never started at
+    all and the pilot mechanism was dead code. A non-empty scope must
+    now start the worker on its own; RECORDING_UPLOAD_ENABLED staying
+    False must still mean only the scoped camera(s) are ever relayed,
+    proven here by camera 2 (outside the scope) never being called."""
+    monkeypatch.setattr(ru, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_ENABLED", False)
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_CAMERA_SCOPE", frozenset({1}))
+    monkeypatch.setattr(ru, "SCAN_SECONDS", 0.02)
+    monkeypatch.setattr(ru, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(ru, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(ru, "_known_camera_numbers", lambda: [1, 2])
+    monkeypatch.setattr(ru, "_camera_identity", lambda n: {"camera_id": f"cam-{n}", "site_id": "site-1", "cloud_recording_mode": None})
+    calls = []
+    monkeypatch.setattr(ru, "_relay_camera_once", lambda camera_number, camera_id: calls.append(camera_number))
+
+    import asyncio
+    task = asyncio.ensure_future(ru.recording_upload_worker())
+    await asyncio.sleep(0.06)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert ru.recording_upload_state["worker_status"] != "disabled"
+    assert 1 in calls
+    assert 2 not in calls
+
+
+@pytest.mark.anyio
+async def test_worker_stays_disabled_with_no_scope_and_globally_off(monkeypatch):
+    """Regression lock in the other direction: a deployment that opts
+    into neither RECORDING_UPLOAD_ENABLED nor a pilot scope must still
+    get the original, unchanged disabled behavior."""
+    monkeypatch.setattr(ru, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_ENABLED", False)
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_CAMERA_SCOPE", None)
+    calls = []
+    monkeypatch.setattr(ru, "_relay_camera_once", lambda camera_number, camera_id: calls.append(camera_number))
+    monkeypatch.setattr(ru, "_known_camera_numbers", lambda: [1, 2])
+
+    import asyncio
+    task = asyncio.ensure_future(ru.recording_upload_worker())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert ru.recording_upload_state["worker_status"] == "disabled"
+    assert calls == []
+
+
+@pytest.mark.anyio
 async def test_worker_relays_normally_when_scope_and_cap_are_both_unset(monkeypatch):
     """Regression lock: neither new mechanism changes existing behavior
     for a deployment that doesn't opt into either."""

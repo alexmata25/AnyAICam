@@ -1026,7 +1026,19 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
 
 
 async def recording_upload_worker() -> None:
-    if RUNTIME_ROLE not in {"edge", "combined"} or not RECORDING_UPLOAD_ENABLED:
+    # 2026-09-15: previously gated on RECORDING_UPLOAD_ENABLED alone,
+    # before this worker ever looked at RECORDING_UPLOAD_CAMERA_SCOPE --
+    # confirmed live to be dead code as a result: ANYAICAM_RECORDING_
+    # UPLOAD_CAMERAS=1 (see that constant's own comment -- "lets a
+    # single camera be validated in production before this is widened")
+    # was already configured on Ryzen with exactly this pilot intent,
+    # but this worker never even started, so it could never take
+    # effect. A non-empty scope now starts the worker on its own, same
+    # as the server-side RECORDING_UPLOAD_PILOT_CAMERAS check this
+    # mirrors (appliance_cloud.py) -- RECORDING_UPLOAD_ENABLED=false
+    # still means every non-pilot camera is skipped by the per-camera
+    # scope check in the loop below, unchanged.
+    if RUNTIME_ROLE not in {"edge", "combined"} or not (RECORDING_UPLOAD_ENABLED or RECORDING_UPLOAD_CAMERA_SCOPE):
         recording_upload_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)
