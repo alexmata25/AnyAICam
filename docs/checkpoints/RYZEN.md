@@ -180,3 +180,25 @@ The one-row placeholder reconciliation above was executed first (cloud camera-ro
 **Current real state**: all 5 physical cameras (`camera_number` 1–5, 5 distinct cloud camera IDs) are cloud-provisioned, locally credentialed, actively streaming real RTSP→HLS video concurrently, and cloud-reported as `online=1`/`recording=1`/`last_error=None`. 3 generic placeholders remain (`8f2e4ce58a`, `c60062fd80`, `eff9704054`), for the correct total of 8 cloud camera rows against the 8-slot entitlement. Installed release unchanged from above: `1893a727958678ed88ecfbcc6f2ea61a46123698`. `anyaicam-agent.service` `NRestarts=0`; `anyaicam-vms` container `healthy`, `RestartCount=0` — no crash-loop across any of the four additions. Full detail (per-camera verification, the two transient/self-resolved convergence delays observed, CPU/RAM under all-five-streaming load, and the one item still sudo-gated — `/var/lib/anyaicam/camera_bindings.json`) is in `docs/PROJECT_CHECKPOINT.md`'s own dated section, not duplicated here.
 
 **Exact next step**: no camera-provisioning work remains for this customer/appliance. Any further step (cleanup of the 3 remaining placeholders, Live View validation, motion/event-media, Motion Cloud) is separately, explicitly not-yet-authorized.
+
+## 2026-09-15: Golden-foundation release (`b90ac639`) deployed to Ryzen — repair install, PASSED, all five cameras confirmed healthy on the new build
+
+The operator authorized bringing Ryzen up to the current authoritative cloud/source checkpoint (`reconcile/golden-foundation-20260911`), 19 commits ahead of the previous Ryzen baseline (`48992a5`) — the account-recovery/password-reset feature plus four tenant-isolation passes, Notifications reliability, Playback pagination reliability, and Investigate reliability, none of which had been on Ryzen before. `appliance-agent/` and `installer/` were unchanged in that range, so no installer-logic delta existed.
+
+**Division of labor, per this project's own standing rule**: Claude built and hash-verified the release, then `scp`'d it (no sudo) to Ryzen's own home directory — **the operator ran `sudo ./install.sh --repair` and `sudo bash validate.sh` themselves**, exactly like every prior Ryzen release in this checkpoint's history. Claude never executed a privileged command against Ryzen.
+
+**Release build**: `installer/build_release_installer.py --vms-commit b90ac6391b50dae0ce6bccf01c28f5ff367c6427` (repo `reconcile/golden-foundation-20260911` at that commit) — all built-in checks passed (no secrets, LF-only scripts, executable bits verified). Artifact `anyaicam-appliance-installer-1.1.0-vms-b90ac6391b50.tar.gz`, SHA-256 `0708cd577a7bca6dca5cd6ba0499fca8c1603b0d3ef1a8d54492a49da942dafa`, verified identical on Ryzen before extraction.
+
+**Install**: operator-run repair install (`5/5 markers -> existing`, identity/bindings/recordings preserved, no wipe), `validate.sh` **PASSED, 0 failures** (operator-confirmed).
+
+**Post-install verification, all read-only, all PASSED**:
+- `/version` `build_id`: `b90ac6391b50dae0ce6bccf01c28f5ff367c6427` (was `48992a51b91c...`) — exact match to the authoritative commit.
+- `cloud_id` unchanged: `AIC-C814766E`.
+- `anyaicam-vms`/`anyaicam-agent` both `active`, `NRestarts=0` on both — no crash loop.
+- `/ready` -> `ready:true`; `self_test.ok:true`, all four critical checks pass (`recordings_writable`, `storage_available` 204.4GB free, `ffmpeg_available`, `configuration_valid` — the same 3 pre-existing non-critical warnings as before, `ANYAICAM_ADMIN_EMAIL`/`ANYAICAM_ADMIN_PASSWORD`/`ANYAICAM_PORTAL_SECRET` unset, unrelated to this release).
+- **All five real cameras individually confirmed streaming and recording on the new build**: each camera's HLS `.m3u8`/latest `.ts` segment freshly written within the prior ~1-2 minutes of the check, and each camera's `/app/recordings/camera{N}/` directory had a `.mkv` file written within the prior 5 minutes. `cameras_online: 8`/`cameras_total: 8` (5 real + 3 unused placeholders, matching the 8-slot entitlement recorded above).
+- A restart-time burst of `analytics_sync`/`recording_uploader` control-plane `429`s (all 5 cameras' workers reconnecting simultaneously) was observed in the first ~3 minutes after restart and confirmed self-resolved (zero in a fresh 30s log window taken afterward) — not a regression, ordinary reconnect-storm behavior. Occasional `[cameraN] error while decoding MB ..., concealing ... errors` H.264 lines on camera2/camera4 are ordinary RTSP error-concealment noise from real hardware, consistent with streaming/recording output being unaffected for those cameras.
+
+**Nothing broke; no debugging or source fix was required for this release.** Samsung was not touched.
+
+**Exact next step**: no further Ryzen work is authorized by this pass. Live View / motion-event / Motion Cloud validation against the new build remains separately, explicitly not-yet-authorized, same as before.
