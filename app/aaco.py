@@ -38,11 +38,12 @@ class DeterministicLanguageAdapter:
         if value in {'which cameras are offline?','which cameras are offline'}:
             return AacoCommand('camera_status')
         if value.startswith('go back '):
-            m=re.fullmatch(r'go back (\d+) minutes?',value)
+            m=re.fullmatch(r'go back (\d+|ten|twenty|thirty) minutes?',value)
             if not m or not context or not context.get('camera_id') or not context.get('playback_at'):
                 return Clarification('Select a camera and playback time before navigating.')
-            at=context['playback_at']-timedelta(minutes=int(m.group(1)))
-            return AacoCommand('playback_navigation',camera_id=context['camera_id'],start=at,end=at+timedelta(minutes=1),offset_minutes=int(m.group(1)))
+            minutes={'ten':10,'twenty':20,'thirty':30}.get(m.group(1), int(m.group(1)) if m.group(1).isdigit() else None)
+            at=context['playback_at']-timedelta(minutes=minutes)
+            return AacoCommand('playback_navigation',camera_id=context['camera_id'],start=at,end=at+timedelta(minutes=1),offset_minutes=minutes)
         m=re.fullmatch(r'show (person|vehicle|car) events from the last (\d+) hours?',value)
         if m: return AacoCommand('event_search',event_type=m.group(1),start=now-timedelta(hours=int(m.group(2))),end=now)
         m=re.fullmatch(r'show camera (\d+)',value)
