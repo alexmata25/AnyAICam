@@ -9,15 +9,20 @@ class Vms:
  def live_view(self,i,c): return ('live',c)
  def playback(self,i,c,s,e): return ('playback',c,s,e)
  def search_events(self,i,**kw): return kw
+ def previous_event(self,i,c,b): return ('previous-event',c,b)
  def camera_status(self,i): return ['camera-4']
 
 def test_families_and_ambiguity_fail_closed():
  p=DeterministicLanguageAdapter(); now=datetime(2026,9,15,12)
  assert p.parse('Show Camera 4',now=now).operation=='live_view'
  assert p.parse('Show Camera 4 yesterday at 3:30 PM',now=now).operation=='playback'
+ assert p.parse('Show Camera 2 from 3:15 yesterday',now=now).operation=='playback'
+ assert p.parse('Show the front entrance',now=now).camera_id=='camera-name:front entrance'
  assert p.parse('Show person events from the last 2 hours',now=now).operation=='event_search'
  assert p.parse('Which cameras are offline?',now=now).operation=='camera_status'
  assert isinstance(p.parse('Show the camera',now=now),Clarification)
+ assert isinstance(p.parse('Return to live',now=now),Clarification)
+ assert isinstance(p.parse('Show previous event',now=now),Clarification)
  assert isinstance(p.parse('Delete everything',now=now),Clarification)
 
 def test_tenant_boundary_and_context_navigation():
@@ -27,3 +32,7 @@ def test_tenant_boundary_and_context_navigation():
  except PermissionError: pass
  c=p.parse('Go back 20 minutes',now=now,context={'camera_id':'camera-4','playback_at':now})
  assert execute(c,identity={'customer_id':'a'},vms=v)[0]=='playback'
+ c=p.parse('Return to live',now=now,context={'camera_id':'camera-4'})
+ assert execute(c,identity={'customer_id':'a'},vms=v)[0]=='live'
+ c=p.parse('Show previous event',now=now,context={'camera_id':'camera-4','event_at':now})
+ assert execute(c,identity={'customer_id':'a'},vms=v)[0]=='previous-event'

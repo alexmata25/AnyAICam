@@ -15,7 +15,7 @@ class ControlledVms:
 
     def authorized_camera(self, identity, camera_id):
         self.calls.append(("authorized_camera", identity["customer_id"], camera_id))
-        return {"id": camera_id} if identity["customer_id"] == "tenant-a" and camera_id == "camera-4" else None
+        return {"id": camera_id} if identity["customer_id"] == "tenant-a" and camera_id in {"camera-4", "camera-name:front entrance"} else None
 
     def live_view(self, identity, camera_id):
         self.calls.append(("live", identity["customer_id"], camera_id))
@@ -27,7 +27,12 @@ class ControlledVms:
 
     def search_events(self, identity, **kwargs):
         self.calls.append(("events", identity["customer_id"], kwargs))
-        return {"kind": "events", "message": "One authorized result", "events": [{"label": "Camera 4: Person", "timestamp": "2026-09-15T10:00:00", "href": "/investigate"}]}
+        context = {"camera_id": "camera-4", "event_at": "2026-09-15T10:00:00"}
+        return {"kind": "events", "message": "One authorized result", "events": [{"label": "Camera 4: Person", "timestamp": "2026-09-15T10:00:00", "href": "/investigate", "context": context}], "context": context}
+
+    def previous_event(self, identity, camera_id, before):
+        self.calls.append(("previous-event", identity["customer_id"], camera_id, before))
+        return {"kind": "events", "message": "Previous authorized event", "events": []}
 
     def camera_status(self, identity):
         self.calls.append(("status", identity["customer_id"]))
@@ -52,6 +57,7 @@ def test_page_is_shell_only_and_does_not_call_vms():
     assert response.status_code == 200
     assert "AACO loads VMS data only after a command" in response.text
     assert "/api/aaco/command" in response.text
+    assert "Show the front entrance" in response.text
     assert vms.calls == []
     assert "/api/customer/clips" not in response.text
 
@@ -72,6 +78,18 @@ def test_live_playback_events_status_and_context_reach_only_controlled_boundary(
     assert back.status_code == 200 and back.json()["kind"] == "playback"
     assert any(call[0] == "live" for call in vms.calls)
     assert sum(call[0] == "playback" for call in vms.calls) == 2
+
+
+def test_named_camera_previous_event_and_return_live_use_only_contextual_operations():
+    client, vms = _client()
+    named = client.post("/api/aaco/command", json={"command": "Show the front entrance"})
+    assert named.status_code == 200 and named.json()["kind"] == "live"
+    context = {"camera_id": "camera-4", "event_at": "2026-09-15T10:00:00"}
+    previous = client.post("/api/aaco/command", json={"command": "Show previous event", "context": context})
+    assert previous.status_code == 200 and previous.json()["kind"] == "events"
+    live = client.post("/api/aaco/command", json={"command": "Return to live", "context": {"camera_id": "camera-4"}})
+    assert live.status_code == 200 and live.json()["kind"] == "live"
+    assert any(call[0] == "previous-event" for call in vms.calls)
 
 
 def test_ambiguous_destructive_and_malformed_commands_fail_closed():

@@ -151966,22 +151966,23 @@ class _ClassicAacoBoundary:
         # Phase-1's deterministic language adapter names cameras as
         # camera-<number>.  Resolve that display token through Classic's
         # customer-scoped camera list, never a request-supplied database id.
-        if not camera_token.startswith("camera-"):
-            return None
-        try:
-            number = int(camera_token.removeprefix("camera-"))
-        except ValueError:
-            return None
         cameras = _customer_playback_cameras(self.request) or []
-        return next((camera for camera in cameras if camera.get("camera_number") == number), None)
+        return self._find_camera(cameras, camera_token)
+
+    @staticmethod
+    def _find_camera(cameras: list[dict], camera_token: str) -> dict | None:
+        if camera_token.startswith("camera-"):
+            try:
+                number = int(camera_token.removeprefix("camera-"))
+            except ValueError:
+                return None
+            return next((camera for camera in cameras if camera.get("camera_number") == number), None)
+        if camera_token.startswith("camera-name:"):
+            requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
+            return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
+        return None
 
     def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
-        if not camera_token.startswith("camera-"):
-            return None
-        try:
-            number = int(camera_token.removeprefix("camera-"))
-        except ValueError:
-            return None
         # Reuse the established Live authorization helper, including its
         # customer_viewer can_live permission, instead of inferring Live
         # access from Playback access.
@@ -151989,7 +151990,7 @@ class _ClassicAacoBoundary:
         from partner_db import connection
         with connection() as db:
             cameras = _customer_live_cameras(db, identity, "")
-        return next((camera for camera in cameras if camera.get("camera_number") == number), None)
+        return self._find_camera(cameras, camera_token)
 
     def authorized_camera(self, identity: dict, camera_id: str) -> dict | None:
         # This common Phase-1 gate establishes that the camera belongs to
@@ -152007,6 +152008,7 @@ class _ClassicAacoBoundary:
             "kind": "live",
             "message": f"Opening authorized Live view for {_camera_display_label(camera)}.",
             "href": f'/customer/cameras/{quote(str(camera["id"]), safe="")}/live',
+            "context": {"camera_id": camera_id},
         }
 
     def playback(self, identity: dict, camera_id: str, start: datetime, end: datetime) -> dict:
@@ -152019,12 +152021,15 @@ class _ClassicAacoBoundary:
         # calls /api/customer/clips, never exports, and never presigns media.
         recordings = _customer_recording_rows(camera["id"], limit=10, near=start.isoformat())
         timestamp = start.isoformat()
+        message = (
+            f"Found {len(recordings)} existing recording metadata result(s) near {timestamp}. "
+            "Open Classic Playback to select authorized media."
+            if recordings else
+            f"Playback media is currently unavailable near {timestamp}. Classic Playback remains the authorized destination when recordings are available."
+        )
         return {
             "kind": "playback",
-            "message": (
-                f"Found {len(recordings)} existing recording metadata result(s) near {timestamp}. "
-                "Open Classic Playback to select authorized media."
-            ),
+            "message": message,
             "href": f'/playback?{urlencode({"camera": camera["id"], "t": timestamp})}',
             "context": {"camera_id": camera_id, "playback_at": timestamp},
         }
@@ -152048,10 +152053,42 @@ class _ClassicAacoBoundary:
                     "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
                     "timestamp": str(event.get("timestamp")),
                     "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
+                    "context": {"camera_id": f'camera-{event.get("camera")}', "event_at": str(event.get("timestamp"))},
                 })
             if len(matches) >= 100:
                 break
-        return {"kind": "events", "message": f"{len(matches)} authorized event result(s).", "events": matches}
+        return {"kind": "events", "message": f"{len(matches)} authorized event result(s).", "events": matches, "context": matches[0]["context"] if matches else None}
+
+    def previous_event(self, identity: dict, camera_id: str, before: datetime) -> dict:
+        camera = self._camera(camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        candidates = _customer_detection_events(self.request) or []
+        prior = []
+        for event in candidates:
+            if event.get("camera_id") != camera["id"]:
+                continue
+            try:
+                occurred = datetime.fromisoformat(str(event.get("timestamp")))
+            except (TypeError, ValueError):
+                continue
+            if occurred < before:
+                prior.append((occurred, event))
+        if not prior:
+            return {"kind": "events", "message": "No earlier authorized event is available for this camera.", "events": []}
+        occurred, event = max(prior, key=lambda item: item[0])
+        context = {"camera_id": camera_id, "event_at": occurred.isoformat()}
+        return {
+            "kind": "events",
+            "message": "Previous authorized event.",
+            "events": [{
+                "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
+                "timestamp": str(event.get("timestamp")),
+                "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
+                "context": context,
+            }],
+            "context": context,
+        }
 
     def camera_status(self, identity: dict) -> dict:
         cameras = _customer_playback_cameras(self.request) or []
