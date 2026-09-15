@@ -202,3 +202,49 @@ The operator authorized bringing Ryzen up to the current authoritative cloud/sou
 **Nothing broke; no debugging or source fix was required for this release.** Samsung was not touched.
 
 **Exact next step**: no further Ryzen work is authorized by this pass. Live View / motion-event / Motion Cloud validation against the new build remains separately, explicitly not-yet-authorized, same as before.
+
+## 2026-09-15 (later): correction -- "nothing broke" above was checked only against local HLS/recording generation, never the real customer portal. It doesn't work. Root-caused both Live View and Playback; one genuine, unrelated appliance bug found and fixed; both real root causes require an owner decision, not a quiet code fix
+
+The operator personally tested the real customer portal after the `b90ac639` release above and found Live View (no feed on any camera) and Playback (nothing plays) both genuinely broken. Correcting the record: the previous entry's "all five cameras confirmed streaming and recording" was true and remains true -- but it was never proof the *customer-facing* paths worked, only that local FFmpeg output existed. This is the same class of mistake this project has been burned by before (verify each real layer, not just the backend one) and should not be repeated.
+
+**Traced customer portal -> cloud (`anyaicam-staging`, the SAME staging environment the account-recovery feature was validated against, per `ANYAICAM_CLOUD_URL` on Ryzen) -> Ryzen -> camera, separately for each feature, using only read-only queries/log inspection plus one safe, contained source fix. Ryzen was NOT reinstalled/reconfigured to investigate.**
+
+### Root cause: Live View
+
+The full command/session chain is real and working, confirmed live: a customer's "start live view" click (`live_view_sessions.py`, Phase 6c) correctly queues a `start_live_relay` command; appliance-agent correctly polls and executes it (`commands.py`'s `_set_relay_command()`), writing `/var/lib/anyaicam/live_relay_commands.json`; `live_relay_uploader.py` (inside the VMS container, which has that same path bind-mounted read-only) correctly reconciles it via `set_relay_active()` and begins requesting a live-upload S3 credential from the cloud every ~2 seconds, for every camera, continuously (confirmed via live container logs during the operator's own test window).
+
+**Every single one of those credential requests gets HTTP 404 from the cloud**, because `appliance_cloud.py`'s `live_relay_session()` route starts with `if not LIVE_RELAY_ENABLED or not appliance.get('live_relay_pilot'): raise 404` -- and on `anyaicam-staging`'s live `portal-green` container, `ANYAICAM_LIVE_RELAY_ENABLED` is **not set at all** (confirmed via the container's own env), so it defaults false. `LIVE_UPLOAD_ROLE_ARN`/`LIVE_RELAY_S3_BUCKET`/`LIVE_RELAY_AWS_REGION` are equally unset -- even flipping the enable flag alone would immediately hit the next check's `503 Live relay is not configured`. **Cloud-side AWS Live Relay infrastructure (an IAM role for live-segment uploads, an S3 bucket, a region) has never actually been provisioned for staging.** This matches, and now concretely confirms, the post-security handoff's own honest prior assessment ("Live Relay: PRESERVED architecture and IAM path; no artificial end-to-end relay session was generated") -- it was never proven end-to-end because the infrastructure to prove it was never stood up, not because of anything this Ryzen release changed. `live_relay_pilot=1` is already correctly set on this appliance's own cloud row, for what it's worth once the infrastructure exists.
+
+**Not fixed this pass** -- provisioning real AWS IAM/S3 resources and flipping `ANYAICAM_LIVE_RELAY_ENABLED` on a live, customer-facing environment is exactly the kind of decision this project reserves for explicit owner authorization, not something to do quietly while debugging.
+
+### Root cause: Playback
+
+Real recorded video reaching the cloud customer portal requires two things, and neither happens today: (1) the appliance-side recording-upload worker (`recording_uploader.py`, R3) has its own top-level gate -- `if RUNTIME_ROLE not in {edge,combined} or not RECORDING_UPLOAD_ENABLED: disabled` -- checked *before* it ever looks at `RECORDING_UPLOAD_CAMERA_SCOPE` (the `ANYAICAM_RECORDING_UPLOAD_CAMERAS=1` pilot-camera allowlist already configured on this very appliance), so the pilot mechanism that env var was clearly built for can never actually run while `RECORDING_UPLOAD_ENABLED` stays false -- a genuine defect relative to its own documented intent, left unfixed this pass (see below for why). (2) Even setting that aside, the cloud's `recordings` table has zero rows for every one of this appliance's cameras -- nothing has ever been uploaded+cataloged -- and `_customer_recording_url()`'s local-fallback path (serving a still-present local `.mkv` directly) is structurally unreachable for this deployment shape anyway, since it checks `RECORDINGS_FOLDER` on whichever container answers the HTTP request, and the cloud-hosted customer portal container has no access to Ryzen's own disk. **Real cloud Playback is only possible once recording upload genuinely runs for at least one camera** -- real video bytes leaving the appliance for S3 -- which is exactly the action the operator has explicitly reserved for their own authorization (`ANYAICAM_RECORDING_UPLOAD_ENABLED` must stay false absent that).
+
+**Not fixed this pass**, for the same reason as Live View: this requires an explicit go/no-go on real customer video leaving the appliance, not a quiet code change.
+
+### Genuine bug found and fixed (unrelated to either root cause above, but real, and explains the CPU/load reading)
+
+Read-only investigation surfaced `anyaicam-vms` running at **798% CPU, system load average ~48 on an 8-core box**. Root cause: the 2026-09-13 identity swap (`coordinated_reenroll()`, documented earlier in this file) resets `camera_bindings.json` but has no equivalent cleanup for this VMS app's own local `cameras` table -- the released customer's (`4efaf5153f`) old rows for camera_number 1, 2, and 3 were still sitting in `partner_portal.db` alongside the current customer's rows for the same numbers. `get_camera_numbers()` (unscoped, the only form every edge-startup caller uses) genuinely returns each duplicated number twice, so `lifespan()`'s per-camera startup loops spawned **two full, independent `motion_detector()` ffmpeg processes** for cameras 1-3 (confirmed directly via `/proc` inspection: 7 motion-detector ffmpeg processes running against 5 real cameras). Fixed in source (`c2cde61`): `lifespan()` now computes `camera_numbers = sorted(set(get_camera_numbers()))` once and every per-camera startup loop (motion, AI person detection, people counting) iterates that, instead of each calling the unscoped, potentially-duplicated query directly. `get_camera_numbers()` itself was deliberately left unchanged -- `test_camera_count_tenant_scoping.py` documents a real, relied-upon contract elsewhere where the unscoped call legitimately sums every row across tenants on a shared database. New regression test added (`test_camera_numbers_phantom_fallback.py`); full tenant-isolation/auth/camera regression sweep reproduced the exact same 2 pre-existing, unrelated failures before and after, zero new ones.
+
+**This fix does not resolve Live View or Playback** -- it only stops real, wasted CPU/resource contention from stale identity-swap rows. It's real and worth deploying on its own merits regardless of the other two.
+
+### Staged, not yet installed
+
+Built and hash-verified: `anyaicam-appliance-installer-1.1.0-vms-c2cde61f239f.tar.gz`, SHA-256 `630c1428f93d0469f6bae7f0f1db086c7b8ec826eb947b18da86dea7603805e7`, copied to Ryzen's own home directory and verified identical there. **Not installed** -- per this project's standing rule, the operator runs the actual `sudo ./install.sh --repair` themselves:
+
+```
+mkdir -p ~/anyaicam-release-c2cde61f
+sha256sum ~/anyaicam-appliance-installer-1.1.0-vms-c2cde61f239f.tar.gz   # confirm: 630c1428...805e7
+tar xzf ~/anyaicam-appliance-installer-1.1.0-vms-c2cde61f239f.tar.gz -C ~/anyaicam-release-c2cde61f
+cd ~/anyaicam-release-c2cde61f
+sudo ./install.sh --repair
+sudo bash validate.sh
+```
+
+### Exact next step
+
+Two explicit owner decisions block Live View and Playback, neither answerable by more debugging:
+1. Provision real AWS Live Relay infrastructure for `anyaicam-staging` (IAM role, S3 bucket, region) and set `ANYAICAM_LIVE_RELAY_ENABLED=true` there -- only then can a live segment ever actually leave Ryzen.
+2. Authorize the pilot recording-upload pathway (fix the appliance-side gating defect, confirm the cloud-side `ANYAICAM_RECORDING_UPLOAD_PILOT_CAMERAS` allowlist, and accept that camera 1's real recordings will start leaving the appliance for S3) -- only then can cloud Playback have anything real to show.
+Until one or both of those are explicitly authorized, Live View and Playback remain genuinely non-functional through the real customer portal, regardless of any further Ryzen release.
