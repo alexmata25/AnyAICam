@@ -42,6 +42,28 @@ def logged_in_page(page, e2e_credentials):
 
 
 @pytest.mark.e2e
+def test_video_and_timeline_both_fit_a_normal_desktop_viewport_without_scrolling(logged_in_page):
+    """The actual usability requirement (2026-09-16): on a normal
+    desktop viewport, the video player and the primary timeline must
+    both be visible together, without the user having to scroll the
+    whole page. Proven by real layout geometry against the live page,
+    not by asserting on CSS source text (see app/tests/test_playback_
+    usability_compact_controls.py for that half of the coverage) --
+    this is the actual rendered/computed result a real browser produces.
+    1440x900 chosen as a representative "normal desktop viewport", not
+    an unusually generous one."""
+    page = logged_in_page
+    page.set_viewport_size({"width": 1440, "height": 900})
+    page.wait_for_timeout(500)  # let layout settle after the resize
+    timeline_bottom = page.locator("#playback-monitor-timeline").bounding_box()["y"] + \
+        page.locator("#playback-monitor-timeline").bounding_box()["height"]
+    assert timeline_bottom <= 900, (
+        f"timeline section bottom edge ({timeline_bottom}px) must fit within the 900px viewport "
+        "alongside the video, not require scrolling to reach"
+    )
+
+
+@pytest.mark.e2e
 def test_playback_loads_with_a_camera_tile_selected(logged_in_page):
     page = logged_in_page
     assert page.locator(".playback-camera-tile.active").count() == 1
