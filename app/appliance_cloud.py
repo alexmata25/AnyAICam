@@ -1361,6 +1361,53 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         audit(identity,'camera.people_counting_enabled_changed','camera',camera_id,{'people_counting_enabled':bool(enabled)})
         return {'camera_id':camera_id,'people_counting_enabled':bool(enabled)}
 
+    @app.post('/api/admin/customers/{customer_id}/camera-quota')
+    def set_camera_quota(request: Request,customer_id: str,payload: dict) -> dict:
+        # RDM's direct control over a customer's licensed camera count --
+        # the missing link the customer_entitlements.py module docstring
+        # itself already calls out: this table is the one function
+        # (total_camera_slots()) both provisioning-enforcement gates
+        # (partner_workspace.request_camera_provisioning(), appliance_
+        # cloud.appliance_submit_provisioning() -- Phase 7) actually call,
+        # but until this route, the ONLY way to write to it was a real
+        # Stripe checkout/subscription event. The pre-existing partner-
+        # facing "Update camera entitlement" form (PUT /api/partner/
+        # customers/{id}/plan) writes a DIFFERENT column (plans.camera_
+        # quantity) that total_camera_slots() has never read -- confirmed
+        # by that module's own docstring ("does not replace or migrate
+        # #1-#3 [including plans.camera_quantity]... a product decision
+        # for a later phase"). This route is that later phase, scoped
+        # exactly to what RDM needs: set the real, enforced number
+        # directly, administrator-only, with an audit trail -- not a
+        # second cosmetic-only entitlement concept.
+        #
+        # Reuses upsert_entitlement() unchanged (idempotent per (customer_
+        # id, product), "updates in place rather than accumulating rows"
+        # per its own docstring) under a dedicated product key so an RDM-
+        # granted quota is never silently double-counted alongside a real
+        # future Stripe-driven camera_slots_local/camera_slots_hybrid
+        # entitlement for the same customer -- total_camera_slots() sums
+        # every active product, so each product key must represent
+        # exactly one real grant.
+        #
+        # No hidden default, no negative/zero-is-implicitly-unlimited
+        # coercion: 0 is a valid, explicit "no cameras licensed right
+        # now" (e.g. a suspended account), and must never be confused
+        # with "not set" (no entitlement row at all, which total_camera_
+        # slots() already treats as 0 via its own sum-of-nothing default).
+        identity=require_partner_access(request,{'administrator'})
+        quota=payload.get('camera_quota')
+        if not isinstance(quota,int) or isinstance(quota,bool) or quota<0:
+            raise HTTPException(status_code=400,detail='camera_quota must be a non-negative integer.')
+        with connection() as db:
+            customer=db.execute('SELECT id FROM customers WHERE id=?',(customer_id,)).fetchone()
+        if not customer:
+            raise HTTPException(status_code=404,detail='Customer not found.')
+        from customer_entitlements import upsert_entitlement, total_camera_slots
+        upsert_entitlement(customer_id=customer_id,product='camera_slots_rdm',camera_slot_quantity=quota,status='active')
+        audit(identity,'customer.camera_quota_changed','customer',customer_id,{'camera_quota':quota})
+        return {'customer_id':customer_id,'camera_quota':quota,'total_camera_slots':total_camera_slots(customer_id)}
+
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
         # A direct Partner Portal session is tried first and is

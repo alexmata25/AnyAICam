@@ -93,7 +93,7 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
         with connection() as db:
             _user_id, cameras = _camera_context(db, identity)
             camera_rows = db.execute(
-                "SELECT id,name,camera_number FROM cameras WHERE customer_id=? ORDER BY camera_number",
+                "SELECT id,name,camera_number FROM cameras WHERE customer_id=? AND status!='removed' ORDER BY camera_number",
                 (identity["customer_id"],),
             ).fetchall()
         camera_options = "".join(

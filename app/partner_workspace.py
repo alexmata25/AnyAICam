@@ -1145,9 +1145,9 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
         if appliance_id:
             appliance=row('SELECT id FROM appliances WHERE id=? AND customer_id=?',(appliance_id,identity['customer_id']))
             if not appliance: raise HTTPException(status_code=404,detail='Appliance not found.')
-            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? AND appliance_id=? ORDER BY created_at",(identity['customer_id'],appliance_id))
+            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? AND appliance_id=? AND status!='removed' ORDER BY created_at",(identity['customer_id'],appliance_id))
         else:
-            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? ORDER BY created_at",(identity['customer_id'],))
+            cameras=rows("SELECT id,name,site_id,appliance_id,resolution,status,device_key,ip_address,manufacturer,model,camera_number,created_at FROM cameras WHERE customer_id=? AND status!='removed' ORDER BY created_at",(identity['customer_id'],))
         for camera in cameras: camera['credentials_configured']=bool(row('SELECT 1 FROM camera_credentials WHERE camera_id=?',(camera['id'],)))
         # Provisioning audit fix: this used to read plans.camera_quantity --
         # a legacy, partner-quoted, per-camera-subscription estimate that
@@ -1192,6 +1192,36 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
 
     @app.delete('/api/customer/cameras/{camera_id}')
     def remove_customer_camera(request: Request,camera_id: str) -> dict:
+        # RDM camera-quota requirement: removing an active camera must
+        # free its licensed slot (device_key IS NOT NULL is exactly what
+        # both provisioning-enforcement gates and list_customer_cameras()'s
+        # own configured_camera_count above count) WITHOUT destroying
+        # historical data -- recordings, detection_events, and
+        # customer_clip_jobs all carry a real FOREIGN KEY(camera_id)
+        # REFERENCES cameras(id) (db_migrations.py). This used to run
+        # `DELETE FROM cameras WHERE id=?`, which would either orphan
+        # every one of those historical rows' camera_id reference or
+        # violate the FK outright -- exactly the "camera removal must
+        # not destroy historical recordings/events/audit history"
+        # requirement this route now honors. The camera row itself
+        # (id/customer_id/site_id/appliance_id/name) is kept permanently
+        # so a historical recording/event still resolves a real camera
+        # name -- only device_key, camera_number, and credentials (all
+        # genuinely disposable: a future replacement camera gets its own
+        # fresh device_key/credentials, never these reused ones) are
+        # cleared, and status becomes 'removed' so a future discovery/
+        # provisioning pass never silently recycles this exact row for a
+        # DIFFERENT physical camera (which would misattribute this
+        # camera's real history onto an unrelated device -- see
+        # appliance_submit_provisioning()'s own placeholder-slot query,
+        # scoped to status='pending_installation' and therefore already
+        # correctly skipping a 'removed' row).
+        #
+        # This is a genuinely separate operation from retention/data
+        # deletion: an explicit "delete this camera's history" action
+        # (if ever added) is its own, distinct, destructive operation on
+        # recordings/detection_events directly -- never implied by
+        # removing the camera from active service.
         identity=customer_owner(request)
         try: require_permission(identity,'camera.self.configure')
         except PermissionError as error: raise HTTPException(status_code=403,detail=str(error)) from error
@@ -1205,8 +1235,8 @@ async function pollProvisioning(jobId,button){{const response=await fetch(`/api/
                 except (LookupError, ValueError):
                     pass
             db.execute('DELETE FROM camera_credentials WHERE camera_id=?',(camera_id,))
-            db.execute('DELETE FROM cameras WHERE id=?',(camera_id,))
-        audit(identity,'camera.removed','camera',camera_id); return {'message':'Camera removed.'}
+            db.execute("UPDATE cameras SET device_key=NULL,camera_number=NULL,status='removed' WHERE id=?",(camera_id,))
+        audit(identity,'camera.removed','camera',camera_id); return {'message':'Camera removed. Historical recordings and events are preserved; the freed slot is available for a new camera.'}
 
     @app.put('/api/customer/cameras')
     def configure_customer_cameras(request: Request,payload: dict) -> dict:
