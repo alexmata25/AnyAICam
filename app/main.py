@@ -79995,7 +79995,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     }}
     function card(event){{
       const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
-      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
       return `<article class="investigation-card" data-event-id="${{event.id}}">
         <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{event.event_type.replaceAll('_',' ')}}</span></div>
         <div class="investigation-body">
@@ -81064,7 +81064,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
 
 
 
@@ -119667,7 +119667,22 @@ def _render_customer_events(request: Request) -> str:
         except ValueError:
             timestamp_label = raw_timestamp or "Unknown time"
         thumb_img = (
-            f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">'
+            # 2026-09-16: loading="lazy" -- found live, real production
+            # data now has enough accumulated events (multi-thousand
+            # smart_motion volume, see _customer_investigate_events()'s
+            # own docstring on why that window exists) that eagerly
+            # requesting every row's own thumbnail as soon as the HTML
+            # parses was measured driving real 302-redirect S3 thumbnail
+            # traffic into the thousands per single page load, pushing
+            # the browser's load-completion past 30s even though every
+            # individual request itself succeeds -- confirmed via
+            # server access logs (clean 302s, zero AccessDenied) during
+            # the exact page loads that timed out. Off-screen rows now
+            # defer their image fetch until scrolled near, which is the
+            # standard fix for this exact "correct per-request but too
+            # many requests at once" shape and changes no visible
+            # behavior for a normal-sized event list.
+            f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" loading="lazy" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">'
             if event.get("thumbnail") else "—"
         )
         # Inline event-clip player (2026-09-02): a same-page thumbnail
