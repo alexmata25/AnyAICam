@@ -139978,27 +139978,43 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
 
     from partner_db import connection
     with connection() as db:
+        # 2026-09-16 correction (real regression, found live by the user
+        # then independently confirmed by Codex's own source review):
+        # this function used to return every cameras row for the
+        # customer, placeholders included, then just sorted a
+        # camera_number-NULL placeholder to the back so it was never
+        # picked as the *default* camera (the 2026-09-15 fix whose own
+        # comment used to live here). That fix solved the "default lands
+        # on an empty placeholder" bug but left every placeholder fully
+        # selectable in the camera-tile row -- confirmed live: Cameras
+        # 6/7/8 (pending_installation, camera_number NULL, no real
+        # device, will never have recordings) shown as real, clickable
+        # tiles alongside the 5 actually-provisioned cameras.
+        #
+        # `camera_number IS NOT NULL` -- the exact same signal
+        # live_view_page.py's own _customer_live_cameras() already uses
+        # to exclude these same placeholders from Live View's fleet grid
+        # (see that function's own 2026-09-13 "Live-tile grid fix"
+        # docstring) -- is reused here rather than inventing a second,
+        # possibly-diverging filter. Deliberately NOT `device_key IS NOT
+        # NULL` or any online/offline signal: camera_number is assigned
+        # once a camera is genuinely provisioned/discovered and stays
+        # assigned regardless of whether the camera is currently online,
+        # so an installer-provisioned or currently-offline real camera
+        # still renders correctly, and a camera's past recording history
+        # is untouched by this filter either way -- it only ever
+        # excludes a row that was never a real camera to begin with. With
+        # placeholders excluded outright, the NULLS-last ordering trick
+        # the previous version of this query needed is now moot (there
+        # is never a NULL camera_number row left to sort around) -- a
+        # plain `ORDER BY camera_number, id` is both simpler and
+        # sufficient.
         if identity.get("role") == "customer_owner":
             return [
                 dict(camera) for camera in db.execute(
-                    'SELECT id, name, camera_number FROM cameras WHERE customer_id=? '
-                    # camera_number IS NULL first: a pending_installation
-                    # placeholder camera (no real device, no recordings,
-                    # never will have any) sorts before every genuinely
-                    # provisioned one under a bare `ORDER BY camera_number`
-                    # -- SQLite (and Postgres) both sort NULL first in
-                    # ascending order. Confirmed live 2026-09-15 against
-                    # the real pilot customer: cameras[0] (this list's own
-                    # first row, used by _render_customer_playback() as
-                    # the default camera when no ?camera= is given) was a
-                    # placeholder ("Camera 8", camera_number NULL) instead
-                    # of any of their 5 real, recording cameras -- every
-                    # plain Playback page load with no deep link landed on
-                    # a permanently-empty timeline. This does not remove
-                    # or hide the placeholder tiles (still selectable,
-                    # same 8-camera list Investigate's own dropdown already
-                    # shows) -- it only changes which one is picked first.
-                    'ORDER BY camera_number IS NULL, camera_number, id',
+                    'SELECT id, name, camera_number FROM cameras '
+                    'WHERE customer_id=? AND camera_number IS NOT NULL '
+                    'ORDER BY camera_number, id',
                     (identity["customer_id"],),
                 ).fetchall()
             ]
@@ -140014,10 +140030,8 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
             dict(camera) for camera in db.execute(
                 'SELECT c.id, c.name, c.camera_number FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
-                'WHERE c.customer_id=? AND p.can_playback=1 '
-                # Same NULLs-last fix as the customer_owner branch above --
-                # see that query's own comment.
-                'ORDER BY c.camera_number IS NULL, c.camera_number, c.id',
+                'WHERE c.customer_id=? AND p.can_playback=1 AND c.camera_number IS NOT NULL '
+                'ORDER BY c.camera_number, c.id',
                 (user["id"], identity["customer_id"]),
             ).fetchall()
         ]
@@ -141446,8 +141460,33 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # short/wide -- centered via the sibling .panel rule below.
         # Nothing removed: the player is smaller, not gone, and every
         # existing control/feature on this page is unchanged.
-        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:min(38vh,380px);'
-        'width:auto;max-width:100%;margin:0 auto}'
+        #
+        # 2026-09-16 correction (real regression, found live by the user
+        # then independently confirmed by Codex's own source review):
+        # `width:auto` above was silently relying on a child element's
+        # own in-flow content size to give this box any width at all --
+        # the shared base `.camera-view{display:grid;aspect-ratio:16/9}`
+        # rule needs a definite width OR height from somewhere to derive
+        # the other via aspect-ratio, and neither of this box's two real
+        # children can ever provide one: `.camera-view video` is a
+        # shared, unrelated rule that makes every video `position:
+        # absolute` (out of flow, contributes nothing), and
+        # `#playback-placeholder` is `display:none` the moment playback
+        # actually starts. Confirmed live via computed styles: before
+        # playback (placeholder visible, incidentally providing a
+        # nonzero fit-content width) the box measured a correct
+        # 408x229.5px; the instant a clip was clicked (placeholder
+        # hidden, video absolutely positioned) it collapsed to exactly
+        # 0x0 -- fit-content of literally nothing. `width:auto` is
+        # replaced with an explicit, content-independent width (the same
+        # 16:9-at-the-old-height-budget size, just expressed width-first
+        # instead of height-first) so aspect-ratio always has a real
+        # value to work from regardless of playback/loading/error state
+        # or which child happens to be visible. max-height is kept as a
+        # defensive, now-normally-inert cap, not the primary driver.
+        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;'
+        'width:min(calc(38vh * 16 / 9),calc(380px * 16 / 9));max-height:min(38vh,380px);'
+        'max-width:100%;margin:0 auto}'
         '.playback-workspace-solo .panel{display:flex;justify-content:center}'
         # The .event-* classes were already used by this legend (and by
         # the /analytics search results legend) but never actually had
@@ -141500,22 +141539,29 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # The outer "Recorded activity / Timeline" section (.monitor-
         # timeline) has NINE separately-added rules in this page's
         # shared stylesheet from different points in this app's history
-        # (Live View's own Monitor page also uses this class). The one
-        # that currently wins the same !important-then-specificity
-        # cascade as above nets out to min-height:285px!important --
-        # an unconditional floor applied regardless of actual content,
-        # which on Playback specifically (now that the lane box above is
-        # a compact ~70px instead of the old broken/spread-out box)
-        # left a large, purposeless gap of dead space below the
-        # timeline. Only min-height is overridden -- height:auto,
-        # max-height:none, and overflow:auto (also part of that same
-        # winning rule) are left exactly as they already were, so the
-        # section still grows to fit real content and still scrolls if
-        # it ever needs to; it just no longer has a padded-out floor.
-        # Scoped to id=playback-monitor-timeline (added to this page's
-        # own <section> below) so Live View's Monitor page, which reuses
-        # the bare .monitor-timeline class, is completely unaffected.
-        '#playback-monitor-timeline{min-height:0!important}'
+        # (Live View's own Monitor page also uses this class).
+        #
+        # 2026-09-16 correction (real regression, found live by the user
+        # then independently confirmed by Codex's own source review): the
+        # min-height:0 override below was aimed at the wrong one of
+        # those nine rules. Confirmed live via computed styles: the rule
+        # actually winning this cascade is
+        # `.monitor-timeline{flex:0 0 285px!important;height:285px!important;
+        # max-height:285px!important;overflow:auto!important;...}` -- a
+        # genuinely FIXED 285px box, not just a 285px floor, and this
+        # section's real content measured 370px tall against a 283px
+        # visible box -- an ~87px nested scrollbar inside the primary
+        # timeline, on top of the page's own normal scroll. min-height
+        # was never the constraining property here at all. Fixed for
+        # real this time by overriding every property that rule actually
+        # sets: height/max-height/flex all forced back to content-driven
+        # values, overflow to visible (nothing needs its own scrollbar
+        # once nothing is being clipped). Still scoped to
+        # id=playback-monitor-timeline so Live View's own Monitor page,
+        # which reuses the bare .monitor-timeline class, is completely
+        # unaffected.
+        '#playback-monitor-timeline{min-height:0!important;height:auto!important;'
+        'max-height:none!important;flex:none!important;overflow:visible!important}'
         # Compact primary controls (2026-09-16, same usability pass as
         # the video-sizing fix above): smaller padding/min-height than
         # this page's shared button style, and icon-only glyphs (see the

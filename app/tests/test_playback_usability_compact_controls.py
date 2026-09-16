@@ -42,12 +42,25 @@ def _render(monkeypatch, recordings=None, events=None):
 # ---------------------------------------------------------------------------
 
 def test_video_is_capped_by_height_not_stretched_by_width(monkeypatch):
+    """2026-09-16 correction: `width:auto` (the original version of this
+    fix) turned out to be a real regression -- it silently depended on a
+    child element's own in-flow content to give the box any width at
+    all, which broke the instant playback started (the video is
+    `position:absolute` via a shared rule, and the placeholder is
+    `display:none` once playing -- see main.py's own updated comment on
+    this exact rule for the full live-diagnosed trace). Replaced with an
+    explicit, content-independent width so aspect-ratio always has a
+    real value to derive height from, regardless of playback state."""
     html = _render(monkeypatch)
     assert (
-        ".playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:min(38vh,380px);"
-        "width:auto;max-width:100%;margin:0 auto}"
+        ".playback-workspace-solo .camera-view{aspect-ratio:16/9;"
+        "width:min(calc(38vh * 16 / 9),calc(380px * 16 / 9));max-height:min(38vh,380px);"
+        "max-width:100%;margin:0 auto}"
         in html
     )
+    # The old, regressed width:auto rule must actually be gone, not
+    # merely joined by the new one.
+    assert "width:auto;max-width:100%;margin:0 auto}" not in html
     # The old width-driven 21:9-at-full-width rule must actually be gone,
     # not merely joined by the new one -- otherwise cascade order could
     # silently let the old rule win again on some browser/media-query

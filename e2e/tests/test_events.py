@@ -63,16 +63,16 @@ def test_events_shows_the_customers_real_recent_activity(events_page):
 
 @pytest.mark.e2e
 def test_events_camera_filter_checkboxes_exist_for_every_real_camera(events_page):
-    """8, not 5 -- confirmed live: this matches Investigate's own
-    established camera-dropdown pattern (PROJECT_CHECKPOINT.md's
-    2026-09-14 note), the 5 real cameras plus the same 3 pre-existing
-    pending_installation placeholder slots. Not a bug; a pre-existing,
-    consistent pattern across Investigate and Events (Live View and
-    Dashboard show only the 5 real cameras instead -- a real, minor
-    cross-page inconsistency, noted but not changed here)."""
+    """5, not 8 -- updated 2026-09-16 alongside the Playback regression
+    fix (PROJECT_CHECKPOINT.md's own entry): _customer_playback_cameras()
+    -- shared by Events, Investigate, Alerts, and Playback alike -- now
+    excludes pending_installation placeholder cameras (camera_number IS
+    NULL) the same way Live View's and Dashboard's own camera lists
+    already did, resolving the previously-documented 8-vs-5 cross-page
+    inconsistency for real rather than leaving it as a known gap."""
     page = events_page
     checkboxes = page.locator("#events-camera-filters input[type=checkbox]")
-    assert checkboxes.count() == 8
+    assert checkboxes.count() == 5
     for i in range(checkboxes.count()):
         assert checkboxes.nth(i).is_checked(), "camera filters default to all-checked (nothing hidden by default)"
 
