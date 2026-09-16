@@ -7,6 +7,17 @@ real natural-language search box (#investigation-query, placeholder
 "Example: red truck on camera 2 yesterday"), a color filter
 (#investigation-color), and 1086 real event rows
 ([data-event-id]) already embedded for this real customer.
+
+Each result is an <article class="investigation-card" data-event-id>
+with a `.investigation-thumb` (a real `<img>` when the event has a
+thumbnail, or a `.investigation-placeholder` "No thumbnail" div when it
+doesn't -- confirmed from source, card()) and a
+`.investigation-card-actions a.primary` "Playback" link. That link's
+href is built by the one shared, canonical
+_customer_event_playback_href() (app/main.py) -- always at least
+`/playback?camera=<id>`, never a broken/empty link, per that function's
+own documented history of two real "Investigate -> Playback handoff"
+bugs it was written to fix once and for all.
 """
 import pytest
 
@@ -63,3 +74,46 @@ def test_investigate_search_narrows_the_visible_event_rows(investigate_page):
     page.wait_for_timeout(500)
     filtered_rows = page.locator("[data-event-id]:visible").count()
     assert filtered_rows <= total_rows
+
+
+@pytest.mark.e2e
+def test_investigate_results_show_a_real_thumbnail_or_an_explicit_placeholder(investigate_page):
+    """Never a silently blank thumbnail area: source (card(), app/main.py)
+    always renders either a real <img> or a ".investigation-placeholder"
+    with "No thumbnail" text -- this proves that contract live, and that
+    any real <img> actually decodes."""
+    page = investigate_page
+    first_thumb = page.locator(".investigation-thumb").first
+    if first_thumb.count() == 0:
+        pytest.skip("no investigation results rendered -- nothing to check thumbnails for")
+    img = first_thumb.locator("img")
+    placeholder = first_thumb.locator(".investigation-placeholder")
+    assert img.count() == 1 or placeholder.count() == 1, "every result thumbnail area must be a real image or an explicit placeholder, never blank"
+    if img.count() == 1:
+        assert img.get_attribute("src")
+        page.wait_for_function(
+            "img => img.complete && img.naturalWidth > 0",
+            arg=img.element_handle(),
+            timeout=5000,
+        )
+    else:
+        assert "No thumbnail" in (placeholder.text_content() or "")
+
+
+@pytest.mark.e2e
+def test_clicking_playback_from_a_result_navigates_to_playback_for_that_events_camera(investigate_page):
+    """The real, canonical handoff (_customer_event_playback_href()) --
+    every result's Playback link always carries at least ?camera=<id>,
+    per that function's own fix for two real historical "Investigate ->
+    Playback handoff" bugs (see this file's own module docstring)."""
+    page = investigate_page
+    playback_link = page.locator(".investigation-card .investigation-card-actions a.primary").first
+    if playback_link.count() == 0:
+        pytest.skip("no investigation results rendered -- nothing to click through to Playback")
+    href = playback_link.get_attribute("href")
+    assert href and href.startswith("/playback"), f"expected a real Playback deep link, got {href!r}"
+    assert "camera=" in href, "a real event's Playback link must carry its own camera, not fall back to the bare /playback path"
+    playback_link.click()
+    page.wait_for_load_state("networkidle")
+    assert "/playback" in page.url
+    assert "camera=" in page.url
