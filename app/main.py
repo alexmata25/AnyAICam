@@ -152388,6 +152388,18 @@ def v111_camera_verification_page(request: Request):
 from aaco_web import register_aaco_routes
 
 
+def _aaco_identity_provider(request: Request) -> dict | None:
+    # Local import, matching this file's own established convention
+    # (17 other call sites do the same) rather than a module-level
+    # import: every existing test that simulates a logged-in identity
+    # does `monkeypatch.setattr(partner_portal, "partner_identity", ...)`,
+    # which only takes effect on a fresh `from partner_portal import
+    # partner_identity` performed at call time -- a module-level import
+    # here would bind a stale reference before any such patch applies.
+    from partner_portal import partner_identity
+    return partner_identity(request)
+
+
 class _ClassicAacoBoundary:
     """Adapter from AACO's strict command schema to existing Classic VMS.
 
@@ -152408,15 +152420,24 @@ class _ClassicAacoBoundary:
 
     @staticmethod
     def _find_camera(cameras: list[dict], camera_token: str) -> dict | None:
+        # "camera-name:" is checked first because it is itself a
+        # "camera-"-prefixed string -- checking the plain numeric prefix
+        # first would swallow every display-name token into
+        # int("name:front entrance"), which always raises and returns
+        # None before the name branch below is ever reached. Found via
+        # a real integration test exercising this against a seeded
+        # camera named "Front Entrance"; the pre-existing 32 AACO unit
+        # tests never caught this because they inject an independent
+        # fake VmsBoundary that never calls this method at all.
+        if camera_token.startswith("camera-name:"):
+            requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
+            return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
         if camera_token.startswith("camera-"):
             try:
                 number = int(camera_token.removeprefix("camera-"))
             except ValueError:
                 return None
             return next((camera for camera in cameras if camera.get("camera_number") == number), None)
-        if camera_token.startswith("camera-name:"):
-            requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
-            return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
         return None
 
     def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
@@ -152528,21 +152549,28 @@ class _ClassicAacoBoundary:
         }
 
     def camera_status(self, identity: dict) -> dict:
-        cameras = _customer_playback_cameras(self.request) or []
+        # Reuses the real, already customer-scoped /api/cameras/status
+        # route function (camera_status(request) at module scope -- not
+        # to be confused with this method of the same name) rather than
+        # a per-camera lookup: that function already excludes
+        # placeholder cameras (camera_number IS NULL) the same way
+        # _customer_playback_cameras()/_customer_live_cameras() do, so
+        # AACO's "which cameras are offline" answer matches Classic's
+        # own dashboard exactly instead of maintaining a second,
+        # independently-scoped status read.
+        by_number = {camera.get("camera_number"): camera for camera in (_customer_playback_cameras(self.request) or [])}
+        status = camera_status(self.request)
         rows = []
-        for camera in cameras:
-            try:
-                current = customer_camera_status(str(camera["id"]), self.request)
-                state = current.get("state", "unknown") if isinstance(current, dict) else "unknown"
-            except HTTPException:
-                state = "unavailable"
-            rows.append({"label": _camera_display_label(camera), "state": state})
+        for entry in status.get("cameras", []):
+            camera = by_number.get(entry.get("camera"))
+            label = _camera_display_label(camera) if camera else f'Camera {entry.get("camera")}'
+            rows.append({"label": label, "state": "online" if entry.get("online") else "offline"})
         return {"kind": "status", "message": f"Status requested for {len(rows)} authorized camera(s).", "cameras": rows}
 
 
 register_aaco_routes(
     app,
     page_shell,
-    identity_provider=lambda request: partner_identity(request),
+    identity_provider=_aaco_identity_provider,
     vms_factory=lambda request: _ClassicAacoBoundary(request),
 )
