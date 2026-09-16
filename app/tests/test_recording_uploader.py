@@ -192,6 +192,43 @@ async def test_worker_never_calls_relay_for_a_camera_outside_scope(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_worker_never_calls_relay_for_a_hybrid_or_disabled_camera(monkeypatch):
+    """Product architecture (2026-09-16): Hybrid ('motion') is cloud
+    event-clips-only now -- it must never reach _relay_camera_once() at
+    all, exactly like 'disabled' (Local) already didn't. Only
+    'continuous'/None (the Cloud/Continuous tier) actually uploads
+    continuous segments. This is the real enforcement point for that
+    guarantee, not _pending_recording_files() itself (which still
+    contains the motion-window logic, preserved for a possible future
+    tier, but is simply never called for a 'motion' camera in
+    production because of this exact gate)."""
+    monkeypatch.setattr(ru, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_ENABLED", True)
+    monkeypatch.setattr(ru, "RECORDING_UPLOAD_CAMERA_SCOPE", None)
+    monkeypatch.setattr(ru, "SCAN_SECONDS", 0.02)
+    monkeypatch.setattr(ru, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(ru, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(ru, "_known_camera_numbers", lambda: [1, 2, 3])
+    modes = {1: "disabled", 2: "motion", 3: "continuous"}
+    monkeypatch.setattr(ru, "_camera_identity", lambda n: {"camera_id": f"cam-{n}", "site_id": "site-1", "cloud_recording_mode": modes[n]})
+    calls = []
+    monkeypatch.setattr(ru, "_relay_camera_once", lambda camera_number, camera_id: calls.append(camera_number))
+
+    import asyncio
+    task = asyncio.ensure_future(ru.recording_upload_worker())
+    await asyncio.sleep(0.06)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert 1 not in calls
+    assert 2 not in calls
+    assert 3 in calls
+
+
+@pytest.mark.anyio
 async def test_worker_never_calls_relay_again_once_a_camera_hits_its_hard_total_cap(monkeypatch):
     """The scenario this whole mechanism exists for: even across many
     scan iterations, a camera that has already reached its configured

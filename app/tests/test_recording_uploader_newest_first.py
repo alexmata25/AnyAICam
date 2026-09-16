@@ -34,6 +34,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from database_backend import override_target
+from partner_db import initialize_database
+
 import recording_uploader as ru
 
 
@@ -49,6 +52,12 @@ def _reset_module_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ru, "RECORDING_UPLOAD_CAMERA_SCOPE", None)
     monkeypatch.setattr(ru, "RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA", None)
     monkeypatch.setattr(ru, "_create_recording_thumbnail", lambda mp4_path, camera_number: None)
+    # A real successful upload now also writes to the local
+    # camera_cloud_upload_daily table -- isolate this file's own DB
+    # target, matching test_recording_uploader_motion_gate.py's pattern.
+    with override_target(sqlite_path=tmp_path / "test_recording_uploader_newest_first.db"):
+        initialize_database()
+        yield
 
 
 def _make_recording(folder, camera_number, start, content=b"original mkv bytes"):

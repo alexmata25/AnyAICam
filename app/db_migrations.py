@@ -455,6 +455,44 @@ CREATE TABLE IF NOT EXISTS pending_camera_credentials(
     created_at TEXT NOT NULL
 );
 '''),
+    # RDM-controlled Hybrid cloud cost policy (2026-09-16). Cloud-side
+    # authoritative source: an RDM administrator's own explicit override
+    # of the system defaults (event_media_policy.DEFAULT_DAILY_SECONDS
+    # for daily_cloud_seconds; MOTION_RETENTION_DAYS' 7/14/30 set for
+    # retention_days), one row per customer, NULL meaning "no override,
+    # use the system default" -- never a second, silently-conflicting
+    # copy of either default. One row per customer (PRIMARY KEY), the
+    # same upsert-in-place shape as customer_entitlements/customer_
+    # notification_channels, not accumulating history rows.
+    #
+    # camera_cloud_upload_daily is the EDGE-side counterpart: real,
+    # local, DB-backed daily usage per camera, so the allowance survives
+    # a container/service restart (an in-memory counter, like recording_
+    # uploader.py's own _uploaded_files dict, would silently reset the
+    # allowance on every restart -- exactly the bypass this table exists
+    # to prevent). Keyed by (camera_number, upload_date) so a new day
+    # starts a fresh row automatically -- no explicit "reset" logic
+    # needed anywhere. Present (harmlessly, always empty) on the cloud
+    # role too, since this schema-init code runs identically on both
+    # roles; only the edge-side recording_upload_worker() ever writes to
+    # it.
+    ('20260916_cloud_cost_policy','''
+CREATE TABLE IF NOT EXISTS customer_cloud_policy(
+    customer_id TEXT PRIMARY KEY,
+    daily_cloud_seconds INTEGER,
+    retention_days INTEGER,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE TABLE IF NOT EXISTS camera_cloud_upload_daily(
+    camera_number INTEGER NOT NULL,
+    upload_date TEXT NOT NULL,
+    seconds_uploaded INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(camera_number,upload_date)
+);
+'''),
 ]
 
 
@@ -751,3 +789,26 @@ def apply_migrations():
                                        {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='detection_event_media'").fetchall()})
         if 'source_media_id' not in detection_event_media_columns: db.execute('ALTER TABLE detection_event_media ADD COLUMN source_media_id TEXT REFERENCES detection_event_media(id)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_detection_event_media_source ON detection_event_media(source_media_id)')
+
+        # Notification external-delivery reliability (2026-09-16): the
+        # real address/number a delivery attempt was actually sent to,
+        # captured at send time -- never re-derived from the customer's
+        # CURRENT preferences on a later retry, which could have changed
+        # (a different email/phone saved, or notifications disabled
+        # entirely) since the original attempt. recipient is NULL for
+        # every pre-existing in_app delivery row (never sent anywhere,
+        # nothing to retry) and for any row created before this column
+        # existed -- both are simply ineligible for the retry worker
+        # below, not treated as a broken/unknown recipient. attempt is
+        # the 1-indexed attempt number for this exact (notification_id,
+        # channel) pair, so notification_retry_worker() can find the
+        # latest attempt and enforce a bounded retry count without a
+        # second lookup table -- every attempt is its own permanent
+        # row, which is also exactly the delivery audit/history trail
+        # this phase's own requirement asks for.
+        notification_delivery_columns=({item['name'] for item in db.execute('PRAGMA table_info(notification_deliveries)').fetchall()}
+                                       if backend()=='sqlite' else
+                                       {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='notification_deliveries'").fetchall()})
+        if 'recipient' not in notification_delivery_columns: db.execute('ALTER TABLE notification_deliveries ADD COLUMN recipient TEXT')
+        if 'attempt' not in notification_delivery_columns: db.execute('ALTER TABLE notification_deliveries ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_notification_deliveries_notification_channel ON notification_deliveries(notification_id,channel,created_at)')

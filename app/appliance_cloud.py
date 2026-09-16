@@ -334,7 +334,24 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     except (TypeError, ValueError):
                         metadata=None
                 item['talk_down']={'supported':bool(supported),'metadata':metadata}
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        # cloud_policy (2026-09-16): the real, effective Hybrid cloud-
+        # cost policy for THIS appliance's own customer -- an RDM-set
+        # override (customer_cloud_policy, POST /api/admin/customers/
+        # {id}/cloud-policy above) or the system default, resolved
+        # exactly once per poll via event_media_policy.cloud_policy_for_
+        # customer(), the same function the cloud-side event-media gate
+        # itself uses, so both halves always agree. Top-level, not
+        # per-camera: the 6-hour allowance and retention window are
+        # both customer-wide entitlements, even though the allowance is
+        # enforced per camera on the appliance (each camera gets its
+        # own independent 6 hours, not a shared pool). This is the
+        # single sync channel recording_uploader.py's own periodic
+        # config refresh reads on the edge -- no second, parallel
+        # config-delivery mechanism.
+        from event_media_policy import cloud_policy_for_customer
+        with connection() as db:
+            cloud_policy=cloud_policy_for_customer(db,appliance['customer_id'])
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -1407,6 +1424,61 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         upsert_entitlement(customer_id=customer_id,product='camera_slots_rdm',camera_slot_quantity=quota,status='active')
         audit(identity,'customer.camera_quota_changed','customer',customer_id,{'camera_quota':quota})
         return {'customer_id':customer_id,'camera_quota':quota,'total_camera_slots':total_camera_slots(customer_id)}
+
+    @app.post('/api/admin/customers/{customer_id}/cloud-policy')
+    def set_cloud_policy(request: Request,customer_id: str,payload: dict) -> dict:
+        # RDM's direct control over a customer's cloud-cost policy -- the
+        # same "RDM entitlement, cloud DB authoritative, generic per
+        # customer_id" shape as cloud_recording_mode and the camera-quota
+        # route above, applied here to the two real cost-control levers:
+        # daily_cloud_seconds (an OPT-IN-ONLY ceiling on the Continuous/
+        # Cloud tier's own continuous-segment upload volume -- Hybrid no
+        # longer uploads continuous segments at all, so this has no
+        # effect there; unset means no cap, matching that tier's own
+        # "unlimited, customer pays for what they use" product purpose)
+        # and retention_days (7/14/30, the real S3 lifecycle-expiration
+        # window, applies to every customer's cloud media -- for Hybrid
+        # that means event clips/thumbnails, event_media_uploader.py's
+        # own pipeline). Either field is optional and independently settable;
+        # omitting one leaves it unchanged (a partial update, not a
+        # destructive full overwrite) -- an administrator raising only
+        # retention_days must never accidentally reset the allowance
+        # back to NULL/default in the same call.
+        #
+        # Product-wide by construction: nothing here reads or special-
+        # cases any specific customer_id, appliance_id, or camera_id --
+        # the exact same route and logic apply to every real customer
+        # this or any future appliance is activated under. Reuses the
+        # existing GET /api/appliance/configuration sync channel (see
+        # appliance_configuration() below) to reach the edge appliance,
+        # exactly like cloud_recording_mode/camera entitlements already
+        # do -- no second, parallel config-delivery mechanism.
+        identity=require_partner_access(request,{'administrator'})
+        with connection() as db:
+            customer=db.execute('SELECT id FROM customers WHERE id=?',(customer_id,)).fetchone()
+            if not customer:
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            existing=db.execute('SELECT daily_cloud_seconds,retention_days FROM customer_cloud_policy WHERE customer_id=?',(customer_id,)).fetchone()
+            daily_cloud_seconds=existing['daily_cloud_seconds'] if existing else None
+            retention_days=existing['retention_days'] if existing else None
+            if 'daily_cloud_seconds' in payload:
+                value=payload.get('daily_cloud_seconds')
+                if value is not None and (not isinstance(value,int) or isinstance(value,bool) or value<=0):
+                    raise HTTPException(status_code=400,detail='daily_cloud_seconds must be a positive integer, or null to clear back to the system default.')
+                daily_cloud_seconds=value
+            if 'retention_days' in payload:
+                value=payload.get('retention_days')
+                if value is not None and value not in (7,14,30):
+                    raise HTTPException(status_code=400,detail='retention_days must be 7, 14, or 30 (or null to clear back to the legacy plan default).')
+                retention_days=value
+            now=datetime.now().isoformat()
+            db.execute(
+                'INSERT INTO customer_cloud_policy(customer_id,daily_cloud_seconds,retention_days,updated_at,updated_by) VALUES(?,?,?,?,?) '
+                'ON CONFLICT(customer_id) DO UPDATE SET daily_cloud_seconds=excluded.daily_cloud_seconds,retention_days=excluded.retention_days,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
+                (customer_id,daily_cloud_seconds,retention_days,now,identity['email']),
+            )
+        audit(identity,'customer.cloud_policy_changed','customer',customer_id,{'daily_cloud_seconds':daily_cloud_seconds,'retention_days':retention_days})
+        return {'customer_id':customer_id,'daily_cloud_seconds':daily_cloud_seconds,'retention_days':retention_days}
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:

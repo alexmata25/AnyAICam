@@ -24,6 +24,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from database_backend import override_target
+from partner_db import initialize_database
+
 import recording_uploader as ru
 
 
@@ -32,6 +35,15 @@ def _reset_module_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ru, "RECORDINGS_FOLDER", tmp_path)
     monkeypatch.setattr(ru, "MOTION_EVENTS_FILE", tmp_path / "motion_events.jsonl")
     monkeypatch.setattr(ru, "_camera_map", {})
+    # Isolates the new (2026-09-16) daily-cloud-allowance bookkeeping's
+    # own local DB reads/writes (camera_cloud_upload_daily) -- every
+    # test in this file that isn't specifically exercising the
+    # allowance itself gets a huge default so the pre-existing motion-
+    # gate assertions below are never incidentally affected by it.
+    with override_target(sqlite_path=tmp_path / "test_recording_uploader_motion_gate.db"):
+        initialize_database()
+        monkeypatch.setattr(ru, "_daily_cloud_seconds", 10**9)
+        yield
 
 
 def _make_recording(folder, camera_number, start, content=b"segment bytes"):
@@ -203,3 +215,105 @@ def test_disabled_camera_is_skipped_entirely_by_the_worker_loop_gate(tmp_path):
     # itself (which only ever sees cameras the worker loop let through).
     _set_camera(1, "disabled")
     assert ru._camera_identity(1)["cloud_recording_mode"] == "disabled"
+
+
+# --------------------------------------------------------------- Hybrid daily cloud-upload allowance
+
+
+def test_allowance_permits_segments_up_to_the_configured_daily_limit(tmp_path, monkeypatch):
+    # Product architecture (2026-09-16): only 'continuous' (Cloud tier)
+    # cameras ever reach the allowance check at all -- Hybrid ('motion')
+    # is excluded one level up, in recording_upload_worker()'s own gate
+    # (see test_recording_uploader.py's dedicated worker-loop proof of
+    # that), so it's never exercised here. An opt-in ceiling on the
+    # premium continuous tier is still a real, useful lever an RDM
+    # administrator may choose to configure.
+    _set_camera(1, "continuous")
+    monkeypatch.setattr(ru, "_daily_cloud_seconds", ru.RECORDING_SEGMENT_SECONDS * 2)
+    starts = [BASE, BASE + timedelta(seconds=ru.RECORDING_SEGMENT_SECONDS)]
+    paths = _seed_segments(tmp_path, 1, starts)
+    pending = ru._pending_recording_files(1, set())
+    assert pending == paths  # exactly 2 segments fit a 2-segment allowance
+
+
+def test_allowance_rejects_a_segment_that_would_exceed_the_daily_limit(tmp_path, monkeypatch):
+    _set_camera(1, "continuous")
+    # 1.5 segments' worth -- the 2nd full segment cannot fit.
+    monkeypatch.setattr(ru, "_daily_cloud_seconds", int(ru.RECORDING_SEGMENT_SECONDS * 1.5))
+    starts = [BASE, BASE + timedelta(seconds=ru.RECORDING_SEGMENT_SECONDS)]
+    paths = _seed_segments(tmp_path, 1, starts)
+    pending = ru._pending_recording_files(1, set())
+    assert pending == paths[:1]
+
+
+def test_zero_remaining_allowance_permits_nothing(tmp_path, monkeypatch):
+    # _pending_recording_files() checks usage under the REAL current
+    # date (datetime.now()), not this file's own fixed BASE constant --
+    # pre-seed under that same real "today" so this test is not
+    # fragile to which calendar day it happens to run on.
+    _set_camera(1, "continuous")
+    monkeypatch.setattr(ru, "_daily_cloud_seconds", ru.RECORDING_SEGMENT_SECONDS)
+    starts = [BASE]
+    _seed_segments(tmp_path, 1, starts)
+    real_today = datetime.now().strftime("%Y-%m-%d")
+    ru._record_local_cloud_upload_seconds(1, real_today, ru.RECORDING_SEGMENT_SECONDS)
+    pending = ru._pending_recording_files(1, set())
+    assert pending == []
+
+
+def test_already_used_seconds_today_reduce_the_remaining_allowance(tmp_path, monkeypatch):
+    _set_camera(1, "continuous")
+    monkeypatch.setattr(ru, "_daily_cloud_seconds", ru.RECORDING_SEGMENT_SECONDS * 3)
+    real_today = datetime.now().strftime("%Y-%m-%d")
+    ru._record_local_cloud_upload_seconds(1, real_today, ru.RECORDING_SEGMENT_SECONDS * 2)
+    starts = [BASE, BASE + timedelta(seconds=ru.RECORDING_SEGMENT_SECONDS)]
+    paths = _seed_segments(tmp_path, 1, starts)
+    pending = ru._pending_recording_files(1, set())
+    assert pending == paths[:1]  # only 1 segment's worth of allowance remains
+
+
+def test_no_configured_ceiling_means_unlimited_for_continuous(tmp_path, monkeypatch):
+    """The Continuous/Cloud tier's own default -- no RDM override means
+    no cap at all, matching its "customer pays for what they use"
+    product purpose."""
+    _set_camera(1, "continuous")
+    monkeypatch.setattr(ru, "_daily_cloud_seconds", None)
+    starts = [BASE, BASE + timedelta(seconds=ru.RECORDING_SEGMENT_SECONDS)]
+    paths = _seed_segments(tmp_path, 1, starts)
+    pending = ru._pending_recording_files(1, set())
+    assert pending == paths
+
+
+def test_allowance_usage_is_persisted_and_survives_a_fresh_process(tmp_path, monkeypatch):
+    """The real point of this whole feature: a container/service
+    restart must never reset or bypass the allowance. Simulated here by
+    reading the usage back through a brand-new call with no in-memory
+    state carried over -- the module itself never cached this value in
+    a process-lifetime dict anywhere, only in the DB."""
+    today = BASE.strftime("%Y-%m-%d")
+    ru._record_local_cloud_upload_seconds(1, today, 1200)
+    assert ru._local_daily_seconds_used(1, today) == 1200
+    ru._record_local_cloud_upload_seconds(1, today, 300)
+    assert ru._local_daily_seconds_used(1, today) == 1500  # accumulates, never overwrites
+
+
+def test_allowance_resets_on_a_new_calendar_day(tmp_path, monkeypatch):
+    ru._record_local_cloud_upload_seconds(1, "2026-09-15", ru.RECORDING_SEGMENT_SECONDS * 10)
+    assert ru._local_daily_seconds_used(1, "2026-09-16") == 0
+
+
+def test_allowance_is_tracked_independently_per_camera(tmp_path, monkeypatch):
+    today = BASE.strftime("%Y-%m-%d")
+    ru._record_local_cloud_upload_seconds(1, today, ru.RECORDING_SEGMENT_SECONDS * 5)
+    assert ru._local_daily_seconds_used(2, today) == 0
+
+
+# The core product-architecture requirement -- Hybrid ('motion') never
+# uploads a single continuous segment to cloud, regardless of motion or
+# any configured allowance -- is proven at the real enforcement point,
+# recording_upload_worker()'s own per-camera gate, in test_recording_
+# uploader.py::test_worker_never_calls_relay_for_a_hybrid_or_disabled_
+# camera. This file's own motion-window tests above continue to prove
+# that logic itself is still correct (preserved, not deleted) if ever
+# reached again by a future product tier -- see _pending_recording_
+# files()'s own docstring.

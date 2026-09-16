@@ -113,7 +113,17 @@ def test_media_registration_rejects_an_unrelated_key_inside_the_camera_prefix(cl
     assert response.status_code == 403
 
 
-def test_media_registration_enforces_six_hour_daily_allowance(client, monkeypatch):
+def test_media_registration_is_never_blocked_by_prior_daily_usage(client, monkeypatch):
+    # Product architecture (2026-09-16): "Event clips, thumbnails,
+    # analytics, and customer notifications should not consume the
+    # 6-hour allowance and should continue normally after the
+    # allowance is reached." event_media_policy.allows_event_media()
+    # no longer enforces any cumulative daily-seconds ceiling at all --
+    # only the single-clip sanity ceiling (_MAX_SINGLE_CLIP_SECONDS,
+    # catching corrupt/bogus duration data) and the real recording-mode/
+    # retention-plan eligibility check remain. A customer with 6+ hours
+    # of ALREADY-registered event media today must still be able to
+    # register another real event's clip.
     test_client, database = client
     monkeypatch.setattr(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True)
     assert test_client.post("/api/appliance/analytics/cam-1/events", headers=_headers(), json=_event_payload()).status_code == 200
@@ -122,8 +132,7 @@ def test_media_registration_enforces_six_hour_daily_allowance(client, monkeypatc
             event_id = db.execute("SELECT id FROM detection_events WHERE local_event_id='evt-1'").fetchone()["id"]
             db.execute("INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,duration_seconds,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("old", event_id, "cust-1", "cam-1", "old", "2026-08-21T00:00:00", "2026-08-21T00:00:01", 21600, "2026-08-21T00:00:00"))
     response = test_client.post("/api/appliance/analytics/cam-1/events/evt-1/media", headers=_headers(), json=_media_payload())
-    assert response.status_code == 403
-    assert "allowance" in response.json()["detail"]
+    assert response.status_code == 200
 
 
 def test_local_path_rejects_traversal_before_any_upload(tmp_path, monkeypatch):

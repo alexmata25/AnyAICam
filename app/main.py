@@ -37134,6 +37134,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         event_end=now,
                         clip_url=clip_url,
                         thumbnail_url=thumbnail_url,
+                        already_classified=True,
                     )
                 except Exception as error:
                     print(

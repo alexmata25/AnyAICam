@@ -17,6 +17,7 @@ import pytest
 import analytics_sync
 import event_media_uploader
 import recording_uploader as recording_upload
+import smart_motion
 
 
 @pytest.fixture(autouse=True)
@@ -180,6 +181,85 @@ def test_appliance_wide_disable_overrides_camera_eligibility(monkeypatch, fake_s
 
     assert _call() is False
     assert fake_s3.uploaded == []
+
+
+# ------------------------------------------------------- environmental-motion filtering
+
+
+def _eligible_identity_with_smart_motion(camera_id="cam-1", smart_motion_enabled=True):
+    return {"camera_id": camera_id, "site_id": "site-1", "cloud_recording_mode": "motion", "smart_motion_enabled": smart_motion_enabled}
+
+
+def test_smart_motion_enabled_with_no_correlated_object_skips_upload_but_reports_success(monkeypatch, fake_s3):
+    """A raw pixel-diff trigger (tree, shadow, rain) with Smart Motion
+    enabled and no real object correlated within the window -- local
+    capture already happened upstream (this function's own contract),
+    only the cloud upload is skipped. Returns True (not a failure, a
+    deliberate skip), matching this function's own "captured local"
+    convention for the appliance-wide-disabled case."""
+    identity = _eligible_identity_with_smart_motion(smart_motion_enabled=True)
+    calls = _wire_happy_path(monkeypatch, identity, fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: None)
+
+    result = _call()
+
+    assert result is True
+    assert fake_s3.uploaded == []
+    assert calls["ensure_session_calls"] == []
+
+
+def test_smart_motion_enabled_with_a_correlated_object_uploads_normally(monkeypatch, fake_s3, _local_files):
+    identity = _eligible_identity_with_smart_motion(smart_motion_enabled=True)
+    calls = _wire_happy_path(monkeypatch, identity, fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: "person")
+
+    result = _call()
+
+    assert result is True
+    assert len(calls["ensure_session_calls"]) == 1
+    assert {item["key"].rsplit(".", 1)[-1] for item in fake_s3.uploaded} == {"mp4", "jpg"}
+
+
+def test_smart_motion_disabled_uploads_every_basic_motion_clip_unfiltered(monkeypatch, fake_s3, _local_files):
+    """No Smart Motion signal available in the existing architecture for
+    this camera -- falls back to current (unfiltered) behavior rather
+    than inventing a new heuristic, exactly as designed."""
+    identity = _eligible_identity_with_smart_motion(smart_motion_enabled=False)
+    calls = _wire_happy_path(monkeypatch, identity, fake_s3)
+
+    def _should_not_be_called(camera_number):
+        raise AssertionError("classify_motion must never be consulted when smart_motion_enabled is off")
+
+    monkeypatch.setattr(smart_motion, "classify_motion", _should_not_be_called)
+
+    result = _call()
+
+    assert result is True
+    assert len(calls["ensure_session_calls"]) == 1
+
+
+def test_already_classified_ai_yolo_path_bypasses_the_filter_entirely(monkeypatch, fake_s3, _local_files):
+    """save_yolo_events()'s own path: its qualifying_detections check
+    already guarantees a real classified object triggered this event --
+    must never be blocked by the separate smart_motion_enabled
+    entitlement/correlation signal, even when Smart Motion itself finds
+    nothing (e.g. the correlation window already moved on)."""
+    identity = _eligible_identity_with_smart_motion(smart_motion_enabled=True)
+    calls = _wire_happy_path(monkeypatch, identity, fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: None)
+
+    result = event_media_uploader.upload_motion_event_media(
+        event_id="evt-1",
+        camera_number=1,
+        event_start=datetime(2026, 9, 10, 12, 0, 0),
+        event_end=datetime(2026, 9, 10, 12, 0, 10),
+        clip_url="/recordings/clips/motion/motion_evt-1.mp4",
+        thumbnail_url="/recordings/media/motion/thumb.jpg",
+        already_classified=True,
+    )
+
+    assert result is True
+    assert len(calls["ensure_session_calls"]) == 1
 
 
 # ------------------------------------------------------------- cloud failure / retry

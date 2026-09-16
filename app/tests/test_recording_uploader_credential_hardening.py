@@ -69,6 +69,9 @@ import pytest
 from boto3.exceptions import S3UploadFailedError
 from botocore.exceptions import ClientError
 
+from database_backend import override_target
+from partner_db import initialize_database
+
 import recording_uploader as ru
 
 
@@ -85,12 +88,21 @@ def _reset_module_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ru, "_camera_backoff", {})
     monkeypatch.setattr(ru, "_uploaded_files", {})
     monkeypatch.setattr(ru, "_unsupported_codec_files", {})
+    # A real successful upload (2026-09-16) now also writes to the local
+    # camera_cloud_upload_daily table (the Continuous-tier daily-cloud-
+    # allowance bookkeeping) -- isolates this file's own DB target so
+    # that write lands in a throwaway, freshly-migrated database rather
+    # than whatever the process-default target happens to be, matching
+    # test_recording_uploader_motion_gate.py's own established pattern.
     # Real ffmpeg/ffprobe work (codec probe, remux, thumbnail extraction)
     # is orthogonal to everything this file tests -- faked out by default
     # so tests are fast and deterministic; individual tests override
     # these where the fake's own return value matters to what's being
     # proven (e.g. the multipart-config test needs a real thumbnail path).
     monkeypatch.setattr(ru, "_create_recording_thumbnail", lambda mp4_path, camera_number: None)
+    with override_target(sqlite_path=tmp_path / "test_recording_uploader_credential_hardening.db"):
+        initialize_database()
+        yield
 
 
 def _make_recording(folder, camera_number, start, content=b"original mkv bytes"):

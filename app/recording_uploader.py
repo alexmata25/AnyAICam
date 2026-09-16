@@ -154,6 +154,23 @@ RECORDING_SEGMENT_SECONDS = 300
 # just the exact detected window. Independently configurable.
 MOTION_UPLOAD_PRE_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_PRE_PADDING_SECONDS", "15")))
 MOTION_UPLOAD_POST_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_POST_PADDING_SECONDS", "15")))
+# Optional, opt-in-only per-camera daily ceiling on continuous-segment
+# cloud uploads -- NOT applied to Hybrid ('motion') at all (that mode
+# no longer uploads continuous segments to cloud in any volume, see
+# recording_upload_worker()'s own gate below: event clips/thumbnails,
+# a completely separate pipeline in event_media_uploader.py, are
+# Hybrid's only cloud media). Relevant only to the Continuous/Cloud
+# tier, and only when an RDM administrator has explicitly configured
+# one for a specific customer (event_media_policy.cloud_policy_for_
+# customer()'s own default is None/no cap -- that tier's whole product
+# purpose is unlimited, customer-paid-for continuous cloud recording).
+# None here means "no cap in effect"; synced down every _refresh_
+# camera_map() poll via GET /api/appliance/configuration's top-level
+# cloud_policy field (appliance_cloud.py), the same channel cloud_
+# recording_mode/analytics entitlements already use. Local recording/
+# analytics/notifications are unaffected regardless -- this module only
+# ever decides which already-recorded local segments also get uploaded.
+_daily_cloud_seconds: int | None = None
 SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SCAN_SECONDS", "30.0")))
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CONFIG_REFRESH_SECONDS", "300.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SESSION_RENEW_MARGIN_SECONDS", "120")))
@@ -340,9 +357,17 @@ def _refresh_camera_map() -> None:
             "lpr_enabled": bool(item.get("lpr_enabled")),
             "ppe_enabled": bool(item.get("ppe_enabled")),
         }
+    cloud_policy = response.get("cloud_policy")
+    daily_cloud_seconds = (
+        cloud_policy.get("daily_cloud_seconds")
+        if isinstance(cloud_policy, dict) and isinstance(cloud_policy.get("daily_cloud_seconds"), int)
+        else None
+    )
     with _lock:
         _camera_map.clear()
         _camera_map.update(mapping)
+        global _daily_cloud_seconds
+        _daily_cloud_seconds = daily_cloud_seconds
     recording_upload_state["last_config_refresh_at"] = datetime.now().isoformat()
 
 
@@ -354,6 +379,40 @@ def _known_camera_numbers() -> list[int]:
 def _camera_identity(camera_number: int) -> dict | None:
     with _lock:
         return _camera_map.get(camera_number)
+
+
+def _current_daily_cloud_seconds() -> int:
+    with _lock:
+        return _daily_cloud_seconds
+
+
+def _local_daily_seconds_used(camera_number: int, day: str) -> int:
+    """Real, DB-backed (not in-memory) seconds already uploaded for this
+    camera today -- survives a container/service restart exactly
+    because it lives in the appliance's own local SQLite, not a
+    process-lifetime dict like _uploaded_files above. Keyed by the
+    calendar date the upload actually happened (the appliance's own
+    local time, matching every other date-scoped concept in this
+    codebase, e.g. motion_events.jsonl's own naive-local-time
+    convention) -- a new day starts at 0 automatically, no explicit
+    reset job needed anywhere."""
+    from partner_db import connection
+    with connection() as db:
+        row = db.execute(
+            "SELECT seconds_uploaded FROM camera_cloud_upload_daily WHERE camera_number=? AND upload_date=?",
+            (camera_number, day),
+        ).fetchone()
+    return int(row["seconds_uploaded"]) if row else 0
+
+
+def _record_local_cloud_upload_seconds(camera_number: int, day: str, seconds: int) -> None:
+    from partner_db import connection
+    with connection() as db:
+        db.execute(
+            "INSERT INTO camera_cloud_upload_daily(camera_number,upload_date,seconds_uploaded,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(camera_number,upload_date) DO UPDATE SET seconds_uploaded=seconds_uploaded+excluded.seconds_uploaded,updated_at=excluded.updated_at",
+            (camera_number, day, seconds, datetime.now().isoformat()),
+        )
 
 
 def _session_expires_soon(session: dict) -> bool:
@@ -749,27 +808,49 @@ def _segment_overlaps_motion(
 
 
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
-    """cloud_recording_mode == 'motion' (Hybrid tier): only queues a
-    segment whose time window overlaps a real, padded motion event --
-    full continuous segments never reach this function at all for
-    'disabled' cameras (recording_upload_worker() skips them earlier).
-    'continuous'/None cameras (Cloud tier / no explicit mode) are
-    completely unaffected by this whole block.
+    """Product architecture (2026-09-16): recording_upload_worker()'s own
+    gate now only ever calls this function for a 'continuous'/None
+    (Cloud/Continuous tier) camera -- 'disabled' (Local) and 'motion'
+    (Hybrid, cloud event-clips-only now) are both excluded before this
+    function is ever reached. The motion-window segment-overlap
+    filtering below is consequently dead code under that gate today,
+    deliberately preserved rather than deleted (not "simply removed" --
+    the underlying local 5-minute segment system it reads, and the
+    motion-window machinery itself, remain real and may be needed again
+    for a future product tier), still fully correct and tested if ever
+    reached again.
 
     Fail-safe: if motion data can't be determined at all
     (_load_motion_windows() returns None), every file that would
-    otherwise have been gated is uploaded anyway -- losing coverage a
-    Hybrid customer is paying for is a worse failure than a few extra
-    uploaded segments. Never touches or deletes any local file either
-    way -- local recording/retention are completely independent of
-    this gate."""
+    otherwise have been gated is uploaded anyway. Never touches or
+    deletes any local file either way -- local recording/retention are
+    completely independent of this gate.
+
+    Optional daily cloud-upload ceiling: gated on whether an RDM
+    administrator has explicitly configured one (_current_daily_cloud_
+    seconds() is not None) -- NOT on cloud_recording_mode, since only a
+    'continuous' camera ever reaches this function now, and that tier's
+    own product purpose is unlimited continuous cloud recording by
+    default (no cap unless a customer's own entitlement says otherwise).
+    Checked against the real, DB-backed local daily-usage total
+    (_local_daily_seconds_used() -- persists across restarts, unlike an
+    in-memory counter), running total tracked within this one call so a
+    single scan can't queue more than the remaining allowance in one
+    pass. Event clips/thumbnails (a completely separate pipeline,
+    event_media_uploader.py) are never subject to this allowance."""
     folder_resolved = _recording_folder(camera_number).resolve()
     identity = _camera_identity(camera_number)
     cloud_recording_mode = identity.get("cloud_recording_mode") if identity else None
     motion_windows = _load_motion_windows(camera_number) if cloud_recording_mode == "motion" else None
     motion_data_unavailable = cloud_recording_mode == "motion" and motion_windows is None
+    today = datetime.now().strftime("%Y-%m-%d")
+    configured_ceiling = _current_daily_cloud_seconds()
+    allowance_remaining = None
+    if configured_ceiling is not None:
+        allowance_remaining = max(0, configured_ceiling - _local_daily_seconds_used(camera_number, today))
     pending = []
     skipped_no_motion = 0
+    skipped_allowance = 0
     for local_path in _completed_recording_files(camera_number):
         if local_path.name in already_uploaded:
             continue
@@ -787,11 +868,18 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
                 if not _segment_overlaps_motion(started_at, segment_end, motion_windows):
                     skipped_no_motion += 1
                     continue
+        if allowance_remaining is not None:
+            if allowance_remaining < RECORDING_SEGMENT_SECONDS:
+                skipped_allowance += 1
+                continue
+            allowance_remaining -= RECORDING_SEGMENT_SECONDS
         pending.append(local_path)
     if motion_data_unavailable:
         logger.warning("recording_upload.motion_data_unavailable_uploading_anyway camera=%s", camera_number)
     if skipped_no_motion:
         logger.info("recording_upload.motion_gate_skipped_no_motion camera=%s count=%s", camera_number, skipped_no_motion)
+    if skipped_allowance:
+        logger.info("recording_upload.daily_cloud_allowance_reached camera=%s skipped=%s", camera_number, skipped_allowance)
     return pending
 
 
@@ -1167,6 +1255,23 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
             logger.warning("recording_upload.notify_failed camera=%s path=%s", camera_number, local_path)
             continue
         _remember_uploaded(camera_number, local_path.name)
+        # Continuous-tier daily cloud-upload bookkeeping (2026-09-16):
+        # only a camera that reached this function at all (which, per
+        # recording_upload_worker()'s own gate, is now only ever
+        # 'continuous'/None -- Hybrid no longer uploads continuous
+        # segments) accrues usage here. Tracked unconditionally
+        # (whether or not an RDM ceiling is currently configured for
+        # this customer) so the real usage history is already accurate
+        # from day one if an administrator adds a ceiling later. Real,
+        # measured duration (not the nominal RECORDING_SEGMENT_SECONDS
+        # constant), persisted to local SQLite so it survives a
+        # container/service restart. A 'duplicate' response (the
+        # appliance's own retry of an already-cataloged upload) still
+        # increments here exactly once per real physical upload that
+        # reached this point -- _remember_uploaded() above already
+        # ensures this exact file is never re-attempted, so double-
+        # counting the same segment twice is not a real risk.
+        _record_local_cloud_upload_seconds(camera_number, started_at.strftime("%Y-%m-%d"), max(0, int(expected_duration_seconds)))
 
 
 async def recording_upload_worker() -> None:
@@ -1203,13 +1308,28 @@ async def recording_upload_worker() -> None:
                 identity = _camera_identity(camera_number)
                 if not identity:
                     continue
-                # 'disabled' (Local tier): never uploaded or cataloged at
-                # all -- skip this camera entirely. 'motion' (Hybrid) and
-                # 'continuous'/None (Cloud / no explicit mode) both still
-                # go through _relay_camera_once(); the motion-only
-                # filtering down to segments that actually overlap real
-                # motion happens inside _pending_recording_files() itself.
-                if identity.get("cloud_recording_mode") == "disabled":
+                # Product-architecture decision (2026-09-16): Hybrid
+                # ('motion') no longer uploads ANY continuous recording
+                # segments to cloud, at all -- only 'continuous'/None
+                # (the Cloud/Continuous premium tier) reaches _relay_
+                # camera_once() now. Hybrid's own cloud footage is
+                # exclusively real, intelligent event clips/thumbnails
+                # (event_media_uploader.py's separate pipeline, gated
+                # the opposite way: cloud_recording_mode=='motion'
+                # only) -- "no event, no cloud video upload" for
+                # Hybrid, full 24/7 continuous cloud for the Continuous
+                # tier a customer explicitly pays for. Local recording
+                # is completely unaffected either way -- this only ever
+                # decides which already-recorded local segments also
+                # get uploaded. 'disabled' (Local tier) was already
+                # excluded; 'motion' now gets the identical treatment.
+                # The motion-window segment-overlap filtering inside
+                # _pending_recording_files() (the ported c380f7e logic)
+                # is consequently unreachable under this gate today --
+                # deliberately preserved, not deleted, in case a future
+                # product tier ever wants a capped/filtered continuous
+                # upload again; see that function's own docstring.
+                if identity.get("cloud_recording_mode") in ("disabled", "motion"):
                     continue
                 await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
             recording_upload_state["last_scan_at"] = datetime.now().isoformat()

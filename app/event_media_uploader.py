@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import recording_uploader as recording_upload
+import smart_motion
 from event_clips import compute_clip_window
 import event_media_outbox
 
@@ -185,7 +186,21 @@ def upload_motion_event_media(
     clip_url: str,
     thumbnail_url: str | None,
     shared_media_out: dict | None = None,
+    already_classified: bool = False,
 ) -> bool:
+    # already_classified is a new, optional, purely-additive parameter
+    # (2026-09-16), defaulting to False -- the correct default for this
+    # function's other real caller, store_motion_event(), whose trigger
+    # is raw pixel-diff Basic Motion and can fire on a waving tree,
+    # shadow, or rain exactly as easily as a real person. save_yolo_
+    # events() passes True explicitly: its own qualifying_detections
+    # check already guarantees a real classified object (person/
+    # vehicle/etc, see AI_CLIP_EVENT_TYPES) triggered this event, so it
+    # never needs -- and must never be blocked by -- the smart_motion
+    # correlation signal below, which is a separate, independently
+    # RDM-controlled entitlement (smart_motion_enabled) that has no
+    # bearing on an already-classified AI detection's own eligibility.
+    #
     # shared_media_out is a new, optional, purely-additive out-parameter:
     # every existing caller (save_yolo_events()'s own AI-classification
     # path, and every existing test) omits it and this function's
@@ -286,6 +301,34 @@ def upload_motion_event_media(
             identity.get("cloud_recording_mode"),
         )
         return False
+
+    # Environmental-motion filtering (2026-09-16): "Hybrid = local
+    # continuous recording + intelligent cloud event clips" -- a raw
+    # Basic Motion trigger (tree movement, shadows, rain) must never
+    # reach the cloud just because pixels changed. Prefers the existing
+    # object-detection pipeline over inventing a new one: smart_motion.
+    # classify_motion() already correlates this camera's own recent
+    # real YOLO detections (person/vehicle/animal) against a
+    # CORRELATION_WINDOW_SECONDS window -- see that module's own
+    # docstring, built and proven for exactly this purpose. Local
+    # capture (thumbnail/clip on disk, the event's own detection_events/
+    # analytics-history row) already happened above and is completely
+    # unaffected -- only the cloud upload is skipped here. Only applies
+    # when smart_motion_enabled is on for this camera (the existing
+    # architecture's only real object-classification signal available)
+    # and the caller hasn't already guaranteed a real classification
+    # (already_classified=True, save_yolo_events()'s own path) --
+    # without Smart Motion enabled, there is no other real signal to
+    # filter on in the existing architecture, so this deliberately falls
+    # back to current behavior (every Basic Motion clip uploads) rather
+    # than inventing a raw-pixel heuristic.
+    if not already_classified and identity.get("smart_motion_enabled") and not smart_motion.classify_motion(camera_number):
+        logger.info(
+            "event_media.environmental_motion_skipped event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return True
 
     camera_id = identity["camera_id"]
     session = recording_upload._ensure_session(camera_number, camera_id)
