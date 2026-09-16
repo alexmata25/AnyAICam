@@ -328,24 +328,37 @@ def test_customer_viewer_is_rejected_on_every_manage_route(client, method, path,
     assert response.status_code == 403
 
 
-# --------------------------------------------------------------- relay stays dormant in the live hook
+# --------------------------------------------------------------- relay only runs behind its own explicit flag, and only mock
 
 
-def test_main_py_never_passes_a_relay_provider_into_the_live_detection_hook():
-    """Structural guard, not a behavioral one: relay_control.RelayProvider
-    is fully implemented and tested (test_relay_control.py,
-    test_facial_events.py), but the live save_yolo_events() hook in
-    main.py must keep calling record_facial_events() WITHOUT
-    relay_provider= -- record_facial_events()'s own default (None)
-    skips access-rule evaluation entirely (see facial_events.py). This
-    test fails loudly the moment a future edit adds relay_provider= to
-    that one call site, which is exactly the kind of change this
-    project's access-control-safety requirement says must never happen
-    silently."""
+def test_main_py_only_passes_a_relay_provider_when_the_access_control_flag_gates_it():
+    """Structural guard, not a behavioral one -- updated 2026-09-16.
+    Facial Recognition and Face Access are one connected feature: the
+    identity match -> authorization decision -> access-control command
+    chain (relay_control.py, facial_events.evaluate_access_rules()) is
+    real, tested, and now wired into the live save_yolo_events() hook,
+    but ONLY behind an explicit opt-in
+    (relay_control.FACIAL_ACCESS_CONTROL_ENABLED, default false) --
+    never unconditionally. This test fails loudly if a future edit
+    either (a) passes relay_provider= unconditionally (bypassing the
+    flag), or (b) constructs anything other than
+    relay_control.get_provider() at that call site, which is what keeps
+    this codebase's "never touch real hardware" guarantee true even
+    with the chain enabled -- see test_relay_control.py's own
+    test_get_provider_is_always_a_mock_regardless_of_the_flag for the
+    companion guarantee that get_provider() itself can never resolve to
+    anything but MockRelayProvider."""
     main_source = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
-    match = re.search(r"facial_events\.record_facial_events\(([^)]*)\)", main_source, re.S)
-    assert match, "expected exactly one record_facial_events(...) call site in main.py"
-    call_arguments = match.group(1)
-    assert "relay_provider" not in call_arguments, (
-        "main.py's live detection hook must not pass relay_provider -- see this test's own docstring"
+    assert main_source.count("facial_events.record_facial_events(") == 1, (
+        "expected exactly one record_facial_events(...) call site in main.py"
+    )
+    start = main_source.index("facial_events.record_facial_events(")
+    # A fixed window rather than a balanced-parens regex: the call site's
+    # own arguments contain a nested call (relay_control.get_provider())
+    # inside a conditional expression, which a simple `[^)]*` regex
+    # cannot span correctly.
+    call_site = " ".join(main_source[start:start + 400].split())
+    assert "relay_provider=relay_control.get_provider() if relay_control.FACIAL_ACCESS_CONTROL_ENABLED else None" in call_site, (
+        "main.py's live detection hook must only pass a relay provider when explicitly gated by "
+        "relay_control.FACIAL_ACCESS_CONTROL_ENABLED, and only via relay_control.get_provider() -- see this test's own docstring"
     )
