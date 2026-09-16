@@ -39386,6 +39386,16 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
+    talk_down_discovery_task = (
+        asyncio.create_task(talk_down_discovery.talk_down_discovery_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    talk_audio_relay_client_task = (
+        asyncio.create_task(talk_audio_relay_client.talk_audio_relay_client_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
 
 
 
@@ -39551,6 +39561,10 @@ async def lifespan(app: FastAPI):
             event_media_retry_task.cancel()
         if camera_config_sync_task:
             camera_config_sync_task.cancel()
+        if talk_down_discovery_task:
+            talk_down_discovery_task.cancel()
+        if talk_audio_relay_client_task:
+            talk_audio_relay_client_task.cancel()
 
 
 
@@ -39653,6 +39667,10 @@ async def lifespan(app: FastAPI):
             pending.append(event_media_retry_task)
         if camera_config_sync_task:
             pending.append(camera_config_sync_task)
+        if talk_down_discovery_task:
+            pending.append(talk_down_discovery_task)
+        if talk_audio_relay_client_task:
+            pending.append(talk_audio_relay_client_task)
 
 
 
@@ -47020,6 +47038,16 @@ from live_view_sessions import register_live_view_session_routes
 from live_view_page import register_live_view_page_routes
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
+# 2026-09-16: edge-side counterpart to the cloud relay above -- ONVIF
+# backchannel transport, capability discovery, and the WebSocket relay
+# client that connects the two. Recovered from an old, unrelated-history
+# branch (real Camera 2 hardware validation) and ported onto the
+# current dynamic camera-provisioning/encrypted-credential model; see
+# talk_audio_relay_client.py's and talk_down_discovery.py's own module
+# docstrings. Both workers are inert by default (ANYAICAM_TALK_AUDIO_
+# ENABLED / ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED default false).
+import talk_down_discovery
+import talk_audio_relay_client
 
 
 
