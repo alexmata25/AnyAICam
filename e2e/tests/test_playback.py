@@ -130,5 +130,17 @@ def test_recording_thumbnails_load_successfully(logged_in_page):
     first = thumbnails.first
     assert first.get_attribute("src")
     # naturalWidth > 0 is the standard real-browser proof an <img> actually
-    # decoded, not just that its src attribute is non-empty.
-    assert first.evaluate("img => img.naturalWidth > 0")
+    # decoded, not just that its src attribute is non-empty. Polled with a
+    # real timeout, not asserted instantly: an earlier version of this
+    # test asserted naturalWidth right after the locator resolved and
+    # failed every time, which looked exactly like a real broken-
+    # thumbnail bug -- a follow-up manual repro (same page, an explicit
+    # wait before checking) showed the same image loading correctly
+    # (naturalWidth 320, real 200/image-jpeg responses throughout) once
+    # actually given time to decode. This was a race in the test, not a
+    # bug in the app -- see PROJECT_CHECKPOINT.md's 2026-09-16 correction.
+    page.wait_for_function(
+        "img => img.complete && img.naturalWidth > 0",
+        arg=first.element_handle(),
+        timeout=5000,
+    )
