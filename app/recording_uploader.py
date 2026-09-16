@@ -199,7 +199,7 @@ RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM
 recording_upload_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None}
 
 _lock = threading.Lock()
-_camera_map: dict[int, dict] = {}          # camera_number -> {"camera_id":..., "site_id":...}, refreshed periodically
+_camera_map: dict[int, dict] = {}          # camera_number -> {"camera_id":..., "site_id":..., "people_counting_enabled":..., "smart_motion_enabled":..., "lpr_enabled":..., "ppe_enabled":...}, refreshed periodically
 _sessions: dict[int, dict] = {}            # camera_number -> {credentials, bucket, key_prefix, expires_at}
 _clients: dict[int, object] = {}           # camera_number -> cached boto3 S3 client -- always rebuilt together with _sessions' own entry, never reused across a credential refresh
 _camera_backoff: dict[int, dict] = {}      # camera_number -> {"consecutive_failures": int, "next_retry_at": float (time.monotonic())} -- credential-failure backoff only, see _record_credential_failure()
@@ -284,7 +284,19 @@ def _refresh_camera_map() -> None:
     event_media_uploader.upload_motion_event_media() exactly the way
     main.py's people_counting_worker() already reads its own per-camera
     entitlement (people_counting_enabled) off this identical map -- one
-    shared cache, not a second one."""
+    shared cache, not a second one.
+
+    2026-09-16: people_counting_enabled/smart_motion_enabled/lpr_enabled/
+    ppe_enabled are now genuinely included in this mapping. Before this
+    fix, people_counting_worker()'s own docstring already claimed it read
+    people_counting_enabled "off this identical map", but this function
+    never actually put that key into the dict it built -- every read of
+    it was silently None/False, meaning People Counting could never
+    become entitled on any camera through this path regardless of what
+    RDM/the admin route set, a real gap that predates this fix and had
+    no test coverage on this exact map. lpr.is_camera_enabled() and
+    ppe.is_camera_enabled() now consult the same 3 new keys the same
+    way."""
     response = _control_plane_get("/api/appliance/configuration")
     if not isinstance(response, dict):
         return
@@ -309,6 +321,10 @@ def _refresh_camera_map() -> None:
             "camera_id": camera_id,
             "site_id": site_id,
             "cloud_recording_mode": cloud_recording_mode if isinstance(cloud_recording_mode, str) else None,
+            "people_counting_enabled": bool(item.get("people_counting_enabled")),
+            "smart_motion_enabled": bool(item.get("smart_motion_enabled")),
+            "lpr_enabled": bool(item.get("lpr_enabled")),
+            "ppe_enabled": bool(item.get("ppe_enabled")),
         }
     with _lock:
         _camera_map.clear()

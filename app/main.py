@@ -34574,7 +34574,16 @@ async def store_motion_event(
 
 
     print(f"Motion detected on Camera {camera_number} (confidence {event.confidence:.1f}%).")
-    classification = smart_motion.classify_motion(camera_number)
+    # 2026-09-16: smart_motion.py deliberately never imports main.py or
+    # recording_uploader.py (dependency-light by design, see its own
+    # module docstring), so the real per-camera RDM entitlement check
+    # lives here at the call site instead of inside that module --
+    # SMART_MOTION_ENABLED (smart_motion.py's own env-var master switch)
+    # was never per-camera or entitlement-aware. Ordinary motion
+    # detection above this point is completely unaffected either way;
+    # this only gates the smart_motion-specific correlated event.
+    smart_motion_identity = recording_uploader._camera_identity(camera_number)
+    classification = smart_motion.classify_motion(camera_number) if bool(smart_motion_identity and smart_motion_identity.get("smart_motion_enabled")) else None
     if classification:
         smart_event = AnalyticsEventModel(
             camera=camera_number,
@@ -37354,7 +37363,19 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         append_analytics_event(event)
         smart_motion.record_object_detection(camera_number, class_name)
-        if class_name == "person" and ppe.is_camera_enabled(camera_number):
+        # 2026-09-16: ppe.is_camera_enabled() is deployment-pilot scope
+        # only (ANYAICAM_PPE_CAMERAS); it was never customer-entitlement-
+        # aware. This second check is the real per-camera RDM entitlement
+        # (camera_analytics_entitlements -> cameras.ppe_enabled via
+        # customer_analytics_panel.assign_entitlement()/remove_entitlement()
+        # -> GET /api/appliance/configuration -> edge_camera_sync.py ->
+        # recording_uploader's cached map), matching people_counting_
+        # worker()'s own established fail-closed pattern: no cached
+        # identity yet (e.g. right after a fresh appliance start, before
+        # the first successful config poll) means not-yet-entitled, not
+        # "assume yes".
+        ppe_identity = recording_uploader._camera_identity(camera_number)
+        if class_name == "person" and ppe.is_camera_enabled(camera_number) and bool(ppe_identity and ppe_identity.get("ppe_enabled")):
             for person_detection in class_detections:
                 try:
                     hx, hy, hw, hh = (
@@ -37390,7 +37411,11 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
                 append_analytics_event(ppe_event)
                 saved_events.append(ppe_event)
-        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number):
+        # 2026-09-16: same real per-camera RDM entitlement check as the
+        # PPE hook above, for the same reason -- lpr.is_camera_enabled()
+        # is deployment-pilot scope only, never entitlement-aware.
+        lpr_identity = recording_uploader._camera_identity(camera_number)
+        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number) and bool(lpr_identity and lpr_identity.get("lpr_enabled")):
             for vehicle_detection in class_detections:
                 try:
                     vx, vy, vw, vh = (

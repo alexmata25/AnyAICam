@@ -109,6 +109,27 @@ def licensed_quantity_exceeded(*, licensed_quantity: int, currently_entitled_cou
     return currently_entitled_count >= licensed_quantity
 
 
+# 2026-09-16: maps each real, appliance-enforceable analytic_key to the
+# matching cameras.<analytic>_enabled column (db_migrations.py) that
+# recording_uploader._refresh_camera_map() exposes to the appliance and
+# lpr.is_camera_enabled()/ppe.is_camera_enabled()/smart_motion's own
+# caller in main.py/people_counting_worker() actually read. Before this,
+# assign_entitlement()/remove_entitlement() only ever wrote
+# camera_analytics_entitlements -- correct for the customer-facing Live
+# View pill and this table's own RDM UI, but never reached the
+# appliance at all, so toggling an entitlement off through RDM never
+# actually stopped the feature from running on Ryzen. Only the 4 keys
+# below have a real per-camera appliance enforcement column; any other
+# key in ANALYTIC_LABELS is written to camera_analytics_entitlements
+# only, exactly as before -- unaffected by this change.
+_APPLIANCE_ENFORCEMENT_COLUMN: dict[str, str] = {
+    "smart_motion": "smart_motion_enabled",
+    "people_counting": "people_counting_enabled",
+    "lpr": "lpr_enabled",
+    "ppe": "ppe_enabled",
+}
+
+
 def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
     """Turns on one analytic for exactly one camera -- never touches any
     other camera, even another one at the same site or owned by the same
@@ -162,6 +183,9 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
         "ON CONFLICT(camera_id,analytic_key) DO UPDATE SET status='active',updated_at=excluded.updated_at",
         (camera_id, analytic_key, now, now),
     )
+    column = _APPLIANCE_ENFORCEMENT_COLUMN.get(analytic_key)
+    if column:
+        db.execute(f"UPDATE cameras SET {column}=1 WHERE id=?", (camera_id,))
 
 
 def remove_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> None:
@@ -173,6 +197,9 @@ def remove_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
         "UPDATE camera_analytics_entitlements SET status='cancelled',updated_at=? WHERE camera_id=? AND analytic_key=?",
         (now, camera_id, analytic_key),
     )
+    column = _APPLIANCE_ENFORCEMENT_COLUMN.get(analytic_key)
+    if column:
+        db.execute(f"UPDATE cameras SET {column}=0 WHERE id=?", (camera_id,))
 
 
 UPGRADE_CARD_CONTENT: dict[str, dict] = {

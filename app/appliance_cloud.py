@@ -312,7 +312,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
     @app.get('/api/appliance/configuration')
     def appliance_configuration(request: Request) -> dict:
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        # smart_motion_enabled/lpr_enabled/ppe_enabled (2026-09-16) join
+        # people_counting_enabled here for the same reason: this is the
+        # one route recording_uploader._refresh_camera_map() polls to
+        # build the in-memory map every real per-camera entitlement read
+        # in the appliance (lpr.is_camera_enabled(), ppe.is_camera_enabled(),
+        # smart_motion's own caller in main.py, people_counting_worker())
+        # ultimately consults -- omitting a column here is exactly the gap
+        # that left people_counting_enabled unreachable in practice.
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-

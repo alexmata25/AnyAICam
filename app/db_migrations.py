@@ -543,6 +543,48 @@ def apply_migrations():
         # 20260824 branch) for the same reason as cloud_recording_mode
         # directly above -- same dropped-migration-hunk gap.
         if 'people_counting_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN people_counting_enabled INTEGER')
+        # 2026-09-16: the "other named analytics" this column's own comment
+        # above pointed at, adopting the exact same per-camera pattern.
+        # Closes a real, verified gap: RDM's own customer-facing entitlement
+        # toggle (customer_analytics_panel.assign_entitlement()/
+        # remove_entitlement(), writing camera_analytics_entitlements) never
+        # reached the appliance at all for any of the 4 real analytics --
+        # confirmed live that even people_counting_enabled itself, despite
+        # having this real column and a real edge-side read
+        # (main.py's people_counting_worker()), was never actually populated
+        # into recording_uploader.py's own in-memory camera map, so it read
+        # as permanently unset regardless of entitlement state. Fixed
+        # alongside this migration: assign_entitlement()/remove_entitlement()
+        # now write all 4 of these columns, GET /api/appliance/configuration
+        # exposes all 4, edge_camera_sync.py syncs all 4 into the local
+        # cameras table, and recording_uploader._refresh_camera_map() now
+        # actually includes all 4 in the map lpr.is_camera_enabled()/
+        # ppe.is_camera_enabled()/smart_motion's own caller in main.py read.
+        if 'smart_motion_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN smart_motion_enabled INTEGER')
+        if 'lpr_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN lpr_enabled INTEGER')
+        if 'ppe_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN ppe_enabled INTEGER')
+        # One-time-per-row backfill, safe to run on every startup: a
+        # customer who already toggled an analytic ON via RDM (writing
+        # camera_analytics_entitlements) before this fix existed must not
+        # suddenly read as "not entitled" on the appliance the moment
+        # these columns first appear. Scoped to `IS NULL` only -- a row
+        # this session's own assign_entitlement()/remove_entitlement()
+        # fix has already explicitly set to 0 (a real "turned off") is
+        # never touched or resurrected by this backfill.
+        for analytic_key, column in (
+            ('smart_motion', 'smart_motion_enabled'),
+            ('people_counting', 'people_counting_enabled'),
+            ('lpr', 'lpr_enabled'),
+            ('ppe', 'ppe_enabled'),
+        ):
+            entitled_camera_ids = [
+                row['camera_id'] for row in db.execute(
+                    "SELECT camera_id FROM camera_analytics_entitlements WHERE analytic_key=? AND status='active'",
+                    (analytic_key,),
+                ).fetchall()
+            ]
+            for entitled_camera_id in entitled_camera_ids:
+                db.execute(f"UPDATE cameras SET {column}=1 WHERE {column} IS NULL AND id=?", (entitled_camera_id,))
         # Phase 3 (dynamic camera provisioning): device_key is the ONVIF
         # endpoint reference UUID -- stable across reboot/DHCP/IP changes,
         # unlike ip_address -- and is how rediscovering an already-

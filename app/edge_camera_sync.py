@@ -21,7 +21,8 @@ reconcile -- it IS the authoritative source), and does two things,
 both idempotent and restart-safe:
 
 1. Camera metadata (id, camera_number, device_key, onvif_endpoint,
-   name, status, recording_mode, people_counting_enabled) -- pulled from
+   name, status, recording_mode, people_counting_enabled,
+   smart_motion_enabled, lpr_enabled, ppe_enabled) -- pulled from
    the existing, unchanged GET /api/appliance/configuration, the same
    endpoint analytics_sync.py and recording_uploader.py already poll for
    their own purposes, deliberately never extended to carry credentials
@@ -167,17 +168,21 @@ def sync_provisioned_cameras() -> dict:
             device_key = item.get("device_key")
             db.execute(
                 "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,device_key,"
-                "onvif_endpoint,resolution,cloud_recording_mode,people_counting_enabled,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "onvif_endpoint,resolution,cloud_recording_mode,people_counting_enabled,smart_motion_enabled,"
+                "lpr_enabled,ppe_enabled,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET name=excluded.name,camera_number=excluded.camera_number,"
                 "status=excluded.status,device_key=excluded.device_key,onvif_endpoint=excluded.onvif_endpoint,"
                 "resolution=excluded.resolution,cloud_recording_mode=excluded.cloud_recording_mode,"
-                "people_counting_enabled=excluded.people_counting_enabled",
+                "people_counting_enabled=excluded.people_counting_enabled,"
+                "smart_motion_enabled=excluded.smart_motion_enabled,lpr_enabled=excluded.lpr_enabled,"
+                "ppe_enabled=excluded.ppe_enabled",
                 (
                     camera_id, identity["customer_id"], identity["site_id"], identity["appliance_id"],
                     item.get("name") or "Camera", camera_number, item.get("status"), device_key,
                     item.get("onvif_endpoint"), item.get("resolution"), item.get("recording_mode"),
-                    item.get("people_counting_enabled"), now,
+                    item.get("people_counting_enabled"), item.get("smart_motion_enabled"),
+                    item.get("lpr_enabled"), item.get("ppe_enabled"), now,
                 ),
             )
             synced += 1
