@@ -69,6 +69,7 @@ and asserting they're never touched by a sync run for the first).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -108,7 +109,6 @@ def _control_plane_get(path: str, appliance_id: str, credential: str) -> dict | 
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            import json
             return json.loads(response.read().decode() or "{}")
     except urllib.error.HTTPError as error:
         logger.warning("edge_camera_sync.control_plane_http_error path=%s status=%s", path, error.code)
@@ -166,23 +166,36 @@ def sync_provisioned_cameras() -> dict:
                 continue
             camera_number = item.get("camera_number")
             device_key = item.get("device_key")
+            talk_down = item.get("talk_down")
+            talk_down_supported = None
+            talk_down_metadata = None
+            talk_down_verified_at = None
+            if isinstance(talk_down, dict) and "supported" in talk_down:
+                talk_down_supported = 1 if talk_down.get("supported") else 0
+                metadata = talk_down.get("metadata")
+                talk_down_metadata = json.dumps(metadata) if metadata else None
+                talk_down_verified_at = now
             db.execute(
                 "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,device_key,"
                 "onvif_endpoint,resolution,cloud_recording_mode,people_counting_enabled,smart_motion_enabled,"
-                "lpr_enabled,ppe_enabled,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata,talk_down_verified_at,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET name=excluded.name,camera_number=excluded.camera_number,"
                 "status=excluded.status,device_key=excluded.device_key,onvif_endpoint=excluded.onvif_endpoint,"
                 "resolution=excluded.resolution,cloud_recording_mode=excluded.cloud_recording_mode,"
                 "people_counting_enabled=excluded.people_counting_enabled,"
                 "smart_motion_enabled=excluded.smart_motion_enabled,lpr_enabled=excluded.lpr_enabled,"
-                "ppe_enabled=excluded.ppe_enabled",
+                "ppe_enabled=excluded.ppe_enabled,"
+                "talk_down_supported=CASE WHEN excluded.talk_down_supported IS NOT NULL THEN excluded.talk_down_supported ELSE cameras.talk_down_supported END,"
+                "talk_down_metadata=CASE WHEN excluded.talk_down_supported IS NOT NULL THEN excluded.talk_down_metadata ELSE cameras.talk_down_metadata END,"
+                "talk_down_verified_at=CASE WHEN excluded.talk_down_supported IS NOT NULL THEN excluded.talk_down_verified_at ELSE cameras.talk_down_verified_at END",
                 (
                     camera_id, identity["customer_id"], identity["site_id"], identity["appliance_id"],
                     item.get("name") or "Camera", camera_number, item.get("status"), device_key,
                     item.get("onvif_endpoint"), item.get("resolution"), item.get("recording_mode"),
                     item.get("people_counting_enabled"), item.get("smart_motion_enabled"),
-                    item.get("lpr_enabled"), item.get("ppe_enabled"), now,
+                    item.get("lpr_enabled"), item.get("ppe_enabled"),
+                    talk_down_supported, talk_down_metadata, talk_down_verified_at, now,
                 ),
             )
             synced += 1

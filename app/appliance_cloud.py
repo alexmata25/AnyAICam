@@ -320,7 +320,21 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # smart_motion's own caller in main.py, people_counting_worker())
         # ultimately consults -- omitting a column here is exactly the gap
         # that left people_counting_enabled unreachable in practice.
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],)); return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
+        for item in camera_items:
+            raw_metadata=item.pop('talk_down_metadata',None)
+            supported=item.pop('talk_down_supported',None)
+            if supported is None:
+                item['talk_down']=None
+            else:
+                metadata=None
+                if raw_metadata:
+                    try:
+                        metadata=json.loads(raw_metadata)
+                    except (TypeError, ValueError):
+                        metadata=None
+                item['talk_down']={'supported':bool(supported),'metadata':metadata}
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-

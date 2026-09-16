@@ -85,7 +85,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -140,6 +140,20 @@ AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
 # start_recording() actually writes, not be independently configurable.
 RECORDINGS_FOLDER = Path("/app/recordings")
+# The same file main.py's store_motion_event() already writes to
+# (MotionEventModel JSON lines: id/camera/start_time/end_time/...),
+# read-only here -- never written or modified by this module.
+MOTION_EVENTS_FILE = RECORDINGS_FOLDER / "motion_events.jsonl"
+# Must match start_recording()'s own "-segment_time 300" in main.py exactly
+# -- the fixed nominal duration of every completed segment, used to compute
+# each segment's [start, start+duration) window for the motion gate below.
+RECORDING_SEGMENT_SECONDS = 300
+# Symmetric-by-default context padding applied to each real motion event
+# before checking whether it overlaps a segment, so an uploaded segment
+# includes a few seconds of lead-in/lead-out around the actual motion, not
+# just the exact detected window. Independently configurable.
+MOTION_UPLOAD_PRE_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_PRE_PADDING_SECONDS", "15")))
+MOTION_UPLOAD_POST_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_POST_PADDING_SECONDS", "15")))
 SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SCAN_SECONDS", "30.0")))
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CONFIG_REFRESH_SECONDS", "300.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SESSION_RENEW_MARGIN_SECONDS", "120")))
@@ -664,9 +678,98 @@ def _completed_recording_files(camera_number: int) -> list[Path]:
     return candidates[:-1] if len(candidates) > 1 else []
 
 
+def _load_motion_windows(camera_number: int) -> list[tuple[datetime, datetime]] | None:
+    """Real motion-event [start_time, end_time] windows for this camera,
+    read from MOTION_EVENTS_FILE -- the same file main.py's
+    store_motion_event() already writes to (MotionEventModel JSON
+    lines). Read-only here: never writes, truncates, or otherwise
+    modifies that file.
+
+    Returns None -- not [] -- when the file is missing, unreadable, or
+    contains not one single parseable line for ANY camera. Callers MUST
+    treat None as "motion status for this camera could not be
+    determined right now," not as "confirmed no motion". [] (a real,
+    distinct value) means the file was read successfully and simply has
+    no events for this specific camera -- that IS a confirmed "no
+    motion for this camera".
+
+    One malformed line/event does not blind the whole result: it's
+    skipped and the rest of the file is still used."""
+    if not MOTION_EVENTS_FILE.exists():
+        return None
+    try:
+        raw_text = MOTION_EVENTS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    windows: list[tuple[datetime, datetime]] = []
+    any_line_parsed = False
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        any_line_parsed = True
+        if event.get("camera") != camera_number:
+            continue
+        try:
+            start = datetime.fromisoformat(str(event["start_time"]))
+            end = datetime.fromisoformat(str(event["end_time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        windows.append((start, end))
+    if not any_line_parsed:
+        return None  # file existed but had literally nothing parseable in it -- treat as unavailable, not as "confirmed empty"
+    return windows
+
+
+def _segment_overlaps_motion(
+    segment_start: datetime,
+    segment_end: datetime,
+    motion_windows: list[tuple[datetime, datetime]],
+    pre_padding_seconds: int = MOTION_UPLOAD_PRE_PADDING_SECONDS,
+    post_padding_seconds: int = MOTION_UPLOAD_POST_PADDING_SECONDS,
+) -> bool:
+    """Pure and independently testable. True if [segment_start,
+    segment_end) overlaps ANY motion window, each padded independently
+    by pre_padding_seconds before its own start and post_padding_seconds
+    after its own end. Standard half-open-interval overlap test."""
+    pre_padding = timedelta(seconds=pre_padding_seconds)
+    post_padding = timedelta(seconds=post_padding_seconds)
+    for motion_start, motion_end in motion_windows:
+        padded_start = motion_start - pre_padding
+        padded_end = motion_end + post_padding
+        if segment_start <= padded_end and segment_end >= padded_start:
+            return True
+    return False
+
+
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
+    """cloud_recording_mode == 'motion' (Hybrid tier): only queues a
+    segment whose time window overlaps a real, padded motion event --
+    full continuous segments never reach this function at all for
+    'disabled' cameras (recording_upload_worker() skips them earlier).
+    'continuous'/None cameras (Cloud tier / no explicit mode) are
+    completely unaffected by this whole block.
+
+    Fail-safe: if motion data can't be determined at all
+    (_load_motion_windows() returns None), every file that would
+    otherwise have been gated is uploaded anyway -- losing coverage a
+    Hybrid customer is paying for is a worse failure than a few extra
+    uploaded segments. Never touches or deletes any local file either
+    way -- local recording/retention are completely independent of
+    this gate."""
     folder_resolved = _recording_folder(camera_number).resolve()
+    identity = _camera_identity(camera_number)
+    cloud_recording_mode = identity.get("cloud_recording_mode") if identity else None
+    motion_windows = _load_motion_windows(camera_number) if cloud_recording_mode == "motion" else None
+    motion_data_unavailable = cloud_recording_mode == "motion" and motion_windows is None
     pending = []
+    skipped_no_motion = 0
     for local_path in _completed_recording_files(camera_number):
         if local_path.name in already_uploaded:
             continue
@@ -677,7 +780,18 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
         if resolved.parent != folder_resolved:
             logger.warning("recording_upload.file_path_outside_recordings_folder camera=%s path=%s", camera_number, resolved)
             continue
+        if cloud_recording_mode == "motion" and not motion_data_unavailable:
+            started_at = _recording_started_at(local_path, camera_number)
+            if started_at is not None:
+                segment_end = started_at + timedelta(seconds=RECORDING_SEGMENT_SECONDS)
+                if not _segment_overlaps_motion(started_at, segment_end, motion_windows):
+                    skipped_no_motion += 1
+                    continue
         pending.append(local_path)
+    if motion_data_unavailable:
+        logger.warning("recording_upload.motion_data_unavailable_uploading_anyway camera=%s", camera_number)
+    if skipped_no_motion:
+        logger.info("recording_upload.motion_gate_skipped_no_motion camera=%s count=%s", camera_number, skipped_no_motion)
     return pending
 
 
@@ -1088,6 +1202,14 @@ async def recording_upload_worker() -> None:
                     continue
                 identity = _camera_identity(camera_number)
                 if not identity:
+                    continue
+                # 'disabled' (Local tier): never uploaded or cataloged at
+                # all -- skip this camera entirely. 'motion' (Hybrid) and
+                # 'continuous'/None (Cloud / no explicit mode) both still
+                # go through _relay_camera_once(); the motion-only
+                # filtering down to segments that actually overlap real
+                # motion happens inside _pending_recording_files() itself.
+                if identity.get("cloud_recording_mode") == "disabled":
                     continue
                 await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
             recording_upload_state["last_scan_at"] = datetime.now().isoformat()
