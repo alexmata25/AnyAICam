@@ -102,8 +102,18 @@ def _classify_as(monkeypatch, classification):
     """classify_motion() is what turns a plain base-Motion event into
     a Smart Motion analytics event too -- forcing a truthy return here
     is the only way to exercise the new media-scheduling code at all,
-    exactly matching how store_motion_event() itself gates it."""
+    exactly matching how store_motion_event() itself gates it.
+
+    2026-09-16: store_motion_event() now also requires the real
+    per-camera RDM entitlement (recording_uploader._camera_identity()'s
+    smart_motion_enabled) before it will even call classify_motion() at
+    all -- see main.py's own comment at that call site. This file is
+    about media-wiring given a classification result, not about
+    entitlement itself, so every test here is granted entitlement by
+    default; a real not-entitled test lives in
+    test_rdm_appliance_enforcement.py instead."""
     monkeypatch.setattr(main.smart_motion, "classify_motion", lambda camera_number: classification)
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda camera_number: {"smart_motion_enabled": True})
 
 
 async def _store_and_drain(camera_number, start_time, end_time, score=50.0, frame=b"fake-jpeg-bytes"):

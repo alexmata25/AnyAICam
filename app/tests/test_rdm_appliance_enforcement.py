@@ -318,3 +318,48 @@ def test_migration_backfill_never_resurrects_an_explicitly_removed_entitlement(d
 
         row = conn.execute("SELECT ppe_enabled FROM cameras WHERE id='cam-1'").fetchone()
     assert row["ppe_enabled"] == 0, "an explicit remove_entitlement() must stay off across a migration re-run, never revert to entitled"
+
+
+# --------------------------------------------------- link 6: the real main.py call site actually suppresses/allows
+
+
+def test_store_motion_event_suppresses_smart_motion_when_camera_is_not_entitled(monkeypatch):
+    """The real gate main.py's motion-detection path added, exercised
+    end to end through the real store_motion_event(), not a stand-in.
+    A camera classify_motion() would happily classify as 'person' must
+    still produce NO smart_motion analytics event while
+    recording_uploader._camera_identity() reports it as not-entitled --
+    proving the entitlement check genuinely runs before classify_motion()
+    is even consulted, not just that classify_motion() itself was mocked
+    to return something falsy."""
+    import asyncio
+    from datetime import datetime
+    from unittest import mock
+
+    import main
+    import recording_uploader
+
+    monkeypatch.setattr(main, "get_alert_rule", lambda camera_number: mock.Mock(enabled=False, event_types=[]))
+    monkeypatch.setattr(main, "append_motion_event", lambda line: None)
+    analytics_events = []
+    monkeypatch.setattr(main, "append_analytics_event", lambda event: analytics_events.append(event))
+
+    async def fake_create_motion_thumbnail(*args, **kwargs):
+        return "/recordings/media/motion/fake.jpg"
+
+    monkeypatch.setattr(main, "create_motion_thumbnail", fake_create_motion_thumbnail)
+    monkeypatch.setattr(main.smart_motion, "classify_motion", lambda camera_number: "person")
+    # The real not-entitled state: no cached identity for this camera at
+    # all (matches a camera the appliance hasn't synced entitlement for
+    # yet, or one RDM has explicitly turned smart_motion off for).
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: None)
+
+    now = datetime.now()
+    asyncio.run(main.store_motion_event(camera_number=1, start_time=now, end_time=now, score=50.0, frame=b"fake-jpeg-bytes"))
+    pending = list(main.clip_tasks)
+    if pending:
+        asyncio.run(asyncio.gather(*pending, return_exceptions=True))
+
+    event_types = [event["event_type"] for event in analytics_events]
+    assert "motion" in event_types, "ordinary motion detection must be completely unaffected by this gate"
+    assert "smart_motion" not in event_types, "smart_motion must not fire for a camera the appliance has no entitled identity for"
