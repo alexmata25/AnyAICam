@@ -152380,3 +152380,169 @@ def v111_camera_verification_page(request: Request):
     </script>
     """
     return page_shell("Camera verification", "settings", content, scripts)
+
+
+# AACO Phase 2 is deliberately registered after the existing customer VMS
+# helpers above.  Its web module is a thin command UI only; this binding is
+# the sole place it can reach Classic's existing, tenant-scoped services.
+from aaco_web import register_aaco_routes
+
+
+class _ClassicAacoBoundary:
+    """Adapter from AACO's strict command schema to existing Classic VMS.
+
+    It returns presentation metadata/deep links only.  Live sessions and
+    playback media continue to be created and authorized by their established
+    Classic routes; an AACO event search never creates a clip or touches S3.
+    """
+
+    def __init__(self, request: Request):
+        self.request = request
+
+    def _camera(self, camera_token: str) -> dict | None:
+        # Phase-1's deterministic language adapter names cameras as
+        # camera-<number>.  Resolve that display token through Classic's
+        # customer-scoped camera list, never a request-supplied database id.
+        cameras = _customer_playback_cameras(self.request) or []
+        return self._find_camera(cameras, camera_token)
+
+    @staticmethod
+    def _find_camera(cameras: list[dict], camera_token: str) -> dict | None:
+        if camera_token.startswith("camera-"):
+            try:
+                number = int(camera_token.removeprefix("camera-"))
+            except ValueError:
+                return None
+            return next((camera for camera in cameras if camera.get("camera_number") == number), None)
+        if camera_token.startswith("camera-name:"):
+            requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
+            return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
+        return None
+
+    def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
+        # Reuse the established Live authorization helper, including its
+        # customer_viewer can_live permission, instead of inferring Live
+        # access from Playback access.
+        from live_view_page import _customer_live_cameras
+        from partner_db import connection
+        with connection() as db:
+            cameras = _customer_live_cameras(db, identity, "")
+        return self._find_camera(cameras, camera_token)
+
+    def authorized_camera(self, identity: dict, camera_id: str) -> dict | None:
+        # This common Phase-1 gate establishes that the camera belongs to
+        # this identity through at least one existing customer VMS surface.
+        # The operation methods below then apply their stricter, operation-
+        # specific Classic access rule (can_live versus can_playback).
+        return self._camera(camera_id) or self._live_camera(identity, camera_id)
+
+    def live_view(self, identity: dict, camera_id: str) -> dict:
+        camera = self._live_camera(identity, camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        # The destination independently enforces Classic's can_live check.
+        return {
+            "kind": "live",
+            "message": f"Opening authorized Live view for {_camera_display_label(camera)}.",
+            "href": f'/customer/cameras/{quote(str(camera["id"]), safe="")}/live',
+            "context": {"camera_id": camera_id},
+        }
+
+    def playback(self, identity: dict, camera_id: str, start: datetime, end: datetime) -> dict:
+        # Playback continues to require Classic's can_playback scope even
+        # when the caller separately has Live permission for the camera.
+        camera = self._camera(camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        # Existing catalog lookup is metadata-only and bounded.  AACO never
+        # calls /api/customer/clips, never exports, and never presigns media.
+        recordings = _customer_recording_rows(camera["id"], limit=10, near=start.isoformat())
+        timestamp = start.isoformat()
+        message = (
+            f"Found {len(recordings)} existing recording metadata result(s) near {timestamp}. "
+            "Open Classic Playback to select authorized media."
+            if recordings else
+            f"Playback media is currently unavailable near {timestamp}. Classic Playback remains the authorized destination when recordings are available."
+        )
+        return {
+            "kind": "playback",
+            "message": message,
+            "href": f'/playback?{urlencode({"camera": camera["id"], "t": timestamp})}',
+            "context": {"camera_id": camera_id, "playback_at": timestamp},
+        }
+
+    def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> dict:
+        normalized_type = "vehicle" if event_type == "car" else event_type
+        # Reuses Classic's own customer-scoped event representation.  The
+        # bounded response is filtered before presentation, with no media
+        # lookup and no creation/export side effect.
+        candidates = _customer_detection_events(self.request) or []
+        matches = []
+        for event in candidates:
+            if normalized_type and event.get("event_type") != normalized_type:
+                continue
+            try:
+                occurred = datetime.fromisoformat(str(event.get("timestamp")))
+            except (TypeError, ValueError):
+                continue
+            if start <= occurred <= end:
+                matches.append({
+                    "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
+                    "timestamp": str(event.get("timestamp")),
+                    "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
+                    "context": {"camera_id": f'camera-{event.get("camera")}', "event_at": str(event.get("timestamp"))},
+                })
+            if len(matches) >= 100:
+                break
+        return {"kind": "events", "message": f"{len(matches)} authorized event result(s).", "events": matches, "context": matches[0]["context"] if matches else None}
+
+    def previous_event(self, identity: dict, camera_id: str, before: datetime) -> dict:
+        camera = self._camera(camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        candidates = _customer_detection_events(self.request) or []
+        prior = []
+        for event in candidates:
+            if event.get("camera_id") != camera["id"]:
+                continue
+            try:
+                occurred = datetime.fromisoformat(str(event.get("timestamp")))
+            except (TypeError, ValueError):
+                continue
+            if occurred < before:
+                prior.append((occurred, event))
+        if not prior:
+            return {"kind": "events", "message": "No earlier authorized event is available for this camera.", "events": []}
+        occurred, event = max(prior, key=lambda item: item[0])
+        context = {"camera_id": camera_id, "event_at": occurred.isoformat()}
+        return {
+            "kind": "events",
+            "message": "Previous authorized event.",
+            "events": [{
+                "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
+                "timestamp": str(event.get("timestamp")),
+                "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
+                "context": context,
+            }],
+            "context": context,
+        }
+
+    def camera_status(self, identity: dict) -> dict:
+        cameras = _customer_playback_cameras(self.request) or []
+        rows = []
+        for camera in cameras:
+            try:
+                current = customer_camera_status(str(camera["id"]), self.request)
+                state = current.get("state", "unknown") if isinstance(current, dict) else "unknown"
+            except HTTPException:
+                state = "unavailable"
+            rows.append({"label": _camera_display_label(camera), "state": state})
+        return {"kind": "status", "message": f"Status requested for {len(rows)} authorized camera(s).", "cameras": rows}
+
+
+register_aaco_routes(
+    app,
+    page_shell,
+    identity_provider=lambda request: partner_identity(request),
+    vms_factory=lambda request: _ClassicAacoBoundary(request),
+)
