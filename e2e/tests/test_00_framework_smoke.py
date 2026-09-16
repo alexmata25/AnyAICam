@@ -24,6 +24,12 @@ def test_staging_login_screen_loads(page, base_url, artifacts_dir, console_netwo
     assert page.locator("#password").is_visible()
     assert page.locator("form#login button.submit").is_visible()
 
+    # mkdir here, not just relying on pytest_configure()'s one-time setup
+    # -- pytest-playwright's own --output flag recreates/clears the
+    # artifacts root at test-run time (confirmed live 2026-09-15).
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    console_network_dir.mkdir(parents=True, exist_ok=True)
+
     page.screenshot(path=str(artifacts_dir / "smoke_staging_login_screen.png"), full_page=True)
 
     # Always written for this specific proof test (not just on failure,

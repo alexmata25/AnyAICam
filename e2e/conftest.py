@@ -136,6 +136,12 @@ def console_and_network_capture(page, request):
 
     failed = request.node.rep_call.failed if hasattr(request.node, "rep_call") else False
     if failed and (console_messages or failed_requests):
+        # Created here, not just once in pytest_configure() -- pytest-
+        # playwright's own --output flag recreates/clears the artifacts
+        # root at test-run time, which silently deleted this subdirectory
+        # out from under the one-time startup mkdir (confirmed live
+        # 2026-09-15: a real FileNotFoundError on this exact write).
+        CONSOLE_NETWORK_DIR.mkdir(parents=True, exist_ok=True)
         safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in request.node.name)
         out_path = CONSOLE_NETWORK_DIR / f"{safe_name}.json"
         out_path.write_text(

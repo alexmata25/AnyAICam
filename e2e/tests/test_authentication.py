@@ -5,13 +5,14 @@
 test_00_framework_smoke.py for the already-passing unauthenticated half
 of this page.
 
-Skipped until a dedicated e2e staging test-tenant login exists (see
-conftest.py's e2e_credentials fixture and docs/
-AUTONOMOUS_VALIDATION_PERMISSIONS.md) -- these are real, intended
-scenarios, not placeholders to be rewritten later, just not yet
-runnable.
+Runs for real once a dedicated e2e staging test-tenant login exists in
+e2e/.env (see conftest.py's e2e_credentials fixture and docs/
+AUTONOMOUS_VALIDATION_PERMISSIONS.md) -- confirmed live 2026-09-15,
+test_valid_login_redirects_to_customer_portal passing against the real
+staging login flow.
 """
 import pytest
+from playwright.sync_api import expect
 
 
 @pytest.mark.e2e
@@ -32,8 +33,12 @@ def test_invalid_password_shows_inline_error_not_a_redirect(page, base_url, e2e_
     page.fill("#email", email)
     page.fill("#password", "deliberately-wrong-password")
     page.click("form#login button.submit")
-    message = page.locator("#message")
-    assert message.is_visible()
+    # The login page's own onsubmit handler awaits a fetch() before
+    # showing #message -- a bare is_visible() check races that async
+    # call (confirmed live 2026-09-15: failed immediately, before the
+    # response could ever arrive). expect(...).to_be_visible() polls
+    # with Playwright's real auto-wait instead of asserting instantly.
+    expect(page.locator("#message")).to_be_visible()
     assert "/customer-login.html" in page.url
 
 

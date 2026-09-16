@@ -139982,7 +139982,23 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
             return [
                 dict(camera) for camera in db.execute(
                     'SELECT id, name, camera_number FROM cameras WHERE customer_id=? '
-                    'ORDER BY camera_number, id',
+                    # camera_number IS NULL first: a pending_installation
+                    # placeholder camera (no real device, no recordings,
+                    # never will have any) sorts before every genuinely
+                    # provisioned one under a bare `ORDER BY camera_number`
+                    # -- SQLite (and Postgres) both sort NULL first in
+                    # ascending order. Confirmed live 2026-09-15 against
+                    # the real pilot customer: cameras[0] (this list's own
+                    # first row, used by _render_customer_playback() as
+                    # the default camera when no ?camera= is given) was a
+                    # placeholder ("Camera 8", camera_number NULL) instead
+                    # of any of their 5 real, recording cameras -- every
+                    # plain Playback page load with no deep link landed on
+                    # a permanently-empty timeline. This does not remove
+                    # or hide the placeholder tiles (still selectable,
+                    # same 8-camera list Investigate's own dropdown already
+                    # shows) -- it only changes which one is picked first.
+                    'ORDER BY camera_number IS NULL, camera_number, id',
                     (identity["customer_id"],),
                 ).fetchall()
             ]
@@ -139999,7 +140015,9 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
                 'SELECT c.id, c.name, c.camera_number FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'WHERE c.customer_id=? AND p.can_playback=1 '
-                'ORDER BY c.camera_number, c.id',
+                # Same NULLs-last fix as the customer_owner branch above --
+                # see that query's own comment.
+                'ORDER BY c.camera_number IS NULL, c.camera_number, c.id',
                 (user["id"], identity["customer_id"]),
             ).fetchall()
         ]
