@@ -141485,9 +141485,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # or which child happens to be visible. max-height is kept as a
         # defensive, now-normally-inert cap, not the primary driver.
         '.playback-workspace-solo .camera-view{aspect-ratio:16/9;'
-        'width:min(calc(38vh * 16 / 9),calc(380px * 16 / 9));max-height:min(38vh,380px);'
+        'width:min(calc(34vh * 16 / 9),calc(340px * 16 / 9));max-height:min(34vh,340px);'
         'max-width:100%;margin:0 auto}'
-        '.playback-workspace-solo .panel{display:flex;justify-content:center}'
+        # Vertical-space trim (2026-09-16, same pass as the timeline
+        # nested-scroll fix above): once the timeline shows its full
+        # real content instead of clipping it, this page's total height
+        # at 1440x900 measured 993px against the 900px budget -- 93px
+        # over. The shared `.panel{padding:19px}` rule (used broadly,
+        # not Playback-specific) was the single biggest contributor
+        # here: 40px of padding around a video that itself only needs
+        # 342px, real weight-bearing content nowhere in that padding.
+        # Trimmed to 6px, scoped to this one solo video panel only --
+        # every other page's own `.panel` padding is completely
+        # untouched. Saves real, no-tradeoff space rather than shrinking
+        # the video itself (the one thing this whole feature exists to
+        # keep usable) to force-fit the remainder.
+        '.playback-workspace-solo .panel{display:flex;justify-content:center;padding:6px}'
         # The .event-* classes were already used by this legend (and by
         # the /analytics search results legend) but never actually had
         # a background color defined anywhere -- every dot rendered
@@ -141560,8 +141573,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # id=playback-monitor-timeline so Live View's own Monitor page,
         # which reuses the bare .monitor-timeline class, is completely
         # unaffected.
+        # margin-top and padding also trimmed here (12px/15px -> 6px/8px):
+        # part of the same 993px-vs-900px vertical-space accounting as
+        # the .playback-workspace-solo .panel padding trim above -- real,
+        # no-content-lost space, not a content reduction.
         '#playback-monitor-timeline{min-height:0!important;height:auto!important;'
-        'max-height:none!important;flex:none!important;overflow:visible!important}'
+        'max-height:none!important;flex:none!important;overflow:visible!important;'
+        'margin-top:6px!important;padding:8px!important}'
         # Compact primary controls (2026-09-16, same usability pass as
         # the video-sizing fix above): smaller padding/min-height than
         # this page's shared button style, and icon-only glyphs (see the
@@ -141577,7 +141595,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         'font-size:15px;line-height:1}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
-        '<section class="playback-workspace-solo" style="margin-top:14px">'
+        '<section class="playback-workspace-solo" style="margin-top:8px">'
         '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'

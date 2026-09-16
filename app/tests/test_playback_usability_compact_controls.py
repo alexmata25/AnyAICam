@@ -54,7 +54,7 @@ def test_video_is_capped_by_height_not_stretched_by_width(monkeypatch):
     html = _render(monkeypatch)
     assert (
         ".playback-workspace-solo .camera-view{aspect-ratio:16/9;"
-        "width:min(calc(38vh * 16 / 9),calc(380px * 16 / 9));max-height:min(38vh,380px);"
+        "width:min(calc(34vh * 16 / 9),calc(340px * 16 / 9));max-height:min(34vh,340px);"
         "max-width:100%;margin:0 auto}"
         in html
     )
@@ -70,7 +70,13 @@ def test_video_is_capped_by_height_not_stretched_by_width(monkeypatch):
 
 def test_video_container_is_centered_within_its_panel(monkeypatch):
     html = _render(monkeypatch)
-    assert ".playback-workspace-solo .panel{display:flex;justify-content:center}" in html
+    # padding:6px added 2026-09-16 (same pass as the timeline nested-
+    # scroll fix): the shared .panel{padding:19px} rule was the single
+    # biggest contributor to this page exceeding a 900px viewport once
+    # the timeline stopped clipping its own real content -- trimmed
+    # here, scoped to this one video panel only, in favor of shrinking
+    # the video itself.
+    assert ".playback-workspace-solo .panel{display:flex;justify-content:center;padding:6px}" in html
 
 
 def test_video_element_itself_still_fills_its_now_correctly_sized_container(monkeypatch):
