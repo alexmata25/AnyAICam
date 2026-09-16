@@ -460,6 +460,27 @@ def _build_payload(event: dict) -> dict:
             "hard_hat_present": bool(event.get("hard_hat_present")),
             "safety_vest_present": bool(event.get("safety_vest_present")),
         }]
+    # AAC (facial recognition), Phase 2: same mechanism as PPE directly
+    # above -- match_state/matched_person_name/matched_watchlist_name/
+    # engine are set as loose extra keys on the local event dict by
+    # main.py's AAC hook in save_yolo_events() (in addition to, not
+    # instead of, that hook's own direct local write into
+    # detection_events/facial_events -- see facial_events.py's own
+    # docstring for why this event exists in two places for a split
+    # edge/cloud deployment). Forwarded here so appliance_cloud.py's
+    # analytics_event_available() route can create the matching
+    # cloud-side facial_events detail row -- see that route's own
+    # comment for exactly how.
+    if str(event.get("event_type") or "").strip() == "facial_recognition" and payload_detections is None:
+        payload_detections = [{
+            "match_state": event.get("match_state"),
+            "matched_person_id": event.get("matched_person_id"),
+            "matched_person_name": event.get("matched_person_name"),
+            "matched_watchlist_id": event.get("matched_watchlist_id"),
+            "matched_watchlist_name": event.get("matched_watchlist_name"),
+            "engine": event.get("engine"),
+            "engine_version": event.get("engine_version"),
+        }]
     return {
         "local_event_id": str(event.get("id") or "").strip(),
         "event_type": str(event.get("event_type") or "").strip(),
