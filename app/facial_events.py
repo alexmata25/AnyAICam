@@ -411,7 +411,7 @@ def record_facial_events(
         )
         created.append(event)
         if relay_provider is not None and match_state in ("known", "watchlist"):
-            event["relay_outcomes"] = evaluate_access_rules(
+            outcomes = evaluate_access_rules(
                 db,
                 customer_id=context["customer_id"],
                 camera_id=context["id"],
@@ -421,6 +421,16 @@ def record_facial_events(
                 matched_watchlist_id=(matched_watchlist or {}).get("id"),
                 relay_provider=relay_provider,
                 detection_event_id=event["detection_event_id"],
+            )
+            event["relay_outcomes"] = outcomes
+            # Persisted separately from the INSERT above (the authorization
+            # decision only runs, if at all, after that row already exists)
+            # so "recognized identity" and "access granted/denied" are both
+            # durable on the same facial_events row, not just returned
+            # in-memory and lost the moment this function returns.
+            db.execute(
+                "UPDATE facial_events SET access_outcomes_json=? WHERE id=?",
+                (json.dumps(outcomes), event["id"]),
             )
     return created
 

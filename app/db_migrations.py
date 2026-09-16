@@ -637,6 +637,25 @@ def apply_migrations():
         if 'talk_down_supported' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_supported INTEGER')
         if 'talk_down_metadata' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_metadata TEXT')
         if 'talk_down_verified_at' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_verified_at TEXT')
+
+        # 2026-09-16: AAC Facial Recognition / Face Access are one connected
+        # feature -- identity match, the authorization decision (facial_rules
+        # + relay_control.rule_applies()), and the access-control command
+        # (relay_control.build_request()/RelayProvider.trigger()) were all
+        # already correctly separated and unit-tested, but the outcome of
+        # that authorization decision was never persisted anywhere -- only
+        # returned in-memory from evaluate_access_rules() and dropped by
+        # save_yolo_events()'s hook. NULL means no access-control evaluation
+        # ran for this match at all (the common case today, since
+        # ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED defaults to false); '[]'
+        # means it ran and no facial_rules row applied; a non-empty JSON
+        # array is one entry per rule that applied, each carrying rule_id,
+        # channel, activated, dry_run, and suppressed_reason -- see
+        # relay_control.RelayResult and facial_events.evaluate_access_rules().
+        facial_events_columns=({item['name'] for item in db.execute('PRAGMA table_info(facial_events)').fetchall()}
+                               if backend()=='sqlite' else
+                               {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='facial_events'").fetchall()})
+        if 'access_outcomes_json' not in facial_events_columns: db.execute('ALTER TABLE facial_events ADD COLUMN access_outcomes_json TEXT')
         # cloud_recording_mode has NO hidden default by design: NULL means
         # "not explicitly set for this camera" and every consumer (the
         # GET /api/appliance/configuration route, and the appliance's own

@@ -32,11 +32,30 @@ Safety posture, deliberately conservative:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 
 VALID_CHANNELS = (1, 2, 3)
+
+# 2026-09-16: closes the gap between "the authorization-decision
+# architecture exists and is fully tested" and "it is ever actually
+# reached" -- record_facial_events() in facial_events.py has always
+# accepted a relay_provider, but main.py's real detection hook
+# (save_yolo_events()) passed None, so evaluate_access_rules() never
+# ran for a real detection at all; identity matches were recorded, but
+# no facial_rules row was ever evaluated against them. This flag wires
+# a provider into that hook -- but even at its most "on", the provider
+# constructed below is ALWAYS MockRelayProvider: there is still no
+# hardware-backed RelayProvider implementation anywhere in this
+# codebase, so turning this on can never energize a real relay or
+# unlock a real door. It only lets the identity-match -> authorization-
+# decision -> (mock) access-control-command chain run for real and be
+# observed end-to-end -- exactly the "digital path first" scope, never
+# the physical one. Default false: existing dormant behavior is
+# unchanged unless an operator explicitly opts in.
+FACIAL_ACCESS_CONTROL_ENABLED = os.environ.get("ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED", "false").strip().lower() == "true"
 
 DEFAULT_PULSE_MS = 3000
 DEFAULT_COOLDOWN_SECONDS = 10.0
@@ -193,6 +212,31 @@ def rule_applies(
     if rule.trigger_type == "specific_person":
         return rule.person_id is not None and rule.person_id == matched_person_id
     return False
+
+
+_provider: RelayProvider | None = None
+_provider_lock = threading.Lock()
+
+
+def get_provider() -> RelayProvider:
+    """Process-wide lazy singleton, matching facial_recognition.get_engine()'s
+    own pattern -- so cooldown/debounce state (tracked per-instance on
+    MockRelayProvider) persists correctly across detections instead of
+    resetting on every call. Always returns a MockRelayProvider today;
+    see this module's own docstring and FACIAL_ACCESS_CONTROL_ENABLED's
+    comment for why that remains true regardless of the flag's state."""
+    global _provider
+    with _provider_lock:
+        if _provider is None:
+            _provider = MockRelayProvider()
+        return _provider
+
+
+def reset_provider() -> None:
+    """Test-only: clears the lazy-loaded provider singleton."""
+    global _provider
+    with _provider_lock:
+        _provider = None
 
 
 def build_request(rule: RelayRule, *, reason: str, requested_by: str = "aac_facial_recognition") -> RelayRequest:

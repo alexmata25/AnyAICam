@@ -365,6 +365,42 @@ def test_relay_rule_never_triggers_for_unknown_faces(db):
     assert provider.calls == []  # relay is never even consulted for an unknown face
 
 
+def test_access_outcomes_are_persisted_on_the_facial_events_row(db):
+    """2026-09-16: the identity match -> authorization decision ->
+    access-control command chain was already correctly separated and
+    tested, but its outcome was only ever returned in-memory and never
+    written to the database -- so "was this person granted or denied
+    access" could not be answered after the fact. Proves it now lands
+    on the real facial_events row, not just the return value."""
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
+    facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
+    db.execute(
+        "INSERT INTO facial_rules(id,customer_id,camera_id,name,trigger_type,relay_channel,pulse_ms,cooldown_seconds,dry_run,enabled,min_confidence,created_at,updated_at) "
+        "VALUES('rule-1','cust-1',NULL,'Open door','known_person',1,3000,10,0,1,0.5,?,?)",
+        (NOW, NOW),
+    )
+    provider = MockRelayProvider()
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    row = db.execute("SELECT access_outcomes_json FROM facial_events WHERE id=?", (events[0]["id"],)).fetchone()
+    import json
+    stored = json.loads(row["access_outcomes_json"])
+    assert stored == events[0]["relay_outcomes"]
+    assert stored[0]["activated"] is True
+
+
+def test_access_outcomes_column_stays_null_when_no_provider_is_given(db):
+    """The common case today (ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED
+    defaults to false): NULL must mean "never evaluated", distinguishable
+    from an empty list meaning "evaluated, nothing applied"."""
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
+    facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    row = db.execute("SELECT access_outcomes_json FROM facial_events WHERE id=?", (events[0]["id"],)).fetchone()
+    assert row["access_outcomes_json"] is None
+
+
 def test_no_real_hardware_is_touched_by_relay_evaluation(db):
     """Structural safety check: MockRelayProvider is the only relay
     provider this whole test suite (and this Phase 1 codebase) ever

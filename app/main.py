@@ -37397,12 +37397,16 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # opens its own short-lived database_backend.connect() rather
         # than building only a local-JSON event dict), which is correct
         # and complete on its own for a single-database deployment
-        # (Ryzen/Samsung). relay_provider is deliberately omitted
-        # (defaults to None inside record_facial_events(), which then
-        # skips access-rule/relay evaluation entirely) -- this hook
-        # records facial match history only; wiring a live relay
-        # provider into this hot detection path remains explicit future
-        # work, not something this hook does implicitly.
+        # (Ryzen/Samsung). relay_provider is passed only when an
+        # operator has explicitly set ANYAICAM_FACIAL_ACCESS_CONTROL_
+        # ENABLED=true (default false, so existing behavior -- facial
+        # match history recorded, access rules never evaluated -- is
+        # unchanged unless opted into); even then, relay_control.
+        # get_provider() always returns MockRelayProvider -- there is no
+        # hardware-backed provider in this codebase, so this can never
+        # energize a real relay. It lets identity match -> authorization
+        # decision -> (mock) access-control command run and be observed
+        # end-to-end, which the real-camera validation protocol needs.
         #
         # Phase 2: each created event is ALSO appended to the local
         # ANALYTICS_EVENTS_FILE (append_analytics_event(), the exact
@@ -37433,7 +37437,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
                     with aac_connect() as aac_db:
                         aac_events_created = facial_events.record_facial_events(
-                            aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now
+                            aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now,
+                            relay_provider=relay_control.get_provider() if relay_control.FACIAL_ACCESS_CONTROL_ENABLED else None,
                         )
                     for aac_event in aac_events_created:
                         append_analytics_event(
@@ -39031,6 +39036,7 @@ import people_counting
 import facial_embedding_sync
 import facial_events
 import facial_recognition
+import relay_control
 
 
 @asynccontextmanager

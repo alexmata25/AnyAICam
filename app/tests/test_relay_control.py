@@ -4,6 +4,7 @@ debounce, dry-run safety, and RelayRule matching (rule_applies())."""
 
 import pytest
 
+import relay_control
 from relay_control import (
     MockRelayProvider,
     RelayRequest,
@@ -207,3 +208,45 @@ def test_build_request_uses_rule_channel_and_pulse():
     request = build_request(rule, reason="test")
     assert request.channel == 2
     assert request.pulse_ms == 1500
+
+
+# ----------------------------------------------- process-wide provider singleton
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_singleton():
+    relay_control.reset_provider()
+    yield
+    relay_control.reset_provider()
+
+
+def test_facial_access_control_enabled_defaults_to_false(monkeypatch):
+    """Existing dormant behavior (identity recorded, access rules never
+    evaluated) must stay the default unless an operator explicitly opts
+    in -- matches every other ANYAICAM_*_ENABLED flag in this codebase."""
+    monkeypatch.delenv("ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED", raising=False)
+    import importlib
+    importlib.reload(relay_control)
+    assert relay_control.FACIAL_ACCESS_CONTROL_ENABLED is False
+    importlib.reload(relay_control)  # restore a clean module for later tests
+
+
+def test_get_provider_returns_the_same_instance_so_cooldown_state_persists():
+    first = relay_control.get_provider()
+    second = relay_control.get_provider()
+    assert first is second
+
+
+def test_get_provider_is_always_a_mock_regardless_of_the_flag(monkeypatch):
+    """The flag only decides whether the authorization chain runs at
+    all -- it can never select a hardware-backed provider, because none
+    exists in this codebase yet."""
+    monkeypatch.setattr(relay_control, "FACIAL_ACCESS_CONTROL_ENABLED", True)
+    assert isinstance(relay_control.get_provider(), relay_control.MockRelayProvider)
+
+
+def test_reset_provider_clears_the_singleton():
+    first = relay_control.get_provider()
+    relay_control.reset_provider()
+    second = relay_control.get_provider()
+    assert first is not second
