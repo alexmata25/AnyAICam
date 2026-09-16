@@ -43,18 +43,47 @@ Deny, touch Ryzen or Samsung, touch AWS resources outside the one
 staging EC2 instance + its own S3/IAM already in scope, or create a
 second real (non-test) tenant on staging.
 
-### Ryzen — autonomous testing/deployment only after separately enabled
+### Ryzen — autonomous diagnosis, always; autonomous change only within an explicitly authorized pass
 
-The physical edge appliance (`ryzen-tailscale`, currently a
-non-privileged SSH key with no `sudo`). **Not in scope for any
-autonomous loop today.** Before it ever is, this document needs a new,
-explicitly-authorized section describing exactly what's allowed there
-(at minimum: which containers may be recreated, whether camera
-discovery/recording may ever be touched automatically, and how a
-privileged action -- still never handled directly per this project's
-standing rule -- fits into an otherwise-unattended loop). Until that
-section exists, any Ryzen change stays a human-initiated, one-at-a-time
-action, exactly as today.
+The physical edge appliance (`ryzen-tailscale`, a non-privileged SSH
+key with no `sudo`; the single `anyaicam-vms` container there runs the
+same shared codebase as the cloud side, in "appliance mode").
+
+**Read-only inspection (logs, `docker top`/`docker stats`, the local
+event-media outbox, non-secret env vars, process list) is always in
+scope** -- the same standing default this document already gives
+staging/production inspection, since it can't change anything.
+
+**Making a change** -- editing appliance config, restarting/recreating
+the `anyaicam-vms` container or any other appliance service -- requires
+its own explicitly authorized pass, exactly like production
+modification does. The first such pass was granted 2026-09-16, scoped
+to: investigate why event-media (clip/thumbnail) delivery was failing
+for most events across all 5 real cameras, and make safe Ryzen-side
+software/configuration changes (plus the affected service/container
+restarts) needed to fix it. Explicitly excluded even within that grant:
+factory-resetting a camera, changing camera firmware, altering camera
+credentials, deleting recordings, wiping queues/databases, or any other
+destructive/irreversible action. Production stayed out of scope
+throughout. A future pass with a different scope needs its own
+authorization -- this entry describes what was granted, not a standing
+blanket allowance for all future Ryzen changes.
+
+**IAM/AWS-account changes are never included in a Ryzen-scoped grant**,
+even implicitly. The 2026-09-16 investigation traced the event-media
+failure to two independent layers: an application-level flag
+(`ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`, unset on the staging cloud
+side) and the underlying IAM role's own identity-based policy (scoped
+by name and by resource ARN to Camera 1 only). The flag was fixed
+directly (a staging config change, within existing staging authorization).
+The IAM policy was diagnosed precisely but deliberately **not**
+touched -- widening an IAM role's resource scope is exactly the kind of
+action this document already reserves for separate, explicit
+authorization ("weaken IAM or the broad recording Deny... without
+separate explicit authorization"), regardless of how narrowly the
+proposed change is scoped. See `docs/PROJECT_CHECKPOINT.md`'s matching
+2026-09-16 entry for the full evidence trail and the specific policy
+change that would need sign-off.
 
 ### Production — inspection allowed when specifically authorized; modification always needs a human
 
