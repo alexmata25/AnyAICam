@@ -3053,3 +3053,5 @@ A live ON/OFF toggle test against the real pilot customer's own account was scop
 2. **Physical-world camera stimulus** -- the consolidated list earlier in this file, unchanged: a real license plate, a real person/vehicle, real PPE, a People-Counting walk-through, a real Intrusion-zone crossing.
 
 Production was never touched throughout this entire multi-message engagement. No camera credential, firmware, or destructive action was taken at any point. Every config change was backed up first and is documented precisely enough to roll back exactly if ever needed.
+
+> **KNOWN-GOOD BASELINE, accepted by the user 2026-09-16: fully-enabled five-camera staging, `e2e/` suite at 77 passed / 1 legitimate skip / 0 failed.** Any future change (RDM testing included) that regresses this suite below that bar, or destabilizes any of the 5 real cameras' event-media or bulk-recording pipelines, is a real regression against an accepted baseline, not just "a test failed" -- treat it accordingly, and do not quietly redefine a worse result as the new normal.
