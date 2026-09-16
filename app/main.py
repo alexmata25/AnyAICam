@@ -141432,8 +141432,23 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.playback-camera-tile{padding:8px 16px;border-radius:999px;border:1px solid var(--line);'
         'background:transparent;color:inherit;font:inherit;cursor:pointer}'
         '.playback-camera-tile.active{background:var(--brand-action,#2f6f6b);color:#fff;border-color:transparent}'
-        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:70vh}'
-        '@media(min-width:900px){.playback-workspace-solo .camera-view{aspect-ratio:21/9}}'
+        # 2026-09-16 usability fix: the video and the timeline must both
+        # be visible together on a normal desktop viewport, without
+        # scrolling, per direct user requirement -- confirmed broken by
+        # a real e2e screenshot at 1440x900 (video alone ran to ~523px
+        # tall via the 21:9-at-full-container-width rule this replaces,
+        # pushing the ~285px-tall timeline section below the fold
+        # entirely). Height-first sizing instead of width-first: capped
+        # by max-height (viewport-relative, budgeted against the
+        # timeline section's own real measured height so both fit),
+        # width:auto derives from the real 16:9 aspect-ratio instead of
+        # stretching to the full container width and then being forced
+        # short/wide -- centered via the sibling .panel rule below.
+        # Nothing removed: the player is smaller, not gone, and every
+        # existing control/feature on this page is unchanged.
+        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:min(38vh,380px);'
+        'width:auto;max-width:100%;margin:0 auto}'
+        '.playback-workspace-solo .panel{display:flex;justify-content:center}'
         # The .event-* classes were already used by this legend (and by
         # the /analytics search results legend) but never actually had
         # a background color defined anywhere -- every dot rendered
@@ -141501,6 +141516,19 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # own <section> below) so Live View's Monitor page, which reuses
         # the bare .monitor-timeline class, is completely unaffected.
         '#playback-monitor-timeline{min-height:0!important}'
+        # Compact primary controls (2026-09-16, same usability pass as
+        # the video-sizing fix above): smaller padding/min-height than
+        # this page's shared button style, and icon-only glyphs (see the
+        # buttons themselves and their title/aria-label attributes
+        # below) instead of full words, so the toolbar takes less
+        # vertical room -- every control is still present and still a
+        # real <button>, just visually lighter. Scoped by the
+        # #playback-monitor-timeline id (already added to this page's
+        # own <section> for the min-height override above) so Live
+        # View's own Monitor page, which reuses the bare .monitor-
+        # toolbar class, is completely unaffected.
+        '#playback-monitor-timeline .monitor-toolbar button{padding:6px 10px;min-height:32px;'
+        'font-size:15px;line-height:1}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:14px">'
@@ -141536,15 +141564,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Timeline</h2></div></div>'
         '<div class="monitor-toolbar">'
         '<div class="monitor-toolbar-group">'
-        '<button id="skip-back" type="button" disabled>Back 10</button>'
-        '<button id="timeline-play" type="button" disabled>Play</button>'
-        '<button id="skip-forward" type="button" disabled>Forward 10</button>'
+        '<button id="skip-back" type="button" disabled title="Back 10 seconds" aria-label="Back 10 seconds">⏪</button>'
+        '<button id="timeline-play" type="button" disabled title="Play" aria-label="Play">▶</button>'
+        '<button id="skip-forward" type="button" disabled title="Forward 10 seconds" aria-label="Forward 10 seconds">⏩</button>'
         '</div>'
         '<div class="monitor-toolbar-group">'
-        '<button id="download-selected" type="button" disabled>Download</button>'
-        '<button id="share-selected" type="button" disabled>Share</button>'
+        '<button id="download-selected" type="button" disabled title="Download" aria-label="Download">⬇</button>'
+        '<button id="share-selected" type="button" disabled title="Share" aria-label="Share">⤴</button>'
         '<button id="create-clip" type="button" disabled>Create clip</button>'
-        '<button id="bookmark-selected" type="button" disabled title="Bookmarking from Playback is not available yet.">Bookmark</button>'
+        '<button id="bookmark-selected" type="button" disabled title="Bookmarking from Playback is not available yet." aria-label="Bookmark">☆</button>'
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
@@ -143038,16 +143066,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }}
   }});
 
+  function setPlayButtonState(isPlaying){{
+    timelinePlayButton.textContent=isPlaying?'⏸':'▶';
+    timelinePlayButton.title=isPlaying?'Pause':'Play';
+    timelinePlayButton.setAttribute('aria-label',isPlaying?'Pause':'Play');
+  }}
+
   video.addEventListener('play',()=>{{
-    timelinePlayButton.textContent='Pause';
+    setPlayButtonState(true);
   }});
 
   video.addEventListener('pause',()=>{{
-    timelinePlayButton.textContent='Play';
+    setPlayButtonState(false);
   }});
 
   video.addEventListener('ended',()=>{{
-    timelinePlayButton.textContent='Play';
+    setPlayButtonState(false);
     const next=_planNextChainedClip(currentClips,selectedClip);
     if(next)playClip(selectedCameraId,next);
   }});

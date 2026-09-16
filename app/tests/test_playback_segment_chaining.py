@@ -58,7 +58,14 @@ def test_ended_event_triggers_chain_via_the_existing_unmodified_playclip(monkeyp
     assert "function _planNextChainedClip(clips,endedClip){" in html
     idx = html.index("video.addEventListener('ended',()=>{")
     block = html[idx: idx + 250]
-    assert "timelinePlayButton.textContent='Play';" in block, "the pre-existing button-state reset must be unchanged"
+    # 2026-09-16 usability pass: the button-state reset itself is
+    # unchanged in effect (still resets to the non-playing state on
+    # 'ended') -- it now goes through the same named setPlayButtonState()
+    # helper the play/pause listeners use, instead of a bare textContent
+    # assignment, as part of converting this control to a compact icon
+    # button (see that helper's own definition for the textContent/
+    # title/aria-label it actually sets).
+    assert "setPlayButtonState(false);" in block, "the pre-existing button-state reset must still fire on 'ended'"
     assert "const next=_planNextChainedClip(currentClips,selectedClip);" in block
     assert "if(next)playClip(selectedCameraId,next);" in block
 
