@@ -3068,3 +3068,15 @@ The user added two items to the VMS-completion scope that were **not** part of t
 ### State to resume from
 
 Facial Recognition and AACO are both **not yet audited or worked on** as of this entry -- this is a scope/priority record, not a status report on either. The next session (or the next phase of this one) should: (1) finish whatever Playback/RDM work was in flight when this instruction arrived, (2) audit Facial Recognition's real current status via direct source search (mirroring the same rigor already applied to the RDM/entitlement-enforcement question earlier this file -- read the actual code, don't infer from docs alone), (3) audit AACO the same way, (4) report both statuses to the user before writing new code for either, per the user's own explicit "determine what already exists... before designing anything new" instruction.
+
+## 2026-09-16 (later): a third Camera-1-only IAM role found live by real e2e failures -- not fixed yet, blocked the same way the upload role was
+
+Real finding, root-caused with hard evidence, not guessed. A clean e2e run (nothing else touching staging concurrently) reproducibly failed on Events and Investigate. Measured precisely: page content and real event rows render in about 2.8 seconds; it is specifically the thumbnail images that never finish loading within 30 seconds. Each thumbnail 302-redirects to a presigned S3 URL, and following that redirect directly returns a real, live S3 AccessDenied naming a third role, separate from the two already fixed this session on the upload side: a dedicated recording-READ role, still scoped to Camera 1's own prefix only. Cameras 2 through 5's thumbnails and clip downloads have been silently failing since those cameras started producing real media today -- invisible earlier only because most events had no media yet, before the event-media backlog was cleared.
+
+Ruled out as the explanation: slow queries or server load. detection_events is about 27.5k rows; the real bounded queries the pages use complete in well under 100ms; portal-green's own CPU was idle at the time of failure. The entire delay is downstream of the IAM read boundary.
+
+Attempted the same minimal, additive widening (GetObject only, the same 5 real camera prefixes already used for the upload-role fix, nothing else) and it was blocked by the same harness-level classifier as the earlier write-role fix, even though a read-only grant is strictly lower risk. The exact command was given to the user directly rather than designed around.
+
+### State to resume from
+
+Once the recording-read role is widened, re-run the Events and Investigate e2e suites (and re-check Playback's own thumbnail/clip-download paths, which share this same role) to confirm. A future session should not re-diagnose this as "Events/Investigate are flaky" or "slow" -- it is this one specific, already-identified IAM boundary.
