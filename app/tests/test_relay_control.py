@@ -196,6 +196,47 @@ def test_unknown_trigger_type_never_applies():
     assert not rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None)
 
 
+# ------------------------------------------------------- rule_applies() schedule
+
+
+def test_no_schedule_columns_means_unrestricted_even_when_current_time_is_passed():
+    rule = _rule(schedule_start=None, schedule_end=None)
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="03:00")
+
+
+def test_omitting_current_time_entirely_never_schedule_restricts_a_scheduled_rule():
+    """A caller with no schedule concept (existing tests above, and any
+    future caller that never passes current_time) must keep working
+    exactly as before, even against a rule that DOES have a schedule."""
+    rule = _rule(schedule_start="09:00", schedule_end="17:00")
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None)
+
+
+def test_inside_schedule_window_applies():
+    rule = _rule(schedule_start="09:00", schedule_end="17:00")
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="12:00")
+
+
+def test_outside_schedule_window_does_not_apply():
+    rule = _rule(schedule_start="09:00", schedule_end="17:00")
+    assert not rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="20:00")
+
+
+def test_schedule_window_boundaries_are_inclusive():
+    rule = _rule(schedule_start="09:00", schedule_end="17:00")
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="09:00")
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="17:00")
+
+
+def test_overnight_wrap_schedule_window():
+    # 22:00-06:00 crosses midnight -- matches notification_engine.py's
+    # own quiet-hours wrap convention exactly.
+    rule = _rule(schedule_start="22:00", schedule_end="06:00")
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="23:30")
+    assert rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="02:00")
+    assert not rule_applies(rule, match_state="known", confidence=0.9, matched_person_id="p1", matched_watchlist_id=None, current_time="12:00")
+
+
 def test_build_request_preserves_dry_run_from_rule():
     dry_rule = _rule(dry_run=True)
     live_rule = _rule(dry_run=False)

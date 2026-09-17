@@ -187,6 +187,25 @@ class RelayRule:
     min_confidence: float
     watchlist_id: str | None = None
     person_id: str | None = None
+    # Face Access door-control (2026-09-17): the "current permitted
+    # time/schedule" requirement for automatic-entry authorization.
+    # Both None (the default) means no schedule restriction -- a rule
+    # created before this column existed, or one nobody has scoped to a
+    # time window, keeps authorizing exactly as it always did. HH:MM
+    # strings, wrap-aware (start > end means the window crosses
+    # midnight), the exact same convention notification_engine.py's own
+    # quiet_start/quiet_end already established -- never a second,
+    # differently-shaped schedule concept.
+    schedule_start: str | None = None
+    schedule_end: str | None = None
+
+
+def _within_schedule(current_time: str, schedule_start: str | None, schedule_end: str | None) -> bool:
+    if not schedule_start or not schedule_end:
+        return True
+    if schedule_start <= schedule_end:
+        return schedule_start <= current_time <= schedule_end
+    return current_time >= schedule_start or current_time <= schedule_end
 
 
 def rule_applies(
@@ -196,14 +215,24 @@ def rule_applies(
     confidence: float,
     matched_person_id: str | None,
     matched_watchlist_id: str | None,
+    current_time: str | None = None,
 ) -> bool:
     """Pure decision: would this rule fire for this match? Never touches
     a RelayProvider or a database -- see facial_events.evaluate_access_rules()
     for the caller that turns a True result into an actual (possibly
-    dry-run) RelayRequest."""
+    dry-run) RelayRequest.
+
+    current_time (HH:MM, appliance-local, matching quiet_hours' own
+    convention): omitted (None) means "don't schedule-restrict" -- every
+    existing caller that has no schedule concept keeps working
+    unchanged. A caller that passes it is checked against the rule's
+    own schedule_start/schedule_end (both None = unrestricted, same as
+    omitting current_time entirely)."""
     if not rule.enabled:
         return False
     if confidence < rule.min_confidence:
+        return False
+    if current_time is not None and not _within_schedule(current_time, rule.schedule_start, rule.schedule_end):
         return False
     if rule.trigger_type == "known_person":
         return match_state == "known"

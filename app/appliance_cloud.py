@@ -743,6 +743,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # anyway. No thumbnail is stored here -- see the Phase 2
             # report's own note on face-crop thumbnail cloud sync being a
             # separate, not-yet-implemented piece.
+            facial_notify_message=None
             if event_type=='facial_recognition' and isinstance(detections,list) and detections and isinstance(detections[0],dict):
                 facial_fields=detections[0]
                 db.execute(
@@ -757,6 +758,16 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         facial_fields.get('engine') or 'unknown',facial_fields.get('engine_version'),now,
                     ),
                 )
+                # Face Access (2026-09-17): door_notify_message is set by
+                # the edge (facial_events.record_facial_events()) only
+                # for modes 2/3 (recognized-not-authorized / unknown) --
+                # never for mode 1 (an authorized automatic unlock) and
+                # never for a facial-recognition camera that isn't a
+                # configured door. The cloud never re-derives that
+                # authorization decision itself; it only relays the
+                # message the edge already decided on, exactly like the
+                # PPE hard_hat_present/safety_vest_present fields above.
+                facial_notify_message=str(facial_fields.get('door_notify_message') or '').strip() or None
         # 2026-09-04, Smart Alerts fix: this is the currently-active
         # event-ingestion path (the older POST /api/appliance/events ->
         # appliance_events route also calls fanout_appliance_event(),
@@ -781,13 +792,24 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # never anything else" convention. Never allowed to fail the
         # actual, already-successful ingestion response below: a
         # notification-side error is logged and swallowed, not raised.
-        try:
-            fanout_appliance_event(
-                {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
-                {'id': event_id, 'camera_id': camera_id, 'event_type': event_type, 'timestamp': event_timestamp},
-            )
-        except Exception:
-            logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
+        # Face Access (2026-09-17): a facial_recognition event fans out
+        # ONLY when the edge attached a door_notify_message (modes 2/3)
+        # -- a mode-1 authorized automatic unlock, or a facial-
+        # recognition camera that isn't a configured door at all, never
+        # reaches fanout_appliance_event() here, exactly matching the
+        # requirements doc's own framing ("do NOT auto-unlock... send
+        # the customer a notification" is specific to modes 2/3; mode 1
+        # has nothing for a customer to act on). Every other event_type
+        # is completely unaffected -- this skip is scoped to event_
+        # type=='facial_recognition' alone.
+        if event_type!='facial_recognition' or facial_notify_message:
+            try:
+                fanout_appliance_event(
+                    {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
+                    {'id': event_id, 'camera_id': camera_id, 'event_type': event_type, 'timestamp': event_timestamp, 'message': facial_notify_message},
+                )
+            except Exception:
+                logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
         return {'status':'accepted','event_id':event_id}
 
     @app.get('/api/appliance/facial-directory')

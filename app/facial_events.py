@@ -45,6 +45,7 @@ import threading
 import time
 from pathlib import Path
 
+import door_access
 import facial_people
 import facial_recognition
 import relay_control
@@ -69,6 +70,23 @@ _UNKNOWN_POSITION_GRID_PX = max(1, int(os.environ.get("ANYAICAM_FACIAL_UNKNOWN_D
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(10)}"
+
+
+def _hhmm(now) -> str | None:
+    """HH:MM for the schedule check in evaluate_access_rules() -- `now`
+    may be a real datetime OR a plain ISO string (this module's own
+    test suite convention, matching create_match_event()'s existing
+    `now.isoformat() if hasattr(now, "isoformat") else str(now)`
+    pattern). None (never schedule-restrict) if neither form parses,
+    rather than raising and losing a real detection over a malformed
+    timestamp."""
+    if hasattr(now, "strftime"):
+        return now.strftime("%H:%M")
+    try:
+        from datetime import datetime as _datetime
+        return _datetime.fromisoformat(str(now)).strftime("%H:%M")
+    except ValueError:
+        return None
 
 
 class _EmbeddingCache:
@@ -120,7 +138,8 @@ def reset_state() -> None:
 
 def _camera_tenant_context(db, camera_number: int) -> dict | None:
     row = db.execute(
-        "SELECT id,customer_id,site_id,appliance_id FROM cameras WHERE camera_number=?",
+        "SELECT id,customer_id,site_id,appliance_id,name,door_access_enabled,door_relay_channel,door_relay_pulse_ms "
+        "FROM cameras WHERE camera_number=?",
         (camera_number,),
     ).fetchone()
     return dict(row) if row else None
@@ -245,15 +264,18 @@ def evaluate_access_rules(
     matched_watchlist_id: str | None,
     relay_provider: "relay_control.RelayProvider",
     detection_event_id: str,
+    current_time: str | None = None,
 ) -> list[dict]:
     """Loads this customer's enabled facial_rules (scoped to this
     camera or camera-agnostic, i.e. camera_id IS NULL), evaluates each
-    against the match via relay_control.rule_applies(), and triggers
-    relay_provider for every rule that applies. Returns one summary
-    dict per rule that applied (whether or not the provider actually
-    activated -- e.g. a rule under cooldown still appears, with
-    activated=False). An empty facial_rules table (the default -- see
-    the Phase 1 report) means this always returns []."""
+    against the match via relay_control.rule_applies() (including the
+    rule's own schedule_start/schedule_end when current_time is given
+    -- the Face Access "current permitted time/schedule" requirement),
+    and triggers relay_provider for every rule that applies. Returns
+    one summary dict per rule that applied (whether or not the
+    provider actually activated -- e.g. a rule under cooldown still
+    appears, with activated=False). An empty facial_rules table (the
+    default -- see the Phase 1 report) means this always returns []."""
     rows = db.execute(
         "SELECT * FROM facial_rules WHERE customer_id=? AND enabled=1 AND (camera_id=? OR camera_id IS NULL)",
         (customer_id, camera_id),
@@ -271,6 +293,8 @@ def evaluate_access_rules(
             min_confidence=row["min_confidence"],
             watchlist_id=row["watchlist_id"],
             person_id=row["person_id"],
+            schedule_start=row["schedule_start"] if "schedule_start" in row.keys() else None,
+            schedule_end=row["schedule_end"] if "schedule_end" in row.keys() else None,
         )
         if not relay_control.rule_applies(
             rule,
@@ -278,6 +302,7 @@ def evaluate_access_rules(
             confidence=confidence,
             matched_person_id=matched_person_id,
             matched_watchlist_id=matched_watchlist_id,
+            current_time=current_time,
         ):
             continue
         request = relay_control.build_request(rule, reason=f"facial_event:{detection_event_id}")
@@ -410,28 +435,90 @@ def record_facial_events(
             now=now,
         )
         created.append(event)
-        if relay_provider is not None and match_state in ("known", "watchlist"):
-            outcomes = evaluate_access_rules(
-                db,
-                customer_id=context["customer_id"],
-                camera_id=context["id"],
-                match_state=match_state,
-                confidence=confidence,
-                matched_person_id=accepted.person_id if accepted else None,
-                matched_watchlist_id=(matched_watchlist or {}).get("id"),
-                relay_provider=relay_provider,
-                detection_event_id=event["detection_event_id"],
+        # Face Access -- Door/Relay Control (2026-09-17): everything
+        # below is scoped to door_access_enabled cameras only -- a
+        # facial-recognition camera that isn't a configured door has no
+        # relay to evaluate against and nothing to notify about, per
+        # the requirements doc's own framing (modes 1-3 are explicitly
+        # about door cameras). A non-door camera's match is still fully
+        # recorded above (create_match_event()); it just never reaches
+        # this block.
+        person_name = (matched_person or {}).get("display_name")
+        door_enabled = bool(context.get("door_access_enabled"))
+        if door_enabled and match_state in ("known", "watchlist"):
+            outcomes = []
+            if relay_provider is not None:
+                outcomes = evaluate_access_rules(
+                    db,
+                    customer_id=context["customer_id"],
+                    camera_id=context["id"],
+                    match_state=match_state,
+                    confidence=confidence,
+                    matched_person_id=accepted.person_id if accepted else None,
+                    matched_watchlist_id=(matched_watchlist or {}).get("id"),
+                    relay_provider=relay_provider,
+                    detection_event_id=event["detection_event_id"],
+                    current_time=_hhmm(now),
+                )
+                event["relay_outcomes"] = outcomes
+                # Persisted separately from the INSERT above (the
+                # authorization decision only runs, if at all, after
+                # that row already exists) so "recognized identity" and
+                # "access granted/denied" are both durable on the same
+                # facial_events row, not just returned in-memory and
+                # lost the moment this function returns.
+                db.execute(
+                    "UPDATE facial_events SET access_outcomes_json=? WHERE id=?",
+                    (json.dumps(outcomes), event["id"]),
+                )
+            activated = any(outcome["activated"] for outcome in outcomes)
+            if activated:
+                # Mode 1: recognized + authorized for automatic entry.
+                # The relay already fired inside evaluate_access_rules()
+                # above -- this only records the audit row; no
+                # customer notification is sent (nothing went wrong,
+                # nothing needs a manual decision).
+                door_access.record_door_access_event(
+                    db, customer_id=context["customer_id"], camera_id=context["id"], door_name=context["name"],
+                    relay_channel=context.get("door_relay_channel"), trigger_type="automatic",
+                    matched_person_id=accepted.person_id if accepted else None, matched_person_name=person_name,
+                    facial_event_id=event["id"], authorization_result="authorized", relay_result="activated",
+                    success=True, now=now,
+                )
+            else:
+                # Mode 2: recognized, but not authorized for automatic
+                # entry at this door (no facial_rules row matched, or
+                # one matched but never actually activates the relay --
+                # e.g. dry_run, cooldown). Never auto-unlocks; the
+                # notify_message below is what a future notification
+                # dispatcher (analytics_sync.py -> appliance_cloud.py's
+                # fanout, see that module's own facial_recognition
+                # comment) turns into "<name> is at <door>."
+                suppressed = outcomes[0].get("suppressed_reason") if outcomes else None
+                relay_result = "suppressed" if suppressed else ("dry_run" if outcomes else "skipped")
+                door_access.record_door_access_event(
+                    db, customer_id=context["customer_id"], camera_id=context["id"], door_name=context["name"],
+                    relay_channel=context.get("door_relay_channel"), trigger_type="automatic",
+                    matched_person_id=accepted.person_id if accepted else None, matched_person_name=person_name,
+                    facial_event_id=event["id"],
+                    authorization_result="authorized" if outcomes else "not_authorized",
+                    relay_result=relay_result, success=False, now=now,
+                )
+                event["door_notify_message"] = f"{person_name or 'A recognized person'} is at {context['name']}."
+        elif door_enabled and match_state == "unknown":
+            # Mode 3: unknown person at a door camera. Never auto-
+            # unlocks; always notifies, regardless of unknown_person_
+            # events_enabled having already gated whether this event
+            # was even created (see the debounce check above -- an
+            # unknown-events-disabled customer never reaches this line
+            # at all, so there is nothing extra to suppress here).
+            door_access.record_door_access_event(
+                db, customer_id=context["customer_id"], camera_id=context["id"], door_name=context["name"],
+                relay_channel=context.get("door_relay_channel"), trigger_type="automatic",
+                matched_person_id=None, matched_person_name=None, facial_event_id=event["id"],
+                authorization_result="unknown_person", relay_result="skipped", success=False, now=now,
             )
-            event["relay_outcomes"] = outcomes
-            # Persisted separately from the INSERT above (the authorization
-            # decision only runs, if at all, after that row already exists)
-            # so "recognized identity" and "access granted/denied" are both
-            # durable on the same facial_events row, not just returned
-            # in-memory and lost the moment this function returns.
-            db.execute(
-                "UPDATE facial_events SET access_outcomes_json=? WHERE id=?",
-                (json.dumps(outcomes), event["id"]),
-            )
+            event["door_notify_message"] = f"Unknown person at {context['name']}."
     return created
 
 

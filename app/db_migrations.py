@@ -729,6 +729,55 @@ CREATE TABLE IF NOT EXISTS facial_settings(
     FOREIGN KEY(customer_id) REFERENCES customers(id)
 );
 '''),
+    # Face Access -- Door/Relay Control (2026-09-17), per the user's own
+    # explicit product specification (docs/aac-face-access-door-control-
+    # requirements.md). Builds on the facial_rules/relay_control.py
+    # foundation the Phase 1 AAC merge above already provides -- this
+    # migration adds only what that foundation didn't yet cover:
+    #
+    # schedule_start/schedule_end on facial_rules: the "current permitted
+    # time/schedule" requirement for automatic-entry authorization
+    # (mode 1). Nullable HH:MM strings, same wrap-aware convention
+    # notification_engine.py's quiet_start/quiet_end already established
+    # (NULL/NULL means "no schedule restriction", not "never
+    # authorized" -- the fail-closed default matches every other
+    # optional-override column in this codebase, e.g. local_storage_
+    # policy.reserved_free_percent).
+    #
+    # door_access_events is the cross-cutting audit table the security
+    # requirements explicitly call for: EVERY unlock attempt (manual
+    # button press or automatic facial-recognition-triggered), covering
+    # both at once, in one place -- distinct from facial_events (which
+    # is about a face MATCH, not an unlock attempt; a manual unlock has
+    # no face match at all, and an automatic unlock's own facial_events
+    # row is linked here via facial_event_id, never duplicated).
+    ('20260917_face_access_door_control','''
+ALTER TABLE facial_rules ADD COLUMN schedule_start TEXT;
+ALTER TABLE facial_rules ADD COLUMN schedule_end TEXT;
+CREATE TABLE IF NOT EXISTS door_access_events(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    door_name TEXT NOT NULL,
+    relay_channel INTEGER,
+    trigger_type TEXT NOT NULL,
+    actor_user_id TEXT,
+    actor_email TEXT,
+    matched_person_id TEXT,
+    matched_person_name TEXT,
+    facial_event_id TEXT,
+    authorization_result TEXT NOT NULL,
+    relay_result TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id),
+    FOREIGN KEY(facial_event_id) REFERENCES facial_events(id)
+);
+CREATE INDEX IF NOT EXISTS idx_door_access_events_customer_created ON door_access_events(customer_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_door_access_events_camera_created ON door_access_events(camera_id,created_at);
+'''),
 ]
 
 
@@ -760,7 +809,14 @@ def apply_migrations():
         permission_columns=({item['name'] for item in db.execute('PRAGMA table_info(customer_camera_permissions)').fetchall()}
                             if backend()=='sqlite' else
                             {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='customer_camera_permissions'").fetchall()})
-        for name,definition in (('can_alerts','INTEGER NOT NULL DEFAULT 1'),('can_settings','INTEGER NOT NULL DEFAULT 0'),('can_talk','INTEGER NOT NULL DEFAULT 0')):
+        # can_unlock (2026-09-17): the "appropriate access permissions"
+        # the Face Access requirements call for -- same shape and same
+        # fail-closed default (0) as can_settings/can_talk. A customer_
+        # viewer with no explicit grant can see a door camera's live tile
+        # but never gets the Unlock Door button; a customer_owner's own
+        # unlock route below still separately re-checks this at the
+        # moment the command is executed, never trusting a cached value.
+        for name,definition in (('can_alerts','INTEGER NOT NULL DEFAULT 1'),('can_settings','INTEGER NOT NULL DEFAULT 0'),('can_talk','INTEGER NOT NULL DEFAULT 0'),('can_unlock','INTEGER NOT NULL DEFAULT 0')):
             if name not in permission_columns: db.execute(f'ALTER TABLE customer_camera_permissions ADD COLUMN {name} {definition}')
 
         camera_columns=({item['name'] for item in db.execute('PRAGMA table_info(cameras)').fetchall()}
@@ -856,6 +912,21 @@ def apply_migrations():
         if 'smart_motion_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN smart_motion_enabled INTEGER')
         if 'lpr_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN lpr_enabled INTEGER')
         if 'ppe_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN ppe_enabled INTEGER')
+        # Face Access -- Door/Relay Control (2026-09-17): fail-closed like
+        # every sibling *_enabled column above -- NULL/0 means this camera
+        # is not a door and must never show the live-tile Unlock button or
+        # be eligible for automatic-entry evaluation, regardless of
+        # facial_recognition/ppe_enabled etc. The door's own display name
+        # is deliberately NOT a separate column: it's this camera's
+        # existing `name` (see the requirements doc's own example --
+        # "Camera 1 is renamed Front Door"), never a second, potentially-
+        # diverging copy of it. door_relay_pulse_ms is this door's default
+        # activation duration for a MANUAL Unlock press; an AUTOMATIC
+        # (facial_rules-driven) unlock uses that rule's own pulse_ms
+        # instead, unchanged.
+        if 'door_access_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_access_enabled INTEGER')
+        if 'door_relay_channel' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_relay_channel INTEGER')
+        if 'door_relay_pulse_ms' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_relay_pulse_ms INTEGER')
         # One-time-per-row backfill, safe to run on every startup: a
         # customer who already toggled an analytic ON via RDM (writing
         # camera_analytics_entitlements) before this fix existed must not

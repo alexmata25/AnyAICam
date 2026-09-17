@@ -39,6 +39,12 @@ EVENT_TYPES: dict[str, str] = {
     "appliance_offline": "Appliance offline",
     "storage_problem": "Recording/storage problem",
     "system_health": "System/health warning",
+    # Face Access (2026-09-17): "John is at the Front Door" / "Unknown
+    # person at the Front Door" -- modes 2/3 of the door-access
+    # requirements. Never fires for mode 1 (an authorized automatic
+    # unlock); see appliance_cloud.py's analytics_event_available()
+    # for where that distinction is actually made.
+    "facial_recognition": "Face Access alert",
 }
 
 CAMERA_SCOPES = {"all", "selected"}

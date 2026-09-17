@@ -76,7 +76,13 @@ def db(db_path):
             conn.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-1','p1','C1','c1@example.test','active','real',?)", (NOW,))
             conn.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-1','cust-1','Site 1',?)", (NOW,))
             conn.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-1','cust-1','site-1','AIC-TEST0001',?)", (NOW,))
-            conn.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,camera_number) VALUES('cam-1','cust-1','site-1','appl-1','Camera 1','active',?,1)", (NOW,))
+            # door_access_enabled=1 (2026-09-17): the automatic-unlock
+            # evaluation path below is now scoped to configured door
+            # cameras only -- see facial_events.record_facial_events()'s
+            # own comment. cam-1 is the one camera in this fixture the
+            # relay-rule tests below exercise; cam-2 deliberately stays
+            # a non-door camera.
+            conn.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,camera_number,door_access_enabled,door_relay_channel) VALUES('cam-1','cust-1','site-1','appl-1','Camera 1','active',?,1,1,1)", (NOW,))
             conn.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,camera_number) VALUES('cam-2','cust-1','site-1','appl-1','Camera 2','active',?,2)", (NOW,))
         with connection() as conn:
             yield conn
@@ -414,3 +420,110 @@ def test_no_real_hardware_is_touched_by_relay_evaluation(db):
         if isinstance(value, type) and issubclass(value, relay_control.RelayProvider)
     ]
     assert provider_classes == [relay_control.RelayProvider, relay_control.MockRelayProvider]
+
+
+# --------------------------------------------------------------------------
+# Face Access -- Door/Relay Control (2026-09-17): mode 1/2/3 behavior
+# --------------------------------------------------------------------------
+
+
+def _door_rule(db, *, relay_channel=1, dry_run=0, min_confidence=0.5):
+    db.execute(
+        "INSERT INTO facial_rules(id,customer_id,camera_id,name,trigger_type,relay_channel,pulse_ms,cooldown_seconds,dry_run,enabled,min_confidence,created_at,updated_at) "
+        "VALUES('door-rule-1','cust-1',NULL,'Open door','known_person',?,3000,10,?,1,?,?,?)",
+        (relay_channel, dry_run, min_confidence, NOW, NOW),
+    )
+
+
+def test_mode1_authorized_auto_unlock_has_no_notify_message_and_audits_success(db):
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
+    facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
+    _door_rule(db, dry_run=0)
+    provider = MockRelayProvider()
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    assert "door_notify_message" not in events[0]
+    audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
+    assert audit is not None
+    assert audit["trigger_type"] == "automatic"
+    assert audit["door_name"] == "Camera 1"
+    assert audit["matched_person_name"] == "Alice"
+    assert audit["authorization_result"] == "authorized"
+    assert audit["relay_result"] == "activated"
+    assert audit["success"] == 1
+
+
+def test_mode2_recognized_without_authorization_notifies_and_never_unlocks(db):
+    """No facial_rules row at all for this customer -- a real person is
+    recognized but no rule authorizes automatic entry."""
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Bob", now=NOW)
+    facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
+    provider = MockRelayProvider()
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    assert provider.calls == []
+    assert events[0]["door_notify_message"] == "Bob is at Camera 1."
+    audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
+    assert audit["matched_person_name"] == "Bob"
+    assert audit["authorization_result"] == "not_authorized"
+    assert audit["relay_result"] == "skipped"
+    assert audit["success"] == 0
+
+
+def test_mode2_a_dry_run_rule_matching_still_notifies_and_never_unlocks(db):
+    """A rule DOES match (this person IS in principle authorized) but
+    dry_run=1 means it never actually activates -- still mode 2, not
+    mode 1: nothing unlocked, so the customer still needs to know."""
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Carol", now=NOW)
+    facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
+    _door_rule(db, dry_run=1)
+    provider = MockRelayProvider()
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    assert events[0]["door_notify_message"] == "Carol is at Camera 1."
+    audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
+    assert audit["authorization_result"] == "authorized"
+    assert audit["relay_result"] == "dry_run"
+    assert audit["success"] == 0
+
+
+def test_mode3_unknown_person_at_door_camera_notifies_and_never_unlocks(db):
+    _entitle(db)
+    provider = MockRelayProvider()
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((9.0, 9.0)), relay_provider=provider)
+    assert provider.calls == []
+    assert events[0]["door_notify_message"] == "Unknown person at Camera 1."
+    audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
+    assert audit["matched_person_id"] is None
+    assert audit["authorization_result"] == "unknown_person"
+    assert audit["relay_result"] == "skipped"
+    assert audit["success"] == 0
+
+
+def test_non_door_camera_never_evaluates_rules_or_notifies_even_with_a_provider(db):
+    """cam-2 in this fixture is deliberately NOT door_access_enabled --
+    a facial-recognition camera that isn't a configured door must
+    behave exactly as it always did (match recorded, nothing more),
+    regardless of relay_provider being supplied."""
+    db.execute(
+        "INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+        ("cam-2", "facial_recognition", "active", NOW, NOW),
+    )
+    _door_rule(db, dry_run=0)
+    provider = MockRelayProvider()
+    events = facial_events.record_facial_events(db, camera_number=2, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    assert provider.calls == []
+    assert "door_notify_message" not in events[0]
+    assert db.execute("SELECT COUNT(*) c FROM door_access_events").fetchone()["c"] == 0
+
+
+def test_door_access_events_written_even_without_a_relay_provider(db):
+    """FACIAL_ACCESS_CONTROL_ENABLED defaults to false, so main.py's real
+    hook passes relay_provider=None today -- mode 2/3 notification and
+    auditing must still work in that default configuration; only the
+    ACTUAL relay evaluation (evaluate_access_rules()) is skipped."""
+    _entitle(db)
+    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((9.0, 9.0)))
+    assert events[0]["door_notify_message"] == "Unknown person at Camera 1."
+    audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
+    assert audit["authorization_result"] == "unknown_person"

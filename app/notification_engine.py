@@ -27,7 +27,13 @@ from partner_db import connection,row,rows
 # (not removed) since existing internal/admin-panel code already
 # references that label independently of customer notification
 # preferences.
-SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe'}
+# 'facial_recognition' added (2026-09-17): the same real, previously-
+# silent gap 'ppe'/'storage_problem' above were fixed for -- Face
+# Access modes 2/3 (notification_preferences.py's own EVENT_TYPES has
+# always called this "Face Access alert") could never have reached a
+# customer without it, regardless of what appliance_cloud.py's
+# analytics_event_available() route built for the message.
+SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition'}
 
 # Per-(user, camera, event_type) minimum spacing between EXTERNAL
 # (email/sms) delivery attempts -- "Prevent duplicate/spam notifications

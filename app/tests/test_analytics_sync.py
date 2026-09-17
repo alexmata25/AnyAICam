@@ -1033,3 +1033,36 @@ def test_sync_state_file_default_is_the_writable_data_config_directory_not_the_r
         assert str(reloaded.CREDENTIAL_FILE).replace("\\", "/") == "/var/lib/anyaicam/credential.json"
     finally:
         importlib.reload(asy)  # restore a clean module state for subsequent tests
+
+
+# ----------------------------------------- Face Access door_notify_message
+
+
+def test_facial_recognition_payload_forwards_door_notify_message_for_mode2_or_3():
+    event = _event("evt-1", event_type="facial_recognition")
+    event["detections"] = None
+    event["match_state"] = "known"
+    event["matched_person_id"] = "person-1"
+    event["matched_person_name"] = "Bob"
+    event["matched_watchlist_id"] = None
+    event["matched_watchlist_name"] = None
+    event["engine"] = "haar_intensity"
+    event["engine_version"] = "1"
+    event["door_notify_message"] = "Bob is at Front Door."
+    payload = asy._build_payload(event)
+    assert payload["detections"][0]["door_notify_message"] == "Bob is at Front Door."
+    assert payload["detections"][0]["matched_person_name"] == "Bob"
+
+
+def test_facial_recognition_payload_has_no_notify_message_for_mode1_success():
+    """record_facial_events() never sets door_notify_message for an
+    authorized automatic unlock (mode 1) or a non-door camera -- the
+    local event dict simply omits the key, matching how main.py's own
+    hook only ever sets it from aac_event.get('door_notify_message')."""
+    event = _event("evt-1", event_type="facial_recognition")
+    event["detections"] = None
+    event["match_state"] = "known"
+    event["matched_person_id"] = "person-1"
+    event["matched_person_name"] = "Bob"
+    payload = asy._build_payload(event)
+    assert payload["detections"][0]["door_notify_message"] is None

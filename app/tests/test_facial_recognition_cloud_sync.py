@@ -60,6 +60,11 @@ def test_facial_recognition_event_forwards_match_fields_via_detections():
         "matched_watchlist_name": None,
         "engine": "onnx_yunet_sface",
         "engine_version": "1",
+        # Face Access (2026-09-17): always present, None here because
+        # the source event has no door_notify_message key at all --
+        # see test_analytics_sync.py's own dedicated mode1/2/3 coverage
+        # for when this is a real message.
+        "door_notify_message": None,
     }]
 
 

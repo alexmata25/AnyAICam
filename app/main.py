@@ -37481,6 +37481,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                                 "matched_watchlist_name": aac_event["matched_watchlist_name"],
                                 "engine": aac_event["engine"],
                                 "engine_version": aac_event["engine_version"],
+                                "door_notify_message": aac_event.get("door_notify_message"),
                             }
                         )
                 except Exception as error:
@@ -47222,6 +47223,7 @@ from live_view_page import register_live_view_page_routes
 from live_view_p2p import register_live_view_p2p_customer_routes, register_live_view_p2p_appliance_routes
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
+from door_access import register_door_access_routes
 # 2026-09-16: edge-side counterpart to the cloud relay above -- ONVIF
 # backchannel transport, capability discovery, and the WebSocket relay
 # client that connects the two. Recovered from an old, unrelated-history
@@ -47380,6 +47382,7 @@ register_live_view_p2p_appliance_routes(app)
 register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
 register_facial_recognition_routes(app, page_shell)
+register_door_access_routes(app)
 
 
 

@@ -480,6 +480,18 @@ def _build_payload(event: dict) -> dict:
             "matched_watchlist_name": event.get("matched_watchlist_name"),
             "engine": event.get("engine"),
             "engine_version": event.get("engine_version"),
+            # Face Access (2026-09-17): set only for modes 2/3
+            # (recognized-not-authorized / unknown) by facial_events.
+            # record_facial_events() -- absent (None) for mode 1 (an
+            # authorized automatic unlock) and for a facial-recognition
+            # camera that isn't a configured door at all. appliance_
+            # cloud.py's analytics_event_available() uses this alone to
+            # decide whether this event fans out a customer notification
+            # -- the cloud never re-derives the authorization decision
+            # itself, matching the PPE hard_hat_present/safety_vest_
+            # present precedent immediately above (edge decides, cloud
+            # relays).
+            "door_notify_message": event.get("door_notify_message"),
         }]
     return {
         "local_event_id": str(event.get("id") or "").strip(),
