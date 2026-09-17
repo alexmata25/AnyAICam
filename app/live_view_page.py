@@ -116,10 +116,11 @@ _P2P_JS = """
     });
 
     pc.addTransceiver('video', {direction: 'recvonly'});
-    // Best-effort trickle (harmless, not required for v1 -- see below):
-    // some future TURN-relay candidates can arrive after gathering
-    // "completes" in edge cases, so this is still wired, but nothing on
-    // either side depends on it succeeding.
+    // Trickle ICE (2026-09-17): load-bearing, not best-effort -- the
+    // offer below is sent before gathering finishes, so every candidate
+    // discovered here (including the one that ultimately succeeds) is
+    // real, necessary signaling, not a redundant echo of what the offer
+    // already carried.
     pc.onicecandidate = (event) => {
       if (!event.candidate) return;
       fetch(`/api/customer/live/sessions/${sessionId}/p2p/ice`, {
@@ -131,24 +132,20 @@ _P2P_JS = """
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // Wait for local ICE gathering to finish (bounded) before sending the
-    // offer, so pc.localDescription.sdp already carries every discovered
-    // candidate inline -- a complete, self-contained, non-trickle offer.
-    // This is a deliberate simplification over full RFC 8840 trickle
-    // exchange with the appliance's MediaMTX bridge: it avoids needing a
-    // byte-exact trickle-ice-sdpfrag implementation on both ends for v1,
-    // at the cost of a bounded extra wait that fits well inside the
-    // overall P2P negotiation timeout. MediaMTX's own answer is expected
-    // to be similarly complete (it gathers before answering by default).
-    if (pc.iceGatheringState !== 'complete') {
-      await new Promise((resolve) => {
-        const onChange = () => {
-          if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', onChange); resolve(); }
-        };
-        pc.addEventListener('icegatheringstatechange', onChange);
-        setTimeout(() => { pc.removeEventListener('icegatheringstatechange', onChange); resolve(); }, Math.min(2000, timeoutMs));
-      });
-    }
+    // Trickle ICE (2026-09-17 redesign): the offer is sent immediately,
+    // with zero or few candidates inline -- NOT after waiting for local
+    // ICE gathering to finish. That wait (previously bounded to 2000ms)
+    // was measured live, real browser against the real Ryzen appliance,
+    // to be the single largest cost in the whole P2P path (612-1584ms
+    // across repeated real runs) -- already exceeding AWS relay's own
+    // real win time on every run, before the offer had even been sent.
+    // Every candidate pc.onicecandidate discovers (above) continues to
+    // be trickled to the appliance as it arrives via the existing POST
+    // .../p2p/ice route -- now load-bearing for real ICE connectivity,
+    // not merely best-effort robustness (see webrtc_publisher.py's own
+    // _forward_client_ice_candidate() for the appliance-side half, and
+    // its module docstring for the real MediaMTX-binary verification
+    // this redesign was built on).
     if (settled) return resultPromise;
 
     fetch(`/api/customer/live/sessions/${sessionId}/p2p/offer`, {

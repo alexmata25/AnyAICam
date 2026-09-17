@@ -4,12 +4,17 @@ cloud-signaling <-> MediaMTX-WHEP bridge.
 
 Runs against a real local HTTP server (http.server, a background thread,
 stdlib only) that reproduces MediaMTX's own confirmed real route contract
-(WHEP POST/Location/answer shape, config REST API add/delete), NOT a live
-`mediamtx` binary -- this sandbox could not reliably download the release
-asset (see webrtc_publisher.py's own module docstring for the full
-explanation and what still needs live-binary verification before this
-feature is trusted end-to-end). Process spawning is tested with a fake
-subprocess.Popen, never a real MediaMTX process.
+(WHEP POST/Location/answer shape, config REST API add/delete, and -- as
+of the 2026-09-17 trickle-ICE redesign -- real PATCH media-line
+validation), not a live `mediamtx` binary directly. That live-binary
+verification has since happened separately, twice (Phase 1's full WHEP
+contract, and this redesign's own trickle-specific PATCH verification --
+see webrtc_publisher.py's own module docstring for both transcripts),
+and this fake's own contract was tightened to match exactly what each
+verification found, including the one real bug (a malformed PATCH media
+line) a too-permissive earlier version of this same fake let ship
+undetected. Process spawning is tested with a fake subprocess.Popen,
+never a real MediaMTX process.
 
 The single most safety-critical test in this file is
 test_worker_does_nothing_at_all_when_the_feature_flag_is_off -- P2P must
@@ -118,6 +123,22 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         body = self._body()
         self.__class__.calls.append((self.command, self.path, body, self._headers_lower()))
+        # Validates the media line the real way MediaMTX itself does
+        # (confirmed live against the real v1.21.0 binary, 2026-09-17):
+        # "m=<media> <port> <proto> <fmt...>" with a real numeric port --
+        # "m=0" or "m=application" (this codebase's own real, never-
+        # actually-exercised-until-then bug) is rejected with a real 400
+        # "sdp: invalid port value" there. A fake that accepted anything
+        # here, as this one previously did, is exactly what let that bug
+        # ship undetected -- this now closes that gap.
+        media_line = next((line for line in body.decode(errors="replace").splitlines() if line.startswith("m=")), "")
+        parts = media_line.split()
+        port_valid = len(parts) >= 2 and parts[1].isdigit()
+        if not port_valid:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"status":"error","error":"sdp: invalid port value"}')
+            return
         self.send_response(204)
         self.end_headers()
 
@@ -233,13 +254,33 @@ def test_whep_offer_returns_none_when_mediamtx_unreachable(monkeypatch):
 
 
 def test_forward_client_ice_candidate_patches_the_session_location(fake_mediamtx):
-    location = list(fake_mediamtx.calls) and None  # noop, just for readability
     session_location, _ = wp.whep_offer("cam-a", "v=0\r\n...")
     wp._forward_client_ice_candidate(session_location, {"candidate": "candidate:1 1 UDP 1 10.0.0.1 5000 typ host", "sdpMid": "0"})
     patch_calls = [c for c in fake_mediamtx.calls if c[0] == "PATCH"]
     assert len(patch_calls) == 1
     assert patch_calls[0][3]["content-type"] == "application/trickle-ice-sdpfrag"
     assert b"a=candidate:1 1 UDP 1 10.0.0.1 5000 typ host" in patch_calls[0][2]
+
+
+def test_forward_client_ice_candidate_sends_a_real_valid_sdp_media_line(fake_mediamtx):
+    """Regression test for a real bug (2026-09-17): the media line this
+    function builds MUST be genuine, valid SDP ("m=<media> <port>
+    <proto> <fmt...>") -- confirmed live against the real MediaMTX
+    v1.21.0 binary that "m=<mid>" (e.g. "m=0") is rejected outright
+    with a real 400 "sdp: invalid port value" error. _FakeMediaMTX's
+    own do_PATCH now enforces this same real validity check, so this
+    test fails loudly (not silently, as it previously did) if this
+    function ever regresses back to the broken shape."""
+    session_location, _ = wp.whep_offer("cam-a", "v=0\r\n...")
+    wp._forward_client_ice_candidate(session_location, {"candidate": "candidate:1 1 UDP 1 10.0.0.1 5000 typ host", "sdpMid": "0"})
+    patch_calls = [c for c in fake_mediamtx.calls if c[0] == "PATCH"]
+    assert len(patch_calls) == 1
+    body = patch_calls[0][2].decode()
+    media_line = next(line for line in body.splitlines() if line.startswith("m="))
+    parts = media_line.split()
+    assert len(parts) >= 4, f"media line is not valid SDP: {media_line!r}"
+    assert parts[1].isdigit(), f"media line has no real port field: {media_line!r}"
+    assert "a=mid:0" in body
 
 
 def test_forward_client_ice_candidate_is_silently_best_effort_on_failure(monkeypatch):

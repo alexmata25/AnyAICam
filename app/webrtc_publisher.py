@@ -59,18 +59,41 @@ signal. _bridge_tick() now runs _handle_pending_signal() via
 asyncio.to_thread(), the same pattern _refresh_camera_map()/
 sync_camera_paths() already used.
 
-Non-trickle ICE by design: the browser (live_view_page.py's
-attemptLiveP2P()) waits for its own ICE gathering to complete before
-sending the offer, so pc.localDescription.sdp already carries every
-candidate inline; MediaMTX is expected to do the same before answering
-(its own default webrtcSTUNGatherTimeout). This sidesteps needing a
-byte-exact RFC 8840 trickle-ice-sdpfrag implementation on both ends for
-v1 -- a deliberate simplification, not an oversight; see live_view_page.py
-for the corresponding client-side change. Best-effort trickle forwarding
-(_forward_client_ice_candidate() below) is still implemented for
-robustness against a client that times out before gathering fully
-completes, but nothing in this module's success path depends on it.
-"""
+Trickle ICE (2026-09-17 redesign, replacing the original non-trickle-
+by-design v1): the non-trickle wait -- the browser blocking on its own
+full local ICE gathering (up to 2000ms) before ever sending the offer
+-- was measured live (real browser, real Ryzen appliance, real
+staging, 2026-09-17) to be the single largest cost in the whole P2P
+path: 612-1584ms across repeated real runs, already exceeding the real
+AWS relay's own real win time (130-975ms) in every run, before the
+offer had even been sent. Lowering every other timer in the path
+(ANYAICAM_LIVE_P2P_SCAN_SECONDS down to its 500ms floor) did not
+change the outcome -- relay kept winning -- confirming the client-side
+gathering wait, not appliance polling cadence, was the real
+architectural bottleneck.
+
+The fix: live_view_page.py's attemptLiveP2P() now sends the offer
+immediately after setLocalDescription() resolves, with zero or few
+candidates inline, and trickles each subsequently-gathered candidate
+via the existing POST /api/customer/live/sessions/{id}/p2p/ice route
+-- previously wired but structurally vestigial (gathering had already
+finished by the time an offer went out, so no candidate was ever
+trickled after the fact). _forward_client_ice_candidate() below is
+what actually bridges each of those into MediaMTX's real PATCH
+endpoint now, and is load-bearing for real ICE success, not merely
+best-effort robustness. Confirmed live (isolated diagnostic against
+the real MediaMTX v1.21.0 binary, 2026-09-17, using a real
+candidate-stripped browser-generated offer, not a hand-crafted one):
+MediaMTX accepts a candidate-sparse WHEP POST offer without error
+(201, a real answer with every one of MediaMTX's own candidates
+already baked in -- MediaMTX's OWN answer generation remains non-
+trickle regardless of the offer's own candidate count, so there is
+nothing to trickle FROM MediaMTX after its one answer; only the
+client -> appliance direction benefits from trickling), and correctly
+accepts a real trickled candidate via PATCH once formatted as a valid
+SDP media-line fragment -- see that function's own docstring for the
+exact real bug (a literal, real "m=<mid>" media line, e.g. "m=0",
+rejected with a real 400) this surfaced and fixed."""
 
 import json
 import logging
@@ -449,19 +472,40 @@ def whep_offer(path_name: str, sdp_offer: str) -> tuple[str, str] | None:
 
 
 def _forward_client_ice_candidate(session_location: str, candidate: dict) -> None:
-    """Best-effort only -- see module docstring's non-trickle-by-design
-    note. A failure here never surfaces anywhere; the offer/answer
-    exchange already completed (this is only ever called for a session
-    that already has a session_location) so a lost late candidate at
-    worst slightly delays -- never prevents -- ICE connectivity, since
-    the offer/answer SDPs already carried every candidate gathered
-    before they were sent."""
+    """Trickle ICE (2026-09-17): forwards one browser-gathered ICE
+    candidate to MediaMTX's real WHEP PATCH endpoint as it arrives --
+    load-bearing now that the browser sends its offer immediately after
+    setLocalDescription() rather than waiting for its own local ICE
+    gathering to finish first (see live_view_page.py's own P2P JS and
+    this module's docstring for why: that wait alone, confirmed live,
+    cost 600-1500ms client-side and was the single largest reason relay
+    consistently won the P2P-vs-relay race even after every other
+    timer in this path was already at its floor).
+
+    media_line MUST be a real, valid SDP media line -- confirmed live
+    against the real MediaMTX v1.21.0 binary (isolated diagnostic,
+    2026-09-17) that "m=<mid>" (e.g. "m=0", this function's own
+    previous, never-actually-exercised output) is rejected outright
+    with a real 400 "sdp: invalid port value" error; "m=video 9
+    UDP/TLS/RTP/SAVPF 0" (the standard RFC 8840 trickle-ice-sdpfrag
+    placeholder shape -- port 9 is the conventional "discard" port for
+    a fragment that isn't renegotiating media itself) is accepted
+    (204), confirmed with the same real binary. Hardcoded to video
+    because this whole system only ever creates exactly one recvonly
+    video transceiver (live_view_page.py's attemptLiveP2P():
+    pc.addTransceiver('video', {direction: 'recvonly'})) -- sdpMid is
+    always "0" for that single m-line in practice, but the media type
+    itself, not just the mid, must match what MediaMTX's parser expects
+    for the line to be valid at all.
+
+    Best-effort: a failure here never surfaces anywhere (this is now
+    one candidate among possibly several a session needs, not the only
+    chance at connectivity -- ICE can still succeed with a subset)."""
     candidate_line = str(candidate.get("candidate", "")).strip()
     if not candidate_line:
         return
-    mid = candidate.get("sdpMid")
-    media_line = f"m={mid}" if isinstance(mid, str) and mid else "m=application"
-    fragment = f"{media_line}\r\na=mid:{mid if isinstance(mid, str) else '0'}\r\na={candidate_line}\r\n"
+    mid = candidate.get("sdpMid") if isinstance(candidate.get("sdpMid"), str) and candidate.get("sdpMid") else "0"
+    fragment = f"m=video 9 UDP/TLS/RTP/SAVPF 0\r\na=mid:{mid}\r\na={candidate_line}\r\n"
     request = urllib.request.Request(
         session_location, data=fragment.encode(), method="PATCH",
         headers={"Content-Type": "application/trickle-ice-sdpfrag"},
