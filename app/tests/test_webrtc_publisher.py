@@ -18,6 +18,7 @@ until ANYAICAM_LIVE_P2P_ENABLED is explicitly set, exactly matching the
 "do not enable P2P" instruction this phase was built under.
 """
 
+import asyncio
 import http.server
 import json
 import threading
@@ -296,6 +297,36 @@ def test_handle_ice_client_signal_for_unknown_session_is_dropped_not_raised(fake
         "payload": {"candidate": "candidate:1 1 UDP 1 10.0.0.1 5000 typ host"},
     })
     assert [c for c in fake_mediamtx.calls if c[0] == "PATCH"] == []
+
+
+@pytest.mark.anyio
+async def test_bridge_tick_never_blocks_the_event_loop_on_a_slow_signal(monkeypatch):
+    """Real-binary finding (2026-09-17): MediaMTX can legitimately take
+    ~10s to fail a WHEP offer against an unreachable camera. _bridge_tick()
+    must run that work off the event loop (asyncio.to_thread), or every
+    other background task sharing this process's loop stalls for the
+    same ~10s. Proven here by making the pending-signal handler block
+    for real (time.sleep) and confirming a concurrently-scheduled
+    asyncio task still gets to run well before it finishes."""
+    import time
+
+    monkeypatch.setattr(wp, "_control_plane_get", lambda path: {"pending": [{"session_id": "s", "camera_id": "c", "kind": "offer", "payload": {}}]})
+
+    def slow_handle(camera_url_fn, item):
+        time.sleep(0.3)
+
+    monkeypatch.setattr(wp, "_handle_pending_signal", slow_handle)
+
+    other_task_ran = asyncio.Event()
+
+    async def other_task():
+        await asyncio.sleep(0.02)
+        other_task_ran.set()
+
+    tick_task = asyncio.ensure_future(wp._bridge_tick(lambda n: "rtsp://u:p@h:554/x"))
+    asyncio.ensure_future(other_task())
+    await asyncio.wait_for(other_task_ran.wait(), timeout=1.0)
+    await tick_task
 
 
 # --------------------------------------------------------------- MediaMTX process lifecycle (fake subprocess)
