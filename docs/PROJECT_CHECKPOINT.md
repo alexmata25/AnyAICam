@@ -3393,6 +3393,20 @@ Per explicit instruction: validated `webrtc_publisher.py` (commit `6c34131`) aga
 
 Real Ryzen VMS/camera service confirmed completely undisturbed throughout (`anyaicam-vms` container uptime/start-time/build unchanged across the whole test). Test directory, RTSP credential files, and the MediaMTX process itself were all fully removed afterward.
 
-### State to resume from
+### State to resume from (superseded by the entry below)
 
 Phase 1 passed. Per the user's own sequencing, Phase 2 (installer wiring -- adding the MediaMTX binary install step, still NOT started by the live VMS service, `ANYAICAM_LIVE_P2P_ENABLED` still off) is next, plus a permanent deployment safeguard for the staging volume-mount incident (verify expected persistent DB/config paths are mounted and contain expected existing data before any staging cutover). Customer Event Notifications remains the separate, still-open milestone described above.
+
+## Deployment safeguard: `deploy/verify_cutover_safety.py` (2026-09-17)
+
+Permanent fix for the 2026-09-16 staging incident class: a candidate container can build cleanly, start, and pass `/version`/`/health` (both return 200 regardless of database state) while silently running against an empty or wrongly-mounted database -- nothing in the existing deploy process checked *which data* a candidate could actually see before it was cut over to live traffic.
+
+`deploy/verify_cutover_safety.py` closes that gap: run on the host (shells out to `docker exec`, no AWS/network dependency of its own) after a candidate is up and healthy but BEFORE `docker network connect --alias portal --alias vms` against it. Reads `partner_users`/`appliances`/`customers`/`cameras` row counts from both the currently-live container and the candidate, and refuses cutover (`CUTOVER_BLOCKED`, exit 1) if the candidate's counts are lower than live's for any of them -- never a fixed "must have N rows" guess, since the real live counts are already known-good. `--force` exists only for a brand-new environment's first-ever deploy, where there is no live container to compare against.
+
+Dogfooded against the real current staging container (`portal-1c9d956` compared against itself): `CUTOVER_OK`, real counts `{partner_users:5, appliances:3, customers:4, cameras:23}` matched exactly. 8 unit tests (mocked `docker exec`, no real containers) including one that reproduces the real incident's exact shape (live has real data, candidate's database is completely empty) and confirms it would have been blocked.
+
+**This check is now a mandatory step in every future staging/production cutover** -- run it between "candidate healthy" and "connect network alias," and only proceed past a `CUTOVER_BLOCKED` result by fixing the actual mount/database problem it reports, never by re-running with `--force` outside the documented first-deploy case.
+
+### State to resume from
+
+Phase 2 (MediaMTX installer wiring, still not started by the live VMS service) is next for P2P. Customer Event Notifications remains the separate, still-open milestone described earlier in this document.
