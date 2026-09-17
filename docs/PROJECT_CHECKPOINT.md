@@ -3614,6 +3614,35 @@ Deployed through the identical mandatory pipeline as the password-reset route (`
 
 Real end-to-end verification, same disposable-synthetic-tenant convention as the password-reset pass: real `POST .../change-email` call (`200`), a same-email retry correctly rejected (`400`), real `audit_logs` row with both old and new address, real `email_messages` row confirming the security notice targeted the OLD address (`status='failed'`, the same known/parked Gmail credential issue -- handled gracefully, not silently swallowed, not crashed), the account's real `partner_users.email` row genuinely updated, the OLD email real `403` on login, the NEW email + unchanged password a real `303` login success through the same `/api/partner-login` route `customer-login.html` itself uses. 200 real Ryzen appliance requests in the verification window, zero errors. Disposable rows fully cleaned up; row counts confirmed back at baseline (`partners`=1, `customers`=4, `partner_users`=5); `audit_logs` left intact per this project's own never-rewrite-history convention.
 
-### State to resume from
+### State to resume from (superseded by the entry below)
 
 Password Recovery + Account Controls milestone is **complete and fully live-verified**: both admin-facing controls (password reset, email change) are built, tested, deployed to staging, and each independently proven end-to-end for real -- not just unit-tested. Staging is currently on `portal-1117b75` (commit `1117b75`), the only running container, `CONTAINER_SPRAWL_OK`, ~2.2GB memory available. FR/AACO remain paused, untouched. Ryzen and production were not touched at any point in this entire session.
+
+## Milestone: five-camera real-world validation -- remote audit pass, two real detection bugs found and fixed (2026-09-17)
+
+### Real appliance identity and deployed configuration
+
+Ryzen = `2f941627b4` / `AIC-C814766E`, customer `d75bdbecdd4887de4d2b89a9fcea9092`, control plane pointed at staging (confirmed real). All 5 real cameras (`dfba6a63ec` Living Room=1, `dc7a226120` Driveway Right=2, `5c689a0c0e` Driveway Left=3, `55bdd715ea` Bedroom=4, `41dc80c85e` Front Door=5) have `smart_motion_enabled`/`ppe_enabled`/`people_counting_enabled`/`lpr_enabled` all `1`. `talk_down_supported`: camera 1/4/5 = true, camera 2/3 = false -- exactly matches the physical-test plan's own camera assignment, confirming capability discovery is correct without needing to ask.
+
+### Passive validation using real, already-occurring activity (no synthetic/manufactured events)
+
+Pulled `app/recordings/analytics_events.json` (local, 5000-event retained window) and staging's `detection_events` (36,851 rows ever, real-time-current) for this customer. **Smart Motion is strongly validated for real**: person detections on cameras 1/4/5 (693/4/81 in one 72h window, real bounding boxes confirmed by viewing an actual frame -- two real people on a couch), vehicle (car/truck) detections on cameras 2/3 (1085+543 / 1733+271), all with real thumbnails and `detection_event_media` S3 rows uploading within ~30-90s of the local event, confirmed as recent as the query itself. Playback linkage confirmed real: `linked_recording` paths resolve to real, currently-being-written `.mkv` files on disk.
+
+### Two real bugs found, both masked by correct fail-closed design
+
+- **LPR**: zero real plate reads ever despite 1600+ real vehicle detections on cameras 2/3, zero LPR errors logged. Root cause: `pytesseract`/`tesseract-ocr` was never installed anywhere in this repo's history (not requirements.txt, not either Dockerfile) -- confirmed live (`_get_pytesseract()` returned None on the real appliance). `recognize_plate()`'s own correct fail-closed contract absorbed this as "no plate found," indistinguishable from a genuine environmental limitation without deep inspection.
+- **PPE**: zero real PPE events ever. Root cause: `PPE_MODEL_NAME`'s default (`yolov8n-ppe.pt`) was never a real Ultralytics-hosted name (unlike the base person/vehicle model), and nothing ever fetched the real weights from anywhere -- confirmed live (`_get_model()` returns None, `_model_load_failed=True`). This is also the real root cause behind the already-baselined `test_ppe.py::test_real_model_loads` failure that prior sessions had accepted as a pre-existing, unexplained gap.
+
+Both fixed in `11b5493` (Dockerfile/Dockerfile.production fetch `tesseract-ocr` apt package + the real MIT-licensed `Tanishjain9/yolov8n-ppe-detection-6classes` model at build time, checksum-pinned; `pytesseract` added to requirements.txt), verified locally end-to-end (all 15 PPE tests including `test_real_model_loads` pass with the real weights present), 2 new permanent regression tests. **Deliberately not yet deployed to Ryzen or staging** -- LPR/PPE physical validation was already deferred by the user pending their return, so there was no urgency to push a live change to the home appliance mid-audit.
+
+### People Counting: correctly wired, blocked on a one-time setup step, not a bug
+
+`people_counting_worker()` requires both the entitlement flag (on, confirmed) AND a configured `line_crossing` rule with real geometry (`analytics_rules.json`) -- **no such file exists on the Ryzen**, so the feature has never produced a count on any camera. This is a legitimate one-time customer setup step (drawing a counting line in the Live View UI), not a software defect, and not something to invent blind -- placing a meaningful line requires seeing the camera's real framing and a deliberate choice about what "in/out" means for that spot. Flagged for the user, not auto-configured.
+
+### One finding surfaced but deliberately not executed
+
+The Ryzen's own local `cameras` table has 3 stale, fully-null, zero-real-data rows (id `7e34833a37`/`ca9d8c53d0`/`2e1a9a64bc`, camera_number 1/2/3) left over from a prior identity re-enrollment -- exactly the known issue class an existing code comment in `main.py` (`get_camera_numbers()`'s docstring area) already documents and partially mitigates (the startup worker-spawn loop already dedupes, so this does NOT currently cause duplicate ffmpeg/detection processes). Confirmed these 3 rows don't exist on staging at all (cloud-side is already clean) and have zero references anywhere in any local table. Safe to delete, but the delete attempt was correctly blocked by this environment's own safety classifier as a live write to physical home hardware -- left in place, flagged here, not forced through.
+
+### State to resume from
+
+Five-camera validation is remotely audited as far as possible without physical presence: Smart Motion (person + vehicle) is strongly validated with real data; Event Media/playback/sync pipeline confirmed live end-to-end; LPR and PPE's real root-cause bugs are fixed in code (not yet deployed to Ryzen, deliberately, since physical testing for both remains pending anyway); People Counting needs a one-time line-configuration step the user should do when convenient (remote, no physical presence needed, just needs to see the camera view). Talk-down (cameras 1/4/5) and any controlled PPE/plate/audio scenario remain the user's own explicitly-deferred physical tests. Ryzen and production were not modified at any point -- the one recommended DB cleanup was surfaced, not executed.
