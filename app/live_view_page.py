@@ -41,6 +41,7 @@ from partner_db import connection
 from partner_portal import partner_identity
 from customer_analytics_panel import analytics_row_state, camera_entitlement_rows, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT, assign_entitlement, remove_entitlement, LicenseLimitExceeded
 from camera_access import is_camera_authorized, set_camera_access, remove_camera_access, ACCESS_MODES
+import relay_control
 
 POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
@@ -381,6 +382,36 @@ function wireTalkMic(button, cameraId) {
 }
 """
 
+# Shared "Unlock Door" client, used identically by the /customer-live
+# grid tile and the single-camera page's own tools row -- same reasoning
+# as wireTalkMic() above for living once at module level. A plain click
+# (not press-and-hold: unlocking is a single discrete action, not a
+# sustained one) that POSTs to the already-authorized/audited
+# /door/unlock route (door_access.py) and surfaces its own success/
+# failure message via the shared showToast(), which every page already
+# defines (main.py's page_shell). stopPropagation() keeps a click here
+# from also being read as a tile double-click (which navigates to the
+# single-camera page) while the request is in flight.
+_UNLOCK_DOOR_JS = """
+function wireUnlockButton(button, cameraId) {
+  button.addEventListener('click', async (event) => {
+    try { event.preventDefault(); } catch (e) {}
+    try { event.stopPropagation(); } catch (e) {}
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/customer/cameras/${cameraId}/door/unlock`, { method: 'POST' });
+      const body = await response.json().catch(() => ({}));
+      showToast((response.ok ? body.message : body.detail) || (response.ok ? 'Door unlocked.' : 'The door could not be unlocked.'));
+    } catch (e) {
+      showToast('The door could not be unlocked.');
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+"""
+
 
 def _talk_down_state(supported) -> dict:
     """Maps the raw tri-state talk_down_supported column value (NULL /
@@ -461,7 +492,7 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
     if identity.get('role') == 'customer_owner':
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.appliance_id, '
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.door_access_enabled, c.appliance_id, '
                 'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'LEFT JOIN appliances a ON a.id=c.appliance_id '
                 'WHERE c.customer_id=? AND c.camera_number IS NOT NULL'+(' AND c.appliance_id=?' if appliance_id else '')+
@@ -479,7 +510,7 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
 
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.appliance_id, '
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.door_access_enabled, c.appliance_id, '
                 'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
                 'LEFT JOIN appliances a ON a.id=c.appliance_id '
@@ -491,6 +522,11 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
 
     for camera in cameras:
         camera.update(_talk_down_state(camera.pop('talk_down_supported')))
+        # Capability hint only, same as talk_enabled above -- whether THIS
+        # identity may actually press it is re-checked from scratch by
+        # door_access.py's _authorized_door_camera() at unlock time, never
+        # trusted from what a page merely rendered.
+        camera['door_enabled'] = bool(camera.pop('door_access_enabled'))
     return cameras
 
 
@@ -511,6 +547,40 @@ def _camera_display_label(camera: dict) -> str:
         return name
     number = camera.get('camera_number')
     return f'Camera {number}' if number is not None else str(camera.get('id', 'Camera'))
+
+
+def _door_access_settings_panel(camera: dict) -> str:
+    """The Camera Settings section of the single-camera live view page --
+    door_access.py's GET/POST /api/customer/cameras/{id}/door-config
+    routes already do the real authorization/validation/persistence;
+    this only renders a form against them, pre-filled from the fresh
+    `camera` row _authorized_camera() already fetched (no extra round-
+    trip). Only ever included for identity['role']=='customer_owner'
+    (see live_view_page()'s own call site) -- update_door_config()
+    itself rejects a customer_viewer's write with 403, matching this
+    codebase's convention of not rendering a form a viewer could not
+    actually submit."""
+    channel_options = ''.join(
+        f'<option value="{channel}"{" selected" if camera.get("door_relay_channel") == channel else ""}>Relay {channel}</option>'
+        for channel in relay_control.VALID_CHANNELS
+    )
+    pulse_value = camera.get('door_relay_pulse_ms') or relay_control.DEFAULT_PULSE_MS
+    door_enabled = bool(camera.get('door_access_enabled'))
+    return (
+        f'<section class="panel" style="margin-top:16px" id="door-access-section">'
+        f'<div class="panel-head"><div><h2>Camera Settings — Face Access</h2>'
+        f'<div class="health-detail">Map this camera to a physical door\'s relay to enable automatic unlock '
+        f'for recognized, authorized faces and manual unlock from the live tile. Rename this camera above '
+        f'(e.g. "Front Door") so alerts and the live tile are easy to recognize.</div></div></div>'
+        f'<label><span><input id="door-access-enabled" type="checkbox" {"checked" if door_enabled else ""}> '
+        f'Enable Face Access for this camera</span></label>'
+        f'<div id="door-access-fields" style="display:grid;gap:14px;max-width:360px;margin-top:12px" {"" if door_enabled else "hidden"}>'
+        f'<label>Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
+        f'<label>Unlock duration (milliseconds)<input id="door-relay-pulse-ms" type="number" min="1" step="1" value="{pulse_value}"></label>'
+        f'</div>'
+        f'<button class="action-button" id="save-door-access" type="button" style="margin-top:12px">Save Face Access settings</button>'
+        f'</section>'
+    )
 
 
 def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
@@ -586,6 +656,19 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         camera_ids = [camera['id'] for camera in cameras]
 
         def _tile(camera: dict) -> str:
+            # Unlock Door only ever appears here for a camera the account
+            # itself has mapped to a relay (door_enabled) -- per the Face
+            # Access spec's explicit requirement to never show it on a
+            # camera with no access-control relay configured. Actual
+            # unlock authorization (owner vs. viewer's own can_unlock
+            # grant) is re-checked server-side on click, same capability-
+            # vs-authorization split as the talk-mic button above.
+            unlock_button = (
+                f'<button class="camera-tool unlock-door" id="unlock-door-{escape(camera["id"], quote=True)}"'
+                f' data-camera-id="{escape(camera["id"], quote=True)}"'
+                f' title="Unlock door" aria-label="Unlock door">🔓</button>'
+                if camera.get('door_enabled') else ''
+            )
             return f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
               <div class="camera-view" style="border-radius:10px">
                 <video id="live-grid-video-{escape(camera['id'], quote=True)}" muted playsinline></video>
@@ -603,6 +686,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                   <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
                     title="Camera tools (mute, snapshot, download, share, analytics, bookmark, stop)"
                     aria-label="Open camera tools">⚙</a>
+                  {unlock_button}
                 </div>
               </div>
             </article>'''
@@ -661,12 +745,13 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.talk-mic{{touch-action:none}}'
             f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
             f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
             f'</style>'
             f'<section class="live-grid">{tiles}</section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_P2P_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
 
@@ -852,6 +937,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   // is still valid.
   document.querySelectorAll('.talk-mic').forEach(button=>{{
     wireTalkMic(button, button.dataset.cameraId);
+  }});
+  // Unlock Door: only cameras with door_enabled rendered a button at
+  // all (see _tile()'s own unlock_button gate above), so this simply
+  // wires whatever exists -- no per-tile capability check needed here.
+  document.querySelectorAll('.unlock-door').forEach(button=>{{
+    wireUnlockButton(button, button.dataset.cameraId);
   }});
   window.addEventListener('pagehide',()=>{{
     cameraIds.forEach(id=>stopSession(id,true));
@@ -1077,12 +1168,21 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
         talk_state = _talk_down_state(camera.get('talk_down_supported'))
         talk_tooltip = talk_state['tooltip'] or 'Press and hold to talk'
+        # camera came from _authorized_camera()'s own `SELECT *`, so the
+        # door columns (added by the Face Access migration) are already
+        # present here with no extra query.
+        door_enabled = bool(camera.get('door_access_enabled'))
+        unlock_tool_button = (
+            f'<button class="camera-tool unlock-door" id="unlock-door-{escape(camera_id, quote=True)}" '
+            f'data-camera-id="{escape(camera_id, quote=True)}" title="Unlock door" aria-label="Unlock door">🔓</button>'
+            if door_enabled else ''
+        )
 
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
             # Camera Hub mobile polish: on a narrow phone screen this
             # row's ~10 tool buttons no longer force horizontal
             # scrolling -- they wrap onto additional lines instead,
@@ -1108,15 +1208,17 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-bookmark" title="Bookmark">◈</button>'
             f'<button class="camera-tool" id="live-view-stop" title="Stop">◼</button>'
             f'<button class="camera-tool" id="live-view-retry" title="Retry" hidden>↻</button>'
+            f'{unlock_tool_button}'
             f'</div></section>'
             f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
             f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
             f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
             f'<div id="live-analytics-panel" class="health-list"></div>'
             f'</section>'
+            + (_door_access_settings_panel(camera) if identity.get('role') == 'customer_owner' else '')
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_P2P_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraId={json.dumps(camera_id)};
   const startUrl={json.dumps(start_url)};
@@ -1317,6 +1419,54 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   // never assumes render-time state still holds.
   const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
   wireTalkMic(talkButton, {json.dumps(camera_id)});
+
+  // Unlock Door: the button only exists in the DOM at all when this
+  // camera is door-enabled (see live_view_page()'s own unlock_tool_button
+  // gate above) -- null here just means "not a door camera".
+  const unlockButton=document.getElementById({json.dumps('unlock-door-' + camera_id)});
+  if(unlockButton)wireUnlockButton(unlockButton,{json.dumps(camera_id)});
+
+  // Camera Settings -- Face Access: this whole section only ever
+  // renders for identity.role==='customer_owner' (see live_view_page()'s
+  // own call site), so every element below is null for a customer_viewer
+  // and each handler is skipped rather than wired.
+  const doorEnabledCheckbox=document.getElementById('door-access-enabled');
+  const doorFields=document.getElementById('door-access-fields');
+  const doorRelayChannel=document.getElementById('door-relay-channel');
+  const doorRelayPulseMs=document.getElementById('door-relay-pulse-ms');
+  const saveDoorAccessButton=document.getElementById('save-door-access');
+  if(doorEnabledCheckbox){{
+    doorEnabledCheckbox.addEventListener('change',()=>{{
+      doorFields.hidden=!doorEnabledCheckbox.checked;
+    }});
+  }}
+  if(saveDoorAccessButton){{
+    saveDoorAccessButton.addEventListener('click',async()=>{{
+      const enabled=doorEnabledCheckbox.checked;
+      const payload={{door_access_enabled:enabled}};
+      if(enabled){{
+        payload.door_relay_channel=parseInt(doorRelayChannel.value,10);
+        const pulseRaw=doorRelayPulseMs.value.trim();
+        payload.door_relay_pulse_ms=pulseRaw?parseInt(pulseRaw,10):{relay_control.DEFAULT_PULSE_MS};
+      }}
+      saveDoorAccessButton.disabled=true;
+      let response,data;
+      try{{
+        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config`,{{
+          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),
+        }});
+        data=await response.json().catch(()=>({{}}));
+      }}catch(e){{
+        saveDoorAccessButton.disabled=false;
+        showToast('Could not save Face Access settings.');
+        return;
+      }}
+      saveDoorAccessButton.disabled=false;
+      if(!response.ok){{showToast(data.detail||'Could not save Face Access settings.');return}}
+      showToast(data.message||'Face Access settings saved.');
+      setTimeout(()=>location.reload(),700);
+    }});
+  }}
 
   window.addEventListener('pagehide',()=>{{stopSession(true)}});
 
