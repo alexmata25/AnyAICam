@@ -162,6 +162,57 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         audit(identity,'customer_account.password_reset_initiated','partner_user',user_id,{'customer_id':customer_id,'provider':settings.email_backend})
         return {'message':'Password-reset message sent to the account on file. The customer\'s current password remains unchanged until they complete the reset.'}
 
+    @app.post('/api/partner/customers/{customer_id}/accounts/{user_id}/change-email')
+    def change_customer_account_email(request: Request,customer_id: str,user_id: str,payload: dict):
+        # Admin-initiated email change (2026-09-17): the Password Recovery +
+        # Account Controls audit confirmed unlock and admin-initiated
+        # password reset (both immediately above) were the only two
+        # existing admin-facing customer-account controls -- there was no
+        # way for a partner/admin to correct a customer's login email on
+        # their behalf (e.g. a typo at signup, or a customer who lost
+        # access to their old address and can't complete a self-service
+        # flow that depends on it). Same tenant-scoped-permission shape as
+        # its two siblings. Deliberately an immediate change, not a
+        # verify-the-new-address-first flow: this account already required
+        # a human support interaction to reach an administrator in the
+        # first place (unlike self-service signup, which does verify),
+        # matching the same immediacy the sibling unlock/reset-password
+        # actions already have.
+        from notification_preferences import is_valid_email
+        identity=require_partner_access(request)
+        try: require_permission(identity,'customer.edit')
+        except PermissionError as error: raise HTTPException(status_code=403,detail='Customer account management permission is required.') from error
+        new_email=str(payload.get('new_email','')).strip().lower()
+        if not is_valid_email(new_email):
+            raise HTTPException(status_code=400,detail='A valid new email address is required.')
+        with connection() as db:
+            customer=authorize_customer_tenant(db,identity,customer_id)
+            if not customer:
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            user=db.execute("SELECT id,email FROM partner_users WHERE id=? AND customer_id=? AND role IN ('customer_owner','customer_viewer')",(user_id,customer_id)).fetchone()
+            if not user:
+                raise HTTPException(status_code=404,detail='Customer account not found.')
+            old_email=user['email']
+            if new_email==old_email.lower():
+                raise HTTPException(status_code=400,detail='The new email must be different from the current one.')
+            # Login is looked up by email (partner_authenticate_detailed()
+            # and friends) -- a duplicate would make one of the two
+            # accounts unreachable rather than raising a clean error at
+            # sign-in time, so this must be checked and rejected here,
+            # not discovered later as a support ticket.
+            if db.execute('SELECT 1 FROM partner_users WHERE email=?',(new_email,)).fetchone():
+                raise HTTPException(status_code=409,detail='That email address is already in use by another account.')
+            db.execute('UPDATE partner_users SET email=? WHERE id=?',(new_email,user['id']))
+        # Security notice to the OLD address, not the new one -- the
+        # standard "your account email was changed" pattern: if this
+        # change was not actually requested by the account owner, the
+        # notice needs to reach the address an attacker (or a support
+        # mistake) just moved away from, not the one they moved to.
+        message=get_email_service().send('account_email_changed',old_email,'Your AnyAiCam account email was changed',f'An administrator changed the email address on your AnyAiCam account from {old_email} to {new_email}. If you did not request this, contact support immediately.',metadata={'old_email':old_email,'new_email':new_email,'initiated_by':'admin'})
+        with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'account_email_changed',old_email,message['status'],settings.email_backend,json.dumps({'old_email':old_email,'new_email':new_email,'initiated_by':'admin'}),datetime.now().isoformat()))
+        audit(identity,'customer_account.email_changed','partner_user',user_id,{'customer_id':customer_id,'old_email':old_email,'new_email':new_email})
+        return {'message':'Email address updated. The customer should sign in with the new email address from now on.','old_email':old_email,'new_email':new_email}
+
     @app.get('/api/partner/customer-accounts')
     def customer_accounts(request: Request):
         identity=require_partner_access(request)
@@ -179,7 +230,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.get('/partner/customer-accounts',response_class=HTMLResponse)
     def customer_accounts_page(request: Request):
         require_partner_access(request)
-        return HTMLResponse('''<!doctype html><html><head><meta charset="utf-8"><title>Customer accounts | AnyAiCam</title></head><body><main><h1>Customer account recovery</h1><p>Unlocking clears only temporary failed-login state. It never changes a password, plan, camera, site, appliance, subscription, or permission. Sending a password reset emails the account's own address on file a one-hour reset link -- it never changes the password itself until the customer completes that link.</p><div id="accounts">Loading authorized customer accounts…</div><p id="result" role="status"></p></main><script>async function load(){const r=await fetch('/api/partner/customer-accounts'),b=await r.json(),box=document.getElementById('accounts');if(!r.ok){box.textContent=b.detail||'Unable to load customer accounts.';return}box.replaceChildren(...b.accounts.map(a=>{const d=document.createElement('div'),unlockButton=document.createElement('button'),resetButton=document.createElement('button');d.textContent=`${a.customer_name} — ${a.email} (${a.locked?'locked':'not locked'}) `;unlockButton.textContent='Unlock account';unlockButton.onclick=async()=>{if(!confirm(`Clear temporary lockout for ${a.email}? Password and customer access will not change.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/unlock`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.';if(x.ok)load()};resetButton.textContent='Send password reset';resetButton.onclick=async()=>{if(!confirm(`Send a password-reset link to ${a.email}? Their current password stays unchanged until they use it.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/reset-password`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.'};d.append(unlockButton,resetButton);return d}))}load()</script></body></html>''')
+        return HTMLResponse('''<!doctype html><html><head><meta charset="utf-8"><title>Customer accounts | AnyAiCam</title></head><body><main><h1>Customer account recovery</h1><p>Unlocking clears only temporary failed-login state. It never changes a password, plan, camera, site, appliance, subscription, or permission. Sending a password reset emails the account's own address on file a one-hour reset link -- it never changes the password itself until the customer completes that link. Changing the email address updates the account's login email immediately and emails a security notice to the OLD address -- it never changes the password, plan, camera, site, appliance, subscription, or permission either.</p><div id="accounts">Loading authorized customer accounts…</div><p id="result" role="status"></p></main><script>async function load(){const r=await fetch('/api/partner/customer-accounts'),b=await r.json(),box=document.getElementById('accounts');if(!r.ok){box.textContent=b.detail||'Unable to load customer accounts.';return}box.replaceChildren(...b.accounts.map(a=>{const d=document.createElement('div'),unlockButton=document.createElement('button'),resetButton=document.createElement('button'),emailButton=document.createElement('button');d.textContent=`${a.customer_name} — ${a.email} (${a.locked?'locked':'not locked'}) `;unlockButton.textContent='Unlock account';unlockButton.onclick=async()=>{if(!confirm(`Clear temporary lockout for ${a.email}? Password and customer access will not change.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/unlock`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.';if(x.ok)load()};resetButton.textContent='Send password reset';resetButton.onclick=async()=>{if(!confirm(`Send a password-reset link to ${a.email}? Their current password stays unchanged until they use it.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/reset-password`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.'};emailButton.textContent='Change email';emailButton.onclick=async()=>{const newEmail=prompt(`New email address for ${a.email}:`);if(!newEmail)return;if(!confirm(`Change this account's login email from ${a.email} to ${newEmail}? A security notice will be sent to the OLD address.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/change-email`,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''},body:JSON.stringify({new_email:newEmail})}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.';if(x.ok)load()};d.append(unlockButton,resetButton,emailButton);return d}))}load()</script></body></html>''')
 
     @app.get('/forgot-password',response_class=HTMLResponse)
     def forgot_password_page():

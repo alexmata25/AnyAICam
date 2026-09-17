@@ -21,6 +21,10 @@ EMAIL_TYPES={
     # hardware_fulfillment.py, hardware_returns.py, purchase_
     # notifications.py. Additive only; every type above is unchanged.
     'hardware_shipped','hardware_cancellation','return_authorized','return_received','refund_processed','getting_started',
+    # Account Controls: admin-initiated customer email change -- see
+    # cloud_features.py's change_customer_account_email(). Additive only;
+    # every type above is unchanged.
+    'account_email_changed',
 }
 
 
