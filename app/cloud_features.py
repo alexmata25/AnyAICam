@@ -121,6 +121,47 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         audit(identity,'customer_account.unlocked','partner_user',user_id,{'customer_id':customer_id,'lockout_cleared':bool(deleted)})
         return {'message':'Customer account lockout cleared. The password and customer access were not changed.','lockout_cleared':bool(deleted)}
 
+    @app.post('/api/partner/customers/{customer_id}/accounts/{user_id}/reset-password')
+    def initiate_customer_password_reset(request: Request,customer_id: str,user_id: str):
+        # Admin-authorized password reset/initiation (2026-09-17): the
+        # audit for this milestone confirmed unlock_customer_account()
+        # immediately above is the ONLY existing admin-facing customer-
+        # account control -- there was no way for a partner/admin to
+        # start a password reset on a customer's behalf (e.g. a customer
+        # who's locked out of the email address on file, or who calls
+        # support asking for a reset). Same tenant-scoped-permission
+        # shape as that route, and reuses create_password_reset()
+        # unchanged -- this produces the exact same kind of single-use,
+        # one-hour, hashed-at-rest token the self-service /forgot-
+        # password flow already does; nothing about the token's own
+        # security properties is special-cased for this admin-initiated
+        # path.
+        identity=require_partner_access(request)
+        try: require_permission(identity,'customer.edit')
+        except PermissionError as error: raise HTTPException(status_code=403,detail='Customer account management permission is required.') from error
+        with connection() as db:
+            customer=authorize_customer_tenant(db,identity,customer_id)
+            if not customer:
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            user=db.execute("SELECT id,email FROM partner_users WHERE id=? AND customer_id=? AND role IN ('customer_owner','customer_viewer')",(user_id,customer_id)).fetchone()
+            if not user:
+                raise HTTPException(status_code=404,detail='Customer account not found.')
+        raw=create_password_reset(user['id'],user['email'])
+        # Same edge_production vs fixed-URL link-building rule as the
+        # self-service request route above -- an admin-initiated reset on
+        # an edge appliance must land the customer back on THAT
+        # appliance's own real address, never a fixed "localhost" default.
+        if settings.edge_production:
+            scheme=request.headers.get('x-forwarded-proto',request.url.scheme)
+            host=request.headers.get('host') or request.url.netloc
+            link=f'{scheme}://{host}/customer-reset-password?token={raw}'
+        else:
+            link=settings.password_reset_url+'?token='+raw
+        message=get_email_service().send('password_reset',user['email'],'Reset your AnyAiCam password',f'An administrator started a password reset for your account. Use this one-hour link to set a new password:\n{link}',metadata={'expires_minutes':60,'initiated_by':'admin'})
+        with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',user['email'],message['status'],settings.email_backend,json.dumps({'expires_minutes':60,'initiated_by':'admin'}),datetime.now().isoformat()))
+        audit(identity,'customer_account.password_reset_initiated','partner_user',user_id,{'customer_id':customer_id,'provider':settings.email_backend})
+        return {'message':'Password-reset message sent to the account on file. The customer\'s current password remains unchanged until they complete the reset.'}
+
     @app.get('/api/partner/customer-accounts')
     def customer_accounts(request: Request):
         identity=require_partner_access(request)
@@ -138,7 +179,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.get('/partner/customer-accounts',response_class=HTMLResponse)
     def customer_accounts_page(request: Request):
         require_partner_access(request)
-        return HTMLResponse('''<!doctype html><html><head><meta charset="utf-8"><title>Customer accounts | AnyAiCam</title></head><body><main><h1>Customer account recovery</h1><p>Unlocking clears only temporary failed-login state. It never changes a password, plan, camera, site, appliance, subscription, or permission.</p><div id="accounts">Loading authorized customer accounts…</div><p id="result" role="status"></p></main><script>async function load(){const r=await fetch('/api/partner/customer-accounts'),b=await r.json(),box=document.getElementById('accounts');if(!r.ok){box.textContent=b.detail||'Unable to load customer accounts.';return}box.replaceChildren(...b.accounts.map(a=>{const d=document.createElement('div'),button=document.createElement('button');d.textContent=`${a.customer_name} — ${a.email} (${a.locked?'locked':'not locked'}) `;button.textContent='Unlock account';button.onclick=async()=>{if(!confirm(`Clear temporary lockout for ${a.email}? Password and customer access will not change.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/unlock`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.';if(x.ok)load()};d.append(button);return d}))}load()</script></body></html>''')
+        return HTMLResponse('''<!doctype html><html><head><meta charset="utf-8"><title>Customer accounts | AnyAiCam</title></head><body><main><h1>Customer account recovery</h1><p>Unlocking clears only temporary failed-login state. It never changes a password, plan, camera, site, appliance, subscription, or permission. Sending a password reset emails the account's own address on file a one-hour reset link -- it never changes the password itself until the customer completes that link.</p><div id="accounts">Loading authorized customer accounts…</div><p id="result" role="status"></p></main><script>async function load(){const r=await fetch('/api/partner/customer-accounts'),b=await r.json(),box=document.getElementById('accounts');if(!r.ok){box.textContent=b.detail||'Unable to load customer accounts.';return}box.replaceChildren(...b.accounts.map(a=>{const d=document.createElement('div'),unlockButton=document.createElement('button'),resetButton=document.createElement('button');d.textContent=`${a.customer_name} — ${a.email} (${a.locked?'locked':'not locked'}) `;unlockButton.textContent='Unlock account';unlockButton.onclick=async()=>{if(!confirm(`Clear temporary lockout for ${a.email}? Password and customer access will not change.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/unlock`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.';if(x.ok)load()};resetButton.textContent='Send password reset';resetButton.onclick=async()=>{if(!confirm(`Send a password-reset link to ${a.email}? Their current password stays unchanged until they use it.`))return;const x=await fetch(`/api/partner/customers/${encodeURIComponent(a.customer_id)}/accounts/${encodeURIComponent(a.id)}/reset-password`,{method:'POST',headers:{'X-CSRF-Token':document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/)?.[1]||''}}),y=await x.json();document.getElementById('result').textContent=y.message||y.detail||'Request failed.'};d.append(unlockButton,resetButton);return d}))}load()</script></body></html>''')
 
     @app.get('/forgot-password',response_class=HTMLResponse)
     def forgot_password_page():
