@@ -270,3 +270,80 @@ def register_door_access_routes(app: FastAPI) -> None:
             'message': f"Door access {'enabled' if enabled else 'disabled'} for {camera['name']}.",
             'door_access_enabled': enabled, 'door_relay_channel': relay_channel, 'door_relay_pulse_ms': pulse_ms,
         }
+
+    @app.get('/api/customer/cameras/{camera_id}/door-config/unlock-access')
+    def get_unlock_access(request: Request, camera_id: str) -> dict:
+        """Camera Settings' own "Viewer access" list -- every customer_
+        viewer this account has, and whether each currently holds
+        can_unlock=1 for this specific camera. Owner-only, matching every
+        other door-config write/read below: managing WHO may unlock a
+        real physical door is not something a viewer inspects about
+        themselves or anyone else here."""
+        identity = _customer_identity(request)
+        if identity.get('role') != 'customer_owner':
+            raise HTTPException(status_code=403, detail='Only the account owner can manage unlock access.')
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id FROM cameras WHERE id=? AND customer_id=?', (camera_id, identity['customer_id']),
+            ).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail='Camera not found.')
+            viewers = db.execute(
+                "SELECT u.id AS user_id, u.email, u.name, COALESCE(p.can_unlock,0) AS can_unlock "
+                "FROM partner_users u LEFT JOIN customer_camera_permissions p ON p.user_id=u.id AND p.camera_id=? "
+                "WHERE u.customer_id=? AND u.role='customer_viewer' ORDER BY u.email",
+                (camera_id, identity['customer_id']),
+            ).fetchall()
+        return {'viewers': [dict(row) for row in viewers]}
+
+    @app.post('/api/customer/cameras/{camera_id}/door-config/unlock-access')
+    def set_unlock_access(request: Request, camera_id: str, payload: dict) -> dict:
+        """Full-replace semantics for can_unlock ACROSS THIS ONE CAMERA
+        ONLY, scoped to this customer's own viewers -- an id in
+        `user_ids` that isn't actually one of this customer's own
+        customer_viewer users is silently ignored (never trusted from
+        the request as a real user to grant or deny), matching this
+        codebase's fail-closed, no-cross-tenant-effect convention
+        elsewhere. Deliberately never touches can_live/can_playback/
+        can_download/can_share/can_alerts/can_settings/can_talk on any
+        row -- see camera_access.set_camera_access()'s own docstring for
+        the real bug this same care avoids repeating (an unrelated
+        change silently resetting an already-granted permission)."""
+        identity = _customer_identity(request)
+        if identity.get('role') != 'customer_owner':
+            raise HTTPException(status_code=403, detail='Only the account owner can manage unlock access.')
+        requested_user_ids = {str(item) for item in payload.get('user_ids', [])}
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id,name FROM cameras WHERE id=? AND customer_id=?', (camera_id, identity['customer_id']),
+            ).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail='Camera not found.')
+            valid_viewer_ids = {
+                row['id'] for row in db.execute(
+                    "SELECT id FROM partner_users WHERE customer_id=? AND role='customer_viewer'",
+                    (identity['customer_id'],),
+                ).fetchall()
+            }
+            granted_user_ids = requested_user_ids & valid_viewer_ids
+            for viewer_id in valid_viewer_ids:
+                if viewer_id in granted_user_ids:
+                    db.execute(
+                        'INSERT INTO customer_camera_permissions(user_id,camera_id,can_live,can_playback,can_download,can_share,can_alerts,can_settings,can_talk,can_unlock) '
+                        'VALUES(?,?,0,0,0,0,0,0,0,1) '
+                        'ON CONFLICT(user_id,camera_id) DO UPDATE SET can_unlock=1',
+                        (viewer_id, camera_id),
+                    )
+                else:
+                    db.execute(
+                        'UPDATE customer_camera_permissions SET can_unlock=0 WHERE user_id=? AND camera_id=?',
+                        (viewer_id, camera_id),
+                    )
+        audit(
+            identity, 'camera.door_unlock_access_updated', 'camera', camera_id,
+            {'granted_user_ids': sorted(granted_user_ids)},
+        )
+        return {
+            'message': f"Unlock access updated for {camera['name']}.",
+            'granted_user_ids': sorted(granted_user_ids),
+        }

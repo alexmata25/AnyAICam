@@ -186,3 +186,74 @@ def test_camera_settings_section_posts_to_the_real_door_config_route(client):
     response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     assert "/api/customer/cameras/${cameraId}/door-config" in response.text
+
+
+# --------------------------------------------------- 4. Viewer access (can_unlock management)
+
+
+def test_owner_sees_viewer_access_section_with_the_real_viewer_listed(client):
+    response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert "Viewer access — who can press Unlock Door" in response.text
+    assert 'data-user-id="user-viewer"' in response.text
+    assert "viewer-a@example.test" in response.text
+    assert 'id="save-unlock-access"' in response.text
+
+
+def test_viewer_access_checkbox_reflects_no_existing_grant_by_default(client):
+    response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert 'data-user-id="user-viewer"' in response.text
+    assert 'data-user-id="user-viewer" checked' not in response.text
+
+
+def test_viewer_access_checkbox_reflects_an_existing_grant(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import connection
+        with connection() as conn:
+            conn.execute("UPDATE customer_camera_permissions SET can_unlock=1 WHERE user_id='user-viewer' AND camera_id='cam-door'")
+            conn.commit()
+    response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert 'data-user-id="user-viewer" checked' in response.text
+
+
+def test_viewer_access_section_never_shows_for_a_not_yet_configured_camera(client):
+    response = client.get("/customer/cameras/cam-plain/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    # The heading's own HTML text (em dash) never collides with the
+    # page's shared JS comment about this same feature, which uses a
+    # deliberately different phrasing/punctuation.
+    assert "Viewer access — who can press Unlock Door" not in response.text
+    assert 'id="save-unlock-access"' not in response.text
+
+
+def test_viewer_never_sees_the_viewer_access_section(client):
+    response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _viewer_cookie()})
+    assert response.status_code == 200
+    assert "Viewer access — who can press Unlock Door" not in response.text
+    # The '.unlock-viewer-toggle' class is always referenced by the
+    # page's shared JS (a harmless querySelectorAll over zero elements
+    # when this section didn't render) -- the assertion targets an
+    # actual rendered checkbox instead of that always-present selector.
+    assert 'data-user-id="user-viewer"' not in response.text
+
+
+def test_viewer_access_shows_an_empty_state_when_the_account_has_no_viewers(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import connection
+        with connection() as conn:
+            conn.execute("DELETE FROM customer_camera_permissions WHERE user_id='user-viewer'")
+            conn.execute("DELETE FROM partner_users WHERE id='user-viewer'")
+            conn.commit()
+    response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert "Viewer access" in response.text
+    assert "No team members yet" in response.text
+    assert 'id="save-unlock-access"' not in response.text
+
+
+def test_viewer_access_section_posts_to_the_real_unlock_access_route(client):
+    response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    assert "/api/customer/cameras/${cameraId}/door-config/unlock-access" in response.text

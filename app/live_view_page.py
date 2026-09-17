@@ -549,7 +549,7 @@ def _camera_display_label(camera: dict) -> str:
     return f'Camera {number}' if number is not None else str(camera.get('id', 'Camera'))
 
 
-def _door_access_settings_panel(camera: dict) -> str:
+def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
     """The Camera Settings section of the single-camera live view page --
     door_access.py's GET/POST /api/customer/cameras/{id}/door-config
     routes already do the real authorization/validation/persistence;
@@ -559,13 +559,46 @@ def _door_access_settings_panel(camera: dict) -> str:
     (see live_view_page()'s own call site) -- update_door_config()
     itself rejects a customer_viewer's write with 403, matching this
     codebase's convention of not rendering a form a viewer could not
-    actually submit."""
+    actually submit.
+
+    `viewers` (each {user_id,email,name,can_unlock}) is this customer's
+    own customer_viewer users with their current can_unlock grant for
+    THIS camera, pre-fetched by live_view_page() -- always `[]` when the
+    camera isn't door-configured yet (see that call site's own guard),
+    so the "Viewer access" sub-section below only ever appears once
+    there is an actual door to grant access to."""
     channel_options = ''.join(
         f'<option value="{channel}"{" selected" if camera.get("door_relay_channel") == channel else ""}>Relay {channel}</option>'
         for channel in relay_control.VALID_CHANNELS
     )
     pulse_value = camera.get('door_relay_pulse_ms') or relay_control.DEFAULT_PULSE_MS
     door_enabled = bool(camera.get('door_access_enabled'))
+
+    if not door_enabled:
+        viewer_access_section = ''
+    elif not viewers:
+        viewer_access_section = (
+            '<div style="margin-top:20px">'
+            '<span class="health-detail">Viewer access — who can press Unlock Door</span>'
+            '<p class="health-detail">No team members yet. Invite a viewer from your account settings to grant them unlock access.</p>'
+            '</div>'
+        )
+    else:
+        viewer_rows = ''.join(
+            f'<label><span><input class="unlock-viewer-toggle" type="checkbox" '
+            f'data-user-id="{escape(viewer["user_id"], quote=True)}" {"checked" if viewer["can_unlock"] else ""}> '
+            f'{escape(viewer.get("name") or viewer["email"])} '
+            f'<small style="color:var(--muted)">{escape(viewer["email"])}</small></span></label>'
+            for viewer in viewers
+        )
+        viewer_access_section = (
+            '<div style="margin-top:20px">'
+            '<span class="health-detail">Viewer access — who can press Unlock Door</span>'
+            f'<div id="unlock-viewer-list" style="display:grid;gap:8px;margin-top:8px">{viewer_rows}</div>'
+            '<button class="action-button" id="save-unlock-access" type="button" style="margin-top:12px">Save unlock access</button>'
+            '</div>'
+        )
+
     return (
         f'<section class="panel" style="margin-top:16px" id="door-access-section">'
         f'<div class="panel-head"><div><h2>Camera Settings — Face Access</h2>'
@@ -579,6 +612,7 @@ def _door_access_settings_panel(camera: dict) -> str:
         f'<label>Unlock duration (milliseconds)<input id="door-relay-pulse-ms" type="number" min="1" step="1" value="{pulse_value}"></label>'
         f'</div>'
         f'<button class="action-button" id="save-door-access" type="button" style="margin-top:12px">Save Face Access settings</button>'
+        f'{viewer_access_section}'
         f'</section>'
     )
 
@@ -1162,6 +1196,23 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
         with connection() as db:
             camera = _authorized_camera(db, camera_id, identity)
+            # Viewer access list for the Camera Settings panel below --
+            # fetched in this same round trip since it's owner-only and
+            # only ever rendered for a door-configured camera anyway (see
+            # the door_enabled check a few lines down). Never queried for
+            # a customer_viewer -- see the same rendering guard.
+            viewers = (
+                [
+                    dict(row) for row in db.execute(
+                        "SELECT u.id AS user_id, u.email, u.name, COALESCE(p.can_unlock,0) AS can_unlock "
+                        "FROM partner_users u LEFT JOIN customer_camera_permissions p ON p.user_id=u.id AND p.camera_id=? "
+                        "WHERE u.customer_id=? AND u.role='customer_viewer' ORDER BY u.email",
+                        (camera_id, identity['customer_id']),
+                    ).fetchall()
+                ]
+                if identity.get('role') == 'customer_owner' and camera.get('door_access_enabled')
+                else []
+            )
 
         camera_name = _camera_display_label(camera)
         start_url = f'/api/customer/cameras/{camera_id}/live/start'
@@ -1215,7 +1266,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
             f'<div id="live-analytics-panel" class="health-list"></div>'
             f'</section>'
-            + (_door_access_settings_panel(camera) if identity.get('role') == 'customer_owner' else '')
+            + (_door_access_settings_panel(camera, viewers) if identity.get('role') == 'customer_owner' else '')
         )
 
         scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
@@ -1465,6 +1516,33 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       if(!response.ok){{showToast(data.detail||'Could not save Face Access settings.');return}}
       showToast(data.message||'Face Access settings saved.');
       setTimeout(()=>location.reload(),700);
+    }});
+  }}
+
+  // Viewer access ("who can press Unlock Door") -- only present at all
+  // when this camera is already door-configured (see
+  // _door_access_settings_panel()'s own guard), so a null
+  // saveUnlockAccessButton here just means "not a door yet", same
+  // pattern as every other optional element on this page.
+  const saveUnlockAccessButton=document.getElementById('save-unlock-access');
+  if(saveUnlockAccessButton){{
+    saveUnlockAccessButton.addEventListener('click',async()=>{{
+      const userIds=[...document.querySelectorAll('.unlock-viewer-toggle:checked')].map(box=>box.dataset.userId);
+      saveUnlockAccessButton.disabled=true;
+      let response,data;
+      try{{
+        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config/unlock-access`,{{
+          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_ids:userIds}}),
+        }});
+        data=await response.json().catch(()=>({{}}));
+      }}catch(e){{
+        saveUnlockAccessButton.disabled=false;
+        showToast('Could not save unlock access.');
+        return;
+      }}
+      saveUnlockAccessButton.disabled=false;
+      if(!response.ok){{showToast(data.detail||'Could not save unlock access.');return}}
+      showToast(data.message||'Unlock access saved.');
     }});
   }}
 

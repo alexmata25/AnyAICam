@@ -341,3 +341,163 @@ def test_door_config_change_is_audited(monkeypatch, db_path):
     assert entry is not None
     assert entry["actor_email"] == "owner-a@example.test"
     assert '"door_relay_channel": 3' in entry["details_json"]
+
+
+# ------------------------------------------------------------- unlock-access (can_unlock management UI)
+
+
+def _add_second_viewer(db_path, now):
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute(
+                "INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,account_status) "
+                "VALUES('viewer-b','partner-a','viewer-b@example.test','Viewer B','customer_viewer','x',1,'customer-a',?,'active')",
+                (now,),
+            )
+
+
+def test_get_unlock_access_lists_every_viewer_with_their_current_grant(monkeypatch, db_path):
+    get_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="GET")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO customer_camera_permissions(user_id,camera_id,can_unlock) VALUES('viewer-a','camera-front-door',1)")
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        result = get_access(_fake_request(), "camera-front-door")
+    assert result["viewers"] == [{"user_id": "viewer-a", "email": "viewer-a@example.test", "name": "Viewer A", "can_unlock": 1}]
+
+
+def test_get_unlock_access_defaults_to_zero_for_a_viewer_with_no_row_at_all(monkeypatch, db_path):
+    get_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="GET")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        result = get_access(_fake_request(), "camera-front-door")
+    assert result["viewers"] == [{"user_id": "viewer-a", "email": "viewer-a@example.test", "name": "Viewer A", "can_unlock": 0}]
+
+
+def test_get_unlock_access_is_owner_only(monkeypatch, db_path):
+    get_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="GET")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _viewer_identity())
+        with pytest.raises(HTTPException) as excinfo:
+            get_access(_fake_request(), "camera-front-door")
+    assert excinfo.value.status_code == 403
+
+
+def test_set_unlock_access_grants_the_listed_viewer(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        result = set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a"]})
+        grant = row("SELECT can_unlock FROM customer_camera_permissions WHERE user_id='viewer-a' AND camera_id='camera-front-door'")
+    assert result["granted_user_ids"] == ["viewer-a"]
+    assert grant["can_unlock"] == 1
+
+
+def test_set_unlock_access_revokes_a_viewer_no_longer_in_the_list(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO customer_camera_permissions(user_id,camera_id,can_unlock) VALUES('viewer-a','camera-front-door',1)")
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        result = set_access(_fake_request(), "camera-front-door", {"user_ids": []})
+        grant = row("SELECT can_unlock FROM customer_camera_permissions WHERE user_id='viewer-a' AND camera_id='camera-front-door'")
+    assert result["granted_user_ids"] == []
+    assert grant["can_unlock"] == 0
+
+
+def test_set_unlock_access_never_touches_an_unrelated_viewers_grant_on_the_same_camera(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    now = datetime.now().isoformat()
+    _add_second_viewer(db_path, now)
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute("INSERT INTO customer_camera_permissions(user_id,camera_id,can_unlock) VALUES('viewer-b','camera-front-door',1)")
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a"]})
+        grant_a = row("SELECT can_unlock FROM customer_camera_permissions WHERE user_id='viewer-a' AND camera_id='camera-front-door'")
+        grant_b = row("SELECT can_unlock FROM customer_camera_permissions WHERE user_id='viewer-b' AND camera_id='camera-front-door'")
+    assert grant_a["can_unlock"] == 1
+    assert grant_b["can_unlock"] == 0  # correctly revoked -- was not in the new list
+
+
+def test_set_unlock_access_never_touches_other_permission_columns_on_the_same_row(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        with connection() as db:
+            db.execute(
+                "INSERT INTO customer_camera_permissions(user_id,camera_id,can_live,can_playback,can_talk,can_unlock) "
+                "VALUES('viewer-a','camera-front-door',1,1,1,0)"
+            )
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a"]})
+        grant = row("SELECT can_live,can_playback,can_talk,can_unlock FROM customer_camera_permissions WHERE user_id='viewer-a' AND camera_id='camera-front-door'")
+    assert dict(grant) == {"can_live": 1, "can_playback": 1, "can_talk": 1, "can_unlock": 1}
+
+
+def test_set_unlock_access_ignores_a_user_id_that_is_not_one_of_this_customers_own_viewers(monkeypatch, db_path):
+    """Fail-closed against a foreign/forged id in the request body --
+    never grants or errors, simply excludes it, matching this codebase's
+    no-cross-tenant-effect convention elsewhere."""
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        result = set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a", "someone-elses-user-id"]})
+        foreign_row = row("SELECT * FROM customer_camera_permissions WHERE user_id='someone-elses-user-id'")
+    assert result["granted_user_ids"] == ["viewer-a"]
+    assert foreign_row is None
+
+
+def test_set_unlock_access_is_owner_only(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _viewer_identity())
+        with pytest.raises(HTTPException) as excinfo:
+            set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a"]})
+    assert excinfo.value.status_code == 403
+
+
+def test_set_unlock_access_unknown_camera_is_404(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        with pytest.raises(HTTPException) as excinfo:
+            set_access(_fake_request(), "camera-does-not-exist", {"user_ids": ["viewer-a"]})
+    assert excinfo.value.status_code == 404
+
+
+def test_set_unlock_access_is_audited(monkeypatch, db_path):
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a"]})
+        entry = row("SELECT * FROM audit_logs WHERE action='camera.door_unlock_access_updated' AND entity_id='camera-front-door'")
+    assert entry is not None
+    assert entry["actor_email"] == "owner-a@example.test"
+    assert '"viewer-a"' in entry["details_json"]
+
+
+def test_granting_unlock_access_this_way_actually_authorizes_a_real_unlock(monkeypatch, db_path, _isolated_relay):
+    """End-to-end proof this management endpoint is wired to the real
+    authorization check unlock_door() uses -- not a parallel, disconnected
+    permission surface."""
+    set_access = _route("/api/customer/cameras/{camera_id}/door-config/unlock-access", method="POST")
+    unlock = _route("/api/customer/cameras/{camera_id}/door/unlock")
+    _seed(db_path)
+    with override_target(sqlite_path=db_path):
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _owner_identity())
+        set_access(_fake_request(), "camera-front-door", {"user_ids": ["viewer-a"]})
+        monkeypatch.setattr(door_access, "partner_identity", lambda request: _viewer_identity())
+        result = unlock(_fake_request(), "camera-front-door")
+    assert result["door_name"] == "Front Door"
+    assert _isolated_relay.calls[-1].channel == 1

@@ -98,17 +98,39 @@ def set_camera_access(db, *, user_id: str, access_mode: str, camera_ids: list[st
     unused while access_mode='all') rather than deleted, so switching back
     to 'selected' later restores the previous per-camera grants instead of
     starting from zero.
+
+    The finer-grained per-camera grants this same table also carries --
+    can_settings/can_talk/can_unlock, none of which this function itself
+    ever sets -- are read back and re-applied to any camera_id that
+    survives into the new list (2026-09-17, real bug found while building
+    the can_unlock management UI: the old unconditional DELETE-then-
+    INSERT silently reset every one of those to 0 the moment an owner
+    changed ANYTHING about a viewer's camera list, even a camera
+    completely unrelated to a grant made five minutes earlier -- e.g.
+    revoking a viewer's access to camera 2 would also silently strip
+    their already-granted can_unlock on camera 1). A camera_id being
+    newly added to the list (never granted before) still starts with
+    every extra grant at its normal fail-closed default (0) -- this
+    only PRESERVES an existing grant, never invents one.
     """
     if access_mode not in ACCESS_MODES:
         raise ValueError(f"Unknown access_mode: {access_mode!r}")
     db.execute("UPDATE partner_users SET camera_access_mode=? WHERE id=?", (access_mode, user_id))
     if access_mode == "selected":
+        existing_extra_grants = {
+            row["camera_id"]: (row["can_settings"], row["can_talk"], row["can_unlock"])
+            for row in db.execute(
+                "SELECT camera_id,can_settings,can_talk,can_unlock FROM customer_camera_permissions WHERE user_id=?",
+                (user_id,),
+            ).fetchall()
+        }
         db.execute("DELETE FROM customer_camera_permissions WHERE user_id=?", (user_id,))
         for camera_id in camera_ids:
+            can_settings, can_talk, can_unlock = existing_extra_grants.get(camera_id, (0, 0, 0))
             db.execute(
-                "INSERT INTO customer_camera_permissions(user_id,camera_id,can_live,can_playback,can_download,can_share,can_alerts) "
-                "VALUES(?,?,1,1,0,0,1)",
-                (user_id, camera_id),
+                "INSERT INTO customer_camera_permissions(user_id,camera_id,can_live,can_playback,can_download,can_share,can_alerts,can_settings,can_talk,can_unlock) "
+                "VALUES(?,?,1,1,0,0,1,?,?,?)",
+                (user_id, camera_id, can_settings, can_talk, can_unlock),
             )
 
 
