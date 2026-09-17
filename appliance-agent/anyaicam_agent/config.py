@@ -108,12 +108,14 @@ class AgentConfig:
     def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
     @property
     def entitlement_state_file(self): return Path(self.state_dir)/'entitlement_state.json'
-    @property
     # Local recording storage management (2026-09-17): the cross-process
     # handoff FROM the VMS app's local_storage_manager.py worker TO this
-    # agent's own heartbeat -- the mirror-image direction of live_relay_
-    # commands_file above (that one flows agent -> VMS app).
-    def local_storage_state_file(self): return Path(self.state_dir)/'local_storage_state.json'
+    # agent's own heartbeat is now an HTTP call (metrics.py's own
+    # VMS_LOCAL_URL, polling GET /api/appliance/local-storage-state) --
+    # NOT a shared state file. STATE_DIR is mounted read-only inside the
+    # VMS container by design, confirmed live on Ryzen, so a file this
+    # agent could read but the VMS app could never write into it was a
+    # structural dead end, not a transient bug.
 
     # RDM4 (remote device management -- privileged actions): the ONLY
     # channel by which this unprivileged agent process can ever request

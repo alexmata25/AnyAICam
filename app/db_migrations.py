@@ -583,6 +583,20 @@ CREATE TABLE IF NOT EXISTS local_storage_cleanup_log(
 );
 CREATE INDEX IF NOT EXISTS idx_local_storage_cleanup_log_deleted_at ON local_storage_cleanup_log(deleted_at);
 '''),
+    # Local recording AGE retention (2026-09-17), independent of the free-
+    # space reserve/warning percentages added above -- see local_storage_
+    # policy.py's own module docstring for why this is a separate
+    # customer/appliance-configurable knob, and explicitly NOT the same
+    # setting as customer_cloud_policy.retention_days (the existing
+    # Hybrid AWS/S3 7/14/30-day cloud entitlement -- that one governs
+    # uploaded event clips/thumbnails, this one only ever touches local
+    # disk). NULL (the default) means "no age-based limit" -- only the
+    # free-space reserve trigger applies until an RDM override sets a
+    # real number, first used for the real Ryzen lab appliance's own
+    # 7-day target.
+    ('20260917_local_storage_retention_days','''
+ALTER TABLE local_storage_policy ADD COLUMN local_retention_days INTEGER;
+'''),
 ]
 
 

@@ -29,7 +29,6 @@ def _reset_module_state(tmp_path, monkeypatch):
         "last_scan_at": None, "last_cleanup_at": None, "last_error": None,
     })
     monkeypatch.setattr(lsm, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(lsm, "LOCAL_STATE_FILE", tmp_path / "state" / "local_storage_state.json")
     with override_target(sqlite_path=str(tmp_path / "test_local_storage_manager.db")):
         from partner_db import initialize_database
         initialize_database()
@@ -255,8 +254,8 @@ def test_run_cleanup_pass_deletes_oldest_first_until_target_restored(tmp_path, m
 
     original_delete = lsm.delete_one_recording
 
-    def tracking_delete(candidate, *, cloud_recording_s3_key_fn):
-        ok = original_delete(candidate, cloud_recording_s3_key_fn=cloud_recording_s3_key_fn)
+    def tracking_delete(candidate, *, cloud_recording_s3_key_fn, reason="auto_cleanup_low_disk"):
+        ok = original_delete(candidate, cloud_recording_s3_key_fn=cloud_recording_s3_key_fn, reason=reason)
         if ok:
             state["used"] -= candidate["size_bytes"]
         return ok
@@ -305,6 +304,107 @@ def test_run_cleanup_pass_respects_max_deletions_per_tick(tmp_path, monkeypatch)
     monkeypatch.setattr(lsm.shutil, "disk_usage", lambda p: _FakeUsage(total=10000, used=9990))  # never reaches target
     result = lsm.run_cleanup_pass(tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key, policy={"reserved_free_percent": 10, "warning_free_percent": 20})
     assert result["deleted"] == 2
+
+
+# --------------------------------------------------------------- run_cleanup_pass: dual-trigger (7-day local retention + 10% reserve)
+
+
+def test_run_cleanup_pass_deletes_retention_expired_files_even_with_healthy_free_space(tmp_path, monkeypatch):
+    """The Ryzen lab appliance's real requirement: a configured
+    local_retention_days target deletes old footage regardless of
+    current free space -- not only when the disk is under pressure."""
+    from partner_db import connection
+
+    _seed_camera("cam-a", 1, "motion")
+    old = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=10), size_bytes=1000)
+    recent = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=1), size_bytes=1000)
+    monkeypatch.setattr(lsm.shutil, "disk_usage", lambda p: _FakeUsage(total=10000, used=1000))  # 90% free -- healthy
+
+    result = lsm.run_cleanup_pass(
+        tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key,
+        policy={"reserved_free_percent": 10, "warning_free_percent": 20, "local_retention_days": 7},
+    )
+
+    assert result["deleted"] == 1
+    assert result["exhausted"] is False
+    assert not old.exists()
+    assert recent.exists()
+    with connection() as db:
+        log_row = db.execute("SELECT reason FROM local_storage_cleanup_log WHERE file_name=?", (old.name,)).fetchone()
+    assert log_row["reason"] == "auto_cleanup_retention_expired"
+
+
+def test_run_cleanup_pass_is_a_noop_when_retention_configured_but_nothing_is_past_due(tmp_path, monkeypatch):
+    _seed_camera("cam-a", 1, "motion")
+    recent = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=1), size_bytes=1000)
+    monkeypatch.setattr(lsm.shutil, "disk_usage", lambda p: _FakeUsage(total=10000, used=1000))  # healthy
+
+    result = lsm.run_cleanup_pass(
+        tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key,
+        policy={"reserved_free_percent": 10, "warning_free_percent": 20, "local_retention_days": 30},
+    )
+    assert result == {"deleted": 0, "freed_bytes": 0, "final_free_percent": 90.0, "exhausted": False}
+    assert recent.exists()
+
+
+def test_run_cleanup_pass_whichever_trigger_needs_it_first_wins(tmp_path, monkeypatch):
+    """The explicit dual-trigger requirement: a retention-expired file is
+    deleted regardless of free space, and -- when that alone isn't
+    enough to restore the reserve -- the free-space trigger picks up
+    from there and deletes further (still-within-retention) oldest-first
+    candidates too, all in one linear oldest-first pass, each candidate
+    logged under whichever reason actually applied to it."""
+    from partner_db import connection
+
+    _seed_camera("cam-a", 1, "motion")
+    old_retention_expired = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=10), size_bytes=100)
+    recent1 = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=1, hours=2), size_bytes=1000)
+    recent2 = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=1, hours=1), size_bytes=1000)
+
+    state = {"used": 9200, "total": 10000}  # 8% free -- below the 10% reserved floor
+
+    def fake_usage(_path):
+        return _FakeUsage(total=state["total"], used=state["used"])
+
+    monkeypatch.setattr(lsm.shutil, "disk_usage", fake_usage)
+
+    original_delete = lsm.delete_one_recording
+
+    def tracking_delete(candidate, *, cloud_recording_s3_key_fn, reason="auto_cleanup_low_disk"):
+        ok = original_delete(candidate, cloud_recording_s3_key_fn=cloud_recording_s3_key_fn, reason=reason)
+        if ok:
+            state["used"] -= candidate["size_bytes"]
+        return ok
+
+    monkeypatch.setattr(lsm, "delete_one_recording", tracking_delete)
+
+    result = lsm.run_cleanup_pass(
+        tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key,
+        policy={"reserved_free_percent": 10, "warning_free_percent": 20, "local_retention_days": 7},
+    )
+
+    assert not old_retention_expired.exists()
+    assert not recent1.exists()
+    assert recent2.exists()
+    assert result["deleted"] == 2
+    assert result["exhausted"] is False
+
+    with connection() as db:
+        reasons = {row["file_name"]: row["reason"] for row in db.execute("SELECT file_name,reason FROM local_storage_cleanup_log").fetchall()}
+    assert reasons[old_retention_expired.name] == "auto_cleanup_retention_expired"
+    assert reasons[recent1.name] == "auto_cleanup_low_disk"
+
+
+def test_run_cleanup_pass_free_space_trigger_unaffected_when_retention_not_configured(tmp_path, monkeypatch):
+    """Regression guard: omitting local_retention_days entirely (the
+    pre-dual-trigger policy shape, still used by callers/tests that
+    predate this feature) must behave exactly as before."""
+    _seed_camera("cam-a", 1, "motion")
+    old = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=1), size_bytes=1000)
+    monkeypatch.setattr(lsm.shutil, "disk_usage", lambda p: _FakeUsage(total=10000, used=1000))  # healthy, no reserve pressure
+    result = lsm.run_cleanup_pass(tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key, policy={"reserved_free_percent": 10, "warning_free_percent": 20})
+    assert result["deleted"] == 0
+    assert old.exists()
 
 
 # --------------------------------------------------------------- _notify_critical_storage
@@ -400,8 +500,14 @@ async def test_worker_never_runs_on_cloud_role_regardless_of_flags(monkeypatch, 
 
 
 @pytest.mark.anyio
-async def test_worker_writes_local_state_file_for_the_agent_heartbeat_to_read(monkeypatch, tmp_path):
-    import asyncio, json
+async def test_worker_updates_in_process_state_for_the_local_status_route_to_read(monkeypatch, tmp_path):
+    """Cross-process handoff to the appliance-agent's heartbeat is now
+    GET /api/appliance/local-storage-state (main.py), which reads
+    local_storage_manager_state directly -- no shared file (see module
+    docstring: STATE_DIR is read-only inside the VMS container by
+    design). This proves the worker keeps that in-process dict itself
+    correct and current, which is all the HTTP route needs."""
+    import asyncio
     monkeypatch.setattr(lsm, "RUNTIME_ROLE", "edge")
     monkeypatch.setattr(lsm, "MANAGEMENT_ENABLED", True)
     monkeypatch.setattr(lsm, "AUTO_DELETE_ENABLED", False)
@@ -418,10 +524,71 @@ async def test_worker_writes_local_state_file_for_the_agent_heartbeat_to_read(mo
     except asyncio.CancelledError:
         pass
 
-    assert lsm.LOCAL_STATE_FILE.exists()
-    payload = json.loads(lsm.LOCAL_STATE_FILE.read_text())
-    assert payload["storage_state"] == "healthy"
-    assert payload["free_percent"] == pytest.approx(50.0)
+    assert lsm.local_storage_manager_state["storage_state"] == "healthy"
+    assert lsm.local_storage_manager_state["free_percent"] == pytest.approx(50.0)
+    assert lsm.local_storage_manager_state["worker_status"] == "running"
+
+
+@pytest.mark.anyio
+async def test_worker_never_reports_critical_for_retention_alone_when_auto_delete_disabled(monkeypatch, tmp_path):
+    """A configured local_retention_days target, even with a real file
+    sitting past it, must never alone force 'critical' the way running
+    out of free-space reserve does -- 'exhausted/critical state must
+    remain about the free-space condition alone' is an explicit
+    requirement, verified here at the worker level since run_cleanup_
+    pass never even runs while auto-delete is disabled."""
+    import asyncio
+    _seed_camera("cam-a", 1, "motion")
+    _make_recording(tmp_path, 1, datetime.now() - timedelta(days=30))
+    monkeypatch.setattr(lsm, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(lsm, "MANAGEMENT_ENABLED", True)
+    monkeypatch.setattr(lsm, "AUTO_DELETE_ENABLED", False)
+    monkeypatch.setattr(lsm, "SCAN_SECONDS", 0.01)
+    monkeypatch.setattr(lsm, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(lsm, "_local_storage_policy", lambda: {"reserved_free_percent": 10, "warning_free_percent": 20, "local_retention_days": 7})
+    monkeypatch.setattr(lsm.shutil, "disk_usage", lambda p: _FakeUsage(total=10000, used=5000))  # healthy free space
+
+    task = asyncio.ensure_future(lsm.local_storage_manager_worker(tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert lsm.local_storage_manager_state["storage_state"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_worker_deletes_retention_expired_files_when_auto_delete_enabled_even_with_healthy_disk(monkeypatch, tmp_path):
+    import asyncio
+    _seed_camera("cam-a", 1, "motion")
+    old = _make_recording(tmp_path, 1, datetime.now() - timedelta(days=30))
+    monkeypatch.setattr(lsm, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(lsm, "MANAGEMENT_ENABLED", True)
+    monkeypatch.setattr(lsm, "AUTO_DELETE_ENABLED", True)
+    monkeypatch.setattr(lsm, "SCAN_SECONDS", 0.01)
+    monkeypatch.setattr(lsm, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(lsm, "_local_storage_policy", lambda: {"reserved_free_percent": 10, "warning_free_percent": 20, "local_retention_days": 7})
+    monkeypatch.setattr(lsm.shutil, "disk_usage", lambda p: _FakeUsage(total=10000, used=5000))  # healthy free space throughout
+
+    task = asyncio.ensure_future(lsm.local_storage_manager_worker(tmp_path, recording_start_fn=_fake_recording_start, cloud_recording_s3_key_fn=_fake_s3_key))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert not old.exists()
+    # The tick that actually deletes something reports 'cleanup_active'
+    # (classify_storage_state's own contract); a later tick with nothing
+    # left to do reports 'healthy' again -- timing-dependent given the
+    # real scan loop, but 'critical' must never appear: the free-space
+    # reserve was never actually threatened here, only the retention
+    # target was.
+    assert lsm.local_storage_manager_state["storage_state"] in ("healthy", "cleanup_active")
+    assert lsm.local_storage_manager_state["last_cleanup_at"] is not None
 
 
 @pytest.fixture

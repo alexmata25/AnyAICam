@@ -1512,18 +1512,25 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # reserved_free_percent is the automatic-cleanup floor (default
         # local_storage_policy.DEFAULT_RESERVED_FREE_PERCENT, 10);
         # warning_free_percent is the earlier, non-destructive line
-        # (default DEFAULT_WARNING_FREE_PERCENT, 20). Reuses the same
-        # GET /api/appliance/configuration sync channel (storage_policy
-        # field, appliance_configuration() above) local_storage_manager.py
-        # already polls -- no second, parallel config-delivery mechanism.
+        # (default DEFAULT_WARNING_FREE_PERCENT, 20). local_retention_days
+        # is the independent age-based local trigger (null = no age
+        # limit, the default for most customers) -- deliberately separate
+        # from the existing Hybrid AWS/S3 cloud retention entitlement
+        # (set_cloud_policy's own retention_days immediately above), which
+        # governs the cloud copy, not this appliance's local disk. Reuses
+        # the same GET /api/appliance/configuration sync channel
+        # (storage_policy field, appliance_configuration() above)
+        # local_storage_manager.py already polls -- no second, parallel
+        # config-delivery mechanism.
         identity=require_partner_access(request,{'administrator'})
         with connection() as db:
             customer=db.execute('SELECT id FROM customers WHERE id=?',(customer_id,)).fetchone()
             if not customer:
                 raise HTTPException(status_code=404,detail='Customer not found.')
-            existing=db.execute('SELECT reserved_free_percent,warning_free_percent FROM local_storage_policy WHERE customer_id=?',(customer_id,)).fetchone()
+            existing=db.execute('SELECT reserved_free_percent,warning_free_percent,local_retention_days FROM local_storage_policy WHERE customer_id=?',(customer_id,)).fetchone()
             reserved_free_percent=existing['reserved_free_percent'] if existing else None
             warning_free_percent=existing['warning_free_percent'] if existing else None
+            local_retention_days=existing['local_retention_days'] if existing else None
             if 'reserved_free_percent' in payload:
                 value=payload.get('reserved_free_percent')
                 if value is not None and (not isinstance(value,int) or isinstance(value,bool) or value<1 or value>90):
@@ -1534,16 +1541,21 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 if value is not None and (not isinstance(value,int) or isinstance(value,bool) or value<1 or value>95):
                     raise HTTPException(status_code=400,detail='warning_free_percent must be an integer from 1 to 95, or null to clear back to the system default.')
                 warning_free_percent=value
+            if 'local_retention_days' in payload:
+                value=payload.get('local_retention_days')
+                if value is not None and (not isinstance(value,int) or isinstance(value,bool) or value<1 or value>3650):
+                    raise HTTPException(status_code=400,detail='local_retention_days must be a positive integer (days), or null to clear back to no age limit.')
+                local_retention_days=value
             if reserved_free_percent is not None and warning_free_percent is not None and reserved_free_percent>=warning_free_percent:
                 raise HTTPException(status_code=400,detail='reserved_free_percent must be lower than warning_free_percent (cleanup only ever triggers below the warning line).')
             now=datetime.now().isoformat()
             db.execute(
-                'INSERT INTO local_storage_policy(customer_id,reserved_free_percent,warning_free_percent,updated_at,updated_by) VALUES(?,?,?,?,?) '
-                'ON CONFLICT(customer_id) DO UPDATE SET reserved_free_percent=excluded.reserved_free_percent,warning_free_percent=excluded.warning_free_percent,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
-                (customer_id,reserved_free_percent,warning_free_percent,now,identity['email']),
+                'INSERT INTO local_storage_policy(customer_id,reserved_free_percent,warning_free_percent,local_retention_days,updated_at,updated_by) VALUES(?,?,?,?,?,?) '
+                'ON CONFLICT(customer_id) DO UPDATE SET reserved_free_percent=excluded.reserved_free_percent,warning_free_percent=excluded.warning_free_percent,local_retention_days=excluded.local_retention_days,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
+                (customer_id,reserved_free_percent,warning_free_percent,local_retention_days,now,identity['email']),
             )
-        audit(identity,'customer.storage_policy_changed','customer',customer_id,{'reserved_free_percent':reserved_free_percent,'warning_free_percent':warning_free_percent})
-        return {'customer_id':customer_id,'reserved_free_percent':reserved_free_percent,'warning_free_percent':warning_free_percent}
+        audit(identity,'customer.storage_policy_changed','customer',customer_id,{'reserved_free_percent':reserved_free_percent,'warning_free_percent':warning_free_percent,'local_retention_days':local_retention_days})
+        return {'customer_id':customer_id,'reserved_free_percent':reserved_free_percent,'warning_free_percent':warning_free_percent,'local_retention_days':local_retention_days}
 
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:

@@ -3,7 +3,17 @@ import os
 import shutil
 import socket
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+# Local recording storage management (2026-09-17): the VMS app (a
+# separate, containerized process from this agent) publishes its own
+# port to the host -- reachable over plain localhost HTTP, same host,
+# no container-network translation needed. Configurable for the rare
+# case a future deployment maps a different host port; the VMS
+# container's own installer-provisioned mapping is 8000 by default.
+VMS_LOCAL_URL = os.environ.get("ANYAICAM_VMS_LOCAL_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 def _cpu_percent(sample=.15):
@@ -36,16 +46,27 @@ def disk_summary(config):
 
 
 def local_storage_state(config):
-    """Local recording storage management (2026-09-17): reads the small
-    cross-process state file the VMS app's own local_storage_manager.py
-    worker writes (see that module's docstring) -- returns {} (no keys
-    added to the heartbeat payload at all) whenever that file is
-    missing, unreadable, or malformed, which is the normal, expected
-    state for any appliance that hasn't enabled
-    ANYAICAM_LOCAL_STORAGE_MANAGEMENT_ENABLED yet. Never raises."""
+    """Local recording storage management (2026-09-17): polls the VMS
+    app's own local status route (GET /api/appliance/local-storage-state,
+    main.py) over plain localhost HTTP -- returns {} (no keys added to
+    the heartbeat payload at all) whenever that call fails for any
+    reason (VMS app down/restarting, feature not enabled there yet, old
+    VMS build predating this route), which is the normal, expected state
+    for any appliance that hasn't enabled
+    ANYAICAM_LOCAL_STORAGE_MANAGEMENT_ENABLED yet. Never raises.
+
+    A prior design had this read a small state FILE
+    local_storage_manager.py wrote into STATE_DIR -- replaced after
+    confirming live on Ryzen that STATE_DIR (/var/lib/anyaicam) is
+    mounted READ-ONLY inside the VMS container by design (it may read
+    the appliance's own credential/identity files there, but must never
+    write into that directory), so that file write failed on every
+    single tick. An HTTP status call has no such conflict and is always
+    live, never stale."""
     try:
-        data=json.loads(config.local_storage_state_file.read_text(encoding='utf-8'))
-    except (OSError,json.JSONDecodeError):
+        with urllib.request.urlopen(f"{VMS_LOCAL_URL}/api/appliance/local-storage-state", timeout=3) as response:
+            data=json.loads(response.read().decode() or "{}")
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
         return {}
     if not isinstance(data,dict):
         return {}

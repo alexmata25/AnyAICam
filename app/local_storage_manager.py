@@ -56,7 +56,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger("anyaicam.local_storage_manager")
@@ -67,7 +67,6 @@ AUTO_DELETE_ENABLED = os.environ.get("ANYAICAM_LOCAL_STORAGE_AUTO_DELETE_ENABLED
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
-LOCAL_STATE_FILE = STATE_DIR / "local_storage_state.json"
 
 SCAN_SECONDS = max(10.0, float(os.environ.get("ANYAICAM_LOCAL_STORAGE_SCAN_SECONDS", "60.0")))
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_LOCAL_STORAGE_CONFIG_REFRESH_SECONDS", "300.0")))
@@ -187,25 +186,38 @@ def _refresh_camera_map() -> None:
 
 
 def _local_storage_policy() -> dict:
-    """The effective reserved/warning free-space percentages for this
-    appliance's own customer -- resolved the same way every other RDM
-    policy override already is (customer_cloud_policy's own precedent),
-    but fetched here via the control plane's storage_policy field
-    (appliance_cloud.appliance_configuration()) rather than direct DB
-    access, since this worker runs on the edge. Falls back to the
-    system defaults (never crashes/blocks) if the cloud is unreachable
-    -- a transient outage must never stop local disk monitoring."""
-    from local_storage_policy import DEFAULT_RESERVED_FREE_PERCENT, DEFAULT_WARNING_FREE_PERCENT
+    """The effective reserved/warning free-space percentages AND local
+    recording retention target (days) for this appliance's own customer
+    -- resolved the same way every other RDM policy override already is
+    (customer_cloud_policy's own precedent), but fetched here via the
+    control plane's storage_policy field (appliance_cloud.
+    appliance_configuration()) rather than direct DB access, since this
+    worker runs on the edge. Falls back to the system defaults (never
+    crashes/blocks) if the cloud is unreachable -- a transient outage
+    must never stop local disk monitoring.
+
+    local_retention_days is deliberately separate from the existing
+    Hybrid AWS/S3 cloud retention entitlement (customer_cloud_policy /
+    event_media_policy) -- it governs only how long a segment is allowed
+    to occupy THIS appliance's local disk, not how long the customer's
+    cloud copy (if any) is kept."""
+    from local_storage_policy import DEFAULT_RESERVED_FREE_PERCENT, DEFAULT_WARNING_FREE_PERCENT, DEFAULT_LOCAL_RETENTION_DAYS
 
     response = _control_plane_get("/api/appliance/configuration")
     policy = response.get("storage_policy") if isinstance(response, dict) else None
     if not isinstance(policy, dict):
-        return {"reserved_free_percent": DEFAULT_RESERVED_FREE_PERCENT, "warning_free_percent": DEFAULT_WARNING_FREE_PERCENT}
+        return {
+            "reserved_free_percent": DEFAULT_RESERVED_FREE_PERCENT,
+            "warning_free_percent": DEFAULT_WARNING_FREE_PERCENT,
+            "local_retention_days": DEFAULT_LOCAL_RETENTION_DAYS,
+        }
     reserved = policy.get("reserved_free_percent")
     warning = policy.get("warning_free_percent")
+    retention = policy.get("local_retention_days")
     return {
         "reserved_free_percent": int(reserved) if isinstance(reserved, (int, float)) else DEFAULT_RESERVED_FREE_PERCENT,
         "warning_free_percent": int(warning) if isinstance(warning, (int, float)) else DEFAULT_WARNING_FREE_PERCENT,
+        "local_retention_days": int(retention) if isinstance(retention, (int, float)) and retention > 0 else DEFAULT_LOCAL_RETENTION_DAYS,
     }
 
 
@@ -340,7 +352,7 @@ def _write_cleanup_log(db, *, candidate: dict, trigger_free_percent: float, reas
     )
 
 
-def delete_one_recording(candidate: dict, *, cloud_recording_s3_key_fn) -> bool:
+def delete_one_recording(candidate: dict, *, cloud_recording_s3_key_fn, reason: str = "auto_cleanup_low_disk") -> bool:
     """Deletes exactly one local recording file plus its matching
     recordings catalog row and cleanup-log entry, all after the file is
     confirmed gone -- never removes catalog/audit state ahead of the
@@ -349,7 +361,12 @@ def delete_one_recording(candidate: dict, *, cloud_recording_s3_key_fn) -> bool:
     runs (a legitimate race -- nothing else in this codebase deletes
     local recordings, but this stays defensive rather than assuming
     exclusivity) or if deletion fails for any other reason; never
-    raises."""
+    raises.
+
+    reason distinguishes, in the audit log, a free-space-reserve
+    deletion ('auto_cleanup_low_disk') from a retention-target deletion
+    ('auto_cleanup_retention_expired') -- run_cleanup_pass() picks
+    whichever actually applied to this specific candidate."""
     from partner_db import connection
 
     path = candidate["path"]
@@ -364,7 +381,7 @@ def delete_one_recording(candidate: dict, *, cloud_recording_s3_key_fn) -> bool:
 
     with connection() as db:
         _delete_matching_recording_row(db, camera_id=candidate["camera_id"], s3_key=s3_key)
-        _write_cleanup_log(db, candidate=candidate, trigger_free_percent=local_storage_manager_state.get("free_percent"), reason="auto_cleanup_low_disk")
+        _write_cleanup_log(db, candidate=candidate, trigger_free_percent=local_storage_manager_state.get("free_percent"), reason=reason)
 
     logger.info(
         "local_storage.deleted camera_number=%s file=%s size_bytes=%s recording_started_at=%s",
@@ -374,20 +391,51 @@ def delete_one_recording(candidate: dict, *, cloud_recording_s3_key_fn) -> bool:
 
 
 def run_cleanup_pass(recordings_folder: Path, *, recording_start_fn, cloud_recording_s3_key_fn, policy: dict) -> dict:
-    """One full cleanup pass: deletes oldest-first, across every
-    eligible camera, until free space is restored above reserved_free_
-    percent (plus CLEANUP_TARGET_MARGIN_PERCENT, to avoid immediately
-    re-triggering) or there are no more eligible candidates or
-    MAX_DELETIONS_PER_TICK is reached. Always synchronous and directly
-    callable (no asyncio) so it's fully testable and so the worker loop
-    can run it via asyncio.to_thread, matching webrtc_publisher.py's own
-    established pattern for real, potentially-slow filesystem/DB work
-    inside an async worker sharing this process's event loop."""
+    """One full cleanup pass, enforcing BOTH independent triggers the
+    real Ryzen lab appliance's 7-day-local / 10%-reserve requirement
+    calls for -- "whichever condition requires cleanup first should
+    win":
+
+      1. Free-space reserve: deletes oldest-first, across every eligible
+         camera, until free space is restored above reserved_free_percent
+         (plus CLEANUP_TARGET_MARGIN_PERCENT, to avoid immediately
+         re-triggering).
+      2. Local retention target (policy["local_retention_days"], None ==
+         no age limit -- most customers): deletes every eligible
+         recording older than that many days, REGARDLESS of current free
+         space, since a customer who set a retention target wants old
+         local footage gone even on a mostly-empty disk.
+
+    Candidates are still tried in one single oldest-first order (never
+    two separate passes) -- since the list is chronological, every
+    retention-expired candidate is necessarily tried before any
+    still-within-retention candidate, so this remains exactly one linear
+    scan. A given candidate is deleted for whichever of the two reasons
+    actually applies to it (recorded in the audit log via delete_one_
+    recording's reason).
+
+    Stops when neither condition applies to the next candidate, there
+    are no more eligible candidates, or MAX_DELETIONS_PER_TICK is
+    reached. Always synchronous and directly callable (no asyncio) so
+    it's fully testable and so the worker loop can run it via asyncio.
+    to_thread, matching webrtc_publisher.py's own established pattern
+    for real, potentially-slow filesystem/DB work inside an async worker
+    sharing this process's event loop.
+
+    exhausted (in the returned dict) reflects ONLY the free-space
+    reserve condition, by design -- a retention target that still has
+    candidates queued (deferred to the next tick by MAX_DELETIONS_PER_
+    TICK, say) is never itself a silent-recording-failure risk the way
+    running out of disk is, so it must never alone force the worker into
+    'critical'."""
     target_free_percent = policy["reserved_free_percent"] + CLEANUP_TARGET_MARGIN_PERCENT
+    retention_days = policy.get("local_retention_days")
+    retention_cutoff = datetime.now() - timedelta(days=retention_days) if retention_days else None
+
     deleted = 0
     freed_bytes = 0
     usage = disk_usage_percent(recordings_folder)
-    if usage["free_percent"] > target_free_percent:
+    if usage["free_percent"] > target_free_percent and retention_cutoff is None:
         return {"deleted": 0, "freed_bytes": 0, "final_free_percent": usage["free_percent"], "exhausted": False}
 
     candidates = enumerate_eligible_recordings(recordings_folder, recording_start_fn=recording_start_fn)
@@ -395,19 +443,25 @@ def run_cleanup_pass(recordings_folder: Path, *, recording_start_fn, cloud_recor
     for candidate in candidates:
         if deleted >= MAX_DELETIONS_PER_TICK:
             break
-        usage = disk_usage_percent(recordings_folder)
-        if usage["free_percent"] > target_free_percent:
-            break
-        if delete_one_recording(candidate, cloud_recording_s3_key_fn=cloud_recording_s3_key_fn):
+        past_retention = retention_cutoff is not None and candidate["started_at"] < retention_cutoff
+        if past_retention:
+            reason = "auto_cleanup_retention_expired"
+        else:
+            usage = disk_usage_percent(recordings_folder)
+            if usage["free_percent"] > target_free_percent:
+                # Neither trigger applies to this candidate, and every
+                # remaining candidate is newer still (list is oldest-
+                # first) -- nothing left to do this pass.
+                break
+            reason = "auto_cleanup_low_disk"
+        if delete_one_recording(candidate, cloud_recording_s3_key_fn=cloud_recording_s3_key_fn, reason=reason):
             deleted += 1
             freed_bytes += candidate["size_bytes"]
     else:
         # The for-loop ran to completion without an internal `break` --
-        # every eligible candidate was tried and free space is still not
-        # restored. Distinct from breaking out early (target reached, or
-        # MAX_DELETIONS_PER_TICK hit with more candidates still queued
-        # for the next tick) -- this specific case means cleanup did
-        # everything it could and it genuinely was not enough.
+        # every eligible candidate was tried. Distinct from breaking out
+        # early (target reached, or MAX_DELETIONS_PER_TICK hit with more
+        # candidates still queued for the next tick).
         usage = disk_usage_percent(recordings_folder)
         exhausted = usage["free_percent"] <= target_free_percent
 
@@ -415,23 +469,21 @@ def run_cleanup_pass(recordings_folder: Path, *, recording_start_fn, cloud_recor
 
 
 # --------------------------------------------------------------- cross-process state + notification
-
-def _write_local_state_file(state: str, free_percent: float) -> None:
-    """Cross-process handoff to the appliance-agent's own heartbeat
-    gathering -- see module docstring. Best-effort: a failure to write
-    this file never stops monitoring/cleanup itself, it only means this
-    scan's result won't reach RDM until the next successful write."""
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "storage_state": state,
-            "free_percent": round(free_percent, 2),
-            "last_cleanup_at": local_storage_manager_state.get("last_cleanup_at"),
-            "updated_at": datetime.now().isoformat(),
-        }
-        LOCAL_STATE_FILE.write_text(json.dumps(payload), encoding="utf-8")
-    except OSError as error:
-        logger.warning("local_storage.state_file_write_failed error=%s", error)
+#
+# Cross-process handoff to the appliance-agent's own heartbeat gathering
+# is now via GET /api/appliance/local-storage-state (main.py's own
+# local_storage_state_endpoint(), read by metrics.py over localhost) --
+# NOT a shared state file. Confirmed live on Ryzen: STATE_DIR
+# (/var/lib/anyaicam) is mounted READ-ONLY inside this container by
+# design (the containerized VMS app may read the appliance's own
+# credential/identity files there, but must never write into that
+# directory), so a file this module wrote into STATE_DIR failed on
+# every single tick with a real, permanent "Read-only file system"
+# error -- not a transient/best-effort failure at all, a structural one.
+# local_storage_manager_state (the plain in-process dict already updated
+# by the worker loop below) is itself the only "state" this module needs
+# to publish; the HTTP endpoint reads it directly, live, with no
+# intermediate file to go stale or fail to write.
 
 
 def _notify_critical_storage(free_percent: float, exhausted: bool) -> None:
@@ -486,10 +538,12 @@ async def local_storage_manager_worker(recordings_folder: Path, *, recording_sta
 
             policy = await asyncio.to_thread(_local_storage_policy)
             usage = await asyncio.to_thread(disk_usage_percent, recordings_folder)
-            needs_cleanup = usage["free_percent"] <= policy["reserved_free_percent"]
+            disk_needs_cleanup = usage["free_percent"] <= policy["reserved_free_percent"]
+            retention_configured = policy.get("local_retention_days") is not None
+            attempt_cleanup = disk_needs_cleanup or retention_configured
 
             cleanup_result = None
-            if needs_cleanup and AUTO_DELETE_ENABLED:
+            if attempt_cleanup and AUTO_DELETE_ENABLED:
                 cleanup_result = await asyncio.to_thread(
                     run_cleanup_pass, recordings_folder,
                     recording_start_fn=recording_start_fn, cloud_recording_s3_key_fn=cloud_recording_s3_key_fn, policy=policy,
@@ -497,10 +551,19 @@ async def local_storage_manager_worker(recordings_folder: Path, *, recording_sta
                 if cleanup_result["deleted"] > 0:
                     local_storage_manager_state["last_cleanup_at"] = datetime.now().isoformat()
                 final_free_percent = cleanup_result["final_free_percent"]
+                # run_cleanup_pass()'s own exhausted is already scoped to
+                # the free-space reserve condition alone (see its
+                # docstring) -- a retention target alone never sets it.
                 exhausted = cleanup_result["exhausted"]
             else:
                 final_free_percent = usage["free_percent"]
-                exhausted = needs_cleanup and not AUTO_DELETE_ENABLED
+                # Only the free-space reserve condition can make a scan
+                # "exhausted" (and therefore forced to 'critical' below)
+                # when no cleanup pass ran at all -- a configured
+                # retention target, even with auto-delete off, is never
+                # itself a silent-recording-failure risk the way running
+                # out of disk is.
+                exhausted = disk_needs_cleanup and not AUTO_DELETE_ENABLED
 
             state = classify_storage_state(
                 final_free_percent, reserved_free_percent=policy["reserved_free_percent"],
@@ -521,7 +584,6 @@ async def local_storage_manager_worker(recordings_folder: Path, *, recording_sta
             local_storage_manager_state["last_scan_at"] = datetime.now().isoformat()
             local_storage_manager_state["last_error"] = None
 
-            await asyncio.to_thread(_write_local_state_file, state, final_free_percent)
             if state == "critical":
                 await asyncio.to_thread(_notify_critical_storage, final_free_percent, exhausted)
         except asyncio.CancelledError:

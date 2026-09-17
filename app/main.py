@@ -47831,6 +47831,44 @@ def version_endpoint() -> dict:
     }
 
 
+@app.get("/api/appliance/local-storage-state")
+def local_storage_state_endpoint() -> dict:
+    """Local recording storage management (2026-09-17): the appliance-
+    agent's own heartbeat gathering (metrics.py, a separate host process,
+    not this container) reads this to fold local_storage_manager.py's
+    live in-process state into the real heartbeat payload the cloud
+    already receives disk_capacity/disk_used through.
+
+    This replaced an earlier file-based cross-process handoff design
+    (STATE_DIR/local_storage_state.json) that turned out to be
+    fundamentally incompatible with a real, deliberate security boundary
+    confirmed live on Ryzen: /var/lib/anyaicam (STATE_DIR) is mounted
+    READ-ONLY inside this container by design, so the containerized VMS
+    app can read the appliance's own credential/identity files but can
+    never write into that directory -- correct and intentional, not a
+    bug to route around with a different writable path. An HTTP status
+    route the agent polls over localhost avoids the whole problem: no
+    shared file, no write permission needed, and the data is always
+    live rather than however stale the last successful file write left
+    it.
+
+    Deliberately unauthenticated, matching /health//version/ready's own
+    convention for basic local status -- exposes only non-sensitive
+    operational numbers (free%, state, timestamps), same sensitivity
+    class as those. Never returns worker internals beyond the same four
+    fields the cloud already stores (storage_state/storage_free_percent/
+    storage_last_cleanup_at, plus worker_status for local debugging)."""
+    import local_storage_manager
+    state = local_storage_manager.local_storage_manager_state
+    return {
+        "worker_status": state.get("worker_status"),
+        "storage_state": state.get("storage_state"),
+        "free_percent": state.get("free_percent"),
+        "last_cleanup_at": state.get("last_cleanup_at"),
+        "last_scan_at": state.get("last_scan_at"),
+    }
+
+
 _DOCKER_GATEWAY_IP_CACHE: dict = {}
 
 
