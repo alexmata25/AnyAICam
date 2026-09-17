@@ -64,6 +64,105 @@ POLL_TIMEOUT_MS = 45000
 # destination -- required by some browsers for onaudioprocess to fire
 # reliably, without which the mic's own input would otherwise be
 # audibly routed back out to the speakers.
+_P2P_JS = """
+(function(){
+  let cachedConfig = null;
+  async function getP2PConfig(){
+    if (cachedConfig) return cachedConfig;
+    try {
+      const res = await fetch('/api/customer/live/p2p/config');
+      cachedConfig = res.ok ? await res.json() : {enabled:false};
+    } catch (e) { cachedConfig = {enabled:false}; }
+    return cachedConfig;
+  }
+
+  // Attempts a direct P2P connection for one live-view session, racing
+  // against the relay poll the caller is running in parallel (never
+  // sequentially -- see live_view_p2p.py's module docstring: relay stays
+  // the automatic fallback, never delayed by a P2P attempt). Resolves
+  // {stream, pc, connect_ms} the moment a real video track arrives;
+  // rejects on disabled/timeout/ICE failure. Never touches a <video>
+  // element itself -- the caller only assigns it after winning the race
+  // against the relay path, so a late-arriving P2P track can never
+  // stomp a relay stream that already won.
+  window.attemptLiveP2P = async function(sessionId){
+    const startedAt = Date.now();
+    const config = await getP2PConfig();
+    if (!config.enabled) throw new Error('p2p_disabled');
+
+    const pc = new RTCPeerConnection({iceServers: config.ice_servers || []});
+    let settled = false;
+    const timeoutMs = config.timeout_ms || 4000;
+    const failClosed = () => { try { pc.close(); } catch (e) {} };
+
+    const resultPromise = new Promise((resolve, reject) => {
+      pc.ontrack = (event) => {
+        if (settled) return;
+        settled = true;
+        resolve({stream: event.streams[0], pc, connect_ms: Date.now() - startedAt});
+      };
+      pc.oniceconnectionstatechange = () => {
+        if (settled) return;
+        if (['failed', 'disconnected', 'closed'].includes(pc.iceConnectionState)) {
+          settled = true; failClosed();
+          reject(new Error('ice_' + pc.iceConnectionState));
+        }
+      };
+      setTimeout(() => {
+        if (settled) return;
+        settled = true; failClosed();
+        reject(new Error('timeout'));
+      }, timeoutMs);
+    });
+
+    pc.addTransceiver('video', {direction: 'recvonly'});
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      fetch(`/api/customer/live/sessions/${sessionId}/p2p/ice`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({candidate: {candidate: event.candidate.candidate, sdpMid: event.candidate.sdpMid, sdpMLineIndex: event.candidate.sdpMLineIndex}}),
+      }).catch(() => {});
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    fetch(`/api/customer/live/sessions/${sessionId}/p2p/offer`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sdp: offer.sdp}),
+    }).catch(() => {});
+
+    let appliedAnswer = false;
+    const pollTimer = setInterval(async () => {
+      if (settled) { clearInterval(pollTimer); return; }
+      let res;
+      try { res = await fetch(`/api/customer/live/sessions/${sessionId}/p2p/answer`); } catch (e) { return; }
+      if (!res || !res.ok) return;
+      const body = await res.json();
+      if (!appliedAnswer && body.answer && body.answer.sdp) {
+        appliedAnswer = true;
+        try { await pc.setRemoteDescription({type: 'answer', sdp: body.answer.sdp}); } catch (e) {}
+      }
+      for (const candidate of (body.candidates || [])) {
+        try { await pc.addIceCandidate(candidate); } catch (e) {}
+      }
+    }, 500);
+
+    try {
+      return await resultPromise;
+    } finally {
+      clearInterval(pollTimer);
+    }
+  };
+
+  window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
+    if (!sessionId) return;
+    fetch(`/api/customer/live/sessions/${sessionId}/transport-outcome`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({transport, connect_ms: connectMs ?? null, error: error || null}),
+    }).catch(() => {});
+  };
+})();
+"""
+
 _TALK_MIC_JS = """
 function wireTalkMic(button, cameraId) {
   // Press-and-hold state, keyed by a monotonically increasing generation
@@ -545,7 +644,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<section class="live-grid">{tiles}</section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
 
@@ -584,11 +683,30 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   cameraIds.forEach(id=>{{
     tiles[id]={{
       sessionId:null, hls:null, pollTimer:null, stopped:false,
+      transport:null, p2pConnection:null, startedAt:null,
       video:document.getElementById(`live-grid-video-${{id}}`),
       placeholder:document.getElementById(`live-grid-placeholder-${{id}}`),
       status:document.getElementById(`live-grid-status-${{id}}`),
     }};
   }});
+
+  // Direct P2P vs. relay race: the first transport to actually produce
+  // video "wins" this tile. claimTransport() is the single choke point
+  // both attachPlayer() (relay) and the P2P success handler in
+  // startSession() go through -- returns 'claimed' the first time a
+  // transport wins (report the outcome once), 'already' on that same
+  // transport's own later reconnect/recovery calls (proceed, but don't
+  // re-report), or 'blocked' for the transport that lost the race (tear
+  // itself down, never displace the winner). See live_view_p2p.py's
+  // module docstring for why the relay path must never be delayed or
+  // displaced once it has already won.
+  function claimTransport(id,transport){{
+    const tile=tiles[id];
+    if(tile.transport===transport)return'already';
+    if(tile.transport)return'blocked';
+    tile.transport=transport;
+    return'claimed';
+  }}
 
   const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
 
@@ -600,6 +718,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     const tile=tiles[id];
     if(!tile.sessionId||tile.stopped)return;
     tile.stopped=true;
+    if(tile.p2pConnection){{try{{tile.p2pConnection.close()}}catch(e){{}}tile.p2pConnection=null}}
     const url=`/api/customer/live/sessions/${{tile.sessionId}}/stop`;
     if(isUnload){{try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}
     else{{try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}}}
@@ -648,6 +767,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   function attachPlayer(id,playlistUrl){{
     const tile=tiles[id];
+    const claim=claimTransport(id,'relay');
+    if(claim==='blocked'){{stopPolling(id);return}}  // P2P already won this tile
     stopPolling(id);
     destroyHls(id);  // guards against ever running two instances at once
     setStatus(id,'Connecting…');
@@ -663,16 +784,37 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }}else{{
       setStatus(id,'This browser cannot play live video.');
     }}
+    if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,'relay',tile.startedAt?Date.now()-tile.startedAt:null,null);
+  }}
+
+  function attemptP2PForTile(id){{
+    const tile=tiles[id];
+    window.attemptLiveP2P(tile.sessionId).then(result=>{{
+      if(tile.stopped){{try{{result.pc.close()}}catch(e){{}}return}}
+      const claim=claimTransport(id,'p2p');
+      if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
+      stopPolling(id);
+      tile.video.srcObject=result.stream;
+      tile.p2pConnection=result.pc;
+      tile.placeholder.hidden=true;
+      tile.video.play().catch(()=>{{}});
+      if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
+    }}).catch(()=>{{
+      // Disabled/timed out/ICE failed -- the relay poll is already running
+      // in parallel and unaffected; this tile simply resolves via relay
+      // (or, if that also fails, via the existing showUnavailable() path).
+    }});
   }}
 
   async function startSession(id){{
     const tile=tiles[id];
-    tile.stopped=false;tile.recoveryAttempts=0;setStatus(id,'Starting live view…');
+    tile.stopped=false;tile.recoveryAttempts=0;tile.transport=null;tile.startedAt=Date.now();setStatus(id,'Starting live view…');
     let response;
     try{{response=await fetch(`/api/customer/cameras/${{id}}/live/start`,{{method:'POST'}})}}catch(e){{showUnavailable(id);return}}
     if(!response.ok){{showUnavailable(id);return}}
     const body=await response.json();
     tile.sessionId=body.session_id;
+    attemptP2PForTile(id);
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
@@ -952,7 +1094,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'</section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraId={json.dumps(camera_id)};
   const startUrl={json.dumps(start_url)};
@@ -972,15 +1114,28 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const stopButton=document.getElementById('live-view-stop');
   const retryButton=document.getElementById('live-view-retry');
   let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
+  let transport=null, p2pConnection=null, startedAt=null;
   const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
 
   function setStatus(text){{statusLabel.textContent=text}}
   function stopPolling(){{if(pollTimer){{clearTimeout(pollTimer);pollTimer=null}}}}
   function destroyHls(){{if(hls){{try{{hls.destroy()}}catch(e){{}}hls=null}}}}
 
+  // Same claim semantics as the multi-camera grid page (live_view_p2p.py's
+  // module docstring): 'claimed' the first time a transport wins (report
+  // once), 'already' on that transport's own later reconnect, 'blocked'
+  // for the transport that lost the race.
+  function claimTransport(t){{
+    if(transport===t)return'already';
+    if(transport)return'blocked';
+    transport=t;
+    return'claimed';
+  }}
+
   async function stopSession(isUnload){{
     if(!sessionId||stopped)return;
     stopped=true;
+    if(p2pConnection){{try{{p2pConnection.close()}}catch(e){{}}p2pConnection=null}}
     const url=`/api/customer/live/sessions/${{sessionId}}/stop`;
     if(isUnload){{
       try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}
@@ -1046,6 +1201,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   }}
 
   function attachPlayer(){{
+    const claim=claimTransport('relay');
+    if(claim==='blocked'){{stopPolling();return}}  // P2P already won
     stopPolling();
     destroyHls();  // guards against ever running two instances at once
     setStatus('Connecting…');
@@ -1061,15 +1218,34 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }}else{{
       setStatus('This browser cannot play live video.');
     }}
+    if(claim==='claimed')reportLiveTransportOutcome(sessionId,'relay',startedAt?Date.now()-startedAt:null,null);
+  }}
+
+  function attemptP2P(){{
+    window.attemptLiveP2P(sessionId).then(result=>{{
+      if(stopped){{try{{result.pc.close()}}catch(e){{}}return}}
+      const claim=claimTransport('p2p');
+      if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
+      stopPolling();
+      video.srcObject=result.stream;
+      p2pConnection=result.pc;
+      placeholder.hidden=true;
+      video.play().catch(()=>{{}});
+      if(claim==='claimed')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
+    }}).catch(()=>{{
+      // Disabled/timed out/ICE failed -- the relay poll already running in
+      // parallel is unaffected; resolves via relay or showUnavailable().
+    }});
   }}
 
   async function startSession(){{
-    stopped=false;recoveryAttempts=0;retryButton.hidden=true;setStatus('Starting live view…');
+    stopped=false;recoveryAttempts=0;transport=null;startedAt=Date.now();retryButton.hidden=true;setStatus('Starting live view…');
     let response;
     try{{response=await fetch(startUrl,{{method:'POST'}})}}catch(e){{showUnavailable();return}}
     if(!response.ok){{showUnavailable();return}}
     const body=await response.json();
     sessionId=body.session_id;
+    attemptP2P();
     pollPlaylist(Date.now()+pollTimeoutMs);
   }}
 

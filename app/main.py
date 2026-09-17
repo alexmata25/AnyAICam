@@ -47037,6 +47037,7 @@ from notification_settings_page import register_notification_settings_routes
 from live_playlist import register_live_playlist_routes
 from live_view_sessions import register_live_view_session_routes
 from live_view_page import register_live_view_page_routes
+from live_view_p2p import register_live_view_p2p_customer_routes, register_live_view_p2p_appliance_routes
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
 # 2026-09-16: edge-side counterpart to the cloud relay above -- ONVIF
@@ -47191,6 +47192,8 @@ register_provisioning_api_routes(app)
 register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
+register_live_view_p2p_customer_routes(app)
+register_live_view_p2p_appliance_routes(app)
 register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
 

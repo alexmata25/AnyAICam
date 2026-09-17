@@ -493,6 +493,40 @@ CREATE TABLE IF NOT EXISTS camera_cloud_upload_daily(
     PRIMARY KEY(camera_number,upload_date)
 );
 '''),
+    # P2P live-view foundation (2026-09-16): direct browser<->appliance
+    # WebRTC as the PREFERRED transport, with the already-proven S3/
+    # CloudFront relay (live_relay_uploader.py/live_playlist.py, unchanged
+    # by this migration) kept as the automatic fallback -- never replaced,
+    # per explicit product direction. p2p_attempted/transport/ready_at/
+    # failed_at/error/relay_bytes are the instrumentation a later cost/
+    # NAT-failure-rate decision (e.g. whether to add self-hosted TURN)
+    # needs; transport/ready_at/failed_at/error already existed on this
+    # table (unused placeholders from the original relay design) and are
+    # now actually written to, not newly added.
+    #
+    # live_view_p2p_signaling is a small, append-only offer/answer/ICE
+    # relay table -- both sides (customer browser, appliance) reach it
+    # only through their OWN already-authenticated channel (partner_
+    # identity cookie for the browser, authenticate_appliance() bearer+
+    # nonce for the appliance), so this table never becomes a new
+    # authentication boundary of its own. `kind` distinguishes the four
+    # message types sharing one poll/insert shape; `consumed_at` makes
+    # each poll idempotent (a message is delivered to its one intended
+    # reader exactly once) without needing a queue service.
+    ('20260917_live_view_p2p','''
+ALTER TABLE live_view_sessions ADD COLUMN p2p_attempted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE live_view_sessions ADD COLUMN relay_bytes INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS live_view_p2p_signaling(
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    consumed_at TEXT,
+    FOREIGN KEY(session_id) REFERENCES live_view_sessions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_live_view_p2p_signaling_poll ON live_view_p2p_signaling(session_id,kind,consumed_at);
+'''),
 ]
 
 
