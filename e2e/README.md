@@ -95,6 +95,7 @@ python -m pytest tests/test_playback.py -v
 | LPR | `test_lpr.py` | Scaffolded, needs a real entitled camera identified |
 | PPE | `test_ppe.py` | Scaffolded, needs a real entitled camera identified |
 | Camera status | `test_camera_status.py` | Scaffolded, needs test-tenant login |
+| Face Access (door/relay control) | `test_face_access.py` | ✅ Passing against real staging (10/10) -- owner config persistence, unlock-button visibility, viewer can_unlock grant/revoke, denied/authorized unlock, audit trail, fail-closed (non-door camera, no relay channel, cooldown). Uses its own disposable tenant -- see `scripts/provision_face_access_test_harness.py` and `ANYAICAM_E2E_FACE_ACCESS_OWNER_PASSWORD`/`..._VIEWER_PASSWORD` in `.env.example` |
 
 ## What's still needed before the first autonomous end-to-end loop
 
