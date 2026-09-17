@@ -38979,6 +38979,7 @@ import live_relay_idle_sweep
 import live_relay_uploader
 import webrtc_publisher
 import local_storage_manager
+import notification_retry_worker
 import recording_uploader
 import recording_retention_sweep
 import analytics_sync
@@ -39407,6 +39408,17 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"} and event_media_uploader.EVENT_MEDIA_UPLOAD_ENABLED
         else None
     )
+    # notification_retry_worker() already internally gates on RUNTIME_ROLE
+    # (cloud/combined only, sleep-forever otherwise -- an edge appliance
+    # has no notifications/notification_deliveries rows of its own), so
+    # this call site's own role check is a plain optimization (never
+    # spawn the task at all on edge), not a second, independently-
+    # maintained copy of that gate.
+    notification_retry_task = (
+        asyncio.create_task(notification_retry_worker.notification_retry_worker())
+        if RUNTIME_ROLE in {"cloud", "combined"}
+        else None
+    )
     # Cloud->edge camera-configuration sync: unconditional for every edge/
     # combined appliance, unlike the AWS/Motion-Cloud-adjacent workers
     # above -- this is core local-VMS plumbing (making a successfully
@@ -39595,6 +39607,8 @@ async def lifespan(app: FastAPI):
             recording_retention_sweep_task.cancel()
         if event_media_retry_task:
             event_media_retry_task.cancel()
+        if notification_retry_task:
+            notification_retry_task.cancel()
         if camera_config_sync_task:
             camera_config_sync_task.cancel()
         if talk_down_discovery_task:
@@ -39705,6 +39719,8 @@ async def lifespan(app: FastAPI):
             pending.append(recording_retention_sweep_task)
         if event_media_retry_task:
             pending.append(event_media_retry_task)
+        if notification_retry_task:
+            pending.append(notification_retry_task)
         if camera_config_sync_task:
             pending.append(camera_config_sync_task)
         if talk_down_discovery_task:
