@@ -1,4 +1,5 @@
 import json
+import logging
 import smtplib
 import ssl
 from abc import ABC,abstractmethod
@@ -7,6 +8,8 @@ from email.message import EmailMessage
 from pathlib import Path
 
 from cloud_config import settings
+
+logger=logging.getLogger("anyaicam.email_service")
 
 EMAIL_TYPES={
     'invitation','password_reset','onboarding','appliance_alert','quote_delivery','notification_test',
@@ -39,10 +42,26 @@ class SMTPEmail(EmailBackend):
         message=EmailMessage(); message['From']=settings.email_from; message['To']=to; message['Subject']=subject; message.set_content(text)
         if html: message.add_alternative(html,subtype='html')
         context=ssl.create_default_context()
-        with smtplib.SMTP(settings.smtp_host,settings.smtp_port,timeout=20) as client:
-            client.starttls(context=context)
-            if settings.smtp_username: client.login(settings.smtp_username,settings.smtp_password)
-            client.send_message(message)
+        try:
+            with smtplib.SMTP(settings.smtp_host,settings.smtp_port,timeout=20) as client:
+                client.starttls(context=context)
+                if settings.smtp_username: client.login(settings.smtp_username,settings.smtp_password)
+                client.send_message(message)
+        except (smtplib.SMTPException,OSError) as error:
+            # A real, previously-uncaught failure mode (found 2026-09-17
+            # against real staging with a real bad Gmail app-password):
+            # every caller of send() -- both password-reset routes,
+            # quote delivery, invitations, appliance alerts -- assumed
+            # this either succeeds or the caller's own code handles a
+            # raised exception. None of them did, so a real SMTP auth/
+            # connection failure crashed the whole request with an
+            # unhandled 500 instead of the degraded-but-recorded outcome
+            # this project's own notification_retry_worker already
+            # expects and retries on (status='failed' is not a new
+            # concept here -- every caller already just stores/returns
+            # whatever status this method reports).
+            logger.warning("email_service.send_failed type=%s to=%s error=%s",message_type,to,error)
+            return {'type':message_type,'to':to,'status':'failed','error':str(error),'created_at':datetime.now().isoformat()}
         return {'type':message_type,'to':to,'status':'sent','created_at':datetime.now().isoformat()}
 
 
