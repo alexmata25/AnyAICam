@@ -160,7 +160,16 @@ def test_review_shows_every_purchased_analytic_and_no_others(http_client, db_pat
     _seed_tenant(conn)
     _seed_analytics(conn, keys=["smart_motion", "people_counting", "lpr"])
     response = _setup_page(http_client)
-    body = response.text
+    # 2026-09-16: scoped past the sidebar <nav>, not the whole page body.
+    # AAC added a "Facial Recognition" nav link gated by role/permission
+    # (partner_db.ROLE_PERMISSIONS's facial.view), the same way every
+    # other nav item on this legacy nav system works -- it is not, and
+    # was never, gated by per-customer analytics purchase the way this
+    # review step's own purchased-analytics summary is. A customer_owner
+    # always sees that nav link regardless of what they purchased, so a
+    # whole-body substring check coincidentally collided with it purely
+    # because its label text matches the analytic's own display name.
+    body = response.text.split("</nav>", 1)[-1]
     assert "Smart Motion" in body
     assert "People Counting" in body
     assert "License Plate Recognition" in body

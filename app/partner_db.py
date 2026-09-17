@@ -16,11 +16,21 @@ DEMO_SOURCE = 'demo'
 
 ROLE_PERMISSIONS = {
     'administrator': {'*'},
-    'partner_owner': {'partner.view','customer.create','customer.view','customer.edit','quote.create','user.invite','appliance.assign','appliance.action','pricing.view','pricing.edit','audit.view'},
+    # AAC (facial recognition / access-control analytics): 'facial.view'
+    # (read people/watchlists/events/settings) and 'facial.manage'
+    # (enroll/edit/delete people, manage watchlists, change settings) --
+    # see facial_recognition_ui.py's own module docstring for why these
+    # two permissions, not a third auth system, gate every AAC route.
+    # partner_owner gets read visibility only (oversight across their
+    # customers); technician and customer_owner get full manage rights
+    # (the on-site roles that actually enroll people); customer_viewer
+    # and salesperson get no AAC access at all -- salesperson's existing
+    # permission set is quote/pricing-only and stays that way.
+    'partner_owner': {'partner.view','customer.create','customer.view','customer.edit','quote.create','user.invite','appliance.assign','appliance.action','pricing.view','pricing.edit','audit.view','facial.view'},
     'salesperson': {'partner.view','customer.create','customer.view','customer.edit','quote.create','pricing.view'},
-    'technician': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action'},
-    'customer_owner': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure'},
-    'customer_viewer': {'customer.self.view'},
+    'technician': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action','facial.manage','facial.view'},
+    'customer_owner': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure','facial.manage','facial.view'},
+    'customer_viewer': {'customer.self.view','facial.view'},
 }
 
 

@@ -597,6 +597,138 @@ CREATE INDEX IF NOT EXISTS idx_local_storage_cleanup_log_deleted_at ON local_sto
     ('20260917_local_storage_retention_days','''
 ALTER TABLE local_storage_policy ADD COLUMN local_retention_days INTEGER;
 '''),
+    # AAC (AnyAiCam facial recognition / access-control analytics),
+    # Phase 1 -- see facial_recognition.py (CV/matching, no DB),
+    # facial_people.py (enrollment/watchlist DB service),
+    # facial_events.py (match-event creation + query, relay-rule
+    # evaluation) and facial_recognition_ui.py (routes) for the code
+    # that reads/writes these tables. Deliberately reuses the existing
+    # detection_events/detection_event_media event system (event_type=
+    # 'facial_recognition') rather than a parallel one -- facial_events
+    # is an auxiliary detail table keyed 1:1 by detection_event_id,
+    # exactly like detection_event_media already is.
+    #
+    # matched_person_id has no ON DELETE CASCADE: deleting an enrolled
+    # person (facial_people.delete_person(), which DOES hard-delete
+    # every facial_embeddings row -- the actual biometric templates --
+    # for that person) must never delete history of a past match.
+    # matched_person_name/matched_watchlist_name are denormalized
+    # snapshots taken at match time for exactly this reason: event
+    # history stays readable even after the live person/watchlist
+    # record is gone.
+    ('20260908_facial_recognition','''
+CREATE TABLE IF NOT EXISTS facial_people(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    site_id TEXT,
+    external_reference TEXT,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(site_id) REFERENCES sites(id)
+);
+CREATE INDEX IF NOT EXISTS idx_facial_people_customer ON facial_people(customer_id,status);
+CREATE TABLE IF NOT EXISTS facial_embeddings(
+    id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    engine_version TEXT NOT NULL,
+    embedding_json TEXT NOT NULL,
+    source_image_path TEXT,
+    quality REAL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(person_id) REFERENCES facial_people(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_facial_embeddings_person ON facial_embeddings(person_id);
+CREATE INDEX IF NOT EXISTS idx_facial_embeddings_customer_engine ON facial_embeddings(customer_id,engine);
+CREATE TABLE IF NOT EXISTS facial_watchlists(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    site_id TEXT,
+    name TEXT NOT NULL,
+    classification TEXT NOT NULL DEFAULT 'alert',
+    description TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_facial_watchlists_customer_name ON facial_watchlists(customer_id,name);
+CREATE TABLE IF NOT EXISTS facial_watchlist_members(
+    watchlist_id TEXT NOT NULL,
+    person_id TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    added_by TEXT,
+    PRIMARY KEY(watchlist_id,person_id),
+    FOREIGN KEY(watchlist_id) REFERENCES facial_watchlists(id) ON DELETE CASCADE,
+    FOREIGN KEY(person_id) REFERENCES facial_people(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_facial_watchlist_members_person ON facial_watchlist_members(person_id);
+CREATE TABLE IF NOT EXISTS facial_events(
+    id TEXT PRIMARY KEY,
+    detection_event_id TEXT NOT NULL UNIQUE,
+    customer_id TEXT NOT NULL,
+    site_id TEXT,
+    camera_id TEXT NOT NULL,
+    match_state TEXT NOT NULL,
+    matched_person_id TEXT,
+    matched_person_name TEXT,
+    matched_watchlist_id TEXT,
+    matched_watchlist_name TEXT,
+    confidence REAL NOT NULL,
+    engine TEXT NOT NULL,
+    engine_version TEXT,
+    face_bbox_json TEXT,
+    face_thumbnail_path TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(detection_event_id) REFERENCES detection_events(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id)
+);
+CREATE INDEX IF NOT EXISTS idx_facial_events_customer_created ON facial_events(customer_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_facial_events_matched_person ON facial_events(matched_person_id);
+CREATE INDEX IF NOT EXISTS idx_facial_events_camera_created ON facial_events(camera_id,created_at);
+CREATE TABLE IF NOT EXISTS facial_rules(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    site_id TEXT,
+    camera_id TEXT,
+    name TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    watchlist_id TEXT,
+    person_id TEXT,
+    min_confidence REAL NOT NULL DEFAULT 0.85,
+    relay_channel INTEGER NOT NULL,
+    pulse_ms INTEGER NOT NULL DEFAULT 3000,
+    cooldown_seconds INTEGER NOT NULL DEFAULT 10,
+    dry_run INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id),
+    FOREIGN KEY(watchlist_id) REFERENCES facial_watchlists(id),
+    FOREIGN KEY(person_id) REFERENCES facial_people(id)
+);
+CREATE INDEX IF NOT EXISTS idx_facial_rules_customer ON facial_rules(customer_id,enabled);
+CREATE TABLE IF NOT EXISTS facial_settings(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL UNIQUE,
+    min_confidence REAL NOT NULL DEFAULT 0.6,
+    unknown_person_events_enabled INTEGER NOT NULL DEFAULT 1,
+    debounce_seconds INTEGER NOT NULL DEFAULT 30,
+    engine TEXT NOT NULL DEFAULT 'haar_intensity',
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+'''),
 ]
 
 
@@ -647,6 +779,25 @@ def apply_migrations():
         if 'talk_down_supported' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_supported INTEGER')
         if 'talk_down_metadata' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_metadata TEXT')
         if 'talk_down_verified_at' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN talk_down_verified_at TEXT')
+
+        # 2026-09-16: AAC Facial Recognition / Face Access are one connected
+        # feature -- identity match, the authorization decision (facial_rules
+        # + relay_control.rule_applies()), and the access-control command
+        # (relay_control.build_request()/RelayProvider.trigger()) were all
+        # already correctly separated and unit-tested, but the outcome of
+        # that authorization decision was never persisted anywhere -- only
+        # returned in-memory from evaluate_access_rules() and dropped by
+        # save_yolo_events()'s hook. NULL means no access-control evaluation
+        # ran for this match at all (the common case today, since
+        # ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED defaults to false); '[]'
+        # means it ran and no facial_rules row applied; a non-empty JSON
+        # array is one entry per rule that applied, each carrying rule_id,
+        # channel, activated, dry_run, and suppressed_reason -- see
+        # relay_control.RelayResult and facial_events.evaluate_access_rules().
+        facial_events_columns=({item['name'] for item in db.execute('PRAGMA table_info(facial_events)').fetchall()}
+                               if backend()=='sqlite' else
+                               {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='facial_events'").fetchall()})
+        if 'access_outcomes_json' not in facial_events_columns: db.execute('ALTER TABLE facial_events ADD COLUMN access_outcomes_json TEXT')
         # cloud_recording_mode has NO hidden default by design: NULL means
         # "not explicitly set for this camera" and every consumer (the
         # GET /api/appliance/configuration route, and the appliance's own

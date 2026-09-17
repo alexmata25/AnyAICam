@@ -94,6 +94,11 @@ EVENT_MEDIA_UPLOAD_ENABLED=os.getenv('ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED','fals
 RECORDING_UPLOAD_PILOT_CAMERAS: frozenset[str] = frozenset(
     item.strip() for item in os.getenv('ANYAICAM_RECORDING_UPLOAD_PILOT_CAMERAS','').split(',') if item.strip()
 )
+# AAC (facial recognition), Phase 2: gates GET /api/appliance/facial-directory
+# below -- the cloud side of facial_embedding_sync.py's edge-pull worker.
+# Independently toggleable from ANALYTICS_SYNC_ENABLED (that flag is for the
+# edge->cloud event direction; this one is cloud->edge enrollment data).
+FACIAL_EMBEDDING_SYNC_ENABLED=os.getenv('ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED','false').strip().lower()=='true'
 
 
 def _bearer(request: Request) -> str:
@@ -721,6 +726,37 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     elif existing['parent_detection_event_id']!=parent_detection_event_id:
                         raise HTTPException(status_code=409,detail='This event is already correlated with a different Motion event.')
                 return {'status':'duplicate','event_id':existing['id']}
+            # AAC (facial recognition), Phase 2: closes the second of the
+            # three split-topology gaps from the Phase 1 Codex review --
+            # this generic route already stored the detection_events row
+            # above for ANY event_type (including facial_recognition,
+            # forwarded here via analytics_sync.py's own facial_recognition
+            # special case in _build_payload()); only the AAC-specific
+            # facial_events detail row (matched person/watchlist,
+            # confidence, engine) had nowhere to land on the cloud side.
+            # Only ever reached on the fresh-insert path above (the
+            # duplicate-replay branch returns early), so a retried
+            # analytics-event POST can never create a second facial_events
+            # row for the same detection_events id -- matching
+            # facial_events.facial_events.detection_event_id's own UNIQUE
+            # constraint, which would otherwise reject a second insert
+            # anyway. No thumbnail is stored here -- see the Phase 2
+            # report's own note on face-crop thumbnail cloud sync being a
+            # separate, not-yet-implemented piece.
+            if event_type=='facial_recognition' and isinstance(detections,list) and detections and isinstance(detections[0],dict):
+                facial_fields=detections[0]
+                db.execute(
+                    'INSERT INTO facial_events(id,detection_event_id,customer_id,site_id,camera_id,match_state,matched_person_id,matched_person_name,matched_watchlist_id,matched_watchlist_name,confidence,engine,engine_version,created_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (
+                        secrets.token_hex(12),event_id,camera['customer_id'],camera['site_id'],camera_id,
+                        facial_fields.get('match_state') or 'unknown',
+                        facial_fields.get('matched_person_id'),facial_fields.get('matched_person_name'),
+                        facial_fields.get('matched_watchlist_id'),facial_fields.get('matched_watchlist_name'),
+                        float(confidence) if confidence is not None else 0.0,
+                        facial_fields.get('engine') or 'unknown',facial_fields.get('engine_version'),now,
+                    ),
+                )
         # 2026-09-04, Smart Alerts fix: this is the currently-active
         # event-ingestion path (the older POST /api/appliance/events ->
         # appliance_events route also calls fanout_appliance_event(),
@@ -753,6 +789,96 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         except Exception:
             logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
         return {'status':'accepted','event_id':event_id}
+
+    @app.get('/api/appliance/facial-directory')
+    def facial_directory(request: Request) -> dict:
+        # AAC (facial recognition), Phase 2: the cloud side of
+        # facial_embedding_sync.py's edge-pull worker -- closes the
+        # largest of the three split-topology gaps from the Phase 1
+        # Codex review (enrolled embeddings only existed in whichever
+        # single database matching ran against). Scoped to the
+        # authenticated appliance's OWN customer_id only, the same
+        # tenant-isolation guarantee every other appliance-scoped route
+        # here already has -- an appliance can never request or receive
+        # another customer's enrollment data, regardless of what it
+        # asks for (this route takes no customer_id parameter at all).
+        appliance=authenticate_appliance(request)
+        if not FACIAL_EMBEDDING_SYNC_ENABLED: raise HTTPException(status_code=404,detail='Facial embedding sync is not enabled.')
+        customer_id=appliance['customer_id']
+        with connection() as db:
+            people=[dict(item) for item in db.execute(
+                'SELECT id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by FROM facial_people WHERE customer_id=? AND status=?',
+                (customer_id,'active'),
+            ).fetchall()]
+            embeddings=[dict(item) for item in db.execute(
+                'SELECT fe.id,fe.person_id,fe.engine,fe.engine_version,fe.embedding_json,fe.quality,fe.created_at '
+                'FROM facial_embeddings fe JOIN facial_people fp ON fp.id=fe.person_id '
+                'WHERE fe.customer_id=? AND fp.status=?',
+                (customer_id,'active'),
+            ).fetchall()]
+            watchlists=[dict(item) for item in db.execute(
+                'SELECT id,site_id,name,classification,description,created_at,updated_at,created_by FROM facial_watchlists WHERE customer_id=?',
+                (customer_id,),
+            ).fetchall()]
+            watchlist_members=[dict(item) for item in db.execute(
+                'SELECT fwm.watchlist_id,fwm.person_id,fwm.added_at,fwm.added_by FROM facial_watchlist_members fwm '
+                'JOIN facial_watchlists fw ON fw.id=fwm.watchlist_id WHERE fw.customer_id=?',
+                (customer_id,),
+            ).fetchall()]
+        return {
+            'customer_id': customer_id,
+            'people': people,
+            'embeddings': embeddings,
+            'watchlists': watchlists,
+            'watchlist_members': watchlist_members,
+        }
+
+    @app.post('/api/appliance/facial-events/{detection_event_id}/thumbnail')
+    def facial_event_thumbnail_available(request: Request,detection_event_id: str,payload: dict) -> dict:
+        # AAC (facial recognition), Phase 2: the third and last of the
+        # split-topology gaps from the Phase 1 Codex review -- face-crop
+        # thumbnails were local-appliance-disk-only, so a separate cloud
+        # customer-portal process could never display one. Reuses the
+        # existing object_storage.py abstraction (the SAME 'thumbnails'
+        # category/backend other event media already goes through, S3
+        # or local per settings.storage_backend) rather than inventing a
+        # second storage path.
+        #
+        # The facial_events row (looked up by detection_event_id, which
+        # is globally unique -- facial_events.detection_event_id has its
+        # own UNIQUE constraint) must already exist AND belong to a
+        # camera assigned to THIS authenticated appliance -- both
+        # checked below -- before any bytes are accepted or stored,
+        # closing the same tenant-isolation gap every other appliance-
+        # scoped route here already closes.
+        #
+        # Edge-side automatic upload (reading the local face-crop file
+        # save_yolo_events()'s AAC hook already writes and POSTing it
+        # here through analytics_sync.py) is not yet wired -- this route
+        # is the tested, ready cloud half; see the Phase 2 report's own
+        # note on this being the one still-manual step.
+        appliance=authenticate_appliance(request)
+        if not FACIAL_EMBEDDING_SYNC_ENABLED: raise HTTPException(status_code=404,detail='Facial embedding sync is not enabled.')
+        image_base64=str(payload.get('image_base64') or '').strip()
+        if not image_base64: raise HTTPException(status_code=400,detail='image_base64 is required.')
+        try:
+            import base64
+            image_bytes=base64.b64decode(image_base64,validate=True)
+        except Exception as error:
+            raise HTTPException(status_code=400,detail='image_base64 is not valid base64.') from error
+        with connection() as db:
+            event=db.execute(
+                'SELECT fe.id,fe.customer_id,fe.camera_id FROM facial_events fe WHERE fe.detection_event_id=?',
+                (detection_event_id,),
+            ).fetchone()
+            if not event: raise HTTPException(status_code=404,detail='Facial event not found.')
+            camera=db.execute('SELECT id FROM cameras WHERE id=? AND appliance_id=?',(event['camera_id'],appliance['id'])).fetchone()
+            if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
+            from object_storage import get_storage
+            storage_key=f"facial/{event['customer_id']}/{detection_event_id}.jpg"
+            stored=get_storage().put('thumbnails',storage_key,image_bytes,content_type='image/jpeg')
+            db.execute('UPDATE facial_events SET face_thumbnail_path=? WHERE detection_event_id=?',(stored['key'],detection_event_id))
+        return {'status':'accepted','thumbnail_key':stored['key']}
 
     @app.post('/api/appliance/analytics/{camera_id}/events/{local_event_id}/media')
     def analytics_event_media_available(request: Request,camera_id: str,local_event_id: str,payload: dict) -> dict:
