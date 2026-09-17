@@ -131,7 +131,16 @@ def initialize_database() -> None:
         for statement in statements: db.execute(statement)
         appliance_columns={item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()} if backend()=='sqlite' else {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()}
         if 'activation_status' not in appliance_columns: db.execute("ALTER TABLE appliances ADD COLUMN activation_status TEXT NOT NULL DEFAULT 'pending'")
-        for column,definition in [('partner_id','TEXT'),('uptime_seconds','INTEGER NOT NULL DEFAULT 0'),('disk_capacity','REAL NOT NULL DEFAULT 0'),('recording_used','REAL NOT NULL DEFAULT 0'),('last_error','TEXT'),('state',"TEXT NOT NULL DEFAULT 'offline'"),('credential_revoked_at','TEXT')]:
+        for column,definition in [('partner_id','TEXT'),('uptime_seconds','INTEGER NOT NULL DEFAULT 0'),('disk_capacity','REAL NOT NULL DEFAULT 0'),('recording_used','REAL NOT NULL DEFAULT 0'),('last_error','TEXT'),('state',"TEXT NOT NULL DEFAULT 'offline'"),('credential_revoked_at','TEXT'),
+                                  # Local recording storage management (2026-09-17): RDM-visible surface
+                                  # for the edge worker's own live state -- populated via the existing
+                                  # heartbeat channel, never computed independently on the cloud side,
+                                  # so "Cleanup Active" (a transient, edge-process-only fact) is always
+                                  # the appliance's own real-time truth, not a cloud-side guess from
+                                  # disk_capacity/disk_used alone. storage_state is one of 'healthy',
+                                  # 'warning', 'cleanup_active', 'critical', or NULL (appliance has never
+                                  # reported -- e.g. this feature not yet enabled on that appliance).
+                                  ('storage_state','TEXT'),('storage_free_percent','REAL'),('storage_last_cleanup_at','TEXT')]:
             if column not in appliance_columns: db.execute(f'ALTER TABLE appliances ADD COLUMN {column} {definition}')
         # authorization_version: bumped on any grant/role/enabled change
         # for this user -- the deterministic (never clock-based) staleness

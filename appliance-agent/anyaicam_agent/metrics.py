@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import socket
@@ -34,5 +35,29 @@ def disk_summary(config):
     return {'disk_capacity':round(disk.total/1073741824,2),'disk_used':round(disk.used/1073741824,2),'recording_used':round(recording.used/1073741824,2)}
 
 
+def local_storage_state(config):
+    """Local recording storage management (2026-09-17): reads the small
+    cross-process state file the VMS app's own local_storage_manager.py
+    worker writes (see that module's docstring) -- returns {} (no keys
+    added to the heartbeat payload at all) whenever that file is
+    missing, unreadable, or malformed, which is the normal, expected
+    state for any appliance that hasn't enabled
+    ANYAICAM_LOCAL_STORAGE_MANAGEMENT_ENABLED yet. Never raises."""
+    try:
+        data=json.loads(config.local_storage_state_file.read_text(encoding='utf-8'))
+    except (OSError,json.JSONDecodeError):
+        return {}
+    if not isinstance(data,dict):
+        return {}
+    result={}
+    if data.get('storage_state') in ('healthy','warning','cleanup_active','critical'):
+        result['storage_state']=data['storage_state']
+    if isinstance(data.get('free_percent'),(int,float)):
+        result['storage_free_percent']=data['free_percent']
+    if isinstance(data.get('last_cleanup_at'),str):
+        result['storage_last_cleanup_at']=data['last_cleanup_at']
+    return result
+
+
 def collect(config,cameras):
-    return {'software_version':config.software_version,'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}
+    return {'software_version':config.software_version,'uptime_seconds':int(float(Path('/proc/uptime').read_text().split()[0])) if Path('/proc/uptime').exists() else 0,'cpu':_cpu_percent(),'memory':_memory_percent(),**disk_summary(config),**local_storage_state(config),'ip_address':local_ip(),'camera_capacity':config.camera_capacity,'camera_count':len(cameras),'cameras':cameras,'last_error':None}

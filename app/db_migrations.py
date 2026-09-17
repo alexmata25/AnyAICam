@@ -537,6 +537,52 @@ CREATE INDEX IF NOT EXISTS idx_live_view_p2p_signaling_poll ON live_view_p2p_sig
     ('20260917_live_view_session_stopped_at','''
 ALTER TABLE live_view_sessions ADD COLUMN stopped_at TEXT;
 '''),
+    # Local recording storage management (2026-09-17): RDM-configurable
+    # thresholds, one row per customer (NULL meaning "no override, use
+    # the system default"), mirroring customer_cloud_policy's exact
+    # established shape/upsert-in-place convention -- never a second,
+    # silently-conflicting copy of the system defaults
+    # (local_storage_policy.DEFAULT_RESERVED_FREE_PERCENT/
+    # DEFAULT_WARNING_FREE_PERCENT).
+    #
+    # local_storage_cleanup_log is the durable, queryable audit trail
+    # "record every automatic cleanup action" requires -- one row per
+    # deleted local recording file, on the EDGE appliance's own local
+    # DB (this feature runs entirely on edge/combined role; the row
+    # never needs to leave the appliance for the cleanup action itself
+    # to be auditable there). Present, harmlessly always empty, on the
+    # cloud role too, since this schema-init code runs identically on
+    # both roles -- same pattern customer_cloud_policy/camera_cloud_
+    # upload_daily already established.
+    #
+    # storage_state/storage_free_percent/storage_last_cleanup_at on
+    # appliances/appliance_health_history are the RDM-visible surface
+    # ("Healthy"/"Warning"/"Cleanup Active"/"Critical") -- populated via
+    # the existing heartbeat channel (POST /api/appliance/heartbeat,
+    # same one disk_capacity/disk_used already flow through), not a new
+    # sync mechanism.
+    ('20260917_local_storage_management','''
+CREATE TABLE IF NOT EXISTS local_storage_policy(
+    customer_id TEXT PRIMARY KEY,
+    reserved_free_percent INTEGER,
+    warning_free_percent INTEGER,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE TABLE IF NOT EXISTS local_storage_cleanup_log(
+    id TEXT PRIMARY KEY,
+    camera_number INTEGER NOT NULL,
+    camera_id TEXT,
+    file_name TEXT NOT NULL,
+    recording_started_at TEXT,
+    size_bytes INTEGER,
+    deleted_at TEXT NOT NULL,
+    trigger_free_percent REAL,
+    reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_local_storage_cleanup_log_deleted_at ON local_storage_cleanup_log(deleted_at);
+'''),
 ]
 
 

@@ -255,7 +255,22 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         previous_uptime=int(appliance.get('uptime_seconds') or 0); restarted=new_uptime<previous_uptime-30
         with connection() as db:
             if restarted: db.execute('UPDATE appliances SET restart_count=COALESCE(restart_count,0)+1 WHERE id=?',(appliance['id'],))
-            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=? WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),appliance['id']))
+            # storage_state/storage_free_percent/storage_last_cleanup_at
+            # (2026-09-17, local recording storage management): reported
+            # only when the appliance's own local_storage_manager.py
+            # worker is actually enabled and has written its cross-
+            # process state file (see that module's docstring) --
+            # metrics.py includes these keys only when present, so an
+            # appliance that hasn't enabled this feature simply never
+            # sends them and these columns stay NULL, distinct from a
+            # real 'healthy' report.
+            storage_state=safe.get('storage_state')
+            storage_state=str(storage_state)[:20] if storage_state in ('healthy','warning','cleanup_active','critical') else None
+            storage_free_percent=safe.get('storage_free_percent')
+            storage_free_percent=float(storage_free_percent) if isinstance(storage_free_percent,(int,float)) else None
+            storage_last_cleanup_at=safe.get('storage_last_cleanup_at')
+            storage_last_cleanup_at=str(storage_last_cleanup_at)[:40] if isinstance(storage_last_cleanup_at,str) else None
+            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at) WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,appliance['id']))
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
         return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}
 
@@ -349,9 +364,17 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # config refresh reads on the edge -- no second, parallel
         # config-delivery mechanism.
         from event_media_policy import cloud_policy_for_customer
+        # storage_policy (2026-09-17): same sync channel and the same
+        # "RDM override, else system default, resolved once per poll"
+        # shape as cloud_policy immediately above -- local_storage_
+        # manager.py's own periodic config refresh reads this exact
+        # field, mirroring recording_uploader.py's established pattern
+        # for cloud_policy.
+        from local_storage_policy import local_storage_policy_for_customer
         with connection() as db:
             cloud_policy=cloud_policy_for_customer(db,appliance['customer_id'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy}
+            storage_policy=local_storage_policy_for_customer(db,appliance['customer_id'])
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -1480,6 +1503,48 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         audit(identity,'customer.cloud_policy_changed','customer',customer_id,{'daily_cloud_seconds':daily_cloud_seconds,'retention_days':retention_days})
         return {'customer_id':customer_id,'daily_cloud_seconds':daily_cloud_seconds,'retention_days':retention_days}
 
+    @app.post('/api/admin/customers/{customer_id}/storage-policy')
+    def set_storage_policy(request: Request,customer_id: str,payload: dict) -> dict:
+        # RDM's direct control over a customer's local recording storage
+        # thresholds -- same "RDM override, cloud DB authoritative,
+        # generic per customer_id, partial update never a destructive
+        # full overwrite" shape as set_cloud_policy() immediately above.
+        # reserved_free_percent is the automatic-cleanup floor (default
+        # local_storage_policy.DEFAULT_RESERVED_FREE_PERCENT, 10);
+        # warning_free_percent is the earlier, non-destructive line
+        # (default DEFAULT_WARNING_FREE_PERCENT, 20). Reuses the same
+        # GET /api/appliance/configuration sync channel (storage_policy
+        # field, appliance_configuration() above) local_storage_manager.py
+        # already polls -- no second, parallel config-delivery mechanism.
+        identity=require_partner_access(request,{'administrator'})
+        with connection() as db:
+            customer=db.execute('SELECT id FROM customers WHERE id=?',(customer_id,)).fetchone()
+            if not customer:
+                raise HTTPException(status_code=404,detail='Customer not found.')
+            existing=db.execute('SELECT reserved_free_percent,warning_free_percent FROM local_storage_policy WHERE customer_id=?',(customer_id,)).fetchone()
+            reserved_free_percent=existing['reserved_free_percent'] if existing else None
+            warning_free_percent=existing['warning_free_percent'] if existing else None
+            if 'reserved_free_percent' in payload:
+                value=payload.get('reserved_free_percent')
+                if value is not None and (not isinstance(value,int) or isinstance(value,bool) or value<1 or value>90):
+                    raise HTTPException(status_code=400,detail='reserved_free_percent must be an integer from 1 to 90, or null to clear back to the system default.')
+                reserved_free_percent=value
+            if 'warning_free_percent' in payload:
+                value=payload.get('warning_free_percent')
+                if value is not None and (not isinstance(value,int) or isinstance(value,bool) or value<1 or value>95):
+                    raise HTTPException(status_code=400,detail='warning_free_percent must be an integer from 1 to 95, or null to clear back to the system default.')
+                warning_free_percent=value
+            if reserved_free_percent is not None and warning_free_percent is not None and reserved_free_percent>=warning_free_percent:
+                raise HTTPException(status_code=400,detail='reserved_free_percent must be lower than warning_free_percent (cleanup only ever triggers below the warning line).')
+            now=datetime.now().isoformat()
+            db.execute(
+                'INSERT INTO local_storage_policy(customer_id,reserved_free_percent,warning_free_percent,updated_at,updated_by) VALUES(?,?,?,?,?) '
+                'ON CONFLICT(customer_id) DO UPDATE SET reserved_free_percent=excluded.reserved_free_percent,warning_free_percent=excluded.warning_free_percent,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
+                (customer_id,reserved_free_percent,warning_free_percent,now,identity['email']),
+            )
+        audit(identity,'customer.storage_policy_changed','customer',customer_id,{'reserved_free_percent':reserved_free_percent,'warning_free_percent':warning_free_percent})
+        return {'customer_id':customer_id,'reserved_free_percent':reserved_free_percent,'warning_free_percent':warning_free_percent}
+
     @app.post('/api/partner/appliances/{appliance_id}/commands')
     def queue_command(request: Request,appliance_id: str,payload: dict) -> dict:
         # A direct Partner Portal session is tried first and is
@@ -1585,9 +1650,22 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if float(item.get('cpu') or 0)>=90: warnings.append('High CPU')
             if any(not c['online'] for c in camera_status): warnings.append('Camera offline')
             if any(c['online'] and not c['recording'] for c in camera_status): warnings.append('Recording stopped')
+            # storage_state (2026-09-17, local recording storage management):
+            # 'healthy'/None (never reported, e.g. feature not enabled on
+            # this appliance) adds no warning -- 'warning'/'cleanup_active'/
+            # 'critical' surface exactly the label the requirement asks for
+            # ("Healthy / Warning / Cleanup Active / Critical"), sourced
+            # from the appliance's own real-time report, not re-derived
+            # from disk_capacity/disk_used here (see heartbeat()'s own
+            # comment on why 'cleanup_active' can't be inferred cloud-side).
+            storage_state=item.get('storage_state')
+            storage_labels={'warning':'Storage warning','cleanup_active':'Storage cleanup active','critical':'Storage critical'}
+            if storage_state in storage_labels: warnings.append(storage_labels[storage_state])
             pending_count=item.get('upload_pending_count'); quarantined_count=item.get('upload_quarantined_count')
             backlog_text=f'{pending_count} pending · {quarantined_count} quarantined' if pending_count is not None else 'Not yet reported'
-            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('install_update','Install update'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
+            storage_free_percent=item.get('storage_free_percent')
+            storage_text=f'{(storage_state or "healthy").replace("_"," ").title()} · {storage_free_percent:.1f}% free' if storage_state is not None and storage_free_percent is not None else 'Not yet reported'
+            cards.append(f'''<article class="panel"><div class="panel-head"><div><h2>{escape(item['cloud_id'])}</h2><div class="health-detail">{escape(item.get('customer_name') or 'Unassigned')} · {escape(item.get('site_name') or 'No site')} · {escape(item.get('software_version') or 'Unknown')}</div></div><span class="pill">{escape(item.get('state') or 'offline')}</span></div><div class="health-row"><span>Last check-in</span><strong>{escape(item.get('last_check_in') or 'Never')}</strong></div><div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get('cpu',0)}% / {item.get('memory',0)}% / {item.get('disk',0)} GB</strong></div><div class="health-row"><span>Local storage</span><strong>{escape(storage_text)}</strong></div><div class="health-row"><span>Cameras</span><strong>{len(camera_status)}</strong></div><div class="health-row"><span>Restarts</span><strong>{item.get('restart_count',0)}</strong></div><div class="health-row"><span>Upload backlog</span><strong>{escape(backlog_text)}</strong></div><div class="mock-banner" {'' if warnings else 'hidden'}>{', '.join(warnings)}</div><div class="library-toolbar">{''.join(f'<button class="filter queue-command" data-appliance="{item["id"]}" data-command="{command}">{label}</button>' for command,label in [('restart_service','Restart service'),('refresh_cameras','Refresh cameras'),('run_diagnostics','Diagnostics'),('install_update','Install update'),('reboot_appliance','Reboot appliance'),('restart_vms','Restart VMS')])}</div><details><summary>Recent health history ({len(history)})</summary>{''.join(f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h["cpu"]}%</p>' for h in history)}</details></article>''')
         # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
         # this query previously had no tenant predicate at all, so any
         # partner-scoped administrator saw every other partner's queued

@@ -38978,6 +38978,7 @@ async def health_monitor() -> None:
 import live_relay_idle_sweep
 import live_relay_uploader
 import webrtc_publisher
+import local_storage_manager
 import recording_uploader
 import recording_retention_sweep
 import analytics_sync
@@ -39353,6 +39354,22 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
+    # recording_start/cloud_recording_s3_key are main.py's own filename-
+    # parsing/catalog-key functions -- injected rather than imported by
+    # local_storage_manager.py for the same circular-import-avoidance
+    # reason as camera_url above. The worker no-ops unless
+    # ANYAICAM_LOCAL_STORAGE_MANAGEMENT_ENABLED is set (and only actually
+    # deletes anything if ANYAICAM_LOCAL_STORAGE_AUTO_DELETE_ENABLED is
+    # ALSO set -- see that module's own docstring), so creating this task
+    # unconditionally for edge/combined has no effect until both flags
+    # are explicitly turned on.
+    local_storage_manager_task = (
+        asyncio.create_task(local_storage_manager.local_storage_manager_worker(
+            RECORDINGS_FOLDER, recording_start_fn=recording_start, cloud_recording_s3_key_fn=cloud_recording_s3_key,
+        ))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # 2026-09-15: `or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE` added.
     # Confirmed live on Ryzen during the Camera 1 recording-upload pilot: a
     # second, independent instance of the exact same dead-code class 2672fb4
@@ -39570,6 +39587,8 @@ async def lifespan(app: FastAPI):
             live_relay_idle_sweep_task.cancel()
         if webrtc_publisher_task:
             webrtc_publisher_task.cancel()
+        if local_storage_manager_task:
+            local_storage_manager_task.cancel()
         if recording_upload_task:
             recording_upload_task.cancel()
         if recording_retention_sweep_task:
@@ -39678,6 +39697,8 @@ async def lifespan(app: FastAPI):
             pending.append(live_relay_idle_sweep_task)
         if webrtc_publisher_task:
             pending.append(webrtc_publisher_task)
+        if local_storage_manager_task:
+            pending.append(local_storage_manager_task)
         if recording_upload_task:
             pending.append(recording_upload_task)
         if recording_retention_sweep_task:

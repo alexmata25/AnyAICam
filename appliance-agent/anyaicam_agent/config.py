@@ -108,6 +108,12 @@ class AgentConfig:
     def live_relay_commands_file(self): return Path(self.state_dir)/'live_relay_commands.json'
     @property
     def entitlement_state_file(self): return Path(self.state_dir)/'entitlement_state.json'
+    @property
+    # Local recording storage management (2026-09-17): the cross-process
+    # handoff FROM the VMS app's local_storage_manager.py worker TO this
+    # agent's own heartbeat -- the mirror-image direction of live_relay_
+    # commands_file above (that one flows agent -> VMS app).
+    def local_storage_state_file(self): return Path(self.state_dir)/'local_storage_state.json'
 
     # RDM4 (remote device management -- privileged actions): the ONLY
     # channel by which this unprivileged agent process can ever request
