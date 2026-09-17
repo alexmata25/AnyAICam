@@ -21,9 +21,14 @@ RUN mkdir -p /app/static/hls /app/recordings
 # PPE model weights: see Dockerfile's own comment for the full story --
 # ppe.py's PPE_MODEL_NAME default is not an Ultralytics-hosted name and
 # was never provisioned anywhere, so PPE detection had silently never
-# worked. Fetched once at build time, checksum-pinned.
-RUN curl -fsSL -o /app/yolov8n-ppe.pt "https://huggingface.co/Tanishjain9/yolov8n-ppe-detection-6classes/resolve/main/best.pt" \
-    && echo "07172ef3ae9e256c40a1fb0ce3eefe5547d90170645aa73dded0fffc382cdb31  /app/yolov8n-ppe.pt" | sha256sum -c -
+# worked. Fetched once at build time, checksum-pinned. Placed OUTSIDE
+# /app (see Dockerfile's own comment for the real-Ryzen bind-mount-
+# shadowing bug this avoids) so this stays correct even if this image
+# is ever run with the same `./app:/app` bind mount the real appliance
+# compose file uses, not only in a context that happens not to.
+RUN mkdir -p /opt/anyaicam-ppe-model \
+    && curl -fsSL -o /opt/anyaicam-ppe-model/yolov8n-ppe.pt "https://huggingface.co/Tanishjain9/yolov8n-ppe-detection-6classes/resolve/main/best.pt" \
+    && echo "07172ef3ae9e256c40a1fb0ce3eefe5547d90170645aa73dded0fffc382cdb31  /opt/anyaicam-ppe-model/yolov8n-ppe.pt" | sha256sum -c -
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \

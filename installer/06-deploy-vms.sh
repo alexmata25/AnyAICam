@@ -158,8 +158,22 @@ deploy_vms() {
     # --delete makes /opt/anyaicam an exact software mirror of the release.
     # Legacy customer state locations are excluded defensively; current state
     # lives under /var/lib or /etc and is never part of this mirror.
+    #
+    # 'mediamtx/' is excluded for the same reason (2026-09-17, real bug
+    # confirmed live on Ryzen): 10-install-mediamtx.sh places the real
+    # MediaMTX binary at $VMS_INSTALL_ROOT/mediamtx, and its own
+    # docstring promises an ordinary VMS-only release rebuild (one built
+    # without --mediamtx-binary, which never embeds a payload/mediamtx/
+    # directory at all) is a complete no-op for that binary -- "changes
+    # nothing about live camera behavior". That promise was false: this
+    # rsync runs BEFORE install_mediamtx() in install.sh's own pipeline
+    # and, with --delete and no exclusion for it, silently deleted the
+    # previously-installed, already-validated MediaMTX binary out from
+    # under a P2P-enabled appliance the moment any unrelated VMS-only
+    # repair (e.g. this session's own LPR/PPE fix) ran, breaking P2P
+    # live view with no error anywhere in the install output.
     rsync -a --delete \
-        --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' \
+        --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
         "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/"
 
     ensure_vms_env

@@ -162,3 +162,59 @@ def test_dockerfiles_actually_fetch_the_model_this_module_depends_on():
         assert "yolov8n-ppe.pt" in content
         assert "Tanishjain9/yolov8n-ppe-detection-6classes" in content
         assert "07172ef3ae9e256c40a1fb0ce3eefe5547d90170645aa73dded0fffc382cdb31" in content
+
+
+def test_ppe_model_is_fetched_and_loaded_from_a_path_the_apps_bind_mount_never_shadows():
+    """Regression guard for a SECOND real gap found 2026-09-17, live on
+    Ryzen, immediately after the fix above was deployed: the model
+    downloaded correctly at build time (this Dockerfile step succeeded
+    -- the build could not have completed otherwise), yet the running
+    container still raised FileNotFoundError loading it.
+
+    Root cause: `docker-compose.yml` bind-mounts the host's own release-
+    payload `./app` directory over the image's own `/app`
+    (`- ./app:/app`, confirmed by reading the compose file directly
+    below) so a real running appliance container serves the exact
+    release payload's Python source -- but that mount also shadows
+    anything a Dockerfile RUN step baked into the image's own `/app`
+    that ISN'T part of that source tree, which is exactly what the
+    curl-fetched model file was. The model existed in the image and
+    loaded fine in any test that only builds/inspects the image; it
+    only ever failed on the real, actually-running container -- the
+    same "looks fixed until you check the specific layer that matters"
+    trap `anyaicam-verify-each-layer-not-just-backend-evidence` already
+    warns about elsewhere in this project's own history.
+
+    Fixed by moving the fetch target to /opt/anyaicam-ppe-model, a path
+    docker-compose.yml never mounts anything over. This test proves all
+    three pieces stay in sync: both Dockerfiles fetch to that exact
+    path, ppe.py's own PPE_MODEL_NAME default points at that exact
+    path, and the real compose file's own bind mounts never cover it."""
+    import pathlib
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    dockerfile = (repo_root / "Dockerfile").read_text()
+    dockerfile_production = (repo_root / "Dockerfile.production").read_text()
+    compose = (repo_root / "docker-compose.yml").read_text()
+
+    model_path = "/opt/anyaicam-ppe-model/yolov8n-ppe.pt"
+    for content in (dockerfile, dockerfile_production):
+        assert model_path in content
+        # Never fetched to anywhere under /app -- the specific mistake
+        # this test exists to catch from ever recurring.
+        assert "-o /app/yolov8n-ppe.pt" not in content
+
+    assert ppe.PPE_MODEL_NAME == model_path
+
+    # The real compose file's bind mounts, read directly rather than
+    # re-implementing docker's own mount-shadowing semantics: none of
+    # them targets a container path that /opt/anyaicam-ppe-model (or
+    # any ancestor of it) sits under.
+    mount_targets = [
+        line.split(":", 2)[1]
+        for line in compose.splitlines()
+        if line.strip().startswith("- ") and ":" in line and "/" in line.split(":", 1)[0]
+    ]
+    for target in mount_targets:
+        assert not model_path.startswith(target.rstrip("/") + "/") and model_path != target, (
+            f"docker-compose.yml mounts {target!r} over a path that would shadow the PPE model at {model_path!r}"
+        )

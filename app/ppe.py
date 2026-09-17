@@ -25,7 +25,17 @@ from ultralytics import YOLO
 
 PPE_ENABLED = os.environ.get("ANYAICAM_PPE_ENABLED", "true").strip().lower() == "true"
 
-PPE_MODEL_NAME = os.environ.get("ANYAICAM_PPE_MODEL", "yolov8n-ppe.pt")
+# Absolute path, deliberately outside /app (2026-09-17, real bug
+# confirmed live on Ryzen): the real appliance's docker-compose.yml
+# bind-mounts the host's own `./app` source tree over the image's own
+# `/app` at container runtime, so a bare relative filename here (or any
+# path under /app) resolves against a directory the running container
+# never actually has this build-time-downloaded file in, even though
+# the Dockerfile's own RUN step placed it there successfully at build
+# time -- see Dockerfile's own comment on this exact path for the full
+# trace. /opt/anyaicam-ppe-model is never bind-mounted over by anything
+# in docker-compose.yml.
+PPE_MODEL_NAME = os.environ.get("ANYAICAM_PPE_MODEL", "/opt/anyaicam-ppe-model/yolov8n-ppe.pt")
 
 # Ultralytics confidence is 0-1 (unlike tesseract's 0-100 in lpr.py) --
 # kept in that native range rather than rescaling, so it reads

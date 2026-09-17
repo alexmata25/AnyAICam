@@ -9,18 +9,30 @@ RUN pip install --no-cache-dir -r /tmp/requirements-cpu.txt \
     && pip install --no-cache-dir -r /tmp/requirements.txt
 COPY ./app /app
 # PPE model weights (2026-09-17): ppe.py's PPE_MODEL_NAME default
-# ("yolov8n-ppe.pt", a bare relative filename Ultralytics' YOLO()
-# resolves against the current working directory, /app per WORKDIR
-# above) has never been an Ultralytics-hosted model name -- unlike
-# main.py's own YOLO_MODEL_NAME ("yolov8n.pt", a real Ultralytics
-# pretrained model Ultralytics auto-downloads on first use), so every
-# _get_model() call here always failed and PPE detection had silently
-# never worked anywhere, confirmed live on the real Ryzen appliance.
-# Fetched once at build time (not at container runtime, so a real
-# deployment never depends on Hugging Face being reachable) from the
-# MIT-licensed community model this module's own docstring already
-# names (Tanishjain9/yolov8n-ppe-detection-6classes), checksum-pinned
-# against the exact file this fix was verified against.
-RUN curl -fsSL -o /app/yolov8n-ppe.pt "https://huggingface.co/Tanishjain9/yolov8n-ppe-detection-6classes/resolve/main/best.pt" \
-    && echo "07172ef3ae9e256c40a1fb0ce3eefe5547d90170645aa73dded0fffc382cdb31  /app/yolov8n-ppe.pt" | sha256sum -c -
+# has never been an Ultralytics-hosted model name -- unlike main.py's
+# own YOLO_MODEL_NAME ("yolov8n.pt", a real Ultralytics pretrained
+# model Ultralytics auto-downloads on first use), so every _get_model()
+# call here always failed and PPE detection had silently never worked
+# anywhere, confirmed live on the real Ryzen appliance. Fetched once at
+# build time (not at container runtime, so a real deployment never
+# depends on Hugging Face being reachable) from the MIT-licensed
+# community model this module's own docstring already names
+# (Tanishjain9/yolov8n-ppe-detection-6classes), checksum-pinned against
+# the exact file this fix was verified against.
+#
+# Placed OUTSIDE /app (2026-09-17, real bug confirmed live on Ryzen):
+# the real appliance's docker-compose.yml bind-mounts the host's own
+# `./app` source tree over the image's own `/app` at container runtime
+# (`- ./app:/app`, the same mechanism that makes an installed appliance
+# run the exact release payload's Python source) -- so anything baked
+# into the image's own `/app` by a Dockerfile RUN step, rather than
+# copied from the git-tracked `./app` source, is invisible the moment
+# the container actually starts, not just theoretically shadowed. This
+# is exactly why the model loaded fine in isolated image-only testing
+# but FileNotFoundError'd on the real running appliance. /opt/anyaicam-
+# ppe-model is never bind-mounted over by anything in docker-compose.
+# yml, so the baked file survives into the real running container.
+RUN mkdir -p /opt/anyaicam-ppe-model \
+    && curl -fsSL -o /opt/anyaicam-ppe-model/yolov8n-ppe.pt "https://huggingface.co/Tanishjain9/yolov8n-ppe-detection-6classes/resolve/main/best.pt" \
+    && echo "07172ef3ae9e256c40a1fb0ce3eefe5547d90170645aa73dded0fffc382cdb31  /opt/anyaicam-ppe-model/yolov8n-ppe.pt" | sha256sum -c -
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

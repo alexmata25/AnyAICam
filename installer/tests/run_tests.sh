@@ -436,6 +436,28 @@ assert_exit "a file no longer in the release payload is removed from VMS_INSTALL
 assert_eq "persistent recordings untouched by the exact-mirror deploy" "real-recording-data" "$(cat "$VMS_RECORDINGS_DIR/clip1.mp4" 2>/dev/null)"
 assert_eq "persistent data-config untouched by the exact-mirror deploy" "real-data-config" "$(cat "$VMS_DATA_CONFIG_DIR/settings.json" 2>/dev/null)"
 
+# 14n. Real bug confirmed live on Ryzen (2026-09-17): a previously-
+#      installed, already-validated MediaMTX binary at
+#      VMS_INSTALL_ROOT/mediamtx sits directly inside the tree this same
+#      rsync --delete mirrors -- an ordinary VMS-only repair (this
+#      session's own LPR/PPE fix), built with no --mediamtx-binary
+#      payload at all, silently deleted it, because 'mediamtx/' was not
+#      in this rsync's own exclude list even though 10-install-
+#      mediamtx.sh's own docstring explicitly promises this exact
+#      scenario "changes nothing about live camera behavior". This
+#      broke a P2P-enabled appliance's live view with no error anywhere
+#      in the install/repair output -- deploy_vms() runs BEFORE
+#      install_mediamtx() in install.sh's own pipeline, and
+#      install_mediamtx() itself correctly no-ops when no payload is
+#      present, so nothing downstream ever got a chance to notice or
+#      restore what this rsync had already removed.
+reset_fixture
+make_fake_vms_payload
+mkdir -p "$MEDIAMTX_INSTALL_DIR"
+printf 'real previously-installed mediamtx binary' > "$MEDIAMTX_BINARY_PATH"
+deploy_vms repair >/dev/null 2>&1
+assert_eq "a previously-installed MediaMTX binary survives an ordinary VMS-only repair deploy untouched" "real previously-installed mediamtx binary" "$(cat "$MEDIAMTX_BINARY_PATH" 2>/dev/null)"
+
 echo
 echo "== ensure_vms_env() / build-identity stamping =="
 
