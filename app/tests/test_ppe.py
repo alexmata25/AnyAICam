@@ -139,3 +139,26 @@ def test_real_inference_never_raises_on_a_noisy_random_frame():
     frame = rng.integers(0, 255, size=(480, 640, 3), dtype=np.uint8)
     result = ppe.detect_ppe(frame, camera_number=1)
     assert result is None or isinstance(result, dict)
+
+
+def test_dockerfiles_actually_fetch_the_model_this_module_depends_on():
+    """Regression guard for a real gap found 2026-09-17 during the real
+    Ryzen five-camera validation pass: PPE_MODEL_NAME's default
+    ("yolov8n-ppe.pt") is not an Ultralytics-hosted name the way
+    main.py's own YOLO_MODEL_NAME ("yolov8n.pt") is, so nothing ever
+    auto-downloaded it and no Dockerfile ever fetched it either --
+    confirmed live on the real Ryzen appliance (`_get_model()` returned
+    None, `_model_load_failed` was True). PPE detection had silently
+    never worked anywhere despite `PPE_ENABLED`/`cameras.ppe_enabled`
+    being on, always failing closed as "no detections" rather than
+    erroring (detect_ppe()'s own fail-closed-by-design contract), which
+    masked a real, fixable software gap as an absence of real-world PPE
+    activity."""
+    import pathlib
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    dockerfile = (repo_root / "Dockerfile").read_text()
+    dockerfile_production = (repo_root / "Dockerfile.production").read_text()
+    for content in (dockerfile, dockerfile_production):
+        assert "yolov8n-ppe.pt" in content
+        assert "Tanishjain9/yolov8n-ppe-detection-6classes" in content
+        assert "07172ef3ae9e256c40a1fb0ce3eefe5547d90170645aa73dded0fffc382cdb31" in content

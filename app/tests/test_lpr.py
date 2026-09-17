@@ -200,3 +200,28 @@ def test_recognize_plate_end_to_end_on_a_synthetic_frame_with_no_cascade_match()
     image = _render_plate_image("ABC1234")
     result = lpr.recognize_plate(image)
     assert result is None or (isinstance(result, dict) and lpr.is_plausible_plate(result["plate_number"]))
+
+
+def test_dockerfiles_actually_install_the_tesseract_binary_this_module_depends_on():
+    """Regression guard for a real gap found 2026-09-17 during the real
+    Ryzen five-camera validation pass: this module's own docstring above
+    has claimed since it was written that OCR tests run "through the
+    real tesseract engine (installed via the Dockerfile)", but neither
+    Dockerfile nor Dockerfile.production nor requirements.txt ever
+    actually installed tesseract-ocr/pytesseract -- confirmed live on
+    the real Ryzen appliance (`_get_pytesseract()` returned None,
+    `shutil.which("tesseract")` returned None), meaning LPR had silently
+    never been able to read a single real plate despite thousands of
+    real vehicle detections, always returning None on every attempt
+    with no error (recognize_plate()'s own fail-closed-by-design
+    contract correctly absorbed the missing dependency as "no plate
+    found," masking it as an environmental limitation instead of a
+    real, fixable software gap)."""
+    import pathlib
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    dockerfile = (repo_root / "Dockerfile").read_text()
+    dockerfile_production = (repo_root / "Dockerfile.production").read_text()
+    requirements = (repo_root / "requirements.txt").read_text()
+    assert "tesseract-ocr" in dockerfile
+    assert "tesseract-ocr" in dockerfile_production
+    assert "pytesseract" in requirements
