@@ -57,6 +57,7 @@ INSTALLER_RUNTIME_FILES = (
     "05-provision-users-dirs.sh",
     "06-deploy-vms.sh",
     "07-install-agent.sh",
+    "10-install-mediamtx.sh",
     "08-systemd-setup.sh",
     "09-identity.sh",
     "validate.sh",
@@ -304,6 +305,8 @@ def main() -> int:
     source.add_argument("--release-archive", help="Prebuilt VMS release archive")
     parser.add_argument("--release-sha256", help="Required with --release-archive")
     parser.add_argument("--env-template", help="Optional non-secret VMS environment template")
+    parser.add_argument("--mediamtx-binary", help="Optional pre-downloaded, checksum-verified MediaMTX Linux binary to embed (P2P live-view foundation, still feature-flagged off)")
+    parser.add_argument("--mediamtx-sha256", help="Required with --mediamtx-binary")
     parser.add_argument("--output-dir", default="dist")
     args = parser.parse_args()
 
@@ -362,6 +365,21 @@ def main() -> int:
         shutil.copytree(agent_export / "appliance-agent", package / "payload/agent", copy_function=shutil.copy2)
 
         copy_release(release_root, package / "payload/vms")
+
+        if args.mediamtx_binary:
+            if not args.mediamtx_sha256:
+                raise SystemExit("--mediamtx-sha256 is required with --mediamtx-binary")
+            expected_mediamtx_sha = validate_sha256(args.mediamtx_sha256, "--mediamtx-sha256")
+            mediamtx_src = Path(args.mediamtx_binary).resolve()
+            if not mediamtx_src.is_file():
+                raise SystemExit(f"MediaMTX binary not found: {mediamtx_src}")
+            actual_mediamtx_sha = sha256_file(mediamtx_src)
+            if actual_mediamtx_sha != expected_mediamtx_sha:
+                raise SystemExit(f"MediaMTX binary SHA-256 mismatch: expected {expected_mediamtx_sha}, got {actual_mediamtx_sha}")
+            mediamtx_dest_dir = package / "payload/mediamtx"
+            mediamtx_dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(mediamtx_src, mediamtx_dest_dir / "mediamtx")
+            (mediamtx_dest_dir / "mediamtx.sha256").write_text(f"{expected_mediamtx_sha}  mediamtx\n", encoding="utf-8", newline="\n")
 
         release_unit = release_root / "systemd/anyaicam-vms.service"
         service_source = "installer"

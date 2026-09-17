@@ -9,6 +9,7 @@ INSTALLER_VERSION="1.1.0"
 PAYLOAD_DIR="$INSTALLER_DIR/payload"
 VMS_PAYLOAD_DIR="$PAYLOAD_DIR/vms"
 AGENT_PAYLOAD_DIR="$PAYLOAD_DIR/agent"
+MEDIAMTX_PAYLOAD_DIR="$PAYLOAD_DIR/mediamtx"
 RUNTIME_DIR="$INSTALLER_DIR/runtime"
 RELEASE_ENV_FILE="$INSTALLER_DIR/release.env"
 
@@ -92,6 +93,8 @@ source "$INSTALLER_DIR/05-provision-users-dirs.sh"
 source "$INSTALLER_DIR/06-deploy-vms.sh"
 # shellcheck source=07-install-agent.sh
 source "$INSTALLER_DIR/07-install-agent.sh"
+# shellcheck source=10-install-mediamtx.sh
+source "$INSTALLER_DIR/10-install-mediamtx.sh"
 # shellcheck source=08-systemd-setup.sh
 source "$INSTALLER_DIR/08-systemd-setup.sh"
 # shellcheck source=09-identity.sh
@@ -119,6 +122,7 @@ run_install() {
     provision_users_dirs "$INSTALL_STATE"
     deploy_vms "$INSTALL_STATE"
     install_agent "$INSTALL_STATE"
+    install_mediamtx "$INSTALL_STATE"
     systemd_setup
     disable_system_suspend
     identity_provision "$INSTALL_STATE"

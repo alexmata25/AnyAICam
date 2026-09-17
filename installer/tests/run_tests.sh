@@ -62,6 +62,15 @@ reset_fixture() {
     AGENT_PAYLOAD_DIR="$FIXTURE_ROOT/installer-payload/agent"
     AGENT_INSTALL_ROOT="$FIXTURE_ROOT/opt/anyaicam-agent"
     AGENT_SOURCE_ROOT="$AGENT_INSTALL_ROOT/source"
+    # P2P live-view foundation, Phase 2 -- same release-driven,
+    # fixture-redirected pattern as AGENT_PAYLOAD_DIR/AGENT_INSTALL_ROOT
+    # above. install_mediamtx() reads MEDIAMTX_PAYLOAD_DIR (optional --
+    # a missing payload is a silent no-op, see 10-install-mediamtx.sh's
+    # own comment) and installs to MEDIAMTX_INSTALL_DIR/MEDIAMTX_BINARY_PATH.
+    MEDIAMTX_PAYLOAD_DIR="$FIXTURE_ROOT/installer-payload/mediamtx"
+    MEDIAMTX_INSTALL_DIR="$FIXTURE_ROOT/opt/anyaicam/mediamtx"
+    MEDIAMTX_BINARY_PATH="$MEDIAMTX_INSTALL_DIR/mediamtx"
+    rm -rf "$MEDIAMTX_PAYLOAD_DIR"
     mkdir -p "$(dirname "$VMS_SERVICE_FILE")"
     # id/docker mocks default to "absent" until a test overrides them.
     ID_MOCK_EXIT=1
@@ -119,6 +128,13 @@ FAKE_AGENT_UNINSTALL
 # side of it). Matches build_release_installer.py's
 # REQUIRED_RELEASE_PATHS exactly: app, requirements.txt, Dockerfile,
 # Dockerfile.production, docker-compose.yml.
+make_fake_mediamtx_payload() {
+    local content="${1:-fake mediamtx binary}"
+    mkdir -p "$MEDIAMTX_PAYLOAD_DIR"
+    printf '%s' "$content" > "$MEDIAMTX_PAYLOAD_DIR/mediamtx"
+    (cd "$MEDIAMTX_PAYLOAD_DIR" && sha256sum mediamtx > mediamtx.sha256)
+}
+
 make_fake_vms_payload() {
     mkdir -p "$VMS_PAYLOAD_DIR/app"
     echo 'print("fake app")' > "$VMS_PAYLOAD_DIR/app/main.py"
@@ -212,6 +228,8 @@ source "$INSTALLER_DIR/02-storage-check.sh"
 source "$INSTALLER_DIR/06-deploy-vms.sh"
 # shellcheck source=../07-install-agent.sh
 source "$INSTALLER_DIR/07-install-agent.sh"
+# shellcheck source=../10-install-mediamtx.sh
+source "$INSTALLER_DIR/10-install-mediamtx.sh"
 # shellcheck source=../uninstall.sh
 # Sourcing this pulls in its own `source install.sh` internally, which
 # re-defines the real-path constants (harmless -- every test below
@@ -583,6 +601,55 @@ make_fake_agent_payload
 assert_exit "install_agent succeeds (prereq installed before the wrapped script ran)" 0 install_agent clean
 assert_exit "python3.12-venv was apt-get installed" 0 test -f "$APT_PYTHON_VENV_MARKER"
 assert_exit "the wrapped appliance-agent install.sh ran" 0 test -f "$FAKE_AGENT_INSTALL_MARKER"
+
+echo
+echo "== install_mediamtx() =="
+
+# P2P live-view foundation, Phase 2 (2026-09-17): MediaMTX embedding is
+# opt-in at build time (build_release_installer.py's --mediamtx-binary),
+# not a hard requirement of every release -- an ordinary VMS-only rebuild
+# that never included MediaMTX must keep installing/repairing exactly as
+# it always did, never fail because a P2P-specific payload is absent.
+reset_fixture
+assert_exit "no MediaMTX payload in this release -- silent no-op, not a failure" 0 install_mediamtx clean
+assert_exit "nothing gets installed when there is no payload" 1 test -f "$MEDIAMTX_BINARY_PATH"
+
+# A present-but-corrupt payload (checksum mismatch) is a real build/
+# transfer problem, and MUST fail loudly -- never install a binary that
+# doesn't match the release manifest.
+reset_fixture
+make_fake_mediamtx_payload
+echo "corrupted after the checksum was written" >> "$MEDIAMTX_PAYLOAD_DIR/mediamtx"
+assert_exit "a payload that fails its own checksum is refused" 1 install_mediamtx clean
+assert_exit "nothing gets installed from a checksum-failed payload" 1 test -f "$MEDIAMTX_BINARY_PATH"
+
+# The real, correct case: a present, checksum-valid payload is installed
+# byte-identical and made executable -- but never started, and nothing
+# about ANYAICAM_LIVE_P2P_ENABLED or the running VMS service is touched
+# by this function at all (it doesn't reference either).
+reset_fixture
+make_fake_mediamtx_payload "real fake mediamtx contents for this test"
+assert_exit "a valid payload installs successfully" 0 install_mediamtx clean
+assert_exit "the binary is installed at the expected path" 0 test -f "$MEDIAMTX_BINARY_PATH"
+assert_eq "installed binary content is byte-identical to the payload" "$(cat "$MEDIAMTX_PAYLOAD_DIR/mediamtx")" "$(cat "$MEDIAMTX_BINARY_PATH")"
+# Not asserted here: test -x on the installed binary. This Windows/MSYS
+# test harness's filesystem does not honor chmod's execute bit at all
+# (confirmed directly: chmod 0755 on a plain file here leaves it
+# -rw-r--r--, and test -x reports false, regardless of what install -m
+# 0755 was actually given) -- a real Linux target (where this installer
+# actually runs) does not have this limitation. install -m 0755's own
+# mode argument is not conditional on platform, so this is a test-
+# environment gap, not something this script can compensate for.
+
+# Repair-safe/idempotent: re-running against an already-installed,
+# matching binary must succeed without re-copying (and without ever
+# needing to touch a running MediaMTX process, since this function never
+# starts one in the first place).
+BEFORE_MTIME="$(stat -c %Y "$MEDIAMTX_BINARY_PATH" 2>/dev/null || stat -f %m "$MEDIAMTX_BINARY_PATH")"
+sleep 1
+assert_exit "re-running install_mediamtx (repair) on an already-current binary succeeds" 0 install_mediamtx repair
+AFTER_MTIME="$(stat -c %Y "$MEDIAMTX_BINARY_PATH" 2>/dev/null || stat -f %m "$MEDIAMTX_BINARY_PATH")"
+assert_eq "an already-current binary is left untouched, not re-copied" "$BEFORE_MTIME" "$AFTER_MTIME"
 
 echo
 echo "== migrate_legacy_persistent_data() / migrate_legacy_persistent_file() =="
