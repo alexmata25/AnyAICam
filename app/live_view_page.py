@@ -116,6 +116,10 @@ _P2P_JS = """
     });
 
     pc.addTransceiver('video', {direction: 'recvonly'});
+    // Best-effort trickle (harmless, not required for v1 -- see below):
+    // some future TURN-relay candidates can arrive after gathering
+    // "completes" in edge cases, so this is still wired, but nothing on
+    // either side depends on it succeeding.
     pc.onicecandidate = (event) => {
       if (!event.candidate) return;
       fetch(`/api/customer/live/sessions/${sessionId}/p2p/ice`, {
@@ -126,8 +130,29 @@ _P2P_JS = """
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+
+    // Wait for local ICE gathering to finish (bounded) before sending the
+    // offer, so pc.localDescription.sdp already carries every discovered
+    // candidate inline -- a complete, self-contained, non-trickle offer.
+    // This is a deliberate simplification over full RFC 8840 trickle
+    // exchange with the appliance's MediaMTX bridge: it avoids needing a
+    // byte-exact trickle-ice-sdpfrag implementation on both ends for v1,
+    // at the cost of a bounded extra wait that fits well inside the
+    // overall P2P negotiation timeout. MediaMTX's own answer is expected
+    // to be similarly complete (it gathers before answering by default).
+    if (pc.iceGatheringState !== 'complete') {
+      await new Promise((resolve) => {
+        const onChange = () => {
+          if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', onChange); resolve(); }
+        };
+        pc.addEventListener('icegatheringstatechange', onChange);
+        setTimeout(() => { pc.removeEventListener('icegatheringstatechange', onChange); resolve(); }, Math.min(2000, timeoutMs));
+      });
+    }
+    if (settled) return resultPromise;
+
     fetch(`/api/customer/live/sessions/${sessionId}/p2p/offer`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sdp: offer.sdp}),
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sdp: pc.localDescription.sdp}),
     }).catch(() => {});
 
     let appliedAnswer = false;

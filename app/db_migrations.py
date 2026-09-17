@@ -527,6 +527,16 @@ CREATE TABLE IF NOT EXISTS live_view_p2p_signaling(
 );
 CREATE INDEX IF NOT EXISTS idx_live_view_p2p_signaling_poll ON live_view_p2p_signaling(session_id,kind,consumed_at);
 '''),
+    # Session-duration instrumentation (2026-09-17): a terminal timestamp
+    # distinct from expires_at (the SESSION_DURATION_SECONDS ceiling, not
+    # when a viewer actually stopped watching) -- set once, by whichever
+    # of stop_live_view()'s explicit customer-initiated stop or
+    # _sweep_expired_sessions()'s lazy expiry sweep reaches a 'requested'
+    # row first. stopped_at-minus-ready_at is real watched duration,
+    # transport-agnostic (works identically for 'p2p' or 'relay').
+    ('20260917_live_view_session_stopped_at','''
+ALTER TABLE live_view_sessions ADD COLUMN stopped_at TEXT;
+'''),
 ]
 
 

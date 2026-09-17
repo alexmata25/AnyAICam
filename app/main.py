@@ -38977,6 +38977,7 @@ async def health_monitor() -> None:
 
 import live_relay_idle_sweep
 import live_relay_uploader
+import webrtc_publisher
 import recording_uploader
 import recording_retention_sweep
 import analytics_sync
@@ -39339,6 +39340,19 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # camera_url is main.py's own credentialed-RTSP-URL builder -- injected
+    # rather than imported by webrtc_publisher.py, which this module
+    # imports to wire this task, exactly the same circular-import
+    # avoidance already used for register_live_playlist_routes(...,
+    # local_identity=lambda: own_appliance_identity()) below. The worker
+    # itself no-ops (sleeps forever) unless ANYAICAM_LIVE_P2P_ENABLED is
+    # set, so creating this task unconditionally for edge/combined has no
+    # effect until that flag is explicitly turned on.
+    webrtc_publisher_task = (
+        asyncio.create_task(webrtc_publisher.webrtc_publisher_worker(camera_url))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # 2026-09-15: `or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE` added.
     # Confirmed live on Ryzen during the Camera 1 recording-upload pilot: a
     # second, independent instance of the exact same dead-code class 2672fb4
@@ -39554,6 +39568,8 @@ async def lifespan(app: FastAPI):
             live_relay_task.cancel()
         if live_relay_idle_sweep_task:
             live_relay_idle_sweep_task.cancel()
+        if webrtc_publisher_task:
+            webrtc_publisher_task.cancel()
         if recording_upload_task:
             recording_upload_task.cancel()
         if recording_retention_sweep_task:
@@ -39660,6 +39676,8 @@ async def lifespan(app: FastAPI):
             pending.append(live_relay_task)
         if live_relay_idle_sweep_task:
             pending.append(live_relay_idle_sweep_task)
+        if webrtc_publisher_task:
+            pending.append(webrtc_publisher_task)
         if recording_upload_task:
             pending.append(recording_upload_task)
         if recording_retention_sweep_task:

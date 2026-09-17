@@ -1,0 +1,520 @@
+"""Appliance-side WebRTC publisher: bridges the cloud-hosted P2P signaling
+exchange (live_view_p2p.py's offer/ICE/answer routes) to a local MediaMTX
+process, which does the actual RTSP-in/WebRTC-out media work. Chosen over
+building a custom WebRTC media server, per explicit product direction --
+MediaMTX already speaks RTSP (the exact protocol this codebase's cameras
+already use) in and WHEP/WebRTC out, as a single static binary with no
+appliance-side dependency beyond the binary itself.
+
+This module is a signaling BRIDGE and process/config-sync ONLY -- it never
+touches a media byte, and it never receives or exposes a camera's RTSP
+credentials to the browser. MediaMTX pulls each camera's RTSP stream
+directly (same trust boundary FFmpeg's start_live_stream() already has on
+this appliance -- see camera_url_fn below), and only ever emits WebRTC
+(no credentials, no RTSP) toward the browser. Both MediaMTX's control API
+(default :9997) and its WebRTC HTTP signaling port (default :8889) are
+bound to 127.0.0.1 only in the config this module writes -- neither is
+ever reachable from the LAN or the internet; only the actual WebRTC
+media (UDP/ICE, via webrtcLocalUDPAddress) needs to reach the internet,
+and that path carries no credentials or control surface, only the video
+track a viewer is already authorized to see.
+
+Protocol details below (WHEP route shapes, MediaMTX config/REST-API field
+names) were verified against MediaMTX's own real, current source code
+(github.com/bluenviron/mediamtx, v1.21.0: internal/servers/webrtc/
+http_server.go, internal/conf/webrtc_ice_server.go, internal/conf/path.go,
+internal/api/api.go) -- not guessed from documentation summaries. What has
+NOT been verified is a live run against the real binary: this sandbox
+could not reliably download the MediaMTX release asset (repeated
+truncated transfers), so this module's exact request/response handling
+was built and tested against a local fake HTTP server that reproduces the
+confirmed real route contract, not the live process. Running this module
+against a real `mediamtx` binary -- on a dev machine or Ryzen itself,
+before any live camera is wired to it -- is the explicit next
+verification step called for before enabling P2P for real, per the
+product decision that gated this whole feature behind
+ANYAICAM_LIVE_P2P_ENABLED (default false, unchanged by this module).
+
+Non-trickle ICE by design: the browser (live_view_page.py's
+attemptLiveP2P()) waits for its own ICE gathering to complete before
+sending the offer, so pc.localDescription.sdp already carries every
+candidate inline; MediaMTX is expected to do the same before answering
+(its own default webrtcSTUNGatherTimeout). This sidesteps needing a
+byte-exact RFC 8840 trickle-ice-sdpfrag implementation on both ends for
+v1 -- a deliberate simplification, not an oversight; see live_view_page.py
+for the corresponding client-side change. Best-effort trickle forwarding
+(_forward_client_ice_candidate() below) is still implemented for
+robustness against a client that times out before gathering fully
+completes, but nothing in this module's success path depends on it.
+"""
+
+import json
+import logging
+import os
+import secrets
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+logger = logging.getLogger("anyaicam.webrtc_publisher")
+
+RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
+LIVE_P2P_ENABLED = os.environ.get("ANYAICAM_LIVE_P2P_ENABLED", "false").strip().lower() == "true"
+CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
+STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
+CREDENTIAL_FILE = STATE_DIR / "credential.json"
+
+MEDIAMTX_BINARY = os.environ.get("ANYAICAM_MEDIAMTX_BINARY", "/opt/anyaicam/mediamtx/mediamtx").strip()
+MEDIAMTX_CONFIG_PATH = Path(os.environ.get("ANYAICAM_MEDIAMTX_CONFIG", str(STATE_DIR / "mediamtx.yml")))
+# Bound to loopback only -- see module docstring. Never override these to a
+# non-loopback address without also firewalling them; that would expose
+# MediaMTX's config API (which can rewrite any camera's source URL,
+# credentials included) and its unauthenticated WHEP endpoint directly to
+# the LAN/internet.
+MEDIAMTX_API_BASE = os.environ.get("ANYAICAM_MEDIAMTX_API_BASE", "http://127.0.0.1:9997").rstrip("/")
+MEDIAMTX_WEBRTC_BASE = os.environ.get("ANYAICAM_MEDIAMTX_WEBRTC_BASE", "http://127.0.0.1:8889").rstrip("/")
+
+_DEFAULT_STUN_SERVERS = "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478"
+STUN_SERVERS = [url.strip() for url in os.environ.get("ANYAICAM_LIVE_STUN_SERVERS", _DEFAULT_STUN_SERVERS).split(",") if url.strip()]
+# TURN is deliberately unset by default (STUN-only ships first, per
+# explicit product direction) -- adding it later is exactly these three
+# env vars, read fresh on every _write_mediamtx_config() call (which runs
+# before every MediaMTX (re)start), never a code change to this module or
+# to live_view_p2p.py's own ice_servers().
+TURN_SERVERS = [url.strip() for url in os.environ.get("ANYAICAM_LIVE_TURN_SERVERS", "").split(",") if url.strip()]
+TURN_USERNAME = os.environ.get("ANYAICAM_LIVE_TURN_USERNAME", "").strip()
+TURN_CREDENTIAL = os.environ.get("ANYAICAM_LIVE_TURN_CREDENTIAL", "").strip()
+
+SCAN_SECONDS = max(0.5, float(os.environ.get("ANYAICAM_LIVE_P2P_SCAN_SECONDS", "1.0")))
+CONFIG_REFRESH_SECONDS = max(30.0, float(os.environ.get("ANYAICAM_LIVE_P2P_CONFIG_REFRESH_SECONDS", "60.0")))
+MEDIAMTX_RESTART_BACKOFF_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_RESTART_BACKOFF_SECONDS", "5.0")))
+MEDIAMTX_STARTUP_GRACE_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_STARTUP_GRACE_SECONDS", "3.0")))
+
+webrtc_publisher_state: dict = {"worker_status": "disabled", "mediamtx_status": "stopped", "last_scan_at": None, "last_error": None}
+
+_lock = threading.Lock()
+_camera_map: dict[str, int] = {}       # camera_id -> camera_number, refreshed periodically via GET /api/appliance/configuration
+_known_paths: set[str] = set()         # camera_ids currently configured as MediaMTX paths (mirrors what MediaMTX itself thinks exists)
+_whep_sessions: dict[str, str] = {}    # session_id -> WHEP session Location URL, for best-effort ICE trickle forwarding
+_mediamtx_process: "subprocess.Popen | None" = None
+
+
+# --------------------------------------------------------------- appliance identity / control plane
+# Identical shape to live_relay_uploader.py's / recording_uploader.py's own
+# copies -- deliberately duplicated per this project's established
+# convention for these small, independent appliance-side workers (see
+# those modules' own docstrings for the same scope decision).
+
+def _load_appliance_identity() -> tuple[str, str] | None:
+    try:
+        data = json.loads(CREDENTIAL_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    appliance_id = str(data.get("appliance_id") or "").strip()
+    credential = str(data.get("credential") or "").strip()
+    if not appliance_id or not credential:
+        return None
+    return appliance_id, credential
+
+
+def _control_plane_headers(appliance_id: str, credential: str) -> dict:
+    return {
+        "User-Agent": "AnyAiCam-WebRTCPublisher/0.1",
+        "Authorization": f"Bearer {credential}",
+        "X-Appliance-ID": appliance_id,
+        "X-Request-Timestamp": str(int(time.time())),
+        "X-Request-Nonce": secrets.token_urlsafe(18),
+    }
+
+
+def _control_plane_get(path: str) -> dict | None:
+    identity = _load_appliance_identity()
+    if not identity or not CLOUD_URL:
+        return None
+    appliance_id, credential = identity
+    request = urllib.request.Request(CLOUD_URL + path, headers=_control_plane_headers(appliance_id, credential), method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode() or "{}")
+    except urllib.error.HTTPError as error:
+        logger.warning("webrtc_publisher.control_plane_http_error path=%s status=%s", path, error.code)
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        logger.warning("webrtc_publisher.control_plane_unreachable path=%s error=%s", path, error)
+        return None
+
+
+def _control_plane_post(path: str, payload: dict) -> dict | None:
+    identity = _load_appliance_identity()
+    if not identity or not CLOUD_URL:
+        return None
+    appliance_id, credential = identity
+    headers = {"Content-Type": "application/json", **_control_plane_headers(appliance_id, credential)}
+    request = urllib.request.Request(CLOUD_URL + path, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode() or "{}")
+    except urllib.error.HTTPError as error:
+        logger.warning("webrtc_publisher.control_plane_http_error path=%s status=%s", path, error.code)
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        logger.warning("webrtc_publisher.control_plane_unreachable path=%s error=%s", path, error)
+        return None
+
+
+def _refresh_camera_map() -> None:
+    """Same source (GET /api/appliance/configuration) and same
+    never-clobber-on-failure behavior as recording_uploader.py's own
+    _refresh_camera_map() -- a transient control-plane outage leaves the
+    previous mapping in place rather than dropping every known camera."""
+    response = _control_plane_get("/api/appliance/configuration")
+    if not isinstance(response, dict):
+        return
+    cameras = response.get("cameras")
+    if not isinstance(cameras, list):
+        return
+    mapping: dict[str, int] = {}
+    for item in cameras:
+        if not isinstance(item, dict):
+            continue
+        camera_id = item.get("id")
+        camera_number = item.get("camera_number")
+        if not isinstance(camera_id, str) or not camera_id.strip():
+            continue
+        if isinstance(camera_number, bool) or not isinstance(camera_number, int):
+            continue
+        mapping[camera_id] = camera_number
+    with _lock:
+        global _camera_map
+        _camera_map = mapping
+
+
+# --------------------------------------------------------------- MediaMTX config + process lifecycle
+
+def _ice_server_entries() -> list[dict]:
+    """One entry per URL, matching MediaMTX's real WebRTCICEServer struct
+    (internal/conf/webrtc_ice_server.go: URL is a single string, not a
+    list -- confirmed from source, not assumed). TURN entries share the
+    configured username/credential; STUN entries carry neither."""
+    entries = [{"url": url} for url in STUN_SERVERS]
+    for url in TURN_SERVERS:
+        entry = {"url": url}
+        if TURN_USERNAME:
+            entry["username"] = TURN_USERNAME
+        if TURN_CREDENTIAL:
+            entry["password"] = TURN_CREDENTIAL
+        entries.append(entry)
+    return entries
+
+
+def _yaml_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render_mediamtx_config() -> str:
+    """Builds the base MediaMTX config -- API and WebRTC HTTP signaling
+    both loopback-only (see module docstring), no static paths (every
+    camera path is added/removed at runtime via the config REST API by
+    _sync_camera_paths() below, since the known-camera set can change
+    without this process ever restarting). Pure string building, no I/O --
+    kept separate from _write_mediamtx_config() so it's directly testable
+    without a filesystem."""
+    lines = [
+        "logLevel: info",
+        "api: yes",
+        "apiAddress: 127.0.0.1:9997",
+        "webrtc: yes",
+        "webrtcAddress: 127.0.0.1:8889",
+        "webrtcLocalUDPAddress: :8189",
+    ]
+    ice_servers = _ice_server_entries()
+    if ice_servers:
+        lines.append("webrtcICEServers2:")
+        for entry in ice_servers:
+            lines.append(f"  - url: {_yaml_quote(entry['url'])}")
+            if "username" in entry:
+                lines.append(f"    username: {_yaml_quote(entry['username'])}")
+            if "password" in entry:
+                lines.append(f"    password: {_yaml_quote(entry['password'])}")
+    lines.append("paths:")
+    lines.append("  all_others:")
+    return "\n".join(lines) + "\n"
+
+
+def _write_mediamtx_config() -> None:
+    MEDIAMTX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MEDIAMTX_CONFIG_PATH.write_text(render_mediamtx_config(), encoding="utf-8")
+
+
+def _mediamtx_alive() -> bool:
+    return _mediamtx_process is not None and _mediamtx_process.poll() is None
+
+
+def _start_mediamtx() -> None:
+    """Spawns MediaMTX as a child process of this VMS process, the same
+    ownership model start_live_stream() already uses for FFmpeg on this
+    appliance (not a separate systemd unit -- see the deployment-plan
+    findings this phase's work is reported alongside for why that's a
+    deliberate, later decision, not an oversight). Never raises: a
+    missing binary or failed spawn is recorded in webrtc_publisher_state
+    and retried by the worker loop's own backoff, exactly like a
+    transient control-plane outage elsewhere in this codebase."""
+    global _mediamtx_process
+    _write_mediamtx_config()
+    try:
+        _mediamtx_process = subprocess.Popen(
+            [MEDIAMTX_BINARY, str(MEDIAMTX_CONFIG_PATH)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        logger.warning("webrtc_publisher.mediamtx_spawn_failed error=%s", error)
+        webrtc_publisher_state["mediamtx_status"] = "spawn_failed"
+        webrtc_publisher_state["last_error"] = str(error)
+        _mediamtx_process = None
+        return
+    webrtc_publisher_state["mediamtx_status"] = "starting"
+
+
+def _ensure_mediamtx_running() -> None:
+    if _mediamtx_alive():
+        webrtc_publisher_state["mediamtx_status"] = "running"
+        return
+    if _mediamtx_process is not None:
+        logger.warning("webrtc_publisher.mediamtx_exited returncode=%s", _mediamtx_process.returncode)
+    _start_mediamtx()
+
+
+def stop_mediamtx() -> None:
+    """Best-effort graceful shutdown, used on worker cancellation. Never
+    raises."""
+    global _mediamtx_process
+    if _mediamtx_process is None:
+        return
+    try:
+        _mediamtx_process.terminate()
+        _mediamtx_process.wait(timeout=5)
+    except Exception:
+        try:
+            _mediamtx_process.kill()
+        except Exception:
+            pass
+    _mediamtx_process = None
+    webrtc_publisher_state["mediamtx_status"] = "stopped"
+
+
+# --------------------------------------------------------------- per-camera path sync
+
+def _config_request(method: str, path: str, payload: dict | None = None) -> tuple[int, str]:
+    """Talks to MediaMTX's own local config REST API (never the cloud
+    control plane) -- returns (status_code, body_text); never raises, a
+    status of 0 means the request itself failed (MediaMTX unreachable)."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(MEDIAMTX_API_BASE + path, data=data, method=method,
+                                      headers={"Content-Type": "application/json"} if data is not None else {})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode() if error.fp else ""
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        logger.warning("webrtc_publisher.mediamtx_api_unreachable path=%s error=%s", path, error)
+        return 0, str(error)
+
+
+def sync_camera_paths(camera_url_fn) -> None:
+    """Reconciles MediaMTX's configured paths against the current known-
+    camera set -- adds a path for every camera not yet configured, removes
+    one for every camera no longer known (removed/reassigned since the
+    last sync), exactly the same "diff against latest known state" shape
+    _reconcile_relay_commands() already uses for live relay activation.
+    Path name is the camera's own camera_id (already an opaque, unique
+    identifier -- consistent with how S3 key prefixes address cameras
+    elsewhere in this codebase), never the camera_number, so a path never
+    needs renaming if a camera is moved to a different slot.
+
+    camera_url_fn(camera_number) -> credentialed RTSP URL is injected by
+    the caller (main.py's own camera_url()) rather than imported directly
+    -- main.py is what imports this module to wire its background task, so
+    importing back from main.py would be a circular import; this mirrors
+    the same dependency-injection shape already used for
+    register_live_playlist_routes(..., local_identity=lambda: ...) in
+    main.py's own route registration. The credential is read once here,
+    handed straight to MediaMTX's local (loopback-only) config API, and
+    never logged, returned, or exposed to any other caller -- MediaMTX
+    itself is the only thing that ever opens the RTSP connection."""
+    with _lock:
+        camera_map = dict(_camera_map)
+    desired = set(camera_map)
+
+    for camera_id in _known_paths - desired:
+        status, _ = _config_request("DELETE", f"/v3/config/paths/delete/{camera_id}")
+        if status in (200, 404):
+            _known_paths.discard(camera_id)
+        else:
+            logger.warning("webrtc_publisher.path_delete_failed camera_id=%s status=%s", camera_id, status)
+
+    for camera_id in desired - _known_paths:
+        camera_number = camera_map[camera_id]
+        try:
+            source = camera_url_fn(camera_number)
+        except Exception as error:
+            logger.warning("webrtc_publisher.camera_url_unavailable camera_id=%s error=%s", camera_id, error)
+            continue
+        status, _ = _config_request("POST", f"/v3/config/paths/add/{camera_id}", {"source": source, "sourceOnDemand": True})
+        if status in (200, 201):
+            _known_paths.add(camera_id)
+        else:
+            logger.warning("webrtc_publisher.path_add_failed camera_id=%s status=%s", camera_id, status)
+
+
+# --------------------------------------------------------------- WHEP signaling bridge
+
+def _resolve_location(location: str) -> str:
+    """MediaMTX's Location header (WHEP spec) may be a path-absolute
+    reference ("/{path}/whep/{secret}") rather than a full URL --
+    resolved against MEDIAMTX_WEBRTC_BASE either way."""
+    if location.startswith("http://") or location.startswith("https://"):
+        return location
+    return MEDIAMTX_WEBRTC_BASE + (location if location.startswith("/") else f"/{location}")
+
+
+def whep_offer(path_name: str, sdp_offer: str) -> tuple[str, str] | None:
+    """POSTs a complete (non-trickle -- see module docstring) SDP offer to
+    MediaMTX's local WHEP endpoint for one camera's path. Returns
+    (session_location, sdp_answer) on success, None on any failure
+    (MediaMTX unreachable, path not found/no source, invalid SDP) -- the
+    caller treats None exactly like "P2P isn't available for this
+    session right now", which the browser's own bounded timeout already
+    turns into a relay fallback with zero special-casing needed here."""
+    request = urllib.request.Request(
+        f"{MEDIAMTX_WEBRTC_BASE}/{path_name}/whep",
+        data=sdp_offer.encode(), method="POST",
+        headers={"Content-Type": "application/sdp"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            location = response.headers.get("Location")
+            answer_sdp = response.read().decode()
+            if not location or not answer_sdp.strip():
+                logger.warning("webrtc_publisher.whep_offer_malformed_response path=%s", path_name)
+                return None
+            return _resolve_location(location), answer_sdp
+    except urllib.error.HTTPError as error:
+        logger.warning("webrtc_publisher.whep_offer_rejected path=%s status=%s", path_name, error.code)
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        logger.warning("webrtc_publisher.whep_offer_unreachable path=%s error=%s", path_name, error)
+        return None
+
+
+def _forward_client_ice_candidate(session_location: str, candidate: dict) -> None:
+    """Best-effort only -- see module docstring's non-trickle-by-design
+    note. A failure here never surfaces anywhere; the offer/answer
+    exchange already completed (this is only ever called for a session
+    that already has a session_location) so a lost late candidate at
+    worst slightly delays -- never prevents -- ICE connectivity, since
+    the offer/answer SDPs already carried every candidate gathered
+    before they were sent."""
+    candidate_line = str(candidate.get("candidate", "")).strip()
+    if not candidate_line:
+        return
+    mid = candidate.get("sdpMid")
+    media_line = f"m={mid}" if isinstance(mid, str) and mid else "m=application"
+    fragment = f"{media_line}\r\na=mid:{mid if isinstance(mid, str) else '0'}\r\na={candidate_line}\r\n"
+    request = urllib.request.Request(
+        session_location, data=fragment.encode(), method="PATCH",
+        headers={"Content-Type": "application/trickle-ice-sdpfrag"},
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5).close()
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as error:
+        logger.info("webrtc_publisher.ice_forward_failed error=%s", error)
+
+
+def _handle_pending_signal(camera_url_fn, item: dict) -> None:
+    session_id = item.get("session_id")
+    camera_id = item.get("camera_id")
+    kind = item.get("kind")
+    payload = item.get("payload") or {}
+    if not isinstance(session_id, str) or not isinstance(camera_id, str):
+        return
+
+    if kind == "offer":
+        sdp = str(payload.get("sdp", ""))
+        if not sdp.strip():
+            return
+        with _lock:
+            path_configured = camera_id in _known_paths
+        if not path_configured:
+            logger.info("webrtc_publisher.offer_for_unconfigured_camera camera_id=%s", camera_id)
+            return
+        result = whep_offer(camera_id, sdp)
+        if result is None:
+            return
+        location, answer_sdp = result
+        _whep_sessions[session_id] = location
+        _control_plane_post(f"/api/appliance/live/{camera_id}/p2p/answer", {"session_id": session_id, "sdp": answer_sdp})
+    elif kind == "ice_client":
+        location = _whep_sessions.get(session_id)
+        if location:
+            _forward_client_ice_candidate(location, payload)
+        # No location yet (offer not processed first, or already failed) --
+        # dropped, matching _forward_client_ice_candidate()'s own
+        # best-effort contract.
+
+
+async def _bridge_tick(camera_url_fn) -> None:
+    response = _control_plane_get("/api/appliance/live/p2p/pending")
+    if not isinstance(response, dict):
+        return
+    pending = response.get("pending")
+    if not isinstance(pending, list):
+        return
+    for item in pending:
+        if isinstance(item, dict):
+            _handle_pending_signal(camera_url_fn, item)
+
+
+async def webrtc_publisher_worker(camera_url_fn) -> None:
+    """Top-level background task -- mirrors live_relay_uploader.live_relay_
+    worker()'s own shape (role/flag gate, sleep-forever when disabled,
+    scan-and-sleep loop when enabled, exceptions logged and retried next
+    cycle, never crash the process). Disabled by ANYAICAM_LIVE_P2P_ENABLED
+    defaulting false -- this task does nothing (not even spawn MediaMTX)
+    until that flag is explicitly set, matching the same fail-closed
+    default every other opt-in worker in this codebase already uses."""
+    import asyncio
+
+    if RUNTIME_ROLE not in {"edge", "combined"} or not LIVE_P2P_ENABLED:
+        webrtc_publisher_state["worker_status"] = "disabled"
+        while True:
+            await asyncio.sleep(3600)
+
+    webrtc_publisher_state["worker_status"] = "running"
+    logger.info("webrtc_publisher.worker_started")
+    last_config_refresh = 0.0
+    try:
+        while True:
+            try:
+                _ensure_mediamtx_running()
+                now = time.monotonic()
+                if now - last_config_refresh >= CONFIG_REFRESH_SECONDS:
+                    await asyncio.to_thread(_refresh_camera_map)
+                    await asyncio.to_thread(sync_camera_paths, camera_url_fn)
+                    last_config_refresh = now
+                await _bridge_tick(camera_url_fn)
+                webrtc_publisher_state["last_scan_at"] = time.time()
+                webrtc_publisher_state["last_error"] = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                webrtc_publisher_state["last_error"] = str(error)
+                logger.warning("webrtc_publisher.worker_iteration_failed error=%s", error)
+            await asyncio.sleep(SCAN_SECONDS)
+    finally:
+        stop_mediamtx()
