@@ -3407,6 +3407,18 @@ Dogfooded against the real current staging container (`portal-1c9d956` compared 
 
 **This check is now a mandatory step in every future staging/production cutover** -- run it between "candidate healthy" and "connect network alias," and only proceed past a `CUTOVER_BLOCKED` result by fixing the actual mount/database problem it reports, never by re-running with `--force` outside the documented first-deploy case.
 
-### State to resume from
+### State to resume from (superseded by the entry below)
 
 Phase 2 (MediaMTX installer wiring, still not started by the live VMS service) is next for P2P. Customer Event Notifications remains the separate, still-open milestone described earlier in this document.
+
+## Milestone: P2P Phase 2 -- MediaMTX installer wiring built and tested, still fully inert (2026-09-17)
+
+`installer/10-install-mediamtx.sh` installs the MediaMTX binary from a release payload embedded at build time (`build_release_installer.py`'s new optional `--mediamtx-binary`/`--mediamtx-sha256` -- omitted on an ordinary VMS-only rebuild, which then silently no-ops this step exactly as before). Only ever places the binary (mode 0755, best-effort root ownership after the copy, matching `06-deploy-vms.sh`'s own established chown-with-fallback pattern) -- no systemd unit, no process start, no `vms.env` changes, no VMS service restart. `webrtc_publisher.py` remains the sole owner of MediaMTX's process lifecycle.
+
+9 new bash tests (no-payload no-op, checksum-mismatch refusal, successful install, repair-safe idempotency) plus a real end-to-end build smoke test (`build_release_installer.py` invoked for real against this repo's own committed state with a fake-but-checksum-valid MediaMTX binary; the resulting tarball inspected and confirmed to contain `10-install-mediamtx.sh` + `payload/mediamtx/{mediamtx,mediamtx.sha256}` correctly). 85 passed (was 76) in the bash suite, same 11 pre-existing unrelated failures.
+
+**Nothing installed on the real Ryzen appliance** -- this milestone only adds the capability to a future release build; no release has actually been rebuilt or redeployed with MediaMTX included yet, and P2P remains feature-flagged off regardless.
+
+### State to resume from
+
+Both P2P phases the user authorized (1: real-binary verification: passed; 2: installer wiring: built/tested) are complete. Remaining before any real Ryzen P2P test: build an actual release that includes a real MediaMTX binary, deploy it to Ryzen (repair-install, matching the established division of labor), confirm the binary lands correctly and MediaMTX still does not start, then get explicit approval for the single-camera controlled test with `ANYAICAM_LIVE_P2P_ENABLED` -- none of that has been requested yet. Customer Event Notifications remains the separate, still-open milestone described earlier in this document. A large new milestone (automatic local recording storage/disk-space management) was requested mid-session and is currently at the audit stage -- see the conversation for findings so far, not yet written to this file.
