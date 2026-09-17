@@ -651,6 +651,37 @@ assert_exit "re-running install_mediamtx (repair) on an already-current binary s
 AFTER_MTIME="$(stat -c %Y "$MEDIAMTX_BINARY_PATH" 2>/dev/null || stat -f %m "$MEDIAMTX_BINARY_PATH")"
 assert_eq "an already-current binary is left untouched, not re-copied" "$BEFORE_MTIME" "$AFTER_MTIME"
 
+# 17. Regression test for a real bug found in live P2P verification on
+#     Ryzen (2026-09-17): install_mediamtx() places the binary on the
+#     HOST at MEDIAMTX_INSTALL_DIR (/opt/anyaicam/mediamtx), but the VMS
+#     process that actually needs to spawn it (webrtc_publisher.py, via
+#     subprocess.Popen(MEDIAMTX_BINARY, ...)) runs INSIDE the vms
+#     container -- and nothing had ever mounted that host directory into
+#     the container. Confirmed live: ANYAICAM_LIVE_P2P_ENABLED=true, the
+#     binary correctly installed and checksum-verified on the host, and
+#     webrtc_publisher_state still went straight to 'spawn_failed'
+#     (FileNotFoundError) because /opt/anyaicam/mediamtx simply didn't
+#     exist inside the container. install_mediamtx()'s own unit tests
+#     above only ever exercised the host-side copy/checksum step in
+#     isolation and could never have caught this -- this test instead
+#     checks the actual repo docker-compose.yml (the exact file every
+#     release payload ships and 06-deploy-vms.sh installs verbatim) for
+#     a volume mount making MEDIAMTX_INSTALL_DIR reachable inside the
+#     container at the same path, so this exact gap can never silently
+#     reappear.
+echo
+echo "== docker-compose.yml / MediaMTX mount consistency =="
+# The real, unmodified constant -- not $MEDIAMTX_INSTALL_DIR, which the
+# fixture setup above (re)pointed at $FIXTURE_ROOT/opt/anyaicam/mediamtx
+# for sandboxing install_mediamtx() itself; that shadowing must never
+# leak into this check, which needs the actual host path 10-install-
+# mediamtx.sh installs to on a real appliance.
+REAL_MEDIAMTX_INSTALL_DIR="/opt/anyaicam/mediamtx"
+REPO_COMPOSE_FILE="$INSTALLER_DIR/../docker-compose.yml"
+assert_exit "repo docker-compose.yml exists" 0 test -f "$REPO_COMPOSE_FILE"
+assert_exit "docker-compose.yml mounts the real MediaMTX install dir into the container (so webrtc_publisher.py's subprocess.Popen can actually find the binary it verified was installed)" \
+    0 grep -qF "$REAL_MEDIAMTX_INSTALL_DIR:$REAL_MEDIAMTX_INSTALL_DIR" "$REPO_COMPOSE_FILE"
+
 echo
 echo "== migrate_legacy_persistent_data() / migrate_legacy_persistent_file() =="
 
