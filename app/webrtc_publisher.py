@@ -93,7 +93,18 @@ STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
 
 MEDIAMTX_BINARY = os.environ.get("ANYAICAM_MEDIAMTX_BINARY", "/opt/anyaicam/mediamtx/mediamtx").strip()
-MEDIAMTX_CONFIG_PATH = Path(os.environ.get("ANYAICAM_MEDIAMTX_CONFIG", str(STATE_DIR / "mediamtx.yml")))
+# NOT under STATE_DIR (/var/lib/anyaicam) -- confirmed live on Ryzen that
+# directory is mounted READ-ONLY inside the VMS container (same real
+# constraint local_storage_manager.py's own module docstring documents
+# hitting first), so every _write_mediamtx_config() call failed with
+# "[Errno 30] Read-only file system" and MediaMTX never started, even
+# with the binary itself correctly installed and reachable. This config
+# is fully regenerated from current camera/ICE state on every single
+# call (render_mediamtx_config() takes no prior-file input), so it has
+# no reason to persist across a container restart -- an ordinary
+# container-local path is the correct choice here, not a second host
+# mount.
+MEDIAMTX_CONFIG_PATH = Path(os.environ.get("ANYAICAM_MEDIAMTX_CONFIG", "/tmp/anyaicam-mediamtx.yml"))
 # Bound to loopback only -- see module docstring. Never override these to a
 # non-loopback address without also firewalling them; that would expose
 # MediaMTX's config API (which can rewrite any camera's source URL,
