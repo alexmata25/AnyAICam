@@ -145,11 +145,47 @@ def test_enroll_succeeds_and_never_returns_a_private_key(db_path, appliance_clie
     body = response.json()
     assert body["gateway_public_key"] == "z" * 43 + "="
     assert body["gateway_endpoint"] == "gateway.example.test:51820"
+    assert body["gateway_tunnel_address"] == "10.70.0.1"
     assert body["status"] == "enrolled"
     assert "tunnel_address" in body and body["tunnel_address"].startswith("10.70.")
-    # The response contract has exactly these four fields -- nothing that
+    # The response contract has exactly these five fields -- nothing that
     # could ever be a private key, a credential, or any other secret.
-    assert set(body.keys()) == {"tunnel_address", "gateway_public_key", "gateway_endpoint", "status"}
+    assert set(body.keys()) == {"tunnel_address", "gateway_public_key", "gateway_endpoint", "gateway_tunnel_address", "status"}
+
+
+def test_enroll_response_gateway_tunnel_address_is_a_single_host_never_a_route(db_path, appliance_client):
+    """Real incident (2026-09-18): the appliance side used this value to
+    build AllowedIPs and got 0.0.0.0/0 instead of a single host, which
+    made wg-quick install a full default-route override into the tunnel
+    the instant the interface came up -- see wireguard.py's own
+    render_wg_conf() docstring for the full incident and its fix. This
+    asserts the cloud side's own half of that contract: the value handed
+    to every enrolling appliance is always exactly one host address
+    (a /32 network, via ipaddress), structurally, never a range."""
+    import ipaddress as _ipaddress
+
+    _seed(db_path)
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll", json={"public_key": _real_public_key()}, headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    tunnel_address = response.json()["gateway_tunnel_address"]
+    assert tunnel_address != "0.0.0.0"
+    network = _ipaddress.ip_network(f"{tunnel_address}/32", strict=True)
+    assert network.num_addresses == 1
+
+
+def test_enroll_response_gateway_tunnel_address_reflects_live_env_not_a_stale_default(db_path, appliance_client, monkeypatch):
+    """Same real-config-must-stay-live principle as
+    test_reenrolling_after_a_gateway_config_change_returns_the_current_endpoint
+    below, applied to this field: if the gateway's own tunnel address is
+    ever reconfigured (e.g. a different TUNNEL_CIDR), a freshly enrolling
+    appliance must see the CURRENT value, not a value cached anywhere."""
+    monkeypatch.setattr(wireguard_remote, "GATEWAY_TUNNEL_ADDRESS", "10.99.0.1")
+    _seed(db_path)
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll", json={"public_key": _real_public_key()}, headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.json()["gateway_tunnel_address"] == "10.99.0.1"
 
 
 def test_enroll_persists_only_the_public_key_never_any_other_submitted_field(db_path, appliance_client):

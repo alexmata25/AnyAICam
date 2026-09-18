@@ -44,18 +44,40 @@ def generate_keypair() -> tuple[str, str]:
 
 
 def render_wg_conf(*, private_key: str, tunnel_address: str, gateway_public_key: str, gateway_endpoint: str,
+                    gateway_tunnel_address: str,
                     persistent_keepalive: int = DEFAULT_PERSISTENT_KEEPALIVE_SECONDS) -> str:
     """Pure function -- the exact text a real `wg-quick up` would read.
-    AllowedIPs = 0.0.0.0/0 in the [Peer] block means "route all of this
-    interface's own traffic through the tunnel when it's up", standard
-    for a single-upstream-peer client config; this does NOT affect the
-    appliance's real LAN-facing interface or its normal internet route
-    at all -- routing scope is confined to WHATEVER traffic is
-    explicitly directed at the wg0 interface itself (see the plan doc
-    Sec 9's own "own virtual NIC, own address space" note), never a
-    system-wide route change. PersistentKeepalive keeps the NAT mapping
-    alive (plan doc Sec 8) -- a standard WireGuard client setting, not
-    custom logic."""
+
+    AllowedIPs is deliberately `{gateway_tunnel_address}/32` -- exactly
+    one host, the gateway's own tunnel address, never a broader range
+    and never 0.0.0.0/0. This appliance only ever needs to reach the
+    gateway over this tunnel (hub-and-spoke: appliances never talk to
+    each other directly, see the plan doc Sec 9), so that one /32 is
+    both necessary and sufficient.
+
+    A real incident (2026-09-18) found this using AllowedIPs = 0.0.0.0/0
+    instead: `wg-quick up` treats that value as "route ALL of this
+    host's traffic through the tunnel", which it installs as a real
+    default-route override into the main routing table the instant the
+    interface comes up -- regardless of whether a handshake has ever
+    succeeded. On the real Ryzen appliance this happened against, no
+    handshake ever completed, so every packet the OS routed into the
+    tunnel (including this appliance's own SSH and Tailscale management
+    traffic, both of which use the host's normal routing table) was
+    silently dropped -- a real, live remote-management outage. The
+    containerized VMS app's own HTTPS heartbeat kept working the whole
+    time specifically because Docker's own NAT path never touches the
+    host routing table at all, which is what made the asymmetry
+    diagnosable. AllowedIPs must never again be anything broader than a
+    single host's /32 (or, if a genuine full-tunnel appliance product
+    feature is ever deliberately designed in the future, that has to be
+    its own explicit, reviewed decision -- never an accidental default
+    here). See tests/test_wireguard_agent.py's own
+    AllowedIpsNeverInstallsAFullTunnelRouteTests, which exists
+    specifically to catch a regression of this exact incident.
+
+    PersistentKeepalive keeps the NAT mapping alive (plan doc Sec 8) --
+    a standard WireGuard client setting, not custom logic."""
     return (
         '[Interface]\n'
         f'PrivateKey = {private_key}\n'
@@ -64,7 +86,7 @@ def render_wg_conf(*, private_key: str, tunnel_address: str, gateway_public_key:
         '[Peer]\n'
         f'PublicKey = {gateway_public_key}\n'
         f'Endpoint = {gateway_endpoint}\n'
-        'AllowedIPs = 0.0.0.0/0\n'
+        f'AllowedIPs = {gateway_tunnel_address}/32\n'
         f'PersistentKeepalive = {persistent_keepalive}\n'
     )
 
@@ -116,11 +138,13 @@ def enroll_wireguard(config, portal_client, *, replace_existing: bool = False) -
         'tunnel_address': response['tunnel_address'],
         'gateway_public_key': response['gateway_public_key'],
         'gateway_endpoint': response['gateway_endpoint'],
+        'gateway_tunnel_address': response['gateway_tunnel_address'],
         'status': response['status'],
     }
     save_wireguard_identity(config, identity)
     save_wg_conf(config, render_wg_conf(
         private_key=private_key, tunnel_address=identity['tunnel_address'],
         gateway_public_key=identity['gateway_public_key'], gateway_endpoint=identity['gateway_endpoint'],
+        gateway_tunnel_address=identity['gateway_tunnel_address'],
     ))
     return identity

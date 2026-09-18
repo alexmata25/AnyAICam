@@ -61,6 +61,33 @@ TUNNEL_CIDR = os.environ.get("ANYAICAM_WIREGUARD_TUNNEL_CIDR", "10.70.0.0/16").s
 # item.
 GATEWAY_PUBLIC_KEY = os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_PUBLIC_KEY", "").strip()
 GATEWAY_ENDPOINT = os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_ENDPOINT", "").strip()
+# .1 in TUNNEL_CIDR is reserved for the gateway itself (see
+# _assign_tunnel_address() below and app/wireguard_gateway/gateway_config.py's
+# own identical DEFAULT_GATEWAY_ADDRESS, which this deliberately matches --
+# same env var name, same default, one real value, not a second guess at
+# it). Returned to every enrolling appliance so its own AllowedIPs can be
+# scoped to exactly this one host instead of a full-tunnel 0.0.0.0/0.
+#
+# Real incident, 2026-09-18: the appliance-agent's rendered wg0.conf used
+# AllowedIPs = 0.0.0.0/0, which made `wg-quick up` install a full
+# default-route override into the tunnel the instant the interface came
+# up -- with no working handshake yet, every packet the appliance's host
+# routing table sent into that dead tunnel simply vanished, silently
+# blackholing its own SSH/Tailscale management traffic. The containerized
+# VMS app's own HTTPS heartbeat kept working throughout only because
+# Docker's own NAT path never touches the host routing table at all --
+# that asymmetry (app traffic fine, host-level traffic dead) is what
+# actually diagnosed this. See appliance-agent/anyaicam_agent/wireguard.py's
+# render_wg_conf() for the corresponding appliance-side fix.
+#
+# Read fresh from the environment on every response, never persisted to
+# the peer row -- unlike gateway_public_key/gateway_endpoint, which WERE
+# persisted and, in this same incident's earlier discovery, were found
+# silently stale on an idempotent re-enroll (see enroll_peer()'s own
+# comment on that fix below). This value has no such history to repeat:
+# it was never a persisted column to begin with, so there's nothing to
+# go stale.
+GATEWAY_TUNNEL_ADDRESS = os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_ADDRESS", "10.70.0.1").strip()
 
 
 def generate_keypair() -> tuple[str, str]:
@@ -281,5 +308,6 @@ def register_wireguard_remote_appliance_routes(app: FastAPI) -> None:
             "tunnel_address": peer["tunnel_address"],
             "gateway_public_key": peer["gateway_public_key"],
             "gateway_endpoint": peer["gateway_endpoint"],
+            "gateway_tunnel_address": GATEWAY_TUNNEL_ADDRESS,
             "status": peer["status"],
         }
