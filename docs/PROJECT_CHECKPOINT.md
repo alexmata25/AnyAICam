@@ -3940,3 +3940,28 @@ Both Hybrid pricing-audit passes (`e013fe3`, this one) are complete and pushed. 
 2. **Measure how much event-clip playback WireGuard/direct-appliance access can actually serve without AWS transfer**, once WireGuard is live, and recalculate the worst-case Hybrid cost using that real, measured fraction rather than the placeholder 5-100%-viewed brackets this pass used.
 
 $9.99/camera/month remains the current working price, unchanged. WireGuard stays frozen exactly at `c332aa9` until the user explicitly says resume.
+
+## Milestone: WireGuard tunnel validation pass -- real handshake never occurred, stale gateway endpoint baked into Ryzen's config at enrollment time (2026-09-18)
+
+Follow-up to the gated `wireguard_interface_up` bring-up (marker `07922ecc5a694ec68a9728002812bb4b`), reported by the user as "completed successfully" -- true only in the narrow sense that the privileged watcher picked up and ran the marker. The actual `wg-quick up` invocation failed.
+
+**Root cause, confirmed via `journalctl -u anyaicam-privileged-watcher.service` on the real Ryzen (read-only, no sudo needed to read the unit's own journal)**:
+```
+Executing ['wg-quick', 'up', '/etc/anyaicam/wireguard/wg0.conf'] for marker type=wireguard_interface_up command_id=07922ecc5a694ec68a9728002812bb4b
+[#] ip link add wg0 type wireguard
+[#] wg setconf wg0 /dev/fd/63
+Name or service not known: `staging-wireguard-gateway.internal.anyaicam.test:51820'
+Configuration parsing error
+[#] ip link delete dev wg0
+```
+Ryzen's WireGuard enrollment (`ryzen_wireguard_enroll_only.py`, run before the staging portal's WireGuard env vars were corrected) rendered `/etc/anyaicam/wireguard/wg0.conf` with the *stale placeholder* gateway endpoint (`staging-wireguard-gateway.internal.anyaicam.test:51820`) that was live in the portal's env at that time -- not the real `34.194.19.113:51820` the portal was later corrected to. `wg-quick` can't resolve that placeholder hostname (it doesn't exist in DNS), fails to parse the config, and cleans up the interface it had just created -- so `wg0` does not exist on Ryzen right now, confirmed directly (`ip addr show wg0` / `ip link show wg0` both report "Device does not exist").
+
+**Confirms this is a config staleness issue, not a mechanism failure**: the queuing/dispatch pipeline itself worked exactly as designed -- correct marker picked up, correct command invoked, clean rollback on failure (no stuck half-up interface). The staging gateway's reconciler independently registered Ryzen's peer from the DB (`wg show wg0` on the gateway shows `peer: LLvcc2gaqQCYb/...` with `allowed ips: 10.70.0.2/32`) -- but critically **no "latest handshake" field is present at all**, confirming zero real handshake ever occurred, consistent with Ryzen's interface never having come up. A peer being *registered* is not the same as a *working tunnel*.
+
+**Independently verified everything else stayed healthy throughout**: Ryzen VMS `Up 11 hours (healthy)`, `/health` reports `ok`, `build_id f07e1d03c...` unchanged; all 5 real cameras have recording segments and AI media from within the last few minutes of the check.
+
+**The real fix, not yet executed**: re-run the already-built, already-tested `ops/ryzen_wireguard_enroll_only.py` (same non-privileged, `--yes`-gated, idempotent script used for the original enrollment) so it re-fetches the gateway endpoint/public key from the now-corrected portal and re-renders `wg0.conf` with the real value. This step does **not** queue `wireguard_interface_up` (by the script's own explicit design) and does not touch any network/interface state -- it only rewrites two files already owned by the unprivileged `anyaicam` user. A **second**, fresh `wireguard_interface_up` queue action is then needed to actually bring the interface up against the corrected config -- that is a new instance of the same privileged/network action already gated once, and needs its own approval.
+
+### State to resume from
+
+WireGuard tunnel validation is blocked, not failed -- the mechanism is proven sound, the config content is stale. Tasks 2 (other-systems health) is independently confirmed clean. Tasks 1 (real tunnel), 3 (per-camera testing), 4 (fallback proof), and 5 (playback-path measurement) all require a real handshake first and were not attempted against a tunnel that doesn't exist. Next step: re-run the enrollment-only script (non-privileged, no network/interface change) to refresh `wg0.conf`, then a fresh gated `wireguard_interface_up` action. Production not touched. Hybrid pricing/source untouched, still checkpointed at `a11416a`. AACO not started.
