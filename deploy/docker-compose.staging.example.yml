@@ -90,13 +90,10 @@ services:
       # the file to be reachable, not because this process needs write
       # access to portal's own broader data.
       - /var/lib/anyaicam-staging/db:/app/data
-    # The real WireGuard UDP listener -- deliberately left empty/
-    # commented out until a real security-group/firewall change
-    # explicitly opens it; adding a "- 51820:51820/udp" line alone does
-    # nothing on a host whose firewall still blocks the port.
-    # ports:
-    #   - "51820:51820/udp"
-    ports: []
+    # The real WireGuard UDP listener -- published now that the
+    # staging security group has the matching inbound UDP 51820 rule.
+    ports:
+      - "51820:51820/udp"
 
 volumes:
   caddy_data:
