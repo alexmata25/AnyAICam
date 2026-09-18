@@ -3824,6 +3824,22 @@ WireGuard gateway + enrollment + reconciliation + telemetry are now proven live 
 
 **No source code was changed this pass** -- audit, artifact build, and staging only. `reconcile/golden-foundation-20260911` is unchanged in content from `8d5a075`; only this doc entry is new.
 
-### State to resume from
+### State to resume from (superseded by the entry below)
 
 Everything up to the next real privileged Ryzen command is now finished and verified: the gateway/DISPATCH/auto-enrollment mechanism was already complete and is re-confirmed tested; the agent redeploy artifact is built, hash-verified, staged, and pre-extracted on Ryzen. The next real step is the agent redeploy itself (`sudo ./install.sh --repair && sudo bash validate.sh` inside `~/anyaicam-release-8d5a075c/`, the same repair-install pattern already used for every prior Ryzen release including LPR/PPE and Face Access) -- see the coordinator's own report for the exact command and explanation. After that: set `ANYAICAM_WIREGUARD_ENABLED=true` in the agent's own config (not yet done), then the separately-authorized real-gateway/security-group step, then a real `wg-quick up`. AACO was not started. Production was not touched. No real WireGuard interface, route, firewall rule, or privileged network configuration was created or modified anywhere this pass, on Ryzen or on staging.
+
+## Milestone: independent post-repair-install verification finds the reported Ryzen redeploy never actually landed -- wrong staged directory was run (2026-09-18)
+
+The operator reported running the exact command from the entry above and getting `validate.sh` 0 failures. Per their own explicit request, this was independently re-verified rather than taken at face value.
+
+**Finding: the real running container is still on the old build.** `curl http://127.0.0.1:8000/version` on the live `anyaicam-vms` container reports `build_id: d838d8c39cca014065257fb120d2bb1d96ba68e1` -- the pre-WireGuard, pre-this-task commit -- not `8d5a075`. Container uptime (`docker ps`, ~5.4h at check time) is also consistent with no recent restart.
+
+**Root cause, found via `~/.bash_history` on Ryzen**: the operator's shell history shows the *last* install/validate pair actually run was `cd ~/anyaicam-repair-d838d8c && sudo ./install.sh --repair && sudo ./validate.sh` -- a different, older staged directory left over from the earlier LPR/PPE repair pass, not `~/anyaicam-release-8d5a075c` (the one this task actually built and staged). This Ryzen home directory has accumulated several similarly-named release directories across past milestones (`releases`, `releases-p2p`, `releases-p2p-v2`, `releases-trickle`, `anyaicam-repair-42f75bc`, `anyaicam-repair-d838d8c`, now `anyaicam-release-8d5a075c`) -- an easy mix-up, not a tooling or code defect. Re-running the repair-install from the old directory reinstalled the same already-running `d838d8c` build, which is exactly why `validate.sh` reported 0 failures (nothing was actually broken by it) while the build itself never advanced.
+
+**What is independently confirmed healthy, unaffected by the build mismatch**: all 5 cameras (`camera1`-`camera5`) have real recording segments written within the last 5 minutes at check time -- recording is fine. This finding is narrowly about which build is deployed, not about appliance health in general.
+
+**No source or infrastructure change made this pass.** `reconcile/golden-foundation-20260911` content is unchanged; this is a documentation-only correction.
+
+### State to resume from
+
+The real next step is unchanged in substance from the prior entry -- the agent redeploy to `8d5a075` still needs to actually happen -- but it has NOT happened yet despite the earlier report. The already-staged, already-checksum-verified artifact is still sitting at `~/anyaicam-release-8d5a075c/` on Ryzen, untouched. The correct command is still `cd ~/anyaicam-release-8d5a075c && sudo ./install.sh --repair && sudo bash validate.sh` -- run from that exact directory, not any of the older ones. After a successful run, `/version`'s `build_id` should read `8d5a075...`, not `d838d8c...` -- that field is the one to check to confirm it actually took effect, not just a 0-failures `validate.sh` result. `ANYAICAM_WIREGUARD_ENABLED` is still unset; no real WireGuard interface exists anywhere. AACO was not started. Production was not touched.
