@@ -1166,6 +1166,22 @@ def apply_migrations():
         if 'source_media_id' not in detection_event_media_columns: db.execute('ALTER TABLE detection_event_media ADD COLUMN source_media_id TEXT REFERENCES detection_event_media(id)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_detection_event_media_source ON detection_event_media(source_media_id)')
 
+        # WireGuard direct event-clip fetch, prepared (2026-09-18):
+        # the appliance's own local /recordings/... URL for this clip,
+        # exactly the same string event_media_uploader.py's
+        # _safe_recording_url() already computes and validates locally --
+        # never re-derived from s3_key, whose date-based prefix does not
+        # preserve the original local subfolder. NULL for every
+        # already-uploaded clip (this column did not exist when they were
+        # registered) and for every future upload from an appliance still
+        # running old agent code that never sends this new, optional
+        # field -- both are simply ineligible for the direct/WireGuard
+        # fetch path (live_view_wireguard.py's own
+        # register_event_media_wireguard_routes() 404s cleanly on NULL),
+        # never a broken/unknown reference. Purely additive: no existing
+        # row, query, or upload behavior changes.
+        if 'local_relative_path' not in detection_event_media_columns: db.execute('ALTER TABLE detection_event_media ADD COLUMN local_relative_path TEXT')
+
         # Notification external-delivery reliability (2026-09-16): the
         # real address/number a delivery attempt was actually sent to,
         # captured at send time -- never re-derived from the customer's

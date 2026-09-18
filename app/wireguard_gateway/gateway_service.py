@@ -44,10 +44,13 @@ satisfied either way).
 Polls the database's own current appliance_wireguard_peers rows (an
 authoritative, human/UI/API-editable set -- see wireguard_remote.py) on
 a fixed interval and drives a WireGuardInterfaceProvider (see
-interface_provider.py) to match. No live-view/proxy wiring is called
-from here in this pass -- proxy.py exists and is tested independently,
-ready for a future Phase C caller to use once a real tunnel exists to
-proxy over.
+interface_provider.py) to match. Optionally (INTERNAL_PROXY_ENABLED,
+off by default) also starts proxy_server.py's internal, docker-network-
+only HTTP server on a background thread alongside the reconcile loop --
+see that module's own docstring for why this is safe to add. Neither the
+reconcile loop nor the proxy server has any concept of a customer,
+session, or camera; live_view_wireguard.py (running in the SEPARATE
+portal container) owns all of that.
 """
 
 from __future__ import annotations
@@ -82,6 +85,17 @@ RECONCILE_INTERVAL_SECONDS = int(os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_RECO
 # applicable to a production deploy: production is out of scope for this
 # whole feature so far.
 GATEWAY_PROVIDER_MODE = os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", "system").strip().lower()
+
+# Off by default -- zero behavior change to this already-live process
+# unless explicitly turned on for the Phase C controlled-camera proof
+# (see live_view_wireguard.py). Safe to add: proxy_server.py's own module
+# docstring covers why this listener is never given a host port mapping,
+# so it is reachable only from the existing deploy_default docker
+# network the portal container already shares with this one, never the
+# host or the internet.
+INTERNAL_PROXY_ENABLED = os.environ.get(
+    "ANYAICAM_WIREGUARD_GATEWAY_INTERNAL_PROXY_ENABLED", "false"
+).strip().lower() == "true"
 
 
 def _provider_from_env() -> WireGuardInterfaceProvider:
@@ -138,4 +152,7 @@ def run_forever(
 
 if __name__ == "__main__":  # pragma: no cover - real process entry point, not exercised by tests
     logging.basicConfig(level=logging.INFO)
+    if INTERNAL_PROXY_ENABLED:
+        from .proxy_server import start as start_internal_proxy_server
+        start_internal_proxy_server()
     run_forever()

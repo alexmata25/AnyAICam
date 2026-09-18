@@ -906,10 +906,11 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
-  function attachPlayer(id,playlistUrl){{
+  function attachPlayer(id,playlistUrl,transport){{
+    transport=transport||'relay';
     const tile=tiles[id];
-    const claim=claimTransport(id,'relay');
-    if(claim==='blocked'){{stopPolling(id);return}}  // P2P already won this tile
+    const claim=claimTransport(id,transport);
+    if(claim==='blocked'){{stopPolling(id);return}}  // a faster transport already won this tile
     stopPolling(id);
     destroyHls(id);  // guards against ever running two instances at once
     setStatus(id,'Connecting…');
@@ -925,7 +926,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }}else{{
       setStatus(id,'This browser cannot play live video.');
     }}
-    if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,'relay',tile.startedAt?Date.now()-tile.startedAt:null,null);
+    if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,transport,tile.startedAt?Date.now()-tile.startedAt:null,null);
   }}
 
   function attemptP2PForTile(id){{
@@ -947,6 +948,32 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }});
   }}
 
+  // Opportunistic fourth transport (2026-09-18): the appliance's own
+  // local HLS, fetched over WireGuard through the cloud gateway instead
+  // of via S3/CloudFront (live_view_wireguard.py). Purely additive and
+  // fire-and-forget, exactly like attemptP2PForTile() above -- never
+  // awaited by startSession(), so it can never delay the relay poll that
+  // starts in the very same tick. A disabled flag, an appliance not on
+  // the controlled allow-list, a down tunnel, or an unreachable gateway
+  // all resolve the same way: this fetch simply never succeeds, and
+  // whichever of relay/P2P wins the race proceeds exactly as it does
+  // today. Uses the SAME attachPlayer()/claimTransport() machinery as
+  // relay (both are plain HLS) rather than duplicating it, so error
+  // recovery (handleFatalError) and instrumentation stay identical.
+  async function attemptWireGuardForTile(id){{
+    const tile=tiles[id];
+    let config;
+    try{{config=await(await fetch('/api/customer/live/wireguard/config')).json()}}catch(e){{return}}
+    if(!config||!config.enabled)return;
+    if(tile.stopped||tile.transport)return;
+    const playlistUrl=`/api/customer/live/sessions/${{tile.sessionId}}/wireguard/playlist.m3u8`;
+    let response;
+    try{{response=await fetch(playlistUrl,{{cache:'no-store'}})}}catch(e){{return}}
+    if(!response||!response.ok)return;  // not enabled for this camera, or gateway/tunnel unavailable
+    if(tile.stopped||tile.transport)return;  // relay or P2P already won while this was in flight
+    attachPlayer(id,playlistUrl,'wireguard');
+  }}
+
   async function startSession(id){{
     const tile=tiles[id];
     tile.stopped=false;tile.recoveryAttempts=0;tile.transport=null;tile.startedAt=Date.now();setStatus(id,'Starting live view…');
@@ -956,6 +983,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     const body=await response.json();
     tile.sessionId=body.session_id;
     attemptP2PForTile(id);
+    attemptWireGuardForTile(id);
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
@@ -1375,25 +1403,27 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     pollPlaylist(Date.now()+pollTimeoutMs);
   }}
 
-  function attachPlayer(){{
-    const claim=claimTransport('relay');
-    if(claim==='blocked'){{stopPolling();return}}  // P2P already won
+  function attachPlayer(url,transport){{
+    url=url||playlistUrl;
+    transport=transport||'relay';
+    const claim=claimTransport(transport);
+    if(claim==='blocked'){{stopPolling();return}}  // a faster transport already won
     stopPolling();
     destroyHls();  // guards against ever running two instances at once
     setStatus('Connecting…');
     if(window.Hls&&Hls.isSupported()){{
       hls=new Hls();
-      hls.loadSource(playlistUrl);
+      hls.loadSource(url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;recoveryAttempts=0;video.play().catch(()=>{{}})}});
       hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(data)}});
     }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
-      video.src=playlistUrl;
+      video.src=url;
       video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
     }}else{{
       setStatus('This browser cannot play live video.');
     }}
-    if(claim==='claimed')reportLiveTransportOutcome(sessionId,'relay',startedAt?Date.now()-startedAt:null,null);
+    if(claim==='claimed')reportLiveTransportOutcome(sessionId,transport,startedAt?Date.now()-startedAt:null,null);
   }}
 
   function attemptP2P(){{
@@ -1413,6 +1443,26 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     }});
   }}
 
+  // Opportunistic fourth transport (2026-09-18): see the multi-camera
+  // grid page's own attemptWireGuardForTile() for the full rationale --
+  // identical shape here, reusing this page's own attachPlayer()/
+  // claimTransport() so error recovery and instrumentation stay
+  // identical to the relay path. Fire-and-forget: never awaited by
+  // startSession(), so it can never delay pollPlaylist()'s own relay
+  // attempt starting in the same tick.
+  async function attemptWireGuard(){{
+    let config;
+    try{{config=await(await fetch('/api/customer/live/wireguard/config')).json()}}catch(e){{return}}
+    if(!config||!config.enabled)return;
+    if(stopped||transport)return;
+    const wireguardUrl=`/api/customer/live/sessions/${{sessionId}}/wireguard/playlist.m3u8`;
+    let response;
+    try{{response=await fetch(wireguardUrl,{{cache:'no-store'}})}}catch(e){{return}}
+    if(!response||!response.ok)return;  // not enabled for this camera, or gateway/tunnel unavailable
+    if(stopped||transport)return;  // relay or P2P already won while this was in flight
+    attachPlayer(wireguardUrl,'wireguard');
+  }}
+
   async function startSession(){{
     stopped=false;recoveryAttempts=0;transport=null;startedAt=Date.now();retryButton.hidden=true;setStatus('Starting live view…');
     let response;
@@ -1421,6 +1471,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     const body=await response.json();
     sessionId=body.session_id;
     attemptP2P();
+    attemptWireGuard();
     pollPlaylist(Date.now()+pollTimeoutMs);
   }}
 

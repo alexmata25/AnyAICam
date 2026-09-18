@@ -935,6 +935,17 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         ended_at=str(safe.get('ended_at','')).strip()
         duration_seconds=safe.get('duration_seconds')
         size_bytes=safe.get('size_bytes')
+        # New, optional (2026-09-18): re-validated here, never trusted
+        # from the request alone -- must look like the same
+        # /recordings/... shape event_media_uploader.py's own
+        # _local_path_from_recording_url() already enforces on the
+        # appliance side. An absent or malformed value is silently
+        # dropped (stored as NULL), never a 400 -- this field is purely
+        # additive and must never be able to fail an otherwise-valid
+        # upload registration.
+        local_relative_path=str(safe.get('local_relative_path') or '').strip() or None
+        if local_relative_path and (not local_relative_path.startswith('/recordings/') or '..' in local_relative_path):
+            local_relative_path=None
 
         if not local_event_id:
             raise HTTPException(status_code=400,detail='local_event_id is required.')
@@ -1004,7 +1015,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 db.execute(
                     'UPDATE detection_event_media SET '
                     's3_key=?,thumbnail_s3_key=?,started_at=?,ended_at=?,'
-                    'duration_seconds=?,size_bytes=? '
+                    'duration_seconds=?,size_bytes=?,local_relative_path=? '
                     'WHERE detection_event_id=?',
                     (
                         s3_key,
@@ -1013,6 +1024,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         ended_at,
                         float(duration_seconds) if duration_seconds is not None else None,
                         int(size_bytes) if size_bytes is not None else None,
+                        local_relative_path,
                         event['id'],
                     ),
                 )
@@ -1024,8 +1036,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 'INSERT INTO detection_event_media('
                 'id,detection_event_id,customer_id,camera_id,s3_key,'
                 'thumbnail_s3_key,started_at,ended_at,duration_seconds,'
-                'size_bytes,created_at'
-                ') VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                'size_bytes,local_relative_path,created_at'
+                ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 (
                     media_id,
                     event['id'],
@@ -1037,6 +1049,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     ended_at,
                     float(duration_seconds) if duration_seconds is not None else None,
                     int(size_bytes) if size_bytes is not None else None,
+                    local_relative_path,
                     now,
                 ),
             )
@@ -1127,7 +1140,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 raise HTTPException(status_code=403,detail='Claimed parent Motion event belongs to a different customer or site.')
 
             parent_media=db.execute(
-                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes '
+                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes,local_relative_path '
                 'FROM detection_event_media WHERE detection_event_id=?',
                 (parent['id'],),
             ).fetchone()
@@ -1146,8 +1159,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                     'INSERT INTO detection_event_media('
                     'id,detection_event_id,customer_id,camera_id,s3_key,'
                     'thumbnail_s3_key,started_at,ended_at,duration_seconds,'
-                    'size_bytes,source_media_id,created_at'
-                    ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                    'size_bytes,local_relative_path,source_media_id,created_at'
+                    ') VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                     (
                         media_id,
                         child['id'],
@@ -1159,6 +1172,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         parent_media['ended_at'],
                         parent_media['duration_seconds'],
                         parent_media['size_bytes'],
+                        parent_media['local_relative_path'],
                         parent_media['id'],
                         now,
                     ),

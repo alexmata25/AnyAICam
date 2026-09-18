@@ -426,6 +426,14 @@ def upload_motion_event_media(
         "ended_at": window.end.isoformat(),
         "duration_seconds": duration_seconds,
         "size_bytes": size_bytes,
+        # New, optional (2026-09-18): the exact local /recordings/... URL
+        # already validated above by _local_path_from_recording_url() --
+        # lets a future WireGuard/direct fetch (live_view_wireguard.py)
+        # reach this clip's bytes on the appliance itself instead of via
+        # S3. An older cloud version simply ignores an unknown payload
+        # field; an older appliance simply never sends it -- either way
+        # this is a pure addition, not a contract change.
+        "local_relative_path": safe_clip_url,
     }
 
     # Media registration depends on detection_events existing first.
