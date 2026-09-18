@@ -714,3 +714,24 @@ this pass deliberately did not take; only then does a real `wg-quick up`
 do anything meaningful. Step (1) is the first of these that needs sudo/
 root on Ryzen at all, and is this pass's own stopping point -- see the
 coordinator's own report for the exact command.
+
+**Step (1) update (2026-09-17, later)**: the operator ran the exact
+command from the prior pass's report themselves --
+`sudo apt-get install -y wireguard-tools` -- confirmed installed
+(`wireguard-tools 1.0.20210914-1ubuntu4`; `wg-quick.target` present,
+not started; no interface exists). Step (2)'s artifact is built,
+hash-verified (`anyaicam-appliance-installer-1.1.0-vms-8d5a075c3ccf.tar.gz`,
+SHA-256 `0d910a589cfbefad44d0b5211f69c923c395bedf89882533dae9f60ac66aafea`,
+commit `8d5a075`), transferred and re-verified identical on Ryzen, and
+pre-extracted (non-privileged) into `~/anyaicam-release-8d5a075c/` --
+the remaining action really is just the one privileged repair-install
+call. `SystemWireGuardInterfaceProvider` and the two DISPATCH entries
+were re-confirmed already fully implemented and tested (no code
+changes needed this pass). Step (4)'s security group
+(`sg-0a7cebe64d0e3d752`, instance `i-0a082abd812929bb4`) was read-only
+audited: only inbound TCP 80/443 from `0.0.0.0/0` exist today, no UDP
+at all -- confirming a new inbound UDP rule (port 51820, the standard
+WireGuard port, source `0.0.0.0/0` since Ryzen's real IP is NAT'd/
+dynamic) is the concrete change step (4) will need. Not created this
+pass -- deliberately treated as its own separate go-ahead, same as
+every other real network/interface change.
