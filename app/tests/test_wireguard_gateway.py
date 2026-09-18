@@ -253,3 +253,84 @@ def test_system_provider_current_peers_ignores_the_interface_row_itself():
     runner = _FakeRunner(dump_stdout=dump)
     provider = SystemWireGuardInterfaceProvider(interface="wg0", runner=runner)
     assert provider.current_peers() == {}
+
+
+# --------------------------------------------------------- provider selection (env-gated)
+
+
+def test_provider_from_env_defaults_to_system_when_unset(monkeypatch):
+    """Unset ANYAICAM_WIREGUARD_GATEWAY_PROVIDER must keep today's real
+    default -- no existing/future deploy that doesn't explicitly opt into
+    the mock provider ever silently changes behavior."""
+    monkeypatch.delenv("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", raising=False)
+    from importlib import reload
+
+    import wireguard_gateway.gateway_service as gateway_service_module
+    reload(gateway_service_module)
+    try:
+        assert isinstance(gateway_service_module._provider_from_env(), SystemWireGuardInterfaceProvider)
+    finally:
+        reload(gateway_service_module)
+
+
+def test_provider_from_env_any_other_value_is_also_system(monkeypatch):
+    """Only the exact literal "mock" (case-insensitive) selects the mock
+    provider -- a typo or an unrecognized value fails safe to the real
+    provider's own already-inert-until-deployed default, never silently
+    to the mock (which would make a real deploy silently do nothing)."""
+    monkeypatch.setenv("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", "systm")
+    from importlib import reload
+
+    import wireguard_gateway.gateway_service as gateway_service_module
+    reload(gateway_service_module)
+    try:
+        assert isinstance(gateway_service_module._provider_from_env(), SystemWireGuardInterfaceProvider)
+    finally:
+        reload(gateway_service_module)
+
+
+def test_provider_from_env_mock_selects_mock_provider(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", "mock")
+    from importlib import reload
+
+    import wireguard_gateway.gateway_service as gateway_service_module
+    reload(gateway_service_module)
+    try:
+        assert isinstance(gateway_service_module._provider_from_env(), MockWireGuardInterfaceProvider)
+    finally:
+        reload(gateway_service_module)
+
+
+def test_provider_from_env_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", "MOCK")
+    from importlib import reload
+
+    import wireguard_gateway.gateway_service as gateway_service_module
+    reload(gateway_service_module)
+    try:
+        assert isinstance(gateway_service_module._provider_from_env(), MockWireGuardInterfaceProvider)
+    finally:
+        reload(gateway_service_module)
+
+
+def test_run_forever_with_no_explicit_provider_uses_env_selection(monkeypatch):
+    """run_forever(provider=None) -- its own documented default path --
+    must go through the same env-gated selection, not silently
+    hardcode SystemWireGuardInterfaceProvider(), so the mock mode this
+    file's own docstring promises ("every test passes an explicit
+    MockWireGuardInterfaceProvider") is also true of a real deploy that
+    sets the env var and calls run_forever() with no arguments, exactly
+    as docker-compose.staging.example.yml's own command line does."""
+    monkeypatch.setenv("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", "mock")
+    from importlib import reload
+
+    import wireguard_gateway.gateway_service as gateway_service_module
+    reload(gateway_service_module)
+    try:
+        seen: list = []
+        gateway_service_module.reconcile_once = lambda provider: seen.append(provider)
+        gateway_service_module.run_forever(stop_after=1, sleep=lambda _: None)
+        assert len(seen) == 1
+        assert isinstance(seen[0], MockWireGuardInterfaceProvider)
+    finally:
+        reload(gateway_service_module)

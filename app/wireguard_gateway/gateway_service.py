@@ -58,12 +58,41 @@ import time
 
 from partner_db import connection
 
-from .interface_provider import SystemWireGuardInterfaceProvider, WireGuardInterfaceProvider
+from .interface_provider import (
+    MockWireGuardInterfaceProvider,
+    SystemWireGuardInterfaceProvider,
+    WireGuardInterfaceProvider,
+)
 from .reconciler import desired_peers_from_rows, reconcile
 
 log = logging.getLogger("anyaicam.wireguard_gateway")
 
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_RECONCILE_SECONDS", "30"))
+
+# Explicit, fail-safe provider selection for the real process entry point
+# below -- unset/anything-other-than-"mock" keeps today's real default
+# (SystemWireGuardInterfaceProvider, requiring a real wg0 interface and
+# CAP_NET_ADMIN), so no existing deploy assumption changes. Set only for a
+# staging verification pass that needs run_forever()'s own real reconcile
+# loop, real DB polling, and real logging exercised over the network
+# against the real staging database, with zero real `wg`/`ip` interface
+# access -- see docs/wireguard-remote-connectivity-plan.md Sec 21 (Phase C
+# staging verification) for why this is the one deploy-time switch that's
+# safe to flip on staging before a real interface exists anywhere. Never
+# applicable to a production deploy: production is out of scope for this
+# whole feature so far.
+GATEWAY_PROVIDER_MODE = os.environ.get("ANYAICAM_WIREGUARD_GATEWAY_PROVIDER", "system").strip().lower()
+
+
+def _provider_from_env() -> WireGuardInterfaceProvider:
+    if GATEWAY_PROVIDER_MODE == "mock":
+        log.warning(
+            "WireGuard gateway starting with MockWireGuardInterfaceProvider "
+            "(ANYAICAM_WIREGUARD_GATEWAY_PROVIDER=mock) -- no real interface "
+            "will ever be touched by this process."
+        )
+        return MockWireGuardInterfaceProvider()
+    return SystemWireGuardInterfaceProvider()
 
 
 def _active_peer_rows(db) -> list[dict]:
@@ -94,7 +123,7 @@ def run_forever(
     SystemWireGuardInterfaceProvider (the default when provider=None)
     in any test -- every test passes an explicit
     MockWireGuardInterfaceProvider."""
-    active_provider = provider or SystemWireGuardInterfaceProvider()
+    active_provider = provider or _provider_from_env()
     iterations = 0
     while stop_after is None or iterations < stop_after:
         try:
