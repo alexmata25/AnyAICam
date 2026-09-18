@@ -31,6 +31,15 @@ QUARANTINE_DIR="$VMS_RECORDINGS_DIR/quarantine"
 VMS_RELEASE_COMMIT=""
 VMS_RELEASE_SHA256=""
 INSTALLER_SOURCE_COMMIT=""
+# Whether this exact release build embedded a MediaMTX payload
+# (build_release_installer.py --mediamtx-binary vs --no-mediamtx, both
+# now mandatory choices -- see that script's own --no-mediamtx help for
+# the 2026-09-17 incident this closes). Empty string means a release
+# built by an older build_release_installer.py, before this field
+# existed -- never treated as an error, only as "unknown", since every
+# already-built historical artifact must keep installing.
+MEDIAMTX_INCLUDED=""
+MEDIAMTX_SHA256=""
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
@@ -59,6 +68,14 @@ load_release_metadata() {
         echo "[ERROR] VMS_RELEASE_SHA256 is present but is not a lowercase SHA-256." >&2
         return 1
     fi
+    if [[ -n "${MEDIAMTX_INCLUDED:-}" && "${MEDIAMTX_INCLUDED}" != "true" && "${MEDIAMTX_INCLUDED}" != "false" ]]; then
+        echo "[ERROR] MEDIAMTX_INCLUDED is present but is not 'true' or 'false'." >&2
+        return 1
+    fi
+    if [[ -n "${MEDIAMTX_SHA256:-}" && ! "${MEDIAMTX_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "[ERROR] MEDIAMTX_SHA256 is present but is not a lowercase SHA-256." >&2
+        return 1
+    fi
     if [[ ! "${INSTALLER_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
         echo "[ERROR] INSTALLER_SOURCE_COMMIT must be one exact 40-character lowercase Git commit hash." >&2
         return 1
@@ -76,7 +93,7 @@ load_release_metadata() {
         echo "[ERROR] Built VMS systemd unit is missing." >&2
         return 1
     fi
-    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT
+    export VMS_RELEASE_COMMIT VMS_RELEASE_SHA256 INSTALLER_SOURCE_COMMIT MEDIAMTX_INCLUDED MEDIAMTX_SHA256
 }
 
 # shellcheck source=01-preflight.sh

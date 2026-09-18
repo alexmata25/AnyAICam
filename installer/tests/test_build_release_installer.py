@@ -267,5 +267,42 @@ class PrivilegedWatcherIsPackagedTests(unittest.TestCase):
         self.assertIn("uninstall_privileged_watcher", uninstall_text)
 
 
+class MediaMTXRequiredChoiceTests(unittest.TestCase):
+    """Regression coverage for a real, second occurrence of the MediaMTX
+    packaging regression (2026-09-17, see docs/PROJECT_CHECKPOINT.md): a
+    release built by simply forgetting to pass --mediamtx-binary silently
+    produced a P2P-broken release, with nothing anywhere in the build
+    pipeline to catch it. --mediamtx-binary/--mediamtx-sha256 and the new
+    --no-mediamtx now form a mandatory, mutually exclusive choice, checked
+    immediately after --vms-commit is validated -- before any git/repo
+    work happens -- so both cases below fail fast, independent of
+    --vms-repo/--vms-commit even being real."""
+
+    def _run(self, extra_args):
+        script = Path(__file__).resolve().parents[1] / "build_release_installer.py"
+        cmd = [sys.executable, str(script), "--vms-commit", "0" * 40, "--vms-repo", "/nonexistent-repo-path-never-reached"] + extra_args
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def test_omitting_both_mediamtx_flags_fails_fast_with_a_clear_error(self):
+        result = self._run([])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--no-mediamtx", result.stderr + result.stdout)
+        self.assertIn("required", result.stderr + result.stdout)
+
+    def test_passing_both_mediamtx_binary_and_no_mediamtx_is_rejected(self):
+        result = self._run(["--mediamtx-binary", "/some/path", "--mediamtx-sha256", "a" * 64, "--no-mediamtx"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutually exclusive", result.stderr + result.stdout)
+
+    def test_the_gate_fires_before_any_git_repo_work(self):
+        # Both fixture calls above pass a --vms-repo path that does not
+        # exist on disk at all -- if the mediamtx gate did not fire
+        # first, the failure would instead come from git/repo handling,
+        # with a completely different message. Confirms the ordering,
+        # not just that *some* error occurs.
+        result = self._run([])
+        self.assertNotIn("nonexistent-repo-path-never-reached", result.stderr + result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

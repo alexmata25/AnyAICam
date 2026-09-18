@@ -305,12 +305,42 @@ def main() -> int:
     source.add_argument("--release-archive", help="Prebuilt VMS release archive")
     parser.add_argument("--release-sha256", help="Required with --release-archive")
     parser.add_argument("--env-template", help="Optional non-secret VMS environment template")
-    parser.add_argument("--mediamtx-binary", help="Optional pre-downloaded, checksum-verified MediaMTX Linux binary to embed (P2P live-view foundation, still feature-flagged off)")
+    parser.add_argument("--mediamtx-binary", help="Pre-downloaded, checksum-verified MediaMTX Linux binary to embed (P2P live-view foundation). Required unless --no-mediamtx is given -- see that flag's help for why this is no longer silently optional.")
     parser.add_argument("--mediamtx-sha256", help="Required with --mediamtx-binary")
+    parser.add_argument(
+        "--no-mediamtx",
+        action="store_true",
+        help=(
+            "Explicitly build a release with no MediaMTX payload -- P2P live view "
+            "will be unavailable on any appliance installed fresh from this exact "
+            "release (a repair onto an appliance that already has a working binary "
+            "installed is unaffected; 06-deploy-vms.sh's rsync excludes mediamtx/ "
+            "from deletion). This flag exists so omitting --mediamtx-binary is "
+            "always a conscious decision, never an accident: a real incident "
+            "(2026-09-17, see docs/PROJECT_CHECKPOINT.md) traced a P2P outage back "
+            "to a release built without anyone remembering to pass "
+            "--mediamtx-binary, and validate.sh had nothing to catch it. Mutually "
+            "exclusive with --mediamtx-binary."
+        ),
+    )
     parser.add_argument("--output-dir", default="dist")
     args = parser.parse_args()
 
     vms_commit = validate_commit(args.vms_commit, "--vms-commit")
+
+    if args.mediamtx_binary and args.no_mediamtx:
+        raise SystemExit("--mediamtx-binary and --no-mediamtx are mutually exclusive.")
+    if not args.mediamtx_binary and not args.no_mediamtx:
+        raise SystemExit(
+            "MediaMTX is required for every release build: pass --mediamtx-binary "
+            "(with --mediamtx-sha256) to embed it, or --no-mediamtx to explicitly "
+            "build a release without it (P2P live view will be unavailable on any "
+            "fresh install from this release). Omitting both used to silently "
+            "produce a P2P-broken release with nothing to catch it -- see "
+            "docs/PROJECT_CHECKPOINT.md's 2026-09-17 MediaMTX packaging-regression "
+            "entry for the real incident this now prevents."
+        )
+
     script_path = Path(__file__).resolve()
     repo_root = script_path.parents[1]
 
@@ -366,6 +396,8 @@ def main() -> int:
 
         copy_release(release_root, package / "payload/vms")
 
+        mediamtx_included = False
+        mediamtx_sha256_value = ""
         if args.mediamtx_binary:
             if not args.mediamtx_sha256:
                 raise SystemExit("--mediamtx-sha256 is required with --mediamtx-binary")
@@ -380,6 +412,8 @@ def main() -> int:
             mediamtx_dest_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(mediamtx_src, mediamtx_dest_dir / "mediamtx")
             (mediamtx_dest_dir / "mediamtx.sha256").write_text(f"{expected_mediamtx_sha}  mediamtx\n", encoding="utf-8", newline="\n")
+            mediamtx_included = True
+            mediamtx_sha256_value = expected_mediamtx_sha
 
         release_unit = release_root / "systemd/anyaicam-vms.service"
         service_source = "installer"
@@ -407,6 +441,8 @@ def main() -> int:
             f"VMS_RELEASE_COMMIT={vms_commit}\n"
             f"VMS_RELEASE_SHA256={release_sha}\n"
             f"INSTALLER_SOURCE_COMMIT={installer_commit}\n"
+            f"MEDIAMTX_INCLUDED={'true' if mediamtx_included else 'false'}\n"
+            f"MEDIAMTX_SHA256={mediamtx_sha256_value}\n"
         )
         (package / "release.env").write_text(release_env, encoding="utf-8", newline="\n")
 
@@ -425,6 +461,8 @@ def main() -> int:
             "environment_template_sha256": env_template_sha,
             "vms_service_source": service_source,
             "shell_script_count": shell_count,
+            "mediamtx_included": mediamtx_included,
+            "mediamtx_sha256": mediamtx_sha256_value,
         }
         (package / "release-manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
@@ -465,6 +503,9 @@ def main() -> int:
         print(f"shell_script_count={shell_count}")
         print("shell_lf=PASS")
         print("shell_executable=PASS")
+        print(f"mediamtx_included={'true' if mediamtx_included else 'false'}")
+        if mediamtx_included:
+            print(f"mediamtx_sha256={mediamtx_sha256_value}")
         return 0
 
 

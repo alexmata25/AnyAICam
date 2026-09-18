@@ -71,6 +71,14 @@ reset_fixture() {
     MEDIAMTX_INSTALL_DIR="$FIXTURE_ROOT/opt/anyaicam/mediamtx"
     MEDIAMTX_BINARY_PATH="$MEDIAMTX_INSTALL_DIR/mediamtx"
     rm -rf "$MEDIAMTX_PAYLOAD_DIR"
+    # MediaMTX packaging-regression guard (2026-09-17, second real
+    # occurrence) -- mediamtx_required_and_usable() in validate.sh reads
+    # both of these; redirected into the fixture the same way every other
+    # path constant here is, so its tests below never touch the real
+    # /etc/anyaicam.
+    VMS_RELEASE_MARKER="$CONFIG_DIR/vms_release.json"
+    MEDIAMTX_INCLUDED="false"
+    MEDIAMTX_SHA256=""
     mkdir -p "$(dirname "$VMS_SERVICE_FILE")"
     # id/docker mocks default to "absent" until a test overrides them.
     ID_MOCK_EXIT=1
@@ -703,6 +711,104 @@ REPO_COMPOSE_FILE="$INSTALLER_DIR/../docker-compose.yml"
 assert_exit "repo docker-compose.yml exists" 0 test -f "$REPO_COMPOSE_FILE"
 assert_exit "docker-compose.yml mounts the real MediaMTX install dir into the container (so webrtc_publisher.py's subprocess.Popen can actually find the binary it verified was installed)" \
     0 grep -qF "$REAL_MEDIAMTX_INSTALL_DIR:$REAL_MEDIAMTX_INSTALL_DIR" "$REPO_COMPOSE_FILE"
+
+echo
+echo "== mediamtx_required_and_usable() (installer/validate.sh) =="
+# MediaMTX packaging regression, permanent guard (2026-09-17, second real
+# occurrence -- see docs/PROJECT_CHECKPOINT.md). Before this, validate.sh
+# had zero awareness of MediaMTX at all, so a release built without it
+# (--mediamtx-binary simply forgotten on the build command) could report
+# "0 failures" on an appliance where P2P live view was completely broken.
+
+# 17a. P2P not enabled at all -- correctly a no-op pass regardless of
+#      whether MediaMTX exists, matching every other P2P-gated behavior
+#      in this codebase (10-install-mediamtx.sh's own docstring).
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+: > "$VMS_ENV_FILE"
+assert_exit "P2P disabled (no vms.env key at all) -> pass regardless of MediaMTX" 0 mediamtx_required_and_usable
+
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+echo "ANYAICAM_LIVE_P2P_ENABLED=false" > "$VMS_ENV_FILE"
+assert_exit "P2P explicitly disabled -> pass regardless of MediaMTX" 0 mediamtx_required_and_usable
+
+# 17b. The real regression this guards against: P2P enabled, but the
+#      binary is genuinely missing (a release built without
+#      --mediamtx-binary, or an install that never got one).
+reset_fixture
+mkdir -p "$CONFIG_DIR"
+echo "ANYAICAM_LIVE_P2P_ENABLED=true" > "$VMS_ENV_FILE"
+assert_exit "P2P enabled + MediaMTX binary missing -> FAIL (the real 2026-09-17 regression)" 1 mediamtx_required_and_usable
+
+# 17c. P2P enabled, binary present, but this release's own recorded
+#      checksum (persisted into VMS_RELEASE_MARKER by stamp_release())
+#      does not match -- a corrupt/wrong/tampered binary, not merely a
+#      missing one.
+reset_fixture
+mkdir -p "$CONFIG_DIR" "$MEDIAMTX_INSTALL_DIR"
+echo "ANYAICAM_LIVE_P2P_ENABLED=true" > "$VMS_ENV_FILE"
+printf 'not the real binary' > "$MEDIAMTX_BINARY_PATH"
+cat > "$VMS_RELEASE_MARKER" <<'EOF'
+{
+  "vms_release_commit": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+  "mediamtx_included": "true",
+  "mediamtx_sha256": "0000000000000000000000000000000000000000000000000000000000000"
+}
+EOF
+assert_exit "P2P enabled + MediaMTX present but checksum mismatches this release's recorded hash -> FAIL" 1 mediamtx_required_and_usable
+
+# 17d. P2P enabled, binary present, checksum matches this release's own
+#      recorded hash exactly -- the genuine, correct, working case.
+#      (The executable-bit half of mediamtx_required_and_usable() is
+#      deliberately not exercised here -- this Windows/MSYS test harness
+#      does not honor chmod's execute bit at all, the identical,
+#      already-documented platform gap install_mediamtx()'s own tests
+#      above work around; confirmed real Linux targets do not have this
+#      limitation.)
+reset_fixture
+mkdir -p "$CONFIG_DIR" "$MEDIAMTX_INSTALL_DIR"
+echo "ANYAICAM_LIVE_P2P_ENABLED=true" > "$VMS_ENV_FILE"
+printf 'the real mediamtx binary contents' > "$MEDIAMTX_BINARY_PATH"
+REAL_SHA="$(sha256sum "$MEDIAMTX_BINARY_PATH" | cut -d' ' -f1)"
+cat > "$VMS_RELEASE_MARKER" <<EOF
+{
+  "vms_release_commit": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+  "mediamtx_included": "true",
+  "mediamtx_sha256": "$REAL_SHA"
+}
+EOF
+chmod 755 "$MEDIAMTX_BINARY_PATH" 2>/dev/null || true
+if [[ -x "$MEDIAMTX_BINARY_PATH" ]]; then
+    assert_exit "P2P enabled + MediaMTX present + checksum matches -> pass" 0 mediamtx_required_and_usable
+else
+    echo "SKIP: P2P enabled + MediaMTX present + checksum matches -> pass (this platform's filesystem does not honor the execute bit; not testable here, see install_mediamtx()'s own identical documented gap above)"
+fi
+
+# 17e. P2P enabled, binary present and checksum-correct, but this
+#      release did NOT embed MediaMTX at all (--no-mediamtx, an
+#      ordinary VMS-only rebuild) -- nothing to cross-check against, so
+#      only presence/executable matter; a prior release's still-present
+#      binary (protected from deletion by 06-deploy-vms.sh's rsync
+#      --exclude 'mediamtx/') must not be flagged just because this
+#      release's own manifest has no recorded hash.
+reset_fixture
+mkdir -p "$CONFIG_DIR" "$MEDIAMTX_INSTALL_DIR"
+echo "ANYAICAM_LIVE_P2P_ENABLED=true" > "$VMS_ENV_FILE"
+printf 'a prior releases still-installed binary' > "$MEDIAMTX_BINARY_PATH"
+cat > "$VMS_RELEASE_MARKER" <<'EOF'
+{
+  "vms_release_commit": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+  "mediamtx_included": "false",
+  "mediamtx_sha256": ""
+}
+EOF
+chmod 755 "$MEDIAMTX_BINARY_PATH" 2>/dev/null || true
+if [[ -x "$MEDIAMTX_BINARY_PATH" ]]; then
+    assert_exit "P2P enabled + this release has no recorded checksum (--no-mediamtx) + a prior binary is present -> pass, nothing to cross-check" 0 mediamtx_required_and_usable
+else
+    echo "SKIP: --no-mediamtx-release prior-binary pass case (execute bit not testable on this platform, see above)"
+fi
 
 echo
 echo "== migrate_legacy_persistent_data() / migrate_legacy_persistent_file() =="

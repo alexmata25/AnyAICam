@@ -61,6 +61,58 @@ ready_endpoint_self_test_ok() {
     curl -sS -m 5 http://127.0.0.1:8000/ready 2>/dev/null | grep -Fq '"self_test":{"ok":true'
 }
 
+# MediaMTX packaging regression, permanent guard (2026-09-17, second real
+# occurrence -- see docs/PROJECT_CHECKPOINT.md). validate.sh previously had
+# zero awareness of MediaMTX at all: a release built without it (an
+# --mediamtx-binary flag simply forgotten on the build command, now
+# impossible to do silently -- build_release_installer.py requires an
+# explicit choice, see its own --no-mediamtx help) could report "0
+# failures" on an appliance where P2P live view was completely broken.
+#
+# Only a hard requirement when this appliance actually has P2P live view
+# turned on (ANYAICAM_LIVE_P2P_ENABLED=true in vms.env) -- an appliance
+# that never enables it is correctly unaffected, matching every other
+# P2P-gated behavior in this codebase (10-install-mediamtx.sh's own
+# docstring). Deliberately never executes the binary (no --version
+# invocation): this script can run against a REAL appliance where
+# webrtc_publisher.py may already have MediaMTX running and bound to its
+# real ports, and this project has no confirmed-safe, side-effect-free
+# CLI invocation for the real binary to fall back on -- existence,
+# the executable bit, and a checksum match against this exact release's
+# own recorded hash (when the release build actually embedded one) give
+# the same assurance install_mediamtx() itself already relies on, with
+# zero execution risk.
+mediamtx_required_and_usable() {
+    grep -q '^ANYAICAM_LIVE_P2P_ENABLED=true$' "$VMS_ENV_FILE" 2>/dev/null || return 0
+
+    if [[ ! -f "$MEDIAMTX_BINARY_PATH" ]]; then
+        echo "MediaMTX binary missing at $MEDIAMTX_BINARY_PATH while ANYAICAM_LIVE_P2P_ENABLED=true -- P2P live view is broken." >&2
+        return 1
+    fi
+    if [[ ! -x "$MEDIAMTX_BINARY_PATH" ]]; then
+        echo "MediaMTX binary at $MEDIAMTX_BINARY_PATH exists but is not executable." >&2
+        return 1
+    fi
+
+    # Cross-check against THIS release's own recorded checksum, when this
+    # release build actually embedded one. A release that intentionally
+    # did not embed MediaMTX (--no-mediamtx, an ordinary VMS-only rebuild)
+    # has nothing to cross-check here -- the presence/executable checks
+    # above are what protect an appliance repaired from such a release,
+    # since 06-deploy-vms.sh's rsync already excludes mediamtx/ from
+    # deletion in that case, leaving a prior release's binary untouched.
+    local recorded_sha
+    recorded_sha="$(grep -o '"mediamtx_sha256": "[0-9a-f]\{64\}"' "$VMS_RELEASE_MARKER" 2>/dev/null | grep -o '[0-9a-f]\{64\}')"
+    if [[ -n "$recorded_sha" ]]; then
+        local actual_sha
+        actual_sha="$(sha256sum "$MEDIAMTX_BINARY_PATH" | cut -d' ' -f1)"
+        if [[ "$actual_sha" != "$recorded_sha" ]]; then
+            echo "MediaMTX binary checksum ($actual_sha) does not match this release's recorded checksum ($recorded_sha)." >&2
+            return 1
+        fi
+    fi
+}
+
 run_validate() {
     load_release_metadata
     detect_install_state
@@ -98,6 +150,7 @@ run_validate() {
     check "VMS local health endpoint responds" curl -fsS -m 5 -o /dev/null http://127.0.0.1:8000/health
     check "VMS local ready endpoint is reachable and self-test passes (business readiness -- e.g. a camera actually recording -- is intentionally not required at install time)" ready_endpoint_self_test_ok
     check "VMS /version reports exact approved commit" version_reports_release
+    check "MediaMTX is present, executable, and checksum-verified when P2P live view is enabled" mediamtx_required_and_usable
 
     if [[ "$FAILURES" -eq 0 ]]; then
         log "Validation PASSED (0 failures; expected VMS release $VMS_RELEASE_COMMIT)."

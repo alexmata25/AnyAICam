@@ -36,6 +36,8 @@ stamp_release() {
         echo "  \"vms_release_commit\": \"$VMS_RELEASE_COMMIT\","
         echo "  \"release_archive_sha256\": \"${VMS_RELEASE_SHA256:-}\","
         echo "  \"installer_source_commit\": \"$INSTALLER_SOURCE_COMMIT\","
+        echo "  \"mediamtx_included\": \"${MEDIAMTX_INCLUDED:-unknown}\","
+        echo "  \"mediamtx_sha256\": \"${MEDIAMTX_SHA256:-}\","
         echo "  \"installer_version\": \"$INSTALLER_VERSION\","
         echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
         echo "}"
