@@ -47224,6 +47224,7 @@ from live_view_p2p import register_live_view_p2p_customer_routes, register_live_
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
 from door_access import register_door_access_routes
+from wireguard_remote import register_wireguard_remote_appliance_routes
 # 2026-09-16: edge-side counterpart to the cloud relay above -- ONVIF
 # backchannel transport, capability discovery, and the WebSocket relay
 # client that connects the two. Recovered from an old, unrelated-history
@@ -47383,6 +47384,7 @@ register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
 register_facial_recognition_routes(app, page_shell)
 register_door_access_routes(app)
+register_wireguard_remote_appliance_routes(app)
 
 
 

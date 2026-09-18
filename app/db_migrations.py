@@ -778,6 +778,43 @@ CREATE TABLE IF NOT EXISTS door_access_events(
 CREATE INDEX IF NOT EXISTS idx_door_access_events_customer_created ON door_access_events(customer_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_door_access_events_camera_created ON door_access_events(camera_id,created_at);
 '''),
+    # WireGuard direct remote-connectivity, Phase A2 (see
+    # docs/wireguard-remote-connectivity-plan.md Sec 10): one row per
+    # enrolled appliance/BYO-PC WireGuard peer. Mirrors appliance_
+    # credentials deliberately -- multiple rows per appliance are
+    # allowed (never enforced to exactly one, so a rotation's overlap
+    # window is normal), rows are never deleted on revocation
+    # (revoked_at/revoked_reason set instead, matching this project's
+    # own never-rewrite-history convention already applied to
+    # audit_logs), and only an ACTIVE tunnel address needs to be
+    # unique -- a revoked peer's old address can be safely reassigned
+    # to a replacement device later. public_key is exactly that: a
+    # public key, never a secret, so unlike appliance_credentials.
+    # credential_hash it is stored in plain text on purpose -- there is
+    # nothing to hash. The corresponding private key is generated on
+    # the appliance itself and never transmitted or stored here, in
+    # either direction; see wireguard_remote.py's own module docstring.
+    ('20260917_wireguard_remote_connectivity','''
+CREATE TABLE IF NOT EXISTS appliance_wireguard_peers(
+    id TEXT PRIMARY KEY,
+    appliance_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    tunnel_address TEXT NOT NULL,
+    gateway_public_key TEXT NOT NULL,
+    gateway_endpoint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'enrolled',
+    last_handshake_at TEXT,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    revoked_reason TEXT,
+    FOREIGN KEY(appliance_id) REFERENCES appliances(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wireguard_peers_public_key ON appliance_wireguard_peers(public_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wireguard_peers_tunnel_address_active ON appliance_wireguard_peers(tunnel_address) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_wireguard_peers_appliance_status ON appliance_wireguard_peers(appliance_id,status);
+'''),
 ]
 
 
