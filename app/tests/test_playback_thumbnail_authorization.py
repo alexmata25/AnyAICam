@@ -57,6 +57,19 @@ def _fake_request():
     return SimpleNamespace(query_params=SimpleNamespace(get=lambda key, default=None: default))
 
 
+@pytest.fixture(autouse=True)
+def _reset_presigned_url_cache():
+    # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-
+    # audit.md): customer_recording_thumbnail() now goes through the
+    # shared, module-level presigned-URL reuse cache
+    # (_presigned_recording_url_and_ttl()'s own cache) -- reset it
+    # around every test in this file so one test's s3_key can never
+    # leak a cached URL/failure into another.
+    main._presigned_url_cache = {}
+    yield
+    main._presigned_url_cache = {}
+
+
 def test_cloud_recording_thumbnail_redirects_to_a_presigned_jpg_derived_from_the_mp4_key(db_path, monkeypatch):
     with override_target(sqlite_path=db_path):
         initialize_database()
@@ -70,9 +83,17 @@ def test_cloud_recording_thumbnail_redirects_to_a_presigned_jpg_derived_from_the
             captured["key"] = key
             return "https://example.com/signed-thumbnail"
 
-        with patch.object(main, "_presigned_recording_url", side_effect=fake_presign):
+        # customer_recording_thumbnail() now calls
+        # _cacheable_presigned_redirect(), which goes through
+        # _presigned_recording_url_and_ttl() -> _generate_presigned_
+        # recording_url() on a cache miss -- patch the actual signing
+        # function, not the now-bypassed _presigned_recording_url()
+        # wrapper.
+        with patch.object(main, "_generate_presigned_recording_url", side_effect=fake_presign):
             response = main.customer_recording_thumbnail("cam-1", "rec-1", _fake_request())
     assert response.status_code == 302
+    assert response.headers["location"] == "https://example.com/signed-thumbnail"
+    assert response.headers["cache-control"] == "private, max-age=300"
     assert captured["key"].endswith("camera1_2026-08-20_00-00-00.jpg")
     assert "camera1_2026-08-20_00-00-00.mp4" not in captured["key"]
 
@@ -129,7 +150,7 @@ def test_thumbnail_route_404s_when_the_presign_fails_rather_than_exposing_any_cr
         _seed_base_tenant(conn)
         _insert_recording(conn, "rec-1", "cam-1", 1, "camera1_2026-08-20_00-00-00.mp4")
         monkeypatch.setattr(main, "_customer_playback_cameras", lambda request: [{"id": "cam-1", "name": "Front Door", "camera_number": 1}])
-        with patch.object(main, "_presigned_recording_url", return_value=None):
+        with patch.object(main, "_generate_presigned_recording_url", return_value=None):
             with pytest.raises(Exception) as excinfo:
                 main.customer_recording_thumbnail("cam-1", "rec-1", _fake_request())
     assert getattr(excinfo.value, "status_code", None) == 404

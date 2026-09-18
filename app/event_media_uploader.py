@@ -51,6 +51,19 @@ RECORDINGS_ROOT = APP_ROOT / "recordings"
 # existing installations do not start retaining new event media unexpectedly.
 EVENT_MEDIA_CAPTURE_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_CAPTURE_ENABLED", "false").strip().lower() == "true"
 EVENT_MEDIA_UPLOAD_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED", "false").strip().lower() == "true"
+
+# Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
+# every event clip/thumbnail object was written with no CacheControl
+# metadata at all, so nothing ever told a browser (or a future CDN sitting
+# in front of this bucket) that these bytes are safe to reuse -- an event
+# clip/thumbnail is captured once and never modified afterward, so it is
+# always safe to mark long-lived and immutable. "public" here describes
+# how the *bytes themselves* may be cached once legitimately fetched, not
+# who may fetch them -- access is still gated entirely by the short-lived
+# presigned URL requirement enforced upstream; nothing about that
+# authorization boundary changes. Set at upload time only -- does not
+# retroactively change any already-uploaded object's stored metadata.
+EVENT_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
 RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
 RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
 RETRY_MAX_JOBS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_JOBS", "10")))
@@ -370,7 +383,7 @@ def upload_motion_event_media(
         str(clip_path),
         session["bucket"],
         clip_key,
-        ExtraArgs={"ContentType": "video/mp4"},
+        ExtraArgs={"ContentType": "video/mp4", "CacheControl": EVENT_MEDIA_CACHE_CONTROL},
     )
 
     thumbnail_key = None
@@ -383,7 +396,7 @@ def upload_motion_event_media(
                 str(thumbnail_path),
                 session["bucket"],
                 thumbnail_key,
-                ExtraArgs={"ContentType": "image/jpeg"},
+                ExtraArgs={"ContentType": "image/jpeg", "CacheControl": EVENT_MEDIA_CACHE_CONTROL},
             )
         except Exception as error:
             logger.warning(

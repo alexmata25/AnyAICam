@@ -101,6 +101,16 @@ logger = logging.getLogger("anyaicam.recording_uploader")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
 RECORDING_UPLOAD_ENABLED = os.environ.get("ANYAICAM_RECORDING_UPLOAD_ENABLED", "false").strip().lower() == "true"
+
+# Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
+# same rationale as event_media_uploader.EVENT_MEDIA_CACHE_CONTROL -- a
+# finished recording segment (and its thumbnail) is uploaded exactly once
+# and never modified afterward, so it is always safe to mark long-lived
+# and immutable. Defined separately here (not imported from
+# event_media_uploader) to avoid introducing a cross-module import between
+# two modules this codebase's own docs already describe as deliberately
+# "distinct from, and unrelated to" each other.
+RECORDING_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
 # Unset (the default, None) means "no restriction" -- this must never
 # narrow existing behavior for a caller that doesn't set it. A comma-
 # separated allowlist (e.g. "1") lets a single camera be validated in
@@ -1077,7 +1087,7 @@ def _upload_recording(
         str(local_path),
         session["bucket"],
         recording_key,
-        ExtraArgs={"ContentType": "video/mp4"},
+        ExtraArgs={"ContentType": "video/mp4", "CacheControl": RECORDING_MEDIA_CACHE_CONTROL},
         Config=_UPLOAD_TRANSFER_CONFIG,
     )
 
@@ -1089,7 +1099,7 @@ def _upload_recording(
                 str(thumbnail_path),
                 session["bucket"],
                 thumbnail_key,
-                ExtraArgs={"ContentType": "image/jpeg"},
+                ExtraArgs={"ContentType": "image/jpeg", "CacheControl": RECORDING_MEDIA_CACHE_CONTROL},
                 Config=_UPLOAD_TRANSFER_CONFIG,
             )
             logger.info(

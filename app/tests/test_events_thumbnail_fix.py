@@ -118,18 +118,25 @@ def test_thumbnail_route_requires_camera_authorization(monkeypatch):
 
 
 def test_thumbnail_route_redirects_to_presigned_url_when_authorized(monkeypatch):
+    # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-
+    # audit.md): the route now resolves the raw s3_key and calls
+    # _cacheable_presigned_redirect() directly (instead of going
+    # through _customer_event_thumbnail_url()) so it can also set a
+    # browser Cache-Control header -- see that test below.
     monkeypatch.setattr(main, "_customer_authorized_camera_id", lambda request, camera_id: True)
-    monkeypatch.setattr(main, "_customer_event_thumbnail_url", lambda camera_id, event_id: "https://s3.example.com/signed.jpg")
+    monkeypatch.setattr(main, "_customer_event_thumbnail_s3_key", lambda camera_id, event_id: "recordings/cust/thumb.jpg")
+    monkeypatch.setattr(main, "_presigned_recording_url_and_ttl", lambda s3_key: ("https://s3.example.com/signed.jpg", 300))
     response = main.customer_event_thumbnail("cam-1", "ev-1", _fake_request())
     assert response.status_code == 302
     assert response.headers["location"] == "https://s3.example.com/signed.jpg"
+    assert response.headers["cache-control"] == "private, max-age=300"
 
 
 def test_thumbnail_route_404s_when_no_thumbnail_exists(monkeypatch):
     from fastapi import HTTPException
 
     monkeypatch.setattr(main, "_customer_authorized_camera_id", lambda request, camera_id: True)
-    monkeypatch.setattr(main, "_customer_event_thumbnail_url", lambda camera_id, event_id: None)
+    monkeypatch.setattr(main, "_customer_event_thumbnail_s3_key", lambda camera_id, event_id: None)
     try:
         main.customer_event_thumbnail("cam-1", "ev-1", _fake_request())
         assert False, "expected HTTPException"

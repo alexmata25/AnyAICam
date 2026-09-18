@@ -54,7 +54,11 @@ class _FakeS3Client:
         self.uploaded = []
 
     def upload_file(self, path, bucket, key, ExtraArgs=None):
-        self.uploaded.append({"path": path, "bucket": bucket, "key": key, "content_type": (ExtraArgs or {}).get("ContentType")})
+        self.uploaded.append({
+            "path": path, "bucket": bucket, "key": key,
+            "content_type": (ExtraArgs or {}).get("ContentType"),
+            "cache_control": (ExtraArgs or {}).get("CacheControl"),
+        })
 
 
 @pytest.fixture()
@@ -165,6 +169,12 @@ def test_eligible_camera_uploads_clip_and_thumbnail(monkeypatch, fake_s3, _local
     # The final media-registration POST is what marks a real success.
     media_calls = [c for c in calls["control_plane_calls"] if c[0].endswith("/media")]
     assert len(media_calls) == 1
+    # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-
+    # audit.md): both the clip and its thumbnail must carry a long-lived,
+    # immutable CacheControl -- neither object is ever modified after
+    # this one upload, so nothing downstream (a browser, a future CDN)
+    # should ever have to guess that it's safe to reuse these bytes.
+    assert all(item["cache_control"] == event_media_uploader.EVENT_MEDIA_CACHE_CONTROL for item in fake_s3.uploaded)
 
 
 def test_appliance_wide_disable_overrides_camera_eligibility(monkeypatch, fake_s3):

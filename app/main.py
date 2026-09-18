@@ -140408,7 +140408,7 @@ def _recording_read_credentials(role_arn: str, region: str) -> dict | None:
         return _recording_read_credentials_cache
 
 
-def _presigned_recording_url(s3_key: str) -> str | None:
+def _generate_presigned_recording_url(s3_key: str) -> str | None:
     """R4 (recording-pipeline roadmap): signs a short-lived GET URL for
     one recording object. Fails closed (returns None) whenever the
     read-capable role isn't configured -- see
@@ -140424,7 +140424,13 @@ def _presigned_recording_url(s3_key: str) -> str | None:
     Credentials for the assumed role are cached and reused across calls
     -- see _recording_read_credentials()'s own comment for why; nothing
     about which recordings are shown or how they're signed changed,
-    only how often STS gets called to do it."""
+    only how often STS gets called to do it.
+
+    Callers should almost never call this directly -- see
+    _presigned_recording_url_and_ttl()/_presigned_recording_url() just
+    below, which wrap this with a reuse cache. This function always
+    performs a fresh sign; it exists as its own name only so the cache
+    wrapper has something real to call on a miss."""
     role_arn = os.getenv('ANYAICAM_RECORDING_READ_ROLE_ARN', '').strip()
     bucket = os.getenv('ANYAICAM_RECORDING_S3_BUCKET', '').strip()
     region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', '')).strip()
@@ -140448,6 +140454,98 @@ def _presigned_recording_url(s3_key: str) -> str | None:
     except Exception:
         logging.getLogger('anyaicam.recording_read').exception('recording_read.presign_failed')
         return None
+
+
+# Reuse window for an already-signed presigned URL (see
+# _presigned_recording_url_and_ttl() below). Found via the Hybrid
+# transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
+# every event thumbnail/clip URL was re-signed from scratch on every
+# single request, and nothing ever told the browser it could reuse a
+# prior response -- so a dashboard/mobile poll loop that redraws the
+# same unchanged thumbnail every 4-15 seconds (see
+# MOBILE_EVENT_POLL_INTERVAL_MS/updateRecentEvents() in the rendered
+# customer pages) re-fetched the identical image bytes from S3 on every
+# single redraw, at full data-transfer-out cost, for as long as a
+# customer kept that page open. 300s is chosen to comfortably cover
+# that entire polling range while staying well inside the underlying
+# object's own 900s ExpiresIn/STS-session window (600s of margin left
+# before the signed URL this cache hands out could ever actually
+# expire).
+PRESIGNED_URL_REUSE_SECONDS = 300
+
+_presigned_url_cache: dict[str, dict] = {}
+_presigned_url_cache_lock = threading.Lock()
+
+
+def _presigned_recording_url_and_ttl(s3_key: str) -> tuple[str | None, int]:
+    """Returns (url, browser_cache_seconds) for one recording/event-media
+    object, reusing an already-signed URL for up to
+    PRESIGNED_URL_REUSE_SECONDS instead of paying a fresh sign (and,
+    upstream, a fresh STS round trip once the credential cache itself
+    is cold) on every call. browser_cache_seconds is how long a caller
+    may safely tell the browser to cache the resulting redirect/response
+    for -- it counts down as the cached entry ages, so it always stays
+    inside PRESIGNED_URL_REUSE_SECONDS and never outlives the signed
+    URL's own real validity. 0 means "don't set a Cache-Control header"
+    (a signing failure, or an entry that just expired), never a
+    negative number.
+
+    The cache key is the raw s3_key -- this app uses exactly one
+    recording-read bucket (ANYAICAM_RECORDING_S3_BUCKET), so no bucket
+    qualifier is needed to keep keys collision-free."""
+    with _presigned_url_cache_lock:
+        entry = _presigned_url_cache.get(s3_key)
+        if entry is not None:
+            remaining = entry['generated_monotonic'] + PRESIGNED_URL_REUSE_SECONDS - time.monotonic()
+            if remaining > 0:
+                return entry['url'], int(remaining)
+            del _presigned_url_cache[s3_key]
+
+    url = _generate_presigned_recording_url(s3_key)
+    if not url:
+        return None, 0
+
+    with _presigned_url_cache_lock:
+        _presigned_url_cache[s3_key] = {'url': url, 'generated_monotonic': time.monotonic()}
+    return url, PRESIGNED_URL_REUSE_SECONDS
+
+
+def _presigned_recording_url(s3_key: str) -> str | None:
+    """Thin, return-shape-compatible wrapper around
+    _presigned_recording_url_and_ttl() for the many existing call sites
+    that only ever wanted the URL itself. See that function's docstring
+    for the reuse-cache behavior this now benefits from automatically."""
+    url, _reuse_seconds = _presigned_recording_url_and_ttl(s3_key)
+    return url
+
+
+def _cacheable_presigned_redirect(s3_key: str) -> "RedirectResponse | None":
+    """Builds a 302 to a presigned media URL the same way a plain
+    RedirectResponse(url=_presigned_recording_url(s3_key)) already did,
+    but additionally sets a `Cache-Control: private, max-age=<n>` header
+    sized to the URL's own real remaining reuse window (see
+    _presigned_recording_url_and_ttl()). `private` (never `public`) is
+    deliberate: this response is only ever safe for the one already-
+    authorized browser that requested it to cache -- a shared/
+    intermediate cache (a corporate proxy, a CDN in front of this
+    route) must never be allowed to serve one customer's signed
+    thumbnail/clip URL to a different request. This is what actually
+    stops a polling UI (dashboard/mobile "recent events", both of which
+    redraw on a several-second timer) from re-fetching the same
+    unchanged image/clip bytes from S3 on every redraw -- the browser
+    now satisfies the repeat request from its own cache instead of
+    re-hitting this route at all. Returns None (same as a plain
+    _presigned_recording_url() miss) when no signable URL exists, so
+    every caller's existing 404-on-None handling is unchanged."""
+    from fastapi.responses import RedirectResponse
+
+    url, reuse_seconds = _presigned_recording_url_and_ttl(s3_key)
+    if not url:
+        return None
+    response = RedirectResponse(url=url, status_code=302)
+    if reuse_seconds > 0:
+        response.headers["Cache-Control"] = f"private, max-age={reuse_seconds}"
+    return response
 
 
 # How many of a camera's most recent recordings the customer Playback
@@ -141020,20 +141118,17 @@ def customer_event_media_url(camera_id: str, event_id: str, request: Request) ->
     return {"url": url}
 
 
-def _customer_event_thumbnail_url(camera_id: str, event_id: str) -> str | None:
-    """Presigns the still-frame preview captured alongside one event's
-    own clip (detection_event_media.thumbnail_s3_key) -- generated by
-    the same ingestion pipeline that writes s3_key (see
-    _customer_event_media_url() above), but never previously read by
-    any customer-facing code: _customer_detection_events() always
-    reported thumbnail=None regardless of whether a real preview
-    image existed, so every Events row rendered the same "--"
-    placeholder and the only visible difference between a row with a
-    real clip and one without was the clickable has_event_clip
-    wrapper itself. Re-scopes by camera_id in the same query as
+def _customer_event_thumbnail_s3_key(camera_id: str, event_id: str) -> str | None:
+    """Resolves one event's own captured-thumbnail S3 key (detection_
+    event_media.thumbnail_s3_key) -- pure DB lookup, no presigning.
+    Re-scopes by camera_id in the same query as
     _customer_event_media_url(), for the same reason: an event_id must
-    never resolve media for a camera other than the one the caller
-    was already authorized against."""
+    never resolve media for a camera other than the one the caller was
+    already authorized against. Split out from the old
+    _customer_event_thumbnail_url() (still below, now a thin wrapper)
+    so the actual route can hand this key to
+    _cacheable_presigned_redirect() and get the browser-caching benefit
+    described there, without a second, separate presign call."""
     from partner_db import connection
 
     with connection() as db:
@@ -141047,8 +141142,29 @@ def _customer_event_thumbnail_url(camera_id: str, event_id: str) -> str | None:
 
     if not row or not row["thumbnail_s3_key"]:
         return None
+    return row["thumbnail_s3_key"]
 
-    return _presigned_recording_url(row["thumbnail_s3_key"])
+
+def _customer_event_thumbnail_url(camera_id: str, event_id: str) -> str | None:
+    """Presigns the still-frame preview captured alongside one event's
+    own clip -- generated by the same ingestion pipeline that writes
+    s3_key (see _customer_event_media_url() above), but never
+    previously read by any customer-facing code: _customer_detection_
+    events() always reported thumbnail=None regardless of whether a
+    real preview image existed, so every Events row rendered the same
+    "--" placeholder and the only visible difference between a row
+    with a real clip and one without was the clickable has_event_clip
+    wrapper itself.
+
+    Retained for any caller that only wants a plain URL string; the
+    live customer_event_thumbnail() route below calls
+    _customer_event_thumbnail_s3_key() + _cacheable_presigned_redirect()
+    directly instead, so it can also set a browser Cache-Control
+    header -- this function does not."""
+    key = _customer_event_thumbnail_s3_key(camera_id, event_id)
+    if not key:
+        return None
+    return _presigned_recording_url(key)
 
 
 @app.get("/api/customer/events/{camera_id}/{event_id}/thumbnail")
@@ -141056,11 +141172,12 @@ def customer_event_thumbnail(camera_id: str, event_id: str, request: Request):
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
-    url = _customer_event_thumbnail_url(camera_id, event_id)
-    if not url:
+    key = _customer_event_thumbnail_s3_key(camera_id, event_id)
+    response = _cacheable_presigned_redirect(key) if key else None
+    if response is None:
         raise HTTPException(status_code=404, detail="Event thumbnail not available.")
 
-    return RedirectResponse(url=url, status_code=302)
+    return response
 
 
 _recording_media_cache_locks: dict = {}
@@ -141335,19 +141452,15 @@ def customer_recording_thumbnail(camera_id: str, recording_id: str, request: Req
     # through EC2.
     if filename.lower().endswith(".mp4"):
         thumbnail_key = s3_key.rsplit(".", 1)[0] + ".jpg"
-        thumbnail_url = _presigned_recording_url(thumbnail_key)
+        response = _cacheable_presigned_redirect(thumbnail_key)
 
-        if not thumbnail_url:
+        if response is None:
             raise HTTPException(
                 status_code=404,
                 detail="Thumbnail not available.",
             )
 
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(
-            url=thumbnail_url,
-            status_code=302,
-        )
+        return response
 
     # Preserve the original edge/local MKV behavior.
     if not filename.lower().endswith(".mkv"):
