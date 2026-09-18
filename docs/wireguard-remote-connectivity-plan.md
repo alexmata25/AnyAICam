@@ -735,3 +735,29 @@ WireGuard port, source `0.0.0.0/0` since Ryzen's real IP is NAT'd/
 dynamic) is the concrete change step (4) will need. Not created this
 pass -- deliberately treated as its own separate go-ahead, same as
 every other real network/interface change.
+
+**Step (2) update, and a real gap found in step (3) (2026-09-17, later
+still)**: step (2) is done -- Ryzen is confirmed independently running
+commit `8d5a075` (later superseded by `f07e1d0`, an unrelated MediaMTX
+packaging fix, see `docs/PROJECT_CHECKPOINT.md`), so the appliance-agent
+code now genuinely has `wireguard.py`, the `ANYAICAM_WIREGUARD_ENABLED`
+gate, and both DISPATCH entries. But step (3) as originally written above
+("set `ANYAICAM_WIREGUARD_ENABLED=true` in the agent's own config") turned
+out to be a dead end on an already-active appliance: that flag is only
+ever read inside `_finish_enrollment()`, which only runs from the
+one-time `interactive_main()`/`claim_main()` activation entry points --
+never from `service.py`'s long-running daemon that's actually running on
+Ryzen right now. Flipping the flag and restarting the service would be a
+complete no-op there; nothing in the daemon's normal code path ever
+reaches `enroll_wireguard()`.
+
+**Fixed**: a new standalone CLI trigger, `anyaicam-setup
+--wireguard-enroll` (`setup_wizard.wireguard_enroll_main()`), calls
+`enroll_wireguard()` directly against the appliance's existing identity
+-- reusing `credential.json` unchanged, never touching
+`first_enroll()`/`coordinated_reenroll()`, safe and idempotent to re-run.
+Full detail, real test evidence, and the exact proposed Ryzen command:
+`docs/PROJECT_CHECKPOINT.md`'s own "`anyaicam-setup --wireguard-enroll`"
+milestone. This supersedes step (3) above as written -- the real step 3
+is now "run `anyaicam-setup --wireguard-enroll`", not "set an env var and
+restart," for any appliance activated before this trigger existed.

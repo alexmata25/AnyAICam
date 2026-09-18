@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .commands import _queue_privileged_action
-from .config import AgentConfig,clear_claim_state,load_claim_state,save_claim_state
+from .config import AgentConfig,clear_claim_state,load_claim_state,load_credential,load_wireguard_identity,save_claim_state
 from .discovery import scan
 from .portal import PortalClient,PortalError
 from .reenrollment import ReenrollmentError,coordinated_reenroll,first_enroll
@@ -305,8 +305,74 @@ def claim_main():
     clear_claim_state(config)
 
 
+# --------------------------------------------------------- WireGuard
+# standalone enrollment trigger (anyaicam-setup --wireguard-enroll).
+#
+# _finish_enrollment()'s own WireGuard hook (above) only ever runs
+# inside interactive_main()/claim_main() -- i.e. only at the moment an
+# appliance is FIRST activated or RE-claimed. service.py's long-running
+# daemon never calls it again afterward, so an appliance that was
+# already active before ANYAICAM_WIREGUARD_ENABLED existed (every real
+# appliance in the field today) has no path that ever reaches
+# enroll_wireguard() -- flipping the env var and restarting the service
+# is a genuine no-op there. This command is that missing path: a small,
+# additive, separately-invocable trigger for an ALREADY-activated
+# appliance, deliberately NOT routed through first_enroll()/
+# coordinated_reenroll() (see wireguard_enroll_main() below) -- turning
+# on one additive feature must never re-run identity replacement.
+def wireguard_enroll_main():
+    print('\nAnyAiCam WireGuard direct-connectivity enrollment\n')
+    config=AgentConfig.load()
+    credential=load_credential(config)
+    if not credential:
+        raise SystemExit('This appliance has not been activated yet. Run anyaicam-setup (or anyaicam-setup --claim) first, then retry --wireguard-enroll.')
+    # Deliberately load_credential()/PortalClient() only -- never
+    # first_enroll()/coordinated_reenroll()/reenrollment.py at all. This
+    # command's entire contract is "reuse the existing appliance
+    # identity, touch nothing about it" -- agent.json, credential.json,
+    # and the VMS's own appliance_identity.json are never read, staged,
+    # or written anywhere in this function.
+    client=PortalClient(config.portal_url,credential['appliance_id'],credential['credential'])
+    # Read BEFORE enrolling, purely to decide afterward whether the
+    # tunnel's own address/gateway assignment actually changed -- never
+    # used to skip calling enroll_wireguard() itself. enroll_wireguard()
+    # is always called; its own already-tested reuse-existing-key logic
+    # (wireguard.py) is what makes a repeat call idempotent at the
+    # keypair layer, and enroll_peer()'s own same-public-key short
+    # circuit (app/wireguard_remote.py) is what makes it idempotent at
+    # the cloud row layer -- this function adds a third, purely
+    # cosmetic/operational layer on top: deciding whether the real
+    # interface needs re-queuing, not whether enrollment should happen.
+    previous=load_wireguard_identity(config)
+    try:
+        # replace_existing is always False here -- that flag exists
+        # exclusively for the hardware-replacement path inside
+        # coordinated_reenroll() (see wireguard.py's own docstring on
+        # this call site), which this command deliberately never
+        # touches. A routine (re-)run of this command is always a
+        # reconnect/reconcile, never a replacement.
+        identity=enroll_wireguard(config,client,replace_existing=False)
+    except PortalError as error:
+        raise SystemExit(f'WireGuard enrollment failed: {error}. Nothing was changed locally -- this command is safe to re-run once the problem above is resolved.') from error
+    changed=(previous is None or any(previous.get(field)!=identity.get(field) for field in ('public_key','tunnel_address','gateway_public_key','gateway_endpoint')))
+    print(f"Tunnel address: {identity['tunnel_address']}")
+    print(f"Gateway endpoint: {identity['gateway_endpoint']}")
+    print(f"Status: {identity['status']}")
+    if changed:
+        status,_,error=_queue_privileged_action(config,'wireguard_interface_up',{'confirmed':True})
+        if status!='completed':
+            print(f'WARNING: could not queue WireGuard interface bring-up automatically ({error}); direct remote connectivity will not be available until this command is re-run -- existing WebRTC P2P and AWS relay paths are unaffected.')
+        else:
+            print('WireGuard interface bring-up has been queued for the privileged watcher to apply.')
+    else:
+        print('This appliance is already enrolled with this exact tunnel configuration -- no interface change is needed.')
+    print('Existing appliance identity (cloud_id, customer/site assignment, credential) and camera configuration were not modified by this command.')
+
+
 def main():
-    if '--claim' in sys.argv[1:]: claim_main()
+    args=sys.argv[1:]
+    if '--wireguard-enroll' in args: wireguard_enroll_main()
+    elif '--claim' in args: claim_main()
     else: interactive_main()
 
 
