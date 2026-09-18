@@ -3843,3 +3843,39 @@ The operator reported running the exact command from the entry above and getting
 ### State to resume from
 
 The real next step is unchanged in substance from the prior entry -- the agent redeploy to `8d5a075` still needs to actually happen -- but it has NOT happened yet despite the earlier report. The already-staged, already-checksum-verified artifact is still sitting at `~/anyaicam-release-8d5a075c/` on Ryzen, untouched. The correct command is still `cd ~/anyaicam-release-8d5a075c && sudo ./install.sh --repair && sudo bash validate.sh` -- run from that exact directory, not any of the older ones. After a successful run, `/version`'s `build_id` should read `8d5a075...`, not `d838d8c...` -- that field is the one to check to confirm it actually took effect, not just a 0-failures `validate.sh` result. `ANYAICAM_WIREGUARD_ENABLED` is still unset; no real WireGuard interface exists anywhere. AACO was not started. Production was not touched.
+
+## Milestone: MediaMTX packaging-pipeline fix verified live on Ryzen -- closed. Independent Ryzen health check clean across every category (2026-09-18)
+
+**MediaMTX fix (`f07e1d0`) verification -- all real, live evidence, not relayed from the operator's own report:**
+
+| Check | Result |
+|---|---|
+| `build_id` | `f07e1d03c03c7c8a8171357451eaf198841da149` via `/version` -- exact match, independently queried |
+| `appliance_wireguard_peers` table exists in the real live DB | Yes -- direct, unambiguous proof this build's full schema (not just the MediaMTX fix) is genuinely running, stronger evidence than build_id alone |
+| All 5 real cameras actively recording | `camera1`'s newest segment file mtime was 1 second behind "now" at check time (`02:38:34` vs `02:38:35`), confirmed still growing -- not a stale snapshot; `camera2`-`camera5` all had segments within the same ~3-minute rotation window |
+| MediaMTX/P2P functionally serving, not just present | `webrtc_publisher`'s own local API (`127.0.0.1:9997/v3/paths/list`) reports all 5 real camera IDs (`dfba6a63ec`/`dc7a226120`/`5c689a0c0e`/`55bdd715ea`/`41dc80c85e`) as configured WebRTC paths, all `online:true` |
+| RDM/entitlement | `anyaicam-agent.service` active; `journalctl` shows `Entitlement refreshed camera_slot_quantity=8` at `21:29:56` CDT, ~9 min before check, consistent with the established ~30min refresh interval and correlated with the repair-install's own restart timestamp |
+| Storage management | `local_storage_manager` actively deleting expired recordings in real time during the check window (multiple `local_storage.deleted` log lines within the last 60 seconds) |
+| Analytics pipeline | `analytics_sync`/`event_media_uploader` real HTTP round trips and event registrations observed live, seconds old |
+| LPR/PPE (no regression) | PPE model still loads (`_get_model()` returns non-None); `pytesseract` still reports version `5.5.0` |
+| Talk-down capability (no regression) | `talk_down_supported` unchanged: cameras 1/4/5 = true, 2/3 = false |
+| Container health | `docker ps` reports `(healthy)` |
+
+All clean. **The MediaMTX packaging-pipeline milestone is now fully closed**: the permanent build-time-mandatory + validate.sh-hard-fail fix (`f07e1d0`) is not just merged but confirmed working end-to-end on the real appliance it was built to protect.
+
+## Genuine gap found while resuming WireGuard: the previously-assumed "enable the flag" step would not actually do anything on an already-enrolled Ryzen -- needs a decision, not a command
+
+Read `setup_wizard.py` directly (not re-assumed from the prior entry's own summary). Finding: **`ANYAICAM_WIREGUARD_ENABLED` is only ever consulted inside `_finish_enrollment()`** (`setup_wizard.py:125`), and `_finish_enrollment()` is only ever called from two places: `interactive_main()` (the one-time interactive `anyaicam-setup` wizard) and `claim_main()` (`anyaicam-setup --claim`, the one-time automated claim flow) -- both manual, one-shot CLI entry points run once during initial appliance activation. **`service.py`'s long-running daemon (the actual `anyaicam-agent.service` that's running on Ryzen right now) never calls `_finish_enrollment()` at all**, on startup, on restart, or periodically.
+
+This means the sequence implied by the prior entry ("set `ANYAICAM_WIREGUARD_ENABLED=true`... then a real `wg-quick up`") would not actually work as stated on Ryzen as it stands today: setting the env var and restarting `anyaicam-agent.service` would be a complete no-op, because nothing in the daemon's normal running code path ever reaches the WireGuard enrollment call. The only two ways to reach it with the code as it exists today are:
+
+1. **Re-run `anyaicam-setup --claim`** -- but this is the fresh/first-time claim flow; running it against an already-activated appliance is not its intended use and its actual behavior in that case (accepted, rejected by the server, or something else) was not tested this pass, and using it as a WireGuard-only toggle risks touching unrelated identity state it wasn't designed to touch a second time.
+2. **A full `coordinated_reenroll()`** -- the codebase's existing hardware-replacement path, which rotates the device's *entire* identity (not just WireGuard-specific state) -- clearly disproportionate just to turn on one additive feature.
+
+Neither is the right tool for "enable WireGuard on an appliance that's already active." **The missing piece is a genuinely new, small trigger** -- e.g., a standalone `anyaicam-setup --wireguard-enroll`-style one-off command that calls the already-built, already-tested `enroll_wireguard()` (`wireguard.py`) directly against the existing identity, without touching anything else -- but deciding to add that, and exactly what it should be called/guarded by, is new source-level design scope this pass's own directive didn't authorize unilaterally, and it's the kind of thing worth the user seeing before it's built, not after.
+
+**Nothing was changed or executed this pass beyond the two DOCEOF-documented investigations above.** No env var was set, no service was restarted, no command was proposed for Ryzen or staging (there is genuinely no correct one to propose yet -- proposing "set the flag and restart" would be actively misleading given what this pass found).
+
+### State to resume from
+
+MediaMTX is closed, fully verified live. WireGuard is blocked on a real design decision, not a privileged-command approval: how should an already-enrolled appliance be given a way to (re-)run WireGuard enrollment without a full re-claim or hardware-replacement-style re-enrollment? Once that's decided, the actual next steps are still, in order: (a) build whatever minimal trigger is decided on, source-only, tested; (b) the staging UDP 51820 security-group rule (still proposed, not created); (c) the real (non-mock) cloud gateway stand-up on staging; (d) only then a real Ryzen privileged command. AACO not started. Production not touched.
