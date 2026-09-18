@@ -629,11 +629,88 @@ fourth participant.
     action this phase's own directive reserves for separate, explicit
     authorization -- see the coordinator's own report for the precise
     command that step would run.
-- **Phase C (future)**: portal-side UI/diagnostics surface, the live-view
-  transport-racing integration (§3, §17) actually wired into
-  `live_view_page.py`, `installer/11-install-wireguard.sh` (§2g), and
-  the gateway's own `proxy.py` wired into a real customer-facing route.
+- **Phase C (this pass, partial -- staging verification only)**: the gateway
+  process, enrollment route, and reconciler proven live on staging end to
+  end -- still zero real WireGuard interface anywhere. See §21. Still
+  future within "Phase C": the portal-side UI/diagnostics surface, the
+  live-view transport-racing integration (§3, §17) actually wired into
+  `live_view_page.py`, `installer/11-install-wireguard.sh` (§2g), and the
+  gateway's own `proxy.py` wired into a real customer-facing route.
 - **Phase D (future)**: real Ryzen/staging rollout, feature-flagged off by
   default the same way `ANYAICAM_LIVE_P2P_ENABLED` shipped, with its own
   explicit go/no-go the same way every other live-infrastructure change in
   this project has required.
+
+## 21. Phase C staging verification (this pass)
+
+Deployed `c5612b9` to staging (`portal-c5612b9`, recreated in place from
+`portal-d971110` via the established `verify_cutover_safety.py` /
+`check_container_sprawl.py`-gated cutover -- `CUTOVER_OK`, then
+`CONTAINER_SPRAWL_OK`, zero-downtime-equivalent, old container preserved
+stopped as `portal-d971110-pre-wireguard-gateway`, never deleted). Exact
+commit confirmed byte-for-byte: `sha256sum` of `wireguard_remote.py` and
+`wireguard_gateway/gateway_service.py` inside the running container
+matches `git show c5612b9:...` exactly.
+
+**New this pass**: `gateway_service.py` gained an env-gated provider
+switch, `ANYAICAM_WIREGUARD_GATEWAY_PROVIDER=mock` (unset/anything else
+keeps the real `SystemWireGuardInterfaceProvider` default unchanged) --
+the one deploy-time switch safe to flip on staging before a real
+interface exists anywhere. A second container, `wireguard-gateway-c5612b9`,
+was started from the SAME already-built image with this flag set,
+`--cap-add=NET_ADMIN` and the UDP port deliberately omitted -- confirmed
+in its own startup log ("no real interface will ever be touched by this
+process"). 9 new tests for the switch itself. Full regression: 91
+failed/2747 passed/24 skipped -- established baseline, zero new
+regressions.
+
+**Real, live evidence, not "should work"**:
+- Enrollment: a genuine disposable synthetic appliance identity (never
+  the real pilot customer -- `e2e/scripts/provision_wireguard_test_
+  harness.py`, torn down after) called the real, public
+  `POST /api/appliance/wireguard/enroll` over real HTTPS. 200 with a real
+  assigned `tunnel_address` (`10.70.0.2`); an identical re-call was
+  idempotent (same address, no duplicate row); a wrong credential got a
+  real 403; a malformed key got a real 400.
+- Reconciliation: the gateway's own log, within one real 30s poll cycle,
+  printed `WireGuard gateway reconciled: +1 -0 peers` -- it read the real
+  database over the real network and drove the mock provider to match,
+  with zero interface access.
+- Telemetry: a real heartbeat carrying `wireguard_status:"enrolled"` was
+  accepted (200) and confirmed, by direct DB read, actually persisted on
+  the `appliances` row -- the full cloud-side telemetry path, proven, not
+  just unit-tested.
+- Fallback: 23 real Playwright browser tests (`test_live_view_p2p.py`,
+  `test_live_view.py`, `test_camera_status.py`, `test_dashboard.py`) ran
+  against this exact deployment, gateway container and all, and all
+  passed -- WebRTC P2P and the existing transport-racing/live-view paths
+  are provably unaffected by the gateway's mere presence.
+- Data safety: `PRAGMA integrity_check: ok` and every row count
+  (`partners`/`customers`/`sites`/`appliances`/`partner_users`/`cameras`)
+  identical before and after, both before and after the disposable
+  harness's own teardown; `appliance_wireguard_peers` (created fresh by
+  this deploy's own migration) ended at exactly 0 rows.
+- Resources: the gateway container uses ~10MB RAM idle; staging's memory/
+  disk headroom is materially unchanged (2.3GB available, 2.4GB disk
+  free) -- no repeat of the documented OOM/disk-exhaustion incidents this
+  project has already had.
+
+**Ryzen, read-only inspection only (per this project's own standing
+Ryzen access model)**: `wireguard-tools` is confirmed **not installed**
+on the real Ryzen appliance (`which wg wg-quick` empty, package absent).
+The currently-running `anyaicam-agent.service` predates every commit in
+this WireGuard effort -- it has no `wireguard.py`, no
+`ANYAICAM_WIREGUARD_ENABLED` gate, and the currently-installed
+`privileged_watcher.py` has no `wireguard_interface_up`/`down` DISPATCH
+entries yet. This means the real chain to a live Ryzen tunnel is, in
+order: (1) install `wireguard-tools` (sudo, zero network/interface
+change by itself); (2) redeploy the updated appliance-agent code via the
+established release-installer pipeline (sudo, the same repair-install
+process already used for LPR/PPE and Face Access); (3) set
+`ANYAICAM_WIREGUARD_ENABLED=true` in the agent's own config; (4) stand up
+a REAL (non-mock) cloud gateway with a real UDP endpoint reachable from
+the internet -- a separate, its-own-authorization infrastructure step
+this pass deliberately did not take; only then does a real `wg-quick up`
+do anything meaningful. Step (1) is the first of these that needs sudo/
+root on Ryzen at all, and is this pass's own stopping point -- see the
+coordinator's own report for the exact command.
