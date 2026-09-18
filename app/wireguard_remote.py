@@ -143,6 +143,23 @@ def enroll_peer(db, *, appliance_id: str, customer_id: str, public_key: str, now
             # must never silently attribute one appliance's tunnel
             # identity to another.
             raise HTTPException(status_code=409, detail="This public key is already enrolled to a different appliance.")
+        # gateway_public_key/gateway_endpoint are live cloud-infrastructure
+        # config, not a snapshot frozen at this peer's original enrollment
+        # moment -- a real incident (2026-09-18) found a routine re-enroll
+        # (same public_key, e.g. an appliance reboot/retry) silently
+        # returning whatever endpoint/key was live back when this row was
+        # first INSERTed, even after the real infrastructure value changed
+        # (a gateway redeploy). Refresh on every idempotent re-enroll so a
+        # reconnecting appliance always gets the current live values;
+        # never touch tunnel_address/public_key/id themselves, so an
+        # appliance's own identity and address assignment stay exactly as
+        # they already are.
+        if existing["gateway_public_key"] != GATEWAY_PUBLIC_KEY or existing["gateway_endpoint"] != GATEWAY_ENDPOINT:
+            db.execute(
+                "UPDATE appliance_wireguard_peers SET gateway_public_key=?, gateway_endpoint=? WHERE id=?",
+                (GATEWAY_PUBLIC_KEY, GATEWAY_ENDPOINT, existing["id"]),
+            )
+            existing = db.execute("SELECT * FROM appliance_wireguard_peers WHERE id=?", (existing["id"],)).fetchone()
         return dict(existing)
 
     tunnel_address = _assign_tunnel_address(db)

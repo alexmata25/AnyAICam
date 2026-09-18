@@ -251,6 +251,43 @@ def test_reenrolling_the_same_public_key_is_idempotent(db_path, appliance_client
     assert count["c"] == 1
 
 
+def test_reenrolling_after_a_gateway_config_change_returns_the_current_endpoint(db_path, appliance_client, monkeypatch):
+    """Real incident (2026-09-18): a routine re-enroll with the SAME
+    public_key (an appliance reboot/retry, not a rotation) hit the
+    idempotent-return path and got back whatever gateway_endpoint/
+    gateway_public_key was live at this peer's ORIGINAL enrollment
+    moment -- stale infrastructure config baked into the DB row,
+    silently overriding a since-corrected live env var. This is exactly
+    the class of bug a test setting the env var to one value, then
+    changing it before a second call, would have caught before it ever
+    reached a real appliance."""
+    _seed(db_path)
+    public_key = _real_public_key()
+    first = appliance_client.post(
+        "/api/appliance/wireguard/enroll", json={"public_key": public_key}, headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert first.json()["gateway_endpoint"] == "gateway.example.test:51820"
+
+    # The real infrastructure value changes (e.g. the gateway is
+    # redeployed/reconfigured) -- simulated here exactly as the fixture
+    # itself sets these module-level values.
+    monkeypatch.setattr(wireguard_remote, "GATEWAY_PUBLIC_KEY", "y" * 43 + "=")
+    monkeypatch.setattr(wireguard_remote, "GATEWAY_ENDPOINT", "34.194.19.113:51820")
+
+    second = appliance_client.post(
+        "/api/appliance/wireguard/enroll", json={"public_key": public_key}, headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert second.status_code == 200
+    assert second.json()["gateway_endpoint"] == "34.194.19.113:51820"
+    assert second.json()["gateway_public_key"] == "y" * 43 + "="
+    # The peer's own identity/assignment must never change as a side
+    # effect of refreshing gateway config.
+    assert second.json()["tunnel_address"] == first.json()["tunnel_address"]
+    with override_target(sqlite_path=str(db_path)):
+        count = row("SELECT COUNT(*) AS c FROM appliance_wireguard_peers WHERE public_key=?", (public_key,))
+    assert count["c"] == 1
+
+
 def test_rotation_allows_a_second_active_peer_for_the_same_appliance(db_path, appliance_client):
     """A genuinely NEW public key for an appliance that already has one
     active peer is a rotation, not a conflict -- see plan doc Sec 11."""
