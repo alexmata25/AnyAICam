@@ -96,6 +96,28 @@ class AgentConfig:
     # appliance_claims.py's DEVICE_ID_PATTERN comment).
     @property
     def installer_identity_file(self): return Path(self.config_dir)/'appliance_identity.json'
+    # WireGuard direct remote connectivity (docs/wireguard-remote-
+    # connectivity-plan.md Sec 6): private key + assigned tunnel address
+    # + gateway public key/endpoint -- provisioned trust material, same
+    # config_dir placement rationale as installer_identity_file/
+    # credential_file above (NOT state_dir: this is not routine runtime
+    # state, it's the device's own identity). See wireguard.py for the
+    # enrollment logic that reads/writes this file, and
+    # privileged_watcher.py's DISPATCH for the fixed, hardcoded path the
+    # rendered wg0.conf (a SEPARATE file, wireguard_conf_file below) is
+    # read from by the actual interface bring-up action.
+    @property
+    def wireguard_identity_file(self): return Path(self.config_dir)/'wireguard_identity.json'
+    # The rendered wg-quick config -- deliberately a real file path
+    # (config_dir/wireguard/wg0.conf), not the OS-default /etc/wireguard/
+    # wg0.conf, specifically so this unprivileged process (which already
+    # owns config_dir, same as every other file here) can write it
+    # without needing write access to /etc/wireguard/ at all -- wg-quick
+    # accepts a full config-file path as well as a bare interface name,
+    # so privileged_watcher.py's DISPATCH can point at this exact path
+    # as a fixed literal (see that module's own comment on this).
+    @property
+    def wireguard_conf_file(self): return Path(self.config_dir)/'wireguard'/'wg0.conf'
     @property
     def queue_file(self): return Path(self.state_dir)/'offline_queue.db'
     @property
@@ -234,3 +256,17 @@ def save_claim_state(config: AgentConfig,value: dict):
 def clear_claim_state(config: AgentConfig):
     try: config.claim_state_file.unlink()
     except FileNotFoundError: pass
+
+
+# WireGuard identity -- same read/write shape as load_credential()/
+# save_credential() above (atomic write-then-rename, 0600), for the
+# same reason: wireguard_identity_file holds this device's own private
+# key, a bearer-equivalent secret for the tunnel exactly like
+# credential_file is for the control-plane API.
+def load_wireguard_identity(config: AgentConfig) -> dict|None:
+    try: return json.loads(config.wireguard_identity_file.read_text(encoding='utf-8'))
+    except (OSError,json.JSONDecodeError): return None
+
+
+def save_wireguard_identity(config: AgentConfig,value: dict):
+    config.wireguard_identity_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.wireguard_identity_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.wireguard_identity_file); os.chmod(config.wireguard_identity_file,0o600)

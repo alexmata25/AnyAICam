@@ -275,7 +275,18 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             storage_free_percent=float(storage_free_percent) if isinstance(storage_free_percent,(int,float)) else None
             storage_last_cleanup_at=safe.get('storage_last_cleanup_at')
             storage_last_cleanup_at=str(storage_last_cleanup_at)[:40] if isinstance(storage_last_cleanup_at,str) else None
-            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at) WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,appliance['id']))
+            # wireguard_status/wireguard_last_handshake_at (docs/wireguard-
+            # remote-connectivity-plan.md Sec 14): same optional-field,
+            # COALESCE-on-omission shape as storage_state directly above --
+            # an appliance that has never enrolled a WireGuard identity
+            # (the overwhelming majority today, since Phase B/C/D have not
+            # shipped) simply never sends these keys, and this UPDATE
+            # leaves the columns exactly as they were (NULL, initially).
+            wireguard_status=safe.get('wireguard_status')
+            wireguard_status=str(wireguard_status)[:20] if wireguard_status in ('disabled','enrolling','enrolled','active','degraded','failed') else None
+            wireguard_last_handshake_at=safe.get('wireguard_last_handshake_at')
+            wireguard_last_handshake_at=str(wireguard_last_handshake_at)[:40] if isinstance(wireguard_last_handshake_at,str) else None
+            db.execute('UPDATE appliances SET state=?,online_status=?,last_check_in=?,software_version=?,uptime_seconds=?,cpu=?,memory=?,disk_capacity=?,disk=?,recording_used=?,last_error=?,camera_capacity=?,storage_state=COALESCE(?,storage_state),storage_free_percent=COALESCE(?,storage_free_percent),storage_last_cleanup_at=COALESCE(?,storage_last_cleanup_at),wireguard_status=COALESCE(?,wireguard_status),wireguard_last_handshake_at=COALESCE(?,wireguard_last_handshake_at) WHERE id=?',(state,state,now,safe.get('software_version','Unknown'),new_uptime,float(safe.get('cpu',0)),float(safe.get('memory',0)),float(safe.get('disk_capacity',0)),float(safe.get('disk_used',0)),float(safe.get('recording_used',0)),safe.get('last_error'),int(safe.get('camera_count',0)),storage_state,storage_free_percent,storage_last_cleanup_at,wireguard_status,wireguard_last_handshake_at,appliance['id']))
             db.execute('INSERT INTO appliance_health_history(appliance_id,status,cpu,memory,disk_capacity,disk_used,recording_used,uptime_seconds,camera_count,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(appliance['id'],state,safe.get('cpu',0),safe.get('memory',0),safe.get('disk_capacity',0),safe.get('disk_used',0),safe.get('recording_used',0),safe.get('uptime_seconds',0),safe.get('camera_count',0),safe.get('last_error'),now))
         return {'status':'accepted','state':state,'warnings':warnings,'restarted':restarted,'server_time':int(time.time()),'current_manifest_version':live_version,'manifest_refreshed':manifest_refreshed}
 

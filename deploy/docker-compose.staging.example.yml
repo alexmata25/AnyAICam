@@ -44,6 +44,60 @@ services:
       - "80:80"
       - "443:443"
 
+  # WireGuard gateway (docs/wireguard-remote-connectivity-plan.md,
+  # Phase B) -- NOT started by anything today. Real staging is not
+  # deployed via `docker-compose up` against this file at all (see
+  # docs/PROJECT_CHECKPOINT.md's own deploy history: real deploys build
+  # `deploy-portal:<commit>` and recreate a single named container by
+  # hand/script via SSM) -- this block exists purely as the documented
+  # template for the Phase C/D deploy pass that eventually adds it for
+  # real, matching this file's own existing "example" role for `portal`/
+  # `caddy` above. Placement decision (gateway_service.py's own module
+  # docstring has the full reasoning): the SAME already-built portal
+  # image, a SECOND container, on the SAME existing deploy_default
+  # network and the SAME staging EC2 instance -- zero new image, zero
+  # new build pipeline, zero new compute. The only genuinely new
+  # infrastructure this needs when it is actually turned on: one new
+  # UDP port opened on that instance's security group, and
+  # --cap-add=NET_ADMIN on this container ONLY -- portal above gets
+  # neither, preserving the same "one minimal process holds the
+  # elevated capability" boundary as MediaMTX's own loopback-only
+  # control surface elsewhere in this codebase.
+  wireguard-gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: anyaicam-staging-wireguard-gateway
+    command: ["python", "-m", "wireguard_gateway.gateway_service"]
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    env_file:
+      - /etc/anyaicam-staging/vms-staging.env
+    environment:
+      # Real values (a real keypair + the real public endpoint/port)
+      # are cloud-infrastructure configuration, deliberately never
+      # filled in here or anywhere in this repository -- see
+      # wireguard_remote.py's own GATEWAY_PUBLIC_KEY/GATEWAY_ENDPOINT
+      # fail-closed-when-unconfigured behavior (503 on enroll until
+      # both are set).
+      ANYAICAM_WIREGUARD_TUNNEL_CIDR: 10.70.0.0/16
+    volumes:
+      # Read/write access to the SAME database volume as `portal` --
+      # this process only ever reads appliance_wireguard_peers rows via
+      # the existing partner_db.connection() (see gateway_service.py),
+      # never writes to any table; shared here because SQLite requires
+      # the file to be reachable, not because this process needs write
+      # access to portal's own broader data.
+      - /var/lib/anyaicam-staging/db:/app/data
+    # The real WireGuard UDP listener -- deliberately left empty/
+    # commented out until a real security-group/firewall change
+    # explicitly opens it; adding a "- 51820:51820/udp" line alone does
+    # nothing on a host whose firewall still blocks the port.
+    # ports:
+    #   - "51820:51820/udp"
+    ports: []
+
 volumes:
   caddy_data:
   caddy_config:

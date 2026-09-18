@@ -64,10 +64,32 @@ GRACE_SECONDS = 10  # re-checked below: a deliberate pause before acting,
 # enrollment -- see restart_service()'s own docstring in setup_wizard.py
 # for why anyaicam-agent.service does not actually need this restart to
 # pick up a freshly written credential.json.
+# wireguard_interface_up/down (docs/wireguard-remote-connectivity-plan.md
+# Sec 5 step 3, Sec 16): the appliance-side half of WireGuard direct
+# remote connectivity. `wg-quick` accepts either a bare interface name
+# (looks up /etc/wireguard/<name>.conf) or a full config-file path --
+# the literal path below is the SECOND form, deliberately pointed at
+# config_dir/wireguard/wg0.conf (AgentConfig.wireguard_conf_file, see
+# config.py) rather than the OS default /etc/wireguard/wg0.conf,
+# specifically so the unprivileged anyaicam-agent process -- which
+# already owns config_dir, same as agent.json/credential.json -- can
+# write the config's content itself (see wireguard.py's own
+# save_wg_conf()) without ever needing write access to /etc/wireguard/.
+# This is the exact same shape restart_vms already established above:
+# a fixed, hardcoded literal argv/path that itself reads a config file
+# from a well-known location the unprivileged process wrote ahead of
+# queuing the action -- the marker's own content is still never read
+# for either action, only its `type`. Neither entry has been queued or
+# executed against any real device by anything in this codebase yet --
+# see setup_wizard.py's own ANYAICAM_WIREGUARD_ENABLED gate (unset by
+# default) and this project's own standing "no real network/interface
+# change on the Ryzen without separate explicit authorization" rule.
 DISPATCH = {
     'reboot': ['systemctl', 'reboot'],
     'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
     'restart_agent': ['systemctl', 'restart', 'anyaicam-agent.service'],
+    'wireguard_interface_up': ['wg-quick', 'up', '/etc/anyaicam/wireguard/wg0.conf'],
+    'wireguard_interface_down': ['wg-quick', 'down', '/etc/anyaicam/wireguard/wg0.conf'],
 }
 
 log = logging.getLogger('anyaicam.privileged_watcher')

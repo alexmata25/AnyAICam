@@ -1,5 +1,6 @@
 import getpass
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from .config import AgentConfig,clear_claim_state,load_claim_state,save_claim_st
 from .discovery import scan
 from .portal import PortalClient,PortalError
 from .reenrollment import ReenrollmentError,coordinated_reenroll,first_enroll
+from .wireguard import enroll_wireguard
 
 
 def _upsert_vms_env_key(config:AgentConfig,key:str,value:str) -> None:
@@ -98,6 +100,36 @@ def _finish_enrollment(config:AgentConfig,activated:dict) -> None:
             vms_identity_path=vms_identity_path,
             restart_service=restart_service,verify_authentication=verify_authentication)
     except ReenrollmentError as error: raise SystemExit(str(error)) from error
+    # WireGuard direct remote connectivity (docs/wireguard-remote-
+    # connectivity-plan.md Sec 5): gated behind ANYAICAM_WIREGUARD_ENABLED,
+    # unset (feature off) everywhere today -- Phase D's own explicit
+    # go/no-go, not this pass, is what would ever set it, matching this
+    # codebase's established staged-rollout precedent (ANYAICAM_LIVE_
+    # P2P_ENABLED, relay_control.py's own ANYAICAM_FACIAL_ACCESS_CONTROL_
+    # ENABLED). already_enrolled (computed above) doubles as replace_
+    # existing here: a re-enrollment (hardware replacement/re-claim)
+    # should rotate this device's WireGuard identity and revoke its
+    # prior peer row the same way it already rotates every other
+    # identity field; a genuinely first-time enrollment has nothing to
+    # replace, so replace_existing=False there is simply a no-op on the
+    # cloud side (see wireguard_remote.py's own enroll route).
+    #
+    # Failure here is ALWAYS only a warning, never fatal -- WireGuard is
+    # fully additive (plan doc Sec 18): the identity this function just
+    # committed above is already real and complete without it, and the
+    # existing WebRTC P2P / AWS relay live-view paths are completely
+    # unaffected either way. This also deliberately never queues
+    # wireguard_interface_up on a failure -- only on a real, confirmed
+    # enrollment success, so a failed enrollment can never leave a
+    # privileged action queued for a config that doesn't exist yet.
+    if os.environ.get('ANYAICAM_WIREGUARD_ENABLED','').strip().lower()=='true':
+        try:
+            client=PortalClient(config.portal_url,activated['appliance_id'],activated['credential'])
+            enroll_wireguard(config,client,replace_existing=already_enrolled)
+            status,_,error=_queue_privileged_action(config,'wireguard_interface_up',{'confirmed':True})
+            if status!='completed': print(f'WARNING: could not queue WireGuard interface bring-up automatically ({error}); direct remote connectivity will not be available until this is retried -- existing WebRTC P2P and AWS relay paths are unaffected.')
+        except Exception as error:
+            print(f'WARNING: WireGuard enrollment failed ({error}); direct remote connectivity will not be available -- existing WebRTC P2P and AWS relay paths are unaffected.')
     # The VMS container reads portal_url from its own ANYAICAM_CLOUD_URL env
     # var at process start (recording_uploader.py/live_relay_uploader.py/
     # analytics_sync.py/event_media_uploader.py all read it the same way) --

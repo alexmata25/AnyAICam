@@ -276,6 +276,89 @@ def test_same_public_key_cannot_be_stolen_by_a_different_appliance(db_path, appl
     assert response.status_code == 409
 
 
+# ------------------------------------------------- replace_existing (hardware replacement, plan doc Sec 12)
+
+
+def test_replace_existing_revokes_the_appliances_prior_peer(db_path, appliance_client):
+    _seed(db_path)
+    old_key = _real_public_key()
+    new_key = _real_public_key()
+    old_response = appliance_client.post("/api/appliance/wireguard/enroll", json={"public_key": old_key}, headers=_appliance_headers("appl-a", "cred-a"))
+    old_peer_id = None
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            old_peer_id = wireguard_remote.active_peers_for_appliance(db, "appl-a")[0]["id"]
+
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": new_key, "replace_existing": True},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            active = wireguard_remote.active_peers_for_appliance(db, "appl-a")
+            old_row = db.execute("SELECT status,revoked_reason FROM appliance_wireguard_peers WHERE id=?", (old_peer_id,)).fetchone()
+    assert {peer["public_key"] for peer in active} == {new_key}
+    assert old_row["status"] == "revoked"
+    assert old_row["revoked_reason"] == "reenrolled"
+
+
+def test_replace_existing_never_revokes_other_appliances_peers(db_path, appliance_client):
+    _seed(db_path)
+    appliance_client.post("/api/appliance/wireguard/enroll", json={"public_key": _real_public_key()}, headers=_appliance_headers("appl-b", "cred-b"))
+    appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": _real_public_key(), "replace_existing": True},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            b_active = wireguard_remote.active_peers_for_appliance(db, "appl-b")
+    assert len(b_active) == 1  # untouched by appl-a's own replace_existing call
+
+
+def test_replace_existing_without_any_prior_peer_is_a_safe_first_enrollment(db_path, appliance_client):
+    """A brand-new appliance's first-ever enroll call can legitimately
+    set replace_existing=True (the agent doesn't need to know whether
+    this is its first activation or a re-enrollment to be correct) --
+    must succeed exactly like a normal enrollment, not error because
+    there was nothing to revoke."""
+    _seed(db_path)
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": _real_public_key(), "replace_existing": True},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            active = wireguard_remote.active_peers_for_appliance(db, "appl-a")
+    assert len(active) == 1
+
+
+def test_replace_existing_resubmitting_the_same_already_active_key_does_not_revoke_itself(db_path, appliance_client):
+    """The ordering fix this route relies on: enroll_peer() runs before
+    the revoke-others step, and the revoke explicitly excludes the row
+    just enrolled/confirmed -- so replaying the SAME key with
+    replace_existing=True must never revoke the very peer it just
+    (idempotently) confirmed."""
+    _seed(db_path)
+    key = _real_public_key()
+    appliance_client.post("/api/appliance/wireguard/enroll", json={"public_key": key}, headers=_appliance_headers("appl-a", "cred-a"))
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": key, "replace_existing": True},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            active = wireguard_remote.active_peers_for_appliance(db, "appl-a")
+    assert {peer["public_key"] for peer in active} == {key}
+
+
 # --------------------------------------------------------------- revocation
 
 

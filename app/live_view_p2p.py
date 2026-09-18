@@ -167,15 +167,23 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
         knows which transport ended up showing real video (attachPlayer()
         succeeding on either the P2P <video> stream or the relay's HLS
         playlist), or that neither did. `transport` is 'p2p'|'relay'|
-        'failed'; `connect_ms` is wall-clock time from session start to
-        first frame, for the P2P-vs-relay success/latency comparison this
-        instrumentation exists to enable. Never trusted for authorization
-        -- this only ever updates this session's own row, already scoped
-        to the authenticated customer by _own_session()."""
+        'wireguard'|'failed'; `connect_ms` is wall-clock time from
+        session start to first frame, for the P2P-vs-relay-vs-wireguard
+        success/latency comparison this instrumentation exists to
+        enable. 'wireguard' (docs/wireguard-remote-connectivity-plan.md
+        Sec 17) is accepted here now even though no caller reports it
+        yet in this pass (no live gateway/portal wiring exists -- see
+        that plan's own Phase C) -- transport-outcome has always been
+        reported by the browser after the fact, never required at
+        session-start time, so accepting a value before any caller
+        sends it is not a behavior change for existing callers. Never
+        trusted for authorization -- this only ever updates this
+        session's own row, already scoped to the authenticated customer
+        by _own_session()."""
         identity = _customer_identity(request)
         transport = str(payload.get('transport', ''))
-        if transport not in {'p2p', 'relay', 'failed'}:
-            raise HTTPException(status_code=400, detail="transport must be 'p2p', 'relay', or 'failed'.")
+        if transport not in {'p2p', 'relay', 'wireguard', 'failed'}:
+            raise HTTPException(status_code=400, detail="transport must be 'p2p', 'relay', 'wireguard', or 'failed'.")
         connect_ms = payload.get('connect_ms')
         connect_ms = int(connect_ms) if isinstance(connect_ms, (int, float)) and connect_ms >= 0 else None
         error = str(payload.get('error', ''))[:500] or None

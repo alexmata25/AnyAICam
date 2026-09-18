@@ -270,6 +270,26 @@ def test_transport_outcome_p2p_sets_transport_and_ready_at(client, db_path):
     assert row["failed_at"] is None
 
 
+def test_transport_outcome_wireguard_sets_transport_and_ready_at(client, db_path):
+    """docs/wireguard-remote-connectivity-plan.md Sec 17: a fourth
+    transport value, same shape as p2p/relay -- no live caller reports
+    this yet (Phase B has no portal wiring), but the route must already
+    accept it correctly for when Phase C adds one."""
+    session_id, cookies = _start_session(client, db_path)
+    response = client.post(
+        f"/api/customer/live/sessions/{session_id}/transport-outcome", cookies=cookies,
+        json={"transport": "wireguard", "connect_ms": 300},
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute("SELECT transport,ready_at,failed_at FROM live_view_sessions WHERE id=?", (session_id,)).fetchone()
+    assert row["transport"] == "wireguard"
+    assert row["ready_at"] is not None
+    assert row["failed_at"] is None
+
+
 def test_transport_outcome_relay_sets_transport_and_ready_at(client, db_path):
     session_id, cookies = _start_session(client, db_path)
     response = client.post(

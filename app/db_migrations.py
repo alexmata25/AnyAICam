@@ -1041,6 +1041,19 @@ def apply_migrations():
                            {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()})
         if 'live_relay_pilot' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN live_relay_pilot INTEGER NOT NULL DEFAULT 0')
 
+        # WireGuard direct remote connectivity (docs/wireguard-remote-
+        # connectivity-plan.md Sec 14): the RDM-visible tunnel-health
+        # surface, populated via the existing heartbeat channel exactly
+        # like storage_state above it -- not a new sync mechanism. NULL
+        # (never reported) is a real, distinct state from 'disabled'
+        # (reported, no identity enrolled): an appliance running agent
+        # code from before this column's own feature existed simply
+        # never sends the field at all, and COALESCE in heartbeat()'s
+        # own UPDATE leaves a prior real value alone on any heartbeat
+        # that omits it.
+        if 'wireguard_status' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN wireguard_status TEXT')
+        if 'wireguard_last_handshake_at' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN wireguard_last_handshake_at TEXT')
+
         # Provisioning Phase 3: `product` is a stable category string
         # (e.g. always "camera_slots") so an upgrade/downgrade between
         # fixed tiers updates the SAME row (customer_id,product) rather

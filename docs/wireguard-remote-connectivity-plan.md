@@ -547,22 +547,92 @@ fourth participant.
 
 ## 20. Implementation phases
 
-- **Phase A (this document)**: audit + plan. Done, this commit.
-- **Phase A2 (this pass, §13's schema + this session's actual code)**: the
-  data model (§10), the enrollment/key-management route and its
-  authorization/tenant-isolation/revocation logic (§5, §11), and real tests
-  for tenant isolation, authorization, key handling (a private key is never
-  server-side, never returned by any API, never logged), revocation,
-  fallback, reconnect-tolerance, and failure cases. No live network/Ryzen
-  dependency; nothing in this phase starts a real WireGuard interface
-  anywhere.
-- **Phase B (future, needs its own check-in)**: the appliance agent's real
-  WireGuard interface lifecycle -- `privileged_watcher.py` DISPATCH
-  additions (§2d, §5 step 3), the actual gateway process, real
-  interface bring-up on a real appliance.
+- **Phase A (this document)**: audit + plan. Done, commit `debf048`.
+- **Phase A2 (`222e255`)**: the data model (§10), the enrollment/key-
+  management route and its authorization/tenant-isolation/revocation
+  logic (§5, §11), and real tests for tenant isolation, authorization,
+  key handling (a private key is never server-side, never returned by
+  any API, never logged), revocation, fallback, reconnect-tolerance,
+  and failure cases. No live network/Ryzen dependency; nothing in this
+  phase starts a real WireGuard interface anywhere.
+- **Phase B (this pass)**: DONE at the source/design level; explicitly
+  NOT deployed or executed against any real interface. Scope actually
+  built:
+  - **Gateway placement decision, resolved** (§19's open item): the
+    SAME already-built `deploy-portal` image, run as a SECOND
+    container on the SAME existing `deploy_default` network on the
+    SAME existing staging EC2 instance (`i-0a082abd812929bb4`) --
+    chosen as the safest option because it needs zero new image, zero
+    new build pipeline, and zero new compute instance; the only real
+    new infrastructure it will ever need is one new UDP port on that
+    instance's security group plus `--cap-add=NET_ADMIN` on that one
+    container. Full reasoning: `app/wireguard_gateway/gateway_service.py`'s
+    own module docstring; template service block (not applied to real
+    staging): `deploy/docker-compose.staging.example.yml`.
+  - **The gateway itself** (`app/wireguard_gateway/`): a
+    `WireGuardInterfaceProvider` abstraction (mirrors
+    `relay_control.py`'s `RelayProvider`/`MockRelayProvider` split) --
+    `MockWireGuardInterfaceProvider` (every test uses this),
+    `SystemWireGuardInterfaceProvider` (real `wg` CLI argv, defined and
+    argv-shape-tested with a fake runner, never instantiated against a
+    real interface by anything in this pass); a pure `reconciler.py`
+    diffing the database's active peers against the interface's live
+    peers; a plain-HTTP `proxy.py` with zero WireGuard-specific code
+    (testable against an ordinary loopback server); `gateway_service.py`
+    ties them together as a real, never-started process entry point.
+  - **Privileged-action design** (§2d, §5 step 3): two new
+    `privileged_watcher.py` DISPATCH entries,
+    `wireguard_interface_up`/`down`, both a fixed `wg-quick`
+    argv pointed at a hardcoded literal path
+    (`/etc/anyaicam/wireguard/wg0.conf`) that the UNPRIVILEGED agent
+    process (which already owns `config_dir`) writes the real config
+    content to ahead of queuing the action -- the same fixed-argv-
+    reads-a-well-known-path shape `restart_vms` already established.
+    Dedicated argv-shape tests in
+    `appliance-agent/tests/test_wireguard_privileged_actions.py`;
+    every existing DISPATCH-wide safety test (no-shell-metacharacters,
+    marker-content-never-trusted) automatically covers these two new
+    entries.
+  - **Appliance-agent integration**: `config.py` gained
+    `wireguard_identity_file`/`wireguard_conf_file` +
+    `load_wireguard_identity()`/`save_wireguard_identity()` (same
+    atomic-write+0600 shape as `credential.json`); a new
+    `wireguard.py` module (`generate_keypair()`, `render_wg_conf()`,
+    `enroll_wireguard()`); `portal.py` gained
+    `PortalClient.wireguard_enroll()` on the existing authenticated
+    channel; `setup_wizard.py`'s `_finish_enrollment()` gained a
+    WireGuard enrollment step, gated behind `ANYAICAM_WIREGUARD_ENABLED`
+    (unset everywhere today) and always non-fatal on failure (matches
+    `restart_service()`'s own established precedent) -- a genuinely
+    fresh enrollment gets `replace_existing=False`; a re-enrollment
+    (hardware replacement) gets `replace_existing=True`, rotating the
+    device's WireGuard identity the same way every other identity
+    field already rotates on `coordinated_reenroll()`.
+  - **Telemetry** (§17): `transport-outcome` now accepts `'wireguard'`
+    alongside `p2p`/`relay`/`failed`; the heartbeat gained
+    `wireguard_status`/`wireguard_last_handshake_at` (new `appliances`
+    columns, COALESCE-on-omission, same shape as `storage_state`), fed
+    by a new best-effort local check in the agent's own `metrics.py`
+    (`disabled`/`enrolled` only -- confirming a live handshake needs a
+    privileged `wg show` call, deferred to Phase C once a real
+    interface exists to query).
+  - **Fail-safe**: proven, not just asserted -- every new code path is
+    behind the `ANYAICAM_WIREGUARD_ENABLED` flag (agent side) or fails
+    closed with a clean 503 when the gateway is unconfigured (cloud
+    side, unchanged from Phase A2); a dedicated regression test proves
+    a failed WireGuard enrollment never aborts or rolls back the
+    overall (already-succeeded) appliance activation.
+  - **What remains explicitly undone**: no real WireGuard interface
+    was brought up anywhere; the gateway process was never started;
+    nothing was deployed to Ryzen or staging. The next real step
+    (bringing up `wg0` on a real box) is the exact privileged/network
+    action this phase's own directive reserves for separate, explicit
+    authorization -- see the coordinator's own report for the precise
+    command that step would run.
 - **Phase C (future)**: portal-side UI/diagnostics surface, the live-view
   transport-racing integration (§3, §17) actually wired into
-  `live_view_page.py`, and `installer/11-install-wireguard.sh` (§2g).
+  `live_view_page.py`, `installer/11-install-wireguard.sh` (§2g), and
+  the gateway's own `proxy.py` wired into a real customer-facing route.
 - **Phase D (future)**: real Ryzen/staging rollout, feature-flagged off by
   default the same way `ANYAICAM_LIVE_P2P_ENABLED` shipped, with its own
   explicit go/no-go the same way every other live-infrastructure change in

@@ -142,17 +142,27 @@ class DiagnosticsTests(unittest.TestCase):
 
 
 class WatcherDispatchTests(unittest.TestCase):
-    def test_dispatch_table_is_exactly_three_fixed_actions(self):
+    def test_dispatch_table_is_exactly_five_fixed_actions(self):
         # restart_agent added 2026-09-12: setup_wizard.py's own
         # _finish_enrollment() now queues an anyaicam-agent.service
         # restart through this same fixed-argv mechanism instead of an
         # unprivileged direct systemctl call -- see
         # test_finish_enrollment_restart_privilege.py for the fix this
         # entry supports.
+        #
+        # wireguard_interface_up/down added for WireGuard direct remote
+        # connectivity (docs/wireguard-remote-connectivity-plan.md Sec 5
+        # step 3, Sec 16) -- see test_wireguard_privileged_actions.py for
+        # dedicated coverage of these two entries specifically. Neither
+        # is queued or executed against any real device by anything in
+        # this codebase yet (ANYAICAM_WIREGUARD_ENABLED is unset by
+        # default).
         self.assertEqual(watcher.DISPATCH, {
             'reboot': ['systemctl', 'reboot'],
             'restart_vms': ['docker', 'compose', '--project-directory', '/opt/anyaicam', 'up', '-d'],
             'restart_agent': ['systemctl', 'restart', 'anyaicam-agent.service'],
+            'wireguard_interface_up': ['wg-quick', 'up', '/etc/anyaicam/wireguard/wg0.conf'],
+            'wireguard_interface_down': ['wg-quick', 'down', '/etc/anyaicam/wireguard/wg0.conf'],
         })
 
     def _write_marker(self, tmp_path, marker):

@@ -215,19 +215,51 @@ def register_wireguard_remote_appliance_routes(app: FastAPI) -> None:
         public_key = payload.get("public_key")
         if not is_valid_wireguard_public_key(public_key):
             raise HTTPException(status_code=400, detail="public_key must be a valid WireGuard public key.")
-        # Deliberately reads ONLY public_key out of the payload -- any
-        # other field (a stray "private_key", "tunnel_address", etc.) is
-        # silently ignored, never persisted, matching enroll_peer()'s own
-        # narrow contract (see module docstring). This is a second,
-        # independent layer of defense against a private key ever
-        # reaching this database, on top of the schema itself having no
-        # column that could hold one.
+        # Deliberately reads ONLY public_key (and, below, the boolean
+        # replace_existing) out of the payload -- any other field (a
+        # stray "private_key", "tunnel_address", etc.) is silently
+        # ignored, never persisted, matching enroll_peer()'s own narrow
+        # contract (see module docstring). This is a second, independent
+        # layer of defense against a private key ever reaching this
+        # database, on top of the schema itself having no column that
+        # could hold one.
+        #
+        # replace_existing (plan doc Sec 12): set by the appliance-agent
+        # only when this enroll call is part of a coordinated_reenroll()
+        # (hardware replacement / re-claim under the same appliance_id,
+        # per reenrollment.py) -- never by a routine reconnect. Revokes
+        # every OTHER currently-active peer for this appliance, so a
+        # replaced device's stale tunnel identity never lingers as a
+        # second live peer the gateway would otherwise keep accepting
+        # traffic from.
+        #
+        # Order matters here: enroll_peer() runs FIRST, revocation
+        # second, deliberately -- the public_key unique index is global,
+        # not scoped to active rows (see db_migrations.py), so revoking
+        # the caller's OWN previous row before enroll_peer() re-checks
+        # for an existing active row would, on the narrow edge case of a
+        # client resubmitting an already-revoked key, make enroll_peer()
+        # try to INSERT a second row with a public_key value that
+        # already exists (now revoked) and hit that unique index instead
+        # of hitting its own intended "different appliance" 409 check.
+        # Enrolling first means enroll_peer()'s existing idempotency
+        # check (WHERE public_key=? AND revoked_at IS NULL) always sees
+        # accurate state, and the revocation below explicitly excludes
+        # the row just enrolled/confirmed so it can never revoke the
+        # peer it was just asked to keep.
+        replace_existing = bool(payload.get("replace_existing"))
         now = datetime.now()
         with connection() as db:
             peer = enroll_peer(
                 db, appliance_id=appliance["id"], customer_id=appliance["customer_id"],
                 public_key=public_key, now=now,
             )
+            if replace_existing:
+                db.execute(
+                    "UPDATE appliance_wireguard_peers SET status='revoked',revoked_at=?,revoked_reason=? "
+                    "WHERE appliance_id=? AND revoked_at IS NULL AND id!=?",
+                    (now.isoformat(), "reenrolled", appliance["id"], peer["id"]),
+                )
         return {
             "tunnel_address": peer["tunnel_address"],
             "gateway_public_key": peer["gateway_public_key"],

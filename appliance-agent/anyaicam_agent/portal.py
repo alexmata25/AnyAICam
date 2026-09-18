@@ -67,3 +67,10 @@ class PortalClient:
     def claim_begin(self,device_id): return self.request('POST','/api/appliance/claim/begin',{'device_id':device_id},authenticated=False)
     def claim_status(self,claim_session_id): return self.request('POST','/api/appliance/claim/status',{'claim_session_id':claim_session_id},authenticated=False)
     def claim_complete(self,claim_session_id,claim_proof): return self.request('POST','/api/appliance/claim/complete',{'claim_session_id':claim_session_id,'claim_proof':claim_proof},authenticated=False)
+    # WireGuard direct remote connectivity (docs/wireguard-remote-
+    # connectivity-plan.md Sec 5): authenticated -- reuses the same
+    # bearer+nonce channel every other appliance route already uses,
+    # via request()'s existing authenticated=True default. Only ever
+    # sends public_key (never a private key -- see wireguard.py's own
+    # enroll_wireguard()) and the replace_existing flag.
+    def wireguard_enroll(self,public_key,replace_existing=False): return self.request('POST','/api/appliance/wireguard/enroll',{'public_key':public_key,'replace_existing':bool(replace_existing)})
