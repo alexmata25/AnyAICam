@@ -224,3 +224,90 @@ this phase adds a layer in front of that boundary, it does not modify it.
   anywhere real — `ANYAICAM_AACO_LLM_MODEL_PATH` stays unset.
 - No staging or production deployment of this code.
 - Ryzen untouched.
+
+## Addendum (2026-09-19): real staging measurement
+
+The above was a paper audit; this is what actually happened once it
+was validated for real on the staging box (`i-0a082abd812929bb4`).
+
+**Host decision, made with real current numbers, not the general audit
+above.** Re-measured staging at validation time: `t3.medium`, 2 vCPU,
+3.7GB RAM with only **2.3GB "available"** and disk at **86-89% full
+(3.1-4.1GB free)** — tighter than the general audit assumed. Ryzen was
+not re-touched (per its own 700-800%-of-800% CPU history, already
+disqualifying, and out of scope for a cloud-side feature). A genuinely
+separate inference host/container was rejected too: the shipped
+`aaco_llm.py` design runs inference **in-process** inside the same
+FastAPI worker that serves the whole portal — splitting it out would
+mean building a new internal service this pass never asked for, and
+would not even remove the real resource contention (same host, same
+memory pool) without also requesting a second EC2 instance, i.e. a
+new-host purchase. **Verdict: smallest safe option is in-process on
+the existing staging EC2, using the smaller Qwen2.5-0.5B-Instruct
+model (not the originally-recommended 1.5B)** — 0.5B's ~500-680MB
+resident footprint leaves real margin on this box; 1.5B's ~1.5-2GB
+would not.
+
+**Real bug found and fixed: the interpreter was calling the wrong
+llama.cpp API.** `LlamaCppInterpreter._generate()` called the model as
+a bare single-string completion. Qwen2.5-Instruct GGUF models are
+fine-tuned specifically for the ChatML template; measured result
+before the fix was a **0% `_validate_ai_command()` pass rate** across
+every test phrase (including trivial ones) and **38-77 second
+latency** per request. Switching to `create_chat_completion()` (system
+role = `_SYSTEM_PROMPT`, user role = the customer's text, prompt
+content otherwise unchanged) measured correct output in **3.5-8.3
+seconds** on the same hardware for the same phrases. Fixed in
+`app/aaco_llm.py`, commit `38762ef`.
+
+**Real measured accuracy on the requested example phrases** (post-fix,
+Qwen2.5-0.5B-Instruct, isolated non-customer-facing test container on
+the real staging host):
+
+| Phrase | Result | Correct? | Latency |
+|---|---|---|---|
+| "Show me the front door" | `live_view`, `camera-name:front door` | yes | 19.5s |
+| "Which cameras are down?" | `camera_status` | yes | 1.8s |
+| "Open the front door for me" | `live_view` (should be `unlock_door`) | no -- wrong but still a validly authorized, non-dangerous action | 3.5s |
+| "Take me back twenty minutes on the driveway" | fell back to regex/`Clarification` | ambiguous without prior playback context, arguably correct to decline | 10.9s |
+| "Were there any people at the front entrance in the last hour?" | fell back to `Clarification` | no -- likely because the matching few-shot example's `start`/`end` are the literal placeholders `"<now-1h>"`/`"<now>"`, which a 0.5B model has no real pattern to compute a real ISO timestamp from | 14.9s |
+
+Adversarial/out-of-domain fallback (the actual hard safety requirement)
+was **100% correct**: "What's the weather like today?" and gibberish
+input both safely fell through to the fixed clarification message in
+1.4-9.0 seconds, with no exception, no bypass, no adversarial value
+ever reaching `execute()`.
+
+**Why this was not cut over to the real customer-facing staging
+container.** Two independent findings argue for staying at
+architecture-proof rather than customer-facing yet:
+1. **Accuracy is partial** (2 of 5 example phrases fully correct; one
+   wrong-but-safe; two safe fallbacks, one of which is a real miss on
+   a phrase the system prompt's own few-shot example should cover).
+2. **`LOCAL_LLM_TIMEOUT_SECONDS` (defined in `aaco_llm.py`) is not
+   actually enforced anywhere** — inference is a synchronous, CPU-
+   bound call inside an `async` route handler on a single-worker
+   process (`web_concurrency: 1`, confirmed from this box's own
+   startup log). A slow generation (measured up to 19.5s here) blocks
+   that one worker for its entire duration, which on a single-worker
+   process means **every other customer's request to this portal --
+   typed AACO, Live View, anything -- would queue behind it**, not
+   just the one AACO request. This is a real, pre-existing gap in the
+   already-merged code, surfaced only by actually running it, and is
+   the concrete prerequisite before any customer-facing enablement
+   (even in staging): wrap the blocking call in a bounded thread/
+   timeout so a slow or hung generation degrades only its own request.
+
+**What was validated, concretely, on the real staging host:** a
+throwaway, non-network-aliased sibling container (`portal-9cccbf4-
+llmtest`) built from the same git-verified staging image, with
+`llama-cpp-python` built from PyPI's official source distribution
+(the project's third-party wheel-index install attempt was blocked by
+this environment's own safety classifier and not pursued further) and
+the real `Qwen2.5-0.5B-Instruct-GGUF` `Q4_K_M` file (491MB, from
+`huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF`) downloaded onto a
+dedicated host volume. `ANYAICAM_AACO_LOCAL_LLM_ENABLED` was never set
+on the real customer-facing `portal-9cccbf4` container; that container
+was never restarted, never modified, and served customer traffic
+uninterrupted throughout. The test container was stopped (not
+deleted) after measurement, releasing its ~680MB back to the host.
