@@ -364,3 +364,65 @@ def test_build_motion_event_clip_exists_standalone_and_is_reusable(monkeypatch, 
     assert callable(main.build_motion_event_clip)
     import inspect
     assert inspect.iscoroutinefunction(main.build_motion_event_clip)
+
+
+# ----------------------------------------- 2026-09-20: Event-mode recording persistence
+
+
+def test_ai_classified_detection_also_persists_an_event_recording_when_camera_is_in_event_mode(
+    monkeypatch, tmp_path, fake_uploader, background_loop
+):
+    """Smart Motion/person/vehicle-triggered events must behave
+    consistently with basic motion for a camera in Event mode: this is
+    the same persist_event_recording() call store_motion_event()'s own
+    basic-motion path already schedules, now also reachable from the
+    AI/YOLO classification path."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+
+    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
+        return f"/recordings/clips/motion/motion_{event_id}.mp4"
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+    _standard_mocks(monkeypatch, tmp_path)
+
+    persisted = []
+
+    async def fake_persist_event_recording(camera_number, start, end):
+        persisted.append((camera_number, start, end))
+
+    monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
+
+    main.save_yolo_events(170, _fake_result("car"))
+
+    assert _wait_until(lambda: len(persisted) == 1), \
+        "persist_event_recording() must actually be scheduled and run on the background loop"
+    assert persisted[0][0] == 170
+
+
+def test_ai_classified_detection_does_not_persist_a_recording_for_a_continuous_mode_camera(
+    monkeypatch, tmp_path, fake_uploader, background_loop
+):
+    """The exact opposite case -- a Continuous-mode camera's AI-event
+    path must schedule zero new work beyond the existing clip build/
+    upload, matching this same guarantee on the basic motion path."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "continuous"})
+
+    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
+        return f"/recordings/clips/motion/motion_{event_id}.mp4"
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+    _standard_mocks(monkeypatch, tmp_path)
+
+    persisted = []
+
+    async def fake_persist_event_recording(camera_number, start, end):
+        persisted.append((camera_number, start, end))
+
+    monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
+
+    main.save_yolo_events(171, _fake_result("car"))
+
+    assert _wait_until(lambda: len(fake_uploader) == 1), "the existing clip/upload path must still run"
+    assert persisted == [], "a Continuous-mode camera must never get an Event-mode recording persisted"

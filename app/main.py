@@ -37434,6 +37434,30 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                     f"build/upload: no main event loop captured yet."
                 )
 
+            # 2026-09-20: the same Event-mode persistence the basic
+            # motion path already schedules (see store_motion_event()'s
+            # own build_and_upload_event_media() sibling call) -- Smart
+            # Motion/person/vehicle-triggered events must behave
+            # consistently with basic motion for a camera in Event
+            # mode, not just cloud-classified detections. Purely
+            # additive, alongside -- never instead of -- the clip
+            # build/upload scheduled immediately above. This whole
+            # function already runs off the shared event loop (see the
+            # asyncio.to_thread() comment above), so the synchronous
+            # mode check here is safe and does not need its own
+            # asyncio.to_thread() wrapper the way the basic motion
+            # path's event-loop-resident equivalent does.
+            if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        persist_event_recording(camera_number, now, now), _ai_event_media_loop
+                    )
+                except RuntimeError as error:
+                    print(
+                        f"AI event {event_group_id}: could not schedule "
+                        f"Event-mode recording persist: {type(error).__name__}: {error}"
+                    )
+
 
 
 
