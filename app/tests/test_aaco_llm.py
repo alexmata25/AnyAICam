@@ -36,6 +36,12 @@ from aaco_llm import (
     default_interpreter,
 )
 import aaco_llm
+from _aaco_llm_subprocess_fakes import (
+    _fake_infer_crashes_the_process,
+    _fake_infer_raises,
+    _fake_infer_returns_camera_status,
+    _fake_infer_sleeps_then_succeeds,
+)
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
 
@@ -303,61 +309,48 @@ class TestLlamaCppInterpreterPlumbing:
         monkeypatch.setattr(interpreter, "_generate", lambda text: '{"operation": "unlock_door", "camera_id": "; rm -rf /"}')
         assert isinstance(interpreter.interpret("open the door", now=NOW), Clarification)
 
-    def test_generate_wraps_a_real_inference_failure_as_interpreter_unavailable(self, tmp_path, monkeypatch):
+    def test_generate_wraps_a_real_inference_failure_as_interpreter_unavailable(self, tmp_path):
         model_file = tmp_path / "fake.gguf"
         model_file.write_bytes(b"not a real model")
-        interpreter = LlamaCppInterpreter(model_path=str(model_file))
-
-        class _ExplodingModel:
-            def create_chat_completion(self, *args, **kwargs):
-                raise RuntimeError("inference backend crashed")
-
-        interpreter._model = _ExplodingModel()
+        interpreter = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_raises)
         with pytest.raises(InterpreterUnavailable):
             interpreter._generate("some customer text")
 
-    def test_generate_enforces_a_bounded_timeout_instead_of_waiting_indefinitely(self):
+    def test_generate_enforces_a_bounded_timeout_instead_of_waiting_indefinitely(self, tmp_path):
         # 2026-09-19: LOCAL_LLM_TIMEOUT_SECONDS existed but was never
         # enforced -- a real gap found during staging validation (an
-        # unbounded generation measured as slow as ~77 seconds, and
-        # this call happens synchronously inside an async route with no
-        # executor of its own, so it blocks the whole single-worker
-        # portal for as long as it runs). timeout_seconds is
-        # constructor-overridable specifically so this test can prove
-        # bounded behavior in well under a second rather than actually
-        # waiting out a real multi-second timeout.
-        interpreter = LlamaCppInterpreter(model_path="/unused", timeout_seconds=0.2)
-
-        class _SlowModel:
-            def create_chat_completion(self, *args, **kwargs):
-                time.sleep(2)
-                return {"choices": [{"message": {"content": '{"operation": "camera_status"}'}}]}
-
-        interpreter._model = _SlowModel()
+        # unbounded generation measured as slow as ~77 seconds). Real
+        # inference now runs in a separate OS process (see aaco_llm.py's
+        # own comment on why -- a native crash there must not be able to
+        # take the whole portal down), so this test's fake "slow model"
+        # is also a real, separate, picklable module-level function
+        # (_fake_infer_sleeps_then_succeeds below) actually executed in
+        # a real subprocess -- not a mock standing in for one.
+        # timeout_seconds is constructor-overridable specifically so
+        # this test can prove bounded behavior quickly rather than
+        # actually waiting out a real multi-second timeout.
+        model_file = tmp_path / "fake.gguf"
+        model_file.write_bytes(b"not a real model")
+        interpreter = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_sleeps_then_succeeds, timeout_seconds=0.3)
         start = time.monotonic()
         with pytest.raises(InterpreterUnavailable):
             interpreter._generate("Which cameras are down?")
         elapsed = time.monotonic() - start
-        assert elapsed < 1.0, "caller must not wait anywhere near the model's real completion time"
+        assert elapsed < 2.0, "caller must not wait anywhere near the fake's real 5s completion time"
 
-    def test_interpret_raises_interpreter_unavailable_on_timeout_like_every_other_generate_failure(self):
+    def test_interpret_raises_interpreter_unavailable_on_timeout_like_every_other_generate_failure(self, tmp_path):
         # interpret() itself never catches InterpreterUnavailable --
         # that is deliberately NaturalAacoLanguageAdapter.parse()'s own
-        # job (see TestNaturalAacoLanguageAdapterFallback below), so a
-        # timeout must surface here exactly like the existing
-        # real-inference-failure case above, not be swallowed early.
-        interpreter = LlamaCppInterpreter(model_path="/unused", timeout_seconds=0.2)
-
-        class _SlowModel:
-            def create_chat_completion(self, *args, **kwargs):
-                time.sleep(2)
-                return {"choices": [{"message": {"content": '{"operation": "camera_status"}'}}]}
-
-        interpreter._model = _SlowModel()
+        # job (see below), so a timeout must surface here exactly like
+        # the existing real-inference-failure case above, not be
+        # swallowed early.
+        model_file = tmp_path / "fake.gguf"
+        model_file.write_bytes(b"not a real model")
+        interpreter = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_sleeps_then_succeeds, timeout_seconds=0.3)
         with pytest.raises(InterpreterUnavailable):
             interpreter.interpret("Which cameras are down?", now=NOW)
 
-    def test_natural_adapter_falls_back_to_regex_end_to_end_when_the_real_interpreter_times_out(self):
+    def test_natural_adapter_falls_back_to_regex_end_to_end_when_the_real_interpreter_times_out(self, tmp_path):
         """The actual requirement in full, using the real
         LlamaCppInterpreter (not a fake NaturalLanguageInterpreter): a
         slow/hung model must result in the exact same authorized,
@@ -366,17 +359,57 @@ class TestLlamaCppInterpreterPlumbing:
         connects LlamaCppInterpreter to NaturalAacoLanguageAdapter,
         not just that each layer individually raises the right
         exception in isolation."""
-        interpreter = LlamaCppInterpreter(model_path="/unused", timeout_seconds=0.2)
-
-        class _SlowModel:
-            def create_chat_completion(self, *args, **kwargs):
-                time.sleep(2)
-                return {"choices": [{"message": {"content": '{"operation": "camera_status"}'}}]}
-
-        interpreter._model = _SlowModel()
+        model_file = tmp_path / "fake.gguf"
+        model_file.write_bytes(b"not a real model")
+        interpreter = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_sleeps_then_succeeds, timeout_seconds=0.3)
         adapter = NaturalAacoLanguageAdapter(interpreter)
         start = time.monotonic()
         result = adapter.parse("Which cameras are offline?", now=NOW)
         elapsed = time.monotonic() - start
         assert result == AacoCommand("camera_status")
-        assert elapsed < 1.0
+        assert elapsed < 2.0
+
+    def test_generate_isolates_a_native_crash_to_its_own_process_not_the_caller(self, tmp_path):
+        """The actual scenario a real staging stress test hit: llama.cpp
+        itself failed a native GGML_ASSERT, which calls abort() and
+        terminates whatever OS process it runs in. A thread-based
+        executor could never contain that (threads share one process --
+        an abort() in any of them kills the whole thing, portal
+        included). Simulated here with os._exit(), which terminates the
+        worker process exactly as abruptly as a real native crash would,
+        without needing an actual native crash to prove the isolation."""
+        model_file = tmp_path / "fake.gguf"
+        model_file.write_bytes(b"not a real model")
+        interpreter = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_crashes_the_process, timeout_seconds=5)
+        with pytest.raises(InterpreterUnavailable):
+            interpreter._generate("Which cameras are down?")
+
+    def test_process_pool_recovers_after_a_crash_for_the_next_call(self, tmp_path):
+        """Not just contained -- recoverable. A crashed worker must not
+        wedge every AACO command after it; the next call gets a fresh
+        worker process and succeeds normally."""
+        model_file = tmp_path / "fake.gguf"
+        model_file.write_bytes(b"not a real model")
+        crashing = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_crashes_the_process, timeout_seconds=5)
+        with pytest.raises(InterpreterUnavailable):
+            crashing._generate("Which cameras are down?")
+        # Windows needs a moment to finish tearing down a killed
+        # process's OS-level resources (semaphores/pipes) before a new
+        # ProcessPoolExecutor can be started cleanly -- a fixed sleep
+        # here is a real, honest concession to that OS timing, not a
+        # logic issue (production runs on Linux, where real requests are
+        # separated by network round-trips, never back-to-back within
+        # milliseconds the way this test's two calls are). Retried
+        # rather than one long fixed sleep so the common case is fast.
+        recovered = LlamaCppInterpreter(model_path=str(model_file), infer_fn=_fake_infer_returns_camera_status, timeout_seconds=5)
+        last_error = None
+        for _ in range(10):
+            try:
+                assert recovered._generate("Which cameras are down?") == '{"operation": "camera_status"}'
+                last_error = None
+                break
+            except InterpreterUnavailable as error:
+                last_error = error
+                time.sleep(0.5)
+        if last_error is not None:
+            raise last_error

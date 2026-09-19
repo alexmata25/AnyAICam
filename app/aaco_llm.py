@@ -52,6 +52,7 @@ its own docstring for why it can only ever load a local GGUF file."""
 from __future__ import annotations
 
 import concurrent.futures
+import concurrent.futures.process
 import json
 import os
 import re
@@ -66,15 +67,75 @@ LOCAL_LLM_MODEL_PATH = os.environ.get("ANYAICAM_AACO_LLM_MODEL_PATH", "").strip(
 LOCAL_LLM_MAX_TOKENS = 100
 LOCAL_LLM_TIMEOUT_SECONDS = 8
 
-# Dedicated, small, module-level pool for local-LLM inference calls only
-# -- never the app's general-purpose executor -- so a slow/hung
-# generation (see LlamaCppInterpreter._generate()'s own docstring)
-# occupies at most this pool's own threads, never anything the rest of
-# the application depends on. max_workers=2 gives one request room to
-# proceed while a previous slow/timed-out one is still winding down in
-# the background, without letting unbounded concurrent requests spawn
-# unbounded threads.
-_INFERENCE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="aaco-llm-inference")
+# 2026-09-19: a real staging stress test crashed llama.cpp itself with a
+# native GGML_ASSERT failure -- a C-level assert() that calls abort(),
+# which terminates the entire OS process it runs in. A ThreadPoolExecutor
+# (this module's first attempt at bounding inference) cannot protect
+# against that: threads share one process, so a native abort() in any
+# thread kills the whole process -- the portal included, along with
+# every other customer's in-flight request, not just the one asking
+# AACO something. A ProcessPoolExecutor is the actual fix: the model
+# only ever runs in a separate OS process, so a native crash there ends
+# that worker process alone. concurrent.futures detects the dead worker
+# and raises BrokenProcessPool on the pending future -- handled in
+# _generate() identically to every other InterpreterUnavailable cause.
+#
+# Important, found only by actually testing a real crash rather than
+# assuming: once a ProcessPoolExecutor's pool is broken, the SAME
+# executor instance stays broken forever -- concurrent.futures does not
+# self-heal it, and every subsequent .submit() on it raises
+# BrokenProcessPool immediately, with no new worker ever started.
+# _generate() therefore explicitly discards a broken executor (see its
+# own BrokenProcessPool handling) so the *next* call gets a fresh one
+# from here -- without that, a single crash would silently and
+# permanently disable local-AI interpretation for the rest of this
+# process's uptime (safe -- it would still always fall back to the
+# deterministic grammar -- but needlessly degraded until a full portal
+# restart). Created lazily, never at import time, so importing this
+# module -- which happens unconditionally, local LLM enabled or not --
+# never spawns a process.
+_PROCESS_EXECUTOR: concurrent.futures.ProcessPoolExecutor | None = None
+
+
+def _get_process_executor() -> concurrent.futures.ProcessPoolExecutor:
+    global _PROCESS_EXECUTOR
+    if _PROCESS_EXECUTOR is None:
+        _PROCESS_EXECUTOR = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+    return _PROCESS_EXECUTOR
+
+
+def _discard_broken_process_executor() -> None:
+    global _PROCESS_EXECUTOR
+    _PROCESS_EXECUTOR = None
+
+
+def _run_inference_in_subprocess(model_path: str, system_prompt: str, text: str, max_tokens: int) -> str:
+    """Runs entirely inside the worker process -- module-level and only
+    plain, picklable arguments in and a plain string out, as
+    ProcessPoolExecutor requires. Loads the model fresh the first time
+    this specific worker process is asked to do anything, then caches
+    it in THIS PROCESS's own module state so a warm model is reused
+    across calls as long as the worker keeps running; any crash simply
+    means the next call gets a brand new worker (and pays the load cost
+    once more), never a resurrected, possibly-corrupted one."""
+    global _subprocess_model
+    if _subprocess_model is None:
+        from llama_cpp import Llama
+        _subprocess_model = Llama(model_path=model_path, n_ctx=768, n_threads=os.cpu_count() or 2, verbose=False)
+    completion = _subprocess_model.create_chat_completion(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=max_tokens, temperature=0.0,
+    )
+    return completion["choices"][0]["message"]["content"]
+
+
+# Lives only inside whatever worker process _run_inference_in_subprocess
+# actually executes in -- never touched by, or meaningful in, the main
+# portal process itself.
+_subprocess_model = None
 
 _ALLOWED_OPERATIONS = frozenset(get_args(Operation))
 # "car" stays accepted (not just "vehicle") because the model may still
@@ -225,26 +286,45 @@ class LlamaCppInterpreter:
     the rest of AACO -- or this whole application -- fails to start.
     """
 
-    def __init__(self, model_path: str | None = None, *, max_tokens: int = LOCAL_LLM_MAX_TOKENS, timeout_seconds: float = LOCAL_LLM_TIMEOUT_SECONDS):
+    def __init__(self, model_path: str | None = None, *, max_tokens: int = LOCAL_LLM_MAX_TOKENS, timeout_seconds: float = LOCAL_LLM_TIMEOUT_SECONDS, infer_fn=_run_inference_in_subprocess, executor: concurrent.futures.Executor | None = None):
         self.model_path = model_path or LOCAL_LLM_MODEL_PATH
         self.max_tokens = max_tokens
         self.timeout_seconds = timeout_seconds
-        self._model = None
+        # infer_fn/executor are overridable only so tests can exercise
+        # real timeout and real crash-isolation behavior (a genuine
+        # subprocess that sleeps, or one that deliberately exits) without
+        # needing an actual multi-hundred-MB GGUF file -- production
+        # code always uses the defaults: the real subprocess inference
+        # function, on the module's own lazily-created process pool.
+        self._infer_fn = infer_fn
+        self._executor = executor
 
     def _load(self):
-        if self._model is not None:
-            return self._model
+        # Cheap, fast-failing precondition check ONLY -- confirms a
+        # model file exists and llama-cpp-python is importable in THIS
+        # (the caller's) process, without ever constructing a real Llama
+        # instance here. The real model load happens inside the worker
+        # process, in _run_inference_in_subprocess, the first time it is
+        # actually asked to infer -- there is no live model object in
+        # the parent process to hold onto or to hand to a subprocess
+        # (a loaded Llama instance holds native memory/mmap state that
+        # cannot be pickled across a process boundary in the first
+        # place). Kept as its own method/behavior because two existing
+        # call sites (and tests) rely on a fast, in-process
+        # InterpreterUnavailable for "no model configured" without
+        # paying subprocess start-up cost just to discover that.
         if not self.model_path or not os.path.isfile(self.model_path):
             raise InterpreterUnavailable(f"No local AACO language model file at {self.model_path!r}.")
-        try:
-            from llama_cpp import Llama
-        except ImportError as error:
-            raise InterpreterUnavailable("llama-cpp-python is not installed.") from error
-        try:
-            self._model = Llama(model_path=self.model_path, n_ctx=768, n_threads=os.cpu_count() or 2, verbose=False)
-        except Exception as error:
-            raise InterpreterUnavailable(f"Local AACO language model failed to load: {error}") from error
-        return self._model
+        # The package is only actually needed by the real subprocess
+        # function -- an infer_fn substituted for testing never touches
+        # llama_cpp at all, so requiring it importable here too would
+        # force every test of timeout/crash behavior to have the real,
+        # optional, multi-hundred-MB package installed for no reason.
+        if self._infer_fn is _run_inference_in_subprocess:
+            try:
+                import llama_cpp  # noqa: F401
+            except ImportError as error:
+                raise InterpreterUnavailable("llama-cpp-python is not installed.") from error
 
     def _generate(self, text: str) -> str:
         # 2026-09-19 staging validation found this MUST be the chat-
@@ -260,42 +340,37 @@ class LlamaCppInterpreter:
         # as the system role measured correct structured JSON output in
         # 3.5-8.3 seconds on the same hardware -- the prompt content
         # was never the problem, only how it was submitted to the model.
+        #
         # 2026-09-19: LOCAL_LLM_TIMEOUT_SECONDS existed as a constant but
-        # was never actually enforced anywhere -- a real gap, since this
-        # call is synchronous CPU-bound work invoked directly (no
-        # await, no executor) inside aaco_web.py's async /api/aaco/
-        # command route. On a single-worker app that means an unbounded
-        # generation blocks every other concurrent customer request on
-        # the entire portal for as long as it runs -- measured as high
-        # as ~77 seconds during staging validation before this fix.
-        # Submitting to a small dedicated thread pool and bounding the
-        # wait with future.result(timeout=...) caps that to at most
-        # self.timeout_seconds: a slow or hung model can no longer
-        # block the request -- or, indirectly, every other user on this
-        # process -- indefinitely. This does NOT forcibly kill the
-        # underlying llama.cpp call (Python cannot safely interrupt a
-        # C-extension call mid-flight without a separate process); a
-        # timed-out generation keeps running in its own worker thread
-        # until it naturally finishes, consuming CPU in the background,
-        # but this method has already given up on it and returned
-        # control (and NaturalAacoLanguageAdapter has already fallen
-        # through to the deterministic grammar) well before that.
-        model = self._load()
-        future = _INFERENCE_EXECUTOR.submit(
-            model.create_chat_completion,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            max_tokens=self.max_tokens, temperature=0.0,
-        )
+        # was never actually enforced, AND a real staging stress test
+        # crashed llama.cpp with a native GGML_ASSERT failure (which
+        # calls abort(), terminating the whole process). Both problems
+        # share one fix: run inference in a separate OS process (see
+        # _run_inference_in_subprocess and the module-level executor
+        # above) and bound the wait with future.result(timeout=...). A
+        # slow generation times out without ever blocking this request
+        # -- or, since this call used to happen synchronously inside an
+        # async route with no executor of its own, every other
+        # concurrent customer on this single-worker portal -- for more
+        # than self.timeout_seconds. A crashing generation only takes
+        # down its own worker process; concurrent.futures raises
+        # BrokenProcessPool here, handled identically to every other
+        # failure below, and transparently gives the next call a fresh
+        # worker.
+        self._load()
+        using_shared_executor = self._executor is None
+        executor = self._executor if self._executor is not None else _get_process_executor()
+        future = executor.submit(self._infer_fn, self.model_path, _SYSTEM_PROMPT, text, self.max_tokens)
         try:
-            completion = future.result(timeout=self.timeout_seconds)
+            return future.result(timeout=self.timeout_seconds)
         except concurrent.futures.TimeoutError as error:
             raise InterpreterUnavailable(f"Local AACO language model inference exceeded the {self.timeout_seconds}s timeout.") from error
+        except concurrent.futures.process.BrokenProcessPool as error:
+            if using_shared_executor:
+                _discard_broken_process_executor()
+            raise InterpreterUnavailable(f"Local AACO language model inference process crashed: {error}") from error
         except Exception as error:
             raise InterpreterUnavailable(f"Local AACO language model inference failed: {error}") from error
-        return completion["choices"][0]["message"]["content"]
 
     def interpret(self, text: str, *, now: datetime, context: dict | None = None) -> AacoCommand | Clarification:
         raw_text = self._generate(text).strip()
