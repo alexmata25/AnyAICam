@@ -153159,6 +153159,121 @@ class _ClassicAacoBoundary:
             rows.append({"label": label, "state": "online" if entry.get("online") else "offline"})
         return {"kind": "status", "message": f"Status requested for {len(rows)} authorized camera(s).", "cameras": rows}
 
+    @staticmethod
+    def _door_matches(doors: list[dict], door_token: str) -> list[dict]:
+        # Deliberately a separate lookup from _find_camera() above:
+        # that method returns the FIRST match only (correct for Live/
+        # Playback, where two identically-named cameras just means the
+        # first one wins), but an unlock command must never silently
+        # pick one of two doors sharing a display name -- it must ask
+        # which one, so this returns every match and lets unlock_door()
+        # decide.
+        if door_token.startswith("camera-name:"):
+            requested = " ".join(door_token.removeprefix("camera-name:").lower().split())
+            return [door for door in doors if " ".join(str(door.get("name") or "").lower().split()) == requested]
+        if door_token.startswith("camera-"):
+            try:
+                number = int(door_token.removeprefix("camera-"))
+            except ValueError:
+                return []
+            return [door for door in doors if door.get("camera_number") == number]
+        return []
+
+    def unlock_door(self, identity: dict, door_id: str) -> dict:
+        """AACO's own path to the exact same authorization/execution/
+        audit code the manual "Unlock Door" button uses
+        (door_access.py) -- never a second, parallel relay-control
+        mechanism, and never a raw relay call of its own. Every attempt
+        -- denied, failed, or successful -- is audited via the same
+        record_door_access_event() the manual button writes to,
+        distinguished only by trigger_type='aaco' instead of 'manual'.
+
+        Deliberately fails closed the same generic way as live_view()/
+        playback() above (raising PermissionError, which
+        aaco_web.py's own command route turns into a uniform 403
+        "Camera is unavailable.") for every kind of failure -- wrong
+        tenant, nonexistent door, missing can_unlock grant, a door with
+        no relay configured, a relay that raised, or a relay the
+        provider itself suppressed (e.g. cooldown). This never reveals
+        which of those actually happened to the caller, matching this
+        codebase's own established no-oracle convention for
+        authorization failures -- the true reason is always the one
+        thing the audit row records, never the customer-facing message.
+        """
+        import door_access
+        import relay_control
+        from aaco import Clarification
+        from partner_db import connection
+
+        with connection() as db:
+            doors = door_access.customer_door_cameras(db, identity["customer_id"])
+        matches = self._door_matches(doors, door_id)
+        if len(matches) > 1:
+            return Clarification("More than one authorized door matches that name -- try a camera number instead.")
+        if not matches:
+            raise PermissionError("Door is unavailable.")
+        door = matches[0]
+
+        now = datetime.now()
+        try:
+            with connection() as db:
+                camera, user_id = door_access._authorized_door_camera(db, door["id"], identity)
+        except HTTPException as error:
+            if error.status_code != 404 or "not configured for door access" in error.detail:
+                with connection() as audit_db:
+                    door_access.record_door_access_event(
+                        audit_db, customer_id=identity["customer_id"], camera_id=door["id"],
+                        door_name="", relay_channel=None, trigger_type="aaco",
+                        actor_user_id=None, actor_email=identity["email"],
+                        authorization_result="denied" if error.status_code == 403 else "no_door",
+                        relay_result="skipped", success=False, error=error.detail, now=now,
+                    )
+            raise PermissionError("Door is unavailable.") from error
+
+        request_obj = relay_control.RelayRequest(
+            channel=camera["door_relay_channel"],
+            pulse_ms=camera["door_relay_pulse_ms"] or relay_control.DEFAULT_PULSE_MS,
+            reason=f"aaco_unlock:{camera['id']}",
+            dry_run=False,
+            requested_by=identity["email"],
+        )
+        try:
+            result = relay_control.get_provider().trigger(request_obj)
+        except Exception as error:
+            with connection() as audit_db:
+                door_access.record_door_access_event(
+                    audit_db, customer_id=identity["customer_id"], camera_id=camera["id"], door_name=camera["name"],
+                    relay_channel=camera["door_relay_channel"], trigger_type="aaco",
+                    actor_user_id=user_id, actor_email=identity["email"],
+                    authorization_result="authorized", relay_result="failed", success=False,
+                    error=str(error), now=now,
+                )
+            raise PermissionError("The door could not be unlocked.") from error
+
+        relay_result = "activated" if result.activated else ("suppressed" if result.suppressed_reason else "failed")
+        with connection() as audit_db:
+            door_access.record_door_access_event(
+                audit_db, customer_id=identity["customer_id"], camera_id=camera["id"], door_name=camera["name"],
+                relay_channel=camera["door_relay_channel"], trigger_type="aaco",
+                actor_user_id=user_id, actor_email=identity["email"],
+                authorization_result="authorized", relay_result=relay_result, success=result.activated,
+                error=result.suppressed_reason, now=now,
+            )
+        if not result.activated:
+            raise PermissionError("The door could not be unlocked.")
+
+        # result.activated only ever describes a timed relay pulse
+        # (relay_control.RelayRequest.pulse_ms, DEFAULT_PULSE_MS if the
+        # door has none configured) -- the same hardware behavior the
+        # manual button triggers, which relocks itself once the pulse
+        # ends. AACO never holds a door open and never issues a second,
+        # separate relock action.
+        return {
+            "kind": "door_unlock",
+            "message": f"{camera['name']} unlocked.",
+            "context": {"camera_id": door_id},
+        }
+
 
 register_aaco_routes(
     app,

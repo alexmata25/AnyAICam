@@ -38,6 +38,17 @@ class ControlledVms:
         self.calls.append(("status", identity["customer_id"]))
         return {"kind": "status", "message": "One camera", "cameras": [{"label": "Camera 4", "state": "online"}]}
 
+    def unlock_door(self, identity, door_id):
+        self.calls.append(("unlock_door", identity["customer_id"], door_id))
+        if identity["customer_id"] != "tenant-a":
+            raise PermissionError("Door is unavailable.")
+        if door_id == "camera-name:ambiguous door":
+            from aaco import Clarification
+            return Clarification("More than one authorized door matches that name -- try a camera number instead.")
+        if door_id != "camera-name:front door":
+            raise PermissionError("Door is unavailable.")
+        return {"kind": "door_unlock", "message": "Front Door unlocked.", "context": {"camera_id": door_id}}
+
 
 def _client(identity={"role": "customer_owner", "customer_id": "tenant-a"}):
     app, vms = FastAPI(), ControlledVms()
@@ -108,3 +119,28 @@ def test_unauthenticated_and_cross_tenant_requests_are_denied():
     foreign, vms = _client({"role": "customer_owner", "customer_id": "tenant-b"})
     assert foreign.post("/api/aaco/command", json={"command": "Show Camera 4"}).status_code == 403
     assert not [call for call in vms.calls if call[0] == "live"]
+
+
+def test_unlock_door_reaches_the_boundary_and_never_the_generic_camera_gate():
+    client, vms = _client()
+    response = client.post("/api/aaco/command", json={"command": "Open Front Door"})
+    assert response.status_code == 200 and response.json()["kind"] == "door_unlock"
+    assert ("unlock_door", "tenant-a", "camera-name:front door") in vms.calls
+    assert not [call for call in vms.calls if call[0] == "authorized_camera" and call[2] == "camera-name:front door"]
+
+
+def test_unlock_door_ambiguous_match_returns_a_clarification_not_an_action():
+    client, _vms = _client()
+    response = client.post("/api/aaco/command", json={"command": "Unlock the ambiguous door"})
+    assert response.status_code == 200
+    assert response.json()["kind"] == "clarification"
+
+
+def test_unlock_door_unauthorized_or_nonexistent_fails_closed():
+    client, _vms = _client()
+    nonexistent = client.post("/api/aaco/command", json={"command": "Open the back gate"})
+    assert nonexistent.status_code == 403
+    foreign, vms = _client({"role": "customer_owner", "customer_id": "tenant-b"})
+    denied = foreign.post("/api/aaco/command", json={"command": "Open Front Door"})
+    assert denied.status_code == 403
+    assert not [call for call in vms.calls if call[0] == "door_unlock"]

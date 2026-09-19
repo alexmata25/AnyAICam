@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import re
 from typing import Literal, Protocol
 
-Operation = Literal["live_view", "playback", "event_search", "camera_status", "playback_navigation", "event_navigation"]
+Operation = Literal["live_view", "playback", "event_search", "camera_status", "playback_navigation", "event_navigation", "unlock_door"]
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class VmsBoundary(Protocol):
     def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> object: ...
     def previous_event(self, identity: dict, camera_id: str, before: datetime) -> object: ...
     def camera_status(self, identity: dict) -> object: ...
+    def unlock_door(self, identity: dict, door_id: str) -> object: ...
 
 
 def _camera_token(value: str) -> str:
@@ -96,7 +97,13 @@ class DeterministicLanguageAdapter:
             if match.group(1).strip() in {"camera", "cameras"}:
                 return Clarification("Tell me which authorized camera you want to see.")
             return AacoCommand("live_view", camera_id=_camera_token(match.group(1)))
-        return Clarification("I can show an authorized camera, playback, events, offline cameras, the previous event, or navigate current playback.")
+        match = re.fullmatch(r"(?:open|unlock) (?:the )?([a-z0-9][a-z0-9 &'_-]{0,80})", value)
+        if match:
+            name = match.group(1).strip()
+            if name in {"door", "doors"}:
+                return Clarification("Tell me which authorized door you want to unlock.")
+            return AacoCommand("unlock_door", camera_id=_camera_token(name))
+        return Clarification("I can show an authorized camera, playback, events, offline cameras, the previous event, unlock an authorized door, or navigate current playback.")
 
 
 def execute(command: AacoCommand, *, identity: dict, vms: VmsBoundary) -> object:
@@ -107,6 +114,17 @@ def execute(command: AacoCommand, *, identity: dict, vms: VmsBoundary) -> object
         if not command.start or not command.end:
             raise ValueError("Event range required.")
         return vms.search_events(identity, event_type=command.event_type, camera_id=command.camera_id, start=command.start, end=command.end)
+    if command.operation == "unlock_door":
+        # Deliberately bypasses the generic authorized_camera() gate
+        # below -- that gate only proves live/playback fleet membership,
+        # never the stricter, door-specific can_unlock grant a physical
+        # unlock requires. vms.unlock_door() performs its own complete,
+        # fail-closed authorization (mirroring the existing manual
+        # "Unlock Door" button's own check) and is the only path an
+        # unlock_door command may ever take to the VMS boundary.
+        if not command.camera_id:
+            raise ValueError("Door required.")
+        return vms.unlock_door(identity, command.camera_id)
     if not command.camera_id or not vms.authorized_camera(identity, command.camera_id):
         raise PermissionError("Camera is unavailable.")
     if command.operation == "live_view":

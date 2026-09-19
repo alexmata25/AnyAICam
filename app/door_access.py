@@ -102,6 +102,22 @@ def door_camera(db, *, customer_id: str, camera_id: str) -> dict | None:
     return dict(row)
 
 
+def customer_door_cameras(db, customer_id: str) -> list[dict]:
+    """Every door_access_enabled=1 camera for this tenant, in the same
+    row shape door_camera() returns for one -- the shared lookup AACO's
+    unlock_door command (app/main.py's _ClassicAacoBoundary) uses to
+    resolve a display-name/camera-number door token against only this
+    customer's real doors, and to detect two doors sharing the same
+    display name (an ambiguous match) before ever calling
+    _authorized_door_camera() below."""
+    rows = db.execute(
+        'SELECT id,name,camera_number,door_access_enabled,door_relay_channel,door_relay_pulse_ms FROM cameras '
+        'WHERE customer_id=? AND door_access_enabled=1',
+        (customer_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _authorized_door_camera(db, camera_id: str, identity: dict) -> dict:
     """Mirrors talk_sessions.py's _authorized_talk_camera() exactly for
     the ownership/permission half (customer_owner has implicit full-

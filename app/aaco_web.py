@@ -44,7 +44,7 @@ def _context(payload: object) -> dict:
 
 
 def _result_payload(result: object) -> dict[str, Any]:
-    if not isinstance(result, dict) or result.get("kind") not in {"live", "playback", "events", "status"}:
+    if not isinstance(result, dict) or result.get("kind") not in {"live", "playback", "events", "status", "door_unlock"}:
         raise HTTPException(status_code=503, detail="AACO capability is unavailable.")
     return result
 
@@ -101,5 +101,14 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
             raise HTTPException(status_code=403, detail="Camera is unavailable.") from error
         except ValueError as error:
             raise HTTPException(status_code=400, detail="Unsupported AACO command.") from error
+        # unlock_door's own boundary implementation may return a
+        # Clarification too (an ambiguous door name matching more than
+        # one authorized door) -- the same escape hatch parse() already
+        # uses, now also available after execute() for a command that
+        # was well-formed but not safely completable as a single
+        # deterministic action.
+        if isinstance(result, Clarification):
+            log.info("aaco.command_clarification")
+            return {"kind": "clarification", "message": result.message}
         log.info("aaco.command operation=%s", parsed.operation)
         return _result_payload(result)
