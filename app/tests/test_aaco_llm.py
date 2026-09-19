@@ -21,6 +21,7 @@ file neither of which this test suite depends on."""
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -314,3 +315,68 @@ class TestLlamaCppInterpreterPlumbing:
         interpreter._model = _ExplodingModel()
         with pytest.raises(InterpreterUnavailable):
             interpreter._generate("some customer text")
+
+    def test_generate_enforces_a_bounded_timeout_instead_of_waiting_indefinitely(self):
+        # 2026-09-19: LOCAL_LLM_TIMEOUT_SECONDS existed but was never
+        # enforced -- a real gap found during staging validation (an
+        # unbounded generation measured as slow as ~77 seconds, and
+        # this call happens synchronously inside an async route with no
+        # executor of its own, so it blocks the whole single-worker
+        # portal for as long as it runs). timeout_seconds is
+        # constructor-overridable specifically so this test can prove
+        # bounded behavior in well under a second rather than actually
+        # waiting out a real multi-second timeout.
+        interpreter = LlamaCppInterpreter(model_path="/unused", timeout_seconds=0.2)
+
+        class _SlowModel:
+            def create_chat_completion(self, *args, **kwargs):
+                time.sleep(2)
+                return {"choices": [{"message": {"content": '{"operation": "camera_status"}'}}]}
+
+        interpreter._model = _SlowModel()
+        start = time.monotonic()
+        with pytest.raises(InterpreterUnavailable):
+            interpreter._generate("Which cameras are down?")
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, "caller must not wait anywhere near the model's real completion time"
+
+    def test_interpret_raises_interpreter_unavailable_on_timeout_like_every_other_generate_failure(self):
+        # interpret() itself never catches InterpreterUnavailable --
+        # that is deliberately NaturalAacoLanguageAdapter.parse()'s own
+        # job (see TestNaturalAacoLanguageAdapterFallback below), so a
+        # timeout must surface here exactly like the existing
+        # real-inference-failure case above, not be swallowed early.
+        interpreter = LlamaCppInterpreter(model_path="/unused", timeout_seconds=0.2)
+
+        class _SlowModel:
+            def create_chat_completion(self, *args, **kwargs):
+                time.sleep(2)
+                return {"choices": [{"message": {"content": '{"operation": "camera_status"}'}}]}
+
+        interpreter._model = _SlowModel()
+        with pytest.raises(InterpreterUnavailable):
+            interpreter.interpret("Which cameras are down?", now=NOW)
+
+    def test_natural_adapter_falls_back_to_regex_end_to_end_when_the_real_interpreter_times_out(self):
+        """The actual requirement in full, using the real
+        LlamaCppInterpreter (not a fake NaturalLanguageInterpreter): a
+        slow/hung model must result in the exact same authorized,
+        correct AacoCommand the deterministic grammar alone would have
+        produced -- proving the timeout->fallback chain actually
+        connects LlamaCppInterpreter to NaturalAacoLanguageAdapter,
+        not just that each layer individually raises the right
+        exception in isolation."""
+        interpreter = LlamaCppInterpreter(model_path="/unused", timeout_seconds=0.2)
+
+        class _SlowModel:
+            def create_chat_completion(self, *args, **kwargs):
+                time.sleep(2)
+                return {"choices": [{"message": {"content": '{"operation": "camera_status"}'}}]}
+
+        interpreter._model = _SlowModel()
+        adapter = NaturalAacoLanguageAdapter(interpreter)
+        start = time.monotonic()
+        result = adapter.parse("Which cameras are offline?", now=NOW)
+        elapsed = time.monotonic() - start
+        assert result == AacoCommand("camera_status")
+        assert elapsed < 1.0

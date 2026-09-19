@@ -51,6 +51,7 @@ LlamaCppInterpreter._generate(), the only place inference happens, and
 its own docstring for why it can only ever load a local GGUF file."""
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -64,6 +65,16 @@ LOCAL_LLM_ENABLED = os.environ.get("ANYAICAM_AACO_LOCAL_LLM_ENABLED", "false").s
 LOCAL_LLM_MODEL_PATH = os.environ.get("ANYAICAM_AACO_LLM_MODEL_PATH", "").strip()
 LOCAL_LLM_MAX_TOKENS = 100
 LOCAL_LLM_TIMEOUT_SECONDS = 8
+
+# Dedicated, small, module-level pool for local-LLM inference calls only
+# -- never the app's general-purpose executor -- so a slow/hung
+# generation (see LlamaCppInterpreter._generate()'s own docstring)
+# occupies at most this pool's own threads, never anything the rest of
+# the application depends on. max_workers=2 gives one request room to
+# proceed while a previous slow/timed-out one is still winding down in
+# the background, without letting unbounded concurrent requests spawn
+# unbounded threads.
+_INFERENCE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="aaco-llm-inference")
 
 _ALLOWED_OPERATIONS = frozenset(get_args(Operation))
 # "car" stays accepted (not just "vehicle") because the model may still
@@ -214,9 +225,10 @@ class LlamaCppInterpreter:
     the rest of AACO -- or this whole application -- fails to start.
     """
 
-    def __init__(self, model_path: str | None = None, *, max_tokens: int = LOCAL_LLM_MAX_TOKENS):
+    def __init__(self, model_path: str | None = None, *, max_tokens: int = LOCAL_LLM_MAX_TOKENS, timeout_seconds: float = LOCAL_LLM_TIMEOUT_SECONDS):
         self.model_path = model_path or LOCAL_LLM_MODEL_PATH
         self.max_tokens = max_tokens
+        self.timeout_seconds = timeout_seconds
         self._model = None
 
     def _load(self):
@@ -248,15 +260,39 @@ class LlamaCppInterpreter:
         # as the system role measured correct structured JSON output in
         # 3.5-8.3 seconds on the same hardware -- the prompt content
         # was never the problem, only how it was submitted to the model.
+        # 2026-09-19: LOCAL_LLM_TIMEOUT_SECONDS existed as a constant but
+        # was never actually enforced anywhere -- a real gap, since this
+        # call is synchronous CPU-bound work invoked directly (no
+        # await, no executor) inside aaco_web.py's async /api/aaco/
+        # command route. On a single-worker app that means an unbounded
+        # generation blocks every other concurrent customer request on
+        # the entire portal for as long as it runs -- measured as high
+        # as ~77 seconds during staging validation before this fix.
+        # Submitting to a small dedicated thread pool and bounding the
+        # wait with future.result(timeout=...) caps that to at most
+        # self.timeout_seconds: a slow or hung model can no longer
+        # block the request -- or, indirectly, every other user on this
+        # process -- indefinitely. This does NOT forcibly kill the
+        # underlying llama.cpp call (Python cannot safely interrupt a
+        # C-extension call mid-flight without a separate process); a
+        # timed-out generation keeps running in its own worker thread
+        # until it naturally finishes, consuming CPU in the background,
+        # but this method has already given up on it and returned
+        # control (and NaturalAacoLanguageAdapter has already fallen
+        # through to the deterministic grammar) well before that.
         model = self._load()
+        future = _INFERENCE_EXECUTOR.submit(
+            model.create_chat_completion,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=self.max_tokens, temperature=0.0,
+        )
         try:
-            completion = model.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                max_tokens=self.max_tokens, temperature=0.0,
-            )
+            completion = future.result(timeout=self.timeout_seconds)
+        except concurrent.futures.TimeoutError as error:
+            raise InterpreterUnavailable(f"Local AACO language model inference exceeded the {self.timeout_seconds}s timeout.") from error
         except Exception as error:
             raise InterpreterUnavailable(f"Local AACO language model inference failed: {error}") from error
         return completion["choices"][0]["message"]["content"]
