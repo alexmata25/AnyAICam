@@ -141130,18 +141130,28 @@ def _event_media_direct_row(camera_id: str, event_id: str) -> dict | None:
         return dict(row) if row else None
 
 
-def _event_media_tunnel_address(appliance_id: str | None):
+def _event_media_active_peer(appliance_id: str | None) -> dict | None:
     """None if WireGuard direct fetch isn't even worth attempting for
     this appliance right now -- no live network call, just the same
     active_peers_for_appliance() lookup live_view_wireguard.py's own
-    live-HLS path already uses."""
-    from live_view_wireguard import EVENT_MEDIA_WIREGUARD_ENABLED, _tunnel_address_for_appliance
+    live-HLS path already uses. Returns the full peer row (tunnel_address
+    AND media_fetch_secret both live here) rather than just the address:
+    a NULL media_fetch_secret -- every appliance today, until a separate,
+    later enrollment step -- makes this appliance ineligible even with a
+    live tunnel, never a naive raw-path fetch that would hit Ryzen's own
+    local-admin-session gate the way this feature's first, unauthenticated
+    version did."""
+    from live_view_wireguard import EVENT_MEDIA_WIREGUARD_ENABLED
+    from wireguard_remote import active_peers_for_appliance
     from partner_db import connection
 
     if not EVENT_MEDIA_WIREGUARD_ENABLED or not appliance_id:
         return None
     with connection() as db:
-        return _tunnel_address_for_appliance(db, appliance_id)
+        peers = active_peers_for_appliance(db, appliance_id)
+    if not peers or not peers[0].get("tunnel_address") or not peers[0].get("media_fetch_secret"):
+        return None
+    return peers[0]
 
 
 def _log_event_media_fetch(media_id: str, source: str, bytes_served: int, outcome: str) -> None:
@@ -141166,7 +141176,7 @@ def customer_event_media_url(camera_id: str, event_id: str, request: Request) ->
     from live_view_wireguard import local_relative_path_allowed
 
     row = _event_media_direct_row(camera_id, event_id)
-    if row and local_relative_path_allowed(row["local_relative_path"]) and _event_media_tunnel_address(row["appliance_id"]):
+    if row and local_relative_path_allowed(row["local_relative_path"]) and _event_media_active_peer(row["appliance_id"]):
         return {"url": f"/api/customer/events/{camera_id}/{event_id}/media/direct"}
 
     url = _customer_event_media_url(camera_id, event_id)
@@ -141188,28 +141198,48 @@ def customer_event_media_direct(camera_id: str, event_id: str, request: Request)
     live_view_wireguard.py's own module docstring documents for the live
     HLS path. The browser only ever sees this one portal-relative URL or
     the existing presigned CloudFront one on fallback -- never a tunnel
-    address, gateway hostname, or port."""
+    address, gateway hostname, port, or media-fetch token.
+
+    2026-09-19 redesign, after a real live-staging finding: this no
+    longer asks the gateway to fetch the raw /recordings/... path at all
+    (that path requires a local Ryzen admin session and redirected to a
+    login page the first time this was tried live -- silently counted as
+    success by the bug this redesign also fixes). It now mints a
+    short-lived, path-scoped HMAC token (appliance_media_fetch.mint()) and
+    asks for /api/appliance/media-fetch instead -- an appliance-
+    authenticated route (main.py's own appliance_media_fetch_endpoint()
+    below) that verifies the token locally and serves ONLY that one file,
+    no directory browsing, no session. And it never trusts a 200 alone --
+    response_looks_like_real_video() must also agree before this is ever
+    logged or served as a real success."""
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
+    import appliance_media_fetch
     from live_view_wireguard import GATEWAY_APPLIANCE_PORT, GatewayUnavailable, _fetch_via_gateway, local_relative_path_allowed
 
     row = _event_media_direct_row(camera_id, event_id)
     if not row:
         raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
 
-    tunnel_address = None
+    peer = None
     if local_relative_path_allowed(row["local_relative_path"]):
-        tunnel_address = _event_media_tunnel_address(row["appliance_id"])
+        peer = _event_media_active_peer(row["appliance_id"])
 
-    if tunnel_address:
+    if peer:
+        expires, token = appliance_media_fetch.mint(peer["media_fetch_secret"], row["local_relative_path"])
+        forward_path = "/api/appliance/media-fetch?" + urlencode({
+            "path": row["local_relative_path"], "expires": expires, "token": token,
+        })
         try:
-            body = _fetch_via_gateway(tunnel_address, GATEWAY_APPLIANCE_PORT, row["local_relative_path"])
+            body = _fetch_via_gateway(peer["tunnel_address"], GATEWAY_APPLIANCE_PORT, forward_path)
         except GatewayUnavailable:
             _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "direct_failed_fallback")
         else:
-            _log_event_media_fetch(row["media_id"], "wireguard", len(body), "direct_success")
-            return Response(content=body, media_type="video/mp4")
+            if appliance_media_fetch.response_looks_like_real_video(body, expected_size=row["size_bytes"]):
+                _log_event_media_fetch(row["media_id"], "wireguard", len(body), "direct_success")
+                return Response(content=body, media_type="video/mp4")
+            _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "direct_invalid_response_fallback")
     else:
         _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "not_eligible")
 
@@ -141217,6 +141247,55 @@ def customer_event_media_direct(camera_id: str, event_id: str, request: Request)
     if not url:
         raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
     return RedirectResponse(url, status_code=302)
+
+
+@app.get("/api/appliance/media-fetch")
+def appliance_media_fetch_endpoint(path: str, expires: int, token: str):
+    """The appliance-side half of customer_event_media_direct()'s
+    authenticated fetch (2026-09-19) -- runs identically whether this
+    process is the cloud portal or a real edge appliance, but is only
+    ever actually reached over the WireGuard tunnel on a real Ryzen box.
+    Deliberately NOT the raw /recordings StaticFiles mount and not gated
+    by the browser-session authentication_middleware at all: it falls
+    under the existing "/api/appliance/" PUBLIC_PATH_PREFIXES entry (the
+    same one covering every other appliance-authenticated route, all of
+    which do their own internal credential check instead of relying on a
+    browser session) and does its own check here -- a short-lived,
+    path-scoped HMAC token, verified against this appliance's own local
+    secret file, never a database round trip. No directory listing, no
+    arbitrary path capability: a token authorizes exactly one path, for
+    about a minute, and this route still independently re-validates that
+    path is safely contained under RECORDINGS_FOLDER before ever opening
+    it -- defense in depth even though the token itself already commits
+    to the exact path requested.
+
+    Fails closed at every stage: no local secret provisioned yet (real
+    for every appliance today, until a separate, later, explicitly-
+    authorized enrollment step), an expired or mismatched token, an
+    unsafe path, or a file that doesn't exist all return a real 4xx --
+    never a redirect to any login page, which is exactly what let the
+    2026-09-19 finding this route replaces slip past as a false-positive
+    200 in the first place."""
+    import appliance_media_fetch
+
+    secret = appliance_media_fetch.load_local_secret()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Media-fetch is not provisioned on this appliance.")
+    if not appliance_media_fetch.verify(secret, path, expires, token):
+        raise HTTPException(status_code=401, detail="Invalid or expired media-fetch token.")
+    if not path.startswith("/recordings/") or ".." in path:
+        raise HTTPException(status_code=400, detail="Invalid path.")
+
+    root = RECORDINGS_FOLDER.resolve()
+    resolved = (root / path.removeprefix("/recordings/")).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path.")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Media file not found.")
+
+    return FileResponse(resolved, media_type="video/mp4")
 
 
 def _customer_event_thumbnail_s3_key(camera_id: str, event_id: str) -> str | None:

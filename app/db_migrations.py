@@ -1204,6 +1204,25 @@ def apply_migrations():
         # row, query, or upload behavior changes.
         if 'local_relative_path' not in detection_event_media_columns: db.execute('ALTER TABLE detection_event_media ADD COLUMN local_relative_path TEXT')
 
+        # WireGuard authenticated media-fetch secret (2026-09-19): the
+        # real fix for a live staging finding the same day -- a naive
+        # fetch of /recordings/... over the tunnel got redirected to
+        # Ryzen's own local admin login page, and the caller wrongly
+        # counted that HTTP 200 as a successful video fetch. This column
+        # holds one shared HMAC key per appliance (see
+        # appliance_media_fetch.py's own module docstring for why this
+        # must be the raw value, not a one-way hash like appliance_
+        # credentials.credential_hash: the cloud actively signs outgoing
+        # requests with it, which requires holding the real key). NULL
+        # for every appliance until a separate, later, explicitly-
+        # authorized enrollment step provisions a real one -- main.py's
+        # event-clip direct-fetch route treats a NULL secret as simply
+        # ineligible (falls back to S3), never as an error.
+        appliance_wireguard_peers_columns=({item['name'] for item in db.execute('PRAGMA table_info(appliance_wireguard_peers)').fetchall()}
+                                          if backend()=='sqlite' else
+                                          {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliance_wireguard_peers'").fetchall()})
+        if 'media_fetch_secret' not in appliance_wireguard_peers_columns: db.execute('ALTER TABLE appliance_wireguard_peers ADD COLUMN media_fetch_secret TEXT')
+
         # Notification external-delivery reliability (2026-09-16): the
         # real address/number a delivery attempt was actually sent to,
         # captured at send time -- never re-derived from the customer's
