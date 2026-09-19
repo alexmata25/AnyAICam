@@ -311,3 +311,101 @@ on the real customer-facing `portal-9cccbf4` container; that container
 was never restarted, never modified, and served customer traffic
 uninterrupted throughout. The test container was stopped (not
 deleted) after measurement, releasing its ~680MB back to the host.
+
+## Addendum 2 (2026-09-19): a real native crash, its root cause, and process isolation
+
+A later benchmark run of the real 0.5B model — under the same threaded
+timeout design the first addendum described as safe-but-imperfect —
+hit a real native failure: `llama.cpp`'s own C++ code failed a
+`GGML_ASSERT` and called `abort()`, which terminates the entire OS
+process it runs in. Every one of the 7 test phrases in that run first
+hit the 8-second timeout exactly (proof the timeout itself was working
+correctly), and the crash surfaced afterward, in a background thread
+that had already been given up on but was still running.
+
+**Why a thread-based timeout cannot contain this.** `ThreadPoolExecutor`
+bounds how long the *caller* waits, but a native `abort()` inside any
+thread kills the whole process, portal included — bounding the wait
+does nothing once the underlying call actually crashes rather than
+merely running long. This was a real, previously undiscovered gap in
+the fix described in Addendum 1.
+
+**Plausible root cause, not just the symptom.** The single shared
+`NaturalAacoLanguageAdapter`/`LlamaCppInterpreter` instance (constructed
+once at route-registration time, per this module's own design) held
+one `Llama` object reused across requests. Under the old
+`ThreadPoolExecutor(max_workers=2)` design, a slow call that had
+already timed out from the *caller's* perspective kept running in its
+own thread — and if a second request arrived before that first one
+finished, both threads could call `create_chat_completion()` on the
+**same** `Llama` instance concurrently. llama.cpp's internal KV-cache/
+batch state is not documented as safe for concurrent access from
+multiple threads; two overlapping calls corrupting that shared state is
+a well-understood, plausible cause of an internal assertion failure
+like this one. This is a diagnosis from evidence and known llama.cpp
+behavior, not a confirmed root-cause trace — offered as the most likely
+explanation, not a certainty.
+
+**The fix (`app/aaco_llm.py`, commit `cfbee40`): process isolation, not
+just a longer thread timeout.** Real inference now runs in a
+`ProcessPoolExecutor(max_workers=1)`, loading the model fresh inside
+that one worker process on first use. Two structural changes follow
+directly from this:
+
+1. **Crash containment.** A native `abort()` now only ends that one
+   worker process. `concurrent.futures` raises `BrokenProcessPool` for
+   the pending future, handled identically to every other
+   `InterpreterUnavailable` cause — safe, immediate fallback to the
+   deterministic grammar, verified by a real test that induces an
+   actual OS-level process kill (`os._exit()`) and confirms the caller
+   never sees anything worse than a clean exception.
+2. **The plausible root cause is now structurally prevented, not just
+   contained.** `max_workers=1` means only one inference call can ever
+   be in flight at a time — a second request must wait for (or time
+   out past) the first, never run concurrently against the same model
+   state. If the crash really was concurrent access to a shared
+   `Llama` instance, this design can no longer produce that condition
+   at all, independent of the fact that a crash would now be contained
+   even if it recurred for some other reason.
+
+Also fixed along the way, found only by testing a real crash rather
+than assuming: a `ProcessPoolExecutor` does not self-heal once broken
+— every subsequent `.submit()` on the same instance keeps raising
+`BrokenProcessPool` forever. Added explicit discard-and-recreate logic
+so one crash degrades local-AI interpretation for a single request,
+not permanently until the whole portal restarts.
+
+**Current stability assessment and recommendation.** The architecture
+fix above is deployed to staging (`portal-cfbee40`, verified live,
+`portal-staging.anyaicam.com` and `app.anyaicam.com` both healthy
+throughout) and covered by real subprocess-level tests (71 passing in
+`test_aaco_llm.py`, including real timeout, real inference failure, and
+real crash-isolation/recovery scenarios). What is **not yet done**: a
+fresh stress run of the *real* 0.5B model against this new
+architecture to directly confirm the crash does not recur (the
+0.5B-model + `llama-cpp-python` build was torn down as part of the same
+day's disk cleanup, and rebuilding it — a 5-15 minute `llama-cpp-python`
+source compile plus a 491MB model download — was deferred this pass in
+favor of shipping the architectural fix and moving to other open
+priorities).
+
+**Recommendation: do not enable `ANYAICAM_AACO_LOCAL_LLM_ENABLED`
+customer-facing yet.** Two independent reasons converge on "not yet,"
+not "abandon this model": the crash-containment fix is real and
+deployed, but its plausible root cause has not been *confirmed* fixed
+by an actual repeat stress test; and Addendum 1's own accuracy
+measurement (2 of 5 example phrases fully correct) was already
+below a customer-ready bar on its own, independent of the crash. The
+smallest practical next step, when picked back up, is exactly one
+thing: rebuild the 0.5B model test environment and run a real,
+repeated-load stress test against `cfbee40`'s process-isolated design,
+confirming zero native crashes across a realistic run before any
+customer-facing decision. If crashes *do* still occur even under
+process isolation (which would at minimum mean the failure is
+contained and safe, never a portal-down incident) — the next
+escalation is not indefinite prompt-patching of the same 0.5B model,
+but evaluating a slightly larger CPU-only instruction model (Addendum
+1 already named Llama-3.2-3B-Instruct as the natural next step up) once
+this same process-isolated architecture is proven stable, rather than
+continuing to invest in phrase-by-phrase tuning of a model that may be
+fundamentally at its accuracy ceiling for this task.
