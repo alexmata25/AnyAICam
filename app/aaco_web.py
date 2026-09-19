@@ -70,7 +70,7 @@ return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',header
 # application, not one per embedding page.
 
 
-def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placeholder: str = "What would you like to see?", intro: str = "", show_voice_diagnostics: bool = True) -> str:
+def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placeholder: str = "What would you like to see?", intro: str = "") -> str:
     """A compact, embeddable AACO command box: one text input, one
     submit button, one status line, and a tap-to-record microphone
     control -- everything a page needs to let a customer speak or type
@@ -85,14 +85,6 @@ def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placehold
     embeddable more than once per page (or alongside the standalone
     workspace's own element ids) without a collision.
 
-    show_voice_diagnostics (default True, TEMPORARY): renders a small
-    always-visible <pre> block showing speech-API support, mic button
-    state, whether recognition actually started, the last error code,
-    and any transcript received -- see its own inline comment below
-    for why. Set False once the real-browser voice failure this was
-    added to diagnose is confirmed and fixed, and delete this
-    parameter and the block it controls in the same pass.
-
     Voice input, exactly as narrow as the requirement asks: the
     browser's own SpeechRecognition API (feature-detected; the button
     stays disabled with an explanatory tooltip when unsupported)
@@ -106,34 +98,46 @@ def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placehold
     no way for recognized speech to reach /api/aaco/command by any
     route other than the one a typed command already uses. A denied
     microphone permission, no speech detected, or the browser lacking
-    SpeechRecognition at all are all handled explicitly (see onerror/
-    the feature-detection branch below) and always leave typing fully
-    available -- voice is additive, never a replacement path."""
-    input_id, mic_id, status_id, form_id, diag_id = (
-        f"{id_prefix}-command", f"{id_prefix}-mic", f"{id_prefix}-status", f"{id_prefix}-form", f"{id_prefix}-voice-diag",
+    SpeechRecognition at all are all handled explicitly and always
+    leave typing fully available -- voice is additive, never a
+    replacement path.
+
+    2026-09-19: a temporary in-page diagnostics block lived here while
+    a real staging browser report ("typed works, voice doesn't") was
+    investigated. Real result: window.SpeechRecognition was present,
+    the mic button enabled, recognition genuinely started (onstart
+    fired, meaning permission was already granted -- Chrome never
+    reaches onstart otherwise) -- and every attempt ended in a
+    no-speech error with no transcript. That rules out Permissions-
+    Policy, a broken build, and unsupported-browser; it points at the
+    recognition session simply not hearing usable audio in whatever
+    window it allotted before giving up -- a real, well-known Web
+    Speech API characteristic (no-speech fires on its own internal
+    silence timeout, which the API gives no way for page script to
+    lengthen) compounded by the reaction-time gap between clicking and
+    actually speaking, and it is exactly as likely to be a Windows/
+    browser microphone *input selection* issue (wrong default
+    recording device, muted/very quiet input) as an app defect --
+    onstart already proved the browser itself has a working
+    permission grant. Two small, real fixes applied given that: (1)
+    interimResults=true, so partial words appear in the status line
+    the moment the recognizer hears anything -- the fastest way for a
+    customer (or an operator debugging this) to tell "the mic is
+    picking up audio, it just hasn't finished a phrase yet" apart from
+    "nothing is reaching the recognizer at all"; (2) exactly one
+    silent, automatic retry on a first no-speech error before
+    reporting failure, directly covering the "ended too quickly before
+    I started talking" case this investigation was asked to check.
+    Neither fix can distinguish an environment-level microphone
+    selection problem from an occasional real timeout -- if no-speech
+    still recurs after both, the final message says so plainly and
+    points at system microphone settings rather than guessing further
+    in the browser layer. The diagnostics block itself is removed
+    (its whole purpose was reaching this conclusion) -- see
+    docs/aaco-voice-no-speech-investigation.md for the full writeup."""
+    input_id, mic_id, status_id, form_id = (
+        f"{id_prefix}-command", f"{id_prefix}-mic", f"{id_prefix}-status", f"{id_prefix}-form",
     )
-    # TEMPORARY (2026-09-19): a real staging browser test found typed
-    # AACO commands work but voice does not, with no visibility into
-    # which of window.SpeechRecognition/webkitSpeechRecognition,
-    # microphone permission, onstart, onresult, or onerror is the
-    # actual failure point. This diagnostics block makes every one of
-    # those five states visible directly in the page -- no devtools
-    # needed -- so the next real browser test identifies the exact
-    # failure instead of another "voice doesn't work" report with
-    # nothing to act on. Exposes only booleans, a short error-code
-    # enum, and the customer's own just-spoken transcript (already
-    # destined for the same input box regardless) -- no cookie,
-    # token, camera id, or other backend/customer detail of any kind.
-    # Remove this block (and show_voice_diagnostics) once the root
-    # cause is confirmed and fixed.
-    diagnostics_html = f"""
-<pre id="{diag_id}" class="aaco-muted" style="margin-top:8px;padding:8px;border:1px dashed var(--line,#444);border-radius:8px;font-size:11px;white-space:pre-line">AACO voice diagnostics (temporary)
-Speech API supported: checking…
-Mic button: checking…
-Listening started: not yet
-Last error: none
-Transcript received: none</pre>
-""" if show_voice_diagnostics else ""
     return f"""
 <style>
 .aaco-mic-listening{{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}}
@@ -147,21 +151,11 @@ Transcript received: none</pre>
 <button class="action-button" type="submit">Ask AACO</button>
 </form>
 <p id="{status_id}" class="aaco-muted" role="status" aria-live="polite" style="margin-top:6px"></p>
-{diagnostics_html}</div>
+</div>
 <script>{_AACO_CLIENT_CORE_JS}
 (function(){{
-var form=document.getElementById({form_id!r}),input=document.getElementById({input_id!r}),status=document.getElementById({status_id!r}),micButton=document.getElementById({mic_id!r}),diag=document.getElementById({diag_id!r});
+var form=document.getElementById({form_id!r}),input=document.getElementById({input_id!r}),status=document.getElementById({status_id!r}),micButton=document.getElementById({mic_id!r});
 if(!form)return;
-var diagState={{supported:null,micEnabled:false,listening:false,lastError:'none',transcript:'none'}};
-function renderDiag(){{
-if(!diag)return;
-diag.textContent='AACO voice diagnostics (temporary)\\n'+
-'Speech API supported: '+(diagState.supported===null?'checking…':(diagState.supported?'yes':'no'))+'\\n'+
-'Mic button: '+(diagState.micEnabled?'enabled':'disabled')+'\\n'+
-'Listening started: '+(diagState.listening?'yes':'not yet')+'\\n'+
-'Last error: '+diagState.lastError+'\\n'+
-'Transcript received: '+diagState.transcript;
-}}
 form.addEventListener('submit',function(event){{
 event.preventDefault();
 var text=input.value.trim();
@@ -176,21 +170,17 @@ input.focus();
 status.textContent=error.detail||'AACO could not complete that command.';
 }});
 }});
-// Voice input: tap to start listening, tap again (or silence/a
+// Voice input: tap to start listening, tap again (or a final
 // result) to stop. Recognized speech is never sent to AACO directly
 // by this code -- it is written into the same <input> a typed
 // command uses, then submitted through the exact same submit
 // listener above via form.requestSubmit(), never a parallel call to
 // window.aacoSubmitCommand of its own.
 var SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition;
-diagState.supported=!!SpeechRecognitionCtor;
-renderDiag();
 if(micButton&&SpeechRecognitionCtor){{
 micButton.disabled=false;
 micButton.title='Press to speak a command';
 micButton.setAttribute('aria-label','Press to speak a command');
-diagState.micEnabled=true;
-renderDiag();
 var recognition=null,listening=false;
 function stopListening(){{
 listening=false;
@@ -198,44 +188,52 @@ micButton.classList.remove('aaco-mic-listening');
 micButton.setAttribute('aria-pressed','false');
 if(recognition){{try{{recognition.stop()}}catch(e){{}}}}
 }}
-micButton.addEventListener('click',function(){{
-if(listening){{stopListening();return}}
-diagState.lastError='none';
-diagState.transcript='none';
-diagState.listening=false;
-renderDiag();
-try{{recognition=new SpeechRecognitionCtor()}}catch(e){{diagState.lastError='constructor: '+e.message;renderDiag();status.textContent='Voice input is unavailable right now. Type your command instead.';return}}
+// isRetry=true marks the one automatic re-attempt after a first
+// no-speech error -- see the function docstring above for why this
+// exists. A retry's own onend must NOT drop the visual "listening"
+// state (the retrying flag suppresses that single onend), otherwise
+// the mic would flicker to idle for an instant between the two
+// attempts even though a fresh recognition session starts
+// immediately after.
+function attemptRecognition(isRetry){{
+var retrying=false;
+try{{recognition=new SpeechRecognitionCtor()}}catch(e){{stopListening();status.textContent='Voice input is unavailable right now. Type your command instead.';return}}
 recognition.lang=navigator.language||'en-US';
-recognition.interimResults=false;
+recognition.interimResults=true;
 recognition.maxAlternatives=1;
-recognition.onstart=function(){{
-diagState.listening=true;
-renderDiag();
-}};
 recognition.onresult=function(event){{
-var alt=event.results&&event.results[0]&&event.results[0][0];
+var result=event.results&&event.results[event.results.length-1];
+var alt=result&&result[0];
 var transcript=alt&&alt.transcript;
-diagState.transcript=transcript||'(empty result)';
-renderDiag();
+if(!transcript)return;
+if(!result.isFinal){{status.textContent='Hearing: “'+transcript+'”…';return}}
 stopListening();
-if(!transcript){{status.textContent='Did not catch that -- try again or type your command.';return}}
 input.value=transcript;
 status.textContent='Heard: “'+transcript+'” — sending to AACO…';
 if(typeof form.requestSubmit==='function'){{form.requestSubmit()}}else{{form.dispatchEvent(new Event('submit',{{cancelable:true}}))}}
 }};
 recognition.onerror=function(event){{
-diagState.lastError=event.error||'unknown';
-renderDiag();
+if(event.error==='no-speech'&&!isRetry){{
+retrying=true;
+status.textContent='Still listening — go ahead and speak your command.';
+attemptRecognition(true);
+return;
+}}
 stopListening();
 if(event.error==='not-allowed'||event.error==='permission-denied'){{status.textContent='Microphone permission was denied. Type your command instead.'}}
-else if(event.error==='no-speech'){{status.textContent='No speech detected. Try again or type your command.'}}
+else if(event.error==='no-speech'){{status.textContent='No speech detected. Check that the correct microphone is selected and unmuted in your system sound settings, then try again or type your command.'}}
 else{{status.textContent='Voice input is unavailable right now. Type your command instead.'}}
 }};
-recognition.onend=function(){{stopListening()}};
+recognition.onend=function(){{if(!retrying)stopListening()}};
+try{{recognition.start()}}catch(e){{stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
+}}
+micButton.addEventListener('click',function(){{
+if(listening){{stopListening();return}}
+listening=true;
 micButton.classList.add('aaco-mic-listening');
 micButton.setAttribute('aria-pressed','true');
 status.textContent='Listening…';
-try{{recognition.start()}}catch(e){{diagState.lastError='start(): '+e.message;renderDiag();stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
+attemptRecognition(false);
 }});
 }}
 }})();
