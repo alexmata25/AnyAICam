@@ -178,14 +178,21 @@ def sync_provisioned_cameras() -> dict:
             db.execute(
                 "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,status,device_key,"
                 "onvif_endpoint,resolution,cloud_recording_mode,people_counting_enabled,smart_motion_enabled,"
-                "lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata,talk_down_verified_at,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "lpr_enabled,ppe_enabled,local_recording_mode,local_recording_pre_roll_seconds,"
+                "local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,"
+                "talk_down_supported,talk_down_metadata,talk_down_verified_at,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET name=excluded.name,camera_number=excluded.camera_number,"
                 "status=excluded.status,device_key=excluded.device_key,onvif_endpoint=excluded.onvif_endpoint,"
                 "resolution=excluded.resolution,cloud_recording_mode=excluded.cloud_recording_mode,"
                 "people_counting_enabled=excluded.people_counting_enabled,"
                 "smart_motion_enabled=excluded.smart_motion_enabled,lpr_enabled=excluded.lpr_enabled,"
                 "ppe_enabled=excluded.ppe_enabled,"
+                "local_recording_mode=excluded.local_recording_mode,"
+                "local_recording_pre_roll_seconds=excluded.local_recording_pre_roll_seconds,"
+                "local_recording_post_roll_seconds=excluded.local_recording_post_roll_seconds,"
+                "local_recording_merge_gap_seconds=excluded.local_recording_merge_gap_seconds,"
+                "local_recording_max_event_seconds=excluded.local_recording_max_event_seconds,"
                 "talk_down_supported=CASE WHEN excluded.talk_down_supported IS NOT NULL THEN excluded.talk_down_supported ELSE cameras.talk_down_supported END,"
                 "talk_down_metadata=CASE WHEN excluded.talk_down_supported IS NOT NULL THEN excluded.talk_down_metadata ELSE cameras.talk_down_metadata END,"
                 "talk_down_verified_at=CASE WHEN excluded.talk_down_supported IS NOT NULL THEN excluded.talk_down_verified_at ELSE cameras.talk_down_verified_at END",
@@ -195,6 +202,9 @@ def sync_provisioned_cameras() -> dict:
                     item.get("onvif_endpoint"), item.get("resolution"), item.get("recording_mode"),
                     item.get("people_counting_enabled"), item.get("smart_motion_enabled"),
                     item.get("lpr_enabled"), item.get("ppe_enabled"),
+                    item.get("local_recording_mode"), item.get("local_recording_pre_roll_seconds"),
+                    item.get("local_recording_post_roll_seconds"), item.get("local_recording_merge_gap_seconds"),
+                    item.get("local_recording_max_event_seconds"),
                     talk_down_supported, talk_down_metadata, talk_down_verified_at, now,
                 ),
             )

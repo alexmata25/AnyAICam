@@ -16209,6 +16209,232 @@ def start_recording(camera_number: int) -> subprocess.Popen:
     return subprocess.Popen(command)
 
 
+# ------------------------------------------------------------------
+# Local Event-mode recording (2026-09-20). See
+# docs/local-event-mode-recording-design.md for the full audit/design
+# this implements.
+#
+# Continuous mode (the default, and every camera's behavior before
+# this pass) is completely untouched above -- start_recording() itself
+# has zero changes. Everything below is new and purely additive: a
+# camera only ever reaches this code if its own local_recording_mode
+# column (synced from the cloud admin route via edge_camera_sync.py)
+# reads back as the literal string 'event'.
+EVENT_BUFFER_SEGMENT_SECONDS = 30
+EVENT_BUFFER_SUBFOLDER_NAME = "_event_buffer"
+
+
+def _local_recording_settings(camera_number: int) -> dict:
+    """Reads this camera's Event-mode configuration fresh from the
+    local database on every call (never cached) so a mode/setting
+    change made via the cloud admin route takes effect the next time
+    process_supervisor()'s own reconnect loop checks, without requiring
+    a full appliance restart. Returns defaults (event_clips.py's own
+    DEFAULT_* constants) for any field the customer/admin has not
+    explicitly configured -- the exact same no-hidden-default
+    philosophy as local_recording_mode itself, just for its numeric
+    knobs."""
+    from event_clips import DEFAULT_MERGE_GAP_SECONDS, DEFAULT_POST_ROLL_SECONDS, DEFAULT_PRE_ROLL_SECONDS
+    from local_recording_policy import DEFAULT_MAX_EVENT_RECORDING_SECONDS
+
+    mode = "continuous"
+    pre_roll = DEFAULT_PRE_ROLL_SECONDS
+    post_roll = DEFAULT_POST_ROLL_SECONDS
+    merge_gap = DEFAULT_MERGE_GAP_SECONDS
+    max_event_seconds = DEFAULT_MAX_EVENT_RECORDING_SECONDS
+    try:
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute(
+                "SELECT local_recording_mode, local_recording_pre_roll_seconds, "
+                "local_recording_post_roll_seconds, local_recording_merge_gap_seconds, "
+                "local_recording_max_event_seconds FROM cameras WHERE camera_number=?",
+                (camera_number,),
+            ).fetchone()
+    except Exception:
+        row = None
+    if row:
+        if row["local_recording_mode"] == "event":
+            mode = "event"
+        if row["local_recording_pre_roll_seconds"] is not None:
+            pre_roll = row["local_recording_pre_roll_seconds"]
+        if row["local_recording_post_roll_seconds"] is not None:
+            post_roll = row["local_recording_post_roll_seconds"]
+        if row["local_recording_merge_gap_seconds"] is not None:
+            merge_gap = row["local_recording_merge_gap_seconds"]
+        if row["local_recording_max_event_seconds"] is not None:
+            max_event_seconds = row["local_recording_max_event_seconds"]
+    return {
+        "mode": mode, "pre_roll_seconds": pre_roll, "post_roll_seconds": post_roll,
+        "merge_gap_seconds": merge_gap, "max_event_seconds": max_event_seconds,
+    }
+
+
+def start_event_recording_buffer(camera_number: int) -> subprocess.Popen:
+    """Event mode's replacement for start_recording(): the same ffmpeg
+    segment-muxer approach, deliberately -- but a short
+    EVENT_BUFFER_SEGMENT_SECONDS segment instead of a 5-minute one, and
+    written to a dedicated, non-customer-facing subfolder rather than
+    the camera's real recordings folder.
+
+    Nothing else in this application ever needs to know this folder
+    exists: _catalog_local_recordings_for_camera()/_customer_recording_
+    rows() glob camera{N}/*.mkv, which is NOT recursive -- a file
+    inside camera{N}/_event_buffer/ is invisible to Playback, cloud
+    upload, and retention_worker() by construction, not by an added
+    exclusion rule. Its only purpose is to give
+    event_buffer_janitor()/persist_event_recording() enough recent raw
+    footage to extract a real pre-roll from; it is never itself "the
+    recording" a customer sees."""
+    camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
+    camera_folder.mkdir(parents=True, exist_ok=True)
+    output_pattern = str(camera_folder / f"buf{camera_number}_%Y-%m-%d_%H-%M-%S.mkv")
+    command = [
+        "ffmpeg", "-rtsp_transport", "tcp", "-i", camera_url(camera_number),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+        "-f", "segment", "-segment_time", str(EVENT_BUFFER_SEGMENT_SECONDS),
+        "-reset_timestamps", "1", "-strftime", "1", output_pattern,
+    ]
+    return subprocess.Popen(command)
+
+
+async def event_buffer_janitor(camera_number: int) -> None:
+    """Deletes this camera's short buffer segments once they age past
+    the configured pre-roll lookback -- the actual mechanism that stops
+    an idle Event-mode camera from accumulating disk usage. A no-op
+    (cheap, polls every EVENT_BUFFER_SEGMENT_SECONDS) for any camera
+    whose local_recording_mode is not 'event', so this can safely run
+    for every camera slot unconditionally rather than needing to be
+    started/stopped as a mode changes."""
+    from local_recording_policy import BufferSegment, is_buffer_segment_still_needed
+
+    while True:
+        await asyncio.sleep(EVENT_BUFFER_SEGMENT_SECONDS)
+        settings = _local_recording_settings(camera_number)
+        if settings["mode"] != "event":
+            continue
+        buffer_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
+        if not buffer_folder.is_dir():
+            continue
+        now = datetime.now()
+        in_flight = tuple(_in_flight_event_windows(camera_number))
+        for path in sorted(buffer_folder.glob("*.mkv")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            # Never touch a file ffmpeg may still be actively writing.
+            if time.time() - stat.st_mtime < EVENT_BUFFER_SEGMENT_SECONDS:
+                continue
+            segment_start = recording_start(path, camera_number)
+            if segment_start is None:
+                continue
+            segment_end = segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS)
+            segment = BufferSegment(start=segment_start, end=segment_end)
+            if not is_buffer_segment_still_needed(
+                segment, now=now, pre_roll_seconds=settings["pre_roll_seconds"],
+                in_flight_event_windows=in_flight,
+            ):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+# Per-camera bookkeeping for should_start_new_event_recording()'s merge
+# decision and event_buffer_janitor()'s "don't delete a segment a build
+# currently depends on" safety check. Guarded by _event_recording_lock
+# exactly like the existing ai_event_clip_windows_lock pattern this
+# file already uses for the same class of shared, per-camera state.
+_open_event_recordings: dict[int, dict] = {}
+_event_recording_lock = asyncio.Lock()
+
+
+def _in_flight_event_windows(camera_number: int) -> list[tuple[datetime, datetime]]:
+    open_recording = _open_event_recordings.get(camera_number)
+    if not open_recording:
+        return []
+    return [(open_recording["start"], open_recording["end"])]
+
+
+async def persist_event_recording(camera_number: int, event_start: datetime, event_end: datetime) -> None:
+    """Event mode's replacement for "just let the continuous segmenter
+    keep it": extracts event_start-pre_roll .. event_end+post_roll from
+    the short rolling buffer and writes/extends a file in the camera's
+    REAL recordings folder using the exact same filename convention
+    start_recording() already uses -- so this is completely
+    indistinguishable from a Continuous-mode recording to every
+    existing downstream consumer (_customer_recording_rows(), Playback,
+    thumbnails, retention_worker(), Hybrid cloud upload): none of that
+    code needed to change at all.
+
+    Adjacent/overlapping detections extend the currently-open
+    recording (should_start_new_event_recording() returning False)
+    instead of creating a new file, up to the configured safety-cap
+    max_event_seconds. This function is purely additive: it is only
+    ever called for a camera whose local_recording_mode is 'event',
+    alongside -- never instead of -- the existing customer-facing clip
+    build (build_motion_event_clip()) that already runs for every
+    camera regardless of mode."""
+    from event_clips import compute_clip_window
+    from local_recording_policy import should_start_new_event_recording
+
+    settings = _local_recording_settings(camera_number)
+    window = compute_clip_window(
+        event_start, event_end,
+        pre_roll_seconds=settings["pre_roll_seconds"], post_roll_seconds=settings["post_roll_seconds"],
+    )
+
+    async with _event_recording_lock:
+        open_recording = _open_event_recordings.get(camera_number)
+        start_new = (
+            open_recording is None
+            or should_start_new_event_recording(
+                current_recording_start=open_recording["start"],
+                current_recording_end=open_recording["end"],
+                detection_start=event_start,
+                merge_gap_seconds=settings["merge_gap_seconds"],
+                max_event_recording_seconds=settings["max_event_seconds"],
+            )
+        )
+        if start_new:
+            camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+            camera_folder.mkdir(parents=True, exist_ok=True)
+            destination = camera_folder / f"camera{camera_number}_{window.start:%Y-%m-%d_%H-%M-%S}.mkv"
+            _open_event_recordings[camera_number] = {"start": window.start, "end": window.end, "path": destination}
+        else:
+            destination = open_recording["path"]
+            _open_event_recordings[camera_number]["end"] = window.end
+
+    buffer_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
+    if not buffer_folder.is_dir():
+        return
+    sources = [
+        path for path in sorted(buffer_folder.glob("*.mkv"))
+        if (segment_start := recording_start(path, camera_number)) is not None
+        and segment_start < window.end
+        and segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS) > window.start
+    ]
+    if not sources:
+        return
+    list_file = destination.with_suffix(".sources.txt")
+    try:
+        list_file.write_text("".join(f"file '{source}'\n" for source in sources))
+        temp_output = destination.with_suffix(".tmp.mkv")
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+             "-c", "copy", str(temp_output)],
+            capture_output=True, timeout=60, check=False,
+        )
+        if result.returncode == 0 and temp_output.exists():
+            temp_output.replace(destination)
+    finally:
+        list_file.unlink(missing_ok=True)
+        destination.with_suffix(".tmp.mkv").unlink(missing_ok=True)
+
+
 
 
 
@@ -16458,9 +16684,25 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
 
-    starter = start_live_stream if mode == "live" else start_recording
-
-
+    # 2026-09-20: for mode=="recording", the starter is no longer fixed
+    # for this task's whole lifetime -- it is re-selected on every
+    # reconnect-loop iteration below, based on this camera's CURRENT
+    # local_recording_mode (read fresh, never cached, by
+    # _local_recording_settings()). This is what lets an admin's mode
+    # change take effect without restarting the appliance: the next
+    # time this camera's recorder reconnects (which happens routinely
+    # anyway -- RTSP hiccups, camera reboots, etc.), it picks up
+    # whichever strategy is currently configured. mode=="live" is
+    # completely unaffected -- always start_live_stream, exactly as
+    # before this change.
+    def _select_recording_starter():
+        if mode != "recording":
+            return start_live_stream
+        return (
+            start_event_recording_buffer
+            if _local_recording_settings(camera_number)["mode"] == "event"
+            else start_recording
+        )
 
 
 
@@ -16486,7 +16728,7 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         try:
-            process = starter(camera_number)
+            process = _select_recording_starter()(camera_number)
         except CameraNotConfiguredError:
             # Not an error: this slot has no camera provisioned yet (a
             # fresh install, or a not-yet-configured supervisor headroom
@@ -34386,6 +34628,25 @@ async def store_motion_event(
         clip_tasks.add(clip_task)
         clip_task.add_done_callback(clip_tasks.discard)
 
+        # 2026-09-20: purely additive, alongside -- never instead of --
+        # the customer-facing clip build immediately above. Only ever
+        # does anything for a camera whose local_recording_mode reads
+        # back as 'event' (checked fresh via _local_recording_settings(),
+        # off the event loop via asyncio.to_thread -- it does a real
+        # sqlite query, and this whole block runs directly on the
+        # shared FastAPI/motion event loop, the exact class of blocking
+        # call this same function's own append_analytics_event() fix
+        # above already had to correct once). Scheduled unconditionally
+        # here so a Continuous-mode camera's existing behavior has zero
+        # new code in its path beyond this one cheap, backgrounded
+        # check.
+        if (await asyncio.to_thread(_local_recording_settings, camera_number))["mode"] == "event":
+            event_recording_task = asyncio.create_task(
+                persist_event_recording(camera_number, start_time, end_time)
+            )
+            clip_tasks.add(event_recording_task)
+            event_recording_task.add_done_callback(clip_tasks.discard)
+
 
 
 
@@ -39268,6 +39529,15 @@ async def lifespan(app: FastAPI):
 
 
                 asyncio.create_task(motion_detector(camera_number))
+                for camera_number in camera_numbers
+            ]
+            # 2026-09-20: one janitor per camera slot, started
+            # unconditionally alongside motion detection -- each one is
+            # a cheap no-op for any camera not currently in Event mode
+            # (see event_buffer_janitor()'s own docstring), so this
+            # never needs its own separate enable flag or lifecycle.
+            event_buffer_janitor_tasks = [
+                asyncio.create_task(event_buffer_janitor(camera_number))
 
 
 

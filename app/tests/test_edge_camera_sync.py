@@ -125,6 +125,41 @@ def test_cloud_camera_is_upserted_into_the_local_cameras_table(db_path, monkeypa
     assert cameras["cam-1"]["appliance_id"] == "appl-ryzen"
 
 
+def test_local_recording_mode_and_configurable_fields_are_synced(db_path, monkeypatch):
+    """The exact same sync path people_counting_enabled etc. already
+    prove -- local_recording_mode (and its 4 configurable seconds
+    fields) must reach the LOCAL cameras table process_supervisor()
+    actually reads, not just exist on the cloud side."""
+    _mock_identity(monkeypatch)
+    _mock_cloud_config(monkeypatch, [
+        {"id": "cam-1", "name": "Camera 1", "camera_number": 1, "status": "configured",
+         "device_key": "urn:uuid:aaaa", "onvif_endpoint": "rtsp://192.168.0.38:554/ch1",
+         "resolution": "2mp", "recording_mode": None, "people_counting_enabled": 0,
+         "local_recording_mode": "event", "local_recording_pre_roll_seconds": 10,
+         "local_recording_post_roll_seconds": 15, "local_recording_merge_gap_seconds": 20,
+         "local_recording_max_event_seconds": 600},
+    ])
+    edge_camera_sync.sync_provisioned_cameras()
+    cameras = _local_cameras(db_path)
+    assert cameras["cam-1"]["local_recording_mode"] == "event"
+    assert cameras["cam-1"]["local_recording_pre_roll_seconds"] == 10
+    assert cameras["cam-1"]["local_recording_post_roll_seconds"] == 15
+    assert cameras["cam-1"]["local_recording_merge_gap_seconds"] == 20
+    assert cameras["cam-1"]["local_recording_max_event_seconds"] == 600
+
+
+def test_local_recording_mode_defaults_to_null_when_not_reported(db_path, monkeypatch):
+    _mock_identity(monkeypatch)
+    _mock_cloud_config(monkeypatch, [
+        {"id": "cam-1", "name": "Camera 1", "camera_number": 1, "status": "configured",
+         "device_key": "urn:uuid:aaaa", "onvif_endpoint": "rtsp://192.168.0.38:554/ch1",
+         "resolution": "2mp", "recording_mode": None, "people_counting_enabled": 0},
+    ])
+    edge_camera_sync.sync_provisioned_cameras()
+    cameras = _local_cameras(db_path)
+    assert cameras["cam-1"]["local_recording_mode"] is None
+
+
 def test_re_sync_updates_in_place_never_duplicates(db_path, monkeypatch):
     _mock_identity(monkeypatch)
     cam = {"id": "cam-1", "name": "Camera 1", "camera_number": 1, "status": "configured",

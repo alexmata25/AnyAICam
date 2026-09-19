@@ -986,6 +986,23 @@ def apply_migrations():
         if 'door_access_enabled' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_access_enabled INTEGER')
         if 'door_relay_channel' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_relay_channel INTEGER')
         if 'door_relay_pulse_ms' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN door_relay_pulse_ms INTEGER')
+        # Local Event-mode recording (2026-09-20): same no-hidden-default
+        # convention as cloud_recording_mode above, deliberately kept as a
+        # completely separate column/concept -- cloud_recording_mode gates
+        # whether an already-recorded LOCAL file gets uploaded to cloud;
+        # local_recording_mode gates whether that file gets recorded to
+        # local disk in the first place. NULL/'continuous' (every existing
+        # row) must be read by every consumer (main.py's process_supervisor)
+        # exactly like today's unconditional 5-minute continuous segmenter,
+        # never like 'event'. Only an explicit 'event' value (set via
+        # POST /api/admin/cameras/{camera_id}/local-recording-mode) switches
+        # a camera to motion/activity-triggered recording -- see
+        # local_recording_policy.py for the actual decision logic.
+        if 'local_recording_mode' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN local_recording_mode TEXT')
+        if 'local_recording_pre_roll_seconds' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN local_recording_pre_roll_seconds INTEGER')
+        if 'local_recording_post_roll_seconds' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN local_recording_post_roll_seconds INTEGER')
+        if 'local_recording_merge_gap_seconds' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN local_recording_merge_gap_seconds INTEGER')
+        if 'local_recording_max_event_seconds' not in camera_columns: db.execute('ALTER TABLE cameras ADD COLUMN local_recording_max_event_seconds INTEGER')
         # One-time-per-row backfill, safe to run on every startup: a
         # customer who already toggled an analytic ON via RDM (writing
         # camera_analytics_entitlements) before this fix existed must not

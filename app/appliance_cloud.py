@@ -351,7 +351,15 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # smart_motion's own caller in main.py, people_counting_worker())
         # ultimately consults -- omitting a column here is exactly the gap
         # that left people_counting_enabled unreachable in practice.
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
+        # local_recording_mode (and its 4 configurable fields) joins the
+        # same exposure list for the same reason -- this is the one route
+        # the appliance's own edge_camera_sync.py polls to bring cloud-set
+        # per-camera config down into the LOCAL cameras table
+        # process_supervisor() actually reads before deciding which
+        # recording strategy to run for a camera. Omitting it here would
+        # be the exact same unreachable-in-practice gap this comment
+        # already documents for people_counting_enabled.
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)
@@ -1552,6 +1560,55 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
         audit(identity,'camera.cloud_recording_mode_changed','camera',camera_id,{'cloud_recording_mode':mode})
         return {'camera_id':camera_id,'cloud_recording_mode':mode}
+
+    @app.post('/api/admin/cameras/{camera_id}/local-recording-mode')
+    def set_local_recording_mode(request: Request,camera_id: str,payload: dict) -> dict:
+        # Same no-hidden-default convention as cloud_recording_mode above,
+        # and deliberately a completely separate column/decision:
+        # cloud_recording_mode gates whether an already-recorded LOCAL
+        # file gets uploaded to cloud; this gates whether that file gets
+        # written to local disk at all. NULL/'continuous' (every camera
+        # today) is read everywhere exactly like the current unconditional
+        # 5-minute segmenter -- only an explicit 'event' value switches a
+        # camera to motion/activity-triggered recording (see
+        # local_recording_policy.py and main.py's process_supervisor).
+        identity=require_partner_access(request,{'administrator'})
+        mode=payload.get('local_recording_mode')
+        if mode is not None and mode not in ('continuous','event'):
+            raise HTTPException(status_code=400,detail="local_recording_mode must be 'continuous', 'event', or null.")
+        # Configurable pre-roll/post-roll/merge-gap/max-event-length --
+        # all optional; a value left out of the payload is left
+        # untouched in the database (omission means "don't change it",
+        # not "clear it to null"). Validated as plain positive integers
+        # within a sane bound -- these are seconds, not milliseconds,
+        # and a customer-facing typo (e.g. 36000 meant as minutes)
+        # should fail loudly here rather than silently record ten hours
+        # of "pre-roll".
+        FIELD_COLUMNS = (
+            ('pre_roll_seconds', 'local_recording_pre_roll_seconds', 300),
+            ('post_roll_seconds', 'local_recording_post_roll_seconds', 300),
+            ('merge_gap_seconds', 'local_recording_merge_gap_seconds', 300),
+            ('max_event_seconds', 'local_recording_max_event_seconds', 3600),
+        )
+        updates: dict[str, int] = {}
+        for field, column, max_seconds in FIELD_COLUMNS:
+            if field not in payload or payload[field] is None:
+                continue
+            value = payload[field]
+            if not isinstance(value, int) or isinstance(value, bool) or not (0 < value <= max_seconds):
+                raise HTTPException(status_code=400, detail=f"{field} must be a positive integer, at most {max_seconds} seconds.")
+            updates[column] = value
+        set_clauses = ['local_recording_mode=?'] + [f'{column}=?' for column in updates]
+        values = [mode] + list(updates.values()) + [camera_id]
+        with connection() as db:
+            cursor=db.execute(f'UPDATE cameras SET {", ".join(set_clauses)} WHERE id=?', values)
+            if cursor.rowcount!=1: raise HTTPException(status_code=404,detail='Camera not found.')
+        response = {'camera_id': camera_id, 'local_recording_mode': mode}
+        for field, column, _ in FIELD_COLUMNS:
+            if column in updates:
+                response[field] = updates[column]
+        audit(identity,'camera.local_recording_mode_changed','camera',camera_id,response)
+        return response
 
     @app.post('/api/admin/cameras/{camera_id}/people-counting')
     def set_people_counting_enabled(request: Request,camera_id: str,payload: dict) -> dict:
