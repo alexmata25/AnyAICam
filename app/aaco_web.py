@@ -69,9 +69,22 @@ document.querySelectorAll('.aaco-example').forEach(button=>button.addEventListen
 """
 
 
-def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identity_provider: Callable[[Request], dict | None], vms_factory: Callable[[Request], object], now: Callable[[], datetime] = datetime.now) -> None:
-    """Register an isolated UI that crosses only the injected VMS boundary."""
+def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identity_provider: Callable[[Request], dict | None], vms_factory: Callable[[Request], object], now: Callable[[], datetime] = datetime.now, language_adapter_factory: Callable[[], object] = DeterministicLanguageAdapter) -> None:
+    """Register an isolated UI that crosses only the injected VMS boundary.
+
+    language_adapter_factory defaults to the plain regex grammar,
+    unchanged -- passing app.aaco_llm.NaturalAacoLanguageAdapter here
+    (main.py's own call site decides this, based on
+    ANYAICAM_AACO_LOCAL_LLM_ENABLED) is strictly additive: that class
+    itself always falls back to a DeterministicLanguageAdapter of its
+    own whenever local inference is disabled/unavailable/invalid, so
+    every existing fixed-phrase command keeps parsing identically
+    either way. Constructed once per app, matching how vms_factory is
+    a *callable that builds one per request* while this is a *callable
+    that builds the (possibly model-loading) adapter once* -- an LLM
+    interpreter should load its model once, not on every command."""
     log = logging.getLogger("anyaicam.aaco")
+    language_adapter = language_adapter_factory()
 
     @app.get("/aaco", response_class=HTMLResponse)
     def aaco_workspace(request: Request):
@@ -91,7 +104,7 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
         command_text = payload.get("command")
         if not isinstance(command_text, str) or not command_text.strip() or len(command_text) > MAX_COMMAND_LENGTH:
             raise HTTPException(status_code=400, detail="A command between 1 and 500 characters is required.")
-        parsed = DeterministicLanguageAdapter().parse(command_text, now=now(), context=_context(payload.get("context")))
+        parsed = language_adapter.parse(command_text, now=now(), context=_context(payload.get("context")))
         if isinstance(parsed, Clarification):
             log.info("aaco.command_clarification")
             return {"kind": "clarification", "message": parsed.message}

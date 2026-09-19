@@ -153288,9 +153288,21 @@ class _ClassicAacoBoundary:
         }
 
 
+def _aaco_language_adapter():
+    # NaturalAacoLanguageAdapter(None) (local inference disabled, the
+    # default -- ANYAICAM_AACO_LOCAL_LLM_ENABLED is unset everywhere
+    # today) always falls straight through to its own internal
+    # DeterministicLanguageAdapter, so wiring this in unconditionally
+    # is a no-op today and the only place a future local-inference
+    # rollout needs to touch to turn on.
+    import aaco_llm
+    return aaco_llm.NaturalAacoLanguageAdapter(aaco_llm.default_interpreter())
+
+
 register_aaco_routes(
     app,
     page_shell,
     identity_provider=_aaco_identity_provider,
     vms_factory=lambda request: _ClassicAacoBoundary(request),
+    language_adapter_factory=_aaco_language_adapter,
 )
