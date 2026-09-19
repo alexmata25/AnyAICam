@@ -77,6 +77,16 @@ class TestValidateAiCommand:
         result = _validate_ai_command({"operation": "event_search", "event_type": "car", "start": _iso(start), "end": _iso(NOW)}, now=NOW)
         assert result.event_type == "car"
 
+    @pytest.mark.parametrize("event_type", ["motion", "lpr", "people_counting", "intrusion"])
+    def test_widened_event_categories_matching_the_investigate_page_are_accepted(self, event_type):
+        # 2026-09-19: widened alongside main.py's _aaco_event_category()
+        # so an AI-interpreted "any license plate events?" or "were
+        # there any intrusion alerts?" is not silently rejected just
+        # because the original allow-list only had person/vehicle/car.
+        start = NOW - timedelta(hours=1)
+        result = _validate_ai_command({"operation": "event_search", "event_type": event_type, "start": _iso(start), "end": _iso(NOW)}, now=NOW)
+        assert result.event_type == event_type
+
     # -- rejections: shape/type ---------------------------------------
     def test_non_dict_input_is_rejected(self):
         for bad in (None, "operation", 42, ["operation"], "{\"operation\":\"live_view\"}"):

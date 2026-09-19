@@ -66,7 +66,12 @@ LOCAL_LLM_MAX_TOKENS = 200
 LOCAL_LLM_TIMEOUT_SECONDS = 8
 
 _ALLOWED_OPERATIONS = frozenset(get_args(Operation))
-_ALLOWED_EVENT_TYPES = frozenset({"person", "vehicle", "car"})
+# "car" stays accepted (not just "vehicle") because the model may still
+# emit it -- normalized downstream at the VMS boundary, same as before.
+# The other four match the real category taxonomy the Investigate page
+# already filters on (see main.py's _aaco_event_category()), not a new
+# invented set.
+_ALLOWED_EVENT_TYPES = frozenset({"person", "vehicle", "car", "motion", "lpr", "people_counting", "intrusion"})
 _CAMERA_TOKEN = re.compile(r"^camera-(?:\d{1,4}|name:[a-z0-9 &'_-]{1,80})$")
 _MAX_OFFSET_MINUTES = 24 * 60
 _MAX_LOOKBACK = timedelta(days=365)
@@ -182,7 +187,7 @@ def _validate_ai_command(raw: object, *, now: datetime) -> AacoCommand | Clarifi
 _SYSTEM_PROMPT = """You translate one customer sentence about their security cameras into exactly one JSON object, nothing else.
 
 Allowed "operation" values: live_view, playback, event_search, camera_status, playback_navigation, event_navigation, unlock_door.
-Fields: operation (required), camera_id ("camera-<number>" or "camera-name:<lowercase name>"), start, end (ISO 8601, no timezone), event_type ("person" or "vehicle"), offset_minutes (positive integer).
+Fields: operation (required), camera_id ("camera-<number>" or "camera-name:<lowercase name>"), start, end (ISO 8601, no timezone), event_type ("person", "vehicle", "motion", "lpr", "people_counting", or "intrusion"), offset_minutes (positive integer).
 Never invent a camera name, door, or event not mentioned. Never answer with anything except one JSON object using only the fields above. If the request is unclear, unsafe, or not about live view/playback/events/camera status/unlocking a door, answer with {"operation":"none"} -- do not guess.
 
 Examples:

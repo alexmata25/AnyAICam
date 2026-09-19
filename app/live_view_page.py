@@ -431,6 +431,19 @@ function wireUnlockButton(button, cameraId) {
 # that is already on screen -- a presentation nicety, never a new
 # video session, never a second source of truth for which camera is
 # "selected".
+#
+# "playback"/"events": 2026-09-19 fix -- these previously only ever
+# inserted a manual "Open Playback"/"Open in Investigate" link the
+# customer had to separately notice and click, unlike "live" above,
+# which already acts on its own with no click required. A voice/typed
+# command like "take me back twenty minutes on the driveway" or "show
+# me what happened at the front entrance" should actually go there,
+# the same way saying it to a person would. The href AACO already
+# returned (already authorization-checked server-side -- this is
+# presentation only, never a second access decision) is what the page
+# navigates to; the manual link is kept alongside it only as a safety
+# net if navigation is ever blocked by the browser, and so the
+# customer can still reopen the destination deliberately.
 _AACO_LIVE_RESULT_JS = """
 window.aacoLiveHandleResult=function(body){
   if(body.kind==='live'&&body.href){
@@ -454,6 +467,7 @@ window.aacoLiveHandleResult=function(body){
     openPlayback.href=body.href;
     openPlayback.textContent='Open Playback';
     linkBox.appendChild(openPlayback);
+    setTimeout(function(){window.location.assign(body.href)},900);
     return;
   }
   if(body.kind==='events'&&linkBox){
@@ -464,6 +478,7 @@ window.aacoLiveHandleResult=function(body){
       openEvent.href=first.href;
       openEvent.textContent=(body.events||[]).length>1?'Open first result in Investigate':'Open in Investigate';
       linkBox.appendChild(openEvent);
+      setTimeout(function(){window.location.assign(first.href)},900);
     }
     return;
   }

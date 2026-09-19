@@ -101,6 +101,24 @@ def test_aaco_panel_reuses_the_shared_client_helper_not_a_second_implementation(
     assert "aacoLiveHandleResult" in response.text
 
 
+def test_aaco_playback_and_events_results_actually_navigate_not_just_a_dangling_link(client):
+    """2026-09-19 fix: a playback/events AACO result previously only
+    ever inserted a manual 'Open Playback'/'Open in Investigate' link
+    the customer had to separately notice and click -- unlike 'live',
+    which already scrolls/highlights with no click required. Confirms
+    the page now actually navigates to the authorized href on its own,
+    with the manual link kept only as a fallback."""
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "window.location.assign(body.href)" in body
+    assert "window.location.assign(first.href)" in body
+    # The fallback link itself must still be built before navigating,
+    # not replaced by it.
+    assert "openPlayback.href=body.href" in body
+    assert "openEvent.href=first.href" in body
+
+
 def test_aaco_mic_button_starts_disabled_with_an_unsupported_tooltip(client):
     """The button's own initial HTML is always safe-by-default --
     disabled with an explanatory tooltip -- before any feature

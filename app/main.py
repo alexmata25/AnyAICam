@@ -153005,6 +153005,31 @@ def _aaco_identity_provider(request: Request) -> dict | None:
     return partner_identity(request)
 
 
+def _aaco_event_category(raw_event_type: object) -> str | None:
+    """The exact same raw-event-type -> filter-category bucketing the
+    Investigate/dashboard page's own client-side filterCategory() JS
+    already ships (see main.py's EVENT_COLORS/filterCategory near the
+    Investigate page markup) -- ported to Python so AACO's event_type
+    filter matches real stored values (e.g. "smart_motion", "plate",
+    "people_counting_in") the same way a customer clicking the existing
+    UI filter chips already does, instead of a narrower reimplementation
+    that would silently miss events the existing UI already finds."""
+    value = str(raw_event_type or "")
+    if value in {"motion", "smart_motion"}:
+        return "motion"
+    if value == "person":
+        return "person"
+    if value in {"car", "truck", "bus", "motorcycle", "bicycle", "vehicle"}:
+        return "vehicle"
+    if value in {"plate", "lpr"}:
+        return "lpr"
+    if value in {"people_counting_in", "people_counting_out", "people_counting"}:
+        return "people_counting"
+    if value == "intrusion":
+        return "intrusion"
+    return None
+
+
 class _ClassicAacoBoundary:
     """Adapter from AACO's strict command schema to existing Classic VMS.
 
@@ -153098,14 +153123,14 @@ class _ClassicAacoBoundary:
         }
 
     def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> dict:
-        normalized_type = "vehicle" if event_type == "car" else event_type
+        normalized_type = _aaco_event_category(event_type) if event_type else None
         # Reuses Classic's own customer-scoped event representation.  The
         # bounded response is filtered before presentation, with no media
         # lookup and no creation/export side effect.
         candidates = _customer_detection_events(self.request) or []
         matches = []
         for event in candidates:
-            if normalized_type and event.get("event_type") != normalized_type:
+            if normalized_type and _aaco_event_category(event.get("event_type")) != normalized_type:
                 continue
             try:
                 occurred = datetime.fromisoformat(str(event.get("timestamp")))

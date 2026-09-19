@@ -78,9 +78,18 @@ class DeterministicLanguageAdapter:
             minutes = minutes if minutes is not None else int(match.group(1))
             at = context["playback_at"] - timedelta(minutes=minutes)
             return AacoCommand("playback_navigation", camera_id=context["camera_id"], start=at, end=at + timedelta(minutes=1), offset_minutes=minutes)
-        match = re.fullmatch(r"show (person|vehicle|car) events from the last (\d+) hours?", value)
+        # Canonical values match the real Investigate-page filter categories
+        # (see main.py's _aaco_event_category()) -- "car" is intentionally
+        # left mapping to itself here (normalized downstream at the VMS
+        # boundary, unchanged) rather than duplicating that normalization.
+        event_words = {
+            "person": "person", "vehicle": "vehicle", "car": "car",
+            "motion": "motion", "lpr": "lpr", "plate": "lpr", "license plate": "lpr",
+            "people counting": "people_counting", "intrusion": "intrusion",
+        }
+        match = re.fullmatch(r"show (person|vehicle|car|motion|lpr|plate|license plate|people counting|intrusion) events from the last (\d+) hours?", value)
         if match:
-            return AacoCommand("event_search", event_type=match.group(1), start=now - timedelta(hours=int(match.group(2))), end=now)
+            return AacoCommand("event_search", event_type=event_words[match.group(1)], start=now - timedelta(hours=int(match.group(2))), end=now)
         # “yesterday at 3:15 PM” and “from 3:15 yesterday” are accepted.
         # An unqualified time is treated as 24-hour local time.
         match = re.fullmatch(r"show camera (\d+) (?:yesterday at|from) (\d{1,2}):(\d{2})(?: ?([ap]m))?(?: yesterday)?", value)

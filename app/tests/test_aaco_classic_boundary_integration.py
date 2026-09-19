@@ -165,6 +165,40 @@ def test_search_events_scopes_to_the_tenant_and_the_requested_window(owner_seede
     assert "Front Entrance" in result["events"][0]["label"]
 
 
+def test_search_events_matches_the_same_raw_type_buckets_the_investigate_page_uses(owner_seeded):
+    """2026-09-19: AACO's event_type filter must find the same rows a
+    customer clicking the Investigate page's own "Motion"/"License
+    Plate" filter chip already finds -- including raw stored values
+    like 'smart_motion' and 'plate' that are not literally the
+    canonical category name. Proves _aaco_event_category() is actually
+    wired into search_events(), not just unit-tested in isolation."""
+    conn = owner_seeded
+    conn.execute(
+        "INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) "
+        "VALUES('evt-motion','cust-1','site-cust-1','appl-cust-1','cam-1','local-1','smart_motion','2026-09-16T10:00:00','2026-09-16T10:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) "
+        "VALUES('evt-plate','cust-1','site-cust-1','appl-cust-1','cam-1','local-2','plate','2026-09-16T10:01:00','2026-09-16T10:01:00')"
+    )
+    conn.execute(
+        "INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) "
+        "VALUES('evt-intrusion','cust-1','site-cust-1','appl-cust-1','cam-1','local-3','intrusion','2026-09-16T10:02:00','2026-09-16T10:02:00')"
+    )
+    conn.commit()
+    boundary = main._ClassicAacoBoundary(_request())
+    window = {"start": datetime(2026, 9, 16, 9, 0), "end": datetime(2026, 9, 16, 11, 0)}
+    motion = boundary.search_events(_owner_identity(), event_type="motion", camera_id=None, **window)
+    lpr = boundary.search_events(_owner_identity(), event_type="lpr", camera_id=None, **window)
+    intrusion = boundary.search_events(_owner_identity(), event_type="intrusion", camera_id=None, **window)
+    assert len(motion["events"]) == 1
+    assert len(lpr["events"]) == 1
+    assert len(intrusion["events"]) == 1
+    # Asking for "person" must not accidentally also match motion/lpr/intrusion rows.
+    person = boundary.search_events(_owner_identity(), event_type="person", camera_id=None, **window)
+    assert person["events"] == []
+
+
 def test_search_events_finds_nothing_outside_the_requested_window(owner_seeded):
     conn = owner_seeded
     conn.execute(

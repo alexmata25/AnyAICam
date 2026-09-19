@@ -35,6 +35,24 @@ def test_families_and_ambiguity_fail_closed():
  assert isinstance(p.parse('Open the door',now=now),Clarification)
  assert isinstance(p.parse('Unlock doors',now=now),Clarification)
 
+def test_event_search_recognizes_the_full_investigate_category_taxonomy_not_just_person_vehicle():
+ # 2026-09-19: widened alongside main.py's _aaco_event_category() so
+ # AACO can find the same event categories the Investigate page's own
+ # filter chips already offer -- motion/lpr/people_counting/intrusion,
+ # not just the original person/vehicle/car set.
+ p=DeterministicLanguageAdapter(); now=datetime(2026,9,15,12)
+ assert p.parse('Show motion events from the last 2 hours',now=now).event_type=='motion'
+ assert p.parse('Show lpr events from the last 2 hours',now=now).event_type=='lpr'
+ assert p.parse('Show plate events from the last 2 hours',now=now).event_type=='lpr'
+ assert p.parse('Show license plate events from the last 2 hours',now=now).event_type=='lpr'
+ assert p.parse('Show people counting events from the last 2 hours',now=now).event_type=='people_counting'
+ assert p.parse('Show intrusion events from the last 2 hours',now=now).event_type=='intrusion'
+ assert p.parse('Show vehicle events from the last 2 hours',now=now).event_type=='vehicle'
+ # "car" is intentionally left unnormalized here -- the VMS boundary
+ # (main.py's _aaco_event_category()) does that, matching how "car"
+ # already worked for this operation before this change.
+ assert p.parse('Show car events from the last 2 hours',now=now).event_type=='car'
+
 def test_unlock_door_bypasses_the_generic_camera_gate_and_can_return_a_clarification():
  v=Vms()
  assert execute(AacoCommand('unlock_door',camera_id='camera-name:front door'),identity={'customer_id':'a'},vms=v)==('door-unlock','camera-name:front door')
