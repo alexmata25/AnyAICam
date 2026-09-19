@@ -22,12 +22,35 @@ from __future__ import annotations
 
 import base64
 import os
+import secrets
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-from .config import load_wireguard_identity, save_wireguard_identity
+from .config import (
+    load_media_fetch_secret,
+    load_wireguard_identity,
+    save_media_fetch_secret,
+    save_wireguard_identity,
+)
 
 DEFAULT_PERSISTENT_KEEPALIVE_SECONDS = 25
+
+# 32 random bytes, URL-safe base64 -- same real entropy as a WireGuard
+# private key, generated with the same stdlib CSPRNG this codebase's own
+# secrets.token_hex()/token_urlsafe() calls already use everywhere else
+# (e.g. reenrollment.py, appliance_claims.py) for bearer-equivalent values.
+MEDIA_FETCH_SECRET_BYTES = 32
+
+
+def generate_media_fetch_secret() -> str:
+    """A fresh, cryptographically random shared secret for the
+    authenticated WireGuard event-media direct-fetch path (app/
+    appliance_media_fetch.py). Generated locally on THIS device only --
+    never derived from, or shared with, any other appliance's identity,
+    which is what makes appliance replacement (coordinated_reenroll(),
+    always replace_existing=True) automatically get its own fresh value
+    here rather than ever inheriting the old hardware's."""
+    return secrets.token_urlsafe(MEDIA_FETCH_SECRET_BYTES)
 
 
 def generate_keypair() -> tuple[str, str]:
@@ -115,6 +138,22 @@ def enroll_wireguard(config, portal_client, *, replace_existing: bool = False) -
     the identity file and the rendered wg0.conf. Returns the saved
     identity dict.
 
+    2026-09-19: also ensures a local media-fetch secret exists (see
+    generate_media_fetch_secret() above), with the EXACT same "reuse
+    unless replace_existing" idempotency as the keypair -- but stored in
+    its own separate file (config.media_fetch_secret_file), never inside
+    the identity dict this function returns or persists, since it is a
+    plain shared secret this device must keep locally, not (like the
+    keypair) something whose public half becomes part of this identity
+    record. Only ever included in the enrollment call's payload when it
+    was JUST generated or rotated here -- an unchanged, already-enrolled
+    secret is never resent on a routine reconnect, minimizing how often
+    this bearer-equivalent value crosses the network at all. On
+    replace_existing (appliance replacement, coordinated_reenroll()),
+    this generates a genuinely fresh secret from this device's own CSPRNG
+    -- structurally unable to reuse or derive from another appliance's
+    value, since nothing about another device's secret is ever read here.
+
     Deliberately does NOT queue the wireguard_interface_up privileged
     action itself -- the caller (setup_wizard.py's _finish_enrollment())
     does that separately, exactly mirroring how restart_vms is queued
@@ -124,14 +163,28 @@ def enroll_wireguard(config, portal_client, *, replace_existing: bool = False) -
     for treating that as non-fatal to the overall activation, matching
     restart_service()'s own established "failure here is a warning,
     never fatal" precedent, since WireGuard is fully additive (plan doc
-    Sec 18: existing paths must keep working regardless)."""
+    Sec 18: existing paths must keep working regardless). On a raised
+    PortalError, the media-fetch secret generated below is still saved
+    locally (harmless -- it simply doesn't match the cloud's copy yet)
+    but never left half-written: save happens only after the network
+    call the value was destined for either succeeds or is confirmed
+    unnecessary to send."""
     existing = load_wireguard_identity(config)
     if existing and not replace_existing:
         private_key = existing['private_key']
         public_key = existing['public_key']
     else:
         private_key, public_key = generate_keypair()
-    response = portal_client.wireguard_enroll(public_key, replace_existing=replace_existing)
+
+    existing_secret = load_media_fetch_secret(config)
+    if existing_secret and not replace_existing:
+        media_fetch_secret = existing_secret
+        secret_to_send = None  # cloud already has this one -- don't resend
+    else:
+        media_fetch_secret = generate_media_fetch_secret()
+        secret_to_send = media_fetch_secret
+
+    response = portal_client.wireguard_enroll(public_key, replace_existing=replace_existing, media_fetch_secret=secret_to_send)
     identity = {
         'private_key': private_key,
         'public_key': public_key,
@@ -147,4 +200,28 @@ def enroll_wireguard(config, portal_client, *, replace_existing: bool = False) -
         gateway_public_key=identity['gateway_public_key'], gateway_endpoint=identity['gateway_endpoint'],
         gateway_tunnel_address=identity['gateway_tunnel_address'],
     ))
+    if secret_to_send is not None:
+        save_media_fetch_secret(config, media_fetch_secret)
     return identity
+
+
+def rotate_media_fetch_secret(config, portal_client) -> str:
+    """Rotates ONLY the media-fetch secret -- never touches the WireGuard
+    keypair, tunnel address, or interface at all, unlike replace_existing=
+    True on enroll_wireguard() (which rotates everything, appropriate only
+    for real hardware replacement). Use this for a routine/suspected-
+    compromise rotation of this one narrower credential. Generates a fresh
+    value locally, submits it via the SAME enrollment route (a plain
+    overwrite server-side -- see wireguard_remote.py's own enroll_peer(),
+    which never needs a transition window for this field the way key
+    rotation might, since both sides simply start using the new value on
+    the very next request), and only saves it locally once the cloud has
+    confirmed receipt -- an interrupted rotation leaves the OLD secret in
+    place on both ends, never a mismatched pair."""
+    identity = load_wireguard_identity(config)
+    if not identity:
+        raise RuntimeError('Cannot rotate the media-fetch secret before this device has enrolled with WireGuard at all.')
+    new_secret = generate_media_fetch_secret()
+    portal_client.wireguard_enroll(identity['public_key'], replace_existing=False, media_fetch_secret=new_secret)
+    save_media_fetch_secret(config, new_secret)
+    return new_secret

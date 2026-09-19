@@ -72,5 +72,14 @@ class PortalClient:
     # bearer+nonce channel every other appliance route already uses,
     # via request()'s existing authenticated=True default. Only ever
     # sends public_key (never a private key -- see wireguard.py's own
-    # enroll_wireguard()) and the replace_existing flag.
-    def wireguard_enroll(self,public_key,replace_existing=False): return self.request('POST','/api/appliance/wireguard/enroll',{'public_key':public_key,'replace_existing':bool(replace_existing)})
+    # enroll_wireguard()) and the replace_existing flag. media_fetch_secret
+    # (2026-09-19, optional) piggybacks on this SAME already-authenticated
+    # call rather than a second route -- omitted entirely (never sent as
+    # None/empty) when this device already has one and isn't rotating, so
+    # an older cloud version that has never heard of this field simply
+    # ignores it on every other call, and this device's own bandwidth
+    # never carries it more than once per real rotation.
+    def wireguard_enroll(self,public_key,replace_existing=False,media_fetch_secret=None):
+        payload={'public_key':public_key,'replace_existing':bool(replace_existing)}
+        if media_fetch_secret: payload['media_fetch_secret']=media_fetch_secret
+        return self.request('POST','/api/appliance/wireguard/enroll',payload)

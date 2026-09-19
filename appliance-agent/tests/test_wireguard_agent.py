@@ -16,8 +16,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from anyaicam_agent.config import AgentConfig, load_wireguard_identity
-from anyaicam_agent.wireguard import enroll_wireguard, generate_keypair, render_wg_conf, save_wg_conf
+from anyaicam_agent.config import AgentConfig, load_media_fetch_secret, load_wireguard_identity
+from anyaicam_agent.wireguard import (
+    enroll_wireguard,
+    generate_keypair,
+    generate_media_fetch_secret,
+    render_wg_conf,
+    rotate_media_fetch_secret,
+    save_wg_conf,
+)
 
 
 def _config(tmp_path):
@@ -218,6 +225,110 @@ class EnrollWireguardTests(unittest.TestCase):
                 enroll_wireguard(config, client)
             self.assertFalse(config.wireguard_identity_file.exists())
             self.assertFalse(config.wireguard_conf_file.exists())
+
+
+class MediaFetchSecretGenerationTests(unittest.TestCase):
+    def test_generate_returns_a_real_random_secret(self):
+        first = generate_media_fetch_secret()
+        second = generate_media_fetch_secret()
+        self.assertNotEqual(first, second)
+        self.assertGreaterEqual(len(first), 32)
+
+
+class EnrollWireguardMediaFetchSecretTests(unittest.TestCase):
+    """The provisioning half of the authenticated event-media direct-fetch
+    design (app/appliance_media_fetch.py): unique per appliance, generated
+    with a real CSPRNG, only ever sent when newly generated/rotated, saved
+    locally only after the cloud has actually received it."""
+
+    def test_first_enrollment_generates_and_sends_a_secret(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            client = _fake_portal_client(_RESPONSE)
+            enroll_wireguard(config, client)
+            sent_secret = client.wireguard_enroll.call_args.kwargs.get('media_fetch_secret')
+            self.assertIsNotNone(sent_secret)
+            self.assertEqual(load_media_fetch_secret(config), sent_secret)
+
+    def test_reenrolling_without_replace_existing_reuses_and_never_resends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            enroll_wireguard(config, _fake_portal_client(_RESPONSE))
+            first_secret = load_media_fetch_secret(config)
+            second_client = _fake_portal_client(_RESPONSE)
+            enroll_wireguard(config, second_client)
+            # An unchanged secret must never cross the network a second time.
+            self.assertIsNone(second_client.wireguard_enroll.call_args.kwargs.get('media_fetch_secret'))
+            self.assertEqual(load_media_fetch_secret(config), first_secret)
+
+    def test_replace_existing_generates_a_genuinely_new_secret(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            enroll_wireguard(config, _fake_portal_client(_RESPONSE))
+            first_secret = load_media_fetch_secret(config)
+            client = _fake_portal_client(_RESPONSE)
+            enroll_wireguard(config, client, replace_existing=True)
+            second_secret = load_media_fetch_secret(config)
+            self.assertNotEqual(first_secret, second_secret)
+            self.assertEqual(client.wireguard_enroll.call_args.kwargs.get('media_fetch_secret'), second_secret)
+
+    def test_portal_failure_never_saves_a_secret_the_cloud_never_received(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            client = MagicMock()
+            client.wireguard_enroll.side_effect = RuntimeError('portal unreachable')
+            with self.assertRaises(RuntimeError):
+                enroll_wireguard(config, client)
+            self.assertIsNone(load_media_fetch_secret(config))
+
+    def test_secret_is_never_logged_or_present_in_the_saved_wireguard_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            identity = enroll_wireguard(config, _fake_portal_client(_RESPONSE))
+            secret = load_media_fetch_secret(config)
+            self.assertNotIn(secret, identity.values())
+            self.assertNotIn(secret, config.wireguard_identity_file.read_text())
+
+
+class RotateMediaFetchSecretTests(unittest.TestCase):
+    def test_rotate_before_any_enrollment_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            with self.assertRaises(RuntimeError):
+                rotate_media_fetch_secret(config, MagicMock())
+
+    def test_rotate_generates_and_sends_a_fresh_secret(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            enroll_wireguard(config, _fake_portal_client(_RESPONSE))
+            original_secret = load_media_fetch_secret(config)
+            client = _fake_portal_client(_RESPONSE)
+            rotated = rotate_media_fetch_secret(config, client)
+            self.assertNotEqual(rotated, original_secret)
+            self.assertEqual(load_media_fetch_secret(config), rotated)
+            client.wireguard_enroll.assert_called_once()
+            self.assertEqual(client.wireguard_enroll.call_args.kwargs.get('media_fetch_secret'), rotated)
+            self.assertFalse(client.wireguard_enroll.call_args.kwargs.get('replace_existing'))
+
+    def test_rotate_never_touches_the_wireguard_keypair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            identity_before = enroll_wireguard(config, _fake_portal_client(_RESPONSE))
+            rotate_media_fetch_secret(config, _fake_portal_client(_RESPONSE))
+            identity_after = load_wireguard_identity(config)
+            self.assertEqual(identity_before['public_key'], identity_after['public_key'])
+            self.assertEqual(identity_before['private_key'], identity_after['private_key'])
+
+    def test_rotate_failure_leaves_the_old_secret_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config(Path(tmp))
+            enroll_wireguard(config, _fake_portal_client(_RESPONSE))
+            original_secret = load_media_fetch_secret(config)
+            client = MagicMock()
+            client.wireguard_enroll.side_effect = RuntimeError('portal unreachable')
+            with self.assertRaises(RuntimeError):
+                rotate_media_fetch_secret(config, client)
+            self.assertEqual(load_media_fetch_secret(config), original_secret)
 
 
 if __name__ == '__main__':

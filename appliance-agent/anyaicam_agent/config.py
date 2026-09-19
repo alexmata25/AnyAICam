@@ -118,6 +118,19 @@ class AgentConfig:
     # as a fixed literal (see that module's own comment on this).
     @property
     def wireguard_conf_file(self): return Path(self.config_dir)/'wireguard'/'wg0.conf'
+    # Authenticated WireGuard event-media direct fetch (2026-09-19): a
+    # symmetric HMAC key this device shares with the cloud only -- see
+    # app/appliance_media_fetch.py's own module docstring for why this
+    # one secret genuinely must be a raw shared value (never a one-way
+    # hash like credential_hash): the cloud actively signs outgoing
+    # requests with it. Same config_dir placement as wireguard_identity_
+    # file (provisioned trust material, not routine runtime state) --
+    # deliberately a SEPARATE file, not folded into wireguard_identity.json,
+    # so rotating this one secret (see wireguard.py's rotate_media_fetch_
+    # secret()) never touches the WireGuard keypair/tunnel identity at all,
+    # and vice versa.
+    @property
+    def media_fetch_secret_file(self): return Path(self.config_dir)/'media_fetch_secret.json'
     @property
     def queue_file(self): return Path(self.state_dir)/'offline_queue.db'
     @property
@@ -270,3 +283,18 @@ def load_wireguard_identity(config: AgentConfig) -> dict|None:
 
 def save_wireguard_identity(config: AgentConfig,value: dict):
     config.wireguard_identity_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.wireguard_identity_file.with_suffix('.tmp'); temporary.write_text(json.dumps(value),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.wireguard_identity_file); os.chmod(config.wireguard_identity_file,0o600)
+
+
+# Media-fetch secret (2026-09-19) -- same read/write shape as every other
+# credential file above, deliberately its own separate file (see
+# AgentConfig.media_fetch_secret_file's own comment for why): a bearer-
+# equivalent shared secret, never logged, never returned by any API this
+# device calls, in either direction.
+def load_media_fetch_secret(config: AgentConfig) -> str|None:
+    try: value=json.loads(config.media_fetch_secret_file.read_text(encoding='utf-8')).get('secret')
+    except (OSError,json.JSONDecodeError,AttributeError): return None
+    return value if isinstance(value,str) and value else None
+
+
+def save_media_fetch_secret(config: AgentConfig,secret: str):
+    config.media_fetch_secret_file.parent.mkdir(parents=True,exist_ok=True); temporary=config.media_fetch_secret_file.with_suffix('.tmp'); temporary.write_text(json.dumps({'secret':secret}),encoding='utf-8'); os.chmod(temporary,0o600); temporary.replace(config.media_fetch_secret_file); os.chmod(config.media_fetch_secret_file,0o600)

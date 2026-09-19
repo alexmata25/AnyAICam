@@ -536,3 +536,148 @@ def test_wireguard_module_does_not_alter_existing_live_view_session_start(db_pat
         with connection() as db:
             table_count = db.execute("SELECT COUNT(*) AS c FROM appliance_wireguard_peers").fetchone()["c"]
     assert table_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Authenticated event-media direct-fetch secret provisioning (2026-09-19)
+# ---------------------------------------------------------------------------
+
+_REAL_SECRET_A = "a" * 43  # >=32 chars, matches a real token_urlsafe(32) length
+_REAL_SECRET_B = "b" * 43
+
+
+def test_enroll_with_media_fetch_secret_persists_it(db_path, appliance_client):
+    _seed(db_path)
+    public_key = _real_public_key()
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": public_key, "media_fetch_secret": _REAL_SECRET_A},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.status_code == 200
+    # Never echoed back -- the response contract is unchanged.
+    assert set(response.json().keys()) == {"tunnel_address", "gateway_public_key", "gateway_endpoint", "gateway_tunnel_address", "status"}
+    with override_target(sqlite_path=str(db_path)):
+        stored = row("SELECT media_fetch_secret FROM appliance_wireguard_peers WHERE public_key=?", (public_key,))
+    assert stored["media_fetch_secret"] == _REAL_SECRET_A
+
+
+def test_enroll_media_fetch_secret_too_short_rejected(db_path, appliance_client):
+    _seed(db_path)
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": _real_public_key(), "media_fetch_secret": "too-short"},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.status_code == 400
+
+
+def test_enroll_omitting_media_fetch_secret_does_not_clear_existing_value(db_path, appliance_client):
+    _seed(db_path)
+    public_key = _real_public_key()
+    headers = _appliance_headers("appl-a", "cred-a")
+    appliance_client.post("/api/appliance/wireguard/enroll", json={"public_key": public_key, "media_fetch_secret": _REAL_SECRET_A}, headers=headers)
+    # A routine reconnect (same public_key), no media_fetch_secret sent.
+    response = appliance_client.post("/api/appliance/wireguard/enroll", json={"public_key": public_key}, headers=_appliance_headers("appl-a", "cred-a"))
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        stored = row("SELECT media_fetch_secret FROM appliance_wireguard_peers WHERE public_key=?", (public_key,))
+    assert stored["media_fetch_secret"] == _REAL_SECRET_A
+
+
+def test_enroll_new_media_fetch_secret_overwrites_old_value(db_path, appliance_client):
+    _seed(db_path)
+    public_key = _real_public_key()
+    appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": public_key, "media_fetch_secret": _REAL_SECRET_A},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    # A real rotation: same public_key (still active), a fresh secret.
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": public_key, "media_fetch_secret": _REAL_SECRET_B},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        stored = row("SELECT media_fetch_secret FROM appliance_wireguard_peers WHERE public_key=?", (public_key,))
+    assert stored["media_fetch_secret"] == _REAL_SECRET_B
+
+
+def test_revoke_media_fetch_secret_clears_it_without_touching_the_peer(db_path, appliance_client):
+    _seed(db_path)
+    public_key = _real_public_key()
+    appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": public_key, "media_fetch_secret": _REAL_SECRET_A},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            cleared = wireguard_remote.revoke_media_fetch_secret(db, "appl-a")
+        assert cleared == 1
+        stored = row("SELECT status, revoked_at, media_fetch_secret FROM appliance_wireguard_peers WHERE public_key=?", (public_key,))
+    assert stored["media_fetch_secret"] is None
+    # The WireGuard peer/tunnel itself is completely untouched.
+    assert stored["status"] == "enrolled"
+    assert stored["revoked_at"] is None
+
+
+def test_revoke_media_fetch_secret_with_none_provisioned_is_a_safe_no_op(db_path, appliance_client):
+    _seed(db_path)
+    appliance_client.post("/api/appliance/wireguard/enroll", json={"public_key": _real_public_key()}, headers=_appliance_headers("appl-a", "cred-a"))
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            cleared = wireguard_remote.revoke_media_fetch_secret(db, "appl-a")
+    assert cleared == 0
+
+
+def test_revoke_media_fetch_secret_scoped_to_the_right_appliance_only(db_path, appliance_client):
+    _seed(db_path)
+    appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": _real_public_key(), "media_fetch_secret": _REAL_SECRET_A},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": _real_public_key(), "media_fetch_secret": _REAL_SECRET_B},
+        headers=_appliance_headers("appl-b", "cred-b"),
+    )
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            wireguard_remote.revoke_media_fetch_secret(db, "appl-a")
+        secret_a = row("SELECT media_fetch_secret FROM appliance_wireguard_peers WHERE appliance_id='appl-a'")
+        secret_b = row("SELECT media_fetch_secret FROM appliance_wireguard_peers WHERE appliance_id='appl-b'")
+    assert secret_a["media_fetch_secret"] is None
+    assert secret_b["media_fetch_secret"] == _REAL_SECRET_B  # completely unaffected
+
+
+def test_appliance_replacement_gets_its_own_fresh_secret_never_the_old_devices(db_path, appliance_client):
+    """coordinated_reenroll() (hardware replacement): the OLD device's row
+    is revoked (its secret becomes inaccessible -- active_peers_for_
+    appliance() only ever returns revoked_at IS NULL rows), and the NEW
+    device's own enrollment call provides a genuinely different secret --
+    never a copy or derivation of the old one."""
+    _seed(db_path)
+    old_public_key = _real_public_key()
+    appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": old_public_key, "media_fetch_secret": _REAL_SECRET_A},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    new_public_key = _real_public_key()
+    response = appliance_client.post(
+        "/api/appliance/wireguard/enroll",
+        json={"public_key": new_public_key, "media_fetch_secret": _REAL_SECRET_B, "replace_existing": True},
+        headers=_appliance_headers("appl-a", "cred-a"),
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        old_row = row("SELECT status, media_fetch_secret FROM appliance_wireguard_peers WHERE public_key=?", (old_public_key,))
+        new_row = row("SELECT status, media_fetch_secret FROM appliance_wireguard_peers WHERE public_key=?", (new_public_key,))
+    assert old_row["status"] == "revoked"
+    assert new_row["status"] == "enrolled"
+    assert new_row["media_fetch_secret"] == _REAL_SECRET_B
+    assert new_row["media_fetch_secret"] != old_row["media_fetch_secret"]

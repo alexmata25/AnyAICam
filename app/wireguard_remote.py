@@ -146,7 +146,8 @@ def _assign_tunnel_address(db) -> str:
     raise HTTPException(status_code=503, detail="No WireGuard tunnel addresses remain available.")
 
 
-def enroll_peer(db, *, appliance_id: str, customer_id: str, public_key: str, now: datetime) -> dict:
+def enroll_peer(db, *, appliance_id: str, customer_id: str, public_key: str, now: datetime,
+                 media_fetch_secret: str | None = None) -> dict:
     """Core enrollment logic, independent of the HTTP route below so
     it's directly unit-testable. Returns the full row dict for the
     newly created peer. Deliberately allows more than one active row
@@ -156,7 +157,20 @@ def enroll_peer(db, *, appliance_id: str, customer_id: str, public_key: str, now
     never rejected or silently overwritten. Re-submitting the exact
     same public_key (a reconnect/retry, not a rotation) is idempotent
     -- returns the existing row rather than violating the public_key
-    unique index or creating a duplicate."""
+    unique index or creating a duplicate.
+
+    media_fetch_secret (2026-09-19, optional): the shared HMAC key for
+    the authenticated WireGuard event-media direct-fetch path (see
+    app/appliance_media_fetch.py). None means "the appliance-agent isn't
+    sending one this call" -- either an older agent build that has never
+    heard of this field, or (the common case after the first enrollment)
+    a routine reconnect that deliberately omits an unchanged value to
+    avoid re-sending a bearer-equivalent secret more than necessary.
+    Never overwrites an already-stored secret with NULL -- only a real,
+    non-empty incoming value ever changes what's stored (the SQL below
+    uses COALESCE(?, media_fetch_secret) for exactly this reason), the
+    same "omitted means leave alone, never means clear" contract this
+    codebase already uses for other optional fields."""
     existing = db.execute(
         "SELECT * FROM appliance_wireguard_peers WHERE public_key=? AND revoked_at IS NULL",
         (public_key,),
@@ -181,10 +195,12 @@ def enroll_peer(db, *, appliance_id: str, customer_id: str, public_key: str, now
         # never touch tunnel_address/public_key/id themselves, so an
         # appliance's own identity and address assignment stay exactly as
         # they already are.
-        if existing["gateway_public_key"] != GATEWAY_PUBLIC_KEY or existing["gateway_endpoint"] != GATEWAY_ENDPOINT:
+        needs_refresh = existing["gateway_public_key"] != GATEWAY_PUBLIC_KEY or existing["gateway_endpoint"] != GATEWAY_ENDPOINT
+        if needs_refresh or media_fetch_secret:
             db.execute(
-                "UPDATE appliance_wireguard_peers SET gateway_public_key=?, gateway_endpoint=? WHERE id=?",
-                (GATEWAY_PUBLIC_KEY, GATEWAY_ENDPOINT, existing["id"]),
+                "UPDATE appliance_wireguard_peers SET gateway_public_key=?, gateway_endpoint=?, "
+                "media_fetch_secret=COALESCE(?, media_fetch_secret) WHERE id=?",
+                (GATEWAY_PUBLIC_KEY, GATEWAY_ENDPOINT, media_fetch_secret, existing["id"]),
             )
             existing = db.execute("SELECT * FROM appliance_wireguard_peers WHERE id=?", (existing["id"],)).fetchone()
         return dict(existing)
@@ -193,11 +209,11 @@ def enroll_peer(db, *, appliance_id: str, customer_id: str, public_key: str, now
     peer_id = uuid.uuid4().hex[:16]
     db.execute(
         "INSERT INTO appliance_wireguard_peers(id,appliance_id,customer_id,public_key,tunnel_address,"
-        "gateway_public_key,gateway_endpoint,status,last_handshake_at,created_at,revoked_at,revoked_reason) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "gateway_public_key,gateway_endpoint,status,last_handshake_at,created_at,revoked_at,revoked_reason,media_fetch_secret) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             peer_id, appliance_id, customer_id, public_key, tunnel_address,
-            GATEWAY_PUBLIC_KEY, GATEWAY_ENDPOINT, "enrolled", None, now.isoformat(), None, None,
+            GATEWAY_PUBLIC_KEY, GATEWAY_ENDPOINT, "enrolled", None, now.isoformat(), None, None, media_fetch_secret,
         ),
     )
     return dict(db.execute("SELECT * FROM appliance_wireguard_peers WHERE id=?", (peer_id,)).fetchone())
@@ -236,6 +252,27 @@ def revoke_all_peers_for_appliance(db, *, appliance_id: str, reason: str, now: d
     return result.rowcount
 
 
+def revoke_media_fetch_secret(db, appliance_id: str) -> int:
+    """Immediate, narrow revocation of ONLY the media-fetch secret for
+    every currently-active peer of one appliance -- never touches the
+    WireGuard keypair, tunnel address, or peer status at all (unlike
+    revoke_all_peers_for_appliance(), which tears down the whole tunnel
+    identity). Setting this column back to NULL is already, by itself,
+    the complete revocation: main.py's own _event_media_active_peer()
+    treats a NULL media_fetch_secret as ineligible, falling back to S3
+    immediately -- there is no separate "live gateway config" this needs
+    to also update, unlike a WireGuard peer revocation (Sec 11), because
+    nothing about this secret is ever pushed to the gateway's own
+    WireGuard interface config in the first place. Returns the number of
+    rows actually cleared (0 is a normal, valid outcome for an appliance
+    that never had one provisioned)."""
+    result = db.execute(
+        "UPDATE appliance_wireguard_peers SET media_fetch_secret=NULL WHERE appliance_id=? AND revoked_at IS NULL AND media_fetch_secret IS NOT NULL",
+        (appliance_id,),
+    )
+    return result.rowcount
+
+
 def active_peers_for_appliance(db, appliance_id: str) -> list[dict]:
     return [
         dict(item) for item in db.execute(
@@ -259,14 +296,28 @@ def register_wireguard_remote_appliance_routes(app: FastAPI) -> None:
         public_key = payload.get("public_key")
         if not is_valid_wireguard_public_key(public_key):
             raise HTTPException(status_code=400, detail="public_key must be a valid WireGuard public key.")
-        # Deliberately reads ONLY public_key (and, below, the boolean
-        # replace_existing) out of the payload -- any other field (a
-        # stray "private_key", "tunnel_address", etc.) is silently
+        # Deliberately reads ONLY public_key, replace_existing, and (2026-
+        # 09-19) media_fetch_secret out of the payload -- any other field
+        # (a stray "private_key", "tunnel_address", etc.) is silently
         # ignored, never persisted, matching enroll_peer()'s own narrow
         # contract (see module docstring). This is a second, independent
         # layer of defense against a private key ever reaching this
         # database, on top of the schema itself having no column that
         # could hold one.
+        #
+        # media_fetch_secret: optional, present only when the appliance-
+        # agent just generated or rotated one (wireguard.py's own
+        # enroll_wireguard()/rotate_media_fetch_secret() never resend an
+        # unchanged value). A bare length/type check only -- this is a
+        # symmetric key the appliance already generated with its own real
+        # CSPRNG, not a value this route parses or validates the shape
+        # of the way is_valid_wireguard_public_key() does for a real
+        # WireGuard key; a merely-too-short value is the one realistic
+        # caller bug worth catching here.
+        media_fetch_secret = payload.get("media_fetch_secret")
+        if media_fetch_secret is not None:
+            if not isinstance(media_fetch_secret, str) or len(media_fetch_secret) < 32:
+                raise HTTPException(status_code=400, detail="media_fetch_secret must be a real secret value, not a placeholder.")
         #
         # replace_existing (plan doc Sec 12): set by the appliance-agent
         # only when this enroll call is part of a coordinated_reenroll()
@@ -296,7 +347,7 @@ def register_wireguard_remote_appliance_routes(app: FastAPI) -> None:
         with connection() as db:
             peer = enroll_peer(
                 db, appliance_id=appliance["id"], customer_id=appliance["customer_id"],
-                public_key=public_key, now=now,
+                public_key=public_key, now=now, media_fetch_secret=media_fetch_secret,
             )
             if replace_existing:
                 db.execute(
