@@ -47380,9 +47380,8 @@ register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
 register_live_view_p2p_customer_routes(app)
 register_live_view_p2p_appliance_routes(app)
-from live_view_wireguard import register_live_view_wireguard_routes, register_event_media_wireguard_routes
+from live_view_wireguard import register_live_view_wireguard_routes
 register_live_view_wireguard_routes(app)
-register_event_media_wireguard_routes(app)
 register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
 register_facial_recognition_routes(app, page_shell)
@@ -141109,16 +141108,115 @@ def _customer_event_media_url(camera_id: str, event_id: str) -> str | None:
     return _presigned_recording_url(row["s3_key"])
 
 
+def _event_media_direct_row(camera_id: str, event_id: str) -> dict | None:
+    """One lookup shared by both routes below: the clip's own id/s3_key/
+    local_relative_path/size_bytes plus its camera's appliance_id --
+    everything customer_event_media_direct() needs to decide eligibility
+    and, on any failure, fall back to the exact same S3 lookup
+    _customer_event_media_url() already does. Re-scopes by camera_id in
+    the same query shape as every other event-media lookup in this file,
+    for the same cross-camera-authorization reason."""
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.id AS media_id, dem.s3_key, dem.local_relative_path, dem.size_bytes, c.appliance_id "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "JOIN cameras c ON c.id=de.camera_id "
+            "WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _event_media_tunnel_address(appliance_id: str | None):
+    """None if WireGuard direct fetch isn't even worth attempting for
+    this appliance right now -- no live network call, just the same
+    active_peers_for_appliance() lookup live_view_wireguard.py's own
+    live-HLS path already uses."""
+    from live_view_wireguard import EVENT_MEDIA_WIREGUARD_ENABLED, _tunnel_address_for_appliance
+    from partner_db import connection
+
+    if not EVENT_MEDIA_WIREGUARD_ENABLED or not appliance_id:
+        return None
+    with connection() as db:
+        return _tunnel_address_for_appliance(db, appliance_id)
+
+
+def _log_event_media_fetch(media_id: str, source: str, bytes_served: int, outcome: str) -> None:
+    from partner_db import connection
+
+    with connection() as db:
+        db.execute(
+            "INSERT INTO event_media_fetch_log(id,media_id,source,bytes_served,outcome,created_at) VALUES(?,?,?,?,?,?)",
+            (secrets.token_hex(12), media_id, source, int(bytes_served or 0), outcome, datetime.now().isoformat()),
+        )
+
+
 @app.get("/api/customer/events/{camera_id}/{event_id}/media/url")
 def customer_event_media_url(camera_id: str, event_id: str, request: Request) -> dict:
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    # Cheap, no-network eligibility check only -- the real fetch-with-
+    # fallback attempt (and its own re-check of the same authorization)
+    # happens in customer_event_media_direct() below, every time it's
+    # called, never trusted from this decision alone.
+    from live_view_wireguard import local_relative_path_allowed
+
+    row = _event_media_direct_row(camera_id, event_id)
+    if row and local_relative_path_allowed(row["local_relative_path"]) and _event_media_tunnel_address(row["appliance_id"]):
+        return {"url": f"/api/customer/events/{camera_id}/{event_id}/media/direct"}
 
     url = _customer_event_media_url(camera_id, event_id)
     if not url:
         raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
 
     return {"url": url}
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/media/direct")
+def customer_event_media_direct(camera_id: str, event_id: str, request: Request):
+    """The one place a real fetch is attempted over WireGuard for an
+    event clip, with an automatic, transparent fallback to the existing
+    S3/CloudFront path on any failure -- ineligible, no active tunnel,
+    gateway unreachable, or a real timeout all resolve the same way.
+    Re-checks authorization independently of customer_event_media_url()
+    above (never trusts a decision made by an earlier request) --
+    exactly the same re-check-every-request discipline
+    live_view_wireguard.py's own module docstring documents for the live
+    HLS path. The browser only ever sees this one portal-relative URL or
+    the existing presigned CloudFront one on fallback -- never a tunnel
+    address, gateway hostname, or port."""
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from live_view_wireguard import GATEWAY_APPLIANCE_PORT, GatewayUnavailable, _fetch_via_gateway, local_relative_path_allowed
+
+    row = _event_media_direct_row(camera_id, event_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+
+    tunnel_address = None
+    if local_relative_path_allowed(row["local_relative_path"]):
+        tunnel_address = _event_media_tunnel_address(row["appliance_id"])
+
+    if tunnel_address:
+        try:
+            body = _fetch_via_gateway(tunnel_address, GATEWAY_APPLIANCE_PORT, row["local_relative_path"])
+        except GatewayUnavailable:
+            _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "direct_failed_fallback")
+        else:
+            _log_event_media_fetch(row["media_id"], "wireguard", len(body), "direct_success")
+            return Response(content=body, media_type="video/mp4")
+    else:
+        _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "not_eligible")
+
+    url = _presigned_recording_url(row["s3_key"])
+    if not url:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+    return RedirectResponse(url, status_code=302)
 
 
 def _customer_event_thumbnail_s3_key(camera_id: str, event_id: str) -> str | None:

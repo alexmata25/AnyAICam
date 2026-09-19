@@ -815,6 +815,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_wireguard_peers_public_key ON appliance_wi
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wireguard_peers_tunnel_address_active ON appliance_wireguard_peers(tunnel_address) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_wireguard_peers_appliance_status ON appliance_wireguard_peers(appliance_id,status);
 '''),
+    ('20260919_event_media_fetch_log','''
+-- One row per real /api/customer/events/{camera_id}/{event_id}/media/direct
+-- resolution (2026-09-19) -- the measurement this Hybrid cost-model pass
+-- needs: how many bytes a real customer fetch actually moved over the
+-- WireGuard/direct path vs. how many fell back to AWS/S3/CloudFront.
+-- bytes_served is always the clip's own stored size_bytes (the same
+-- physical file either way) -- for the 'aws' outcomes this route issues a
+-- 302 to a presigned CloudFront URL and never sees the bytes itself, so
+-- the stored size is the only honest number available, not a real
+-- transferred-byte count off the wire.
+CREATE TABLE IF NOT EXISTS event_media_fetch_log(
+    id TEXT PRIMARY KEY,
+    media_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    bytes_served INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(media_id) REFERENCES detection_event_media(id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_media_fetch_log_media ON event_media_fetch_log(media_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_event_media_fetch_log_source ON event_media_fetch_log(source,created_at);
+'''),
 ]
 
 

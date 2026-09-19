@@ -62,18 +62,27 @@ for the controlled single-camera proof this task's own directive asked
 for; expanding to more cameras later is exactly one env value away, no
 code change.
 
-## Event-clip support (prepared, not yet wired to any UI)
+## Event-clip support
 
-register_event_media_wireguard_routes() below exists so a LATER pass can
-measure Hybrid AWS-transfer avoidance by fetching an event clip directly
-from the appliance instead of downloading it from S3 -- reusing this same
-authenticated-proxy mechanism. It depends on `detection_event_media.
-local_relative_path` (see db_migrations.py's 20260918_event_media_local_path
-and event_media_uploader.py's own now-additive payload field), which is
-only ever populated going forward, from the next upload the appliance
-performs, and stays NULL on every already-uploaded clip -- so this route
-correctly, deliberately 404s for every clip that predates this change,
-never assumes a path that was never recorded.
+The actual customer-facing event-clip integration (2026-09-19) lives in
+main.py, right next to the existing, already-working
+`/api/customer/events/{camera_id}/{event_id}/media/url` route it extends
+-- not here, to reuse that route's own `_customer_authorized_camera_id()`
+check directly rather than re-importing across a main.py/live_view_wireguard.py
+boundary that only ever flows one direction (main.py imports this module,
+not the reverse). This module still supplies the shared, tested primitives
+main.py's new route calls: `_fetch_via_gateway()`, `GatewayUnavailable`,
+`_tunnel_address_for_appliance()`, `EVENT_MEDIA_WIREGUARD_ENABLED`,
+`GATEWAY_APPLIANCE_PORT` -- the exact same gateway-proxy mechanism the live
+HLS path above already uses, applied to `detection_event_media.
+local_relative_path` instead of `/static/hls/...`. That column (see
+db_migrations.py's 20260918_event_media_local_path and
+event_media_uploader.py's own now-additive payload field) is only ever
+populated going forward, from the next upload a redeployed appliance
+performs, and stays NULL on every already-uploaded clip -- so main.py's
+route correctly, deliberately falls back to the existing S3/CloudFront URL
+for every clip that predates this change, never assumes a path that was
+never recorded.
 """
 
 from __future__ import annotations
@@ -233,35 +242,11 @@ def register_live_view_wireguard_routes(app: FastAPI) -> None:
         return Response(content=body, media_type='video/mp2t')
 
 
-def register_event_media_wireguard_routes(app: FastAPI) -> None:
-    """Prepared for a later Hybrid-cost measurement pass -- not wired
-    into any customer-facing UI yet. See module docstring's Event-clip
-    support section for why this reliably 404s on every clip uploaded
-    before local_relative_path existed, by design, not as a bug."""
-
-    @app.get('/api/customer/event-media/{media_id}/wireguard')
-    def event_media_fetch(request: Request, media_id: str):
-        identity = _customer_identity(request)
-        if not EVENT_MEDIA_WIREGUARD_ENABLED:
-            raise HTTPException(status_code=404, detail='WireGuard event-clip fetch is not enabled.')
-        with connection() as db:
-            media = db.execute(
-                'SELECT customer_id, camera_id, local_relative_path FROM detection_event_media WHERE id=? AND customer_id=?',
-                (media_id, identity['customer_id']),
-            ).fetchone()
-            if not media:
-                raise HTTPException(status_code=404, detail='Event clip not found.')
-            local_relative_path = media['local_relative_path']
-            if not local_relative_path or not local_relative_path.startswith('/recordings/') or '..' in local_relative_path:
-                raise HTTPException(status_code=404, detail='Direct appliance fetch is not available for this clip.')
-            camera = db.execute('SELECT appliance_id FROM cameras WHERE id=?', (media['camera_id'],)).fetchone()
-            if not camera or not camera['appliance_id']:
-                raise HTTPException(status_code=404, detail='Direct appliance fetch is not available for this clip.')
-            tunnel_address = _tunnel_address_for_appliance(db, camera['appliance_id'])
-        if not tunnel_address:
-            raise HTTPException(status_code=503, detail='No active WireGuard tunnel for this appliance.')
-        try:
-            body = _fetch_via_gateway(tunnel_address, GATEWAY_APPLIANCE_PORT, local_relative_path)
-        except GatewayUnavailable:
-            raise HTTPException(status_code=503, detail='Could not reach the appliance over WireGuard.')
-        return Response(content=body, media_type='video/mp4')
+def local_relative_path_allowed(value: str | None) -> bool:
+    """Shared validation main.py's event-clip route uses before ever
+    handing local_relative_path to _fetch_via_gateway() -- re-checked
+    here even though appliance_cloud.py already validated it at write
+    time (defense in depth, matching this codebase's own established
+    style: never trust a stored value to still be safe just because it
+    was safe when written)."""
+    return bool(value) and value.startswith('/recordings/') and '..' not in value
