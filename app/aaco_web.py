@@ -241,6 +241,111 @@ attemptRecognition(false);
 """
 
 
+def render_aaco_floating_widget() -> str:
+    """A small, persistent floating AACO bubble -- bottom-right, fixed
+    position, collapsed by default -- meant to be injected exactly
+    once by the shared customer page shell (main.py's page_shell()),
+    never coded into any individual page. This is deliberately the
+    ONLY embedding of render_aaco_command_panel() left anywhere in the
+    customer portal (2026-09-19: the previous fixed, always-visible
+    Live View panel was removed in the same pass this was added --
+    "one primary AACO UI" means exactly one, not one fixed and one
+    floating). /aaco itself keeps its own separate, hand-written
+    workspace markup (_workspace() below) and is never given this
+    floating widget on top of it -- page_shell() itself is responsible
+    for that exclusion (skipping active=="aaco"), not this function.
+
+    Collapsed, this is a single small button -- it never permanently
+    consumes page layout space the way the old fixed panel did.
+    Expanded, it is a compact overlay panel sized in viewport-relative
+    units (min(360px, calc(100vw - 24px)) wide, capped page-relative
+    height) specifically so it behaves reasonably on a phone-sized
+    viewport without needing a second, separate mobile implementation.
+
+    Reuses render_aaco_command_panel() unchanged for the actual
+    input/mic/submit machinery (typed commands, voice, and the fetch to
+    /api/aaco/command are all still that one function's job) -- this
+    function only adds the toggle chrome around it and defines
+    window.aacoFloatHandleResult, the one result handler for every page
+    that gets this widget. That handler is deliberately page-agnostic:
+    it looks for an on-screen live-grid tile matching a "live" result's
+    camera id and scrolls/highlights it if present (exactly what the
+    old Live-View-specific handler did), and simply navigates the
+    browser to the authorized href AACO already returned for any other
+    kind (playback, events) or page that has no such tile -- one
+    handler that adapts to whatever is actually on the current page,
+    not one per page. This is also what satisfies "the floating
+    assistant remains available on the destination page after AACO
+    navigates somewhere": a normal same-origin navigation reloads
+    page_shell() on the destination page too, which injects this exact
+    same widget there again -- no client-side state to carry over."""
+    panel = render_aaco_command_panel(
+        id_prefix="aaco-float", on_result_js_fn="aacoFloatHandleResult",
+        placeholder="Ask AACO…",
+    )
+    return f"""
+<style>
+.aaco-float-root{{position:fixed;right:16px;bottom:16px;z-index:9999}}
+.aaco-float-toggle{{width:52px;height:52px;border-radius:50%;font-size:22px;line-height:52px;text-align:center;padding:0;border:none;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);background:var(--accent,#42e4dc);color:#04211f}}
+.aaco-float-panel{{position:fixed;right:16px;bottom:78px;width:min(360px,calc(100vw - 24px));max-height:min(72vh,560px);overflow-y:auto;background:var(--panel-bg,#0b1830);border:1px solid var(--line,#2a3a5c);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.45);padding:12px}}
+.aaco-float-panel[hidden]{{display:none}}
+.aaco-float-panel-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-weight:600}}
+.aaco-float-close{{background:none;border:none;font-size:20px;line-height:1;cursor:pointer;color:inherit;padding:2px 6px}}
+@media (max-width:480px){{.aaco-float-root{{right:10px;bottom:10px}}.aaco-float-panel{{right:10px;bottom:70px}}}}
+</style>
+<div class="aaco-float-root">
+<div id="aaco-float-panel" class="aaco-float-panel" hidden>
+<div class="aaco-float-panel-header"><span>AACO</span><button type="button" id="aaco-float-close" class="aaco-float-close" aria-label="Close AACO assistant">×</button></div>
+{panel}
+</div>
+<button type="button" id="aaco-float-toggle" class="aaco-float-toggle" aria-expanded="false" aria-controls="aaco-float-panel" aria-label="Open AACO assistant" title="Ask AACO">💬</button>
+</div>
+<script>
+(function(){{
+var toggle=document.getElementById('aaco-float-toggle'),panel=document.getElementById('aaco-float-panel'),closeBtn=document.getElementById('aaco-float-close');
+if(!toggle||!panel)return;
+function setOpen(open){{
+panel.hidden=!open;
+toggle.setAttribute('aria-expanded',open?'true':'false');
+toggle.setAttribute('aria-label',open?'Close AACO assistant':'Open AACO assistant');
+if(open){{var input=document.getElementById('aaco-float-command');if(input)input.focus();}}
+}}
+toggle.addEventListener('click',function(){{setOpen(panel.hidden)}});
+if(closeBtn)closeBtn.addEventListener('click',function(){{setOpen(false)}});
+}})();
+window.aacoFloatHandleResult=function(body){{
+if(body.kind==='live'&&body.href){{
+var match=/\\/customer\\/cameras\\/([^/]+)\\/live/.exec(body.href);
+var cameraId=match&&match[1];
+var tile=cameraId&&document.querySelector('.live-grid-tile[data-camera-id="'+cameraId+'"]');
+if(tile){{
+tile.scrollIntoView({{behavior:'smooth',block:'center'}});
+tile.classList.add('aaco-highlight');
+setTimeout(function(){{tile.classList.remove('aaco-highlight')}},2500);
+return;
+}}
+window.location.assign(body.href);
+return;
+}}
+if(body.kind==='playback'&&body.href){{
+setTimeout(function(){{window.location.assign(body.href)}},900);
+return;
+}}
+if(body.kind==='events'){{
+var first=(body.events||[])[0];
+if(first&&first.href){{setTimeout(function(){{window.location.assign(first.href)}},900);}}
+return;
+}}
+if(body.kind==='door_unlock'){{
+if(typeof showToast==='function')showToast(body.message||'Door action completed.');
+return;
+}}
+// "status" and anything else: the panel's own status line already shows body.message.
+}};
+</script>
+"""
+
+
 def _workspace() -> str:
     # Page open deliberately makes zero VMS/media requests. The first fetch is
     # inside submit(), so the request-driven loading rule is observable.

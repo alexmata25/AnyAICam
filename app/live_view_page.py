@@ -41,7 +41,6 @@ from partner_db import connection
 from partner_portal import partner_identity
 from customer_analytics_panel import analytics_row_state, camera_entitlement_rows, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT, assign_entitlement, remove_entitlement, LicenseLimitExceeded
 from camera_access import is_camera_authorized, set_camera_access, remove_camera_access, ACCESS_MODES
-from aaco_web import render_aaco_command_panel
 import relay_control
 
 POLL_INTERVAL_MS = 2000
@@ -413,84 +412,19 @@ function wireUnlockButton(button, cameraId) {
 }
 """
 
-# The customer-live grid page's own reaction to an AACO result --
-# presentation only, no AACO parsing/execution of any kind (that stays
-# entirely server-side, in aaco.py/main.py's _ClassicAacoBoundary,
-# reached only through the unmodified POST /api/aaco/command route).
-# Registered as window.aacoLiveHandleResult and invoked by
-# aaco_web.render_aaco_command_panel()'s own shared submit plumbing
-# (aaco_web._AACO_CLIENT_CORE_JS) -- the same function name convention
-# every embedding page uses, each with its own page-specific handler.
-#
-# "live": never fetches or replaces this page's own video -- every
-# tile here is already independently streaming (this grid's own
-# existing per-tile HLS/WebRTC logic, untouched). AACO only finds the
-# real camera id already embedded in its own authorized href
-# (/customer/cameras/<id>/live, exactly the same deep link Classic
-# navigation already uses) and scrolls/highlights the matching tile
-# that is already on screen -- a presentation nicety, never a new
-# video session, never a second source of truth for which camera is
-# "selected".
-#
-# "playback"/"events": 2026-09-19 fix -- these previously only ever
-# inserted a manual "Open Playback"/"Open in Investigate" link the
-# customer had to separately notice and click, unlike "live" above,
-# which already acts on its own with no click required. A voice/typed
-# command like "take me back twenty minutes on the driveway" or "show
-# me what happened at the front entrance" should actually go there,
-# the same way saying it to a person would. The href AACO already
-# returned (already authorization-checked server-side -- this is
-# presentation only, never a second access decision) is what the page
-# navigates to; the manual link is kept alongside it only as a safety
-# net if navigation is ever blocked by the browser, and so the
-# customer can still reopen the destination deliberately.
-_AACO_LIVE_RESULT_JS = """
-window.aacoLiveHandleResult=function(body){
-  if(body.kind==='live'&&body.href){
-    var match=/\\/customer\\/cameras\\/([^/]+)\\/live/.exec(body.href);
-    var cameraId=match&&match[1];
-    var tile=cameraId&&document.querySelector('.live-grid-tile[data-camera-id="'+cameraId+'"]');
-    if(tile){
-      tile.scrollIntoView({behavior:'smooth',block:'center'});
-      tile.classList.add('aaco-highlight');
-      setTimeout(function(){tile.classList.remove('aaco-highlight')},2500);
-    } else if(typeof showToast==='function'){
-      showToast('That camera is authorized but not shown on this page.');
-    }
-    return;
-  }
-  var linkBox=document.getElementById('aaco-live-result-link');
-  if(linkBox)linkBox.innerHTML='';
-  if(body.kind==='playback'&&body.href&&linkBox){
-    var openPlayback=document.createElement('a');
-    openPlayback.className='action-button';
-    openPlayback.href=body.href;
-    openPlayback.textContent='Open Playback';
-    linkBox.appendChild(openPlayback);
-    setTimeout(function(){window.location.assign(body.href)},900);
-    return;
-  }
-  if(body.kind==='events'&&linkBox){
-    var first=(body.events||[])[0];
-    if(first&&first.href){
-      var openEvent=document.createElement('a');
-      openEvent.className='action-button';
-      openEvent.href=first.href;
-      openEvent.textContent=(body.events||[]).length>1?'Open first result in Investigate':'Open in Investigate';
-      linkBox.appendChild(openEvent);
-      setTimeout(function(){window.location.assign(first.href)},900);
-    }
-    return;
-  }
-  if(body.kind==='door_unlock'){
-    if(typeof showToast==='function')showToast(body.message||'Door action completed.');
-    return;
-  }
-  // "status" (which cameras are offline) and anything else: the
-  // command panel's own status line already shows body.message --
-  // nothing further to do on this page.
-};
-"""
+# 2026-09-19: this page's own AACO panel and result handler
+# (previously window.aacoLiveHandleResult, defined here) were removed
+# in favor of the persistent floating AACO assistant now injected once
+# by the shared page shell (main.py's page_shell() ->
+# aaco_web.render_aaco_floating_widget()) on every normal customer
+# page, this one included -- "one primary AACO UI" means exactly one,
+# not a fixed page-specific one and a floating one both. The floating
+# widget's own result handler (window.aacoFloatHandleResult, in
+# aaco_web.py) reproduces the same tile-scroll/highlight behavior for
+# a "live" result by looking for a .live-grid-tile matching the
+# returned camera id -- the .aaco-highlight CSS class below is still
+# used by that handler, just no longer by a script defined on this
+# page.
 
 
 def _talk_down_state(supported) -> dict:
@@ -862,23 +796,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
             # Brief, purely visual pulse on the tile AACO just switched
             # attention to -- no state, removed by its own setTimeout in
-            # _AACO_LIVE_RESULT_JS below. Never applied to more than one
-            # tile at a time, and never changes which camera is actually
+            # aaco_web.py's window.aacoFloatHandleResult. Never applied
+            # to more than one tile at a time, and never changes which camera is actually
             # streaming -- see that same script's own comment.
             f'.aaco-highlight{{outline:3px solid var(--brand,#42e4dc);outline-offset:-3px;transition:outline-color .3s ease}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
             f'</style>'
-            f'<section class="panel" style="margin-bottom:16px">'
-            f'<div class="panel-head"><div><h2>Ask AACO</h2></div></div>'
-            + render_aaco_command_panel(
-                id_prefix="aaco-live",
-                on_result_js_fn="aacoLiveHandleResult",
-                placeholder='Ask AACO — e.g. "Show Camera 2" or "Which cameras are offline?"',
-                intro="Switch a camera, open playback or events, or unlock a door -- without leaving this page.",
-            )
-            + f'<div id="aaco-live-result-link" style="margin-top:8px"></div>'
-            f'</section>'
-            f'<script>{_AACO_LIVE_RESULT_JS}</script>'
             f'<section class="live-grid">{tiles}</section>'
         )
 
