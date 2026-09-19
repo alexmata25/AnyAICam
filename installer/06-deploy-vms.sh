@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# Deploy exactly the VMS payload embedded in the built installer artifact.
+# No application files are read from the surrounding Git checkout.
+
+migrate_legacy_persistent_data() {
+    local old="$1" new="$2" label="$3"
+    [[ -d "$old" ]] || return 0
+    log "Found legacy $label under $old -- migrating to $new ..."
+    mkdir -p "$new"
+    chmod 0750 "$new"
+    chown anyaicam:anyaicam "$new" 2>/dev/null || true
+    rsync -a --ignore-existing "$old/" "$new/"
+    local unresolved=0 rel
+    while IFS= read -r -d '' f; do
+        rel="${f#"$old"/}"
+        if [[ -f "$new/$rel" ]] && cmp -s "$f" "$new/$rel"; then
+            rm -f "$f"
+        else
+            log "WARNING: could not verify migration of $label file '$rel' -- leaving it at $old for manual review."
+            unresolved=1
+        fi
+    done < <(find "$old" -type f -print0)
+    find "$old" -type d -empty -delete 2>/dev/null || true
+    if [[ "$unresolved" -eq 0 ]]; then
+        rmdir "$old" 2>/dev/null || true
+    fi
+}
+
+migrate_legacy_persistent_file() {
+    local old="$1" new="$2" label="$3"
+    [[ -f "$old" ]] || return 0
+    if [[ ! -f "$new" ]]; then
+        log "Found legacy $label at $old -- migrating to $new ..."
+        mkdir -p "$(dirname "$new")"
+        cp -p "$old" "$new"
+        chmod 0640 "$new"
+        chown anyaicam:anyaicam "$new" 2>/dev/null || true
+        rm -f "$old"
+    elif cmp -s "$old" "$new"; then
+        rm -f "$old"
+    else
+        log "WARNING: legacy $label differs from existing $new -- preserving both."
+    fi
+}
+
+upsert_env_key() {
+    local file="$1" key="$2" value="$3" tmp
+    tmp="$(mktemp)"
+    if [[ -f "$file" ]]; then
+        awk -F= -v key="$key" '$1 != key { print }' "$file" > "$tmp"
+    fi
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+ensure_vms_env() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 0750 "$CONFIG_DIR"
+    if [[ ! -f "$VMS_ENV_FILE" ]]; then
+        if [[ -f "$PAYLOAD_DIR/config/vms.env.template" ]]; then
+            log "Creating VMS environment config from the release template (existing configs are never overwritten)."
+            cp "$PAYLOAD_DIR/config/vms.env.template" "$VMS_ENV_FILE"
+        else
+            log "Creating minimal VMS environment config (existing configs are never overwritten)."
+            : > "$VMS_ENV_FILE"
+        fi
+    fi
+
+    grep -q '^ANYAICAM_RUNTIME_ROLE=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf '%s\n' 'ANYAICAM_RUNTIME_ROLE=edge' >> "$VMS_ENV_FILE"
+    # Canonical name is ANYAICAM_ENV -- the only variable app/main.py and
+    # app/cloud_config.py actually read (DEPLOYMENT_ENV = os.environ.get
+    # ("ANYAICAM_ENV", "local")). This installer previously wrote
+    # ANYAICAM_ENVIRONMENT here, a different name the app has never read
+    # -- every appliance installed that way silently stayed on the
+    # "local" default forever, regardless of this line ever running.
+    grep -q '^ANYAICAM_ENV=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf '%s\n' 'ANYAICAM_ENV=production' >> "$VMS_ENV_FILE"
+
+    # Live View staging transport (2026-09-13): the existing S3/CloudFront
+    # live-relay worker (app/live_relay_uploader.py) already self-gates on
+    # this flag and defaults OFF in the app if the key is absent entirely
+    # -- this line only makes that default explicit and present in every
+    # installed appliance's own env file, the same way ANYAICAM_RUNTIME_
+    # ROLE/ANYAICAM_ENV above do, so a future repair-install never has to
+    # guess whether an existing appliance already has an opinion here.
+    # Never overwrites an existing value -- flipping this to true for a
+    # specific pilot appliance (alongside setting AWS_REGION and the
+    # cloud-side live_relay_pilot DB flag) is a separate, explicit,
+    # per-appliance decision, not something this installer makes for
+    # every appliance by default.
+    grep -q '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf '%s\n' 'ANYAICAM_LIVE_RELAY_ENABLED=false' >> "$VMS_ENV_FILE"
+
+    # Generated once, per appliance, the first time this file has no
+    # value yet -- and, like ANYAICAM_ENV/ANYAICAM_RUNTIME_ROLE above
+    # (never like the always-refreshed build-identity keys below), NEVER
+    # regenerated once present: rotating it silently on every
+    # reinstall/repair would instantly invalidate every existing signed
+    # session/cookie. 32 raw bytes (256 bits) of /dev/urandom entropy,
+    # hex-encoded with only coreutils (od/tr) -- no new dependency, and
+    # deliberately never derived from the appliance ID, hostname, MAC
+    # address, or anything else an attacker could predict or observe by
+    # other means. Never printed or logged anywhere: the generated value
+    # exists only in this command substitution and the file it's
+    # redirected into.
+    grep -q '^ANYAICAM_APP_SECRETS=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf 'ANYAICAM_APP_SECRETS=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$VMS_ENV_FILE"
+
+    # Camera credential encryption key -- an appliance/installer
+    # requirement, not a Samsung-only fix: confirmed live that a fresh
+    # edge appliance never provisioned this at all, so ANY attempt to
+    # add a discovered camera WITH ONVIF/RTSP credentials failed closed
+    # (app/appliance_protocol.py's encrypt_camera_credentials() returns
+    # nothing without a key, and app/partner_workspace.py's
+    # request_camera_provisioning() 503s rather than ever storing
+    # credentials it can't encrypt). Generated once, exactly like
+    # ANYAICAM_APP_SECRETS above, and for the same reason NEVER
+    # regenerated once present: this key is what every already-stored
+    # camera credential (camera_credentials.encrypted_blob) is encrypted
+    # with -- silently rotating it on a reinstall/repair would make every
+    # existing credential permanently undecryptable, breaking every
+    # already-working camera stream. A valid Fernet key (the format
+    # app/appliance_protocol.py requires) is 32 random bytes, URL-safe
+    # base64-encoded -- reproduced here with only coreutils (head/base64/
+    # tr), the same no-new-dependency approach as ANYAICAM_APP_SECRETS,
+    # since this must generate correctly before the VMS image (which
+    # bundles the `cryptography` package) has even been built yet. Never
+    # printed or logged anywhere: the generated value exists only in this
+    # command substitution and the file it's redirected into.
+    grep -q '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" 2>/dev/null || \
+        printf 'ANYAICAM_CAMERA_CREDENTIAL_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_')" >> "$VMS_ENV_FILE"
+
+    # These two keys are installer-owned build identity. They are updated on
+    # every reinstall/repair while all other customer configuration survives.
+    upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VMS_COMMIT" "$VMS_RELEASE_COMMIT"
+    upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_BUILD_ID" "$VMS_RELEASE_COMMIT"
+    chown anyaicam:anyaicam "$VMS_ENV_FILE" 2>/dev/null || true
+    chmod 0640 "$VMS_ENV_FILE"
+}
+
+deploy_vms() {
+    local state="$1"
+
+    [[ -d "$VMS_PAYLOAD_DIR/app" ]] || {
+        echo "[ERROR] Missing built VMS payload: $VMS_PAYLOAD_DIR/app" >&2
+        return 1
+    }
+
+    migrate_legacy_persistent_data "$VMS_INSTALL_ROOT/recordings" "$VMS_RECORDINGS_DIR" "VMS recordings/application state"
+    migrate_legacy_persistent_data "$VMS_INSTALL_ROOT/data/config" "$VMS_DATA_CONFIG_DIR" "VMS data/config"
+    migrate_legacy_persistent_file "$VMS_INSTALL_ROOT/.env" "$VMS_ENV_FILE" "VMS environment config"
+
+    install -d -m 0755 -o root -g root "$VMS_INSTALL_ROOT"
+
+    log "Installing exact VMS release $VMS_RELEASE_COMMIT into $VMS_INSTALL_ROOT ..."
+    # --delete makes /opt/anyaicam an exact software mirror of the release.
+    # Legacy customer state locations are excluded defensively; current state
+    # lives under /var/lib or /etc and is never part of this mirror.
+    #
+    # 'mediamtx/' is excluded for the same reason (2026-09-17, real bug
+    # confirmed live on Ryzen): 10-install-mediamtx.sh places the real
+    # MediaMTX binary at $VMS_INSTALL_ROOT/mediamtx, and its own
+    # docstring promises an ordinary VMS-only release rebuild (one built
+    # without --mediamtx-binary, which never embeds a payload/mediamtx/
+    # directory at all) is a complete no-op for that binary -- "changes
+    # nothing about live camera behavior". That promise was false: this
+    # rsync runs BEFORE install_mediamtx() in install.sh's own pipeline
+    # and, with --delete and no exclusion for it, silently deleted the
+    # previously-installed, already-validated MediaMTX binary out from
+    # under a P2P-enabled appliance the moment any unrelated VMS-only
+    # repair (e.g. this session's own LPR/PPE fix) ran, breaking P2P
+    # live view with no error anywhere in the install output.
+    rsync -a --delete \
+        --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
+        "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/"
+
+    ensure_vms_env
+
+    log "Building VMS Docker image for release $VMS_RELEASE_COMMIT ..."
+    (cd "$VMS_INSTALL_ROOT" && docker compose build)
+
+    if [[ "$state" == "clean" ]]; then
+        log "VMS deployed from exact release payload (clean install)."
+    else
+        log "VMS replaced with exact release payload (existing install); persistent state untouched."
+    fi
+}

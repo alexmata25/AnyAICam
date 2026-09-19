@@ -29,14 +29,20 @@ already-reviewed, unchanged routes.
 """
 
 import json
+from datetime import datetime
 from html import escape
 from typing import Callable
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from partner_db import connection
 from partner_portal import partner_identity
+from customer_analytics_panel import analytics_row_state, camera_entitlement_rows, event_types_for_analytic, summarize, UPGRADE_CARD_CONTENT, assign_entitlement, remove_entitlement, LicenseLimitExceeded
+from camera_access import is_camera_authorized, set_camera_access, remove_camera_access, ACCESS_MODES
+from aaco_web import render_aaco_command_panel
+import relay_control
 
 POLL_INTERVAL_MS = 2000
 POLL_TIMEOUT_MS = 45000
@@ -60,41 +66,277 @@ POLL_TIMEOUT_MS = 45000
 # destination -- required by some browsers for onaudioprocess to fire
 # reliably, without which the mic's own input would otherwise be
 # audibly routed back out to the speakers.
+_P2P_JS = """
+(function(){
+  let cachedConfig = null;
+  async function getP2PConfig(){
+    if (cachedConfig) return cachedConfig;
+    try {
+      const res = await fetch('/api/customer/live/p2p/config');
+      cachedConfig = res.ok ? await res.json() : {enabled:false};
+    } catch (e) { cachedConfig = {enabled:false}; }
+    return cachedConfig;
+  }
+
+  // Attempts a direct P2P connection for one live-view session, racing
+  // against the relay poll the caller is running in parallel (never
+  // sequentially -- see live_view_p2p.py's module docstring: relay stays
+  // the automatic fallback, never delayed by a P2P attempt). Resolves
+  // {stream, pc, connect_ms} the moment a real video track arrives;
+  // rejects on disabled/timeout/ICE failure. Never touches a <video>
+  // element itself -- the caller only assigns it after winning the race
+  // against the relay path, so a late-arriving P2P track can never
+  // stomp a relay stream that already won.
+  window.attemptLiveP2P = async function(sessionId){
+    const startedAt = Date.now();
+    const config = await getP2PConfig();
+    if (!config.enabled) throw new Error('p2p_disabled');
+
+    const pc = new RTCPeerConnection({iceServers: config.ice_servers || []});
+    let settled = false;
+    const timeoutMs = config.timeout_ms || 4000;
+    const failClosed = () => { try { pc.close(); } catch (e) {} };
+
+    const resultPromise = new Promise((resolve, reject) => {
+      pc.ontrack = (event) => {
+        if (settled) return;
+        settled = true;
+        resolve({stream: event.streams[0], pc, connect_ms: Date.now() - startedAt});
+      };
+      pc.oniceconnectionstatechange = () => {
+        if (settled) return;
+        if (['failed', 'disconnected', 'closed'].includes(pc.iceConnectionState)) {
+          settled = true; failClosed();
+          reject(new Error('ice_' + pc.iceConnectionState));
+        }
+      };
+      setTimeout(() => {
+        if (settled) return;
+        settled = true; failClosed();
+        reject(new Error('timeout'));
+      }, timeoutMs);
+    });
+
+    pc.addTransceiver('video', {direction: 'recvonly'});
+    // Trickle ICE (2026-09-17): load-bearing, not best-effort -- the
+    // offer below is sent before gathering finishes, so every candidate
+    // discovered here (including the one that ultimately succeeds) is
+    // real, necessary signaling, not a redundant echo of what the offer
+    // already carried.
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      fetch(`/api/customer/live/sessions/${sessionId}/p2p/ice`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({candidate: {candidate: event.candidate.candidate, sdpMid: event.candidate.sdpMid, sdpMLineIndex: event.candidate.sdpMLineIndex}}),
+      }).catch(() => {});
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Trickle ICE (2026-09-17 redesign): the offer is sent immediately,
+    // with zero or few candidates inline -- NOT after waiting for local
+    // ICE gathering to finish. That wait (previously bounded to 2000ms)
+    // was measured live, real browser against the real Ryzen appliance,
+    // to be the single largest cost in the whole P2P path (612-1584ms
+    // across repeated real runs) -- already exceeding AWS relay's own
+    // real win time on every run, before the offer had even been sent.
+    // Every candidate pc.onicecandidate discovers (above) continues to
+    // be trickled to the appliance as it arrives via the existing POST
+    // .../p2p/ice route -- now load-bearing for real ICE connectivity,
+    // not merely best-effort robustness (see webrtc_publisher.py's own
+    // _forward_client_ice_candidate() for the appliance-side half, and
+    // its module docstring for the real MediaMTX-binary verification
+    // this redesign was built on).
+    if (settled) return resultPromise;
+
+    fetch(`/api/customer/live/sessions/${sessionId}/p2p/offer`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({sdp: pc.localDescription.sdp}),
+    }).catch(() => {});
+
+    let appliedAnswer = false;
+    const pollTimer = setInterval(async () => {
+      if (settled) { clearInterval(pollTimer); return; }
+      let res;
+      try { res = await fetch(`/api/customer/live/sessions/${sessionId}/p2p/answer`); } catch (e) { return; }
+      if (!res || !res.ok) return;
+      const body = await res.json();
+      if (!appliedAnswer && body.answer && body.answer.sdp) {
+        appliedAnswer = true;
+        try { await pc.setRemoteDescription({type: 'answer', sdp: body.answer.sdp}); } catch (e) {}
+      }
+      for (const candidate of (body.candidates || [])) {
+        try { await pc.addIceCandidate(candidate); } catch (e) {}
+      }
+    }, 500);
+
+    try {
+      return await resultPromise;
+    } finally {
+      clearInterval(pollTimer);
+    }
+  };
+
+  window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
+    if (!sessionId) return;
+    fetch(`/api/customer/live/sessions/${sessionId}/transport-outcome`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({transport, connect_ms: connectMs ?? null, error: error || null}),
+    }).catch(() => {});
+  };
+})();
+"""
+
 _TALK_MIC_JS = """
 function wireTalkMic(button, cameraId) {
-  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null, sessionId = null, stopping = false;
+  // Press-and-hold state, keyed by a monotonically increasing generation
+  // token (pressId) rather than a single boolean -- this is what makes
+  // the async pointer lifecycle race-free. start() is async and awaits
+  // three separate things in sequence (the REST /talk/start fetch, its
+  // response.json(), then getUserMedia()); a release (pointerup/
+  // pointercancel/pointerleave/pagehide) can land after any one of
+  // those awaits resumes. Every resume point below re-checks
+  // `myPress === pressId` -- the token captured synchronously at this
+  // press's own pointerdown, before any await ran -- and refuses to
+  // proceed (including refusing to ever construct a WebSocket) once a
+  // release or a newer press has invalidated it. This is what
+  // previously let a stale start() resume after stop() had already
+  // cleared sessionId to null and open a WebSocket at
+  // /sessions/null/audio.
+  let pressId = 0;
+  let held = false;
+  let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null;
+  let sessionId = null;   // the REST-created session this press currently owns, if any
+  let wsOpened = false;   // true only once this session's WebSocket has actually finished connecting
 
-  async function stop() {
-    if (stopping) return;
-    stopping = true;
-    button.classList.remove('active');
+  function cleanupOrphanSession(sid) {
+    // Best-effort: releases a REST-created talk session that will never
+    // get a WebSocket (because the press that created it ended, or
+    // permission was denied, before the socket could open), so no
+    // 'requested' row is left behind for talk_sessions.py's own
+    // expiry sweep to have to age out later. Fire-and-forget -- the
+    // stop route is already idempotent server-side, and there is no
+    // UI state left to update for a press that's already over.
+    fetch(`/api/customer/talk/sessions/${sid}/stop`, { method: 'POST' }).catch(() => {});
+  }
+
+  function teardownLocal() {
     if (processor) { try { processor.disconnect() } catch (e) {} }
     if (source) { try { source.disconnect() } catch (e) {} }
     if (silentGain) { try { silentGain.disconnect() } catch (e) {} }
     if (audioCtx) { try { audioCtx.close() } catch (e) {} }
     if (mediaStream) { mediaStream.getTracks().forEach(track => track.stop()) }
     if (ws) { try { ws.close() } catch (e) {} }
-    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null; sessionId = null;
+    ws = null; audioCtx = null; mediaStream = null; processor = null; source = null; silentGain = null;
   }
 
-  async function start() {
-    if (button.disabled || ws || stopping === false && sessionId) return;
-    stopping = false;
+  function stop(event) {
+    // event is only present for a real pointerup/pointercancel/
+    // pointerleave -- stop() is also called internally (ws.onclose,
+    // ws.onerror, a stale press's own cleanup) with no event at all,
+    // so every event-only call below is guarded. preventDefault()/
+    // stopPropagation() here are defensive, matching pointerdown's own
+    // handling below; releasePointerCapture() is technically automatic
+    // on pointerup/pointercancel, but calling it explicitly costs
+    // nothing and removes any doubt.
+    if (event) {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      if (event.pointerId !== undefined) {
+        try { button.releasePointerCapture(event.pointerId); } catch (e) {}
+      }
+    }
+    held = false;
+    pressId++;   // invalidates any in-flight start() still awaiting something for the press that just ended
+    button.classList.remove('active');
+    const sid = sessionId;
+    const openedBeforeStop = wsOpened;
+    sessionId = null;
+    wsOpened = false;
+    teardownLocal();
+    if (sid && !openedBeforeStop) {
+      // Released after /talk/start created a session but before the
+      // WebSocket finished opening (still mid-fetch, mid-getUserMedia,
+      // or mid-handshake) -- nothing else will ever clean this session
+      // up, since the WebSocket route (the only other place that marks
+      // it 'stopped') never got a chance to run.
+      cleanupOrphanSession(sid);
+    }
+  }
+
+  async function start(event) {
+    // Mobile press-and-hold on a button that sits near/over a playing
+    // <video> tile is a well-known source of touch-event conflicts --
+    // without these, a sustained touch-hold can be interpreted by the
+    // browser's own default gesture handling as also targeting the
+    // video underneath (observed as the video pausing on press and
+    // resuming on release). preventDefault() stops the browser's
+    // default touch handling for this pointerdown; stopPropagation()
+    // keeps it from reaching any ancestor handler; setPointerCapture()
+    // pins every subsequent pointer event for this exact touch (move,
+    // up, cancel) to this button specifically, so a finger drifting
+    // slightly during the hold can never be reinterpreted as
+    // interacting with whatever is underneath it. touch-action:none in
+    // this button's own CSS is the equivalent instruction at the CSS
+    // layer, for browsers that decide gesture handling before any JS
+    // runs at all. None of this touches press-and-hold semantics --
+    // it only ever runs once, synchronously, at the very top of the
+    // same pointerdown handler that already existed.
+    if (event) {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      try { button.setPointerCapture(event.pointerId); } catch (e) {}
+    }
+    if (button.disabled || held) return;
+    held = true;
+    const myPress = ++pressId;
+
     let response;
     try {
       response = await fetch(`/api/customer/cameras/${cameraId}/talk/start`, { method: 'POST' });
-    } catch (e) { return; }
-    if (!response.ok) { return; }
-    const body = await response.json();
-    sessionId = body.session_id;
-
-    try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      showToast('Microphone permission denied or unavailable.');
-      sessionId = null;
+      if (myPress === pressId) held = false;
       return;
     }
+    if (!response.ok) {
+      if (myPress === pressId) held = false;
+      return;
+    }
+    const body = await response.json();
+    const sid = body && body.session_id;
+    if (!sid) {
+      if (myPress === pressId) held = false;
+      return;
+    }
+
+    if (myPress !== pressId) {
+      // Released (or superseded by a newer press) while /talk/start was
+      // in flight -- stop() already ran and had no sessionId to see yet,
+      // so this press is the only one that knows this session exists.
+      cleanupOrphanSession(sid);
+      return;
+    }
+    sessionId = sid;   // now visible to stop(), which takes over orphan cleanup from here if released
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      if (myPress === pressId) { held = false; sessionId = null; }
+      showToast('Microphone permission denied or unavailable.');
+      cleanupOrphanSession(sid);
+      return;
+    }
+
+    if (myPress !== pressId) {
+      // Released while the permission prompt was pending. stop() already
+      // saw sessionId set and released it itself -- this stream simply
+      // arrived too late to be used; stop its tracks immediately so a
+      // granted-but-unwanted mic stays off.
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    mediaStream = stream;
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     source = audioCtx.createMediaStreamSource(mediaStream);
@@ -102,15 +344,24 @@ function wireTalkMic(button, cameraId) {
     silentGain = audioCtx.createGain();
     silentGain.gain.value = 0;
 
+    // Always built from the local `sid` captured above, never the
+    // shared `sessionId` -- this is the specific guarantee that a
+    // WebSocket can never be constructed with a null/empty session id,
+    // independent of anything stop() may have done concurrently.
     const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sessionId}/audio?sample_rate=${audioCtx.sampleRate}`);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { button.classList.add('active') };
-    ws.onclose = () => { stop() };
-    ws.onerror = () => { stop() };
+    const socket = new WebSocket(`${wsProtocol}//${location.host}/api/customer/talk/sessions/${sid}/audio?sample_rate=${audioCtx.sampleRate}`);
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = () => {
+      if (myPress !== pressId) { try { socket.close() } catch (e) {} return; }
+      wsOpened = true;
+      button.classList.add('active');
+    };
+    socket.onclose = () => { if (myPress === pressId) stop(); };
+    socket.onerror = () => { if (myPress === pressId) stop(); };
+    ws = socket;
 
     processor.onaudioprocess = (event) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (myPress !== pressId || !ws || ws.readyState !== WebSocket.OPEN) return;
       const input = event.inputBuffer.getChannelData(0);
       const pcm16 = new Int16Array(input.length);
       for (let i = 0; i < input.length; i++) {
@@ -125,11 +376,120 @@ function wireTalkMic(button, cameraId) {
   }
 
   button.addEventListener('pointerdown', start);
-  button.addEventListener('pointerup', () => stop());
-  button.addEventListener('pointercancel', () => stop());
-  button.addEventListener('pointerleave', () => stop());
+  button.addEventListener('pointerup', (event) => stop(event));
+  button.addEventListener('pointercancel', (event) => stop(event));
+  button.addEventListener('pointerleave', (event) => stop(event));
   window.addEventListener('pagehide', () => stop());
 }
+"""
+
+# Shared "Unlock Door" client, used identically by the /customer-live
+# grid tile and the single-camera page's own tools row -- same reasoning
+# as wireTalkMic() above for living once at module level. A plain click
+# (not press-and-hold: unlocking is a single discrete action, not a
+# sustained one) that POSTs to the already-authorized/audited
+# /door/unlock route (door_access.py) and surfaces its own success/
+# failure message via the shared showToast(), which every page already
+# defines (main.py's page_shell). stopPropagation() keeps a click here
+# from also being read as a tile double-click (which navigates to the
+# single-camera page) while the request is in flight.
+_UNLOCK_DOOR_JS = """
+function wireUnlockButton(button, cameraId) {
+  button.addEventListener('click', async (event) => {
+    try { event.preventDefault(); } catch (e) {}
+    try { event.stopPropagation(); } catch (e) {}
+    if (button.disabled) return;
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/customer/cameras/${cameraId}/door/unlock`, { method: 'POST' });
+      const body = await response.json().catch(() => ({}));
+      showToast((response.ok ? body.message : body.detail) || (response.ok ? 'Door unlocked.' : 'The door could not be unlocked.'));
+    } catch (e) {
+      showToast('The door could not be unlocked.');
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+"""
+
+# The customer-live grid page's own reaction to an AACO result --
+# presentation only, no AACO parsing/execution of any kind (that stays
+# entirely server-side, in aaco.py/main.py's _ClassicAacoBoundary,
+# reached only through the unmodified POST /api/aaco/command route).
+# Registered as window.aacoLiveHandleResult and invoked by
+# aaco_web.render_aaco_command_panel()'s own shared submit plumbing
+# (aaco_web._AACO_CLIENT_CORE_JS) -- the same function name convention
+# every embedding page uses, each with its own page-specific handler.
+#
+# "live": never fetches or replaces this page's own video -- every
+# tile here is already independently streaming (this grid's own
+# existing per-tile HLS/WebRTC logic, untouched). AACO only finds the
+# real camera id already embedded in its own authorized href
+# (/customer/cameras/<id>/live, exactly the same deep link Classic
+# navigation already uses) and scrolls/highlights the matching tile
+# that is already on screen -- a presentation nicety, never a new
+# video session, never a second source of truth for which camera is
+# "selected".
+#
+# "playback"/"events": 2026-09-19 fix -- these previously only ever
+# inserted a manual "Open Playback"/"Open in Investigate" link the
+# customer had to separately notice and click, unlike "live" above,
+# which already acts on its own with no click required. A voice/typed
+# command like "take me back twenty minutes on the driveway" or "show
+# me what happened at the front entrance" should actually go there,
+# the same way saying it to a person would. The href AACO already
+# returned (already authorization-checked server-side -- this is
+# presentation only, never a second access decision) is what the page
+# navigates to; the manual link is kept alongside it only as a safety
+# net if navigation is ever blocked by the browser, and so the
+# customer can still reopen the destination deliberately.
+_AACO_LIVE_RESULT_JS = """
+window.aacoLiveHandleResult=function(body){
+  if(body.kind==='live'&&body.href){
+    var match=/\\/customer\\/cameras\\/([^/]+)\\/live/.exec(body.href);
+    var cameraId=match&&match[1];
+    var tile=cameraId&&document.querySelector('.live-grid-tile[data-camera-id="'+cameraId+'"]');
+    if(tile){
+      tile.scrollIntoView({behavior:'smooth',block:'center'});
+      tile.classList.add('aaco-highlight');
+      setTimeout(function(){tile.classList.remove('aaco-highlight')},2500);
+    } else if(typeof showToast==='function'){
+      showToast('That camera is authorized but not shown on this page.');
+    }
+    return;
+  }
+  var linkBox=document.getElementById('aaco-live-result-link');
+  if(linkBox)linkBox.innerHTML='';
+  if(body.kind==='playback'&&body.href&&linkBox){
+    var openPlayback=document.createElement('a');
+    openPlayback.className='action-button';
+    openPlayback.href=body.href;
+    openPlayback.textContent='Open Playback';
+    linkBox.appendChild(openPlayback);
+    setTimeout(function(){window.location.assign(body.href)},900);
+    return;
+  }
+  if(body.kind==='events'&&linkBox){
+    var first=(body.events||[])[0];
+    if(first&&first.href){
+      var openEvent=document.createElement('a');
+      openEvent.className='action-button';
+      openEvent.href=first.href;
+      openEvent.textContent=(body.events||[]).length>1?'Open first result in Investigate':'Open in Investigate';
+      linkBox.appendChild(openEvent);
+      setTimeout(function(){window.location.assign(first.href)},900);
+    }
+    return;
+  }
+  if(body.kind==='door_unlock'){
+    if(typeof showToast==='function')showToast(body.message||'Door action completed.');
+    return;
+  }
+  // "status" (which cameras are offline) and anything else: the
+  // command panel's own status line already shows body.message --
+  // nothing further to do on this page.
+};
 """
 
 
@@ -147,13 +507,27 @@ def _talk_down_state(supported) -> dict:
     return {"enabled": False, "tooltip": "Talk-down capability not verified"}
 
 
-def _customer_live_cameras(db, identity: dict) -> list[dict]:
+def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[dict]:
     """Every camera this identity may view live, scoped to identity's own
     customer_id: the full fleet for customer_owner, or only the subset
     explicitly granted can_live for customer_viewer -- same ownership/
     permission rule _authorized_camera() applies to one camera_id from a
     URL, evaluated here for the whole fleet at once so /customer-live can
     render a grid instead of picking a single camera to redirect to.
+
+    Multi-appliance isolation fix (2026-09-12): this used to return every
+    camera for the customer with no appliance attribution at all -- the
+    same defect class already fixed elsewhere (see partner_workspace.py's
+    customer_account() for the full trace). Confirmed live on anyaicam-
+    staging: a customer with two appliances saw both appliances' cameras
+    tiled together with colliding camera_number-derived labels ("Camera 1"
+    from one appliance indistinguishable from "Camera 1" from the other).
+    `appliance_id` is optional and backward compatible (omitted -> every
+    camera this identity may view, exactly as before); when given, the
+    caller (customer_live_landing()) has already verified it belongs to
+    this customer, so it is trusted here as a plain filter. Every returned
+    row now also carries appliance_id/appliance_cloud_id so the caller can
+    group tiles by appliance without a second query.
 
     Each returned dict also carries talk_enabled/talk_tooltip -- the
     server-persisted camera CAPABILITY state (talk_down_supported),
@@ -170,13 +544,40 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
     trusts what a page merely rendered. A viewer lacking can_talk still
     sees an enabled-looking mic for a capable camera and gets a real
     403 the moment they try to use it -- a UX gap acceptable for this
-    foundation, not a security one."""
+    foundation, not a security one.
+
+    Live-tile grid fix (2026-09-13): `c.camera_number IS NOT NULL` on
+    both branches below -- confirmed live on anyaicam-staging (8-slot
+    entitlement, 5 physical cameras discovered): this query used to
+    return every `cameras` row for the customer with no distinction
+    between a real, discovered camera and a licensed-but-undiscovered
+    onboarding placeholder (device_key IS NULL, camera_number IS NULL),
+    so the grid rendered one dead "Starting live view..." tile per
+    placeholder alongside the real cameras (8 tiles for 5 real cameras).
+    `camera_number IS NOT NULL` -- not `device_key IS NOT NULL` -- is the
+    signal used here deliberately: it is the exact same "has an assigned
+    relay slot" check live_view_sessions.start_live_view() and
+    live_playlist.py's own authorized_camera() already gate a live
+    session on (resolve_camera_number() returning None -> 409), so a
+    camera that would 409 on /live/start can never even reach a tile
+    that tries to call it, and an installer/technician-provisioned
+    camera that has a real camera_number but no self-service-discovery
+    device_key (see partner_workspace.camera_is_installed()'s own
+    broader "installed" definition -- device_key is one signal among
+    several there, never the only one) still correctly renders a tile.
+    Licensed-but-unused capacity is an entitlement number shown
+    elsewhere (customer_entitlements.total_camera_slots(), e.g.
+    "5 of 8 cameras configured / 3 licenses available"), never a video
+    tile with nothing behind it."""
     if identity.get('role') == 'customer_owner':
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT id, name, talk_down_supported FROM cameras WHERE customer_id=? '
-                'ORDER BY camera_number, id',
-                (identity['customer_id'],),
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.door_access_enabled, c.appliance_id, '
+                'a.cloud_id AS appliance_cloud_id FROM cameras c '
+                'LEFT JOIN appliances a ON a.id=c.appliance_id '
+                'WHERE c.customer_id=? AND c.camera_number IS NOT NULL'+(' AND c.appliance_id=?' if appliance_id else '')+
+                ' ORDER BY c.camera_number, c.id',
+                (identity['customer_id'], appliance_id) if appliance_id else (identity['customer_id'],),
             ).fetchall()
         ]
     else:
@@ -189,17 +590,111 @@ def _customer_live_cameras(db, identity: dict) -> list[dict]:
 
         cameras = [
             dict(camera) for camera in db.execute(
-                'SELECT c.id, c.name, c.talk_down_supported FROM cameras c '
+                'SELECT c.id, c.name, c.camera_number, c.talk_down_supported, c.door_access_enabled, c.appliance_id, '
+                'a.cloud_id AS appliance_cloud_id FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
-                'WHERE c.customer_id=? AND p.can_live=1 '
-                'ORDER BY c.camera_number, c.id',
-                (user['id'], identity['customer_id']),
+                'LEFT JOIN appliances a ON a.id=c.appliance_id '
+                'WHERE c.customer_id=? AND p.can_live=1 AND c.camera_number IS NOT NULL'+(' AND c.appliance_id=?' if appliance_id else '')+
+                ' ORDER BY c.camera_number, c.id',
+                (user['id'], identity['customer_id'], appliance_id) if appliance_id else (user['id'], identity['customer_id']),
             ).fetchall()
         ]
 
     for camera in cameras:
         camera.update(_talk_down_state(camera.pop('talk_down_supported')))
+        # Capability hint only, same as talk_enabled above -- whether THIS
+        # identity may actually press it is re-checked from scratch by
+        # door_access.py's _authorized_door_camera() at unlock time, never
+        # trusted from what a page merely rendered.
+        camera['door_enabled'] = bool(camera.pop('door_access_enabled'))
     return cameras
+
+
+def _camera_display_label(camera: dict) -> str:
+    """The friendly-name-or-"Camera N" fallback for a cameras-table row
+    dict that carries name/camera_number -- my own editable-friendly-
+    name system (customer_platform.py) remains the one authoritative
+    place a customer actually renames a camera; this only decides what
+    the grid shows when no name has been set yet, replacing the old
+    raw camera['id'] fallback (a UUID-like string) with something a
+    customer can actually read. Duplicated rather than imported from
+    main.py's own _camera_display_label(), same reasoning as
+    _authorized_camera()'s docstring above: main.py imports this
+    module to register its routes, so importing back from main.py
+    would risk a circular import."""
+    name = (camera.get('name') or '').strip()
+    if name:
+        return name
+    number = camera.get('camera_number')
+    return f'Camera {number}' if number is not None else str(camera.get('id', 'Camera'))
+
+
+def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
+    """The Camera Settings section of the single-camera live view page --
+    door_access.py's GET/POST /api/customer/cameras/{id}/door-config
+    routes already do the real authorization/validation/persistence;
+    this only renders a form against them, pre-filled from the fresh
+    `camera` row _authorized_camera() already fetched (no extra round-
+    trip). Only ever included for identity['role']=='customer_owner'
+    (see live_view_page()'s own call site) -- update_door_config()
+    itself rejects a customer_viewer's write with 403, matching this
+    codebase's convention of not rendering a form a viewer could not
+    actually submit.
+
+    `viewers` (each {user_id,email,name,can_unlock}) is this customer's
+    own customer_viewer users with their current can_unlock grant for
+    THIS camera, pre-fetched by live_view_page() -- always `[]` when the
+    camera isn't door-configured yet (see that call site's own guard),
+    so the "Viewer access" sub-section below only ever appears once
+    there is an actual door to grant access to."""
+    channel_options = ''.join(
+        f'<option value="{channel}"{" selected" if camera.get("door_relay_channel") == channel else ""}>Relay {channel}</option>'
+        for channel in relay_control.VALID_CHANNELS
+    )
+    pulse_value = camera.get('door_relay_pulse_ms') or relay_control.DEFAULT_PULSE_MS
+    door_enabled = bool(camera.get('door_access_enabled'))
+
+    if not door_enabled:
+        viewer_access_section = ''
+    elif not viewers:
+        viewer_access_section = (
+            '<div style="margin-top:20px">'
+            '<span class="health-detail">Viewer access — who can press Unlock Door</span>'
+            '<p class="health-detail">No team members yet. Invite a viewer from your account settings to grant them unlock access.</p>'
+            '</div>'
+        )
+    else:
+        viewer_rows = ''.join(
+            f'<label><span><input class="unlock-viewer-toggle" type="checkbox" '
+            f'data-user-id="{escape(viewer["user_id"], quote=True)}" {"checked" if viewer["can_unlock"] else ""}> '
+            f'{escape(viewer.get("name") or viewer["email"])} '
+            f'<small style="color:var(--muted)">{escape(viewer["email"])}</small></span></label>'
+            for viewer in viewers
+        )
+        viewer_access_section = (
+            '<div style="margin-top:20px">'
+            '<span class="health-detail">Viewer access — who can press Unlock Door</span>'
+            f'<div id="unlock-viewer-list" style="display:grid;gap:8px;margin-top:8px">{viewer_rows}</div>'
+            '<button class="action-button" id="save-unlock-access" type="button" style="margin-top:12px">Save unlock access</button>'
+            '</div>'
+        )
+
+    return (
+        f'<section class="panel" style="margin-top:16px" id="door-access-section">'
+        f'<div class="panel-head"><div><h2>Camera Settings — Face Access</h2>'
+        f'<div class="health-detail">Map this camera to a physical door\'s relay to enable automatic unlock '
+        f'for recognized, authorized faces and manual unlock from the live tile. Rename this camera above '
+        f'(e.g. "Front Door") so alerts and the live tile are easy to recognize.</div></div></div>'
+        f'<label><span><input id="door-access-enabled" type="checkbox" {"checked" if door_enabled else ""}> '
+        f'Enable Face Access for this camera</span></label>'
+        f'<div id="door-access-fields" style="display:grid;gap:14px;max-width:360px;margin-top:12px" {"" if door_enabled else "hidden"}>'
+        f'<label>Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
+        f'<label>Unlock duration (milliseconds)<input id="door-relay-pulse-ms" type="number" min="1" step="1" value="{pulse_value}"></label>'
+        f'</div>'
+        f'<button class="action-button" id="save-door-access" type="button" style="margin-top:12px">Save Face Access settings</button>'
+        f'{viewer_access_section}'
+        f'</section>'
+    )
 
 
 def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
@@ -218,32 +713,51 @@ def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
         raise HTTPException(status_code=404, detail='Camera not found.')
 
     user = db.execute(
-        'SELECT id FROM partner_users WHERE email=?',
+        'SELECT id, camera_access_mode FROM partner_users WHERE email=?',
         (identity['email'],),
     ).fetchone()
     if not user:
         raise HTTPException(status_code=403, detail='Customer owner permission required.')
 
-    if identity.get('role') != 'customer_owner':
-        permission = db.execute(
-            'SELECT can_live FROM customer_camera_permissions WHERE user_id=? AND camera_id=?',
-            (user['id'], camera_id),
-        ).fetchone()
-        if not permission or not permission['can_live']:
-            raise HTTPException(status_code=403, detail='Not authorized to view this camera live.')
+    permitted_camera_ids = {
+        row['camera_id'] for row in db.execute(
+            'SELECT camera_id FROM customer_camera_permissions WHERE user_id=? AND can_live=1', (user['id'],)
+        ).fetchall()
+    }
+    if not is_camera_authorized(
+        camera_id,
+        role=identity.get('role', ''),
+        access_mode=user['camera_access_mode'] or 'selected',
+        permitted_camera_ids=permitted_camera_ids,
+    ):
+        raise HTTPException(status_code=403, detail='Not authorized to view this camera live.')
 
     return dict(camera)
 
 
 def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     @app.get('/customer-live', response_class=HTMLResponse)
-    def customer_live_landing(request: Request):
+    def customer_live_landing(request: Request, appliance_id: str = ''):
         identity = partner_identity(request)
         if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
             return RedirectResponse('/partner-login', status_code=303)
 
+        # Multi-appliance isolation fix (2026-09-12): appliance_id is
+        # optional and backward compatible (see _customer_live_cameras()'s
+        # own docstring for the full trace); when given it is verified to
+        # belong to this customer before use, same own-tenant check every
+        # other appliance-scoped customer route already applies.
+        if appliance_id:
+            with connection() as db:
+                owned = db.execute(
+                    'SELECT id FROM appliances WHERE id=? AND customer_id=?',
+                    (appliance_id, identity['customer_id']),
+                ).fetchone()
+            if not owned:
+                raise HTTPException(status_code=404, detail='Appliance not found.')
+
         with connection() as db:
-            cameras = _customer_live_cameras(db, identity)
+            cameras = _customer_live_cameras(db, identity, appliance_id)
 
         if not cameras:
             # No cameras at all, or (customer_viewer) none explicitly
@@ -255,46 +769,151 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         columns = 1 if len(cameras) == 1 else 2 if len(cameras) <= 4 else 3 if len(cameras) <= 9 else 4
         camera_ids = [camera['id'] for camera in cameras]
 
-        tiles = ''.join(
-            f'''<article class="live-grid-tile">
+        def _tile(camera: dict) -> str:
+            # Unlock Door only ever appears here for a camera the account
+            # itself has mapped to a relay (door_enabled) -- per the Face
+            # Access spec's explicit requirement to never show it on a
+            # camera with no access-control relay configured. Actual
+            # unlock authorization (owner vs. viewer's own can_unlock
+            # grant) is re-checked server-side on click, same capability-
+            # vs-authorization split as the talk-mic button above.
+            unlock_button = (
+                f'<button class="camera-tool unlock-door" id="unlock-door-{escape(camera["id"], quote=True)}"'
+                f' data-camera-id="{escape(camera["id"], quote=True)}"'
+                f' title="Unlock door" aria-label="Unlock door">🔓</button>'
+                if camera.get('door_enabled') else ''
+            )
+            return f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
               <div class="camera-view" style="border-radius:10px">
                 <video id="live-grid-video-{escape(camera['id'], quote=True)}" muted playsinline></video>
                 <div class="camera-placeholder" id="live-grid-placeholder-{escape(camera['id'], quote=True)}">
                   <span class="signal">◉</span>
                   <strong id="live-grid-status-{escape(camera['id'], quote=True)}">Starting live view…</strong>
                 </div>
-              </div>
-              <div class="live-grid-tile-head">
-                <span>{escape(camera.get('name') or camera['id'])}</span>
-                <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
-                  data-camera-id="{escape(camera['id'], quote=True)}"
-                  title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                  aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                  {'' if camera['enabled'] else 'disabled'}>◖</button>
-                <a class="ghost-button" href="/customer/cameras/{escape(camera['id'], quote=True)}/live">Full screen</a>
+                <div class="tile-name-overlay">{escape(_camera_display_label(camera))}</div>
+                <div class="tile-controls-overlay">
+                  <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
+                    data-camera-id="{escape(camera['id'], quote=True)}"
+                    title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
+                    aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
+                    {'' if camera['enabled'] else 'disabled'}>🎤</button>
+                  <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
+                    title="Camera tools (mute, snapshot, download, share, analytics, bookmark, stop)"
+                    aria-label="Open camera tools">⚙</a>
+                  {unlock_button}
+                </div>
               </div>
             </article>'''
-            for camera in cameras
-        )
+
+        # Multi-appliance isolation fix (2026-09-12), continued: with no
+        # appliance_id given, `cameras` can legitimately span more than one
+        # appliance -- this page has no appliance-selector control of its
+        # own (same gap reported for /customer-account). Rather than
+        # tiling them together indistinguishably (the actual reported
+        # defect: two appliances' "Camera 1" tiles looked identical), each
+        # appliance's tiles are grouped under their own full-width heading
+        # (their cloud_id). When appliance_id was passed, or the account
+        # only has one appliance, this is a single group and renders
+        # exactly as before (no heading, no visual change).
+        distinct_appliance_ids = list(dict.fromkeys(c['appliance_id'] for c in cameras)) if not appliance_id else []
+        if len(distinct_appliance_ids) > 1:
+            tiles = ''.join(
+                f'<div class="live-grid-appliance-heading" style="grid-column:1/-1;font-weight:600;margin-top:14px">'
+                f'{escape(next((c["appliance_cloud_id"] for c in cameras if c["appliance_id"]==aid and c.get("appliance_cloud_id")),aid) or "Appliance")}</div>'
+                + ''.join(_tile(c) for c in cameras if c['appliance_id'] == aid)
+                for aid in distinct_appliance_ids
+            )
+        else:
+            tiles = ''.join(_tile(camera) for camera in cameras)
 
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p><h1>Your cameras</h1></div>'
             f'<a class="ghost-button" href="/customer-account">Account</a></header>'
             f'<style>'
             f'.live-grid{{display:grid;grid-template-columns:repeat({columns},minmax(0,1fr));gap:16px}}'
-            f'.live-grid-tile{{display:grid;gap:8px}}'
-            f'.live-grid-tile .camera-view{{aspect-ratio:16/9}}'
-            f'.live-grid-tile-head{{display:flex;align-items:center;justify-content:space-between;gap:8px}}'
+            f'.live-grid-tile{{display:grid;gap:0}}'
+            f'.live-grid-tile .camera-view{{aspect-ratio:16/9;position:relative;overflow:hidden}}'
+            # Friendly name: a small, unobtrusive footer overlay inside
+            # the video frame itself -- tight/flush tiles, no separate
+            # always-visible row outside the image shrinking it.
+            f'.tile-name-overlay{{position:absolute;left:8px;bottom:8px;padding:3px 9px;'
+            f'border-radius:999px;background:rgba(7,12,20,.62);color:#fff;font-size:12px;'
+            f'font-weight:650;letter-spacing:.01em;pointer-events:none;max-width:calc(100% - 60px);'
+            f'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:2}}'
+            # Mic/tools controls: overlaid, hidden until hover/focus
+            # (desktop) or a tap on the tile (touch) -- fades back out
+            # on its own (see the touchend handler below).
+            f'.tile-controls-overlay{{position:absolute;top:8px;right:8px;z-index:3;display:flex;gap:6px;'
+            f'opacity:0;transition:opacity .18s ease;pointer-events:none}}'
+            f'.live-grid-tile:hover .tile-controls-overlay,'
+            f'.live-grid-tile:focus-within .tile-controls-overlay,'
+            f'.live-grid-tile.controls-visible .tile-controls-overlay'
+            f'{{opacity:1;pointer-events:auto}}'
+            # touch-action:none -- stops the browser's own default
+            # touch-gesture handling for a sustained press-and-hold on
+            # this button, so it can never be interpreted as also
+            # targeting the video tile underneath/nearby (the exact
+            # cause of a real "video pauses on mic press, resumes on
+            # release" mobile bug this pairs with pointerdown's own
+            # preventDefault()/stopPropagation()/setPointerCapture()).
+            f'.talk-mic{{touch-action:none}}'
             f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
             f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
+            # Brief, purely visual pulse on the tile AACO just switched
+            # attention to -- no state, removed by its own setTimeout in
+            # _AACO_LIVE_RESULT_JS below. Never applied to more than one
+            # tile at a time, and never changes which camera is actually
+            # streaming -- see that same script's own comment.
+            f'.aaco-highlight{{outline:3px solid var(--brand,#42e4dc);outline-offset:-3px;transition:outline-color .3s ease}}'
             f'@media(max-width:760px){{.live-grid{{grid-template-columns:1fr}}}}'
             f'</style>'
+            f'<section class="panel" style="margin-bottom:16px">'
+            f'<div class="panel-head"><div><h2>Ask AACO</h2></div></div>'
+            + render_aaco_command_panel(
+                id_prefix="aaco-live",
+                on_result_js_fn="aacoLiveHandleResult",
+                placeholder='Ask AACO — e.g. "Show Camera 2" or "Which cameras are offline?"',
+                intro="Switch a camera, open playback or events, or unlock a door -- without leaving this page.",
+            )
+            + f'<div id="aaco-live-result-link" style="margin-top:8px"></div>'
+            f'</section>'
+            f'<script>{_AACO_LIVE_RESULT_JS}</script>'
             f'<section class="live-grid">{tiles}</section>'
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraIds={json.dumps(camera_ids)};
+
+  // Double-click (desktop) or double-tap (touch) opens the focused
+  // camera view (/customer/cameras/{{id}}/live) instead of calling
+  // requestFullscreen() locally on the tile -- that page itself
+  // decides, from this identity's own real entitlements, whether to
+  // stay a simple large view or additionally show the real analytics
+  // row underneath. A single tap on touch just reveals/fades the
+  // overlaid mic/tools controls -- desktop gets the same reveal via
+  // :hover/:focus-within in CSS, no JS needed there.
+  document.querySelectorAll('.live-grid-tile').forEach(tile=>{{
+    tile.addEventListener('dblclick',()=>{{
+      window.location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`;
+    }});
+    let lastTap=0,fadeTimer=null;
+    tile.addEventListener('touchend',event=>{{
+      const now=Date.now();
+      if(now-lastTap<350){{
+        window.location.href=`/customer/cameras/${{tile.dataset.cameraId}}/live`;
+        lastTap=0;
+        return;
+      }}
+      lastTap=now;
+      if(event.target.closest('.camera-tool'))return;
+      tile.classList.add('controls-visible');
+      clearTimeout(fadeTimer);
+      fadeTimer=setTimeout(()=>tile.classList.remove('controls-visible'),3000);
+    }});
+  }});
+
   const pollIntervalMs={POLL_INTERVAL_MS};
   const pollTimeoutMs={POLL_TIMEOUT_MS};
   const tiles={{}};
@@ -302,19 +921,42 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   cameraIds.forEach(id=>{{
     tiles[id]={{
       sessionId:null, hls:null, pollTimer:null, stopped:false,
+      transport:null, p2pConnection:null, startedAt:null,
       video:document.getElementById(`live-grid-video-${{id}}`),
       placeholder:document.getElementById(`live-grid-placeholder-${{id}}`),
       status:document.getElementById(`live-grid-status-${{id}}`),
     }};
   }});
 
+  // Direct P2P vs. relay race: the first transport to actually produce
+  // video "wins" this tile. claimTransport() is the single choke point
+  // both attachPlayer() (relay) and the P2P success handler in
+  // startSession() go through -- returns 'claimed' the first time a
+  // transport wins (report the outcome once), 'already' on that same
+  // transport's own later reconnect/recovery calls (proceed, but don't
+  // re-report), or 'blocked' for the transport that lost the race (tear
+  // itself down, never displace the winner). See live_view_p2p.py's
+  // module docstring for why the relay path must never be delayed or
+  // displaced once it has already won.
+  function claimTransport(id,transport){{
+    const tile=tiles[id];
+    if(tile.transport===transport)return'already';
+    if(tile.transport)return'blocked';
+    tile.transport=transport;
+    return'claimed';
+  }}
+
+  const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
+
   function setStatus(id,text){{tiles[id].status.textContent=text}}
   function stopPolling(id){{if(tiles[id].pollTimer){{clearTimeout(tiles[id].pollTimer);tiles[id].pollTimer=null}}}}
+  function destroyHls(id){{const tile=tiles[id];if(tile.hls){{try{{tile.hls.destroy()}}catch(e){{}}tile.hls=null}}}}
 
   async function stopSession(id,isUnload){{
     const tile=tiles[id];
     if(!tile.sessionId||tile.stopped)return;
     tile.stopped=true;
+    if(tile.p2pConnection){{try{{tile.p2pConnection.close()}}catch(e){{}}tile.p2pConnection=null}}
     const url=`/api/customer/live/sessions/${{tile.sessionId}}/stop`;
     if(isUnload){{try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}}}
     else{{try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}}}
@@ -341,32 +983,104 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     tile.pollTimer=setTimeout(()=>pollPlaylist(id,deadline),pollIntervalMs);
   }}
 
-  function attachPlayer(id,playlistUrl){{
+  function handleFatalError(id,data){{
+    // Fatal-error recovery (2026-09-13): mirrors the single-camera
+    // page's own handleFatalError() -- see that function's own comment
+    // for the full root-cause trace. Scoped per-tile via `tiles[id]` so
+    // one camera's error/recovery cycle can never affect another's.
     const tile=tiles[id];
+    if(tile.stopped)return;
+    tile.recoveryAttempts=(tile.recoveryAttempts||0)+1;
+    if(tile.recoveryAttempts<=MAX_INPLACE_RECOVERY_ATTEMPTS){{
+      setStatus(id,'Reconnecting…');
+      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){{tile.hls.startLoad();return}}
+      if(data.type===Hls.ErrorTypes.MEDIA_ERROR){{tile.hls.recoverMediaError();return}}
+    }}
+    destroyHls(id);
+    tile.placeholder.hidden=false;
+    setStatus(id,'Reconnecting…');
     stopPolling(id);
+    pollPlaylist(id,Date.now()+pollTimeoutMs);
+  }}
+
+  function attachPlayer(id,playlistUrl,transport){{
+    transport=transport||'relay';
+    const tile=tiles[id];
+    const claim=claimTransport(id,transport);
+    if(claim==='blocked'){{stopPolling(id);return}}  // a faster transport already won this tile
+    stopPolling(id);
+    destroyHls(id);  // guards against ever running two instances at once
     setStatus(id,'Connecting…');
     if(window.Hls&&Hls.isSupported()){{
       tile.hls=new Hls();
       tile.hls.loadSource(playlistUrl);
       tile.hls.attachMedia(tile.video);
-      tile.hls.on(Hls.Events.MANIFEST_PARSED,()=>{{tile.placeholder.hidden=true;tile.video.play().catch(()=>{{}})}});
-      tile.hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)setStatus(id,'Reconnecting…')}});
+      tile.hls.on(Hls.Events.MANIFEST_PARSED,()=>{{tile.placeholder.hidden=true;tile.recoveryAttempts=0;tile.video.play().catch(()=>{{}})}});
+      tile.hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(id,data)}});
     }}else if(tile.video.canPlayType('application/vnd.apple.mpegurl')){{
       tile.video.src=playlistUrl;
       tile.video.addEventListener('loadedmetadata',()=>{{tile.placeholder.hidden=true;tile.video.play().catch(()=>{{}})}});
     }}else{{
       setStatus(id,'This browser cannot play live video.');
     }}
+    if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,transport,tile.startedAt?Date.now()-tile.startedAt:null,null);
+  }}
+
+  function attemptP2PForTile(id){{
+    const tile=tiles[id];
+    window.attemptLiveP2P(tile.sessionId).then(result=>{{
+      if(tile.stopped){{try{{result.pc.close()}}catch(e){{}}return}}
+      const claim=claimTransport(id,'p2p');
+      if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
+      stopPolling(id);
+      tile.video.srcObject=result.stream;
+      tile.p2pConnection=result.pc;
+      tile.placeholder.hidden=true;
+      tile.video.play().catch(()=>{{}});
+      if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
+    }}).catch(()=>{{
+      // Disabled/timed out/ICE failed -- the relay poll is already running
+      // in parallel and unaffected; this tile simply resolves via relay
+      // (or, if that also fails, via the existing showUnavailable() path).
+    }});
+  }}
+
+  // Opportunistic fourth transport (2026-09-18): the appliance's own
+  // local HLS, fetched over WireGuard through the cloud gateway instead
+  // of via S3/CloudFront (live_view_wireguard.py). Purely additive and
+  // fire-and-forget, exactly like attemptP2PForTile() above -- never
+  // awaited by startSession(), so it can never delay the relay poll that
+  // starts in the very same tick. A disabled flag, an appliance not on
+  // the controlled allow-list, a down tunnel, or an unreachable gateway
+  // all resolve the same way: this fetch simply never succeeds, and
+  // whichever of relay/P2P wins the race proceeds exactly as it does
+  // today. Uses the SAME attachPlayer()/claimTransport() machinery as
+  // relay (both are plain HLS) rather than duplicating it, so error
+  // recovery (handleFatalError) and instrumentation stay identical.
+  async function attemptWireGuardForTile(id){{
+    const tile=tiles[id];
+    let config;
+    try{{config=await(await fetch('/api/customer/live/wireguard/config')).json()}}catch(e){{return}}
+    if(!config||!config.enabled)return;
+    if(tile.stopped||tile.transport)return;
+    const playlistUrl=`/api/customer/live/sessions/${{tile.sessionId}}/wireguard/playlist.m3u8`;
+    let response;
+    try{{response=await fetch(playlistUrl,{{cache:'no-store'}})}}catch(e){{return}}
+    if(!response||!response.ok)return;  // not enabled for this camera, or gateway/tunnel unavailable
+    if(tile.stopped||tile.transport)return;  // relay or P2P already won while this was in flight
+    attachPlayer(id,playlistUrl,'wireguard');
   }}
 
   async function startSession(id){{
     const tile=tiles[id];
-    tile.stopped=false;setStatus(id,'Starting live view…');
+    tile.stopped=false;tile.recoveryAttempts=0;tile.transport=null;tile.startedAt=Date.now();setStatus(id,'Starting live view…');
     let response;
     try{{response=await fetch(`/api/customer/cameras/${{id}}/live/start`,{{method:'POST'}})}}catch(e){{showUnavailable(id);return}}
     if(!response.ok){{showUnavailable(id);return}}
     const body=await response.json();
     tile.sessionId=body.session_id;
+    attemptP2PForTile(id);
+    attemptWireGuardForTile(id);
     pollPlaylist(id,Date.now()+pollTimeoutMs);
   }}
 
@@ -383,6 +1097,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   document.querySelectorAll('.talk-mic').forEach(button=>{{
     wireTalkMic(button, button.dataset.cameraId);
   }});
+  // Unlock Door: only cameras with door_enabled rendered a button at
+  // all (see _tile()'s own unlock_button gate above), so this simply
+  // wires whatever exists -- no per-tile capability check needed here.
+  document.querySelectorAll('.unlock-door').forEach(button=>{{
+    wireUnlockButton(button, button.dataset.cameraId);
+  }});
   window.addEventListener('pagehide',()=>{{
     cameraIds.forEach(id=>stopSession(id,true));
   }});
@@ -392,6 +1112,178 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 </script>'''
 
         return page_shell('Live view', 'live', content, scripts)
+
+    def _require_customer_owner(request: Request) -> dict:
+        identity = partner_identity(request)
+        if not identity or identity.get('role') != 'customer_owner':
+            raise HTTPException(status_code=403, detail='Customer owner permission required.')
+        return identity
+
+    @app.post('/api/customer/users/{user_id}/camera-access')
+    def set_user_camera_access(request: Request, user_id: str, payload: dict) -> dict:
+        """Customer-owner-only: grants a restricted user (customer_viewer)
+        'all' cameras or an explicit 'selected' list. Takes effect
+        immediately (set_camera_access() deletes and replaces the row set
+        in one call) and never crosses into another customer's users or
+        cameras -- both are re-scoped to identity['customer_id'] here."""
+        identity = _require_customer_owner(request)
+        mode = str(payload.get('mode', '')).strip()
+        if mode not in ACCESS_MODES:
+            raise HTTPException(status_code=400, detail=f"mode must be one of {ACCESS_MODES}.")
+        camera_ids = [str(item) for item in payload.get('camera_ids', [])]
+        with connection() as db:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE id=? AND customer_id=?',
+                (user_id, identity['customer_id']),
+            ).fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail='User not found.')
+            if camera_ids:
+                owned = {row['id'] for row in db.execute(
+                    'SELECT id FROM cameras WHERE customer_id=?', (identity['customer_id'],)
+                ).fetchall()}
+                if not set(camera_ids) <= owned:
+                    raise HTTPException(status_code=400, detail='One or more camera_ids do not belong to this customer.')
+            set_camera_access(db, user_id=user_id, access_mode=mode, camera_ids=camera_ids, now=datetime.now().isoformat())
+        return {'message': 'Camera access updated.', 'mode': mode, 'camera_ids': camera_ids if mode == 'selected' else []}
+
+    @app.delete('/api/customer/users/{user_id}/camera-access/{camera_id}')
+    def remove_user_camera_access(request: Request, user_id: str, camera_id: str) -> dict:
+        identity = _require_customer_owner(request)
+        with connection() as db:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE id=? AND customer_id=?',
+                (user_id, identity['customer_id']),
+            ).fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail='User not found.')
+            remove_camera_access(db, user_id=user_id, camera_id=camera_id)
+        return {'message': 'Camera access removed.'}
+
+    @app.post('/api/customer/cameras/{camera_id}/analytics/{analytic_key}')
+    def assign_camera_analytic(request: Request, camera_id: str, analytic_key: str) -> dict:
+        """Customer-owner-only camera-level entitlement assignment.
+        assign_entitlement() itself enforces the licensed_quantity cap
+        against analytics_subscriptions (see LicenseLimitExceeded) --
+        billing is always the authority on how many camera-seats exist."""
+        identity = _require_customer_owner(request)
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+                (camera_id, identity['customer_id']),
+            ).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail='Camera not found.')
+            try:
+                assign_entitlement(db, camera_id, analytic_key, now=datetime.now().isoformat())
+            except ValueError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+            except LicenseLimitExceeded as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        return {'message': 'Analytic enabled for this camera.'}
+
+    @app.delete('/api/customer/cameras/{camera_id}/analytics/{analytic_key}')
+    def remove_camera_analytic(request: Request, camera_id: str, analytic_key: str) -> dict:
+        identity = _require_customer_owner(request)
+        with connection() as db:
+            camera = db.execute(
+                'SELECT id FROM cameras WHERE id=? AND customer_id=?',
+                (camera_id, identity['customer_id']),
+            ).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail='Camera not found.')
+            remove_entitlement(db, camera_id, analytic_key, now=datetime.now().isoformat())
+        return {'message': 'Analytic removed from this camera.'}
+
+    @app.get('/api/customer/cameras/{camera_id}/analytics')
+    def customer_camera_analytics_enabled(request: Request, camera_id: str) -> dict:
+        """Every analytic the Focused Live View's row can ever show for
+        this camera, each flagged enabled (real results) or not (an
+        upgrade-opportunity card) -- the row is never empty, even for a
+        camera with nothing purchased yet. See
+        customer_analytics_panel.analytics_row_state()'s docstring for the
+        site-level subscription scoping."""
+        identity = partner_identity(request)
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+            return RedirectResponse('/partner-login', status_code=303)
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+            # Per-camera entitlements (camera_analytics_entitlements), not
+            # the site-level analytics_subscriptions billing record -- a
+            # customer with 10 cameras at one site can have LPR on 2 of
+            # them and nothing on the rest. See
+            # customer_analytics_panel's module docstring.
+            entitlements = camera_entitlement_rows(db, camera_id)
+        analytics = analytics_row_state(entitlements)
+        for item in analytics:
+            item['upgrade'] = UPGRADE_CARD_CONTENT[item['key']]
+        return {'analytics': analytics}
+
+    @app.get('/api/customer/cameras/{camera_id}/analytics/{analytic_key}/summary')
+    def customer_camera_analytics_summary(request: Request, camera_id: str, analytic_key: str) -> dict:
+        """Most-recent-useful-results for one selected analytic pill --
+        never the underlying long recording, never every historical
+        detection, just what customer_analytics_panel.summarize() decides
+        is relevant for that analytic type."""
+        identity = partner_identity(request)
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+            return RedirectResponse('/partner-login', status_code=303)
+        try:
+            event_types = event_types_for_analytic(analytic_key)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail='Unknown analytic.') from error
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+            placeholders = ','.join('?' for _ in event_types)
+            rows = db.execute(
+                f'SELECT event_type, confidence, object_count, detections_json, event_timestamp '
+                f'FROM detection_events WHERE camera_id=? AND customer_id=? AND event_type IN ({placeholders}) '
+                f'ORDER BY event_timestamp DESC LIMIT 20',
+                (camera_id, identity['customer_id'], *event_types),
+            ).fetchall()
+        return summarize(analytic_key, [dict(row) for row in rows])
+
+    @app.get('/api/customer/cameras/{camera_id}/status')
+    def customer_camera_status(request: Request, camera_id: str) -> dict:
+        """Honest state for the Live placeholder, checked BEFORE starting
+        a session -- never lets the UI sit on a generic 'Connecting...'
+        for a camera that was never provisioned or whose appliance is
+        known offline. 'unknown' means the camera and appliance both look
+        fine at the DB level; the client's own HLS/manifest polling
+        (already real, not a cached/stale frame -- see
+        camera_status()/get_camera_numbers() in main.py) is what actually
+        confirms a live stream is flowing.
+
+        'degraded' is NOT the same as offline -- health_state()
+        (appliance_protocol.py) sets online_status='degraded' for
+        warnings like low_disk or high_cpu on an appliance that is still
+        heartbeating, still authenticated, and still actively relaying
+        video (confirmed live: an appliance at 91.9% disk usage kept
+        streaming all 5 cameras successfully through the multi-camera
+        grid page throughout). Blocking live view here on 'degraded'
+        alone was the actual bug -- this endpoint previously treated any
+        non-'online' status identically to a genuinely unreachable
+        appliance, which is what silently defeated the dedicated
+        single-camera page while the grid page (no such pre-check)
+        thereby worked. Every other non-'online','degraded' value
+        (offline, revoked, None/NULL, or anything future/unrecognized)
+        still fails closed as appliance_offline -- only these two known,
+        explicitly-modeled "still reachable" states are let through."""
+        identity = partner_identity(request)
+        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+            return RedirectResponse('/partner-login', status_code=303)
+        with connection() as db:
+            camera = _authorized_camera(db, camera_id, identity)
+            if camera.get('camera_number') is None:
+                return {'state': 'not_configured', 'message': 'This camera has not been provisioned yet.'}
+            appliance = db.execute(
+                'SELECT online_status FROM appliances WHERE id=?', (camera.get('appliance_id'),)
+            ).fetchone()
+            if appliance and appliance['online_status'] == 'degraded':
+                return {'state': 'degraded', 'message': 'The appliance is reporting a health warning; live view may be affected.'}
+            if appliance and appliance['online_status'] != 'online':
+                return {'state': 'appliance_offline', 'message': 'The appliance for this camera is offline.'}
+        return {'state': 'unknown'}
 
     @app.get('/customer/cameras/{camera_id}/live', response_class=HTMLResponse)
     def live_view_page(request: Request, camera_id: str):
@@ -405,23 +1297,74 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         # customer_viewer who reaches this page for a camera they're not
         # granted can_live on gets a real 403 from those routes, not a
         # silently-broken page.
-        if not identity or identity.get('role') not in {'customer_owner', 'customer_viewer'}:
+        #
+        # A genuinely unauthenticated visitor (no identity at all) belongs
+        # on the customer-facing login page, not /partner-login, and never
+        # the legacy local-emergency-recovery /login -- that redirect only
+        # ever comes from authentication_middleware's own fallback in
+        # main.py, which this route reaching its own body at all means it
+        # already passed; this check is this route's own, independent
+        # second guard, not a rescue from that middleware. next preserves
+        # the intended destination for a future customer-login-page
+        # enhancement to honor -- not consumed there yet, but harmless to
+        # carry now. A recognized identity with the WRONG role (partner/
+        # administrator navigating here) keeps the exact prior behavior --
+        # /partner-login bounces them to their own portal via
+        # partner_login()'s own already-authenticated redirect --
+        # deliberately unchanged so admin/partner authorization elsewhere
+        # is never weakened by this fix.
+        if not identity:
+            next_url = quote(f'/customer/cameras/{camera_id}/live', safe='')
+            return RedirectResponse(f'/customer-login.html?next={next_url}', status_code=303)
+        if identity.get('role') not in {'customer_owner', 'customer_viewer'}:
             return RedirectResponse('/partner-login', status_code=303)
 
         with connection() as db:
             camera = _authorized_camera(db, camera_id, identity)
+            # Viewer access list for the Camera Settings panel below --
+            # fetched in this same round trip since it's owner-only and
+            # only ever rendered for a door-configured camera anyway (see
+            # the door_enabled check a few lines down). Never queried for
+            # a customer_viewer -- see the same rendering guard.
+            viewers = (
+                [
+                    dict(row) for row in db.execute(
+                        "SELECT u.id AS user_id, u.email, u.name, COALESCE(p.can_unlock,0) AS can_unlock "
+                        "FROM partner_users u LEFT JOIN customer_camera_permissions p ON p.user_id=u.id AND p.camera_id=? "
+                        "WHERE u.customer_id=? AND u.role='customer_viewer' ORDER BY u.email",
+                        (camera_id, identity['customer_id']),
+                    ).fetchall()
+                ]
+                if identity.get('role') == 'customer_owner' and camera.get('door_access_enabled')
+                else []
+            )
 
-        camera_name = camera.get('name') or camera_id
+        camera_name = _camera_display_label(camera)
         start_url = f'/api/customer/cameras/{camera_id}/live/start'
         playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
         talk_state = _talk_down_state(camera.get('talk_down_supported'))
         talk_tooltip = talk_state['tooltip'] or 'Press and hold to talk'
+        # camera came from _authorized_camera()'s own `SELECT *`, so the
+        # door columns (added by the Face Access migration) are already
+        # present here with no extra query.
+        door_enabled = bool(camera.get('door_access_enabled'))
+        unlock_tool_button = (
+            f'<button class="camera-tool unlock-door" id="unlock-door-{escape(camera_id, quote=True)}" '
+            f'data-camera-id="{escape(camera_id, quote=True)}" title="Unlock door" aria-label="Unlock door">🔓</button>'
+            if door_enabled else ''
+        )
 
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}</style>'
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
+            # Camera Hub mobile polish: on a narrow phone screen this
+            # row's ~10 tool buttons no longer force horizontal
+            # scrolling -- they wrap onto additional lines instead,
+            # every tool staying reachable without a sideways swipe.
+            f'@media(max-width:480px){{.camera-tools{{flex-wrap:wrap;overflow-x:visible}}}}'
+            f'</style>'
             f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
             f'<video id="live-view-video" controls muted playsinline></video>'
             f'<div class="camera-placeholder" id="live-view-placeholder">'
@@ -432,7 +1375,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-mute" title="Mute">♪</button>'
             f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
             f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
-            f'{"" if talk_state["enabled"] else "disabled"}>◖</button>'
+            f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
             f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot">◉</button>'
             f'<button class="camera-tool" id="live-view-download" title="Download">⬇</button>'
             f'<button class="camera-tool" id="live-view-share" title="Share">↗</button>'
@@ -441,27 +1384,25 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-bookmark" title="Bookmark">◈</button>'
             f'<button class="camera-tool" id="live-view-stop" title="Stop">◼</button>'
             f'<button class="camera-tool" id="live-view-retry" title="Retry" hidden>↻</button>'
+            f'{unlock_tool_button}'
             f'</div></section>'
-            f'<section class="panel" style="margin-top:16px">'
-            f'<div class="panel-head"><div><h2>Live analytics</h2>'
-            f'<div class="health-detail">No analytics events recorded yet for this camera.</div></div></div>'
-            f'<div class="health-list">'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-motion" style="display:inline-block;margin-right:8px"></i>Motion</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-person" style="display:inline-block;margin-right:8px"></i>Person</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-vehicle" style="display:inline-block;margin-right:8px"></i>Vehicle</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-lpr" style="display:inline-block;margin-right:8px"></i>License plate</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-people_counting" style="display:inline-block;margin-right:8px"></i>People count</span><span class="health-detail">No detections yet</span></div>'
-            f'<div class="health-row"><span class="health-name"><i class="legend-dot event-intrusion" style="display:inline-block;margin-right:8px"></i>Intrusion</span><span class="health-detail">No detections yet</span></div>'
-            f'</div></section>'
+            f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
+            f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
+            f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
+            f'<div id="live-analytics-panel" class="health-list"></div>'
+            f'</section>'
+            + (_door_access_settings_panel(camera, viewers) if identity.get('role') == 'customer_owner' else '')
         )
 
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>
+        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
+  const cameraId={json.dumps(camera_id)};
   const startUrl={json.dumps(start_url)};
   const playlistUrl={json.dumps(playlist_url)};
   const pollIntervalMs={POLL_INTERVAL_MS};
   const pollTimeoutMs={POLL_TIMEOUT_MS};
   const video=document.getElementById('live-view-video');
+  const cameraView=document.querySelector('.camera-view');
   const placeholder=document.getElementById('live-view-placeholder');
   const statusLabel=document.getElementById('live-view-status');
   const muteButton=document.getElementById('live-view-mute');
@@ -472,14 +1413,29 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const bookmarkButton=document.getElementById('live-view-bookmark');
   const stopButton=document.getElementById('live-view-stop');
   const retryButton=document.getElementById('live-view-retry');
-  let sessionId=null, hls=null, pollTimer=null, stopped=false;
+  let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
+  let transport=null, p2pConnection=null, startedAt=null;
+  const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
 
   function setStatus(text){{statusLabel.textContent=text}}
   function stopPolling(){{if(pollTimer){{clearTimeout(pollTimer);pollTimer=null}}}}
+  function destroyHls(){{if(hls){{try{{hls.destroy()}}catch(e){{}}hls=null}}}}
+
+  // Same claim semantics as the multi-camera grid page (live_view_p2p.py's
+  // module docstring): 'claimed' the first time a transport wins (report
+  // once), 'already' on that transport's own later reconnect, 'blocked'
+  // for the transport that lost the race.
+  function claimTransport(t){{
+    if(transport===t)return'already';
+    if(transport)return'blocked';
+    transport=t;
+    return'claimed';
+  }}
 
   async function stopSession(isUnload){{
     if(!sessionId||stopped)return;
     stopped=true;
+    if(p2pConnection){{try{{p2pConnection.close()}}catch(e){{}}p2pConnection=null}}
     const url=`/api/customer/live/sessions/${{sessionId}}/stop`;
     if(isUnload){{
       try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}
@@ -510,30 +1466,109 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     pollTimer=setTimeout(()=>pollPlaylist(deadline),pollIntervalMs);
   }}
 
-  function attachPlayer(){{
+  function handleFatalError(data){{
+    // Fatal-error recovery (2026-09-13): confirmed live -- a brief,
+    // already-self-healing relay/upload gap (the same transient-blip
+    // category documented elsewhere in this project) briefly starved
+    // this camera's manifest, hls.js surfaced that as a fatal error, and
+    // the ONLY thing that used to happen here was setStatus('Reconnecting…')
+    // -- a label change with no actual recovery action, so the player
+    // stayed dead forever even once the underlying stream had fully
+    // recovered server-side. NETWORK_ERROR/MEDIA_ERROR get hls.js's own
+    // documented in-place recovery calls first (bounded by
+    // MAX_INPLACE_RECOVERY_ATTEMPTS, reset on the next successful
+    // MANIFEST_PARSED, so a persistently broken stream doesn't retry
+    // forever in place); anything else -- or exhausting those attempts --
+    // falls back to a full teardown and reattachment through the exact
+    // same bounded playlist-poll flow a fresh page load already uses.
+    // The still-valid live_view_session/relay is never restarted here --
+    // only the browser-side player -- and pollPlaylist's own
+    // pollTimeoutMs deadline is what eventually shows "unavailable" if
+    // the stream genuinely never returns, so no separate give-up path is
+    // needed in this function.
+    if(stopped)return;
+    recoveryAttempts++;
+    if(recoveryAttempts<=MAX_INPLACE_RECOVERY_ATTEMPTS){{
+      setStatus('Reconnecting…');
+      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();return}}
+      if(data.type===Hls.ErrorTypes.MEDIA_ERROR){{hls.recoverMediaError();return}}
+    }}
+    destroyHls();
+    placeholder.hidden=false;
+    setStatus('Reconnecting…');
     stopPolling();
+    pollPlaylist(Date.now()+pollTimeoutMs);
+  }}
+
+  function attachPlayer(url,transport){{
+    url=url||playlistUrl;
+    transport=transport||'relay';
+    const claim=claimTransport(transport);
+    if(claim==='blocked'){{stopPolling();return}}  // a faster transport already won
+    stopPolling();
+    destroyHls();  // guards against ever running two instances at once
     setStatus('Connecting…');
     if(window.Hls&&Hls.isSupported()){{
       hls=new Hls();
-      hls.loadSource(playlistUrl);
+      hls.loadSource(url);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
-      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)setStatus('Reconnecting…')}});
+      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;recoveryAttempts=0;video.play().catch(()=>{{}})}});
+      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(data)}});
     }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
-      video.src=playlistUrl;
+      video.src=url;
       video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
     }}else{{
       setStatus('This browser cannot play live video.');
     }}
+    if(claim==='claimed')reportLiveTransportOutcome(sessionId,transport,startedAt?Date.now()-startedAt:null,null);
+  }}
+
+  function attemptP2P(){{
+    window.attemptLiveP2P(sessionId).then(result=>{{
+      if(stopped){{try{{result.pc.close()}}catch(e){{}}return}}
+      const claim=claimTransport('p2p');
+      if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
+      stopPolling();
+      video.srcObject=result.stream;
+      p2pConnection=result.pc;
+      placeholder.hidden=true;
+      video.play().catch(()=>{{}});
+      if(claim==='claimed')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
+    }}).catch(()=>{{
+      // Disabled/timed out/ICE failed -- the relay poll already running in
+      // parallel is unaffected; resolves via relay or showUnavailable().
+    }});
+  }}
+
+  // Opportunistic fourth transport (2026-09-18): see the multi-camera
+  // grid page's own attemptWireGuardForTile() for the full rationale --
+  // identical shape here, reusing this page's own attachPlayer()/
+  // claimTransport() so error recovery and instrumentation stay
+  // identical to the relay path. Fire-and-forget: never awaited by
+  // startSession(), so it can never delay pollPlaylist()'s own relay
+  // attempt starting in the same tick.
+  async function attemptWireGuard(){{
+    let config;
+    try{{config=await(await fetch('/api/customer/live/wireguard/config')).json()}}catch(e){{return}}
+    if(!config||!config.enabled)return;
+    if(stopped||transport)return;
+    const wireguardUrl=`/api/customer/live/sessions/${{sessionId}}/wireguard/playlist.m3u8`;
+    let response;
+    try{{response=await fetch(wireguardUrl,{{cache:'no-store'}})}}catch(e){{return}}
+    if(!response||!response.ok)return;  // not enabled for this camera, or gateway/tunnel unavailable
+    if(stopped||transport)return;  // relay or P2P already won while this was in flight
+    attachPlayer(wireguardUrl,'wireguard');
   }}
 
   async function startSession(){{
-    stopped=false;retryButton.hidden=true;setStatus('Starting live view…');
+    stopped=false;recoveryAttempts=0;transport=null;startedAt=Date.now();retryButton.hidden=true;setStatus('Starting live view…');
     let response;
     try{{response=await fetch(startUrl,{{method:'POST'}})}}catch(e){{showUnavailable();return}}
     if(!response.ok){{showUnavailable();return}}
     const body=await response.json();
     sessionId=body.session_id;
+    attemptP2P();
+    attemptWireGuard();
     pollPlaylist(Date.now()+pollTimeoutMs);
   }}
 
@@ -554,10 +1589,26 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   }});
   downloadButton.addEventListener('click',()=>comingSoon('Download applies to recorded clips in Playback'));
   shareButton.addEventListener('click',()=>comingSoon('Share'));
-  analyticsButton.addEventListener('click',()=>comingSoon('Live analytics'));
+  analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
   bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
-  stopButton.addEventListener('click',()=>{{stopPolling();if(hls)hls.destroy();stopSession(false)}});
+  stopButton.addEventListener('click',()=>{{stopPolling();destroyHls();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
+
+  // Real browser fullscreen (double-click on desktop, double-tap on
+  // touch) on the camera-view frame itself -- the grid's own tile
+  // double-click/double-tap navigates here instead of calling
+  // requestFullscreen() directly, so this Focused Live View page is
+  // the one place that capability lives. .catch(()=>{{}}) is
+  // deliberate: a browser that denies or lacks the Fullscreen API
+  // (e.g. iOS Safari on some elements) silently no-ops rather than
+  // surfacing an error -- the video keeps playing normally either way.
+  let lastVideoTap=0;
+  cameraView.addEventListener('dblclick',()=>{{if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}})}});
+  cameraView.addEventListener('touchend',()=>{{
+    const now=Date.now();
+    if(now-lastVideoTap<350&&cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
+    lastVideoTap=now;
+  }});
 
   // Push-to-talk: press-and-hold only, real mic capture, no always-open
   // duplex mode. This button already reflects the server-persisted
@@ -568,9 +1619,170 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
   wireTalkMic(talkButton, {json.dumps(camera_id)});
 
+  // Unlock Door: the button only exists in the DOM at all when this
+  // camera is door-enabled (see live_view_page()'s own unlock_tool_button
+  // gate above) -- null here just means "not a door camera".
+  const unlockButton=document.getElementById({json.dumps('unlock-door-' + camera_id)});
+  if(unlockButton)wireUnlockButton(unlockButton,{json.dumps(camera_id)});
+
+  // Camera Settings -- Face Access: this whole section only ever
+  // renders for identity.role==='customer_owner' (see live_view_page()'s
+  // own call site), so every element below is null for a customer_viewer
+  // and each handler is skipped rather than wired.
+  const doorEnabledCheckbox=document.getElementById('door-access-enabled');
+  const doorFields=document.getElementById('door-access-fields');
+  const doorRelayChannel=document.getElementById('door-relay-channel');
+  const doorRelayPulseMs=document.getElementById('door-relay-pulse-ms');
+  const saveDoorAccessButton=document.getElementById('save-door-access');
+  if(doorEnabledCheckbox){{
+    doorEnabledCheckbox.addEventListener('change',()=>{{
+      doorFields.hidden=!doorEnabledCheckbox.checked;
+    }});
+  }}
+  if(saveDoorAccessButton){{
+    saveDoorAccessButton.addEventListener('click',async()=>{{
+      const enabled=doorEnabledCheckbox.checked;
+      const payload={{door_access_enabled:enabled}};
+      if(enabled){{
+        payload.door_relay_channel=parseInt(doorRelayChannel.value,10);
+        const pulseRaw=doorRelayPulseMs.value.trim();
+        payload.door_relay_pulse_ms=pulseRaw?parseInt(pulseRaw,10):{relay_control.DEFAULT_PULSE_MS};
+      }}
+      saveDoorAccessButton.disabled=true;
+      let response,data;
+      try{{
+        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config`,{{
+          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),
+        }});
+        data=await response.json().catch(()=>({{}}));
+      }}catch(e){{
+        saveDoorAccessButton.disabled=false;
+        showToast('Could not save Face Access settings.');
+        return;
+      }}
+      saveDoorAccessButton.disabled=false;
+      if(!response.ok){{showToast(data.detail||'Could not save Face Access settings.');return}}
+      showToast(data.message||'Face Access settings saved.');
+      setTimeout(()=>location.reload(),700);
+    }});
+  }}
+
+  // Viewer access ("who can press Unlock Door") -- only present at all
+  // when this camera is already door-configured (see
+  // _door_access_settings_panel()'s own guard), so a null
+  // saveUnlockAccessButton here just means "not a door yet", same
+  // pattern as every other optional element on this page.
+  const saveUnlockAccessButton=document.getElementById('save-unlock-access');
+  if(saveUnlockAccessButton){{
+    saveUnlockAccessButton.addEventListener('click',async()=>{{
+      const userIds=[...document.querySelectorAll('.unlock-viewer-toggle:checked')].map(box=>box.dataset.userId);
+      saveUnlockAccessButton.disabled=true;
+      let response,data;
+      try{{
+        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config/unlock-access`,{{
+          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_ids:userIds}}),
+        }});
+        data=await response.json().catch(()=>({{}}));
+      }}catch(e){{
+        saveUnlockAccessButton.disabled=false;
+        showToast('Could not save unlock access.');
+        return;
+      }}
+      saveUnlockAccessButton.disabled=false;
+      if(!response.ok){{showToast(data.detail||'Could not save unlock access.');return}}
+      showToast(data.message||'Unlock access saved.');
+    }});
+  }}
+
   window.addEventListener('pagehide',()=>{{stopSession(true)}});
 
-  startSession();
+  // Focused Live View's switchable analytics row (punch-list item 1).
+  // The video itself is never paused/reloaded by any of this -- switching
+  // pills only swaps the summary panel below it.
+  const analyticsSection=document.getElementById('live-analytics-section');
+  const analyticsPills=document.getElementById('live-analytics-pills');
+  const analyticsPanel=document.getElementById('live-analytics-panel');
+  let activeAnalytic=null;
+  let analyticsByKey={{}};
+
+  function renderUpgradeCard(key){{
+    const info=analyticsByKey[key].upgrade;
+    const benefits=info.benefits.map(item=>`<li>${{item}}</li>`).join('');
+    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{info.description}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><button class="action-button" id="upgrade-request-${{key}}">Request Upgrade</button><button class="ghost-button" id="upgrade-add-${{key}}">Add to This Camera</button><button class="ghost-button" id="upgrade-learn-${{key}}">Learn More</button></div></div>`;
+    document.getElementById(`upgrade-request-${{key}}`).addEventListener('click',()=>comingSoon('Upgrade requests are coming soon -- contact your partner for now.'));
+    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',()=>comingSoon('Adding analytics directly from Live View is coming soon.'));
+    document.getElementById(`upgrade-learn-${{key}}`).addEventListener('click',()=>comingSoon(analyticsByKey[key].label+': '+info.description));
+  }}
+
+  function renderAnalyticsSummary(key,data){{
+    if(key==='lpr'){{
+      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest plate</span><span class="health-detail">${{data.latest_plate||'No plates read yet'}}</span></div><div class="health-row"><span class="health-name">Confidence</span><span class="health-detail">${{data.latest_confidence!=null?data.latest_confidence+'%':'—'}}</span></div><div class="health-row"><span class="health-name">Recent</span><span class="health-detail">${{data.recent.length}} recent detection(s)</span></div>`;
+    }}else if(key==='people_counting'){{
+      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest count</span><span class="health-detail">${{data.latest_count!=null?data.latest_count:'No counts yet'}}</span></div><div class="health-row"><span class="health-name">Entries / exits</span><span class="health-detail">${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}</span></div>`;
+    }}else if(key==='ppe'){{
+      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest status</span><span class="health-detail">${{data.latest_status||'No PPE events yet'}}</span></div><div class="health-row"><span class="health-name">As of</span><span class="health-detail">${{data.latest_timestamp||'—'}}</span></div>`;
+    }}else{{
+      const rows=data.recent.map(item=>`<div class="health-row"><span class="health-name">${{item.event_type||'motion'}}</span><span class="health-detail">${{item.timestamp||''}}</span></div>`).join('')||'<div class="health-row"><span class="health-detail">No motion/person/vehicle events yet</span></div>';
+      analyticsPanel.innerHTML=rows;
+    }}
+  }}
+
+  async function selectAnalytic(key){{
+    activeAnalytic=key;
+    [...analyticsPills.children].forEach(pill=>{{
+      const isActive=pill.dataset.key===key;
+      pill.classList.toggle('active',isActive);
+      pill.setAttribute('aria-selected',isActive?'true':'false');
+    }});
+    if(!analyticsByKey[key].enabled){{renderUpgradeCard(key);return}}
+    analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Loading…</span></div>';
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics/${{key}}/summary`);
+      if(!response.ok)throw new Error('summary request failed');
+      renderAnalyticsSummary(key,await response.json());
+    }}catch(e){{
+      analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Analytics data is temporarily unavailable.</span></div>';
+    }}
+  }}
+
+  async function loadEnabledAnalytics(){{
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics`);
+      if(!response.ok)return;
+      const {{analytics}}=await response.json();
+      if(!analytics.length)return;
+      analyticsByKey={{}};
+      analytics.forEach(item=>{{analyticsByKey[item.key]=item}});
+      // Every analytic always gets a pill -- enabled ones show real
+      // results, disabled ones show an upgrade card (punch-list:
+      // "no dead space, never leave the analytics section blank").
+      analyticsPills.innerHTML=analytics.map(item=>`<button type="button" class="filter" role="tab" data-key="${{item.key}}">${{item.label}}${{item.enabled?'':' <span class="pill wait" style="margin-left:4px">Upgrade</span>'}}</button>`).join('');
+      [...analyticsPills.children].forEach(pill=>pill.addEventListener('click',()=>selectAnalytic(pill.dataset.key)));
+      analyticsSection.hidden=false;
+      const firstEnabled=analytics.find(item=>item.enabled);
+      selectAnalytic((firstEnabled||analytics[0]).key);  // one panel active at a time, default to the first real analytic if any is enabled
+    }}catch(e){{}}
+  }}
+
+  async function checkCameraStatusThenStart(){{
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/status`);
+      if(response.ok){{
+        const {{state,message}}=await response.json();
+        if(state==='not_configured'){{setStatus(message||'Not configured');placeholder.hidden=false;return}}
+        if(state==='appliance_offline'){{setStatus(message||'Appliance offline');placeholder.hidden=false;return}}
+        // 'degraded' is a health warning (e.g. low disk), not an outage --
+        // the appliance is still heartbeating and relaying, so live view
+        // proceeds normally; the warning is only surfaced as a transient
+        // status line, never blocking startSession() below.
+        if(state==='degraded'){{setStatus(message||'Appliance health warning -- starting live view…')}}
+      }}
+    }}catch(e){{}}
+    startSession();
+  }}
+
+  checkCameraStatusThenStart();
+  loadEnabledAnalytics();
 }})();
 </script>'''
 

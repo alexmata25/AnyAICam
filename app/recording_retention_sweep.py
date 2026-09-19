@@ -73,9 +73,22 @@ def _expired_candidates(db, now: datetime) -> list[dict]:
     retention_days AND whose own started_at is older than that many
     days. Computed per-row in Python -- retention_days varies per
     customer, not expressible as a single static SQL WHERE clause --
-    rather than a per-plan-tier UNION query."""
+    rather than a per-plan-tier UNION query.
+
+    event_media candidates are restricted to ROOT rows only
+    (source_media_id IS NULL) -- see db_migrations.py's own comment on
+    that column. A shared row (a correlated Smart Motion event
+    referencing its base Motion event's own uploaded clip) is a
+    reference, never an owner, of its S3 object: it must never
+    independently select itself for deletion, and must never trigger
+    its own S3 delete_object call. Its lifetime is tied to its root's
+    -- see run_retention_sweep_tick() below, which deletes every row
+    sharing a deleted root's own id in the SAME pass, only after that
+    root's own S3 object is confirmed deleted."""
     candidates = []
-    for row in db.execute("SELECT id, customer_id, s3_key, started_at FROM recordings WHERE status='available'").fetchall():
+    rows = list(db.execute("SELECT id, customer_id, s3_key, started_at, 'recording' AS kind FROM recordings WHERE status='available'").fetchall())
+    rows += list(db.execute("SELECT id, customer_id, s3_key, started_at, 'event_media' AS kind FROM detection_event_media WHERE source_media_id IS NULL").fetchall())
+    for row in rows:
         retention_days = _customer_retention_days(db, row["customer_id"])
         if retention_days is None:
             continue
@@ -135,9 +148,25 @@ def run_retention_sweep_tick(now: datetime | None = None) -> dict:
     deleted = 0
     for candidate in candidates:
         if not _delete_recording_object(candidate["s3_key"]):
+            # S3 deletion not confirmed -- leave every DB record (this
+            # root row, and any shared rows referencing it below)
+            # completely untouched. The next tick retries from the same
+            # state; a database record must never be removed ahead of
+            # its own confirmed physical deletion.
             continue
         with connection() as db:
-            db.execute("DELETE FROM recordings WHERE id=?", (candidate["id"],))
+            table = "recordings" if candidate["kind"] == "recording" else "detection_event_media"
+            if table == "detection_event_media":
+                # This candidate is always a ROOT row (source_media_id
+                # IS NULL, enforced by _expired_candidates()'s own
+                # query) -- its S3 object is now confirmed gone, so
+                # every row that shares it (a correlated Smart Motion
+                # event's own reference) is deleted in this SAME
+                # transaction. A shared row never gets its own
+                # _delete_recording_object() call: it owns no S3 object
+                # of its own to delete, only a reference to this one.
+                db.execute("DELETE FROM detection_event_media WHERE source_media_id=?", (candidate["id"],))
+            db.execute(f"DELETE FROM {table} WHERE id=?", (candidate["id"],))
         deleted += 1
         logger.info(
             "recording_retention.deleted recording_id=%s customer_id=%s",

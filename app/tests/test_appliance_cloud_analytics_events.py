@@ -279,3 +279,87 @@ def test_missing_required_field_is_rejected(client, db_path, monkeypatch):
 
     assert response.status_code == 400
     assert _count(db_path) == 0
+
+
+# ----------------------------------------- Face Access door_notify_message fanout
+
+
+def _seed_notifiable_owner(db, customer_id="cust-1"):
+    now = "2026-08-21T00:00:00"
+    db.execute(
+        "INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at,account_status) "
+        "VALUES('owner-1','partner-1','owner@example.test','Owner','customer_owner',?,1,?,?,'active')",
+        (password_hash("x"), customer_id, now),
+    )
+
+
+def test_facial_recognition_event_with_notify_message_creates_a_customer_notification(client, db_path, monkeypatch):
+    monkeypatch.setattr(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _seed_notifiable_owner(db)
+
+    response = client.post(
+        "/api/appliance/analytics/cam-1/events",
+        headers=_auth_headers("appl-1", "test-credential"),
+        json=_valid_payload(
+            event_type="facial_recognition",
+            detections=[{"match_state": "known", "matched_person_id": "p1", "matched_person_name": "Bob", "door_notify_message": "Bob is at Front Door."}],
+        ),
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            notification = db.execute("SELECT * FROM notifications WHERE user_id='owner-1'").fetchone()
+    assert notification is not None
+    assert notification["message"] == "Bob is at Front Door."
+
+
+def test_facial_recognition_event_without_notify_message_never_notifies(client, db_path, monkeypatch):
+    """Mode 1 (an authorized automatic unlock, or a non-door facial-
+    recognition camera): the edge never sets door_notify_message, and
+    this route must not fan out a notification for it -- the
+    detection_events/facial_events rows are still stored either way
+    (proven by test_authenticated_valid_event_is_accepted_and_stored's
+    own sibling coverage), only the customer-facing alert is skipped."""
+    monkeypatch.setattr(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _seed_notifiable_owner(db)
+
+    response = client.post(
+        "/api/appliance/analytics/cam-1/events",
+        headers=_auth_headers("appl-1", "test-credential"),
+        json=_valid_payload(
+            event_type="facial_recognition",
+            detections=[{"match_state": "known", "matched_person_id": "p1", "matched_person_name": "Bob", "door_notify_message": None}],
+        ),
+    )
+    assert response.status_code == 200
+    row = _row_for(db_path, "cam-1", "local-evt-abc123")
+    assert row is not None, "the detection_events row must still be stored"
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            notification = db.execute("SELECT * FROM notifications WHERE user_id='owner-1'").fetchone()
+    assert notification is None
+
+
+def test_non_facial_event_types_are_completely_unaffected_by_the_notify_message_gate(client, db_path, monkeypatch):
+    monkeypatch.setattr(appliance_cloud, "ANALYTICS_SYNC_ENABLED", True)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed(db, "appl-1", "AIC-TEST0001", "test-credential", "cam-1")
+            _seed_notifiable_owner(db)
+
+    response = client.post(
+        "/api/appliance/analytics/cam-1/events",
+        headers=_auth_headers("appl-1", "test-credential"),
+        json=_valid_payload(event_type="ppe"),
+    )
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            notification = db.execute("SELECT * FROM notifications WHERE user_id='owner-1'").fetchone()
+    assert notification is not None

@@ -85,18 +85,63 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
     import boto3
+    from boto3.s3.transfer import TransferConfig
+    from botocore.exceptions import ClientError
 except ImportError:
     boto3 = None
+    TransferConfig = None
+    ClientError = None
 
 logger = logging.getLogger("anyaicam.recording_uploader")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
 RECORDING_UPLOAD_ENABLED = os.environ.get("ANYAICAM_RECORDING_UPLOAD_ENABLED", "false").strip().lower() == "true"
+
+# Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
+# same rationale as event_media_uploader.EVENT_MEDIA_CACHE_CONTROL -- a
+# finished recording segment (and its thumbnail) is uploaded exactly once
+# and never modified afterward, so it is always safe to mark long-lived
+# and immutable. Defined separately here (not imported from
+# event_media_uploader) to avoid introducing a cross-module import between
+# two modules this codebase's own docs already describe as deliberately
+# "distinct from, and unrelated to" each other.
+RECORDING_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
+# Unset (the default, None) means "no restriction" -- this must never
+# narrow existing behavior for a caller that doesn't set it. A comma-
+# separated allowlist (e.g. "1") lets a single camera be validated in
+# production before this is widened to the rest -- a camera_number
+# outside this set is skipped entirely in recording_upload_worker()'s
+# own loop below, before _ensure_session() is ever called for it, so an
+# out-of-scope camera generates zero credential/upload traffic of any
+# kind. Mirrors analytics_sync.py's own SYNC_CAMERA_SCOPE exactly.
+_raw_camera_scope = os.environ.get("ANYAICAM_RECORDING_UPLOAD_CAMERAS", "").strip()
+RECORDING_UPLOAD_CAMERA_SCOPE: frozenset[int] | None = (
+    frozenset(int(item) for item in _raw_camera_scope.split(",") if item.strip().isdigit())
+    if _raw_camera_scope
+    else None
+)
+# Unset (the default, None) means "no total limit" -- existing production
+# behavior (drain the whole backlog over time) is completely unchanged
+# for anyone who doesn't set this. When set, this is a HARD, total,
+# process-lifetime cap per camera -- unlike RECORDING_UPLOAD_MAX_FILES_
+# PER_SCAN below (which only bounds one scan's own attempt count, so an
+# indefinitely-running worker still eventually drains an entire
+# backlog), this makes recording_upload_worker() stop calling
+# _relay_camera_once() for a camera entirely, for the rest of this
+# process's life, the moment _uploaded_files already has this many
+# successfully-uploaded filenames recorded for it -- regardless of how
+# many scans run or how long the worker keeps running. Built for exactly
+# one purpose: a controlled, one-recording validation window that
+# can't accidentally sweep up a historical backlog even if left running
+# longer than intended.
+RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA = (
+    int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA", "").strip() or 0) or None
+)
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
@@ -105,6 +150,37 @@ AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "
 # RECORDINGS_FOLDER constant exactly -- this must always agree with where
 # start_recording() actually writes, not be independently configurable.
 RECORDINGS_FOLDER = Path("/app/recordings")
+# The same file main.py's store_motion_event() already writes to
+# (MotionEventModel JSON lines: id/camera/start_time/end_time/...),
+# read-only here -- never written or modified by this module.
+MOTION_EVENTS_FILE = RECORDINGS_FOLDER / "motion_events.jsonl"
+# Must match start_recording()'s own "-segment_time 300" in main.py exactly
+# -- the fixed nominal duration of every completed segment, used to compute
+# each segment's [start, start+duration) window for the motion gate below.
+RECORDING_SEGMENT_SECONDS = 300
+# Symmetric-by-default context padding applied to each real motion event
+# before checking whether it overlaps a segment, so an uploaded segment
+# includes a few seconds of lead-in/lead-out around the actual motion, not
+# just the exact detected window. Independently configurable.
+MOTION_UPLOAD_PRE_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_PRE_PADDING_SECONDS", "15")))
+MOTION_UPLOAD_POST_PADDING_SECONDS = max(0, int(os.environ.get("ANYAICAM_MOTION_UPLOAD_POST_PADDING_SECONDS", "15")))
+# Optional, opt-in-only per-camera daily ceiling on continuous-segment
+# cloud uploads -- NOT applied to Hybrid ('motion') at all (that mode
+# no longer uploads continuous segments to cloud in any volume, see
+# recording_upload_worker()'s own gate below: event clips/thumbnails,
+# a completely separate pipeline in event_media_uploader.py, are
+# Hybrid's only cloud media). Relevant only to the Continuous/Cloud
+# tier, and only when an RDM administrator has explicitly configured
+# one for a specific customer (event_media_policy.cloud_policy_for_
+# customer()'s own default is None/no cap -- that tier's whole product
+# purpose is unlimited, customer-paid-for continuous cloud recording).
+# None here means "no cap in effect"; synced down every _refresh_
+# camera_map() poll via GET /api/appliance/configuration's top-level
+# cloud_policy field (appliance_cloud.py), the same channel cloud_
+# recording_mode/analytics entitlements already use. Local recording/
+# analytics/notifications are unaffected regardless -- this module only
+# ever decides which already-recorded local segments also get uploaded.
+_daily_cloud_seconds: int | None = None
 SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SCAN_SECONDS", "30.0")))
 CONFIG_REFRESH_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_CONFIG_REFRESH_SECONDS", "300.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_SESSION_RENEW_MARGIN_SECONDS", "120")))
@@ -125,14 +201,53 @@ TRANSCODE_THREADS = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_THRE
 TRANSCODE_TIMEOUT_SECONDS = max(60, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_TIMEOUT_SECONDS", "600")))
 TRANSCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_RECORDING_TRANSCODE_MAX_CONCURRENCY", "1")))
 
+# ExpiredToken/RequestExpired/InvalidToken: AWS's own vocabulary for "this
+# credential set itself is no good any more" -- as opposed to a one-off
+# network blip, a single corrupt file, or an S3 permission/bucket problem,
+# none of which mean every other pending file will also fail the exact
+# same way. Retrying the identical (bad) session against every remaining
+# file in a scan wastes calls and floods logs for no benefit -- see
+# _relay_camera_once()'s own handling below.
+#
+# 2026-09-03 correction: a real ExpiredToken from client.upload_file()
+# (the high-level, multipart-capable method _upload_recording() actually
+# calls) never arrives as a raw ClientError. boto3's own S3Transfer.
+# upload_file() catches it internally and re-raises as
+# boto3.exceptions.S3UploadFailedError(f"Failed to upload {filename} to
+# {bucket}/{key}: {e}") -- a bare `raise NewError(...)` inside the
+# `except ClientError as e:` block, which does NOT inherit from
+# ClientError (MRO: S3UploadFailedError -> Boto3Error -> Exception) but
+# DOES get e attached as __context__ via Python's own implicit exception
+# chaining (no `from e` was used, so __cause__ stays None -- __context__
+# is what's actually set). _classify_credential_error() below is what
+# actually recovers the real code from either shape; CREDENTIAL_ERROR_CODES
+# itself stays just the set of codes to recognize once found.
+CREDENTIAL_ERROR_CODES = frozenset({"ExpiredToken", "RequestExpired", "InvalidToken"})
+RECORDING_UPLOAD_MAX_BACKOFF_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_BACKOFF_SECONDS", "600")))
+# Bounds how many files one camera's scan will actually attempt to
+# codec-detect/remux-or-transcode/upload in a single pass -- a large
+# backlog (uploader off for days, or credentials broken for a while)
+# drains across several scans instead of one scan occupying its
+# asyncio.to_thread() worker for an unbounded amount of time. Nothing is
+# ever dropped: files beyond this cap simply remain pending and are
+# picked up on a later scan, exactly like any other not-yet-uploaded file.
+RECORDING_UPLOAD_MAX_FILES_PER_SCAN = max(1, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MAX_FILES_PER_SCAN", "5")))
+# boto3's own default (10) is never explicitly set anywhere in this file
+# otherwise -- start conservatively; can be raised later once real
+# Samsung/network behavior under load has been measured.
+RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY", "2")))
+
 recording_upload_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_config_refresh_at": None, "last_error": None}
 
 _lock = threading.Lock()
-_camera_map: dict[int, dict] = {}          # camera_number -> {"camera_id":..., "site_id":...}, refreshed periodically
+_camera_map: dict[int, dict] = {}          # camera_number -> {"camera_id":..., "site_id":..., "people_counting_enabled":..., "smart_motion_enabled":..., "lpr_enabled":..., "ppe_enabled":...}, refreshed periodically
 _sessions: dict[int, dict] = {}            # camera_number -> {credentials, bucket, key_prefix, expires_at}
+_clients: dict[int, object] = {}           # camera_number -> cached boto3 S3 client -- always rebuilt together with _sessions' own entry, never reused across a credential refresh
+_camera_backoff: dict[int, dict] = {}      # camera_number -> {"consecutive_failures": int, "next_retry_at": float (time.monotonic())} -- credential-failure backoff only, see _record_credential_failure()
 _uploaded_files: dict[int, list[str]] = {}  # camera_number -> successfully uploaded+notified filenames (bounded)
 _unsupported_codec_files: dict[int, set[str]] = {}  # camera_number -> filenames already logged as unsupported/undetected this process lifetime -- avoids re-probing/re-logging the same permanently-bad file every scan
 _transcode_semaphore = threading.Semaphore(TRANSCODE_MAX_CONCURRENCY)
+_UPLOAD_TRANSFER_CONFIG = TransferConfig(max_concurrency=RECORDING_UPLOAD_MULTIPART_MAX_CONCURRENCY) if TransferConfig is not None else None
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -198,10 +313,31 @@ def _control_plane_get(path: str) -> dict | None:
 
 def _refresh_camera_map() -> None:
     """Polls the existing, unchanged GET /api/appliance/configuration for
-    this appliance's own camera_number -> camera_id/site_id mapping.
-    Never writes anything; a failed/unreachable poll just leaves the
-    previous mapping in place, so a transient network blip never stops
-    already-known cameras from continuing to upload."""
+    this appliance's own camera_number -> camera_id/site_id/cloud_recording_
+    mode mapping. Never writes anything; a failed/unreachable poll just
+    leaves the previous mapping in place, so a transient network blip
+    never stops already-known cameras from continuing to upload.
+
+    cloud_recording_mode is carried through here (aliased as
+    'recording_mode' in the API response -- see appliance_cloud.py's
+    appliance_configuration()) because it's this camera's own per-camera
+    cloud-upload entitlement, read live off this same cached map by
+    event_media_uploader.upload_motion_event_media() exactly the way
+    main.py's people_counting_worker() already reads its own per-camera
+    entitlement (people_counting_enabled) off this identical map -- one
+    shared cache, not a second one.
+
+    2026-09-16: people_counting_enabled/smart_motion_enabled/lpr_enabled/
+    ppe_enabled are now genuinely included in this mapping. Before this
+    fix, people_counting_worker()'s own docstring already claimed it read
+    people_counting_enabled "off this identical map", but this function
+    never actually put that key into the dict it built -- every read of
+    it was silently None/False, meaning People Counting could never
+    become entitled on any camera through this path regardless of what
+    RDM/the admin route set, a real gap that predates this fix and had
+    no test coverage on this exact map. lpr.is_camera_enabled() and
+    ppe.is_camera_enabled() now consult the same 3 new keys the same
+    way."""
     response = _control_plane_get("/api/appliance/configuration")
     if not isinstance(response, dict):
         return
@@ -221,10 +357,27 @@ def _refresh_camera_map() -> None:
             continue
         if not isinstance(site_id, str) or not site_id.strip():
             continue
-        mapping[camera_number] = {"camera_id": camera_id, "site_id": site_id}
+        cloud_recording_mode = item.get("recording_mode")
+        mapping[camera_number] = {
+            "camera_id": camera_id,
+            "site_id": site_id,
+            "cloud_recording_mode": cloud_recording_mode if isinstance(cloud_recording_mode, str) else None,
+            "people_counting_enabled": bool(item.get("people_counting_enabled")),
+            "smart_motion_enabled": bool(item.get("smart_motion_enabled")),
+            "lpr_enabled": bool(item.get("lpr_enabled")),
+            "ppe_enabled": bool(item.get("ppe_enabled")),
+        }
+    cloud_policy = response.get("cloud_policy")
+    daily_cloud_seconds = (
+        cloud_policy.get("daily_cloud_seconds")
+        if isinstance(cloud_policy, dict) and isinstance(cloud_policy.get("daily_cloud_seconds"), int)
+        else None
+    )
     with _lock:
         _camera_map.clear()
         _camera_map.update(mapping)
+        global _daily_cloud_seconds
+        _daily_cloud_seconds = daily_cloud_seconds
     recording_upload_state["last_config_refresh_at"] = datetime.now().isoformat()
 
 
@@ -236,6 +389,40 @@ def _known_camera_numbers() -> list[int]:
 def _camera_identity(camera_number: int) -> dict | None:
     with _lock:
         return _camera_map.get(camera_number)
+
+
+def _current_daily_cloud_seconds() -> int:
+    with _lock:
+        return _daily_cloud_seconds
+
+
+def _local_daily_seconds_used(camera_number: int, day: str) -> int:
+    """Real, DB-backed (not in-memory) seconds already uploaded for this
+    camera today -- survives a container/service restart exactly
+    because it lives in the appliance's own local SQLite, not a
+    process-lifetime dict like _uploaded_files above. Keyed by the
+    calendar date the upload actually happened (the appliance's own
+    local time, matching every other date-scoped concept in this
+    codebase, e.g. motion_events.jsonl's own naive-local-time
+    convention) -- a new day starts at 0 automatically, no explicit
+    reset job needed anywhere."""
+    from partner_db import connection
+    with connection() as db:
+        row = db.execute(
+            "SELECT seconds_uploaded FROM camera_cloud_upload_daily WHERE camera_number=? AND upload_date=?",
+            (camera_number, day),
+        ).fetchone()
+    return int(row["seconds_uploaded"]) if row else 0
+
+
+def _record_local_cloud_upload_seconds(camera_number: int, day: str, seconds: int) -> None:
+    from partner_db import connection
+    with connection() as db:
+        db.execute(
+            "INSERT INTO camera_cloud_upload_daily(camera_number,upload_date,seconds_uploaded,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(camera_number,upload_date) DO UPDATE SET seconds_uploaded=seconds_uploaded+excluded.seconds_uploaded,updated_at=excluded.updated_at",
+            (camera_number, day, seconds, datetime.now().isoformat()),
+        )
 
 
 def _session_expires_soon(session: dict) -> bool:
@@ -295,7 +482,129 @@ def _ensure_session(camera_number: int, camera_id: str) -> dict | None:
         "expires_at": expiration,
     }
     _sessions[camera_number] = session
+    # A freshly (re-)issued session invalidates whatever S3 client was
+    # built from the previous one -- that client has the old credentials
+    # baked in at construction time. _ensure_client() rebuilds on demand.
+    _clients.pop(camera_number, None)
     return session
+
+
+def _ensure_client(camera_number: int, session: dict):
+    """One boto3 S3 client per camera, reused for every file in a scan --
+    rather than the previous per-file construction. Tied 1:1 to the
+    currently cached session: _ensure_session() clears this entry
+    whenever it issues a new session, and _invalidate_session() below
+    clears both together on a credential-class failure, so this can
+    never silently outlive the credentials it was built from."""
+    client = _clients.get(camera_number)
+    if client is not None:
+        return client
+    if boto3 is None:
+        return None
+    if not AWS_REGION:
+        # Confirmed live twice now (Phase C's real-hardware validation,
+        # then independently again in live_relay_uploader.py): an empty
+        # AWS_REGION/AWS_DEFAULT_REGION silently builds
+        # https://s3..amazonaws.com (the double dot is the empty region)
+        # and every upload fails with a cryptic "Invalid endpoint" deep
+        # inside boto3, with no indication why. Fail loud and specific
+        # here instead, before ever constructing the client -- the
+        # appliance's own operator/logs get an unambiguous configuration
+        # error the moment upload is attempted, not a mysterious network
+        # failure.
+        raise RuntimeError(
+            "AWS_REGION (or AWS_DEFAULT_REGION) is not configured. "
+            "Refusing to construct an S3 client with an empty region -- "
+            "this would otherwise build an invalid https://s3..amazonaws.com "
+            "endpoint and fail uploads with no clear reason. Set AWS_REGION "
+            "in this appliance's environment before enabling recording upload."
+        )
+    creds = session["credentials"]
+    client = boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        aws_access_key_id=creds["access_key_id"],
+        aws_secret_access_key=creds["secret_access_key"],
+        aws_session_token=creds["session_token"],
+    )
+    _clients[camera_number] = client
+    return client
+
+
+def _invalidate_session(camera_number: int) -> None:
+    """Called on a credential-class S3 failure (ExpiredToken/
+    RequestExpired/InvalidToken) -- discards both the cached session and
+    its client together, so the next attempt for this camera is
+    guaranteed to request genuinely fresh credentials rather than
+    trusting the same (apparently wrong) self-reported expiration again."""
+    _sessions.pop(camera_number, None)
+    _clients.pop(camera_number, None)
+
+
+def _credential_error_code(error: object) -> str | None:
+    """The AWS error code if `error` itself is a ClientError, else None.
+    Never raises -- a malformed/missing response dict just yields None,
+    same as "not a credential error", rather than blowing up the caller's
+    own error-handling path."""
+    if isinstance(error, ClientError):
+        return (getattr(error, "response", None) or {}).get("Error", {}).get("Code")
+    return None
+
+
+def _classify_credential_error(error: BaseException) -> str | None:
+    """Returns the AWS error code if `error` is, or wraps, a credential-
+    class ClientError (one of CREDENTIAL_ERROR_CODES) -- else None,
+    including when it wraps some OTHER, non-credential ClientError (e.g.
+    AccessDenied, NoSuchBucket) or isn't ClientError-shaped at all (a
+    corrupt file, a network blip). The membership check against
+    CREDENTIAL_ERROR_CODES lives here, not in the caller, so "is this a
+    credential error" has exactly one answer regardless of which of the
+    two real shapes it arrived in.
+
+    Checks `error` itself first (the direct-ClientError shape a
+    low-level call like put_object() would raise), then one level into
+    __cause__ and __context__ (the wrapped shape client.upload_file()
+    actually raises in production -- see CREDENTIAL_ERROR_CODES's own
+    comment above for exactly why). boto3 never nests more than one
+    level deep here, so this deliberately does not walk further."""
+    for candidate in (error, getattr(error, "__cause__", None), getattr(error, "__context__", None)):
+        code = _credential_error_code(candidate)
+        if code in CREDENTIAL_ERROR_CODES:
+            return code
+    return None
+
+
+def _in_backoff_window(camera_number: int) -> bool:
+    entry = _camera_backoff.get(camera_number)
+    if not entry:
+        return False
+    return time.monotonic() < entry.get("next_retry_at", 0.0)
+
+
+def _record_credential_failure(camera_number: int) -> None:
+    """Bounded exponential backoff, credential failures only -- starts
+    at the normal scan interval, doubles each consecutive failure, caps
+    at RECORDING_UPLOAD_MAX_BACKOFF_SECONDS. This is state, not a sleep:
+    recording_upload_worker()'s own per-camera loop stays a plain,
+    non-blocking sequential scan -- _in_backoff_window() lets a camera
+    still inside its window be skipped in the time it takes to check one
+    dict, so a credential problem on one camera never delays any other
+    camera's own normal scan."""
+    entry = _camera_backoff.setdefault(camera_number, {"consecutive_failures": 0, "next_retry_at": 0.0})
+    entry["consecutive_failures"] += 1
+    delay = min(
+        SCAN_SECONDS * (2 ** (entry["consecutive_failures"] - 1)),
+        RECORDING_UPLOAD_MAX_BACKOFF_SECONDS,
+    )
+    entry["next_retry_at"] = time.monotonic() + delay
+    logger.warning(
+        "recording_upload.credential_backoff camera=%s consecutive_failures=%s next_retry_in_seconds=%.0f",
+        camera_number, entry["consecutive_failures"], delay,
+    )
+
+
+def _record_credential_success(camera_number: int) -> None:
+    _camera_backoff.pop(camera_number, None)
 
 
 def _recording_folder(camera_number: int) -> Path:
@@ -438,9 +747,120 @@ def _completed_recording_files(camera_number: int) -> list[Path]:
     return candidates[:-1] if len(candidates) > 1 else []
 
 
+def _load_motion_windows(camera_number: int) -> list[tuple[datetime, datetime]] | None:
+    """Real motion-event [start_time, end_time] windows for this camera,
+    read from MOTION_EVENTS_FILE -- the same file main.py's
+    store_motion_event() already writes to (MotionEventModel JSON
+    lines). Read-only here: never writes, truncates, or otherwise
+    modifies that file.
+
+    Returns None -- not [] -- when the file is missing, unreadable, or
+    contains not one single parseable line for ANY camera. Callers MUST
+    treat None as "motion status for this camera could not be
+    determined right now," not as "confirmed no motion". [] (a real,
+    distinct value) means the file was read successfully and simply has
+    no events for this specific camera -- that IS a confirmed "no
+    motion for this camera".
+
+    One malformed line/event does not blind the whole result: it's
+    skipped and the rest of the file is still used."""
+    if not MOTION_EVENTS_FILE.exists():
+        return None
+    try:
+        raw_text = MOTION_EVENTS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    windows: list[tuple[datetime, datetime]] = []
+    any_line_parsed = False
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        any_line_parsed = True
+        if event.get("camera") != camera_number:
+            continue
+        try:
+            start = datetime.fromisoformat(str(event["start_time"]))
+            end = datetime.fromisoformat(str(event["end_time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        windows.append((start, end))
+    if not any_line_parsed:
+        return None  # file existed but had literally nothing parseable in it -- treat as unavailable, not as "confirmed empty"
+    return windows
+
+
+def _segment_overlaps_motion(
+    segment_start: datetime,
+    segment_end: datetime,
+    motion_windows: list[tuple[datetime, datetime]],
+    pre_padding_seconds: int = MOTION_UPLOAD_PRE_PADDING_SECONDS,
+    post_padding_seconds: int = MOTION_UPLOAD_POST_PADDING_SECONDS,
+) -> bool:
+    """Pure and independently testable. True if [segment_start,
+    segment_end) overlaps ANY motion window, each padded independently
+    by pre_padding_seconds before its own start and post_padding_seconds
+    after its own end. Standard half-open-interval overlap test."""
+    pre_padding = timedelta(seconds=pre_padding_seconds)
+    post_padding = timedelta(seconds=post_padding_seconds)
+    for motion_start, motion_end in motion_windows:
+        padded_start = motion_start - pre_padding
+        padded_end = motion_end + post_padding
+        if segment_start <= padded_end and segment_end >= padded_start:
+            return True
+    return False
+
+
 def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> list[Path]:
+    """Product architecture (2026-09-16): recording_upload_worker()'s own
+    gate now only ever calls this function for a 'continuous'/None
+    (Cloud/Continuous tier) camera -- 'disabled' (Local) and 'motion'
+    (Hybrid, cloud event-clips-only now) are both excluded before this
+    function is ever reached. The motion-window segment-overlap
+    filtering below is consequently dead code under that gate today,
+    deliberately preserved rather than deleted (not "simply removed" --
+    the underlying local 5-minute segment system it reads, and the
+    motion-window machinery itself, remain real and may be needed again
+    for a future product tier), still fully correct and tested if ever
+    reached again.
+
+    Fail-safe: if motion data can't be determined at all
+    (_load_motion_windows() returns None), every file that would
+    otherwise have been gated is uploaded anyway. Never touches or
+    deletes any local file either way -- local recording/retention are
+    completely independent of this gate.
+
+    Optional daily cloud-upload ceiling: gated on whether an RDM
+    administrator has explicitly configured one (_current_daily_cloud_
+    seconds() is not None) -- NOT on cloud_recording_mode, since only a
+    'continuous' camera ever reaches this function now, and that tier's
+    own product purpose is unlimited continuous cloud recording by
+    default (no cap unless a customer's own entitlement says otherwise).
+    Checked against the real, DB-backed local daily-usage total
+    (_local_daily_seconds_used() -- persists across restarts, unlike an
+    in-memory counter), running total tracked within this one call so a
+    single scan can't queue more than the remaining allowance in one
+    pass. Event clips/thumbnails (a completely separate pipeline,
+    event_media_uploader.py) are never subject to this allowance."""
     folder_resolved = _recording_folder(camera_number).resolve()
+    identity = _camera_identity(camera_number)
+    cloud_recording_mode = identity.get("cloud_recording_mode") if identity else None
+    motion_windows = _load_motion_windows(camera_number) if cloud_recording_mode == "motion" else None
+    motion_data_unavailable = cloud_recording_mode == "motion" and motion_windows is None
+    today = datetime.now().strftime("%Y-%m-%d")
+    configured_ceiling = _current_daily_cloud_seconds()
+    allowance_remaining = None
+    if configured_ceiling is not None:
+        allowance_remaining = max(0, configured_ceiling - _local_daily_seconds_used(camera_number, today))
     pending = []
+    skipped_no_motion = 0
+    skipped_allowance = 0
     for local_path in _completed_recording_files(camera_number):
         if local_path.name in already_uploaded:
             continue
@@ -451,7 +871,25 @@ def _pending_recording_files(camera_number: int, already_uploaded: set[str]) -> 
         if resolved.parent != folder_resolved:
             logger.warning("recording_upload.file_path_outside_recordings_folder camera=%s path=%s", camera_number, resolved)
             continue
+        if cloud_recording_mode == "motion" and not motion_data_unavailable:
+            started_at = _recording_started_at(local_path, camera_number)
+            if started_at is not None:
+                segment_end = started_at + timedelta(seconds=RECORDING_SEGMENT_SECONDS)
+                if not _segment_overlaps_motion(started_at, segment_end, motion_windows):
+                    skipped_no_motion += 1
+                    continue
+        if allowance_remaining is not None:
+            if allowance_remaining < RECORDING_SEGMENT_SECONDS:
+                skipped_allowance += 1
+                continue
+            allowance_remaining -= RECORDING_SEGMENT_SECONDS
         pending.append(local_path)
+    if motion_data_unavailable:
+        logger.warning("recording_upload.motion_data_unavailable_uploading_anyway camera=%s", camera_number)
+    if skipped_no_motion:
+        logger.info("recording_upload.motion_gate_skipped_no_motion camera=%s count=%s", camera_number, skipped_no_motion)
+    if skipped_allowance:
+        logger.info("recording_upload.daily_cloud_allowance_reached camera=%s skipped=%s", camera_number, skipped_allowance)
     return pending
 
 
@@ -571,20 +1009,111 @@ def _remember_uploaded(camera_number: int, filename: str) -> None:
     del uploaded[:-MAX_TRACKED_FILES_PER_CAMERA]
 
 
-def _upload_recording(session: dict, local_path: Path, started_at: datetime) -> str:
-    if boto3 is None:
-        raise RuntimeError("boto3 is not installed.")
-    creds = session["credentials"]
-    client = boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        aws_access_key_id=creds["access_key_id"],
-        aws_secret_access_key=creds["secret_access_key"],
-        aws_session_token=creds["session_token"],
-    )
+def _camera_at_or_over_total_cap(camera_number: int) -> bool:
+    """See RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA's own comment --
+    None (unset) always returns False here, so this is a pure no-op for
+    every existing caller that doesn't set the env var. Reuses
+    _uploaded_files, the same bookkeeping _remember_uploaded() already
+    maintains on every real success -- no new persistent state, and the
+    count this checks is exactly "files this process has actually
+    uploaded and cataloged so far," never an estimate."""
+    if RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA is None:
+        return False
+    return len(_uploaded_files.get(camera_number, [])) >= RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA
+
+
+def _create_recording_thumbnail(mp4_path: Path, camera_number: int) -> Path | None:
+    """Extract a small JPEG preview from the already-prepared cloud MP4.
+
+    Thumbnail failure never blocks the recording upload. The JPEG is a
+    transient staging artifact and is removed by the caller.
+    """
+    thumbnail_path = mp4_path.with_suffix(".jpg")
+    _cleanup_staged_file(thumbnail_path)
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", "5",
+                "-i", str(mp4_path),
+                "-frames:v", "1",
+                "-vf", "scale=320:-2",
+                "-q:v", "3",
+                str(thumbnail_path),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        logger.warning(
+            "recording_upload.thumbnail_failed camera=%s path=%s error=%s",
+            camera_number, mp4_path, error,
+        )
+        _cleanup_staged_file(thumbnail_path)
+        return None
+
+    try:
+        valid = result.returncode == 0 and thumbnail_path.stat().st_size > 0
+    except OSError:
+        valid = False
+
+    if not valid:
+        logger.warning(
+            "recording_upload.thumbnail_nonzero_or_empty camera=%s path=%s code=%s",
+            camera_number, mp4_path, result.returncode,
+        )
+        _cleanup_staged_file(thumbnail_path)
+        return None
+
+    return thumbnail_path
+
+
+def _upload_recording(
+    client,
+    session: dict,
+    local_path: Path,
+    started_at: datetime,
+    camera_number: int,
+) -> str:
+    # client is caller-provided (one per session, reused across every file
+    # in a scan -- see _ensure_client()) rather than constructed here per
+    # file. Caller guarantees it is not None before calling this.
     date_part = started_at.strftime("%Y/%m/%d")
     recording_key = f"{session['key_prefix']}{date_part}/{local_path.name}"
-    client.upload_file(str(local_path), session["bucket"], recording_key, ExtraArgs={"ContentType": "video/mp4"})
+
+    client.upload_file(
+        str(local_path),
+        session["bucket"],
+        recording_key,
+        ExtraArgs={"ContentType": "video/mp4", "CacheControl": RECORDING_MEDIA_CACHE_CONTROL},
+        Config=_UPLOAD_TRANSFER_CONFIG,
+    )
+
+    thumbnail_path = _create_recording_thumbnail(local_path, camera_number)
+    if thumbnail_path is not None:
+        thumbnail_key = recording_key.rsplit(".", 1)[0] + ".jpg"
+        try:
+            client.upload_file(
+                str(thumbnail_path),
+                session["bucket"],
+                thumbnail_key,
+                ExtraArgs={"ContentType": "image/jpeg", "CacheControl": RECORDING_MEDIA_CACHE_CONTROL},
+                Config=_UPLOAD_TRANSFER_CONFIG,
+            )
+            logger.info(
+                "recording_upload.thumbnail_uploaded camera=%s key=%s",
+                camera_number, thumbnail_key,
+            )
+        except Exception as error:
+            logger.warning(
+                "recording_upload.thumbnail_upload_failed camera=%s error=%s",
+                camera_number, error,
+            )
+        finally:
+            _cleanup_staged_file(thumbnail_path)
+
     return recording_key
 
 
@@ -599,12 +1128,79 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
     de-dup, which never retries or re-logs it, but still never touches
     or deletes the original either). The original MKV is untouched by
     every one of these paths; only the derived MP4 staging file is
-    ever cleaned up, and only after its own upload attempt concludes."""
+    ever cleaned up, and only after its own upload attempt concludes.
+
+    A credential-class S3 failure (ExpiredToken/RequestExpired/
+    InvalidToken -- see CREDENTIAL_ERROR_CODES) is handled differently
+    from every other failure here: the cached session AND its S3 client
+    are both invalidated, this camera enters bounded-exponential backoff
+    (_record_credential_failure()), and the REST of this camera's
+    pending backlog is left untouched for this pass -- retrying every
+    remaining file against the same (already-proven-bad) credentials
+    would only waste calls and flood logs. This is recognized whether
+    the failure arrives as a direct ClientError or -- the shape
+    client.upload_file() actually raises in production -- wrapped in
+    boto3.exceptions.S3UploadFailedError; see _classify_credential_error()
+    for exactly how the wrapped case is unwrapped via __cause__/
+    __context__. Any other exception (a single corrupt file, a transient
+    network error, a bucket/permission problem, or an S3UploadFailedError
+    that turns out to wrap some other, non-credential ClientError) keeps
+    the existing behavior exactly: log, skip just that one file, continue
+    to the next."""
+    if _in_backoff_window(camera_number):
+        return
+
     session = _ensure_session(camera_number, camera_id)
     if not session:
         return
+    client = _ensure_client(camera_number, session)
+    if client is None:
+        return
+
     already = set(_uploaded_files.get(camera_number, []))
-    for local_path in _pending_recording_files(camera_number, already):
+    pending = _pending_recording_files(camera_number, already)
+
+    # Newest-first, entirely (2026-09-15, staging pilot with
+    # RECORDING_UPLOAD_MAX_TOTAL_FILES_PER_CAMERA raised from 1 to 12):
+    # _pending_recording_files() returns oldest-first (its own sort is
+    # by filename, which is chronological for this project's fixed-width
+    # start_recording() naming). The previous fix here only promoted the
+    # single newest file to the front and left the rest oldest-first --
+    # correct when the total cap was 1 (that one promoted file was the
+    # only upload that could ever happen), but confirmed live on Ryzen
+    # to silently regress once the cap allows more than one upload per
+    # camera: of a 12-file allowance, only the first slot was ever the
+    # newest recording -- the remaining 11 still drained from the oldest
+    # end of the backlog (here, Sept 13), leaving current Playback
+    # analytics markers (Sept 15) with no uploaded recording underneath
+    # them most of the time. A full reverse keeps every file this
+    # function already considered eligible (nothing added, nothing
+    # dropped, nothing re-filtered) and does not change the first file
+    # selected in a single-upload pass -- reversed(pending)[0] is still
+    # pending[-1] -- only the order for the 2nd file onward changes.
+    pending = list(reversed(pending))
+
+    attempted = 0
+    for local_path in pending:
+        if attempted >= RECORDING_UPLOAD_MAX_FILES_PER_SCAN:
+            break  # remainder stays pending -- picked up on a later scan, never dropped
+        # Real, live defect found and fixed 2026-09-14: RECORDING_UPLOAD_
+        # MAX_TOTAL_FILES_PER_CAMERA used to be checked only once, by the
+        # worker loop, before this whole function was ever called -- so a
+        # fresh/just-restarted camera (an empty _uploaded_files entry)
+        # could still have this single call upload an entire
+        # RECORDING_UPLOAD_MAX_FILES_PER_SCAN-sized batch (5 by default)
+        # before the cap was ever re-checked, regardless of a total cap
+        # of 1. Re-checked here, inside the loop, immediately after every
+        # completed iteration (successful or not) via _remember_uploaded()
+        # updating _uploaded_files -- so a total cap of 1 now makes it
+        # impossible for this single call to ever complete a second
+        # upload, no matter how large RECORDING_UPLOAD_MAX_FILES_PER_SCAN
+        # is. Unset (None, the default) is unaffected -- see
+        # _camera_at_or_over_total_cap()'s own docstring.
+        if _camera_at_or_over_total_cap(camera_number):
+            break  # remainder stays pending -- never dropped, just not attempted this call
+
         if not local_path.exists():
             continue
         started_at = _recording_started_at(local_path, camera_number)
@@ -618,17 +1214,40 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
         ended_at = datetime.fromtimestamp(stat.st_mtime)
         expected_duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
 
+        # Counts toward the per-scan cap here -- this is where real,
+        # potentially expensive work (codec probe, remux/transcode,
+        # upload) actually begins, regardless of how it concludes.
+        attempted += 1
+
         mp4_path = _prepare_cloud_copy(local_path, camera_number, expected_duration_seconds)
         if mp4_path is None:
             continue  # unsupported codec, or remux/transcode failed -- original MKV untouched either way
 
         try:
             size_bytes = mp4_path.stat().st_size
-            recording_key = _upload_recording(session, mp4_path, started_at)
+            recording_key = _upload_recording(client, session, mp4_path, started_at, camera_number)
         except Exception as error:
+            # Single handler for both real shapes a credential-class
+            # failure can arrive in (direct ClientError, or wrapped in
+            # S3UploadFailedError by client.upload_file() -- see
+            # _classify_credential_error()'s own docstring) so "is this
+            # a credential error" is answered identically either way,
+            # instead of only being checked in a ClientError-specific
+            # branch a wrapped failure would never reach.
+            code = _classify_credential_error(error)
+            if code is not None:
+                logger.warning("recording_upload.credential_error camera=%s code=%s", camera_number, code)
+                _invalidate_session(camera_number)
+                _record_credential_failure(camera_number)
+                _cleanup_staged_file(mp4_path)
+                return  # stop this camera's backlog for this pass; other cameras are unaffected
             logger.warning("recording_upload.file_upload_failed camera=%s path=%s error=%s", camera_number, local_path, error)
             _cleanup_staged_file(mp4_path)
             continue
+
+        # A real upload against these credentials just succeeded --
+        # proof the session is genuinely good, not just recently issued.
+        _record_credential_success(camera_number)
 
         response = _control_plane_post(
             f"/api/appliance/recordings/{camera_id}/available",
@@ -646,10 +1265,39 @@ def _relay_camera_once(camera_number: int, camera_id: str) -> None:
             logger.warning("recording_upload.notify_failed camera=%s path=%s", camera_number, local_path)
             continue
         _remember_uploaded(camera_number, local_path.name)
+        # Continuous-tier daily cloud-upload bookkeeping (2026-09-16):
+        # only a camera that reached this function at all (which, per
+        # recording_upload_worker()'s own gate, is now only ever
+        # 'continuous'/None -- Hybrid no longer uploads continuous
+        # segments) accrues usage here. Tracked unconditionally
+        # (whether or not an RDM ceiling is currently configured for
+        # this customer) so the real usage history is already accurate
+        # from day one if an administrator adds a ceiling later. Real,
+        # measured duration (not the nominal RECORDING_SEGMENT_SECONDS
+        # constant), persisted to local SQLite so it survives a
+        # container/service restart. A 'duplicate' response (the
+        # appliance's own retry of an already-cataloged upload) still
+        # increments here exactly once per real physical upload that
+        # reached this point -- _remember_uploaded() above already
+        # ensures this exact file is never re-attempted, so double-
+        # counting the same segment twice is not a real risk.
+        _record_local_cloud_upload_seconds(camera_number, started_at.strftime("%Y-%m-%d"), max(0, int(expected_duration_seconds)))
 
 
 async def recording_upload_worker() -> None:
-    if RUNTIME_ROLE not in {"edge", "combined"} or not RECORDING_UPLOAD_ENABLED:
+    # 2026-09-15: previously gated on RECORDING_UPLOAD_ENABLED alone,
+    # before this worker ever looked at RECORDING_UPLOAD_CAMERA_SCOPE --
+    # confirmed live to be dead code as a result: ANYAICAM_RECORDING_
+    # UPLOAD_CAMERAS=1 (see that constant's own comment -- "lets a
+    # single camera be validated in production before this is widened")
+    # was already configured on Ryzen with exactly this pilot intent,
+    # but this worker never even started, so it could never take
+    # effect. A non-empty scope now starts the worker on its own, same
+    # as the server-side RECORDING_UPLOAD_PILOT_CAMERAS check this
+    # mirrors (appliance_cloud.py) -- RECORDING_UPLOAD_ENABLED=false
+    # still means every non-pilot camera is skipped by the per-camera
+    # scope check in the loop below, unchanged.
+    if RUNTIME_ROLE not in {"edge", "combined"} or not (RECORDING_UPLOAD_ENABLED or RECORDING_UPLOAD_CAMERA_SCOPE):
         recording_upload_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)
@@ -663,8 +1311,35 @@ async def recording_upload_worker() -> None:
                 await asyncio.to_thread(_refresh_camera_map)
                 last_config_refresh = now
             for camera_number in _known_camera_numbers():
+                if RECORDING_UPLOAD_CAMERA_SCOPE is not None and camera_number not in RECORDING_UPLOAD_CAMERA_SCOPE:
+                    continue
+                if _camera_at_or_over_total_cap(camera_number):
+                    continue
                 identity = _camera_identity(camera_number)
                 if not identity:
+                    continue
+                # Product-architecture decision (2026-09-16): Hybrid
+                # ('motion') no longer uploads ANY continuous recording
+                # segments to cloud, at all -- only 'continuous'/None
+                # (the Cloud/Continuous premium tier) reaches _relay_
+                # camera_once() now. Hybrid's own cloud footage is
+                # exclusively real, intelligent event clips/thumbnails
+                # (event_media_uploader.py's separate pipeline, gated
+                # the opposite way: cloud_recording_mode=='motion'
+                # only) -- "no event, no cloud video upload" for
+                # Hybrid, full 24/7 continuous cloud for the Continuous
+                # tier a customer explicitly pays for. Local recording
+                # is completely unaffected either way -- this only ever
+                # decides which already-recorded local segments also
+                # get uploaded. 'disabled' (Local tier) was already
+                # excluded; 'motion' now gets the identical treatment.
+                # The motion-window segment-overlap filtering inside
+                # _pending_recording_files() (the ported c380f7e logic)
+                # is consequently unreachable under this gate today --
+                # deliberately preserved, not deleted, in case a future
+                # product tier ever wants a capped/filtered continuous
+                # upload again; see that function's own docstring.
+                if identity.get("cloud_recording_mode") in ("disabled", "motion"):
                     continue
                 await asyncio.to_thread(_relay_camera_once, camera_number, identity["camera_id"])
             recording_upload_state["last_scan_at"] = datetime.now().isoformat()

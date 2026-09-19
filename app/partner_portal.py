@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from pricing_config import calculate_partner_quote, load_pricing, public_pricing, save_pricing
-from partner_db import authenticate_detailed, audit, allowed, connection, password_hash
+from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
@@ -36,8 +36,11 @@ def destination_for_role(role: str) -> str:
     return role_destination(role)
 
 
-def _token(email: str, role: str, partner_id=None, customer_id=None,session_id=None) -> str:
-    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + 28800}, separators=(',', ':')).encode()
+def _token(email: str, role: str, partner_id=None, customer_id=None, session_id=None, ttl_hours: int | None = None) -> str:
+    if ttl_hours is None:
+        from appliance_identity import get_ttl_config
+        ttl_hours = get_ttl_config()['session_ttl_hours']
+    payload = json.dumps({'email': email, 'role': role, 'partner_id': partner_id, 'customer_id': customer_id, 'session_id':session_id, 'expires': int(time.time()) + ttl_hours * 3600}, separators=(',', ':')).encode()
     encoded = urlsafe_b64encode(payload).decode().rstrip('=')
     signature = hmac.new(SESSION_SECRETS[0].encode(), encoded.encode(), hashlib.sha256).hexdigest()
     return encoded + '.' + signature
@@ -56,6 +59,40 @@ def _identity(request: Request) -> dict | None:
         return payload
     except (ValueError, KeyError, json.JSONDecodeError):
         return None
+
+
+def establish_partner_session(destination: str, *, request: Request, email: str, role: str, user: dict | None, authorization_version_at_login: int | None = None) -> RedirectResponse:
+    """Writes the user_sessions row and sets the signed partner cookie
+    for a freshly-authenticated Partner Portal identity, then redirects
+    to destination -- the exact same two steps partner_login_submit()
+    (POST /api/partner-login) already performed inline. Factored out so
+    a second entry point (main.py's POST /api/portal-login, the blue
+    Portal login page's Administrator/Partner/Technician selector) can
+    establish an identical session without duplicating this
+    security-sensitive cookie-signing logic."""
+    from appliance_identity import get_ttl_config
+    session_ttl_hours = get_ttl_config()['session_ttl_hours']
+    session_id = secrets.token_hex(16)
+    now = datetime.now()
+    expiry = now + timedelta(hours=session_ttl_hours)
+    with connection() as db:
+        db.execute(
+            'INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent,authorization_version_at_login) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            (
+                session_id, user.get('id') if user else None, email, role, 'Web browser', 'cookie',
+                now.isoformat(), now.isoformat(), expiry.isoformat(),
+                request.client.host if request.client else None, request.headers.get('user-agent', '')[:500],
+                authorization_version_at_login,
+            ),
+        )
+    response = RedirectResponse(destination, status_code=303)
+    response.set_cookie(
+        SESSION_COOKIE,
+        _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id, session_ttl_hours),
+        httponly=True, samesite='strict', secure=settings.secure_cookies, max_age=session_ttl_hours * 3600, domain=settings.cookie_domain or None,
+    )
+    return response
 
 
 def _require(request: Request, roles=PARTNER_ROLES) -> dict:
@@ -87,6 +124,41 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
     @app.get('/api/public-pricing')
     def public_prices() -> dict:
         return public_pricing()
+
+    def setup_available():
+        if settings.runtime_role not in {'edge', 'combined'}:
+            raise HTTPException(status_code=404)
+        with connection() as db:
+            if db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None:
+                raise HTTPException(status_code=404)
+
+    @app.get('/first-admin-setup', response_class=HTMLResponse)
+    def first_admin_setup(request: Request):
+        setup_available()
+        content = '<h1>Create the administrator account</h1><form id="first-admin-form"><label>Email<input name="email" type="email" required></label><label>Password<input name="password" type="password" minlength="12" required></label><label>Confirm password<input name="confirm" type="password" minlength="12" required></label><button>Create account</button><p role="status" id="setup-status"></p></form>'
+        scripts = """<script>document.getElementById('first-admin-form').addEventListener('submit',async event=>{
+          event.preventDefault();const form=event.currentTarget, status=document.getElementById('setup-status');
+          if(form.elements.password.value!==form.elements.confirm.value){status.textContent='Passwords do not match.';return;}
+          const csrf=document.cookie.split('; ').find(c=>c.startsWith('anyaicam_csrf='));
+          try{const response=await fetch('/api/first-admin-setup',{method:'POST',credentials:'same-origin',
+            headers:{'Content-Type':'application/json','X-CSRF-Token':csrf?decodeURIComponent(csrf.substring(14)):''},
+            body:JSON.stringify({email:form.elements.email.value,password:form.elements.password.value})});
+            const payload=await response.json();if(!response.ok){status.textContent=payload.detail||'Setup failed.';return;}
+            form.reset();location.href='/partner.html';
+          }catch(error){status.textContent='Unable to connect. Try again.';}
+        });</script>"""
+        return shell('First-time setup','partner-login',content,scripts)
+
+    @app.post('/api/first-admin-setup')
+    def first_admin_submit(payload: dict):
+        setup_available()
+        try:
+            user_id=create_first_admin(str(payload.get('email','')),str(payload.get('password','')))
+        except ValueError as error:
+            raise HTTPException(status_code=400,detail=str(error)) from error
+        except FirstAdminAlreadyExists as error:
+            raise HTTPException(status_code=409,detail='An administrator account already exists.') from error
+        return {'message':'Administrator created. Sign in.', 'destination':'/partner.html'}
 
     @app.get('/partner-login', response_class=HTMLResponse)
     def partner_login(request: Request) -> str:
@@ -129,10 +201,32 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=403, detail=messages.get(reason,'The email or password is incorrect.'))
         clear_login_failures(email)
         audit(user or {'email':email,'role':role},'login.succeeded','partner_user',user.get('id','') if user else '')
-        destination='/change-password' if user and user.get('must_change_password') else ('/customer-portal' if payload.get('customer_only') and role=='administrator' else destination_for_role(role))
-        session_id=secrets.token_hex(16); now=datetime.now(); expiry=now+timedelta(hours=8)
-        with connection() as db: db.execute('INSERT INTO user_sessions(id,user_id,email,role,device_name,session_type,created_at,last_seen_at,expires_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(session_id,user.get('id') if user else None,email,role,'Web browser','cookie',now.isoformat(),now.isoformat(),expiry.isoformat(),request.client.host if request.client else None,request.headers.get('user-agent','')[:500]))
-        response=RedirectResponse(destination,status_code=303); response.set_cookie(SESSION_COOKIE,_token(email,role,user.get('partner_id') if user else None,user.get('customer_id') if user else None,session_id),httponly=True,samesite='strict',secure=settings.secure_cookies,max_age=28800,domain=settings.cookie_domain or None); return response
+        # next: only ever honored for the plain customer_only login path,
+        # and only after the two existing special-case destinations above
+        # it (forced password change, admin-viewing-as-customer) still
+        # win outright -- neither of those should ever be skipped past
+        # just because the customer nav happened to bounce someone here
+        # with a next= attached. Validated as a same-origin relative path
+        # (starts with "/", not "//") before use, same open-redirect
+        # guard as the rest of this app's own next= handling
+        # (authentication_middleware's own next_url is never trusted
+        # further than this either) -- an unauthenticated visit to a
+        # protected customer page (main.py's authentication_middleware,
+        # RUNTIME_ROLE=="cloud") is what actually attaches this in
+        # practice, so a valid value is always exactly one of the
+        # customer nav's own bare paths, never anything external.
+        next_path=payload.get('next')
+        if not(isinstance(next_path,str) and next_path.startswith('/') and not next_path.startswith('//')):
+            next_path=None
+        if user and user.get('must_change_password'):
+            destination='/change-password'
+        elif payload.get('customer_only') and role=='administrator':
+            destination='/customer-portal'
+        elif payload.get('customer_only') and next_path:
+            destination=next_path
+        else:
+            destination=destination_for_role(role)
+        return establish_partner_session(destination, request=request, email=email, role=role, user=user)
 
     @app.post('/partner-logout')
     def partner_logout(request: Request):
@@ -187,7 +281,21 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.put('/api/admin/partner-pricing')
     def admin_update(request: Request, payload: dict) -> dict:
-        identity=_require(request, {'administrator'}); config=load_pricing(); partner=config['partner']
+        identity=_require(request, {'administrator'})
+        # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
+        # {'administrator'} above is only this codebase's role LABEL --
+        # byte-identical whether the grant behind it is scope_type=
+        # 'global' or scope_type='partner'. This is a direct global
+        # pricing WRITE path (central retail/partner pricing, margins,
+        # MAP, commercial settings), so it must require a live,
+        # unrevoked global administrator grant before any mutation, not
+        # just the role name. Same primitive as appliance_cloud.py's
+        # appliance_dashboard() and partner_workspace.py's tenant checks.
+        from appliance_identity import has_global_administrator_grant
+        with connection() as db:
+            if not has_global_administrator_grant(db,email=identity.get('email','')):
+                raise HTTPException(status_code=403,detail='Global administrator grant required.')
+        config=load_pricing(); partner=config['partner']
         for field in ('pricing_mode','percentage_discount','map_enabled'):
             if field in payload: partner[field]=payload[field]
         if 'trial_days' in payload: config['trial_days']=max(0,min(365,int(payload['trial_days'])))
@@ -250,6 +358,17 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         identity=_identity(request)
         if not identity: return RedirectResponse('/partner-login',status_code=303)
         if identity['role']!='administrator': raise HTTPException(status_code=403,detail='Administrator role required.')
+        # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex):
+        # the role check above is only a label -- a partner-scoped
+        # administrator carries it too. This page reveals central retail
+        # pricing, partner prices/costs, margins, MAP controls, and
+        # global commercial settings, so reaching it requires a live,
+        # unrevoked global administrator grant, checked before any
+        # pricing data is loaded. Same primitive as the PUT handler above.
+        from appliance_identity import has_global_administrator_grant
+        with connection() as db:
+            if not has_global_administrator_grant(db,email=identity.get('email','')):
+                raise HTTPException(status_code=403,detail='Global administrator grant required.')
         config=load_pricing(); p=config['partner']; tiers=''.join(f'<label>{t["label"]} discount %<input class="tier" data-index="{i}" type="number" min="0" max="100" step="0.01" value="{t["discount_percent"]}"></label>' for i,t in enumerate(p['volume_tiers']))
         term_inputs=''.join(f'<div class="panel"><strong>{key}</strong><label>Retail monthly price<input class="retail-term" data-key="{key}" type="number" min="0" step="0.01" value="{term.get("retail_monthly_price") if term.get("retail_monthly_price") is not None else ""}" required></label><label>Partner monthly price<input class="partner-term" data-key="{key}" data-field="partner_monthly_price" type="number" min="0" step="0.01" value="{term.get("partner_monthly_price") if term.get("partner_monthly_price") is not None else ""}"></label><label>Partner cost<input class="partner-term" data-key="{key}" data-field="partner_cost" type="number" min="0" step="0.01" value="{term.get("partner_cost") if term.get("partner_cost") is not None else ""}"></label><label>Suggested retail<input class="partner-term" data-key="{key}" data-field="suggested_retail_price" type="number" min="0" step="0.01" value="{term.get("suggested_retail_price") if term.get("suggested_retail_price") is not None else ""}"></label><label>Minimum advertised price<input class="partner-term" data-key="{key}" data-field="minimum_advertised_price" type="number" min="0" step="0.01" value="{term.get("minimum_advertised_price") if term.get("minimum_advertised_price") is not None else ""}"></label><label><input class="partner-check" data-key="{key}" data-field="map_enabled" type="checkbox" {"checked" if term.get("map_enabled") else ""}> Enforce MAP</label></div>' for key,term in p['plan_terms'].items())
         addon_inputs=''.join(f'<div class="panel"><strong>{config["addons"][key]["label"]}</strong><label>Retail price<input class="addon-term" data-key="{key}" data-field="retail_monthly_price" type="number" step="0.01" value="{term["retail_monthly_price"]}"></label><label>Partner price<input class="addon-term" data-key="{key}" data-field="partner_monthly_price" type="number" step="0.01" value="{term.get("partner_monthly_price") if term.get("partner_monthly_price") is not None else ""}"></label><label>Partner cost<input class="addon-term" data-key="{key}" data-field="partner_cost" type="number" step="0.01" value="{term.get("partner_cost") if term.get("partner_cost") is not None else ""}"></label><label>Suggested retail<input class="addon-term" data-key="{key}" data-field="suggested_retail_price" type="number" step="0.01" value="{term.get("suggested_retail_price") if term.get("suggested_retail_price") is not None else ""}"></label><label>MAP<input class="addon-term" data-key="{key}" data-field="minimum_advertised_price" type="number" step="0.01" value="{term.get("minimum_advertised_price") if term.get("minimum_advertised_price") is not None else ""}"></label><label><input class="addon-check" data-key="{key}" data-field="map_enabled" type="checkbox" {"checked" if term.get("map_enabled") else ""}> Enforce MAP</label></div>' for key,term in p['addon_terms'].items())

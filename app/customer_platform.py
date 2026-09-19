@@ -265,6 +265,7 @@ def register_customer_platform_routes(
         content = f'''
         <header class="topbar">
           <div><p class="eyebrow">Mobile app settings</p><h1>Camera analytics and alerts</h1></div>
+          <a class="ghost-button" href="/settings/notifications">Notification settings</a>
           <a class="ghost-button" href="/customer-portal">Back to customer portal</a>
         </header>
         <section class="panel">

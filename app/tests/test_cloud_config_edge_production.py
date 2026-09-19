@@ -1,0 +1,294 @@
+"""Regression coverage for the confirmed-live release blocker: ANYAICAM_ENV=
+production correctly activates cloud_config.Settings.validate()'s hardening
+checks (HTTPS-only, secure cookies, CSRF, HTTPS URLs/origins, strong
+secrets), but those checks had no concept of ANYAICAM_RUNTIME_ROLE=edge --
+an appliance reached over a private LAN/Tailscale network, never the public
+internet. Confirmed live on Samsung: correctly stamping ANYAICAM_ENV=
+production (this session's own installer fix) made the VMS process refuse
+to start at all, because the plain-HTTP, Tailscale-only edge deployment
+could never satisfy internet-facing HTTPS/cookie/CSRF requirements it was
+never designed to meet.
+
+Settings.edge_production (cloud_config.py) is now the one, narrowly-scoped
+exemption: production + RUNTIME_ROLE=edge skips ONLY the HTTPS-termination-
+dependent checks (secure cookies, CSRF, HTTPS-scheme URLs/origins, HTTPS-
+only mode, HTTPS login URLs). It does NOT skip the strong/non-default
+application secret requirement, and it does not affect staging at all,
+regardless of runtime_role. Cloud/combined production is completely
+unchanged -- every check below proves it still enforces exactly what it
+did before.
+
+Settings is a frozen dataclass whose field DEFAULTS read os.environ at
+class-definition time (i.e. once, at module import) -- these tests never
+touch os.environ or reimport the module; every scenario is built by
+passing explicit constructor arguments directly, which always override
+those baked-in defaults.
+"""
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from cloud_config import Settings  # noqa: E402
+from starlette.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
+
+
+STRONG_SECRET = "a" * 40  # >=32 chars, not one of the known default/placeholder values
+WEAK_SECRET = "local-development-secret-change-me"
+
+# Exact shape 06-deploy-vms.sh's ensure_vms_env() actually generates:
+# `head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'` -- 64 lowercase
+# hex characters (32 bytes / 256 bits of entropy).
+INSTALLER_GENERATED_SECRET = "4f" * 32
+
+HTTPS_URL_KWARGS = dict(
+    public_portal_url="https://portal.example.test",
+    appliance_api_url="https://api.example.test",
+    public_website_url="https://www.example.test",
+    portal_url="https://portal.example.test",
+    api_base_url="https://api.example.test/api/v1",
+    password_reset_url="https://portal.example.test/reset-password",
+    invitation_url="https://portal.example.test/invite",
+    appliance_activation_url="https://portal.example.test/activate",
+    production_partner_url="https://partner.example.test",
+    production_customer_url="https://customer.example.test",
+)
+
+
+def _cloud_production(**overrides):
+    kwargs = dict(
+        environment="production",
+        runtime_role="cloud",
+        https_only=True,
+        secure_cookies=True,
+        csrf_enabled=True,
+        allowed_origins=["https://www.example.test"],
+        app_secrets=[STRONG_SECRET],
+        **HTTPS_URL_KWARGS,
+    )
+    kwargs.update(overrides)
+    return Settings(**kwargs)
+
+
+def _edge_production(**overrides):
+    # Deliberately the appliance's real defaults: plain HTTP, no secure
+    # cookies, no CSRF, localhost URLs -- exactly what a fresh Samsung-
+    # style install actually looks like.
+    kwargs = dict(
+        environment="production",
+        runtime_role="edge",
+        https_only=False,
+        secure_cookies=False,
+        csrf_enabled=False,
+        app_secrets=[STRONG_SECRET],
+    )
+    kwargs.update(overrides)
+    return Settings(**kwargs)
+
+
+class CloudProductionRemainsStrictTests(unittest.TestCase):
+    """Every one of these must still fail exactly as before -- proves the
+    edge exemption never leaks into a cloud/combined deployment."""
+
+    def test_fully_compliant_cloud_production_passes(self):
+        _cloud_production().validate()  # must not raise
+
+    def test_cloud_production_still_requires_https_only(self):
+        with self.assertRaisesRegex(RuntimeError, "HTTPS-only"):
+            _cloud_production(https_only=False).validate()
+
+    def test_cloud_production_still_requires_secure_cookies_and_csrf(self):
+        with self.assertRaisesRegex(RuntimeError, "secure cookies and CSRF"):
+            _cloud_production(secure_cookies=False).validate()
+        with self.assertRaisesRegex(RuntimeError, "secure cookies and CSRF"):
+            _cloud_production(csrf_enabled=False).validate()
+
+    def test_cloud_production_still_requires_https_urls(self):
+        with self.assertRaisesRegex(RuntimeError, "public URLs must use HTTPS"):
+            _cloud_production(portal_url="http://portal.example.test").validate()
+
+    def test_cloud_production_still_requires_https_origins(self):
+        with self.assertRaisesRegex(RuntimeError, "origins must use HTTPS"):
+            _cloud_production(allowed_origins=["http://www.example.test"]).validate()
+
+    def test_cloud_production_still_requires_https_login_urls(self):
+        with self.assertRaisesRegex(RuntimeError, "login URLs must use HTTPS"):
+            _cloud_production(production_partner_url="http://partner.example.test").validate()
+
+    def test_cloud_production_still_requires_strong_secrets(self):
+        with self.assertRaisesRegex(RuntimeError, "Replace default or short"):
+            _cloud_production(app_secrets=[WEAK_SECRET]).validate()
+        with self.assertRaisesRegex(RuntimeError, "Replace default or short"):
+            _cloud_production(app_secrets=["short"]).validate()
+
+    def test_staging_is_unaffected_by_runtime_role(self):
+        # Staging must stay exactly as strict regardless of runtime_role --
+        # the edge exemption is scoped to production only.
+        with self.assertRaisesRegex(RuntimeError, "secure cookies and CSRF"):
+            Settings(
+                environment="staging", runtime_role="edge",
+                secure_cookies=False, csrf_enabled=False,
+                app_secrets=[STRONG_SECRET],
+            ).validate()
+
+
+class EdgeProductionProfileTests(unittest.TestCase):
+    """The actual fix: an edge appliance's real, unmodified defaults
+    (plain HTTP, no secure cookies, no CSRF, localhost URLs) must be able
+    to start in ANYAICAM_ENV=production -- confirmed live-failing on
+    Samsung before this fix, confirmed passing after it."""
+
+    def test_edge_production_with_real_defaults_starts(self):
+        _edge_production().validate()  # must not raise
+
+    def test_edge_production_does_not_require_https_only(self):
+        Settings(
+            environment="production", runtime_role="edge",
+            https_only=False, secure_cookies=True, csrf_enabled=True,
+            app_secrets=[STRONG_SECRET],
+        ).validate()
+
+    def test_edge_production_does_not_require_secure_cookies_or_csrf(self):
+        _edge_production(secure_cookies=False, csrf_enabled=False).validate()
+
+    def test_edge_production_does_not_require_https_urls_or_origins(self):
+        Settings(
+            environment="production", runtime_role="edge",
+            https_only=False, secure_cookies=False, csrf_enabled=False,
+            allowed_origins=["http://100.123.115.65:8000"],
+            app_secrets=[STRONG_SECRET],
+        ).validate()
+
+    def test_edge_production_still_requires_strong_secrets(self):
+        # The one requirement edge NEVER gets to skip.
+        with self.assertRaisesRegex(RuntimeError, "Replace default or short"):
+            _edge_production(app_secrets=[WEAK_SECRET]).validate()
+        with self.assertRaisesRegex(RuntimeError, "Replace default or short"):
+            _edge_production(app_secrets=["short"]).validate()
+
+    def test_edge_production_property_is_false_outside_production(self):
+        self.assertFalse(Settings(environment="staging", runtime_role="edge").edge_production)
+        self.assertFalse(Settings(environment="development", runtime_role="edge").edge_production)
+
+    def test_edge_production_property_is_false_for_cloud_runtime_role(self):
+        self.assertFalse(Settings(environment="production", runtime_role="cloud").edge_production)
+        self.assertFalse(Settings(environment="production", runtime_role="combined").edge_production)
+
+    def test_edge_production_startup_passes_with_the_installers_own_generated_secret(self):
+        # Bridges the two fixes: the exact secret shape
+        # 06-deploy-vms.sh's ensure_vms_env() now auto-generates must
+        # itself satisfy this validation on a real edge appliance --
+        # not just an arbitrary 40-char string of "a"s.
+        _edge_production(app_secrets=[INSTALLER_GENERATED_SECRET]).validate()  # must not raise
+
+
+class EffectiveTrustedHostsTests(unittest.TestCase):
+    """Confirmed live on Samsung: TrustedHostMiddleware (main.py) rejected
+    the appliance's own Tailscale address with "Invalid host header",
+    because ANYAICAM_TRUSTED_HOSTS was never set by the installer and the
+    untouched default (localhost/127.0.0.1/testserver) matches no LAN/
+    Tailscale address an operator actually connects through. No appliance
+    IP appears anywhere below -- the fix is structural, not a Samsung-
+    specific allowlist entry."""
+
+    def test_edge_production_with_untouched_default_disables_host_matching(self):
+        # This is the exact fix: a fresh edge install that never set
+        # ANYAICAM_TRUSTED_HOSTS gets Starlette's own "*" wildcard,
+        # which accepts any Host header -- the appliance's LAN IP,
+        # its Tailscale IP, a .local mDNS name, anything.
+        self.assertEqual(_edge_production().effective_trusted_hosts, ["*"])
+
+    def test_cloud_production_with_untouched_default_is_unaffected(self):
+        # Must stay exactly as strict as before this fix -- cloud has a
+        # single fixed public domain and real Host-header validation
+        # value, unlike an edge appliance.
+        self.assertEqual(
+            _cloud_production().effective_trusted_hosts,
+            ["localhost", "127.0.0.1", "testserver"],
+        )
+
+    def test_edge_production_honors_an_explicit_override(self):
+        # An operator who explicitly configures ANYAICAM_TRUSTED_HOSTS on
+        # an edge appliance (e.g. to lock it down to one known hostname)
+        # is never silently overridden by the wildcard.
+        self.assertEqual(
+            _edge_production(trusted_hosts=["vms.internal.example"]).effective_trusted_hosts,
+            ["vms.internal.example"],
+        )
+
+    def test_cloud_production_honors_an_explicit_override(self):
+        self.assertEqual(
+            _cloud_production(trusted_hosts=["portal.anyaicam.com"]).effective_trusted_hosts,
+            ["portal.anyaicam.com"],
+        )
+
+    def test_staging_is_unaffected_regardless_of_runtime_role(self):
+        # edge_production scopes strictly to production (see its own
+        # docstring) -- staging must never get the wildcard.
+        self.assertEqual(
+            Settings(environment="staging", runtime_role="edge").effective_trusted_hosts,
+            ["localhost", "127.0.0.1", "testserver"],
+        )
+
+
+class TrustedHostMiddlewareIntegrationTests(unittest.TestCase):
+    """Exercises the real Starlette TrustedHostMiddleware class -- the same
+    one main.py registers -- against Settings.effective_trusted_hosts,
+    with concrete host strings, rather than just asserting the computed
+    property value in isolation. Confirmed live: both a Tailscale address
+    (100.123.115.65) and the Samsung box's plain LAN address
+    (192.168.0.165) were rejected identically before this fix, proving it
+    was never Tailscale-specific -- neither address is hard-coded into
+    the fix or these tests; they stand in for "any real edge access
+    address", which is the actual thing being fixed."""
+
+    @staticmethod
+    def _make_client(trusted_hosts):
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+
+        async def homepage(request):
+            return PlainTextResponse("ok")
+
+        app = Starlette(routes=[Route("/", homepage)])
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+        return TestClient(app)
+
+    def test_edge_production_accepts_a_lan_ip_host(self):
+        client = self._make_client(_edge_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "192.168.0.165:8000"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_edge_production_accepts_a_tailscale_ip_host(self):
+        client = self._make_client(_edge_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "100.123.115.65:8000"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_edge_production_accepts_an_mdns_local_hostname(self):
+        # A third, unrelated address style -- proves the fix is not
+        # scoped to IP addresses at all, let alone one specific IP.
+        client = self._make_client(_edge_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "anyaicam-appliance.local:8000"})
+        self.assertEqual(resp.status_code, 200)
+
+    def test_cloud_production_still_rejects_an_arbitrary_lan_looking_host(self):
+        # The exact regression this fix must never cause: cloud/AWS
+        # production must keep rejecting a host it never configured,
+        # even one that looks like a legitimate edge LAN address.
+        client = self._make_client(_cloud_production().effective_trusted_hosts)
+        resp = client.get("/", headers={"Host": "192.168.0.165:8000"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cloud_production_accepts_its_own_configured_domain(self):
+        client = self._make_client(
+            _cloud_production(trusted_hosts=["portal.anyaicam.com"]).effective_trusted_hosts
+        )
+        resp = client.get("/", headers={"Host": "portal.anyaicam.com"})
+        self.assertEqual(resp.status_code, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()

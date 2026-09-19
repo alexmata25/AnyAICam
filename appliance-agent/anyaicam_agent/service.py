@@ -4,19 +4,249 @@ import logging.handlers
 import signal
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 from .commands import execute
+from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
+                             LocalVmsStatusReader,atomic_write_json,
+                             auto_bind_discovered_cameras,
+                             reconcile_cloud_cameras,redact_discovery_for_cloud)
 from .config import AgentConfig,load_credential
 from .discovery import scan
 from .metrics import collect
+from .onvif_media import resolve_media_uri
 from .portal import PortalClient,PortalError,sanitize
+from .provisioning import locate_device,verify_device
 from .queue import OfflineQueue
+from .updater.factory import build_update_state_machine
+from .updater.health import make_health_check
+from .updater.restart import make_restart_signal
+from .updater.s3_source import make_manifest_source
+
+# How often run()'s pre-activation wait re-checks for a real credential.
+# Deliberately a short, fixed interval, not config.checkin_seconds (a
+# normal OPERATIONAL polling knob that has no defined meaning before
+# activation even establishes cloud_id/mode) -- matches the systemd
+# unit's own RestartSec=10, so a technician watching a freshly installed
+# appliance sees the same responsiveness whether the agent is waiting or
+# (as it used to, before this fix) crash-looping.
+ACTIVATION_POLL_INTERVAL_SECONDS = 10
 
 
 class ApplianceAgent:
     def __init__(self,config):
         self.config=config; credential=load_credential(config) or {}; self.client=PortalClient(config.portal_url,credential.get('appliance_id'),credential.get('credential')); self.queue=OfflineQueue(config.queue_file); self.stop_event=threading.Event(); self.log=logging.getLogger('anyaicam.agent')
+        # RDM-2 Group 2A/2B/2F/2G: restart_signal is the real wrapper
+        # (Group 2B) around this same agent's own stop_event -- exactly
+        # the mechanism commands.py's existing restart_service handler
+        # already uses. health_check is the real one too (Group 2F):
+        # minimal local filesystem/state accessibility checks plus a
+        # bounded, short-timeout authenticated cloud probe reusing this
+        # same self.client -- see updater/health.py for the full retry/
+        # timeout budget and fail-closed rationale. source is now real
+        # too (Group 2G): the cloud's authenticated manifest endpoint
+        # plus a direct, unauthenticated GET against whatever presigned
+        # S3 URL that endpoint returns -- this device never receives an
+        # AWS credential of any kind. Gated entirely by the CLOUD's own
+        # feature flag (default off, see app/appliance_cloud.py); no
+        # device-side toggle exists or is needed. state_machine itself
+        # is constructed unconditionally so resolve_update_state() can
+        # always run at startup, regardless of whether this agent has
+        # ever processed an install_update command.
+        self.state_machine=build_update_state_machine(config,restart_signal=make_restart_signal(self.stop_event),health_check=make_health_check(config,self.client),source=make_manifest_source(self.client))
+        self.discovered_store=DiscoveredCameraStore(config.discovered_cameras_file)
+        self.binding_store=CameraBindingStore(config.camera_bindings_file)
+        self.vms_status=LocalVmsStatusReader(config.vms_hls_path,config.vms_recordings_path,config.vms_status_freshness_seconds,config.vms_recording_freshness_seconds)
+        self.update_resume_failed=False
+        self._next_source_check_at=0.0
+        self._next_entitlement_check_at=0.0
+    def resolve_update_state(self):
+        # RDM-2 Groups 2A/2E: runs once at startup, before any command
+        # processing -- per UpdateStateMachine.resume_if_pending()'s own
+        # documented call-order requirement (resume_if_pending() first,
+        # then sweep_orphaned_state()). Reporting sits between the two.
+        #
+        # Deliberately THREE separate try/except blocks, not one: a
+        # failure in report_update_result() must never be caught by the
+        # SAME except that sets update_resume_failed below -- by the time
+        # reporting runs, resume_if_pending() has ALREADY concluded
+        # successfully; only the CLOUD's awareness of that conclusion is
+        # at stake, never this device's own understanding of its update
+        # state. Sharing one try/except across resume+report would
+        # incorrectly block future install_update commands on a pure
+        # network/reporting failure. This method never re-raises for any
+        # of the three steps, so a broken update-resume, reporting
+        # failure, or sweep can never prevent heartbeat/camera/discovery/
+        # command-polling from starting.
+        result=None
+        try:
+            result=self.state_machine.resume_if_pending()
+        except Exception:
+            self.log.exception('resume_if_pending() failed; blocking new install_update commands until next restart')
+            self.update_resume_failed=True
+        if result is not None:
+            try:
+                self.report_update_result(result)
+            except Exception:
+                self.log.exception('Reporting update result to the cloud failed; will retry via the offline queue')
+        try:
+            self.state_machine.sweep_orphaned_state()
+        except Exception:
+            self.log.exception('sweep_orphaned_state() failed; continuing startup')
+    def report_update_result(self,result):
+        # RDM-2 Group 2E: reports one concluded UpdateResult (from
+        # resume_if_pending()) to Group 2D's dedicated endpoint. Payload
+        # is result.as_dict() verbatim -- it already matches exactly what
+        # that endpoint expects, no transformation needed.
+        #
+        # Deliberately does NOT call self.send_or_queue() -- that
+        # helper's blanket "queue on ANY PortalError" behavior is correct
+        # for heartbeat/cameras/commands/discovery (left completely
+        # unchanged by this method) but wrong here: a 404 (remote-update
+        # reporting disabled cloud-side) or a 409 (a permanent, never-
+        # retryable conflict -- see app/appliance_cloud.py's
+        # update_result()) would never succeed no matter how many times
+        # it is retried, so queuing either would only grow the local
+        # queue forever for nothing. Every OTHER outcome (401/403,
+        # network timeout, unknown status) reuses the SAME OfflineQueue
+        # instance and the same durable atomic-write discipline
+        # send_or_queue() itself uses -- never a second queue, never new
+        # local state.
+        path=f'/api/appliance/updates/{result.update_id}/result'
+        payload=result.as_dict()
+        key=f'update-result-{result.update_id}-{result.state.value}'
+        try:
+            self.client.request('POST',path,payload)
+        except PortalError as error:
+            if error.status_code==404:
+                self.log.warning('Update result reporting is disabled on the cloud (404); dropping report update_id=%s state=%s',result.update_id,result.state.value)
+                return
+            if error.status_code==409:
+                self.log.error('Update result report update_id=%s state=%s was rejected as a conflict (409); not retrying: %s',result.update_id,result.state.value,error)
+                return
+            self.queue.put(key,'POST',path,sanitize(payload))
+            self.log.warning('Queued offline update result report update_id=%s state=%s error=%s',result.update_id,result.state.value,error)
+    def check_for_source_update(self):
+        # RDM-2 Group 2G: the periodic PULL path -- calls the ALREADY-
+        # EXISTING UpdateStateMachine.check_and_install() (built in
+        # RDM-1, never previously called by anything in the real
+        # runtime) on its own slow cadence (config.update_check_interval_
+        # seconds, default 900s), deliberately separate from
+        # checkin_seconds' much more frequent normal poll interval.
+        #
+        # Isolated in its own try/except, matching resolve_update_state()'s
+        # established discipline (Groups 2E/2F): a failure here is
+        # logged and skipped for THIS cycle, never sets
+        # update_resume_failed, and never blocks/delays heartbeat/
+        # camera-sync/command-polling -- this method is called from
+        # cycle(), which already tolerates any single step failing
+        # without aborting the rest.
+        #
+        # INTERLOCK (see docs/AI_HANDOFF.md RDM-2 Group 2G): check_and_
+        # install() -> process_install_update() has NO built-in
+        # protection against running while a previous activation is
+        # still unresolved -- has_unresolved_activation() (Group 2C) was
+        # built specifically for commands.py's own install_update
+        # handler, not for this state-machine entry point. The SAME
+        # check is applied here, for the SAME reason: letting a second
+        # pointer flip stack on top of unresolved post-activation state
+        # would break resume_if_pending()'s crash-timing guarantees.
+        # Both call sites (this one and commands.py's) now independently
+        # enforce the identical interlock, so process_install_update()
+        # is never reachable from either path (cloud-pushed OR self-
+        # polled) while a marker is pending. Also checks
+        # update_resume_failed for the same reason commands.py does: an
+        # unresolved resume means this device's own update state is not
+        # currently trustworthy enough to layer a new attempt on top of.
+        now=time.time()
+        if now<self._next_source_check_at:
+            return
+        self._next_source_check_at=now+self.config.update_check_interval_seconds
+        try:
+            if self.update_resume_failed:
+                self.log.debug('Skipping periodic update check: update resume did not complete cleanly.')
+                return
+            if self.state_machine.has_unresolved_activation():
+                self.log.debug('Skipping periodic update check: a previous update is still awaiting restart/health confirmation.')
+                return
+            result=self.state_machine.check_and_install()
+            if result is not None:
+                # A pre-restart outcome (REJECTED/DOWNLOAD_FAILED/etc.)
+                # from THIS self-initiated pull is recorded durably in
+                # the local update history (RDM-1) but not separately
+                # reported to the cloud here -- Group 2D's endpoint is
+                # scoped to POST-RESTART conclusions only (Group 2E). If
+                # this pull DOES trigger an actual restart, the real
+                # conclusion is reported the normal way, via
+                # resolve_update_state() on this device's next startup.
+                self.log.info('Periodic update check concluded: %s',result.as_dict())
+        except Exception:
+            self.log.exception('Periodic update source check failed; will retry next cycle')
+    def current_camera_slot_quantity(self) -> int:
+        # Fail-closed by construction: an appliance that has never
+        # successfully completed a refresh (fresh install, or every
+        # attempt so far has failed) reports 0, never a guessed/unlimited
+        # value -- matches customer_entitlements.total_camera_slots()'s
+        # own "sum only *active* entitlements, never a hard-coded
+        # constant" discipline on the cloud side.
+        try:
+            data=json.loads(self.config.entitlement_state_file.read_text(encoding='utf-8'))
+            return max(0,int(data.get('camera_slot_quantity',0)))
+        except (OSError,json.JSONDecodeError,ValueError,TypeError):
+            return 0
+    def poll_entitlement(self):
+        # Provisioning Phase 7: the device-side caller for the cloud's
+        # already-existing, already-tested POST /api/provisioning/refresh
+        # (provisioning_api.py) -- that endpoint predates this call site;
+        # nothing on the device ever invoked it before this. Uses the
+        # SAME self.client the rest of this agent already authenticates
+        # every other cloud call with (signed X-Appliance-Id/X-Request-
+        # Timestamp/X-Request-Nonce/Bearer credential) -- no second
+        # identity/auth mechanism, no credential of any kind persisted
+        # beyond the one this agent already manages via config.
+        # credential_file.
+        #
+        # Own cadence (entitlement_refresh_interval_seconds, default
+        # 1800s), deliberately separate from checkin_seconds -- matches
+        # check_for_source_update()'s own established precedent
+        # immediately above. Isolated in its own try/except so a failure
+        # here never aborts the rest of cycle() (heartbeat/camera-sync/
+        # command-polling all still run).
+        #
+        # Fail-safe on cloud unavailability: on ANY PortalError (network
+        # failure, timeout, auth issue, cloud down), this logs and
+        # returns WITHOUT touching entitlement_state_file at all -- the
+        # last successfully-fetched value (via current_camera_slot_
+        # quantity() above) is preserved exactly as it was, never
+        # optimistically bumped, never zeroed out just because this one
+        # refresh attempt failed. A genuinely fresh install that has
+        # never once succeeded correctly reports 0 (fail closed), not a
+        # stale guess and not unlimited.
+        now=time.time()
+        if now<self._next_entitlement_check_at:
+            return
+        self._next_entitlement_check_at=now+self.config.entitlement_refresh_interval_seconds
+        try:
+            response=self.client.request('POST','/api/provisioning/refresh')
+        except PortalError as error:
+            self.log.warning('Entitlement refresh unavailable; keeping last known value. error=%s',error)
+            return
+        except Exception:
+            self.log.exception('Unexpected error during entitlement refresh; keeping last known value.')
+            return
+        try:
+            quantity=max(0,int(response.get('camera_slot_quantity',0)))
+        except (TypeError, ValueError):
+            self.log.warning('Entitlement refresh returned an unusable camera_slot_quantity; keeping last known value. response=%s',sanitize(response))
+            return
+        atomic_write_json(self.config.entitlement_state_file,{
+            'camera_slot_quantity':quantity,
+            'entitlements':response.get('entitlements',[]),
+            'fetched_at':time.time(),
+        })
+        self.log.info('Entitlement refreshed camera_slot_quantity=%s',quantity)
     def cameras(self):
         try: return json.loads(self.config.cameras_file.read_text(encoding='utf-8'))
         except (OSError,json.JSONDecodeError): return []
@@ -31,25 +261,237 @@ class ApplianceAgent:
         try:
             response=self.client.request('GET',f'/api/appliance/{self.config.cloud_id}/scan-jobs')
             for job in response.get('jobs',[]):
-                results=scan(self.config.discovery_networks); payload={'status':'complete','progress':100,'results':results,'message':f'Discovered {len(results)} compatible camera endpoints.'}; self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/scan-jobs/{job["id"]}',payload,'scan-'+job['id'])
+                results=scan(self.config.discovery_networks); self.discovered_store.save_scan(results); payload={'status':'complete','progress':100,'results':redact_discovery_for_cloud(results),'message':f'Discovered {len(results)} compatible camera endpoints; physical addressing retained on appliance.'}; self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/scan-jobs/{job["id"]}',payload,'scan-'+job['id'])
         except PortalError as error: self.log.debug('Discovery poll unavailable: %s',error)
+    def poll_provisioning(self):
+        # Isolated from recording/upload entirely by construction: this
+        # agent process never runs FFmpeg or touches recordings (see
+        # provisioning.py's own docstring) -- it only verifies a
+        # candidate device is reachable and, when credentials were
+        # supplied, that they're accepted, then reports the outcome.
+        try:
+            response=self.client.request('GET',f'/api/appliance/{self.config.cloud_id}/provisioning-jobs')
+        except PortalError as error: self.log.debug('Provisioning poll unavailable: %s',error); return
+        seen=set()
+        for job in response.get('jobs',[]):
+            job_id=job.get('id')
+            if not job_id or job_id in seen: continue  # local defense-in-depth against ever double-processing one delivery
+            seen.add(job_id)
+            # Never log job['credentials'] or any field derived from it --
+            # only the non-secret identifiers below.
+            self.log.info('Provisioning job received job_id=%s device_key=%s',job_id,job.get('device_key'))
+            try: success,message=verify_device(job.get('device_key',''),job.get('credentials'),self.config.discovery_networks)
+            except Exception:
+                self.log.exception('Provisioning verification error job_id=%s',job_id); success,message=False,'Appliance-side verification error.'
+            submitted=self.send_or_queue(f'/api/appliance/{self.config.cloud_id}/provisioning-jobs/{job_id}',{'success':success,'message':message},'provision-'+job_id)
+            if success and submitted:
+                # Reuses the SAME transient, in-memory credentials
+                # verify_device() just used for this exact job -- see
+                # _resolve_media_uri_after_provisioning()'s own
+                # docstring for why this, not a second fetch/store, is
+                # the only place ONVIF resolution is ever attempted
+                # with a credential.
+                self._resolve_media_uri_after_provisioning(job.get('device_key',''),job.get('credentials'))
+                # Cloud->edge camera-configuration sync (2026-09-12):
+                # same reuse principle as the ONVIF resolution call just
+                # above -- the ONE plaintext credential this job payload
+                # ever carries, handed once, locally, to the VMS this
+                # exact box also runs, so it can encrypt-and-persist it
+                # into its own local camera_credentials table (see
+                # main.py's provisioned_camera_credential() for the
+                # receiving half). Best-effort by design: this agent
+                # still never persists the credential itself, in any
+                # form, at any point -- a failed local delivery here is
+                # logged and otherwise ignored, never retried from this
+                # method (a customer who reprovisions, or a future
+                # explicit re-sync, is the natural recovery path -- not
+                # a queued retry of a plaintext secret).
+                self._deliver_credential_to_local_vms(job.get('device_key',''),job.get('credentials'))
+    def _deliver_credential_to_local_vms(self,device_key,credentials):
+        if not device_key or not isinstance(credentials,dict):
+            return
+        username=str(credentials.get('username') or '')
+        password=str(credentials.get('password') or '')
+        if not username and not password:
+            return
+        # Deliberately raw urllib, not self.client.request(): PortalClient.
+        # request() runs every payload through portal.sanitize(), which
+        # strips exactly the username/password keys this one call exists
+        # to deliver -- correct for every OTHER call this agent makes
+        # (nothing else should ever carry a camera credential over the
+        # wire to the cloud), wrong for this one intentional exception.
+        # vms_local_health_url's own host:port (127.0.0.1:8000 by
+        # default) is reused rather than a second config field -- same
+        # box, same process this box's own /health already targets.
+        base_url=self.config.vms_local_health_url.rsplit('/health',1)[0]
+        body=json.dumps({'device_key':device_key,'username':username,'password':password}).encode()
+        request=urllib.request.Request(
+            base_url+'/api/local/provisioned-camera-credential',
+            data=body,
+            headers={
+                'Content-Type':'application/json',
+                'Authorization':'Bearer '+(self.client.credential or ''),
+            },
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(request,timeout=self.config.checkin_seconds or 10):
+                pass
+        except (urllib.error.URLError,TimeoutError,OSError) as error:
+            # Never logs device_key alongside anything credential-shaped
+            # (it isn't -- device_key is a non-secret ONVIF identifier,
+            # same as every other log line in this method already logs),
+            # and never logs the credential itself under any
+            # circumstance, matching this file's existing discipline.
+            self.log.warning('Local VMS credential handoff failed device_key=%s error=%s',device_key,error)
+    def _resolve_media_uri_after_provisioning(self,device_key,credentials):
+        # Deliberately the ONLY caller of resolve_media_uri() that ever
+        # passes a username/password -- and only the exact plaintext
+        # values this same job's own verify_device() call already used,
+        # never refetched, never written to disk, never sent anywhere
+        # except (only if the device actually challenges for it) one
+        # ONVIF SOAP call. Extends the existing, already-tested
+        # single-delivery credential path (cloud -> this agent, once)
+        # instead of inventing a second one. The periodic unauthenticated
+        # sweep in resolve_media_uris() below is unaffected -- it remains
+        # the path for cameras that never needed a credential at all.
+        if not device_key:
+            return
+        device=locate_device(device_key,self.config.discovery_networks)
+        if not device or not device.get('ip'):
+            return
+        try:
+            configuration=self.client.request('GET','/api/appliance/configuration')
+        except PortalError:
+            return
+        camera_id=None
+        for camera in configuration.get('cameras',[]):
+            if camera.get('device_key')==device_key:
+                if camera.get('onvif_endpoint'):
+                    return  # already resolved (e.g. an earlier attempt for this same camera) -- nothing to do
+                camera_id=camera.get('id'); break
+        if not camera_id:
+            return
+        username=str((credentials or {}).get('username','')) or None
+        password=str((credentials or {}).get('password','')) or None
+        result=resolve_media_uri(device['ip'],device_key,username=username,password=password)
+        if result['status']!='resolved':
+            self.log.info('onvif_media.not_resolved_during_provisioning device_key=%s status=%s',device_key,result['status'])
+            return
+        try:
+            self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':result['rtsp_uri']})
+        except PortalError as error:
+            self.log.debug('onvif_media.submit_failed_during_provisioning device_key=%s error=%s',device_key,error)
     def poll_commands(self):
         try:
             for item in self.client.request('GET','/api/appliance/commands').get('commands',[]):
-                status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
+                status,result,error=execute(item['command'],item.get('payload',{}),self.config,self.stop_event,state_machine=self.state_machine,update_resume_failed=self.update_resume_failed); self.send_or_queue(f'/api/appliance/commands/{item["id"]}',{'status':status,'result':result,'error':error},'command-'+item['id'])
         except PortalError as error: self.log.debug('Command poll unavailable: %s',error)
+    def resolve_media_uris(self,cloud_cameras):
+        # Closes the last confirmed-live Samsung gap: cameras.onvif_
+        # endpoint (what app/main.py's _provisioned_camera_stream()
+        # actually reads for camera_url()) was never populated by
+        # anything. For each cloud camera that already has a
+        # camera_number and a matching discovered physical device (by
+        # device_key -- never IP/MAC/name) but no onvif_endpoint yet,
+        # runs the read-only ONVIF GetProfiles/GetStreamUri lookup
+        # (onvif_media.py -- this agent, not the cloud/VMS process, has
+        # direct LAN reachability to the camera) and submits a resolved,
+        # already-credential-stripped rtsp:// URI to the cloud. Never
+        # guesses a path, never modifies any camera setting, and never
+        # submits anything at all if the device challenges for
+        # authentication -- that camera is simply skipped and retried
+        # (unchanged) on the next cycle, exactly like an unbound camera
+        # is.
+        discovered_by_device_key={}
+        for camera in self.discovered_store.cameras():
+            device_key=str(camera.get('device_key') or '').strip()
+            if device_key: discovered_by_device_key[device_key]=camera
+        for cloud_camera in cloud_cameras:
+            camera_id=str(cloud_camera.get('id','')).strip()
+            device_key=str(cloud_camera.get('device_key') or '').strip()
+            if not camera_id or not device_key or cloud_camera.get('onvif_endpoint') or cloud_camera.get('camera_number') is None:
+                continue  # already resolved, or nothing to associate a lookup with yet
+            physical=discovered_by_device_key.get(device_key)
+            ip=physical.get('ip') if physical else None
+            if not ip:
+                continue  # not (or not yet) seen on this appliance's own network scan
+            result=resolve_media_uri(ip,device_key)
+            if result['status']!='resolved':
+                self.log.info('onvif_media.not_resolved camera_id=%s status=%s',camera_id,result['status'])
+                continue
+            try:
+                self.client.request('POST',f'/api/appliance/{self.config.cloud_id}/cameras/{camera_id}/media-uri',{'device_key':device_key,'rtsp_uri':result['rtsp_uri']})
+            except PortalError as error:
+                self.log.debug('onvif_media.submit_failed camera_id=%s error=%s',camera_id,error)
     def sync_configuration(self):
         try:
-            configuration=self.client.request('GET','/api/appliance/configuration'); existing={item.get('id'):item for item in self.cameras()}; merged=[]
-            for item in configuration.get('cameras',[]):
-                local=existing.get(item.get('id'),{}); merged.append({**local,**item,'online':local.get('online',False),'recording':local.get('recording',False),'analytics':local.get('analytics',False),'last_recording_at':local.get('last_recording_at'),'last_error':local.get('last_error')})
-            if merged: self.config.cameras_file.parent.mkdir(parents=True,exist_ok=True); self.config.cameras_file.write_text(json.dumps(merged,indent=2),encoding='utf-8')
+            configuration=self.client.request('GET','/api/appliance/configuration')
+            cloud_cameras=configuration.get('cameras',[])
+            # Closes the camera_not_bound gap for any camera the cloud has
+            # just assigned a relay slot to: matches it against this
+            # appliance's own already-discovered cameras by device_key
+            # (never MAC/IP/name) and persists the binding locally. No
+            # rediscovery, no re-provisioning -- see camera_binding.py's
+            # auto_bind_discovered_cameras() docstring for the full
+            # idempotency contract.
+            auto_bind_discovered_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store)
+            self.resolve_media_uris(cloud_cameras)
+            merged=reconcile_cloud_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store.bindings(),self.vms_status)
+            atomic_write_json(self.config.cameras_file,merged)
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
     def cycle(self):
-        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery()
+        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement()
+    def _await_activation(self):
+        """Waits for `anyaicam-setup` (interactive or --claim) to write a
+        real credential, instead of treating a freshly-installed,
+        not-yet-claimed appliance as a fatal error.
+
+        Confirmed live on Ryzen (2026-09-11): installer/scripts/
+        install.sh enables and (re)starts this service unconditionally,
+        before claim/activation ever runs -- "installed but not yet
+        claimed" is the FIRST real state of every fresh appliance, and
+        is exactly the state installer/validate.sh runs in (see that
+        script's own is-active check on this unit). The previous
+        behavior here -- raise RuntimeError immediately -- combined with
+        this unit's `Restart=always`/`RestartSec=10` turned that
+        entirely normal, expected, intentional state into a permanent
+        crash loop: confirmed via journalctl showing 600+ restarts on a
+        correctly installed, deliberately-still-unclaimed Ryzen, with
+        every single restart logging the identical "Appliance is not
+        activated" traceback. A missing credential before claim is not a
+        misconfiguration to fail loudly on -- it is the appliance
+        correctly waiting for a step of its own documented lifecycle
+        that has not happened yet.
+
+        Logs once on entry and once on success; every retry in between
+        is silent (an unclaimed appliance can sit here for a long time
+        by design -- Samsung's own checkpoint records exactly this
+        state persisting across sessions -- so this must never become a
+        second, quieter crash loop in the journal).
+
+        Re-reads credential.json directly (not just relies on
+        `_finish_enrollment()`'s own `restart_service()` call) so a
+        single long-running process can transition cleanly from waiting
+        to active the moment `anyaicam-setup` completes, without
+        depending on that restart succeeding or racing it.
+        """
+        if self.client.credential: return
+        self.log.info('Appliance is not activated yet; waiting for anyaicam-setup (interactive or --claim) to complete...')
+        while not self.stop_event.is_set():
+            credential=load_credential(self.config)
+            if credential and credential.get('credential'):
+                self.client.appliance_id=credential.get('appliance_id'); self.client.credential=credential.get('credential')
+                self.log.info('Appliance activation detected; resuming normal operation cloud_id=%s',self.config.cloud_id)
+                return
+            self.stop_event.wait(ACTIVATION_POLL_INTERVAL_SECONDS)
     def run(self):
-        if not self.client.credential: raise RuntimeError('Appliance is not activated. Run anyaicam-setup first.')
+        self._await_activation()
+        if self.stop_event.is_set():
+            self.log.info('AnyAiCam appliance agent stopped (still waiting for activation)')
+            return
         self.log.info('AnyAiCam appliance agent started cloud_id=%s mode=%s',self.config.cloud_id,self.config.mode)
+        self.resolve_update_state()
         while not self.stop_event.is_set():
             try: self.cycle()
             except Exception: self.log.exception('Unhandled agent cycle error')

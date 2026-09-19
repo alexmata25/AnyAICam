@@ -16,11 +16,21 @@ DEMO_SOURCE = 'demo'
 
 ROLE_PERMISSIONS = {
     'administrator': {'*'},
-    'partner_owner': {'partner.view','customer.create','customer.view','customer.edit','quote.create','user.invite','appliance.assign','appliance.action','pricing.view','pricing.edit','audit.view'},
+    # AAC (facial recognition / access-control analytics): 'facial.view'
+    # (read people/watchlists/events/settings) and 'facial.manage'
+    # (enroll/edit/delete people, manage watchlists, change settings) --
+    # see facial_recognition_ui.py's own module docstring for why these
+    # two permissions, not a third auth system, gate every AAC route.
+    # partner_owner gets read visibility only (oversight across their
+    # customers); technician and customer_owner get full manage rights
+    # (the on-site roles that actually enroll people); customer_viewer
+    # and salesperson get no AAC access at all -- salesperson's existing
+    # permission set is quote/pricing-only and stays that way.
+    'partner_owner': {'partner.view','customer.create','customer.view','customer.edit','quote.create','user.invite','appliance.assign','appliance.action','pricing.view','pricing.edit','audit.view','facial.view'},
     'salesperson': {'partner.view','customer.create','customer.view','customer.edit','quote.create','pricing.view'},
-    'technician': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action'},
-    'customer_owner': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure'},
-    'customer_viewer': {'customer.self.view'},
+    'technician': {'partner.view','customer.view','customer.edit','appliance.assign','appliance.action','facial.manage','facial.view'},
+    'customer_owner': {'customer.self.view','customer.self.edit','user.invite','appliance.self.link','camera.self.configure','facial.manage','facial.view'},
+    'customer_viewer': {'customer.self.view','facial.view'},
 }
 
 
@@ -78,13 +88,76 @@ def initialize_database() -> None:
         '''CREATE TABLE IF NOT EXISTS appliance_camera_status(appliance_id TEXT NOT NULL,camera_id TEXT NOT NULL,name TEXT,online INTEGER,recording INTEGER,analytics INTEGER,last_recording_at TEXT,last_error TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(appliance_id,camera_id),FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
         '''CREATE TABLE IF NOT EXISTS appliance_events(appliance_id TEXT NOT NULL,event_id TEXT NOT NULL,event_type TEXT,camera_id TEXT,event_timestamp TEXT,payload_json TEXT NOT NULL,received_at TEXT NOT NULL,PRIMARY KEY(appliance_id,event_id),FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
         '''CREATE TABLE IF NOT EXISTS appliance_commands(id TEXT PRIMARY KEY,appliance_id TEXT NOT NULL,command TEXT NOT NULL,payload_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT,completed_at TEXT,expires_at TEXT NOT NULL,error TEXT,created_by TEXT,FOREIGN KEY(appliance_id) REFERENCES appliances(id))''',
+        # admin_partner_bridge.py: an explicit, revocable link from one
+        # Admin Portal user (admin_user_id, the legacy JSON-store user id)
+        # to one existing Partner Portal user (partner_user_id) -- never a
+        # new partner_users row, never a copied/shared password. See that
+        # module's own docstring for the full design and every
+        # fail-closed check applied on top of this table at resolution
+        # time.
+        '''CREATE TABLE IF NOT EXISTS admin_partner_links(admin_user_id TEXT PRIMARY KEY,admin_email TEXT NOT NULL,partner_user_id TEXT NOT NULL,partner_email TEXT NOT NULL,linked_at TEXT NOT NULL,linked_by TEXT NOT NULL,revoked_at TEXT,FOREIGN KEY(partner_user_id) REFERENCES partner_users(id))''',
+        # notification_preferences.py: one row per portal user -- Email/
+        # SMS contact info + channel toggles + verification timestamps +
+        # quiet hours + delivery mode. event_types_json/camera_scope
+        # decide WHAT and WHERE; the actual authorized-cameras check
+        # happens at save time (see save_preferences()'s own docstring),
+        # never trusted from this table alone at read time either.
+        #
+        # Named customer_notification_channels, NOT notification_
+        # preferences: db_migrations.py already defines a *different*
+        # table under that exact name (one row per user/customer/site/
+        # camera/event_type, with in_app/email/web_push/sms channel
+        # booleans -- the admin-managed per-event-type rule set
+        # notification_engine.fanout_appliance_event() actually reads
+        # for real delivery decisions, surfaced via /api/notification-
+        # rules). This table is deliberately a separate, additive
+        # concept -- WHERE to send (an actual email address/phone
+        # number, plus verification state) -- neither of which that
+        # existing rule table stores anywhere. It is not yet wired into
+        # that live fanout path; see notification_settings_page.py's
+        # own module docstring and this session's Notifications
+        # milestone report for that follow-up.
+        '''CREATE TABLE IF NOT EXISTS customer_notification_channels(user_id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,email_address TEXT,email_enabled INTEGER NOT NULL DEFAULT 0,email_verified_at TEXT,phone_number TEXT,sms_enabled INTEGER NOT NULL DEFAULT 0,phone_verified_at TEXT,event_types_json TEXT NOT NULL DEFAULT '[]',camera_scope TEXT NOT NULL DEFAULT 'all',quiet_hours_enabled INTEGER NOT NULL DEFAULT 0,quiet_start TEXT NOT NULL DEFAULT '22:00',quiet_end TEXT NOT NULL DEFAULT '07:00',delivery_mode TEXT NOT NULL DEFAULT 'immediate',updated_at TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES partner_users(id))''',
+        # Only populated when camera_scope='selected' -- deliberately
+        # empty (not a frozen snapshot) when camera_scope='all', so a
+        # camera added to the account later is automatically included
+        # without the customer having to re-save anything.
+        '''CREATE TABLE IF NOT EXISTS customer_notification_channel_cameras(user_id TEXT NOT NULL,camera_id TEXT NOT NULL,PRIMARY KEY(user_id,camera_id),FOREIGN KEY(user_id) REFERENCES partner_users(id),FOREIGN KEY(camera_id) REFERENCES cameras(id))''',
+        # Appliance identity contract (see appliance_identity.py's own
+        # module docstring for the full design): the explicit grant this
+        # whole contract exists to require -- a user is authorized for a
+        # given appliance only if a live (revoked_at IS NULL) row here
+        # resolves to it, never merely because partner_id matches.
+        # scope_type is one of global/partner/customer/site/appliance;
+        # scope_id is NULL only for scope_type='global'.
+        '''CREATE TABLE IF NOT EXISTS identity_grants(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,role TEXT NOT NULL,scope_type TEXT NOT NULL,scope_id TEXT,granted_at TEXT NOT NULL,granted_by TEXT,revoked_at TEXT,FOREIGN KEY(user_id) REFERENCES partner_users(id))''',
+        # v1/dev only: the manifest-signing keypair lives in this same
+        # database. A real cloud deployment keeps the private key in a
+        # proper KMS/secrets store, never a queryable table -- see
+        # appliance_identity.py's module docstring.
+        '''CREATE TABLE IF NOT EXISTS identity_signing_keys(key_id TEXT PRIMARY KEY,public_key_b64 TEXT NOT NULL,private_key_b64 TEXT NOT NULL,created_at TEXT NOT NULL,revoked_at TEXT)''',
     ]
     with database_connect() as db:
         for statement in statements: db.execute(statement)
         appliance_columns={item['name'] for item in db.execute('PRAGMA table_info(appliances)').fetchall()} if backend()=='sqlite' else {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='appliances'").fetchall()}
         if 'activation_status' not in appliance_columns: db.execute("ALTER TABLE appliances ADD COLUMN activation_status TEXT NOT NULL DEFAULT 'pending'")
-        for column,definition in [('partner_id','TEXT'),('uptime_seconds','INTEGER NOT NULL DEFAULT 0'),('disk_capacity','REAL NOT NULL DEFAULT 0'),('recording_used','REAL NOT NULL DEFAULT 0'),('last_error','TEXT'),('state',"TEXT NOT NULL DEFAULT 'offline'"),('credential_revoked_at','TEXT')]:
+        for column,definition in [('partner_id','TEXT'),('uptime_seconds','INTEGER NOT NULL DEFAULT 0'),('disk_capacity','REAL NOT NULL DEFAULT 0'),('recording_used','REAL NOT NULL DEFAULT 0'),('last_error','TEXT'),('state',"TEXT NOT NULL DEFAULT 'offline'"),('credential_revoked_at','TEXT'),
+                                  # Local recording storage management (2026-09-17): RDM-visible surface
+                                  # for the edge worker's own live state -- populated via the existing
+                                  # heartbeat channel, never computed independently on the cloud side,
+                                  # so "Cleanup Active" (a transient, edge-process-only fact) is always
+                                  # the appliance's own real-time truth, not a cloud-side guess from
+                                  # disk_capacity/disk_used alone. storage_state is one of 'healthy',
+                                  # 'warning', 'cleanup_active', 'critical', or NULL (appliance has never
+                                  # reported -- e.g. this feature not yet enabled on that appliance).
+                                  ('storage_state','TEXT'),('storage_free_percent','REAL'),('storage_last_cleanup_at','TEXT')]:
             if column not in appliance_columns: db.execute(f'ALTER TABLE appliances ADD COLUMN {column} {definition}')
+        # authorization_version: bumped on any grant/role/enabled change
+        # for this user -- the deterministic (never clock-based) staleness
+        # signal an appliance compares against its cached manifest. See
+        # appliance_identity.py.
+        partner_user_columns={item['name'] for item in db.execute('PRAGMA table_info(partner_users)').fetchall()} if backend()=='sqlite' else {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='partner_users'").fetchall()}
+        if 'authorization_version' not in partner_user_columns: db.execute('ALTER TABLE partner_users ADD COLUMN authorization_version INTEGER NOT NULL DEFAULT 1')
     bootstrap_admin()
     from db_migrations import apply_migrations
     apply_migrations()
@@ -102,13 +175,120 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def bootstrap_admin() -> None:
-    email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower(); password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
-    if not email or not password: return
+    """TEMPORARY LOCAL BOOTSTRAP PATH -- validation/emergency-access
+    scaffolding only, not the production onboarding design. The real
+    first-identity flow will come from the website -> AWS -> VMS
+    pipeline; when that lands, this function (and its ANYAICAM_ADMIN_
+    EMAIL/ANYAICAM_ADMIN_PASSWORD env vars) should be removed cleanly
+    rather than left running alongside it as a second, parallel
+    authentication path.
+
+    Confirmed live on Samsung: a bootstrap admin created before this
+    fix could log in fine right up until its own appliance activated --
+    at that exact point POST /api/portal-login (main.py) switches from
+    the simple local password check (partner_db.authenticate_detailed())
+    to the cloud-delegated one (appliance_identity.authenticate_operator()),
+    which requires a live identity_grants row resolving to the activated
+    appliance's scope, not just a correct password. This account never
+    had one, so every login attempt failed with a generic "Invalid email
+    or password" regardless of how many times the password was reset.
+
+    scope_type='global' -- corrected from an earlier version of this fix
+    that used scope_type='partner'. That first attempt let POST /api/
+    portal-login succeed again, but confirmed live on Samsung it left
+    the Admin Portal itself effectively empty ("Your current role does
+    not include manage_settings"): cloud_administrator_bridge() (main.py)
+    -- the sole path any cloud-delegated session uses to reach the
+    legacy Admin Portal's manage_settings-gated pages -- deliberately
+    only recognizes a scope_type='global' administrator grant
+    (has_global_administrator_grant()), by design excluding a partner-
+    scoped (company-level) administrator from ever silently becoming a
+    true platform administrator (see that function's own docstring, and
+    test_cloud_administrator_bridge.py's test_partner_scoped_
+    administrator_cannot_reach_admin_portal). This bootstrap account
+    represents the one true AnyAiCam operator identity, not a scoped
+    company admin, and needs exactly that reach to match what its
+    pre-activation local-password check granted it (unrestricted
+    access, no scope concept at all) -- so scope_type='global' (scope_id
+    NULL, per the schema's own convention) is the correct, already-
+    documented choice here, not an over-broad one: it is the one
+    designed-in scope 'administrator' role legitimately has for a true
+    top-level operator (see VALID_ROLE_SCOPES's own comment in
+    appliance_identity.py), and grant_resolves() already treats
+    scope_type='global' as authorized for every appliance unconditionally,
+    same as 'partner' was for appliances under one partner_id -- so this
+    correction does not narrow appliance-login access at all, only
+    restores the Admin Portal reach the account needs. Checking for an
+    existing live (revoked_at IS NULL) match before creating one makes
+    this idempotent: rerunning bootstrap_admin() (it runs on every
+    initialize_database() call, i.e. every container start) never
+    creates a duplicate grant, and an admin that already has the correct
+    grant is left completely untouched.
+
+    ANYAICAM_ADMIN_PASSWORD is required ONLY to create a brand-new
+    account -- an already-existing bootstrap admin (found by email
+    alone) never has its password_hash touched here, and no password
+    needs to be present in the environment at all for its missing grant
+    to be backfilled. This matters in exactly the scenario that caused
+    the live failure above: the temporary password env var gets removed
+    from vms.env once the account is confirmed created (never left
+    sitting in a persistent file), but this function keeps running on
+    every container start regardless -- it must be able to backfill a
+    still-missing grant for that already-created account without ever
+    needing a password (real or placeholder) put back into the
+    environment just to reach this code."""
+    email=os.getenv('ANYAICAM_ADMIN_EMAIL','').strip().lower()
+    if not email: return
     now=datetime.now().isoformat(); partner_id='anyaicam-primary'
     with database_connect() as db:
-        db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
         existing=db.execute('SELECT id FROM partner_users WHERE email=?',(email,)).fetchone()
-        if not existing: db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(secrets.token_hex(5),partner_id,email,'Administrator','administrator',password_hash(password),now))
+        if existing:
+            user_id=existing['id']
+        else:
+            password=os.getenv('ANYAICAM_ADMIN_PASSWORD','')
+            if not password: return
+            db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',(partner_id,'AnyAiCam','approved',REAL_SOURCE,now))
+            user_id=secrets.token_hex(5)
+            db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',(user_id,partner_id,email,'Administrator','administrator',password_hash(password),now))
+        has_grant=db.execute("SELECT 1 FROM identity_grants WHERE user_id=? AND role='administrator' AND scope_type='global' AND revoked_at IS NULL",(user_id,)).fetchone()
+        if not has_grant:
+            from appliance_identity import create_grant
+            create_grant(db,user_id=user_id,role='administrator',scope_type='global',scope_id=None,granted_by='system:bootstrap_admin',now=now)
+
+
+class FirstAdminAlreadyExists(Exception):
+    """Raised by create_first_admin() when at least one partner_users
+    row already exists. The web setup path (partner_portal.py's
+    GET/POST /setup) is the only caller -- it must never create a
+    second bootstrap admin once any account exists, on a genuinely
+    fresh install (RUNTIME_ROLE=edge, no ANYAICAM_ADMIN_EMAIL/PASSWORD
+    env vars set) where bootstrap_admin() above never ran."""
+
+
+def create_first_admin(email: str, password: str) -> str:
+    """Atomically create the initial administrator and its global identity grant."""
+    email = str(email).strip().lower()
+    if not email or '@' not in email or len(password) < 12:
+        raise ValueError('A valid email and a password of at least 12 characters are required.')
+    hashed = password_hash(password)
+    now = datetime.now().isoformat()
+    with connection() as db:
+        # Serialize the empty-table check across processes, not only threads.
+        if backend() == 'sqlite':
+            db.execute('BEGIN IMMEDIATE')
+        else:
+            db.execute('LOCK TABLE partner_users IN EXCLUSIVE MODE')
+        if db.execute('SELECT 1 FROM partner_users LIMIT 1').fetchone() is not None:
+            raise FirstAdminAlreadyExists('An administrator account already exists.')
+        db.execute('INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)',
+                   ('anyaicam-primary','AnyAiCam','approved',REAL_SOURCE,now))
+        user_id = secrets.token_hex(16)
+        db.execute('INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,1,?)',
+                   (user_id,'anyaicam-primary',email,'Administrator','administrator',hashed,now))
+        from appliance_identity import create_grant
+        create_grant(db,user_id=user_id,role='administrator',scope_type='global',scope_id=None,
+                     granted_by='system:first_admin_setup',now=now)
+    return user_id
 
 
 def authenticate(email: str,password: str):
@@ -141,6 +321,90 @@ def allowed(identity: dict, permission: str) -> bool:
 
 def require_permission(identity: dict, permission: str) -> None:
     if not allowed(identity,permission): raise PermissionError(f'Permission required: {permission}')
+
+
+def tenant_owns_partner(db, identity: dict, resource_partner_id: str | None) -> bool:
+    """True when resource_partner_id is within identity's own tenant
+    reach: either it equals identity's own partner_id, or identity
+    holds a genuine, live-verified GLOBAL administrator grant.
+
+    Deliberately never a bare identity.get('role')=='administrator'
+    shortcut (2026-09-14 multi-tenant security remediation, Codex
+    tenant-isolation audit -- see docs/PROJECT_CHECKPOINT.md's matching
+    dated entry): that field is only this user's own partner_users.role
+    value, and it is byte-identical whether their administrator grant
+    is scope_type='global' (true platform-wide reach, minted only by
+    partner_db.bootstrap_admin()/create_first_admin()) or scope_type=
+    'partner' (administrator of exactly one company, per appliance_
+    identity.py's own VALID_ROLE_SCOPES contract). Collapsing that
+    distinction back into a role-name check would let a partner-scoped
+    administrator silently reach every other tenant -- the exact class
+    of bug this remediation exists to close. See appliance_identity.
+    has_global_administrator_grant()'s own docstring for the full
+    rationale; that function is this codebase's one existing, already-
+    correct implementation of "is this really a global administrator,"
+    used here rather than reinvented.
+
+    resource_partner_id may be None (an appliance not yet backfilled
+    with its own partner_id column -- see appliance_cloud.py's
+    activation-time COALESCE backfill -- always has a real, non-null
+    owning customer's own partner_id available via a join instead;
+    callers resolving appliance ownership must pass THAT, never the
+    appliance row's own possibly-null partner_id column directly)."""
+    from appliance_identity import has_global_administrator_grant
+    if has_global_administrator_grant(db, email=identity.get('email', '')):
+        return True
+    if resource_partner_id is None:
+        return False
+    return resource_partner_id == (identity.get('partner_id') or 'anyaicam-primary')
+
+
+def authorize_customer_tenant(db, identity: dict, customer_id: str) -> dict | None:
+    """Resolves customer_id inside the caller's own already-open
+    connection and returns the full customers row only when it exists
+    AND is within identity's own tenant reach -- None in every other
+    case (unknown id, wrong tenant), on purpose, so a caller can raise
+    one uniform 404 for both and a cross-tenant probe can never tell
+    "no such customer" apart from "not yours" (matching this project's
+    own established customer_detail()/add_customer_note() convention).
+
+    A customer_owner/customer_viewer identity has no partner-wide reach
+    at all -- only self-service reach over its own account -- so for
+    those roles this additionally requires customer_id to equal
+    identity's own customer_id, never merely the same partner.
+
+    Callers MUST call this before any write, inside the same
+    transaction/connection as that write (pass the same db handle you
+    are about to INSERT/UPDATE with) -- a denial must never be followed
+    by a partial mutation."""
+    customer = db.execute('SELECT * FROM customers WHERE id=?', (customer_id,)).fetchone()
+    if not customer:
+        return None
+    customer = dict(customer)
+    if identity.get('role') in ('customer_owner', 'customer_viewer'):
+        return customer if customer_id == identity.get('customer_id') else None
+    return customer if tenant_owns_partner(db, identity, customer['partner_id']) else None
+
+
+def authorize_appliance_tenant(db, identity: dict, appliance_id: str) -> dict | None:
+    """Same contract and same call-before-any-write requirement as
+    authorize_customer_tenant(), resolved through the appliance's own
+    customer's partner_id -- never the appliance row's own partner_id
+    column, which is only backfilled at activation time (see
+    tenant_owns_partner()'s own docstring) and can legitimately be NULL
+    for an appliance this same tenant owns but has not yet activated,
+    which is exactly when activation-token generation is used."""
+    appliance = db.execute(
+        'SELECT a.*, c.partner_id AS owning_partner_id, c.id AS owning_customer_id '
+        'FROM appliances a JOIN customers c ON c.id = a.customer_id WHERE a.id=?',
+        (appliance_id,),
+    ).fetchone()
+    if not appliance:
+        return None
+    appliance = dict(appliance)
+    if identity.get('role') in ('customer_owner', 'customer_viewer'):
+        return appliance if appliance['owning_customer_id'] == identity.get('customer_id') else None
+    return appliance if tenant_owns_partner(db, identity, appliance['owning_partner_id']) else None
 
 
 def audit(actor: dict,action: str,entity_type: str='',entity_id: str='',details=None) -> None:

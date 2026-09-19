@@ -1,0 +1,655 @@
+"""Real short-clip + thumbnail cloud delivery for a single qualifying
+motion/AI detection event (store_motion_event()/save_yolo_events()'s own
+per-event build-then-upload background task) -- distinct from, and
+unrelated to, recording_uploader.py's own periodic bulk recording sync
+and analytics_sync.py's own periodic bulk analytics-event sync.
+
+This module's own cloud calls (an STS-credentialed S3 PutObject for the
+clip and thumbnail, then two control-plane POSTs to register the
+detection event and its media in EC2) are gated by their own explicit
+flag, ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED (EVENT_MEDIA_UPLOAD_ENABLED
+below) -- deliberately NOT by ANYAICAM_RECORDING_UPLOAD_ENABLED or
+ANYAICAM_ANALYTICS_SYNC_ENABLED, whose own meaning is unchanged by this
+module and stays scoped to gating recording_uploader.py's and
+analytics_sync.py's own periodic background workers only, exactly as
+before. Local event creation, local clip creation (build_motion_event_
+clip()), and local thumbnail creation all happen upstream of this
+module's own entry point and are never affected by this flag either
+way -- only the outbound network calls below are."""
+
+import logging
+import os
+import subprocess
+import time
+import asyncio
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import recording_uploader as recording_upload
+import smart_motion
+from event_clips import compute_clip_window
+import event_media_outbox
+
+logger = logging.getLogger("anyaicam.event_media_uploader")
+
+APP_ROOT = Path("/app")
+RECORDINGS_ROOT = APP_ROOT / "recordings"
+
+# Default false: matches the same safe-by-default convention every other
+# appliance -> cloud call in this codebase already uses (recording_
+# uploader.RECORDING_UPLOAD_ENABLED, analytics_sync.ANALYTICS_SYNC_
+# ENABLED, and analytics_sync.py's own ANALYTICS_SYNC_NOTIFY_ENABLED --
+# all default "false"). Before this flag existed, this module's calls
+# ran unconditionally; a fresh or already-deployed appliance that never
+# sets ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED now gets the same off-by-
+# default posture as every sibling cloud-call flag, not a silent
+# continuation of the previous always-on behavior.
+# Local capture is deliberately independent from transport.  It permits only
+# validation of the local clip/thumbnail paths and an atomic outbox write;
+# it never reads an appliance identity, requests STS credentials, contacts
+# the control plane, or initializes an S3 client.  Keep it off by default so
+# existing installations do not start retaining new event media unexpectedly.
+EVENT_MEDIA_CAPTURE_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_CAPTURE_ENABLED", "false").strip().lower() == "true"
+EVENT_MEDIA_UPLOAD_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED", "false").strip().lower() == "true"
+
+# Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
+# every event clip/thumbnail object was written with no CacheControl
+# metadata at all, so nothing ever told a browser (or a future CDN sitting
+# in front of this bucket) that these bytes are safe to reuse -- an event
+# clip/thumbnail is captured once and never modified afterward, so it is
+# always safe to mark long-lived and immutable. "public" here describes
+# how the *bytes themselves* may be cached once legitimately fetched, not
+# who may fetch them -- access is still gated entirely by the short-lived
+# presigned URL requirement enforced upstream; nothing about that
+# authorization boundary changes. Set at upload time only -- does not
+# retroactively change any already-uploaded object's stored metadata.
+EVENT_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
+RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
+RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
+RETRY_MAX_JOBS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_JOBS", "10")))
+event_media_retry_state = {"worker_status": "not_started", "last_summary": None, "last_error": None}
+
+
+def _local_path_from_recording_url(value: str | None) -> Path | None:
+    if not value:
+        return None
+
+    value = str(value).split("#", 1)[0].split("?", 1)[0]
+
+    if not value.startswith("/recordings/"):
+        return None
+
+    # URLs are not file capabilities.  Resolve and contain the resulting
+    # filesystem path before opening it so a URL such as
+    # /recordings/../../etc/shadow can never be turned into an upload.
+    try:
+        root = RECORDINGS_ROOT.resolve(strict=True)
+        path = (APP_ROOT / value.lstrip("/")).resolve(strict=True)
+        path.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return path if path.is_file() else None
+
+
+def _safe_recording_url(value: str | None) -> str | None:
+    """Canonical local reference safe to persist in the durable outbox.
+
+    Recording URLs are paths, never bearer URLs.  Remove query and fragment
+    data before persistence so a caller cannot accidentally retain a token in
+    the outbox while still allowing the existing local path resolver to
+    validate containment.
+    """
+    if not value:
+        return None
+    return str(value).split("#", 1)[0].split("?", 1)[0]
+
+
+def _duration_seconds(path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _ensure_detection_event_synced(
+    event_id: str,
+    camera_id: str,
+) -> bool:
+    """Ensure this exact local analytics event exists in EC2 before media registration."""
+    import analytics_sync
+
+    events = analytics_sync._load_local_events()
+    event = next(
+        (
+            item
+            for item in events
+            if str(item.get("id") or "").strip() == event_id
+        ),
+        None,
+    )
+
+    if event is None:
+        logger.warning(
+            "event_media.analytics_event_missing event_id=%s",
+            event_id,
+        )
+        return False
+
+    payload = analytics_sync._build_payload(event)
+
+    for attempt in range(1, 13):
+        response = analytics_sync._control_plane_post(
+            f"/api/appliance/analytics/{camera_id}/events",
+            payload,
+        )
+
+        if (
+            isinstance(response, dict)
+            and response.get("status") in {"accepted", "duplicate"}
+        ):
+            analytics_sync._persist_synced_id(event_id)
+
+            logger.info(
+                "event_media.analytics_synced "
+                "event_id=%s camera_id=%s status=%s",
+                event_id,
+                camera_id,
+                response.get("status"),
+            )
+            return True
+
+        if attempt < 12:
+            time.sleep(5)
+
+    logger.warning(
+        "event_media.analytics_sync_failed "
+        "event_id=%s camera_id=%s",
+        event_id,
+        camera_id,
+    )
+    return False
+
+
+def upload_motion_event_media(
+    *,
+    event_id: str,
+    camera_number: int,
+    event_start: datetime,
+    event_end: datetime,
+    clip_url: str,
+    thumbnail_url: str | None,
+    shared_media_out: dict | None = None,
+    already_classified: bool = False,
+) -> bool:
+    # already_classified is a new, optional, purely-additive parameter
+    # (2026-09-16), defaulting to False -- the correct default for this
+    # function's other real caller, store_motion_event(), whose trigger
+    # is raw pixel-diff Basic Motion and can fire on a waving tree,
+    # shadow, or rain exactly as easily as a real person. save_yolo_
+    # events() passes True explicitly: its own qualifying_detections
+    # check already guarantees a real classified object (person/
+    # vehicle/etc, see AI_CLIP_EVENT_TYPES) triggered this event, so it
+    # never needs -- and must never be blocked by -- the smart_motion
+    # correlation signal below, which is a separate, independently
+    # RDM-controlled entitlement (smart_motion_enabled) that has no
+    # bearing on an already-classified AI detection's own eligibility.
+    #
+    # shared_media_out is a new, optional, purely-additive out-parameter:
+    # every existing caller (save_yolo_events()'s own AI-classification
+    # path, and every existing test) omits it and this function's
+    # observable behavior/return value is completely unchanged for them.
+    # When provided, it is populated with this event's own s3_key/
+    # thumbnail_s3_key/duration_seconds/size_bytes/window IF AND ONLY IF
+    # this call reaches the real cloud-registration success path below --
+    # left untouched (empty) on every other path (capture-only mode, any
+    # gate/session/credential failure, registration failure). A
+    # correlated Smart Motion event (main.py's store_motion_event())
+    # awaits this exact call's own task and reuses that dict to register
+    # its own, independent detection_event_media row against the SAME
+    # already-uploaded S3 object, instead of re-encoding and re-uploading
+    # the identical physical window a second time.
+    # Upload historically caused the first durable outbox write.  Preserve
+    # that behavior by making upload imply local capture, while allowing a
+    # separately enabled local-only capture run to stop before every
+    # credential, S3, and control-plane operation.
+    if not (EVENT_MEDIA_CAPTURE_ENABLED or EVENT_MEDIA_UPLOAD_ENABLED):
+        logger.info(
+            "event_media.capture_disabled event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    safe_clip_url = _safe_recording_url(clip_url)
+    clip_path = _local_path_from_recording_url(safe_clip_url)
+
+    if clip_path is None:
+        logger.warning(
+            "event_media.clip_missing event_id=%s camera=%s clip=%s",
+            event_id,
+            camera_number,
+            clip_url,
+        )
+        return False
+
+    safe_thumbnail_url = _safe_recording_url(thumbnail_url)
+    thumbnail_path = _local_path_from_recording_url(safe_thumbnail_url)
+    if thumbnail_path is None:
+        safe_thumbnail_url = None
+
+    # Persist only deterministic local references and timing metadata.  In
+    # particular, no identity, bearer credential, STS material, bucket, or
+    # cloud-derived key can enter the durable outbox.
+    event_media_outbox.put({"event_id": event_id, "camera_number": camera_number,
+                            "event_start": event_start.isoformat(), "event_end": event_end.isoformat(),
+                            "clip_url": safe_clip_url, "thumbnail_url": safe_thumbnail_url})
+
+    # This is the hard local-only boundary.  Nothing below it may run unless
+    # the explicit transport flag is true.
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        logger.info(
+            "event_media.captured_local event_id=%s camera=%s thumbnail=%s",
+            event_id,
+            camera_number,
+            thumbnail_path is not None,
+        )
+        return True
+
+    recording_upload._refresh_camera_map()
+    identity = recording_upload._camera_identity(camera_number)
+
+    if not identity:
+        logger.warning(
+            "event_media.camera_unknown event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    # Per-camera entitlement gate: cameras.cloud_recording_mode, the same
+    # column POST /api/admin/cameras/{id}/cloud-recording-mode sets and
+    # GET /api/appliance/configuration already exposes -- read here off
+    # the cached camera map exactly the way main.py's
+    # people_counting_worker() already reads its own per-camera
+    # entitlement (people_counting_enabled) off that identical map.
+    # Checked AFTER the appliance-wide EVENT_MEDIA_UPLOAD_ENABLED gate
+    # above, never before it: the appliance-wide flag is the master
+    # switch and must be able to disable every camera's upload
+    # regardless of individual eligibility, not the other way around.
+    #
+    # Deliberately 'motion' only -- NOT 'continuous'. 'continuous' is
+    # the separate Cloud 24/7 product, served entirely by
+    # recording_uploader.py's own continuous-recording upload path;
+    # this module's uploads (motion-event clips/thumbnails) are Cloud
+    # Motion's own distinct entitlement and are never inferred from a
+    # camera's continuous-recording eligibility. (Independently
+    # confirmed live and fixed twice, once on staging's own branch and
+    # once during this session's Phase C real-hardware validation --
+    # both converged on the identical gate below.)
+    if identity.get("cloud_recording_mode") != "motion":
+        logger.info(
+            "event_media.camera_ineligible event_id=%s camera=%s cloud_recording_mode=%s",
+            event_id,
+            camera_number,
+            identity.get("cloud_recording_mode"),
+        )
+        return False
+
+    # Environmental-motion filtering (2026-09-16): "Hybrid = local
+    # continuous recording + intelligent cloud event clips" -- a raw
+    # Basic Motion trigger (tree movement, shadows, rain) must never
+    # reach the cloud just because pixels changed. Prefers the existing
+    # object-detection pipeline over inventing a new one: smart_motion.
+    # classify_motion() already correlates this camera's own recent
+    # real YOLO detections (person/vehicle/animal) against a
+    # CORRELATION_WINDOW_SECONDS window -- see that module's own
+    # docstring, built and proven for exactly this purpose. Local
+    # capture (thumbnail/clip on disk, the event's own detection_events/
+    # analytics-history row) already happened above and is completely
+    # unaffected -- only the cloud upload is skipped here. Only applies
+    # when smart_motion_enabled is on for this camera (the existing
+    # architecture's only real object-classification signal available)
+    # and the caller hasn't already guaranteed a real classification
+    # (already_classified=True, save_yolo_events()'s own path) --
+    # without Smart Motion enabled, there is no other real signal to
+    # filter on in the existing architecture, so this deliberately falls
+    # back to current behavior (every Basic Motion clip uploads) rather
+    # than inventing a raw-pixel heuristic.
+    if not already_classified and identity.get("smart_motion_enabled") and not smart_motion.classify_motion(camera_number):
+        logger.info(
+            "event_media.environmental_motion_skipped event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return True
+
+    camera_id = identity["camera_id"]
+    session = recording_upload._ensure_session(camera_number, camera_id)
+
+    if not session:
+        logger.warning(
+            "event_media.session_unavailable event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    if recording_upload.boto3 is None:
+        logger.warning(
+            "event_media.boto3_missing event_id=%s",
+            event_id,
+        )
+        return False
+
+    creds = session["credentials"]
+
+    client = recording_upload.boto3.client(
+        "s3",
+        region_name=recording_upload.AWS_REGION,
+        aws_access_key_id=creds["access_key_id"],
+        aws_secret_access_key=creds["secret_access_key"],
+        aws_session_token=creds["session_token"],
+    )
+
+    date_part = event_start.strftime("%Y/%m/%d")
+    base_key = (
+        f"{session['key_prefix']}"
+        f"{date_part}/events/motion_{event_id}"
+    )
+
+    clip_key = base_key + ".mp4"
+
+    client.upload_file(
+        str(clip_path),
+        session["bucket"],
+        clip_key,
+        ExtraArgs={"ContentType": "video/mp4", "CacheControl": EVENT_MEDIA_CACHE_CONTROL},
+    )
+
+    thumbnail_key = None
+
+    if thumbnail_path is not None:
+        thumbnail_key = base_key + ".jpg"
+
+        try:
+            client.upload_file(
+                str(thumbnail_path),
+                session["bucket"],
+                thumbnail_key,
+                ExtraArgs={"ContentType": "image/jpeg", "CacheControl": EVENT_MEDIA_CACHE_CONTROL},
+            )
+        except Exception as error:
+            logger.warning(
+                "event_media.thumbnail_upload_failed "
+                "event_id=%s camera=%s error=%s",
+                event_id,
+                camera_number,
+                error,
+            )
+            thumbnail_key = None
+
+    window = compute_clip_window(event_start, event_end)
+
+    actual_duration = _duration_seconds(clip_path)
+    duration_seconds = (
+        actual_duration
+        if actual_duration is not None
+        else (window.end - window.start).total_seconds()
+    )
+
+    size_bytes = clip_path.stat().st_size
+
+    payload = {
+        "s3_key": clip_key,
+        "thumbnail_s3_key": thumbnail_key,
+        "started_at": window.start.isoformat(),
+        "ended_at": window.end.isoformat(),
+        "duration_seconds": duration_seconds,
+        "size_bytes": size_bytes,
+        # New, optional (2026-09-18): the exact local /recordings/... URL
+        # already validated above by _local_path_from_recording_url() --
+        # lets a future WireGuard/direct fetch (live_view_wireguard.py)
+        # reach this clip's bytes on the appliance itself instead of via
+        # S3. An older cloud version simply ignores an unknown payload
+        # field; an older appliance simply never sends it -- either way
+        # this is a pure addition, not a contract change.
+        "local_relative_path": safe_clip_url,
+    }
+
+    # Media registration depends on detection_events existing first.
+    # Sync this exact event into EC2 before attempting media registration.
+    if not _ensure_detection_event_synced(event_id, camera_id):
+        logger.warning(
+            "event_media.registration_deferred "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    # detection_events now exists, so media registration can proceed.
+    for attempt in range(1, 13):
+        response = recording_upload._control_plane_post(
+            f"/api/appliance/analytics/"
+            f"{camera_id}/events/{event_id}/media",
+            payload,
+        )
+
+        if (
+            isinstance(response, dict)
+            and response.get("status") in {"accepted", "duplicate"}
+        ):
+            logger.info(
+                "event_media.registered "
+                "event_id=%s camera=%s clip_key=%s thumbnail_key=%s",
+                event_id,
+                camera_number,
+                clip_key,
+                thumbnail_key,
+            )
+            event_media_outbox.remove(event_id)
+            if shared_media_out is not None:
+                shared_media_out.update({
+                    "s3_key": clip_key,
+                    "thumbnail_s3_key": thumbnail_key,
+                    "duration_seconds": duration_seconds,
+                    "size_bytes": size_bytes,
+                    "started_at": payload["started_at"],
+                    "ended_at": payload["ended_at"],
+                })
+            return True
+
+        if attempt < 12:
+            time.sleep(5)
+
+    logger.warning(
+        "event_media.registration_failed "
+        "event_id=%s camera=%s clip_key=%s",
+        event_id,
+        camera_number,
+        clip_key,
+    )
+
+    return False
+
+
+def register_shared_event_media(
+    *,
+    event_id: str,
+    camera_number: int,
+    parent_local_event_id: str,
+) -> bool:
+    """Registers a SECOND, independently-owned detection_event_media row
+    (for `event_id`) referencing the correlated base Motion event's own
+    already-uploaded clip/thumbnail -- no ffmpeg encode, no S3
+    PutObject, no S3 credential of any kind, here. The ONLY thing sent
+    is the parent's own LOCAL event id (`parent_local_event_id`) --
+    never any storage key, timing, duration, or size. The cloud
+    independently re-resolves that id, verifies the full ownership
+    chain, and derives the approved clip/thumbnail/metadata itself from
+    the parent's own already-registered media row (see appliance_cloud.
+    py's analytics_event_media_shared()) -- this call has no S3 key to
+    supply even if it wanted to.
+
+    Durable: writes a "shared" registration-intent entry to the SAME
+    event_media_outbox a base upload uses (see retry_pending_event_
+    media() below), before attempting anything -- so a restart mid-
+    registration, or a parent whose own media isn't ready yet, can
+    always be recovered later WITHOUT this call, or its retry, ever
+    encoding or uploading anything. Removed from the outbox only on a
+    confirmed accepted/duplicate response."""
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        logger.info(
+            "event_media.shared_registration_skipped_disabled "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    recording_upload._refresh_camera_map()
+    identity = recording_upload._camera_identity(camera_number)
+
+    if not identity:
+        logger.warning(
+            "event_media.shared_registration_camera_unknown "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    camera_id = identity["camera_id"]
+
+    event_media_outbox.put({
+        "event_id": event_id,
+        "camera_number": camera_number,
+        "kind": "shared",
+        "parent_local_event_id": parent_local_event_id,
+    })
+
+    if not _ensure_detection_event_synced(event_id, camera_id):
+        logger.warning(
+            "event_media.shared_registration_deferred "
+            "event_id=%s camera=%s",
+            event_id,
+            camera_number,
+        )
+        return False
+
+    payload = {"parent_local_event_id": parent_local_event_id}
+
+    for attempt in range(1, 13):
+        response = recording_upload._control_plane_post(
+            f"/api/appliance/analytics/"
+            f"{camera_id}/events/{event_id}/media/shared",
+            payload,
+        )
+
+        if (
+            isinstance(response, dict)
+            and response.get("status") in {"accepted", "duplicate"}
+        ):
+            logger.info(
+                "event_media.registered_shared "
+                "event_id=%s camera=%s parent_local_event_id=%s",
+                event_id,
+                camera_number,
+                parent_local_event_id,
+            )
+            event_media_outbox.remove(event_id)
+            return True
+
+        if attempt < 12:
+            time.sleep(5)
+
+    logger.warning(
+        "event_media.shared_registration_failed "
+        "event_id=%s camera=%s parent_local_event_id=%s",
+        event_id,
+        camera_number,
+        parent_local_event_id,
+    )
+
+    return False
+
+
+def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
+    """Retry durable jobs on the next local worker tick; never contacts a
+    service unless the normal event-media feature gate is enabled."""
+    # Keep this guard here as well as in event_media_retry_worker(): tests,
+    # diagnostics, and future supervisors may call this synchronous entry
+    # point directly.  An upload-disabled local-capture run must never turn
+    # into transport because of such a call.
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        return {"attempted": 0, "completed": 0, "pending": len(event_media_outbox.load())}
+    attempted = completed = 0
+    for job in event_media_outbox.due()[:max(1, max_jobs)]:
+        attempted += 1
+        try:
+            if job.get("kind") == "shared":
+                # Registration-only recovery for a correlated Smart
+                # Motion event: never re-encodes or re-uploads anything
+                # -- only re-attempts registering an already-uploaded
+                # (by its base Motion event) shared clip under this
+                # event's own id.
+                succeeded = register_shared_event_media(
+                    event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
+                    parent_local_event_id=str(job["parent_local_event_id"]),
+                )
+            else:
+                succeeded = upload_motion_event_media(
+                    event_id=str(job["event_id"]), camera_number=int(job["camera_number"]),
+                    event_start=datetime.fromisoformat(str(job["event_start"])),
+                    event_end=datetime.fromisoformat(str(job["event_end"])),
+                    clip_url=str(job["clip_url"]), thumbnail_url=job.get("thumbnail_url"),
+                )
+            if succeeded:
+                completed += 1
+            else:
+                attempts = int(job.get("attempts", 0)) + 1
+                delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
+                event_media_outbox.replace(str(job["event_id"]), {**job, "attempts": attempts, "last_error": "retry_failed", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
+        except (KeyError, TypeError, ValueError):
+            # Keep malformed records inspectable, but defer them so one bad
+            # item cannot cause a tight loop or block later jobs.
+            attempts = int(job.get("attempts", 0)) + 1
+            delay = min(RETRY_MAX_SECONDS, RETRY_SECONDS * (2 ** min(attempts, 8)))
+            event_media_outbox.replace(str(job.get("event_id")), {**job, "attempts": attempts, "last_error": "invalid_job", "next_attempt_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()})
+    return {"attempted": attempted, "completed": completed, "pending": len(event_media_outbox.load())}
+
+
+async def event_media_retry_worker() -> None:
+    if not EVENT_MEDIA_UPLOAD_ENABLED:
+        event_media_retry_state["worker_status"] = "disabled"
+        while True: await asyncio.sleep(3600)
+    event_media_retry_state["worker_status"] = "running"
+    while True:
+        try:
+            event_media_retry_state["last_summary"] = await asyncio.to_thread(retry_pending_event_media)
+            event_media_retry_state["last_error"] = None
+        except asyncio.CancelledError: raise
+        except Exception as error:
+            event_media_retry_state["last_error"] = type(error).__name__
+            logger.warning("event_media.retry_tick_failed error=%s", type(error).__name__)
+        await asyncio.sleep(RETRY_SECONDS)

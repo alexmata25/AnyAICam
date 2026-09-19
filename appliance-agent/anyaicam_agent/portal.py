@@ -4,7 +4,7 @@ import time
 import urllib.error
 import urllib.request
 
-FORBIDDEN={'username','password','camera_username','camera_password','rtsp_url','credentials','secret'}
+FORBIDDEN={'username','password','camera_username','camera_password','rtsp_url','rtsp_urls','stream_url','stream_urls','credentials','secret','ip','ip_address','host','mac','mac_address','onvif_xaddrs'}
 
 
 def sanitize(value):
@@ -13,7 +13,20 @@ def sanitize(value):
     return value
 
 
-class PortalError(RuntimeError): pass
+class PortalError(RuntimeError):
+    # RDM-2 Group 2E: status_code is additive and backward-compatible --
+    # every existing raise site/caller that only ever passed a message
+    # positionally keeps working unchanged (defaults to None). It lets a
+    # caller distinguish HTTP response classes (e.g. 404 vs 409 vs a
+    # generic network failure) without this module growing any new
+    # exception types -- still exactly one error type for "the portal
+    # request failed", just with an optional extra fact attached. None
+    # means "no HTTP response was ever received" (a network-level
+    # failure, or the pre-flight 'not activated' check below), not
+    # "unknown HTTP status".
+    def __init__(self,message,status_code=None):
+        super().__init__(message)
+        self.status_code=status_code
 
 
 class PortalClient:
@@ -29,7 +42,44 @@ class PortalClient:
         except urllib.error.HTTPError as error:
             try: detail=json.loads(error.read().decode()).get('detail',str(error))
             except Exception: detail=str(error)
-            raise PortalError(detail) from error
+            raise PortalError(detail,status_code=error.code) from error
         except (urllib.error.URLError,TimeoutError,OSError,json.JSONDecodeError) as error: raise PortalError(str(error)) from error
     def test(self): return self.request('GET','/api/appliance/config',authenticated=False)
     def activate(self,cloud_id,token): return self.request('POST','/api/appliance/activate',{'cloud_id':cloud_id,'activation_token':token},authenticated=False)
+    # Phase 1 of the non-interactive/self-service claim flow (see
+    # docs/non-interactive-activation-phase1-plan.md and
+    # app/appliance_claims.py's own module docstring for the cloud-side
+    # half these three methods talk to). Unauthenticated, exactly like
+    # activate() above -- the device has no credential yet at any point
+    # during this exchange, by definition. claim_code/claim_session_id/
+    # claim_proof are bearer-equivalent secrets and, like credential and
+    # activation_token above, are never added to FORBIDDEN: sanitize()
+    # exists to strip camera-credential-shaped keys that should never
+    # reach the wire through this generic path at all (see provisioning.py's
+    # own comment on it being a second, independent layer of defense),
+    # not to scrub values this exchange legitimately has to send. "No
+    # secrets in logs" is satisfied the same way activate() already
+    # satisfies it: nothing in this module logs a payload or a response,
+    # and no caller of these three methods exists yet -- wiring the
+    # interactive wizard (the only current call site pattern to follow)
+    # to actually use this flow is explicitly deferred to a later phase,
+    # so there is no logging call site to get wrong in this one.
+    def claim_begin(self,device_id): return self.request('POST','/api/appliance/claim/begin',{'device_id':device_id},authenticated=False)
+    def claim_status(self,claim_session_id): return self.request('POST','/api/appliance/claim/status',{'claim_session_id':claim_session_id},authenticated=False)
+    def claim_complete(self,claim_session_id,claim_proof): return self.request('POST','/api/appliance/claim/complete',{'claim_session_id':claim_session_id,'claim_proof':claim_proof},authenticated=False)
+    # WireGuard direct remote connectivity (docs/wireguard-remote-
+    # connectivity-plan.md Sec 5): authenticated -- reuses the same
+    # bearer+nonce channel every other appliance route already uses,
+    # via request()'s existing authenticated=True default. Only ever
+    # sends public_key (never a private key -- see wireguard.py's own
+    # enroll_wireguard()) and the replace_existing flag. media_fetch_secret
+    # (2026-09-19, optional) piggybacks on this SAME already-authenticated
+    # call rather than a second route -- omitted entirely (never sent as
+    # None/empty) when this device already has one and isn't rotating, so
+    # an older cloud version that has never heard of this field simply
+    # ignores it on every other call, and this device's own bandwidth
+    # never carries it more than once per real rotation.
+    def wireguard_enroll(self,public_key,replace_existing=False,media_fetch_secret=None):
+        payload={'public_key':public_key,'replace_existing':bool(replace_existing)}
+        if media_fetch_secret: payload['media_fetch_secret']=media_fetch_secret
+        return self.request('POST','/api/appliance/wireguard/enroll',payload)

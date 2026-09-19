@@ -69,6 +69,21 @@ RELAY_COMMANDS_FILE = STATE_DIR / "live_relay_commands.json"  # Phase 4: written
 AWS_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "")).strip()
 SCAN_SECONDS = max(0.5, float(os.environ.get("ANYAICAM_LIVE_RELAY_SCAN_SECONDS", "1.0")))
 SESSION_RENEW_MARGIN_SECONDS = max(30, int(os.environ.get("ANYAICAM_LIVE_RELAY_SESSION_RENEW_MARGIN_SECONDS", "120")))
+# Bounded per-camera concurrency (2026-09-13): confirmed live on Ryzen under
+# real 5-camera load that the previous strictly-sequential for-loop below
+# made every camera wait for every other camera's full session-check +
+# upload + notify round trip before its own turn came up again, producing a
+# measured 1-34 second per-camera freshness spread against a 30-second
+# manifest staleness threshold. Default 8 matches the current Starter
+# tier's own camera-slot ceiling (customer_entitlements.PLAN_TIERS), so
+# today's worst case (8 active cameras) gets full parallelism with zero
+# serialization. A future, larger appliance tier should NOT simply raise
+# this 1:1 with camera count -- asyncio.to_thread's own default executor is
+# shared with every other background worker in this process and caps at
+# min(32, cpu_count()+4) threads, and at high camera counts the real
+# ceiling becomes S3/network throughput, not thread scheduling -- so this
+# stays a single, installer/ops-tunable value, not an auto-scaling formula.
+MAX_CONCURRENT_UPLOADS = max(1, int(os.environ.get("ANYAICAM_LIVE_RELAY_MAX_CONCURRENCY", "8")))
 MAX_TRACKED_SEGMENTS_PER_CAMERA = 50  # bounds our own memory; local .ts files already rotate fast under hls_flags=delete_segments
 
 live_relay_state: dict = {"worker_status": "disabled", "last_scan_at": None, "last_error": None}
@@ -339,6 +354,24 @@ def _remember_uploaded(camera_number: int, segment_name: str) -> None:
 def _upload_segment(session: dict, local_path: Path) -> str:
     if boto3 is None:
         raise RuntimeError("boto3 is not installed.")
+    if not AWS_REGION:
+        # Confirmed live twice now (Phase C's real-hardware validation
+        # of recording_uploader.py, then independently again here): an
+        # empty AWS_REGION/AWS_DEFAULT_REGION silently builds
+        # https://s3..amazonaws.com (the double dot is the empty region)
+        # and every upload fails with a cryptic "Invalid endpoint" deep
+        # inside boto3, with no indication why -- the exact failure mode
+        # _relay_camera_once()'s own log line
+        # (live_relay.segment_upload_failed) reported with no further
+        # context. Fail loud and specific here instead, before ever
+        # constructing the client.
+        raise RuntimeError(
+            "AWS_REGION (or AWS_DEFAULT_REGION) is not configured. "
+            "Refusing to construct an S3 client with an empty region -- "
+            "this would otherwise build an invalid https://s3..amazonaws.com "
+            "endpoint and fail uploads with no clear reason. Set AWS_REGION "
+            "in this appliance's environment before enabling live relay."
+        )
     creds = session["credentials"]
     client = boto3.client(
         "s3",
@@ -381,6 +414,55 @@ def _relay_camera_once(hls_folder: Path, camera_number: int, camera_id: str) -> 
         )
 
 
+async def _relay_camera_bounded(semaphore: "asyncio.Semaphore", hls_folder: Path, camera_number: int, camera_id: str) -> None:
+    """One camera's full per-tick unit of work, gated by the shared
+    concurrency semaphore. Segment processing WITHIN this call remains
+    exactly as sequential as before (unchanged _relay_camera_once) --
+    only the scheduling of this call relative to OTHER cameras' calls is
+    now concurrent, bounded by `semaphore` rather than run one-at-a-time."""
+    async with semaphore:
+        await asyncio.to_thread(_relay_camera_once, hls_folder, camera_number, camera_id)
+
+
+async def _relay_tick(semaphore: "asyncio.Semaphore", hls_folder: Path) -> None:
+    """One full scan tick: reconcile commands, then fan out bounded,
+    concurrent per-camera uploads. Extracted from live_relay_worker()'s
+    own while-loop body so a single tick can be exercised directly in
+    tests without running (and then having to cleanly cancel) the real
+    infinite loop. Updates live_relay_state's timestamp/error fields the
+    same way the loop always has; raises (via a bare `raise`, never
+    swallowed into a warning) if any single camera's task was itself
+    cancelled, so cooperative shutdown still propagates correctly."""
+    await asyncio.to_thread(_reconcile_relay_commands)
+    # A snapshot, not a live view -- fixes the (camera_number, camera_id,
+    # result) correspondence below even if _active_cameras is mutated by a
+    # concurrent set_relay_active() call while this tick's tasks are still
+    # running.
+    snapshot = list(_active_cameras.items())
+    if snapshot:
+        results = await asyncio.gather(
+            *(_relay_camera_bounded(semaphore, hls_folder, camera_number, camera_id)
+              for camera_number, camera_id in snapshot),
+            return_exceptions=True,
+        )
+        # return_exceptions=True means one camera's real exception never
+        # cancels or blocks any other camera's task in this same tick --
+        # each result is inspected independently here, identified by its
+        # own camera_number/camera_id, instead of the previous single
+        # tick-wide try/except that could not tell which camera had
+        # actually failed.
+        for (camera_number, camera_id), result in zip(snapshot, results):
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                logger.warning(
+                    "live_relay.camera_iteration_failed camera_number=%s camera_id=%s error=%s",
+                    camera_number, camera_id, result,
+                )
+    live_relay_state["last_scan_at"] = datetime.now().isoformat()
+    live_relay_state["last_error"] = None
+
+
 async def live_relay_worker(hls_folder: Path) -> None:
     if RUNTIME_ROLE not in {"edge", "combined"} or not LIVE_RELAY_ENABLED:
         live_relay_state["worker_status"] = "disabled"
@@ -388,13 +470,14 @@ async def live_relay_worker(hls_folder: Path) -> None:
             await asyncio.sleep(3600)
     live_relay_state["worker_status"] = "running" if boto3 is not None else "dependency_missing"
     logger.info("live_relay.worker_started status=%s", live_relay_state["worker_status"])
+    # Constructed here, inside the loop that will actually await it, rather
+    # than at module import time -- this is the loop live_relay_worker()
+    # itself runs on, and every task created from `semaphore` below shares
+    # this exact instance for the lifetime of this worker.
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
     while True:
         try:
-            await asyncio.to_thread(_reconcile_relay_commands)
-            for camera_number, camera_id in list(_active_cameras.items()):
-                await asyncio.to_thread(_relay_camera_once, hls_folder, camera_number, camera_id)
-            live_relay_state["last_scan_at"] = datetime.now().isoformat()
-            live_relay_state["last_error"] = None
+            await _relay_tick(semaphore, hls_folder)
             await asyncio.sleep(SCAN_SECONDS)
         except asyncio.CancelledError:
             raise

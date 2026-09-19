@@ -96,8 +96,8 @@ def _sweep_expired_sessions(db, now: datetime) -> None:
     an already-'stopped' row is a terminal, customer-initiated outcome
     and must never be overwritten by a later sweep."""
     db.execute(
-        "UPDATE live_view_sessions SET state='expired' WHERE state='requested' AND expires_at<?",
-        (now.isoformat(),),
+        "UPDATE live_view_sessions SET state='expired',stopped_at=? WHERE state='requested' AND expires_at<?",
+        (now.isoformat(), now.isoformat()),
     )
 
 
@@ -187,8 +187,8 @@ def register_live_view_session_routes(app: FastAPI) -> None:
             # camera relay can be stopped. Multiple browser tabs/reloads may
             # have independent requested sessions for the same camera.
             db.execute(
-                "UPDATE live_view_sessions SET state='stopped' WHERE id=?",
-                (session_id,),
+                "UPDATE live_view_sessions SET state='stopped',stopped_at=? WHERE id=?",
+                (now.isoformat(), session_id),
             )
 
             # Do not stop the camera relay here. A browser pagehide only

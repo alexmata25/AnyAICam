@@ -1,0 +1,11 @@
+# AnyAiCam e2e browser-test foundation (2026-09-15). Local/CI only --
+# never install this in a production/edge/appliance image. Separate from
+# requirements-test.txt (app/tests/'s own pytest unit suite) on purpose:
+# these pull down a real Chromium binary and are a different, heavier
+# testing tier that most unit-test runs should never need.
+#
+# After installing, download the browser binary once:
+#   python -m playwright install chromium
+playwright==1.63.0
+pytest-playwright==0.9.0
+python-dotenv==1.2.3

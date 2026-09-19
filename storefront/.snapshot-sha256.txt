@@ -1,0 +1,1 @@
+86938fb38d01700d18affadb295dcb7f61cf804adc9f115c14aa0b2ca71759ca  /tmp/storefront_snapshot.tar.gz

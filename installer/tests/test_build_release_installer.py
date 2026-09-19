@@ -1,0 +1,308 @@
+"""Regression coverage for run_git()'s core.autocrlf=false override in
+build_release_installer.py.
+
+Confirmed live: on a Windows host with the very common core.autocrlf=true
+setting, `git archive` invoked via Python's subprocess (not through a
+shell/pty) silently re-introduces CRLF into every exported file, even
+though the actual committed blobs are correctly LF-only (git show / a
+plain shell's own `git archive` both return clean bytes on the same
+host and commit). Without a fix, this made a release build's shell-LF
+validation (ensure_lf_and_modes()) fail non-deterministically depending
+entirely on the *building operator's* global git config -- something
+this tool must never depend on. run_git() now passes
+`-c core.autocrlf=false` as an in-process override on every git
+invocation, so the build is deterministic regardless of the host's or
+operator's own git configuration, without ever reading or writing the
+repo's own .git/config.
+
+Two independent checks:
+  1. The constructed command line always carries the override (a pure,
+     platform-independent guard against someone removing it later).
+  2. A real git round-trip: a temporary repo with core.autocrlf=true
+     explicitly set, archived via run_git() -- the output must be
+     byte-for-byte LF-only, proving the override actually neutralizes
+     that config value rather than merely being present on the command
+     line.
+"""
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from build_release_installer import AGENT_RELEASE_PATHS, INSTALLER_RUNTIME_FILES, OPTIONAL_RELEASE_PATHS, REQUIRED_RELEASE_PATHS, run_git, write_deterministic_tar  # noqa: E402
+
+
+class RunGitAutocrlfOverrideTests(unittest.TestCase):
+    def test_every_invocation_carries_the_autocrlf_override(self):
+        with patch("build_release_installer.subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"")
+            run_git(Path("."), "rev-parse", "HEAD")
+        (cmd,), _kwargs = mock_run.call_args
+        self.assertEqual(cmd[0], "git")
+        self.assertIn("-c", cmd)
+        self.assertEqual(cmd[cmd.index("-c") + 1], "core.autocrlf=false")
+
+    def test_archive_is_lf_clean_even_when_the_repo_is_configured_autocrlf_true(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.test"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+            # The exact condition confirmed to trigger the bug: the repo
+            # (not just some global operator setting) has autocrlf=true.
+            subprocess.run(["git", "-C", str(repo), "config", "core.autocrlf", "true"], check=True)
+            script = repo / "script.sh"
+            script.write_bytes(b"#!/usr/bin/env bash\necho hi\n")
+            subprocess.run(["git", "-C", str(repo), "add", "script.sh"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "add script"], check=True)
+
+            archive = run_git(repo, "archive", "--format=tar", "HEAD", "--", "script.sh")
+
+        self.assertNotIn(b"\r", archive, "run_git()'s archive output must be LF-clean regardless of the repo's own core.autocrlf setting")
+
+
+class DeterministicTarExecutableBitTests(unittest.TestCase):
+    """Regression coverage for a second confirmed-live release blocker:
+    the artifact printed "shell_executable=PASS" (previously a hardcoded
+    string with no check behind it at all) while every extracted script
+    was actually mode 0644 on the real Ubuntu target -- `sudo
+    ./install.sh` failed with Permission denied on Samsung. Root cause:
+    write_deterministic_tar() trusted gettarinfo()'s auto-detected mode,
+    which reads the *building host's* os.stat() -- on Windows, os.chmod
+    (..., 0o755) (see ensure_lf_and_modes()) cannot actually confer a
+    POSIX executable bit, so the tar silently inherited Windows' own
+    fabricated, non-executable mode regardless of what chmod "set".
+
+    Every mode is now assigned explicitly in write_deterministic_tar(),
+    independent of any host stat() call -- these tests build a real
+    tarball with write_deterministic_tar() itself (not a mock) and prove
+    the executable bit survives two ways: reading the archive's own
+    stored TarInfo.mode directly (meaningful on any host, including this
+    one), and actually extracting to disk and checking the resulting
+    file's real permissions (meaningful wherever POSIX permissions
+    exist -- skipped on Windows, which cannot represent them at all,
+    exactly the platform gap that let this bug ship undetected)."""
+
+    def _build_sample_tar(self, tmp_path: Path) -> Path:
+        source = tmp_path / "package"
+        source.mkdir()
+        (source / "install.sh").write_text("#!/usr/bin/env bash\necho install\n", newline="\n")
+        (source / "validate.sh").write_text("#!/usr/bin/env bash\necho validate\n", newline="\n")
+        (source / "README.md").write_text("not a script\n", newline="\n")
+        output = tmp_path / "sample.tar.gz"
+        write_deterministic_tar(source, output, mtime=0, executable_paths=frozenset({"install.sh", "validate.sh"}))
+        return output
+
+    def test_executable_paths_are_stored_with_the_exec_bit_in_the_archive_itself(self):
+        with tempfile.TemporaryDirectory() as td:
+            output = self._build_sample_tar(Path(td))
+            with tarfile.open(output, "r:gz") as tf:
+                modes = {member.name: member.mode for member in tf.getmembers()}
+        self.assertTrue(modes["install.sh"] & 0o111, "install.sh must be stored with an executable bit")
+        self.assertTrue(modes["validate.sh"] & 0o111, "validate.sh must be stored with an executable bit")
+        self.assertFalse(modes["README.md"] & 0o111, "README.md must NOT be stored executable")
+
+    @unittest.skipIf(os.name == "nt", "Windows cannot represent real POSIX executable bits at all -- this is exactly the platform gap the fix works around, not something extraction-based assertions can meaningfully re-check here.")
+    def test_extracted_files_are_actually_executable_without_a_manual_chmod(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            output = self._build_sample_tar(tmp_path)
+            extract_dir = tmp_path / "extracted"
+            extract_dir.mkdir()
+            with tarfile.open(output, "r:gz") as tf:
+                tf.extractall(extract_dir)  # noqa: S202 -- trusted, just-built local archive
+            self.assertTrue(os.access(extract_dir / "install.sh", os.X_OK), "install.sh must be executable immediately after extraction, with no manual chmod")
+            self.assertTrue(os.access(extract_dir / "validate.sh", os.X_OK), "validate.sh must be executable immediately after extraction, with no manual chmod")
+
+    def test_all_installer_runtime_shell_scripts_are_covered_by_the_executable_set(self):
+        # Guards against someone adding a new top-level installer .sh
+        # file without it ever landing in the executable set computed
+        # from INSTALLER_RUNTIME_FILES in main().
+        expected = {name for name in INSTALLER_RUNTIME_FILES if name.endswith(".sh")}
+        self.assertIn("install.sh", expected)
+        self.assertIn("validate.sh", expected)
+        self.assertIn("uninstall.sh", expected)
+        self.assertNotIn("README.md", expected)
+
+
+class DockerfileCopySourcesAreAllReleasedTests(unittest.TestCase):
+    """A third confirmed-live release blocker, same family as the two
+    above (both caught only by actually running the built package on a
+    real target, never by this test file): REQUIRED_RELEASE_PATHS
+    listed requirements.txt but not requirements-cpu.txt, even though
+    both Dockerfile and Dockerfile.production COPY it -- a release built
+    from that allowlist always failed `docker compose build` on a real
+    Linux/Docker host with 'requirements-cpu.txt: not found', confirmed
+    live on a fresh disposable EC2 instance. REQUIRED_RELEASE_PATHS now
+    includes it; this test parses both real repo-root Dockerfiles for
+    every top-level COPY source and asserts each one is covered by
+    REQUIRED_RELEASE_PATHS or OPTIONAL_RELEASE_PATHS, so a Dockerfile
+    referencing a new root-level file without updating that allowlist
+    fails here instead of only being discovered by a live install."""
+
+    _COPY_RE = __import__("re").compile(r"^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+\S+\s*$", __import__("re").MULTILINE)
+
+    def _copy_sources(self, dockerfile: Path) -> set[str]:
+        text = dockerfile.read_text(encoding="utf-8")
+        sources = set()
+        for match in self._COPY_RE.finditer(text):
+            src = match.group(1).lstrip("./")
+            # Directory copies (e.g. "app", "./app") are covered by the
+            # "app" entry itself; only bare top-level file names are
+            # relevant here.
+            top_level = src.split("/", 1)[0]
+            sources.add(top_level)
+        return sources
+
+    def test_every_dockerfile_copy_source_is_in_the_release_allowlist(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        allowlisted = set(REQUIRED_RELEASE_PATHS) | set(OPTIONAL_RELEASE_PATHS)
+        for name in ("Dockerfile", "Dockerfile.production"):
+            dockerfile = repo_root / name
+            if not dockerfile.is_file():
+                continue
+            for source in self._copy_sources(dockerfile):
+                self.assertIn(
+                    source, allowlisted,
+                    f"{name} COPYs {source!r} but it is not in REQUIRED_RELEASE_PATHS or "
+                    "OPTIONAL_RELEASE_PATHS -- a built release package would be missing it.",
+                )
+
+    def test_requirements_cpu_txt_is_required(self):
+        self.assertIn("requirements-cpu.txt", REQUIRED_RELEASE_PATHS)
+
+
+class PrivilegedWatcherIsPackagedTests(unittest.TestCase):
+    """A fourth confirmed-live blocker, found while fixing restart_vms's
+    own dispatched command: appliance-agent/system/ (privileged_watcher.
+    py plus its two systemd units) is a completely different directory
+    from appliance-agent/systemd/ (only anyaicam-agent.service) -- the
+    similar name is exactly why this had never been noticed by
+    inspection. AGENT_RELEASE_PATHS only ever packaged the latter, so
+    restart_vms/reboot_appliance could never function on any real
+    installed appliance, independent of the dispatched command itself
+    being correct. See docs/phase1-edge-validation-report.md."""
+
+    def test_appliance_agent_system_directory_is_packaged(self):
+        self.assertIn("appliance-agent/system", AGENT_RELEASE_PATHS)
+
+    def test_appliance_agent_systemd_directory_is_still_separately_packaged(self):
+        # Regression guard against "fixing" this by renaming/merging the
+        # two directories instead of listing both -- anyaicam-agent.
+        # service (appliance-agent/systemd/) must keep shipping too.
+        self.assertIn("appliance-agent/systemd", AGENT_RELEASE_PATHS)
+
+    def test_the_packaged_directory_actually_contains_the_watcher_and_both_units(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        system_dir = repo_root / "appliance-agent" / "system"
+        self.assertTrue((system_dir / "privileged_watcher.py").is_file())
+        self.assertTrue((system_dir / "anyaicam-privileged-watcher.path").is_file())
+        self.assertTrue((system_dir / "anyaicam-privileged-watcher.service").is_file())
+
+    def test_service_unit_execstart_matches_where_the_installer_actually_puts_the_script(self):
+        """These two facts live in different files (the unit's ExecStart=
+        here, the installed path in scripts/lib-privileged-watcher.sh's
+        own default) with nothing enforcing they agree -- this test is
+        that enforcement, so a future edit to either one alone fails
+        here instead of shipping a unit that points at a path the
+        installer never actually populates."""
+        repo_root = Path(__file__).resolve().parents[2]
+        unit_text = (repo_root / "appliance-agent" / "system" / "anyaicam-privileged-watcher.service").read_text(encoding="utf-8")
+        lib_text = (repo_root / "appliance-agent" / "scripts" / "lib-privileged-watcher.sh").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/opt/anyaicam-agent/privileged/watcher.py", unit_text)
+        self.assertIn("/opt/anyaicam-agent/privileged", lib_text)
+
+    def test_both_units_disable_the_systemd_start_rate_limit(self):
+        """Confirmed live on a real disposable EC2 instance: leaving a
+        handful of unknown/malformed markers in the pending_actions
+        directory (privileged_watcher.py deliberately never deletes
+        them, so an operator can inspect what was rejected) caused
+        BOTH anyaicam-privileged-watcher.path and its .service to hit
+        systemd's default start-rate-limit and go `failed` after only a
+        few closely-spaced triggers -- and a FAILED unit is never
+        retriggered again until an operator runs `systemctl reset-
+        failed`, silently disabling restart_vms/reboot_appliance for
+        any real request queued after the block, with no crash and no
+        bad exit code to point at. Both units must set
+        StartLimitIntervalSec=0 (this test cannot exercise real systemd
+        rate-limiting itself -- no real systemd is available in this
+        test environment -- so it locks in the config line the live
+        finding actually required)."""
+        repo_root = Path(__file__).resolve().parents[2]
+        for unit_name in ("anyaicam-privileged-watcher.path", "anyaicam-privileged-watcher.service"):
+            unit_text = (repo_root / "appliance-agent" / "system" / unit_name).read_text(encoding="utf-8")
+            self.assertIn(
+                "StartLimitIntervalSec=0", unit_text,
+                f"{unit_name} must disable systemd's start-rate-limit, or a burst of "
+                "unknown/malformed markers can permanently block real requests.",
+            )
+
+    def test_uninstall_removes_what_install_creates(self):
+        """Found while reviewing the full fresh-install/uninstall/
+        reinstall workflow ahead of Samsung deployment (not from a live
+        run this time -- a straight reading of the two scripts): install.
+        sh calls install_privileged_watcher(), which creates two systemd
+        units and a script directory, but scripts/uninstall.sh never
+        called anything to remove them -- confirmed by the absence of
+        `uninstall_privileged_watcher` anywhere in it before this fix.
+        A default (non-purge) uninstall left the .path unit enabled and
+        watching a directory with no watcher script left to run it.
+        This test only proves the call site exists and is wired to the
+        same lib both scripts already share; appliance-agent/tests/
+        test_privileged_watcher_install.sh proves the function's own
+        behavior (units actually disabled and files actually removed)
+        against a fixture root."""
+        repo_root = Path(__file__).resolve().parents[2]
+        install_text = (repo_root / "appliance-agent" / "scripts" / "install.sh").read_text(encoding="utf-8")
+        uninstall_text = (repo_root / "appliance-agent" / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+        self.assertIn("install_privileged_watcher", install_text)
+        self.assertIn("source", uninstall_text)
+        self.assertIn("lib-privileged-watcher.sh", uninstall_text)
+        self.assertIn("uninstall_privileged_watcher", uninstall_text)
+
+
+class MediaMTXRequiredChoiceTests(unittest.TestCase):
+    """Regression coverage for a real, second occurrence of the MediaMTX
+    packaging regression (2026-09-17, see docs/PROJECT_CHECKPOINT.md): a
+    release built by simply forgetting to pass --mediamtx-binary silently
+    produced a P2P-broken release, with nothing anywhere in the build
+    pipeline to catch it. --mediamtx-binary/--mediamtx-sha256 and the new
+    --no-mediamtx now form a mandatory, mutually exclusive choice, checked
+    immediately after --vms-commit is validated -- before any git/repo
+    work happens -- so both cases below fail fast, independent of
+    --vms-repo/--vms-commit even being real."""
+
+    def _run(self, extra_args):
+        script = Path(__file__).resolve().parents[1] / "build_release_installer.py"
+        cmd = [sys.executable, str(script), "--vms-commit", "0" * 40, "--vms-repo", "/nonexistent-repo-path-never-reached"] + extra_args
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def test_omitting_both_mediamtx_flags_fails_fast_with_a_clear_error(self):
+        result = self._run([])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--no-mediamtx", result.stderr + result.stdout)
+        self.assertIn("required", result.stderr + result.stdout)
+
+    def test_passing_both_mediamtx_binary_and_no_mediamtx_is_rejected(self):
+        result = self._run(["--mediamtx-binary", "/some/path", "--mediamtx-sha256", "a" * 64, "--no-mediamtx"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutually exclusive", result.stderr + result.stdout)
+
+    def test_the_gate_fires_before_any_git_repo_work(self):
+        # Both fixture calls above pass a --vms-repo path that does not
+        # exist on disk at all -- if the mediamtx gate did not fire
+        # first, the failure would instead come from git/repo handling,
+        # with a completely different message. Confirms the ordering,
+        # not just that *some* error occurs.
+        result = self._run([])
+        self.assertNotIn("nonexistent-repo-path-never-reached", result.stderr + result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

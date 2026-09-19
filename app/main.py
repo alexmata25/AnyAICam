@@ -1,3 +1,4 @@
+from event_media import media_state as customer_event_media_state
 import asyncio
 
 
@@ -17,6 +18,30 @@ import base64
 
 
 import binascii
+
+
+
+
+# Provisioning Phase 2 audit finding: neither `hashlib` nor `hmac` was
+# imported anywhere in this file, even though verify_stripe_webhook_
+# signature() (below) calls both -- and a second, unrelated caller at
+# (search for hashlib.sha256()) does too. Both call sites were dormant
+# NameError bugs: verify_stripe_webhook_signature() only reaches them
+# once ANYAICAM_STRIPE_WEBHOOK_SECRET is actually configured (it returns
+# False before that point when the secret is empty, which is why this
+# was never caught by any existing test -- there were none for this
+# route before this phase). Discovered while adding webhook coverage for
+# Phase 2; fixed here since "preserve existing Stripe signature
+# verification" is meaningless if that verification cannot run at all.
+# NOTE: this reconciliation-branch checkout of main.py may not be
+# byte-identical to whatever main.py is actually running on the Ryzen
+# appliance -- see this session's own prior finding that the Ryzen's
+# live app/main.py, not this git checkout, is the authoritative
+# production baseline. Whether this exact bug is live in production is
+# therefore unconfirmed and should be checked against the real running
+# file before being treated as a confirmed production incident.
+import hashlib
+import hmac
 
 
 
@@ -44,6 +69,7 @@ import json
 
 
 import logging
+import numpy as np
 
 
 
@@ -94,6 +120,15 @@ import shutil
 
 
 
+import socket
+
+
+
+
+
+
+
+
 import subprocess
 
 
@@ -104,6 +139,7 @@ import subprocess
 
 
 import time
+import threading
 
 
 
@@ -184,7 +220,8 @@ from contextvars import ContextVar
 
 
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 
 
@@ -211,7 +248,7 @@ from pathlib import Path
 
 
 
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 
 
@@ -465,6 +502,8 @@ try:
 
     from ultralytics import YOLO
 
+    import torch
+
 
 
 
@@ -492,6 +531,8 @@ except ImportError:
 
     YOLO = None
 
+    torch = None
+
 
 
 
@@ -510,7 +551,7 @@ except ImportError:
 
 STATIC_FOLDER = Path("/app/static")
 
-HLS_FOLDER = Path("/app/static/hls")
+HLS_FOLDER = Path(os.environ.get("ANYAICAM_HLS_FOLDER", str(Path(__file__).parent / "static" / "hls") if os.name == "nt" else "/app/static/hls"))
 
 HLS_URL_PREFIX = "/static/hls"
 
@@ -1129,6 +1170,34 @@ DEPLOYMENT_ENV = os.environ.get("ANYAICAM_ENV", "local").strip().lower()
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
 
 
+def appliance_hostname() -> str:
+    """The OS hostname this process is actually running as -- part of
+    the release/build identifier (version + build_id + hostname +
+    Cloud ID) required to appear on every appliance, so a support call
+    or screenshot can be traced back to a specific device without
+    guessing. Never raises: an unresolvable hostname degrades to
+    'unknown' rather than breaking every page that renders it."""
+    try:
+        return socket.gethostname() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def build_identifier() -> dict:
+    """The single source every build-identifier surface (the /version
+    API and page_shell()'s sidebar footer) reads from, so the two can
+    never drift apart. cloud_id is only present once this appliance
+    has actually activated (own_appliance_identity()) -- never the
+    permanent credential itself, only the public Cloud ID."""
+    identity = own_appliance_identity()
+    return {
+        "version": APP_VERSION,
+        "build_id": BUILD_ID,
+        "hostname": appliance_hostname(),
+        "cloud_id": identity["cloud_id"] if identity else None,
+    }
+
+
 
 
 
@@ -1288,6 +1357,29 @@ CLOUD_UPLOAD_MULTIPART_THRESHOLD_MB = max(8, int(os.environ.get("ANYAICAM_CLOUD_
 
 
 
+def _default_force_https(deployment_env: str, runtime_role: str) -> bool:
+    """The default for ANYAICAM_FORCE_HTTPS when an operator hasn't set it
+    explicitly. Confirmed live on Samsung: this used to be simply
+    `deployment_env == "production"`, so ANYAICAM_ENV=production (this
+    session's own installer fix) made forwarded_https_middleware below
+    307-redirect every plain-HTTP request to https:// -- on an appliance
+    with no TLS listener at all, reached only over a private LAN/
+    Tailscale network, never the public internet. A pure function (not
+    inlined into the FORCE_HTTPS assignment) so it's directly unit-
+    testable without needing to reimport this module under different
+    environment variables.
+
+    Cloud/combined production is completely unchanged: still defaults to
+    True, exactly as before. Staging and development are unaffected
+    regardless of runtime_role, matching cloud_config.Settings.
+    edge_production's own scoping. An operator who explicitly sets
+    ANYAICAM_FORCE_HTTPS (e.g. an edge box with its own real TLS
+    termination in front of it) is always honored -- this function only
+    supplies the default when that env var is absent."""
+    edge_production = deployment_env == "production" and runtime_role == "edge"
+    return deployment_env == "production" and not edge_production
+
+
 FORCE_HTTPS = os.environ.get(
 
 
@@ -1306,7 +1398,7 @@ FORCE_HTTPS = os.environ.get(
 
 
 
-    "true" if DEPLOYMENT_ENV == "production" else "false",
+    "true" if _default_force_https(DEPLOYMENT_ENV, RUNTIME_ROLE) else "false",
 
 
 
@@ -1819,7 +1911,120 @@ def structured_log(event: str, level: str = "info", **fields) -> None:
 
 
 
-CAMERA_COUNT = 4
+LEGACY_DEFAULT_CAMERA_COUNT = 4  # fallback slot count -- see get_camera_numbers()
+CAMERA_SUPERVISOR_HEADROOM = 4   # extra idle supervisor slots beyond what's
+CAMERA_NOT_CONFIGURED_POLL_SECONDS = 15  # how often an idle/unprovisioned supervisor slot re-checks camera_url()
+                                 # provisioned at startup, so a customer can
+                                 # add a few more cameras later without a
+                                 # VMS restart -- see get_supervisor_slot_count()
+
+
+class CameraNotConfiguredError(Exception):
+    """Raised by camera_url() when a camera_number has neither a
+    provisioned record (cameras/camera_credentials tables) nor the legacy
+    CAMERA{n}_HOST/USERNAME/PASSWORD env vars. Deliberately NOT a subclass
+    of OSError/KeyError: process_supervisor() must treat this as a normal,
+    expected, indefinitely-retryable "nothing to connect to yet" state --
+    never an unhandled exception that silently kills the task. See the
+    Phase 3 Samsung incident this fixes: an unset env var previously threw
+    a bare KeyError here, which process_supervisor() only caught OSError
+    for, so the task died once, silently, and never retried -- live view
+    and recording never started and nothing in the logs said why."""
+
+
+def legacy_camera_numbers_in_use() -> list[int]:
+    """Which of the 1..LEGACY_DEFAULT_CAMERA_COUNT legacy slots actually
+    have at least one CAMERA{n}_HOST/USERNAME/PASSWORD env var set --
+    i.e. a real legacy installation genuinely relying on that scheme,
+    not merely the ABSENCE of dynamic provisioning. get_camera_numbers()
+    is the only caller; configuration_issues() (the readiness validator)
+    has its own similar-looking but distinct partial-vs-fully-configured
+    scan and is intentionally left as its own logic, not merged with
+    this one."""
+    return [
+        camera for camera in range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1)
+        if any(os.environ.get(f"CAMERA{camera}_{suffix}", "").strip() for suffix in ("HOST", "USERNAME", "PASSWORD"))
+    ]
+
+
+def get_camera_numbers(customer_id: str | None = None) -> list[int]:
+    """The real, currently-provisioned set of camera_number slots this
+    appliance's FFmpeg/HLS/recording/analytics pipeline should run --
+    sourced from the same multi-tenant `cameras` table Wizard A/B
+    provisioning writes to (see camera_mapping.py for camera_number
+    assignment), not a hardcoded get_camera_count(). A single edge appliance's
+    local database holds exactly one customer's rows, so no further
+    appliance_id/customer_id scoping is needed here; see the Phase 3
+    report for this documented limitation in a future multi-appliance
+    "combined" deployment.
+
+    2026-09-04: customer_id is a new, optional, additive parameter --
+    every existing edge-role caller (none of which have a customer_id
+    to pass) is completely unaffected, since omitting it reproduces
+    today's exact unscoped query. It exists for the cloud role, where
+    the assumption in the paragraph above is false: EC2's `cameras`
+    table is genuinely multi-tenant, one shared database across every
+    customer, not "exactly one customer's rows". Confirmed live: two
+    unrelated customers each provisioned camera_number 1-5, and the
+    unscoped query summed both -- "10 cameras configured, license
+    permits 5" -- one customer's license being enforced against a
+    total that included a second customer's own, entirely separate
+    cameras. When customer_id is given, it's scoped with AND customer_
+    id=? and the legacy-env-var fallback below is skipped even on a
+    genuine zero-cameras result: that fallback exists for a brand-new
+    *edge* install with nothing provisioned yet, and has no meaning
+    for "this one cloud customer happens to have zero cameras" --
+    falling back to CAMERA<n>_HOST/USERNAME/PASSWORD env-var slots
+    there would just resurrect the same kind of phantom-camera bug
+    this function's own fallback logic was already written to avoid.
+
+    Falls back to the legacy CAMERA<n>_HOST/USERNAME/PASSWORD env-var
+    slots ONLY when at least one is genuinely configured (see
+    legacy_camera_numbers_in_use()) -- a fresh dynamic-provisioning
+    install with zero cameras and no legacy env vars returns an empty
+    list, not four phantom slots. This was previously an unconditional
+    `range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1)` fallback whenever the
+    `cameras` table was empty, which made a brand-new install with
+    nothing provisioned yet report cameras_total: 4, show four fake
+    "Camera 1"-"Camera 4" selectors in Investigate, and so on across
+    every one of this function's callers -- see the Samsung camera-
+    count audit this fixes. A real legacy installation (actual
+    CAMERA1_* etc. configuration present) is unaffected: it still gets
+    its configured slot numbers back exactly as before."""
+    try:
+        from partner_db import connection
+        with connection() as db:
+            if customer_id is not None:
+                assigned = db.execute(
+                    "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL AND customer_id=? ORDER BY camera_number",
+                    (customer_id,),
+                ).fetchall()
+            else:
+                assigned = db.execute(
+                    "SELECT camera_number FROM cameras WHERE camera_number IS NOT NULL ORDER BY camera_number"
+                ).fetchall()
+    except Exception:
+        assigned = []
+    numbers = [int(item["camera_number"]) for item in assigned]
+    if numbers or customer_id is not None:
+        return numbers
+    return legacy_camera_numbers_in_use()
+
+
+def get_camera_count(customer_id: str | None = None) -> int:
+    return len(get_camera_numbers(customer_id=customer_id))
+
+
+def get_supervisor_slot_count() -> int:
+    """How many camera_number supervisor tasks to start at boot -- always
+    at least LEGACY_DEFAULT_CAMERA_COUNT (so a from-scratch install has
+    slots 1..4 sitting in the "not configured" state, ready the instant
+    they're provisioned) and always CAMERA_SUPERVISOR_HEADROOM above
+    whatever is already provisioned (so a customer with 5 cameras already
+    provisioned at startup can add a few more without a VMS restart).
+    Provisioning a camera_number beyond this computed ceiling still needs
+    a restart to get a supervisor task -- see the Phase 3 report."""
+    return max(LEGACY_DEFAULT_CAMERA_COUNT, get_camera_count() + CAMERA_SUPERVISOR_HEADROOM)
 
 
 
@@ -1891,7 +2096,7 @@ DEFAULT_LICENSE_CAMERA_LIMIT = max(
 
 
 
-    int(os.environ.get("ANYAICAM_LICENSE_CAMERA_LIMIT", str(CAMERA_COUNT))),
+    int(os.environ.get("ANYAICAM_LICENSE_CAMERA_LIMIT", str(get_camera_count()))),
 
 
 
@@ -2493,6 +2698,20 @@ MOTION_THRESHOLD = float(os.environ.get("MOTION_THRESHOLD", "12"))
 
 
 
+# Punch-list item 5 (false motion filtering), safe default: a real
+# person/vehicle essentially never covers this much of a wide-angle
+# camera's frame at once. A changed_ratio this high is almost always
+# a global lighting/exposure shift, not an object -- rejecting it does
+# not weaken real person/vehicle detection (see the punch-list report
+# for why finer tree/shadow-specific tuning still needs real footage).
+MOTION_MAX_CHANGED_RATIO = float(os.environ.get("MOTION_MAX_CHANGED_RATIO", "0.85"))
+
+
+
+
+
+
+
 
 MOTION_COOLDOWN_SECONDS = int(os.environ.get("MOTION_COOLDOWN_SECONDS", "15"))
 
@@ -2515,6 +2734,15 @@ AI_ENABLED = AI_PERSON_DETECTION_ENABLED
 
 
 AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL_SECONDS", "5")))
+# Small per-camera startup delay so all 5 ai_person_detector() tasks --
+# created back-to-back in a single list comprehension, with an identical
+# AI_DETECTION_INTERVAL_SECONDS sleep thereafter -- don't stay in
+# lockstep for the appliance's entire uptime, repeatedly bursting their
+# model-load attempts and inference calls at the same moment every
+# cycle. Complementary to ai_inference_semaphore/yolo_model_lock above,
+# which already make simultaneous starts correct; this just spreads the
+# load out instead of serializing a burst of 5 every cycle.
+AI_DETECTOR_STARTUP_STAGGER_SECONDS = max(0, int(os.environ.get("AI_DETECTOR_STARTUP_STAGGER_SECONDS", "1")))
 
 
 
@@ -2524,6 +2752,33 @@ AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL
 
 
 AI_PERSON_COOLDOWN_SECONDS = max(5, int(os.environ.get("AI_PERSON_COOLDOWN_SECONDS", "30")))
+
+# People Counting: OFF by default, appliance-wide, no hidden default --
+# matches this session's own established convention (MOTION_DETECTION_
+# ENABLED/AI_PERSON_DETECTION_ENABLED). Even when this master flag is
+# on, a given camera only actually runs People Counting if BOTH (a) the
+# cloud has set cameras.people_counting_enabled=1 for it (read via
+# recording_uploader._camera_identity(), reused rather than duplicated
+# -- appliance_cloud.py, cloud lineage, is the source of truth) AND
+# (b) a real, enabled line_crossing rule exists for that camera in
+# ANALYTICS_RULES_FILE (reused, not a second config system -- see
+# people_counting.py's own module docstring). A faster-than-default
+# polling interval is used deliberately, ONLY for entitled+configured
+# cameras, to make frame-to-frame tracking reliable -- the ordinary
+# 5s AI_DETECTION_INTERVAL_SECONDS is too coarse for a person to be
+# reliably tracked across a line at normal walking speed.
+PEOPLE_COUNTING_ENABLED = os.environ.get("PEOPLE_COUNTING_ENABLED", "false").lower() == "true"
+PEOPLE_COUNTING_INTERVAL_SECONDS = max(0.5, float(os.environ.get("PEOPLE_COUNTING_INTERVAL_SECONDS", "1.5")))
+PEOPLE_COUNTING_STATE_FILE = RECORDINGS_FOLDER / "people_counting_state.json"
+
+# TEMPORARY, walk-test diagnostics only -- intentionally hardcoded, not
+# an env var, so it can't accidentally be left on for every camera in
+# a real deployment. 0 (or any camera number never actually entitled)
+# disables the extra [PeopleCountingDebug] log lines entirely. Remove
+# this constant and its use in people_counting_worker() once real-world
+# walk-test debugging is done -- it is not meant to be a permanent
+# feature of this worker.
+PEOPLE_COUNTING_DEBUG_CAMERA = int(os.environ.get("PEOPLE_COUNTING_DEBUG_CAMERA", "1"))
 
 
 
@@ -2670,7 +2925,7 @@ camera_process_state = {
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1)
+    for camera_number in range(1, get_supervisor_slot_count() + 1)
 
 
 
@@ -2688,7 +2943,7 @@ camera_process_state = {
 
 
 
-camera_reconnect_counts = {camera_number: 0 for camera_number in range(1, CAMERA_COUNT + 1)}
+camera_reconnect_counts = {camera_number: 0 for camera_number in range(1, get_supervisor_slot_count() + 1)}
 
 
 
@@ -2800,7 +3055,7 @@ ai_detection_state = {
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1)
+    for camera_number in get_camera_numbers()
 
 
 
@@ -2827,7 +3082,7 @@ ai_person_last_event = {
 
 
 
-    camera_number: 0.0 for camera_number in range(1, CAMERA_COUNT + 1)
+    camera_number: 0.0 for camera_number in get_camera_numbers()
 
 
 
@@ -2854,7 +3109,13 @@ yolo_model = None
 
 
 
-yolo_model_lock = None
+yolo_model_lock = threading.Lock()
+# Bounds simultaneous YOLO inference (detect_objects_frame()) to 1 at a
+# time -- see ai_person_detector()'s own async with block. Independent
+# of yolo_model_lock above: that lock only ever guards the one-time
+# model construction; this semaphore guards every later inference call
+# too, for the appliance's entire uptime, not just at startup.
+ai_inference_semaphore = asyncio.Semaphore(1)
 
 
 
@@ -4348,7 +4609,7 @@ class EventSettingsModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -4429,7 +4690,7 @@ class AlertRuleModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -5329,7 +5590,7 @@ class AnalyticsRuleModel(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -7291,6 +7552,19 @@ class BillingSupportTicketUpdateModel(BaseModel):
 
 
 
+class HardwareCheckoutCreateModel(BaseModel):
+    # Provisioning Phase 5: the customer selects a catalog SKU, never a
+    # Stripe Price ID -- create_hardware_checkout() below resolves sku
+    # server-side via hardware_orders.HARDWARE_CATALOG the same way
+    # create_stripe_checkout() resolves plan via stripe_price_map(), so a
+    # browser can never submit an arbitrary Price ID.
+    sku: str
+    quantity: int = 1
+class CameraSlotCheckoutModel(BaseModel):
+    plan_type: str
+    tier_label: str
+
+
 class StripeCheckoutCreateModel(BaseModel):
 
 
@@ -7885,7 +8159,7 @@ class SnapshotRequest(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -7939,7 +8213,7 @@ class ClipRequest(BaseModel):
 
 
 
-    camera: int = Field(ge=1, le=CAMERA_COUNT)
+    camera: int = Field(ge=1, le=256)  # structural ceiling only; real validity is enforced per-request via get_camera_numbers()
 
 
 
@@ -8003,6 +8277,42 @@ clip_tasks: set[asyncio.Task] = set()
 
 
 motion_event_lock = asyncio.Lock()
+
+
+# Per-camera dedup for AI-classification event clips (2026-09-02): a
+# single scene often produces several near-simultaneous detections --
+# multiple object classes in one frame (save_yolo_events()'s own
+# grouped-by-class-name loop below), or the same person walking
+# through several consecutive detection scans -- and none of those
+# should trigger its own separate clip extraction+upload covering
+# nearly-identical footage. Tracks the most recently built (or
+# in-flight) clip window per camera; a new detection whose window
+# event_clips.should_merge()s with it is treated as the same real
+# event and skipped -- exactly the rule event_clips.py's own
+# docstring already describes ("a burst of near-simultaneous or
+# rapidly repeated detections produces one clip, not several"), just
+# not previously wired into this detection path.
+ai_event_clip_windows: dict[int, tuple] = {}
+ai_event_clip_windows_lock = threading.Lock()
+
+# The main application event loop, captured lazily on ai_person_detector()'s
+# own first run (see that function's own opening lines) -- confirmed live
+# on the Samsung appliance that save_yolo_events() actually executes via
+# `await asyncio.to_thread(save_yolo_events, ...)`, a worker thread with no
+# event loop of its own. asyncio.ensure_future()/asyncio.create_task() only
+# ever schedule onto "the current thread's running loop" -- called from
+# that worker thread, there isn't one, so an earlier version of this fix's
+# ensure_future() call always raised RuntimeError and was silently
+# swallowed, meaning no AI-classification clip was ever actually built,
+# despite compiling and testing cleanly (every automated test scheduled
+# from the main thread, exactly the one case that already worked).
+# asyncio.run_coroutine_threadsafe(coro, loop) is the correct primitive for
+# scheduling from a different thread onto a specific, already-running loop
+# -- ai_person_detector() is itself created via asyncio.create_task() on
+# the real main loop (see the lifespan() startup block), so capturing it
+# there, once, is sufficient for every later save_yolo_events() call for
+# any camera.
+_ai_event_media_loop: "asyncio.AbstractEventLoop | None" = None
 
 
 
@@ -8803,7 +9113,7 @@ def default_users() -> list[dict]:
 
 
 
-            camera_ids=list(range(1, CAMERA_COUNT + 1)),
+            camera_ids=list(get_camera_numbers()),
 
 
 
@@ -10468,6 +10778,55 @@ def authenticated_user(request: Request) -> dict | None:
 
 
 
+def cloud_administrator_bridge(request: Request) -> dict | None:
+    """Lets a cloud-delegated Partner Portal session with a LIVE,
+    GLOBAL-scoped 'administrator' grant use the legacy Admin Portal --
+    exactly what "amata@anyaicam.com + Administrator selection ->
+    /admin-portal" requires, without ever creating a legacy users.json
+    row for that person (see this session's own explicit instruction
+    against that). This is the one, single choke point current_user()
+    falls back to when there's no legacy session at all; because nearly
+    every Admin Portal route already calls current_user()/has_permission()
+    without modification, this bridge applies uniformly across the whole
+    Admin Portal rather than needing to be wired into each route.
+
+    Re-verifies against the LIVE identity_grants table on every call
+    (appliance_identity.has_global_administrator_grant()) -- never
+    trusts the partner session cookie's own embedded role claim alone.
+    A revoked grant loses Admin Portal access on this function's very
+    next call, not only after the appliance's own manifest-
+    reconciliation cycle catches up. A partner-scoped administrator
+    (company-level admin, scope_type='partner') is deliberately
+    excluded -- has_global_administrator_grant() only matches
+    scope_type='global' -- so a partner-scoped admin can never silently
+    become a global AnyAiCam administrator through this path. Partner/
+    Technician/Customer roles are excluded outright by the role=='administrator'
+    check below; admin@local's own local-recovery session path
+    (authenticated_user()) is completely separate from and unaffected
+    by this function -- it's only ever consulted when that path found
+    nothing."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        return None
+    if not identity or identity.get("role") != "administrator":
+        return None
+    email = str(identity.get("email") or "").strip()
+    if not email:
+        return None
+    from appliance_identity import has_global_administrator_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        if not has_global_administrator_grant(db, email=email):
+            return None
+    return {
+        "id": f"cloud-administrator:{email}", "display_name": email, "email": email,
+        "role": "administrator", "enabled": True, "site_ids": [], "camera_ids": list(get_camera_numbers()),
+        "via_cloud_administrator_grant": True,
+    }
+
+
 def current_user(request: Request) -> dict:
 
 
@@ -10477,7 +10836,7 @@ def current_user(request: Request) -> dict:
 
 
 
-    return authenticated_user(request) or {
+    return authenticated_user(request) or cloud_administrator_bridge(request) or {
 
 
 
@@ -10666,7 +11025,7 @@ def user_camera_ids(user: dict) -> list[int]:
 
 
 
-        return list(range(1, CAMERA_COUNT + 1))
+        return list(get_camera_numbers())
 
 
 
@@ -10738,7 +11097,7 @@ def user_camera_ids(user: dict) -> list[int]:
 
 
 
-        if 1 <= camera_number <= CAMERA_COUNT:
+        if camera_number in get_camera_numbers():
 
 
 
@@ -11476,7 +11835,29 @@ def configuration_issues() -> list[dict]:
 
 
 
-    required_global = ["ANYAICAM_ADMIN_EMAIL", "ANYAICAM_ADMIN_PASSWORD", "ANYAICAM_PORTAL_SECRET"]
+    # Recommended, not required: all three degrade gracefully today
+    # rather than breaking the VMS, so a fresh install missing them is
+    # not a readiness failure -- see each one's own comment below.
+    # Downgraded from "critical" (session audit: previously made a
+    # freshly-installed, fully-functional VMS report configuration_
+    # valid=False / /ready 503 for a state that was never actually
+    # broken).
+    recommended_global = ["ANYAICAM_ADMIN_EMAIL", "ANYAICAM_ADMIN_PASSWORD", "ANYAICAM_PORTAL_SECRET"]
+    # ANYAICAM_ADMIN_EMAIL/ANYAICAM_ADMIN_PASSWORD: bootstrap_admin()
+    # (partner_db.py) already no-ops safely without them -- the app
+    # doesn't crash, it simply skips auto-creating a Partner Portal
+    # administrator account. The legacy Admin Portal identity
+    # (current_user()'s own admin@local bootstrap, a separate system)
+    # still provides working admin access either way. Worth surfacing
+    # (Partner Portal admin login genuinely won't work without them)
+    # but not a readiness-blocking failure.
+    # ANYAICAM_PORTAL_SECRET: already has a real runtime fallback
+    # (secrets.token_urlsafe(48) here; partner_portal.py's own
+    # SESSION_SECRETS chain falls back further to settings.app_secrets
+    # or a random token). The VMS runs correctly without it -- the only
+    # cost is that a random per-process secret means restarting the
+    # container invalidates existing sessions, worth flagging, not
+    # worth failing readiness over.
 
 
 
@@ -11485,7 +11866,7 @@ def configuration_issues() -> list[dict]:
 
 
 
-    for key in required_global:
+    for key in recommended_global:
 
 
 
@@ -11512,7 +11893,7 @@ def configuration_issues() -> list[dict]:
 
 
 
-            issues.append({"key": key, "severity": "critical", "message": f"{key} is missing."})
+            issues.append({"key": key, "severity": "warning", "message": f"{key} is missing."})
 
 
 
@@ -11548,43 +11929,39 @@ def configuration_issues() -> list[dict]:
 
 
 
-    for camera in range(1, CAMERA_COUNT + 1):
+    # Dynamic provisioning is the primary supported path (cameras are
+    # onboarded through the setup wizard/API and stored in the `cameras`
+    # table -- see camera_access.py) and never touches these legacy
+    # CAMERA{n}_HOST/USERNAME/PASSWORD env vars at all, so zero DB
+    # camera rows is a perfectly valid, ready state, not a config
+    # error. The old code iterated get_camera_numbers(), which falls
+    # back to range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1) whenever the
+    # `cameras` table is empty -- so a brand-new install with zero
+    # cameras provisioned was checked against 4 *candidate* legacy
+    # slots as if all 4 were *required*, manufacturing up to 12 fake
+    # "critical" issues out of a state that was actually fine. Iterate
+    # the fixed legacy slot range directly instead (never DB-row-
+    # dependent), and only raise an issue for a slot whose legacy env
+    # vars are partially set -- i.e. the operator is actively using the
+    # legacy scheme for that slot but got it wrong. A slot with none of
+    # its three vars set is simply not in use (dynamic or unprovisioned)
+    # and is skipped entirely.
+    for camera in range(1, LEGACY_DEFAULT_CAMERA_COUNT + 1):
 
+        slot_keys = {suffix: f"CAMERA{camera}_{suffix}" for suffix in ("HOST", "USERNAME", "PASSWORD")}
+        slot_values = {suffix: os.environ.get(key, "") for suffix, key in slot_keys.items()}
+        # Only a partially-configured slot (some but not all three set)
+        # is a real, actionable misconfiguration -- an operator using
+        # the legacy scheme for this slot who got it wrong. A slot with
+        # none of the three set is simply not in use.
+        if not any(value.strip() for value in slot_values.values()):
+            continue
 
+        for suffix, key in slot_keys.items():
 
+            if not slot_values[suffix].strip():
 
-
-
-
-
-        for suffix in ("HOST", "USERNAME", "PASSWORD"):
-
-
-
-
-
-
-
-
-            key = f"CAMERA{camera}_{suffix}"
-
-
-
-
-
-
-
-
-            if not os.environ.get(key, "").strip():
-
-
-
-
-
-
-
-
-                issues.append({"key": key, "severity": "critical", "message": f"{key} is missing."})
+                issues.append({"key": key, "severity": "critical", "message": f"{key} is missing (camera {camera} is partially configured via legacy env vars)."})
 
 
 
@@ -11811,41 +12188,29 @@ def configuration_issues() -> list[dict]:
 
     if DEPLOYMENT_ENV in {"staging", "production"}:
 
+        # AWS/cloud infrastructure (AWS_REGION, external database, S3
+        # bucket, public URL, Secrets Manager) is only ever required for
+        # an appliance that does cloud-facing work directly --
+        # RUNTIME_ROLE cloud/combined -- matching readiness_snapshot()'s
+        # own role scoping one level up (role_ready only requires
+        # cloud_foundation_ready for those two roles, never for edge).
+        # A pure edge appliance's own cloud interactions go through the
+        # appliance-agent's separately-scoped claim/upload credentials,
+        # never these env vars baked into the VMS container itself --
+        # requiring them here made every genuinely clean edge install
+        # permanently un-ready regardless of camera/claim state, since
+        # this check ignored RUNTIME_ROLE entirely. Confirmed live on
+        # Ryzen's first zero-manual-patch clean install (2026-09-11,
+        # golden-foundation-rc1 -> rc2): every prior Ryzen validation had
+        # AWS_REGION etc. already hand-patched into vms.env from earlier
+        # sessions, which is exactly what masked this. Regression tests:
+        # app/tests/test_ready_endpoint_role_aware_configuration.py.
+        if RUNTIME_ROLE in {"cloud", "combined"}:
 
 
 
 
-
-
-
-        cloud_checks = cloud_configuration_snapshot()
-
-
-
-
-
-
-
-
-        for key in cloud_checks["missing_cloud_requirements"]:
-
-
-
-
-
-
-
-
-            issues.append({
-
-
-
-
-
-
-
-
-                "key": key,
+            cloud_checks = cloud_configuration_snapshot()
 
 
 
@@ -11854,25 +12219,12 @@ def configuration_issues() -> list[dict]:
 
 
 
-                "severity": "warning" if DEPLOYMENT_ENV == "staging" else "critical",
-
-
-
-
-
-
-
-
-                "message": f"AWS deployment requirement is not configured: {key}.",
-
-
-
-
-
-
-
-
-            })
+            for key in cloud_checks["missing_cloud_requirements"]:
+                issues.append({
+                    "key": key,
+                    "severity": "warning" if DEPLOYMENT_ENV == "staging" else "critical",
+                    "message": f"AWS deployment requirement is not configured: {key}.",
+                })
 
 
 
@@ -11935,51 +12287,21 @@ def configuration_issues() -> list[dict]:
 
 
 
-        if DEPLOYMENT_ENV == "production" and not FORCE_HTTPS:
-
-
-
-
-
-
-
-
+        # Mirrors _default_force_https()'s own edge_production carve-out
+        # exactly: a production edge appliance has no TLS listener of its
+        # own (reached over a private LAN/Tailscale, or an operator-
+        # provided reverse proxy that terminates TLS in front of it), so
+        # FORCE_HTTPS correctly *defaults* to False there already -- this
+        # check used to require it be True anyway, contradicting its own
+        # default and permanently failing configuration_valid on every
+        # production edge box that hasn't explicitly overridden it.
+        # Cloud/combined production is unchanged -- still required.
+        edge_production = DEPLOYMENT_ENV == "production" and RUNTIME_ROLE == "edge"
+        if DEPLOYMENT_ENV == "production" and not edge_production and not FORCE_HTTPS:
             issues.append({
-
-
-
-
-
-
-
-
                 "key": "ANYAICAM_FORCE_HTTPS",
-
-
-
-
-
-
-
-
                 "severity": "critical",
-
-
-
-
-
-
-
-
                 "message": "HTTPS enforcement must be enabled in production.",
-
-
-
-
-
-
-
-
             })
 
 
@@ -12871,7 +13193,7 @@ def cloud_recording_camera_number(path: Path) -> int | None:
 
 
 
-    return number if 1 <= number <= CAMERA_COUNT else None
+    return number if number in get_camera_numbers() else None
 
 
 
@@ -14042,444 +14364,25 @@ def upload_cloud_recording_job(job: dict) -> dict:
 
 
 async def cloud_upload_worker() -> None:
-
-
-
-
-
-
-
-
-    if not CLOUD_UPLOAD_ENABLED:
-
-
-
-
-
-
-
-
-        cloud_upload_state["worker_status"] = "disabled"
-
-
-
-
-
-
-
-
-        while True:
-
-
-
-
-
-
-
-
-            await asyncio.sleep(3600)
-
-
-
-
-
-
-
-
-    cloud_upload_state["worker_status"] = "running" if boto3 is not None else "dependency_missing"
-
-
-
-
-
-
-
-
-    structured_log("cloud_upload.worker_started", status=cloud_upload_state["worker_status"], bucket=S3_BUCKET or None)
-
-
-
-
-
-
-
-
+    """Retired: recording_uploader.recording_upload_worker() is the sole
+    authoritative automatic recording-upload pipeline now (tenant/IAM-
+    scoped, codec-aware H.264 remux/HEVC transcode, retention-swept, and
+    real-hardware validated -- see docs/reconciliation-2026-09-11.md).
+    This worker used to run its own independent scan-and-upload loop
+    against a flat, non-tenant-scoped queue, which meant two separate
+    systems could both be actively uploading the same recordings to S3 if
+    ANYAICAM_CLOUD_UPLOAD_ENABLED and ANYAICAM_RECORDING_UPLOAD_ENABLED
+    were ever both set at once. It now never scans or uploads, regardless
+    of ANYAICAM_CLOUD_UPLOAD_ENABLED, so that risk cannot recur even if
+    that legacy env var is set again by mistake. The `/api/cloud-
+    recording` status page and its scan/retry endpoints are kept working
+    (so nothing 404s) but no longer perform any real upload -- see
+    cloud_recording_scan() and cloud_recording_retry() below. Regression
+    coverage: tests/test_cloud_upload_worker_retired.py.
+    """
+    cloud_upload_state["worker_status"] = "retired_superseded_by_recording_uploader"
     while True:
-
-
-
-
-
-
-
-
-        try:
-
-
-
-
-
-
-
-
-            scan_recordings_for_cloud_upload()
-
-
-
-
-
-
-
-
-            now = datetime.now()
-
-
-
-
-
-
-
-
-            job = next(
-
-
-
-
-
-
-
-
-                (item for item in cloud_upload_queue
-
-
-
-
-
-
-
-
-                 if item.get("status") in {"queued", "failed"}
-
-
-
-
-
-
-
-
-                 and int(item.get("attempts") or 0) < int(item.get("max_retries") or CLOUD_UPLOAD_MAX_RETRIES)
-
-
-
-
-
-
-
-
-                 and (not item.get("next_attempt_at") or datetime.fromisoformat(str(item["next_attempt_at"])) <= now)),
-
-
-
-
-
-
-
-
-                None,
-
-
-
-
-
-
-
-
-            )
-
-
-
-
-
-
-
-
-            if not job:
-
-
-
-
-
-
-
-
-                refresh_cloud_upload_state()
-
-
-
-
-
-
-
-
-                await asyncio.sleep(CLOUD_UPLOAD_SCAN_SECONDS)
-
-
-
-
-
-
-
-
-                continue
-
-
-
-
-
-
-
-
-            job["status"] = "uploading"
-
-
-
-
-
-
-
-
-            job["attempts"] = int(job.get("attempts") or 0) + 1
-
-
-
-
-
-
-
-
-            save_cloud_upload_queue(cloud_upload_queue)
-
-
-
-
-
-
-
-
-            refresh_cloud_upload_state()
-
-
-
-
-
-
-
-
-            try:
-
-
-
-
-
-
-
-
-                record = await asyncio.to_thread(upload_cloud_recording_job, job)
-
-
-
-
-
-
-
-
-                job.update({"status": "uploaded", "uploaded_at": record["uploaded_at"], "sha256": record["sha256"], "s3_uri": record["s3_uri"], "last_error": ""})
-
-
-
-
-
-
-
-
-                cloud_upload_state["last_upload_at"] = record["uploaded_at"]
-
-
-
-
-
-
-
-
-                cloud_upload_state["last_error"] = None
-
-
-
-
-
-
-
-
-                structured_log("cloud_upload.completed", job_id=job["id"], s3_uri=record["s3_uri"], size_bytes=record["size_bytes"])
-
-
-
-
-
-
-
-
-            except Exception as error:
-
-
-
-
-
-
-
-
-                job["status"] = "failed"
-
-
-
-
-
-
-
-
-                job["last_error"] = str(error)
-
-
-
-
-
-
-
-
-                delay = CLOUD_UPLOAD_RETRY_SECONDS * (2 ** max(0, job["attempts"] - 1))
-
-
-
-
-
-
-
-
-                job["next_attempt_at"] = (datetime.now() + timedelta(seconds=delay)).isoformat()
-
-
-
-
-
-
-
-
-                cloud_upload_state["last_error"] = str(error)
-
-
-
-
-
-
-
-
-                structured_log("cloud_upload.failed", level="error", job_id=job["id"], error=str(error))
-
-
-
-
-
-
-
-
-            save_cloud_upload_queue(cloud_upload_queue)
-
-
-
-
-
-
-
-
-            refresh_cloud_upload_state()
-
-
-
-
-
-
-
-
-            await asyncio.sleep(1)
-
-
-
-
-
-
-
-
-        except asyncio.CancelledError:
-
-
-
-
-
-
-
-
-            raise
-
-
-
-
-
-
-
-
-        except Exception as error:
-
-
-
-
-
-
-
-
-            cloud_upload_state["last_error"] = str(error)
-
-
-
-
-
-
-
-
-            await asyncio.sleep(CLOUD_UPLOAD_RETRY_SECONDS)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        await asyncio.sleep(3600)
 
 
 async def cloud_upload_worker_placeholder() -> None:
@@ -14995,7 +14898,16 @@ def readiness_snapshot() -> dict:
 
 
 
-    statuses = camera_status().get("cameras", [])
+    # _legacy_camera_status(), not camera_status(): none of this file's
+    # three request-less callers (readiness_snapshot(), health_monitor(),
+    # site_monitoring_summary()) have an HTTP request/customer-session to
+    # scope by -- that's what camera_status(request)'s customer-portal
+    # branch needs. Calling camera_status() with no arguments at all is
+    # what crashed GET /ready with a 500 (TypeError: missing required
+    # argument 'request') -- confirmed live on a fresh install. The
+    # legacy, appliance-wide camera listing is exactly what a system-
+    # level status check wants regardless of who (if anyone) is logged in.
+    statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -15184,7 +15096,7 @@ def readiness_snapshot() -> dict:
 
 
 
-        "cameras_total": CAMERA_COUNT,
+        "cameras_total": get_camera_count(),
 
 
 
@@ -15301,7 +15213,7 @@ def backup_manifest() -> dict:
 
 
 
-        "camera_count": CAMERA_COUNT,
+        "camera_count": get_camera_count(),
 
 
 
@@ -15985,69 +15897,75 @@ def diagnostics_snapshot() -> dict:
 
 
 
+def _provisioned_camera_stream(camera_number: int) -> dict | None:
+    """Real, provisioned-camera source for camera_url(): looks up the
+    cameras row assigned this camera_number (see camera_mapping.py) plus
+    its encrypted credentials, and returns {rtsp_url, username, password}
+    -- or None if this slot has no provisioned camera at all (a normal,
+    expected state for an idle supervisor slot, not an error)."""
+    try:
+        from partner_db import connection
+        from appliance_protocol import decrypt_camera_credentials
+        with connection() as db:
+            camera = db.execute(
+                "SELECT id, onvif_endpoint, ip_address FROM cameras WHERE camera_number=?",
+                (camera_number,),
+            ).fetchone()
+            if not camera:
+                return None
+            credential_row = db.execute(
+                "SELECT encrypted_blob FROM camera_credentials WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchone()
+    except Exception:
+        return None
+    if not credential_row:
+        return None
+    credentials = decrypt_camera_credentials(credential_row["encrypted_blob"])
+    if not credentials:
+        return None
+    rtsp_url = camera["onvif_endpoint"] or ""
+    if not rtsp_url.startswith("rtsp://"):
+        return None
+    return {
+        "rtsp_url": rtsp_url,
+        "username": credentials.get("username", ""),
+        "password": credentials.get("password", ""),
+    }
+
+
+def credentialed_rtsp_url(rtsp_url: str, username: str, password: str) -> str:
+    """Builds the real, credentialed RTSP URL for local FFmpeg use only --
+    never for display/logging. Percent-encodes the credentials themselves."""
+    parsed = urlsplit(rtsp_url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    if username or password:
+        userinfo = quote(username, safe="") + (":" + quote(password, safe="") if password else "")
+        netloc = f"{userinfo}@{netloc}"
+    return urlunsplit((parsed.scheme or "rtsp", netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 def camera_url(camera_number: int) -> str:
+    """Real, provisioned-camera source first (dynamic camera registry --
+    see _provisioned_camera_stream()); falls back to the legacy
+    CAMERA{n}_HOST/USERNAME/PASSWORD/PATH env vars for backward
+    compatibility with an existing installation that configured cameras
+    that way. Raises CameraNotConfiguredError (never a bare KeyError) when
+    neither source has anything for this camera_number -- see that
+    exception's docstring for why process_supervisor() depends on this
+    distinction."""
+    provisioned = _provisioned_camera_stream(camera_number)
+    if provisioned:
+        return credentialed_rtsp_url(provisioned["rtsp_url"], provisioned["username"], provisioned["password"])
 
-
-
-
-
-
-
-
-    host = os.environ[f"CAMERA{camera_number}_HOST"]
-
-
-
-
-
-
-
-
-    username = quote(os.environ[f"CAMERA{camera_number}_USERNAME"], safe="")
-
-
-
-
-
-
-
-
-    password = quote(os.environ[f"CAMERA{camera_number}_PASSWORD"], safe="")
-
-
-
-
-
-
-
-
-    path = os.environ.get(
-
-
-
-
-
-
-
-
-        f"CAMERA{camera_number}_PATH", "/Streaming/Channels/101"
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
+    host = os.environ.get(f"CAMERA{camera_number}_HOST")
+    if not host:
+        raise CameraNotConfiguredError(f"Camera {camera_number} has no provisioned record and no CAMERA{camera_number}_HOST env var.")
+    username = quote(os.environ.get(f"CAMERA{camera_number}_USERNAME", ""), safe="")
+    password = quote(os.environ.get(f"CAMERA{camera_number}_PASSWORD", ""), safe="")
+    path = os.environ.get(f"CAMERA{camera_number}_PATH", "/Streaming/Channels/101")
     return f"rtsp://{username}:{password}@{host}:554{path}"
 
 
@@ -16125,6 +16043,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
+        "-hls_segment_filename", str(HLS_FOLDER / f"camera{camera_number}_%09d.ts"),
         output_file,
 
 
@@ -16315,302 +16234,92 @@ def start_recording(camera_number: int) -> subprocess.Popen:
 
 
 def delete_expired_recordings() -> None:
+    """Permanent local-recording retention: deletes a local .mkv once
+    it is older than RETENTION_DAYS (an appliance-level environment
+    setting -- this function itself hard-codes no particular value).
+    The camera's newest file (presumed still being actively written)
+    is never considered, matching recording_uploader._completed_
+    recording_files()'s own guarantee. Every deletion also removes the
+    matching local Playback catalog row (recordings table, keyed by
+    cloud_recording_s3_key()), so no row survives pointing at a file
+    that no longer exists.
 
-
-
-
-
-
-
+    Age-only, with no upload-confirmation gate: deletion does not wait
+    for a recording's cloud upload to be confirmed first. Accepted for
+    appliances where local recordings are not the sole durable copy of
+    the footage. A confirmation-gated variant (persisted upload-proof
+    checked before deletion) was designed and validated for appliances
+    holding customer data as the only durable copy, but was not the
+    variant accepted here -- see the retention-fix session history if
+    that stricter behavior is ever needed for a specific deployment."""
+    from partner_db import connection
 
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
-
-
-
-
-
-
-
-
     deleted_count = 0
 
+    with connection() as db:
+        camera_id_by_number = {
+            int(row["camera_number"]): row["id"]
+            for row in db.execute("SELECT id, camera_number FROM cameras WHERE camera_number IS NOT NULL").fetchall()
+        }
 
-
-
-
-
-
-
-    for recording_file in RECORDINGS_FOLDER.rglob("*.mkv"):
-
-
-
-
-
-
-
-
+    for camera_number, camera_id in camera_id_by_number.items():
+        camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+        if not camera_folder.is_dir():
+            continue
         try:
-
-
-
-
-
-
-
-
-            if datetime.fromtimestamp(recording_file.stat().st_mtime) < cutoff:
-
-
-
-
-
-
-
-
-                recording_file.unlink(missing_ok=True)
-
-
-
-
-
-
-
-
-                deleted_count += 1
-
-
-
-
-
-
-
-
+            candidates = sorted(item.name for item in camera_folder.iterdir() if item.is_file() and item.suffix == ".mkv")
         except OSError as error:
+            print(f"Could not list {camera_folder}: {error}")
+            continue
+        # The newest file for this camera is presumed still being
+        # actively written -- never a deletion candidate, matching
+        # recording_uploader._completed_recording_files()'s guarantee.
+        completed = candidates[:-1] if len(candidates) > 1 else []
 
-
-
-
-
-
-
-
-            print(f"Could not inspect or delete {recording_file}: {error}")
-
-
-
-
-
-
-
-
-    if deleted_count:
-
-
-
-
-
-
-
-
-        print(f"Retention cleanup deleted {deleted_count} expired recording(s).")
-
-
-
-
-
-
-
-
-    if MOTION_EVENTS_FILE.exists():
-
-
-
-
-
-
-
-
-        retained_events = []
-
-
-
-
-
-
-
-
-        for event in load_motion_events():
-
-
-
-
-
-
-
-
+        for filename in completed:
+            recording_file = camera_folder / filename
             try:
-
-
-
-
-
-
-
-
-                event_time = event.get("start_time") or event.get("timestamp")
-
-
-
-
-
-
-
-
-                if datetime.fromisoformat(event_time) >= cutoff:
-
-
-
-
-
-
-
-
-                    retained_events.append(json.dumps(event, separators=(",", ":")))
-
-
-
-
-
-
-
-
-            except (KeyError, TypeError, ValueError):
-
-
-
-
-
-
-
-
+                if datetime.fromtimestamp(recording_file.stat().st_mtime) >= cutoff:
+                    continue
+            except OSError as error:
+                print(f"Could not inspect {recording_file}: {error}")
                 continue
 
+            catalog_key = cloud_recording_s3_key(recording_file, camera_number)
+            try:
+                with connection() as db:
+                    db.execute("DELETE FROM recordings WHERE camera_id=? AND s3_key=?", (camera_id, catalog_key))
+                recording_file.unlink(missing_ok=True)
+                deleted_count += 1
+            except OSError as error:
+                print(f"Could not delete {recording_file}: {error}")
 
+    if deleted_count:
+        print(f"Retention cleanup deleted {deleted_count} expired recording(s).")
 
-
-
-
-
-
+    if MOTION_EVENTS_FILE.exists():
+        retained_events = []
+        for event in load_motion_events():
+            try:
+                event_time = event.get("start_time") or event.get("timestamp")
+                if datetime.fromisoformat(event_time) >= cutoff:
+                    retained_events.append(json.dumps(event, separators=(",", ":")))
+            except (KeyError, TypeError, ValueError):
+                continue
         try:
-
-
-
-
-
-
-
-
             MOTION_EVENTS_FILE.write_text(
-
-
-
-
-
-
-
-
                 "\n".join(retained_events) + ("\n" if retained_events else ""),
-
-
-
-
-
-
-
-
                 encoding="utf-8",
-
-
-
-
-
-
-
-
             )
-
-
-
-
-
-
-
-
         except OSError as error:
-
-
-
-
-
-
-
-
             print(f"Could not prune motion events: {error}")
 
-
-
-
-
-
-
-
     for thumbnail in MOTION_THUMBNAILS_FOLDER.rglob("*.jpg"):
-
-
-
-
-
-
-
-
         try:
-
-
-
-
-
-
-
-
             if datetime.fromtimestamp(thumbnail.stat().st_mtime) < cutoff:
-
-
-
-
-
-
-
-
                 thumbnail.unlink(missing_ok=True)
-
-
-
-
-
-
-
-
         except OSError:
-
-
-
-
-
-
-
-
             continue
 
 
@@ -16656,7 +16365,7 @@ async def retention_worker() -> None:
 
 
 
-        delete_expired_recordings()
+        await asyncio.to_thread(delete_expired_recordings)
 
 
 
@@ -16778,6 +16487,23 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
         try:
             process = starter(camera_number)
+        except CameraNotConfiguredError:
+            # Not an error: this slot has no camera provisioned yet (a
+            # fresh install, or a not-yet-configured supervisor headroom
+            # slot -- see get_supervisor_slot_count()). Report a clear
+            # "not_configured" state instead of "retrying" so Live/
+            # Recording UI can show that honestly instead of implying a
+            # connection is being attempted and failing, and keep polling
+            # indefinitely at a slower cadence -- no restart is needed
+            # once the camera is provisioned; the very next iteration of
+            # this loop calls camera_url() again and will succeed.
+            camera_process_state[camera_number][mode] = "not_configured"
+            if mode == "live":
+                camera_process_state[camera_number]["last_exit_code"] = None
+                camera_process_state[camera_number]["last_error"] = None
+                camera_process_state[camera_number]["last_error_at"] = None
+            await asyncio.sleep(CAMERA_NOT_CONFIGURED_POLL_SECONDS)
+            continue
         except OSError as error:
             error_text = _redact_camera_stream_error(
                 str(error)
@@ -16833,7 +16559,68 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
 
         completed = False
+        watchdog_restart = False
         try:
+            if mode == "live":
+                playlist_path = HLS_FOLDER / f"camera{camera_number}.m3u8"
+                watchdog_started = time.monotonic()
+
+                while process.poll() is None:
+                    await asyncio.sleep(5)
+
+                    # Give a newly-started RTSP/HLS pipeline time to connect,
+                    # decode and write its first playlist before judging it.
+                    if time.monotonic() - watchdog_started < 30:
+                        continue
+
+                    try:
+                        playlist_age = time.time() - playlist_path.stat().st_mtime
+                    except OSError:
+                        playlist_age = time.monotonic() - watchdog_started
+
+                    if playlist_age <= 45:
+                        continue
+
+                    watchdog_restart = True
+                    print(
+                        f"Camera {camera_number} live HLS playlist stale "
+                        f"for {playlist_age:.1f}s; restarting worker."
+                    )
+
+                    process.terminate()
+
+                    try:
+                        await asyncio.to_thread(process.wait, timeout=5)
+                    except subprocess.TimeoutExpired:
+                        print(
+                            f"Camera {camera_number} live worker ignored TERM; "
+                            f"sending KILL."
+                        )
+                        process.kill()
+
+                    break
+            else:
+                # "recording" mode: no playlist-staleness watchdog --
+                # recording has no equivalent concept to watch. Just the
+                # same non-blocking poll loop "live" mode already uses
+                # safely above, so this coroutine never ties up one of
+                # Python's ~12 default-executor threads for the entire,
+                # effectively unbounded lifetime of a healthy, still-
+                # running recording process. Confirmed live via py-spy on
+                # this Samsung appliance: this exact gap (previously
+                # `return_code = await asyncio.to_thread(process.wait)`
+                # called immediately, with no polling loop first, against
+                # a process that runs indefinitely) permanently pinned 5
+                # executor threads -- one per camera -- for the
+                # appliance's entire uptime. By the time the loop below
+                # exits, the process has already exited on its own, so
+                # the to_thread(process.wait) call just beneath this
+                # block returns immediately -- it's still needed to reap
+                # the process and obtain its real exit code, just no
+                # longer blocks for any meaningful duration.
+                while process.poll() is None:
+                    await asyncio.sleep(5)
+
             return_code = await asyncio.to_thread(process.wait)
             completed = True
 
@@ -16843,7 +16630,9 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
             if mode == "live":
                 camera_process_state[camera_number]["last_exit_code"] = return_code
                 camera_process_state[camera_number]["last_error"] = (
-                    _bounded_camera_error(stderr_tail)
+                    "HLS playlist stopped advancing; worker restarted automatically."
+                    if watchdog_restart
+                    else _bounded_camera_error(stderr_tail)
                 )
                 camera_process_state[camera_number]["last_error_at"] = (
                     datetime.now().isoformat()
@@ -17759,15 +17548,6 @@ ONBOARDING_STEPS = [
 
 
     "deployment",
-
-
-
-
-
-
-
-
-    "cameras",
 
 
 
@@ -22807,7 +22587,11 @@ def customer_cloud_usage_snapshot(user: dict) -> dict:
 
 
 
-        "configured_cameras": CAMERA_COUNT,
+        # 2026-09-04: scoped to this customer -- see get_camera_numbers()'s
+        # own comment for the cross-tenant-leak this closes. user.get(
+        # "customer_id") is None for any caller that doesn't have one
+        # (unaffected, matches today's behavior exactly).
+        "configured_cameras": get_camera_count(customer_id=user.get("customer_id")),
 
 
 
@@ -23860,7 +23644,12 @@ def feature_entitlement(feature: str, snapshot: dict | None = None) -> dict:
 
 
 
-def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
+def license_enforcement_snapshot(camera_count: int | None = None, customer_id: str | None = None) -> dict:
+    # 2026-09-04: customer_id is new and optional -- only used to scope
+    # the get_camera_count() fallback below when the caller doesn't
+    # already provide an explicit camera_count of its own. See get_
+    # camera_numbers()'s own comment for the full cross-tenant-leak
+    # root cause this closes.
 
 
 
@@ -23878,7 +23667,7 @@ def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
 
 
 
-    current_camera_count = CAMERA_COUNT if camera_count is None else max(0, int(camera_count))
+    current_camera_count = get_camera_count(customer_id=customer_id) if camera_count is None else max(0, int(camera_count))
 
 
 
@@ -24688,7 +24477,12 @@ def license_enforcement_snapshot(camera_count: int | None = None) -> dict:
 
 
 
-def license_warning_banner() -> str:
+def license_warning_banner(customer_id: str | None = None) -> str:
+    # 2026-09-04: customer_id is new/optional -- see get_camera_numbers()'s
+    # own comment. page_shell() (this function's only caller) now passes
+    # the current page's already-resolved identity's customer_id, so the
+    # banner shown on every customer-facing page (including /alerts) is
+    # scoped to that customer's own cameras, not every tenant's combined.
 
 
 
@@ -24715,7 +24509,7 @@ def license_warning_banner() -> str:
 
 
 
-    snapshot = license_enforcement_snapshot()
+    snapshot = license_enforcement_snapshot(customer_id=customer_id)
 
 
 
@@ -31924,69 +31718,34 @@ def get_alert_rule(camera_number: int) -> AlertRuleModel:
 
 
 
-def linked_recording_for(camera_number: int, event_time: datetime) -> str | None:
+def linked_recording_for(
+    camera_number: int, event_time: datetime, event_end_time: datetime | None = None
+) -> str | None:
+    """Punch-list item 4: a customer's event clip link must be windowed
+    to pre-roll + the real event duration + post-roll (see
+    event_clips.compute_clip_window()) -- not the full raw multi-minute
+    recording segment. event_end_time defaults to event_time for a
+    zero-duration/instant detection (motion events currently only carry a
+    single timestamp -- see store_motion_event()'s call site).
 
+    This still links into the same underlying segment file (real, separate-
+    file clip extraction -- reusing the existing create_clip()/
+    build_manual_clip() job -- is follow-up work, not done here; see the
+    punch-list report) but bounds playback to the computed window via the
+    HTML5 Media Fragments #t=start,end syntax, which browsers honor by
+    stopping playback at the end offset -- so the duration a customer
+    actually sees is correct even before real extraction lands.
+    """
+    from event_clips import compute_clip_window
 
-
-
-
-
-
-
+    window = compute_clip_window(event_time, event_end_time or event_time)
     camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
-
-
-
-
-
-
-
-
     for source in sorted(camera_folder.glob("*.mkv"), reverse=True):
-
-
-
-
-
-
-
-
         source_start = recording_start(source, camera_number)
-
-
-
-
-
-
-
-
         if source_start and source_start <= event_time < source_start + timedelta(minutes=5):
-
-
-
-
-
-
-
-
-            offset = max(0, int((event_time - source_start).total_seconds()))
-
-
-
-
-
-
-
-
-            return f"/recordings/camera{camera_number}/{quote(source.name)}#t={offset}"
-
-
-
-
-
-
-
-
+            start_offset = max(0, (window.start - source_start).total_seconds())
+            end_offset = max(start_offset, (window.end - source_start).total_seconds())
+            return f"/recordings/camera{camera_number}/{quote(source.name)}#t={start_offset:.1f},{end_offset:.1f}"
     return None
 
 
@@ -34093,6 +33852,277 @@ async def create_motion_thumbnail(
 
 
 
+
+
+
+
+
+
+
+
+
+# Mirrors start_recording()'s own `-segment_time 300` -- used only as a
+# conservative margin for shortlisting candidate files by their filename
+# timestamp (recording_start()), never to assume any file's real, probed
+# duration. Doubled below so a shorter-than-nominal segment (e.g. from an
+# ffmpeg restart) or an event whose pre-roll crosses a segment boundary
+# still pulls in the neighboring segment.
+RECORDING_SEGMENT_SECONDS = 300
+
+
+def _probe_motion_clip_candidates(
+    shortlist: list[tuple[datetime, Path]],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[tuple[datetime, datetime, Path]]:
+    """Synchronous: ffprobe each already-shortlisted file and keep the
+    ones whose real [start, end) interval overlaps the event window.
+    Always invoked via asyncio.to_thread() from build_motion_event_clip()
+    below -- never called directly on the event loop. `shortlist` is
+    expected to already be narrowed by filename timestamp (cheap, no
+    subprocess) before this function ever runs, so it stays small
+    (typically 1-3 files) regardless of how many recordings a camera has
+    retained in total."""
+    candidates: list[tuple[datetime, datetime, Path]] = []
+
+    for source_start, source in shortlist:
+        try:
+            probe = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=nw=1:nk=1",
+                    str(source),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            duration_text = probe.stdout.strip()
+
+            if duration_text and duration_text.upper() != "N/A":
+                source_duration = float(duration_text)
+
+                if source_duration <= 0:
+                    continue
+
+                source_end = source_start + timedelta(
+                    seconds=source_duration
+                )
+            else:
+                # An actively-written MKV can report duration=N/A.
+                # If it was modified recently, treat it as extending
+                # through the current moment so event extraction can
+                # use the live recording segment.
+                age_seconds = max(
+                    0.0,
+                    time.time() - source.stat().st_mtime,
+                )
+
+                if age_seconds > 30:
+                    continue
+
+                source_end = datetime.now()
+
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            ValueError,
+        ):
+            continue
+
+        if source_start < window_end and source_end > window_start:
+            candidates.append((source_start, source_end, source))
+
+    return candidates
+
+
+# Bounds how many build_motion_event_clip() ffmpeg encodes (libx264,
+# real-time cost) can run simultaneously, appliance-wide -- both the
+# basic-motion and AI paths share this one function/semaphore, matching
+# the same TRANSCODE_MAX_CONCURRENCY pattern recording_uploader.py's own
+# HEVC-transcode path already uses for an equivalent problem. Measured
+# directly on this appliance: a single such encode takes ~2.6s for a
+# real 10s clip when nothing else is competing, but 3 concurrent encodes
+# already stretch to ~4-6s each -- and live AI testing (119 real
+# detections across 5 cameras in 18 minutes, no bound at all) produced
+# 10+ simultaneous encodes, a monotonically climbing load average
+# (13.78 -> 67.99 over 10 minutes, 8-core appliance), and 8 real
+# /health failures. Default 1, mirroring TRANSCODE_MAX_CONCURRENCY's own
+# default -- the most conservative starting point, loosenable later once
+# proven stable. asyncio.Semaphore (not threading.Semaphore): unlike
+# _transcode_hevc_to_h264() (which runs inside asyncio.to_thread()),
+# build_motion_event_clip() is itself an async def running directly on
+# the event loop, dispatching ffmpeg via asyncio.create_subprocess_exec.
+EVENT_CLIP_ENCODE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_EVENT_CLIP_ENCODE_MAX_CONCURRENCY", "1")))
+event_clip_encode_semaphore = asyncio.Semaphore(EVENT_CLIP_ENCODE_MAX_CONCURRENCY)
+
+
+
+
+async def build_motion_event_clip(
+    event_id: str,
+    camera_number: int,
+    event_start: datetime,
+    event_end: datetime,
+) -> str | None:
+    """Create a standalone MP4 covering 5s pre-roll + event + 5s post-roll."""
+    from event_clips import compute_clip_window
+
+    window = compute_clip_window(event_start, event_end)
+
+    # Do not try to extract post-roll before that footage exists. Add a
+    # small completion margin so the active recording segment has flushed.
+    wait_seconds = max(
+        0.0,
+        (window.end - datetime.now()).total_seconds(),
+    ) + 3.0
+    if wait_seconds:
+        await asyncio.sleep(wait_seconds)
+
+    camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+
+    # Shortlist by filename timestamp only (recording_start() -- cheap,
+    # no subprocess) before ever invoking ffprobe. Without this, every
+    # motion-event clip build ffprobed the camera's ENTIRE retained
+    # recording history (1,000+ files after a few days), each call
+    # blocking the event loop directly -- confirmed live on the Samsung
+    # production appliance to take minutes per event and reproduce the
+    # HTTP outage. A file can only possibly overlap the event window if
+    # it starts no later than the window's end, and no earlier than
+    # 2 * RECORDING_SEGMENT_SECONDS before the window's start.
+    earliest_start = window.start - timedelta(
+        seconds=RECORDING_SEGMENT_SECONDS * 2
+    )
+    shortlist: list[tuple[datetime, Path]] = []
+    for source in sorted(camera_folder.glob("*.mkv")):
+        source_start = recording_start(source, camera_number)
+        if source_start is None:
+            continue
+        if source_start > window.end:
+            continue
+        if source_start < earliest_start:
+            continue
+        shortlist.append((source_start, source))
+
+    candidates = await asyncio.to_thread(
+        _probe_motion_clip_candidates, shortlist, window.start, window.end
+    )
+
+    if not candidates:
+        print(
+            f"Motion event {event_id}: no completed recordings cover "
+            f"camera {camera_number} event window."
+        )
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+
+    # Prefer one real source file that fully covers the requested event
+    # window. This avoids concat-timeline distortion when a short/restarted
+    # recording exists between otherwise normal five-minute segments.
+    covering = [
+        item for item in candidates
+        if item[0] <= window.start and item[1] >= window.end
+    ]
+
+    if covering:
+        source_start, _, source = covering[-1]
+        candidates = [(source_start, source_start, source)]
+        first_start = source_start
+    else:
+        first_start = candidates[0][0]
+
+    offset_seconds = max(0.0, (window.start - first_start).total_seconds())
+    duration_seconds = (window.end - window.start).total_seconds()
+
+    event_folder = CLIPS_FOLDER / "motion"
+    event_folder.mkdir(parents=True, exist_ok=True)
+
+    list_file = event_folder / f".{event_id}.txt"
+    output_path = event_folder / f"motion_{event_id}.mp4"
+    temp_path = event_folder / f".{event_id}.mp4"
+
+    try:
+        list_file.write_text(
+            "".join(
+                f"file '{source.as_posix()}'\n"
+                for _, _, source in candidates
+            ),
+            encoding="utf-8",
+        )
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_file),
+            "-ss", str(offset_seconds),
+            "-t", str(duration_seconds),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-movflags", "+faststart",
+            str(temp_path),
+        ]
+
+        # Only the actual encode -- never the pre-roll wait above, the
+        # shortlist/ffprobe candidate search above that, or the list-
+        # file write just above -- is gated: those are cheap and never
+        # what saturated the appliance. async with queues indefinitely
+        # (no timeout, never drops a job) and releases on every exit
+        # path -- success, a non-zero ffmpeg exit raising below, or this
+        # task being cancelled mid-encode.
+        async with event_clip_encode_semaphore:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            error_text = stderr.decode(
+                "utf-8", errors="replace"
+            )[-600:]
+            raise RuntimeError(
+                f"Motion event clip processing failed: {error_text}"
+            )
+
+        temp_path.replace(output_path)
+
+        print(
+            f"Motion event {event_id}: created clip "
+            f"{output_path.name} ({duration_seconds:.1f}s)."
+        )
+
+        return f"/recordings/clips/motion/{quote(output_path.name)}"
+
+    except Exception as error:
+        print(
+            f"Motion event {event_id}: clip creation failed: "
+            f"{type(error).__name__}: {error}"
+        )
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    finally:
+        try:
+            list_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 async def store_motion_event(
 
 
@@ -34237,7 +34267,7 @@ async def store_motion_event(
 
 
 
-        linked_recording=linked_recording_for(camera_number, start_time),
+        linked_recording=f"/recordings/clips/motion/motion_{event_id}.mp4",
 
 
 
@@ -34254,6 +34284,31 @@ async def store_motion_event(
 
 
 
+
+    # Basic Motion is also a first-class analytics-history event.
+    # Keep the legacy motion_events.jsonl write below for compatibility,
+    # while mirroring the minimal event into analytics_events.json so the
+    # existing appliance -> cloud analytics sync can index it for mobile
+    # Playback.
+    # Moved off the event loop via asyncio.to_thread(): this used to call
+    # append_analytics_event() directly and synchronously here, inside an
+    # async def running on the shared FastAPI event loop. That blocking
+    # file read/sort/rewrite (analytics_events.json, up to 5000 events)
+    # stalled every concurrent HTTP handler -- /health, /playback,
+    # /events, and the dashboard -- for the duration of each motion
+    # event, confirmed live via a Samsung production audit.
+    await asyncio.to_thread(
+        append_analytics_event,
+        {
+            "id": event.id,
+            "camera": camera_number,
+            "event_type": "motion",
+            "timestamp": start_time.isoformat(),
+            "confidence": event.confidence,
+            "object_count": 1,
+            "detections": [],
+        },
+    )
 
     line = event.model_dump_json() + "\n"
 
@@ -34274,6 +34329,62 @@ async def store_motion_event(
 
 
         await asyncio.to_thread(append_motion_event, line)
+
+        # Build the standalone customer event clip independently of event
+        # persistence/notifications. The builder waits until the configured
+        # 5-second post-roll exists, then extracts:
+        # 5s pre-roll + full event duration + 5s post-roll.
+        #
+        # Returns the shared-media reference (s3_key/thumbnail_s3_key/
+        # duration_seconds/size_bytes) on a full successful cloud upload,
+        # or None on any failure/no-op path (clip build failure, capture-
+        # only mode with no S3 key, any upload/registration failure) --
+        # a correlated Smart Motion event (scheduled below, only when
+        # classify_motion() fires) awaits THIS exact task and reuses that
+        # result instead of independently re-encoding and re-uploading
+        # the identical physical window. upload_motion_event_media()'s
+        # own return value/behavior is completely unchanged for every
+        # other caller (including save_yolo_events()) -- shared_media_out
+        # is a new, optional, purely-additive parameter nothing else passes.
+        async def build_and_upload_event_media() -> dict | None:
+            clip_url = await build_motion_event_clip(
+                event_id,
+                camera_number,
+                start_time,
+                end_time,
+            )
+
+            if not clip_url:
+                return None
+
+            shared_media: dict = {}
+            try:
+                from event_media_uploader import upload_motion_event_media
+
+                await asyncio.to_thread(
+                    upload_motion_event_media,
+                    event_id=event_id,
+                    camera_number=camera_number,
+                    event_start=start_time,
+                    event_end=end_time,
+                    clip_url=clip_url,
+                    thumbnail_url=thumbnail,
+                    shared_media_out=shared_media,
+                )
+            except Exception as error:
+                print(
+                    f"Motion event {event_id}: media upload failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                return None
+
+            return shared_media or None
+
+        clip_task = asyncio.create_task(
+            build_and_upload_event_media()
+        )
+        clip_tasks.add(clip_task)
+        clip_task.add_done_callback(clip_tasks.discard)
 
 
 
@@ -34463,6 +34574,114 @@ async def store_motion_event(
 
 
     print(f"Motion detected on Camera {camera_number} (confidence {event.confidence:.1f}%).")
+    # 2026-09-16: smart_motion.py deliberately never imports main.py or
+    # recording_uploader.py (dependency-light by design, see its own
+    # module docstring), so the real per-camera RDM entitlement check
+    # lives here at the call site instead of inside that module --
+    # SMART_MOTION_ENABLED (smart_motion.py's own env-var master switch)
+    # was never per-camera or entitlement-aware. Ordinary motion
+    # detection above this point is completely unaffected either way;
+    # this only gates the smart_motion-specific correlated event.
+    smart_motion_identity = recording_uploader._camera_identity(camera_number)
+    classification = smart_motion.classify_motion(camera_number) if bool(smart_motion_identity and smart_motion_identity.get("smart_motion_enabled")) else None
+    if classification:
+        smart_event = AnalyticsEventModel(
+            camera=camera_number,
+            site="home",
+            rule_name=f"Smart Motion ({classification})",
+            event_type="smart_motion",
+            timestamp=start_time,
+            confidence=event.confidence,
+            thumbnail=thumbnail,
+            linked_recording=event.linked_recording,
+            mock=False,
+        ).model_dump(mode="json")
+        smart_event["triggered_by"] = classification
+        smart_event["motion_event_id"] = event.id
+        await asyncio.to_thread(append_analytics_event, smart_event)
+
+        # Smart Motion keeps its own independent event/media OWNERSHIP
+        # (its own detection_event_id, its own detection_event_media
+        # row) -- but a correlated Smart Motion event covers the exact
+        # same physical (camera, start_time, end_time) window as the
+        # base Motion event above, by construction, so re-encoding and
+        # re-uploading that identical footage a second time is pure
+        # waste (confirmed live: both produced byte-identical output).
+        # Instead of independently calling build_motion_event_clip()/
+        # upload_motion_event_media() a second time, this task simply
+        # AWAITS clip_task -- the base Motion event's own media task,
+        # already created above -- purely as a "did the base event's own
+        # media actually succeed" signal (clip_task's own truthy/falsy
+        # result), then calls register_shared_event_media() with ONLY
+        # this base Motion event's own LOCAL id (`event_id`) as
+        # `parent_local_event_id` -- never any S3 key, timing, duration,
+        # or size. The cloud independently re-resolves that id, verifies
+        # the full ownership chain (see appliance_cloud.py's
+        # analytics_event_media_shared()), and derives the approved
+        # clip/thumbnail/metadata itself from the parent's own already-
+        # registered media -- this call has no storage reference to
+        # supply even if it wanted to. This is a genuine in-process
+        # dependency on an already-scheduled asyncio.Task -- never a DB
+        # poll and never a second queue -- so it costs nothing extra on
+        # the already-saturated event_clip_encode_semaphore.
+        #
+        # Safe failure behavior, explicit: if the base Motion event's
+        # own media task fails or produces nothing shareable (clip
+        # build failure, capture-only mode with no S3 upload, upload/
+        # registration failure), clip_task resolves to None and this
+        # task logs that plainly and returns -- it never falls back to
+        # an independent Smart Motion re-encode. The Smart Motion
+        # analytics event itself is completely unaffected either way:
+        # append_analytics_event() above has already persisted it.
+        smart_event_id = smart_event["id"]
+
+        async def build_and_upload_smart_motion_media() -> None:
+            try:
+                shared_media = await clip_task
+            except Exception as error:
+                print(
+                    f"Smart Motion event {smart_event_id}: base Motion "
+                    f"media task failed: {type(error).__name__}: {error}"
+                )
+                return
+            if not shared_media:
+                print(
+                    f"Smart Motion event {smart_event_id}: no shared "
+                    f"media available from base Motion event {event_id} "
+                    f"-- skipping (no independent re-encode)."
+                )
+                return
+            try:
+                from event_media_uploader import register_shared_event_media
+
+                await asyncio.to_thread(
+                    register_shared_event_media,
+                    event_id=smart_event_id,
+                    camera_number=camera_number,
+                    parent_local_event_id=event_id,
+                )
+            except Exception as error:
+                print(
+                    f"Smart Motion event {smart_event_id}: shared media "
+                    f"registration failed: {type(error).__name__}: {error}"
+                )
+
+        # Scheduling itself is guarded too: a failure here must never
+        # un-create or block the analytics event already persisted
+        # above -- append_analytics_event() has already returned by
+        # this point, so the Smart Motion event exists and is
+        # cloud-syncable regardless of what happens next.
+        try:
+            smart_motion_clip_task = asyncio.create_task(
+                build_and_upload_smart_motion_media()
+            )
+            clip_tasks.add(smart_motion_clip_task)
+            smart_motion_clip_task.add_done_callback(clip_tasks.discard)
+        except Exception as error:
+            print(
+                f"Smart Motion event {smart_event_id}: could not schedule "
+                f"media registration: {type(error).__name__}: {error}"
+            )
 
 
 
@@ -34485,6 +34704,77 @@ async def store_motion_event(
 
 
 
+
+
+
+
+# Cache of (zones fingerprint -> precomputed 160x90 boolean zone mask),
+# keyed per camera. Rebuilt only when a camera's configured zones
+# actually change (compared by value, not identity) -- not on every
+# frame. The fingerprint is a tuple of each zone's (x, y, width, height)
+# since those four numbers are the only inputs that affect the mask.
+_motion_zone_mask_cache: dict[int, tuple[tuple, "np.ndarray"]] = {}
+
+
+def _motion_zone_mask(camera_number: int, zones: list) -> "np.ndarray":
+    fingerprint = tuple((zone.x, zone.y, zone.width, zone.height) for zone in zones)
+    cached = _motion_zone_mask_cache.get(camera_number)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+
+    pixel_x = (np.arange(14400) % 160) / 160
+    pixel_y = (np.arange(14400) // 160) / 90
+    mask = np.zeros(14400, dtype=bool)
+    for zone in zones:
+        mask |= (
+            (pixel_x >= zone.x)
+            & (pixel_x <= zone.x + zone.width)
+            & (pixel_y >= zone.y)
+            & (pixel_y <= zone.y + zone.height)
+        )
+
+    _motion_zone_mask_cache[camera_number] = (fingerprint, mask)
+    return mask
+
+
+def _compare_motion_frames(
+    camera_number: int,
+    frame: bytes,
+    previous_frame: bytes,
+    zones: list,
+) -> tuple[int, int, int]:
+    """Synchronous, NumPy-vectorized replacement for the old per-pixel
+    Python `for` loop -- numerically equivalent (same inclusive zone
+    bounds, same |current - previous| difference, same >= 20 changed-
+    pixel threshold), just computed across the whole 160x90 frame at
+    once instead of one Python-level iteration per pixel. Always invoked
+    via asyncio.to_thread() from motion_detector() below -- never called
+    directly on the event loop. Confirmed live on the Samsung production
+    appliance via py-spy: the old loop held the event loop's own
+    MainThread (CPU-bound, GIL-held, no await inside it) for long enough,
+    especially when multiple cameras' frames landed close together, to
+    reproduce the same class of HTTP outage as the earlier
+    build_motion_event_clip() and retention_worker() bugs.
+
+    Returns (total_difference, compared_pixels, changed_pixels), the
+    exact three accumulators the old loop produced -- everything
+    downstream (motion_score, changed_ratio, effective_threshold,
+    cooldown/event-creation state machine) is unchanged."""
+    mask = _motion_zone_mask(camera_number, zones)
+
+    current = np.frombuffer(frame, dtype=np.uint8)
+    previous = np.frombuffer(previous_frame, dtype=np.uint8)
+    # int16 (not the raw uint8 arrays) so the subtraction can't wrap
+    # around -- matches the original Python `abs(current - previous)`,
+    # which never overflowed since Python ints are arbitrary precision.
+    difference = np.abs(current.astype(np.int16) - previous.astype(np.int16))
+
+    in_zone_difference = difference[mask]
+    total_difference = int(in_zone_difference.sum())
+    compared_pixels = int(mask.sum())
+    changed_pixels = int(np.count_nonzero(in_zone_difference >= 20))
+
+    return total_difference, compared_pixels, changed_pixels
 
 
 
@@ -34813,168 +35103,13 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                    total_difference = 0
-
-
-
-
-
-
-
-
-                    changed_pixels = 0
-
-
-
-
-
-
-
-
-                    compared_pixels = 0
-
-
-
-
-
-
-
-
-                    for index, (current, previous) in enumerate(zip(frame, previous_frame)):
-
-
-
-
-
-
-
-
-                        pixel_x = (index % 160) / 160
-
-
-
-
-
-
-
-
-                        pixel_y = (index // 160) / 90
-
-
-
-
-
-
-
-
-                        in_zone = any(
-
-
-
-
-
-
-
-
-                            zone.x <= pixel_x <= zone.x + zone.width
-
-
-
-
-
-
-
-
-                            and zone.y <= pixel_y <= zone.y + zone.height
-
-
-
-
-
-
-
-
-                            for zone in settings.zones
-
-
-
-
-
-
-
-
-                        )
-
-
-
-
-
-
-
-
-                        if not in_zone:
-
-
-
-
-
-
-
-
-                            continue
-
-
-
-
-
-
-
-
-                        difference = abs(current - previous)
-
-
-
-
-
-
-
-
-                        total_difference += difference
-
-
-
-
-
-
-
-
-                        compared_pixels += 1
-
-
-
-
-
-
-
-
-                        if difference >= 20:
-
-
-
-
-
-
-
-
-                            changed_pixels += 1
-
-
-
-
-
-
-
-
+                    total_difference, compared_pixels, changed_pixels = await asyncio.to_thread(
+                        _compare_motion_frames,
+                        camera_number,
+                        frame,
+                        previous_frame,
+                        settings.zones,
+                    )
                     motion_score = total_difference / max(compared_pixels, 1)
 
 
@@ -35002,7 +35137,11 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                    effective_threshold = MOTION_THRESHOLD * (1.5 - settings.sensitivity / 100)
+                    # Calibrated against the detector's actual 160x90,
+                    # 1-fps grayscale feed. Normal person-sized motion in
+                    # wide camera views produces scores around 3-4, while
+                    # the old default required ~10.8 at sensitivity 60.
+                    effective_threshold = 4.0 * (1.5 - settings.sensitivity / 100)
 
 
 
@@ -35020,7 +35159,7 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
-                        motion_score >= effective_threshold and changed_ratio >= 0.08
+                        motion_score >= effective_threshold and 0.02 <= changed_ratio <= MOTION_MAX_CHANGED_RATIO
 
 
 
@@ -35452,43 +35591,26 @@ async def motion_detector(camera_number: int) -> None:
 
 
 
+analytics_events_file_lock = threading.Lock()
+
+
 def append_analytics_event(event: dict) -> None:
+    # Concurrency safety: called from multiple worker threads via
+    # asyncio.to_thread() -- the motion-event path (store_motion_event())
+    # and the YOLO/AI detection path (save_yolo_events()) both call this
+    # for cameras 1-5, concurrently. The full read-modify-sort-write
+    # transaction must be serialized with a process-wide lock, or two
+    # concurrent writers can interleave their read/write and silently
+    # drop one caller's event.
+    with analytics_events_file_lock:
 
+        events = load_json_list(ANALYTICS_EVENTS_FILE)
 
+        events.append(event)
 
+        events.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
 
-
-
-
-
-    events = load_json_list(ANALYTICS_EVENTS_FILE)
-
-
-
-
-
-
-
-
-    events.append(event)
-
-
-
-
-
-
-
-
-    events.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
-
-
-
-
-
-
-
-
-    save_json_list(ANALYTICS_EVENTS_FILE, events[:5000])
+        save_json_list(ANALYTICS_EVENTS_FILE, events[:5000])
 
 
 
@@ -35551,25 +35673,32 @@ def get_yolo_model():
 
 
 
-    if yolo_model is None:
+    # Fast path: once loaded, every later call (one per camera, every
+    # AI_DETECTION_INTERVAL_SECONDS, for the appliance's entire uptime)
+    # returns immediately without ever touching yolo_model_lock.
+    if yolo_model is not None:
+        return yolo_model
 
-
-
-
-
-
-
-
-        print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
-
-
-
-
-
-
-
-
-        yolo_model = YOLO(YOLO_MODEL_NAME)
+    # Real threading.Lock(), not asyncio.Lock() -- get_yolo_model() is
+    # called via asyncio.to_thread() from up to 5 different worker
+    # threads (one per camera's ai_person_detector(), all racing here on
+    # their very first run), each with no asyncio event loop of its own
+    # to await an asyncio.Lock() on. Double-checked: the inner
+    # `if yolo_model is None` re-test is what actually prevents a second
+    # thread -- one that was blocked waiting for this lock while the
+    # first thread was still loading -- from loading a second model
+    # instance once it finally acquires the lock.
+    with yolo_model_lock:
+        if yolo_model is None:
+            print(f"Loading YOLO model: {YOLO_MODEL_NAME} on {YOLO_DEVICE}")
+            # Once, tied to this same one-time initialization -- caps
+            # PyTorch's own per-call intra-op parallelism so a single
+            # inference pass can't claim every core on an appliance
+            # also running 5 live ffmpeg streams, 5 recorders, and
+            # motion detection.
+            if torch is not None:
+                torch.set_num_threads(2)
+            yolo_model = YOLO(YOLO_MODEL_NAME)
 
 
 
@@ -36534,6 +36663,15 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
     }
 
+    # Every class this function draws a box for and writes an
+    # analytics event for (i.e. every key above) is eligible for the
+    # same real short clip motion events already get -- reusing
+    # class_colors' own key set rather than a second, possibly-
+    # drifting list. "smart_motion" is a distinct event_type produced
+    # elsewhere, not by this function, and is not covered here.
+    AI_CLIP_EVENT_TYPES = frozenset(class_colors.keys())
+
+
 
 
 
@@ -36894,6 +37032,147 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         grouped.setdefault(detection["class_name"], []).append(detection)
 
+    # Real short clip + cloud upload for qualifying AI-classification
+    # detections (2026-09-02): reuses build_motion_event_clip(),
+    # compute_clip_window(), and -- traced live on the Samsung
+    # appliance, not guessed -- event_media_uploader.upload_motion_
+    # event_media() exactly as store_motion_event() already wires them
+    # together on the live production build, in the same nested-build-
+    # then-upload-task shape, using the same recording_uploader.py
+    # S3/session machinery that function already reuses. No second
+    # uploader.
+    #
+    # upload_motion_event_media() looks its event up in
+    # ANALYTICS_EVENTS_FILE by exact id match before it will register
+    # media (see _ensure_detection_event_synced() in event_media_
+    # uploader.py) -- so the clip's event_id must be the SAME id as
+    # one real local analytics event, not a separate group id. A scan
+    # can still produce several per-class analytics events (person AND
+    # car in one frame keep their own existing, independent ids/
+    # records, unchanged) but only ONE of them -- the first qualifying
+    # class, "primary_class_name" -- owns event_group_id, the clip,
+    # and the upload; detection_event_media.detection_event_id is
+    # UNIQUE in the cloud schema, so only one event could ever own a
+    # given clip's registration anyway. The others' event_clip stays
+    # None, exactly as an analytics-only event's already does.
+    #
+    # One clip per scan, not one per detected class -- every class in
+    # this scan shares event_group_id's window, and
+    # ai_event_clip_windows/should_merge() below skips a new
+    # extraction+upload entirely when this scan's window merges with
+    # the camera's most recently built one (a burst of repeated
+    # detections of the same real event), matching event_clips.py's
+    # own documented merge rule.
+    event_clip_path: str | None = None
+    primary_class_name: str | None = None
+    qualifying_detections = [
+        detection for detection in detections
+        if detection["class_name"] in AI_CLIP_EVENT_TYPES
+    ]
+    if qualifying_detections:
+        from event_clips import compute_clip_window, should_merge
+
+        window = compute_clip_window(now, now)
+        with ai_event_clip_windows_lock:
+            previous_window = ai_event_clip_windows.get(camera_number)
+            is_duplicate = (
+                previous_window is not None
+                and should_merge(previous_window.end, window.start)
+            )
+            ai_event_clip_windows[camera_number] = window
+
+        if not is_duplicate:
+            primary_class_name = qualifying_detections[0]["class_name"]
+            # Optimistic path, matching store_motion_event()'s own
+            # convention: extraction/upload run in the background (the
+            # extractor waits out the post-roll first), so this is the
+            # location the clip will exist at once that finishes, not
+            # a confirmation it already has or that upload succeeded.
+            event_clip_path = (
+                f"/recordings/clips/motion/motion_{event_group_id}.mp4"
+            )
+
+            async def build_and_upload_ai_event_media() -> None:
+                try:
+                    clip_url = await build_motion_event_clip(
+                        event_group_id, camera_number, now, now
+                    )
+                except Exception as error:
+                    # Diagnostic-only guard: this call used to be
+                    # unguarded, so a raised exception here was silently
+                    # swallowed. This coroutine is scheduled via
+                    # asyncio.run_coroutine_threadsafe() (see below) and
+                    # nothing ever retrieves the resulting
+                    # concurrent.futures.Future's result/exception --
+                    # unlike asyncio.create_task(), whose Task at least
+                    # logs "exception was never retrieved" on garbage
+                    # collection, an unretrieved Future here logs
+                    # nothing at all. Fail open exactly like the
+                    # scheduling try/except below already does -- the
+                    # analytics event itself and its existing
+                    # linked_recording fallback are unaffected -- but
+                    # LOGGED with enough detail (event id, camera
+                    # number, exception type and message) to actually
+                    # diagnose the real failure instead of guessing at
+                    # it. Not a behavior change: this is the same
+                    # "no clip" outcome the `if not clip_url: return`
+                    # branch below already produces.
+                    print(
+                        f"AI event {event_group_id} camera {camera_number}: "
+                        f"clip build failed: {type(error).__name__}: {error}"
+                    )
+                    return
+                if not clip_url:
+                    return
+                try:
+                    from event_media_uploader import upload_motion_event_media
+                    await asyncio.to_thread(
+                        upload_motion_event_media,
+                        event_id=event_group_id,
+                        camera_number=camera_number,
+                        event_start=now,
+                        event_end=now,
+                        clip_url=clip_url,
+                        thumbnail_url=thumbnail_url,
+                        already_classified=True,
+                    )
+                except Exception as error:
+                    print(
+                        f"AI event {event_group_id}: media upload failed: "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+            # save_yolo_events() executes via await asyncio.to_thread(...)
+            # (confirmed live on the Samsung appliance) -- a worker thread
+            # with no event loop of its own, so asyncio.ensure_future()/
+            # asyncio.create_task() cannot be used here (each only
+            # schedules onto "the current thread's running loop"; called
+            # from a thread with none, they raise RuntimeError).
+            # asyncio.run_coroutine_threadsafe(coro, loop) is the correct
+            # cross-thread primitive: it hands the coroutine to a specific,
+            # already-running loop -- _ai_event_media_loop, captured once
+            # on ai_person_detector()'s own first run (see that function's
+            # own opening lines) -- regardless of which thread is doing
+            # the scheduling.
+            if _ai_event_media_loop is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        build_and_upload_ai_event_media(), _ai_event_media_loop
+                    )
+                except RuntimeError as error:
+                    # Fail open -- the analytics event itself and its
+                    # existing linked_recording fallback are unaffected --
+                    # but LOGGED, not silently swallowed.
+                    print(
+                        f"AI event {event_group_id}: could not schedule "
+                        f"clip build/upload: {type(error).__name__}: {error}"
+                    )
+            else:
+                print(
+                    f"AI event {event_group_id}: could not schedule clip "
+                    f"build/upload: no main event loop captured yet."
+                )
+
 
 
 
@@ -36955,7 +37234,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-            id=uuid.uuid4().hex[:12],
+            id=(event_group_id if class_name == primary_class_name else uuid.uuid4().hex[:12]),
 
 
 
@@ -37065,6 +37344,17 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         event["detections"] = class_detections
 
+        # New, additive field -- only the one primary_class_name event
+        # this scan actually owns the clip/upload for gets a path; a
+        # secondary class detected in the same frame (e.g. person AND
+        # car) keeps its own independent analytics-history record but
+        # None here, exactly like an analytics-only event already had
+        # -- detection_event_media.detection_event_id is UNIQUE in the
+        # cloud schema, so only one event could ever own this clip's
+        # registration anyway. Existing "linked_recording" above is
+        # untouched, so nothing that already reads it changes behavior.
+        event["event_clip"] = event_clip_path if class_name == primary_class_name else None
+
 
 
 
@@ -37073,14 +37363,181 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
         append_analytics_event(event)
+        smart_motion.record_object_detection(camera_number, class_name)
+        # 2026-09-16: ppe.is_camera_enabled() is deployment-pilot scope
+        # only (ANYAICAM_PPE_CAMERAS); it was never customer-entitlement-
+        # aware. This second check is the real per-camera RDM entitlement
+        # (camera_analytics_entitlements -> cameras.ppe_enabled via
+        # customer_analytics_panel.assign_entitlement()/remove_entitlement()
+        # -> GET /api/appliance/configuration -> edge_camera_sync.py ->
+        # recording_uploader's cached map), matching people_counting_
+        # worker()'s own established fail-closed pattern: no cached
+        # identity yet (e.g. right after a fresh appliance start, before
+        # the first successful config poll) means not-yet-entitled, not
+        # "assume yes".
+        ppe_identity = recording_uploader._camera_identity(camera_number)
+        if class_name == "person" and ppe.is_camera_enabled(camera_number) and bool(ppe_identity and ppe_identity.get("ppe_enabled")):
+            for person_detection in class_detections:
+                try:
+                    hx, hy, hw, hh = (
+                        person_detection["x"],
+                        person_detection["y"],
+                        person_detection["width"],
+                        person_detection["height"],
+                    )
+                    person_crop = frame[hy : hy + hh, hx : hx + hw]
+                    ppe_result = ppe.detect_ppe(person_crop, camera_number=camera_number)
+                except Exception as error:
+                    ppe_result = None
+                    print(f"Camera {camera_number} PPE skipped (non-fatal): {error}")
+                if not ppe_result:
+                    continue
+                ppe_event = AnalyticsEventModel(
+                    id=uuid.uuid4().hex[:12],
+                    camera=camera_number,
+                    site="home",
+                    rule_name=(
+                        "PPE compliant"
+                        if ppe_result["hard_hat_present"] and ppe_result["safety_vest_present"]
+                        else "PPE violation"
+                    ),
+                    event_type="ppe",
+                    timestamp=now,
+                    confidence=ppe_result["confidence"],
+                    thumbnail=thumbnail_url,
+                    linked_recording=linked_recording,
+                    mock=False,
+                ).model_dump(mode="json")
+                ppe_event["hard_hat_present"] = ppe_result["hard_hat_present"]
+                ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
+                append_analytics_event(ppe_event)
+                saved_events.append(ppe_event)
+        # AAC (facial recognition / access-control analytics).
+        # Same shape as the PPE hook directly above: a person's own crop
+        # in, event(s) out -- but AAC events are written straight into
+        # detection_events/facial_events via facial_events.py (this hook
+        # opens its own short-lived database_backend.connect() rather
+        # than building only a local-JSON event dict), which is correct
+        # and complete on its own for a single-database deployment
+        # (Ryzen/Samsung). relay_provider is passed only when an
+        # operator has explicitly set ANYAICAM_FACIAL_ACCESS_CONTROL_
+        # ENABLED=true (default false, so existing behavior -- facial
+        # match history recorded, access rules never evaluated -- is
+        # unchanged unless opted into); even then, relay_control.
+        # get_provider() always returns MockRelayProvider -- there is no
+        # hardware-backed provider in this codebase, so this can never
+        # energize a real relay. It lets identity match -> authorization
+        # decision -> (mock) access-control command run and be observed
+        # end-to-end, which the real-camera validation protocol needs.
+        #
+        # Phase 2: each created event is ALSO appended to the local
+        # ANALYTICS_EVENTS_FILE (append_analytics_event(), the exact
+        # same call ppe.py's own hook makes) -- not instead of the
+        # direct write above, in addition to it. The direct write is
+        # what makes local matching/debounce/history work today, on
+        # this database, with no cloud involved; this second, local-
+        # JSON copy exists purely so analytics_sync.py's own existing
+        # appliance -> cloud forwarding (already the mechanism ppe/lpr
+        # events use) has something to forward for a SPLIT edge/cloud
+        # deployment, where the edge's own direct write above lands in
+        # a database the cloud customer portal never reads. See
+        # analytics_sync.py's own facial_recognition special case in
+        # _build_payload() and appliance_cloud.py's facial_events
+        # detail-row creation in analytics_event_available() for the
+        # cloud-side half of this.
+        if class_name == "person" and facial_recognition.is_camera_enabled(camera_number):
+            for person_detection in class_detections:
+                try:
+                    fx, fy, fw, fh = (
+                        person_detection["x"],
+                        person_detection["y"],
+                        person_detection["width"],
+                        person_detection["height"],
+                    )
+                    person_crop_for_aac = frame[fy : fy + fh, fx : fx + fw]
+                    from database_backend import connect as aac_connect
 
-
-
-
-
-
-
-
+                    with aac_connect() as aac_db:
+                        aac_events_created = facial_events.record_facial_events(
+                            aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now,
+                            relay_provider=relay_control.get_provider() if relay_control.FACIAL_ACCESS_CONTROL_ENABLED else None,
+                        )
+                    for aac_event in aac_events_created:
+                        append_analytics_event(
+                            {
+                                "id": aac_event["id"],
+                                "camera": camera_number,
+                                "event_type": "facial_recognition",
+                                "timestamp": now.isoformat(),
+                                "confidence": aac_event["confidence"],
+                                "object_count": 1,
+                                "thumbnail": thumbnail_url,
+                                "linked_recording": linked_recording,
+                                "mock": False,
+                                "match_state": aac_event["match_state"],
+                                "matched_person_id": aac_event["matched_person_id"],
+                                "matched_person_name": aac_event["matched_person_name"],
+                                "matched_watchlist_id": aac_event["matched_watchlist_id"],
+                                "matched_watchlist_name": aac_event["matched_watchlist_name"],
+                                "engine": aac_event["engine"],
+                                "engine_version": aac_event["engine_version"],
+                                "door_notify_message": aac_event.get("door_notify_message"),
+                            }
+                        )
+                except Exception as error:
+                    print(f"Camera {camera_number} AAC facial recognition skipped (non-fatal): {error}")
+        # 2026-09-16: same real per-camera RDM entitlement check as the
+        # PPE hook above, for the same reason -- lpr.is_camera_enabled()
+        # is deployment-pilot scope only, never entitlement-aware.
+        lpr_identity = recording_uploader._camera_identity(camera_number)
+        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number) and bool(lpr_identity and lpr_identity.get("lpr_enabled")):
+            for vehicle_detection in class_detections:
+                try:
+                    vx, vy, vw, vh = (
+                        vehicle_detection["x"],
+                        vehicle_detection["y"],
+                        vehicle_detection["width"],
+                        vehicle_detection["height"],
+                    )
+                    vehicle_crop = frame[vy : vy + vh, vx : vx + vw]
+                    plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
+                except Exception as error:
+                    plate_result = None
+                    print(f"Camera {camera_number} LPR skipped (non-fatal): {error}")
+                if not plate_result:
+                    continue
+                plate_crop_url = None
+                try:
+                    px, py, pw, ph = plate_result["region"]
+                    plate_crop_image = vehicle_crop[py : py + ph, px : px + pw]
+                    plate_filename = (
+                        f"camera{camera_number}_{now.strftime('%H-%M-%S')}_"
+                        f"plate_{uuid.uuid4().hex[:12]}.jpg"
+                    )
+                    plate_output_path = day_folder / plate_filename
+                    if cv2.imwrite(str(plate_output_path), plate_crop_image):
+                        plate_crop_url = (
+                            f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
+                            f"{quote(plate_filename)}"
+                        )
+                except Exception as error:
+                    print(f"Camera {camera_number} LPR plate-crop save skipped (non-fatal): {error}")
+                plate_event = AnalyticsEventModel(
+                    id=uuid.uuid4().hex[:12],
+                    camera=camera_number,
+                    site="home",
+                    rule_name=f"LPR ({class_name})",
+                    event_type="plate",
+                    timestamp=now,
+                    confidence=round(plate_result["confidence"] / 100, 4),
+                    plate_number=plate_result["plate_number"],
+                    plate_crop=plate_crop_url,
+                    thumbnail=thumbnail_url,
+                    linked_recording=linked_recording,
+                    mock=False,
+                ).model_dump(mode="json")
+                append_analytics_event(plate_event)
+                saved_events.append(plate_event)
         saved_events.append(event)
 
 
@@ -37126,7 +37583,257 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
+def _load_people_counting_rule(camera_number: int) -> dict | None:
+    """Reuses the EXISTING line_crossing rule-builder/storage (analytics_
+    rules.json) rather than a second, incompatible configuration system,
+    per explicit instruction. Returns the first enabled line_crossing
+    rule for this camera, or None if none exists -- an entitled camera
+    with no configured line simply doesn't run People Counting yet
+    (fail-safe: no crash, no guess at where a line should go)."""
+    rules = load_json_list(ANALYTICS_RULES_FILE)
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("analytic_type") == "line_crossing" and rule.get("camera") == camera_number and rule.get("enabled", True):
+            return rule
+    return None
+
+
+def _people_counting_state_load_all() -> dict:
+    """Fail-safe load: a missing or corrupt state file is treated
+    identically to 'no prior state' (every counter starts fresh at
+    0/0) rather than crashing the worker -- matches this session's
+    established fail-safe convention for every other piece of
+    persisted appliance state."""
+    if not PEOPLE_COUNTING_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(PEOPLE_COUNTING_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _people_counting_state_save(camera_number: int, counter: "people_counting.PeopleCounter") -> None:
+    """Read-modify-write of the shared state file. Known, disclosed
+    limitation for a future multi-camera phase: this isn't cross-thread
+    locked, so two cameras saving state in the same instant could race
+    -- acceptable for this narrow, single-camera validation phase (only
+    one camera's worker is ever actually entitled+configured right now)
+    and flagged explicitly in the report rather than silently accepted."""
+    all_state = _people_counting_state_load_all()
+    saved = counter.state()
+    all_state[str(camera_number)] = {"in_count": saved.in_count, "out_count": saved.out_count, "frame_index": saved.frame_index}
+    PEOPLE_COUNTING_STATE_FILE.write_text(json.dumps(all_state))
+
+
+async def people_counting_worker(camera_number: int) -> None:
+    """One task per camera, spawned only when PEOPLE_COUNTING_ENABLED
+    (the appliance-wide master switch) is on -- mirrors motion_detector/
+    ai_person_detector's own existing startup pattern exactly. Within
+    that, this specific camera only does anything once BOTH the cloud
+    entitlement flag (cameras.people_counting_enabled, read live via
+    recording_uploader._camera_identity() -- reused, not duplicated)
+    AND a configured line_crossing rule are present; otherwise it idles
+    harmlessly, re-checking every cycle so a live entitlement/rule
+    change takes effect without an appliance restart.
+
+    Reuses detect_objects_frame() -- the EXACT SAME YOLO call
+    ai_person_detector() already makes -- for detections; no new model,
+    no separate inference path. Only the polling cadence differs
+    (PEOPLE_COUNTING_INTERVAL_SECONDS, faster than the ordinary
+    AI_DETECTION_INTERVAL_SECONDS) for cameras actually running this
+    feature, since reliable line-crossing tracking needs closer-spaced
+    samples than plain presence detection does.
+
+    Crossing events are appended via append_analytics_event() -- the
+    same function save_yolo_events() already uses -- so they
+    automatically flow through the existing, already-validated
+    analytics_sync.py background sync to AWS with zero new sync code."""
+    counter: "people_counting.PeopleCounter | None" = None
+    configured_line_key = None
+    debug = camera_number == PEOPLE_COUNTING_DEBUG_CAMERA  # TEMPORARY, walk-test diagnostics only -- see PEOPLE_COUNTING_DEBUG_CAMERA's own comment
+    # TEMPORARY reconstruction-diagnostic state, Camera-1-debug-only (see below) --
+    # exists solely to answer "why was the counter rebuilt" and is not otherwise
+    # used for counting logic. worker_session_id changes only if this whole
+    # coroutine is re-entered (a real worker/process/container restart), so
+    # comparing it across log lines distinguishes "this is a genuinely new
+    # worker invocation" from "the same worker rebuilt its counter mid-session".
+    worker_session_id = uuid.uuid4().hex[:8] if debug else None
+    ever_constructed = False
+    last_entitled = None
+    last_rule_id = None
+    if debug:
+        print(f"[PeopleCountingDebug][cam{camera_number}] worker_task_started session={worker_session_id}")
+    while True:
+        try:
+            identity = recording_uploader._camera_identity(camera_number)
+            entitled = bool(identity and identity.get("people_counting_enabled"))
+            rule = _load_people_counting_rule(camera_number) if entitled else None
+            rule_id = rule.get("id") if rule else None
+            config_refresh_at = recording_uploader.recording_upload_state.get("last_config_refresh_at") if debug else None
+
+            if debug:
+                if last_entitled is not None and entitled != last_entitled:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] entitlement_changed session={worker_session_id} {last_entitled} -> {entitled} identity={identity} last_config_refresh_at={config_refresh_at}")
+                if last_rule_id is not None and rule_id != last_rule_id:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] rule_id_changed session={worker_session_id} {last_rule_id} -> {rule_id}")
+                print(f"[PeopleCountingDebug][cam{camera_number}] cycle_start session={worker_session_id} entitled={entitled} rule_loaded={rule is not None} rule_id={rule_id} last_config_refresh_at={config_refresh_at}")
+            last_entitled = entitled
+            last_rule_id = rule_id
+
+            if entitled and rule and len(rule.get("geometry", [])) >= 2:
+                line = people_counting.CountingLine.from_rule_geometry(rule["geometry"], rule.get("direction", "both"))
+                line_key = (tuple((p.get("x"), p.get("y")) for p in rule["geometry"][:2]), rule.get("direction", "both"))
+                if counter is None or line_key != configured_line_key:
+                    # Exact reason code, per explicit instruction: distinguish a
+                    # genuine first-ever construction from "was cleared by a
+                    # de-entitlement/rule-loss cycle and is now being rebuilt"
+                    # from "entitled and rule-having the whole time, but the
+                    # rule's own geometry/direction/id changed under us".
+                    if not ever_constructed:
+                        reconstruction_reason = "first_startup"
+                    elif counter is None:
+                        reconstruction_reason = "counter_cleared_then_reentitled_or_rule_restored"
+                    else:
+                        reconstruction_reason = "line_key_changed"
+                    if debug:
+                        state_file_exists = PEOPLE_COUNTING_STATE_FILE.exists()
+                        state_file_raw = None
+                        state_file_read_error = None
+                        if state_file_exists:
+                            try:
+                                state_file_raw = PEOPLE_COUNTING_STATE_FILE.read_text()
+                            except OSError as read_error:
+                                state_file_read_error = f"{type(read_error).__name__}:{read_error}"
+                        print(
+                            f"[PeopleCountingDebug][cam{camera_number}] reconstruction_triggered session={worker_session_id} "
+                            f"reason={reconstruction_reason} previous_line_key={configured_line_key} new_line_key={line_key} "
+                            f"rule_id={rule_id} state_file_path={PEOPLE_COUNTING_STATE_FILE} state_file_exists={state_file_exists} "
+                            f"state_file_raw_len={len(state_file_raw) if state_file_raw is not None else None} "
+                            f"state_file_read_error={state_file_read_error} last_config_refresh_at={config_refresh_at}"
+                        )
+                    counter = people_counting.PeopleCounter(line)
+                    ever_constructed = True
+                    saved_all = _people_counting_state_load_all()
+                    saved = saved_all.get(str(camera_number))
+                    if saved:
+                        counter.restore(people_counting.CounterState(**saved))
+                    configured_line_key = line_key
+                    if debug:
+                        print(
+                            f"[PeopleCountingDebug][cam{camera_number}] line_loaded session={worker_session_id} "
+                            f"x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction} "
+                            f"restored_from_state={saved is not None} state_file_keys_present={list(saved_all.keys())} "
+                            f"reason={reconstruction_reason}"
+                        )
+                if debug:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] line_in_use x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction}")
+
+                result = await asyncio.to_thread(detect_objects_frame, camera_number)
+                if debug:
+                    print(f"[PeopleCountingDebug][cam{camera_number}] detect_objects_frame ok={result.get('ok')} error={result.get('error')} raw_detections={len(result.get('detections', []))}")
+                if result.get("ok"):
+                    frame = result.get("frame")
+                    centroids = []
+                    if frame is not None:
+                        frame_height, frame_width = frame.shape[0], frame.shape[1]
+                        for detection in result.get("detections", []):
+                            if detection.get("class_name") != "person":
+                                continue
+                            cx = (detection["x"] + detection["width"] / 2) / frame_width
+                            cy = (detection["y"] + detection["height"] / 2) / frame_height
+                            norm_w = detection["width"] / frame_width
+                            norm_h = detection["height"] / frame_height
+                            # foot_x/foot_y: bottom-center of the box (a
+                            # person's ground-contact point), used ONLY
+                            # by people_counting.py's crossing decision,
+                            # not for matching -- see that module's
+                            # update() docstring for why this is the
+                            # physically correct point for a ground-
+                            # plane doorway/walkway line.
+                            foot_x = cx
+                            foot_y = (detection["y"] + detection["height"]) / frame_height
+                            centroids.append({"x": cx, "y": cy, "w": norm_w, "h": norm_h, "foot_x": foot_x, "foot_y": foot_y})
+                    if debug:
+                        print(f"[PeopleCountingDebug][cam{camera_number}] person_centroids={len(centroids)} " + " ".join(f"(x={c['x']:.4f},y={c['y']:.4f},foot_x={c['foot_x']:.4f},foot_y={c['foot_y']:.4f})" for c in centroids))
+                    if debug:
+                        events, debug_entries = counter.update(centroids, debug=True)
+                        for entry in debug_entries:
+                            print(
+                                f"[PeopleCountingDebug][cam{camera_number}] track={entry['track_id']} status={entry['track_status']} "
+                                f"prev_side={entry['prev_side']} new_side={entry['new_side']} crossed={entry['crossed']} "
+                                f"reason={entry['crossing_reason']} raw_cross={entry['raw_cross_value']} "
+                                f"crossing_point={entry.get('crossing_point')} foot_x={entry.get('foot_x')} foot_y={entry.get('foot_y')}"
+                            )
+                        print(f"[PeopleCountingDebug][cam{camera_number}] totals in={counter.in_count} out={counter.out_count} occupancy={counter.occupancy}")
+                    else:
+                        events = counter.update(centroids)
+                    if events:
+                        now = datetime.now()
+                        for event in events:
+                            record = AnalyticsEventModel(
+                                camera=camera_number,
+                                site="home",
+                                rule_name=f"People Counting ({rule.get('name', 'counting line')})",
+                                event_type=f"people_counting_{event.direction}",
+                                direction=event.direction,
+                                confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
+                                thumbnail=None,
+                                linked_recording=linked_recording_for(camera_number, now),
+                                mock=False,
+                            ).model_dump(mode="json")
+                            record["occupancy"] = counter.occupancy
+                            record["in_count"] = counter.in_count
+                            record["out_count"] = counter.out_count
+                            append_analytics_event(record)
+                        await asyncio.to_thread(_people_counting_state_save, camera_number, counter)
+            else:
+                # Not (or no longer) entitled+configured -- drop any
+                # in-progress counter/tracks. Cumulative counts already
+                # saved to PEOPLE_COUNTING_STATE_FILE are untouched and
+                # will be restored if this camera becomes entitled again.
+                if debug and counter is not None:
+                    geometry_len = len(rule.get("geometry", [])) if rule else 0
+                    print(
+                        f"[PeopleCountingDebug][cam{camera_number}] counter_cleared session={worker_session_id} "
+                        f"entitled={entitled} rule_loaded={rule is not None} geometry_len={geometry_len} "
+                        f"prior_line_key={configured_line_key}"
+                    )
+                counter = None
+                configured_line_key = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if debug:
+                print(
+                    f"[PeopleCountingDebug][cam{camera_number}] exception_recovery session={worker_session_id} "
+                    f"counter_alive={counter is not None} configured_line_key={configured_line_key} "
+                    f"error_type={type(error).__name__} error={error}"
+                )
+            print(f"Camera {camera_number} People Counting worker error: {error}")
+        await asyncio.sleep(PEOPLE_COUNTING_INTERVAL_SECONDS)
+
+
 async def ai_person_detector(camera_number: int) -> None:
+    # Startup stagger -- see AI_DETECTOR_STARTUP_STAGGER_SECONDS's own
+    # comment. All 5 of these tasks are created back-to-back with no gap
+    # (see the startup list comprehension); this is what actually
+    # separates them in time, camera 1 first, camera 5 last.
+    if AI_DETECTOR_STARTUP_STAGGER_SECONDS:
+        await asyncio.sleep(camera_number * AI_DETECTOR_STARTUP_STAGGER_SECONDS)
+
+    # Captured once, lazily, on whichever camera's detector task happens
+    # to start first -- this coroutine is itself created via
+    # asyncio.create_task() on the real main event loop (see lifespan()'s
+    # own startup block), so this is a reliable, one-time way to obtain
+    # that loop for save_yolo_events()'s own cross-thread scheduling
+    # (that function runs via asyncio.to_thread(), a worker thread with
+    # no running loop of its own -- see _ai_event_media_loop's own
+    # module-level comment).
+    global _ai_event_media_loop
+    if _ai_event_media_loop is None:
+        _ai_event_media_loop = asyncio.get_running_loop()
+
 
 
 
@@ -37342,34 +38049,17 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
-            result = await asyncio.to_thread(
-
-
-
-
-
-
-
-
-                detect_objects_frame,
-
-
-
-
-
-
-
-
-                camera_number,
-
-
-
-
-
-
-
-
-            )
+            # At most one camera's inference runs at a time, appliance-
+            # wide -- released automatically on the way out of this
+            # block whether detect_objects_frame() succeeds, raises, or
+            # this task is cancelled while waiting/running (async with's
+            # own __aexit__ guarantee), so a failed or cancelled scan
+            # can never leave the semaphore permanently held.
+            async with ai_inference_semaphore:
+                result = await asyncio.to_thread(
+                    detect_objects_frame,
+                    camera_number,
+                )
 
 
 
@@ -37927,7 +38617,16 @@ async def health_monitor() -> None:
 
 
 
-        statuses = camera_status().get("cameras", [])
+        # _legacy_camera_status(), not camera_status(): none of this file's
+        # three request-less callers (readiness_snapshot(), health_monitor(),
+        # site_monitoring_summary()) have an HTTP request/customer-session to
+        # scope by -- that's what camera_status(request)'s customer-portal
+        # branch needs. Calling camera_status() with no arguments at all is
+        # what crashed GET /ready with a 500 (TypeError: missing required
+        # argument 'request') -- confirmed live on a fresh install. The
+        # legacy, appliance-wide camera listing is exactly what a system-
+        # level status check wants regardless of who (if anyone) is logged in.
+        statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -38352,8 +39051,22 @@ async def health_monitor() -> None:
 
 import live_relay_idle_sweep
 import live_relay_uploader
+import webrtc_publisher
+import local_storage_manager
+import notification_retry_worker
 import recording_uploader
 import recording_retention_sweep
+import analytics_sync
+import event_media_uploader
+import edge_camera_sync
+import lpr
+import ppe
+import smart_motion
+import people_counting
+import facial_embedding_sync
+import facial_events
+import facial_recognition
+import relay_control
 
 
 @asynccontextmanager
@@ -38446,7 +39159,7 @@ async def lifespan(app: FastAPI):
 
 
 
-        for camera_number in range(1, CAMERA_COUNT + 1):
+        for camera_number in range(1, get_supervisor_slot_count() + 1):  # see CAMERA_SUPERVISOR_HEADROOM
 
 
 
@@ -38509,6 +39222,33 @@ async def lifespan(app: FastAPI):
 
 
 
+        # 2026-09-15: computed once and deduplicated, then reused by all
+        # three per-camera startup loops below (motion, AI person
+        # detection, people counting) instead of each calling
+        # get_camera_numbers() separately. Confirmed live on Ryzen: an
+        # edge appliance's identity swap (coordinated_reenroll()) resets
+        # camera_bindings.json but has no equivalent cleanup for this
+        # VMS app's own local `cameras` table, so a released customer's
+        # old row for a camera_number the NEW customer also uses can be
+        # left behind indefinitely -- get_camera_numbers() then returns
+        # that camera_number twice. Before this fix, that meant TWO full,
+        # independent motion_detector() (and, had they been enabled,
+        # ai_person_detector()/people_counting_worker()) tasks per
+        # duplicated number -- confirmed live as two entirely redundant
+        # ffmpeg processes each for camera_number 1, 2, and 3 (the exact
+        # numbers the old and new customer identities both had), a real
+        # contributor to 798% CPU / load average 48 on an otherwise-idle
+        # 8-core appliance. get_camera_numbers() itself is deliberately
+        # NOT changed to deduplicate -- test_camera_count_tenant_scoping.
+        # py's test_edge_role_callers_omitting_customer_id_are_completely_
+        # unchanged documents that its unscoped call is relied on
+        # elsewhere to sum every row, including legitimately-repeated
+        # camera_numbers across different customers on a shared/cloud
+        # database -- this fix is scoped to exactly the edge-only,
+        # one-task-per-camera-slot startup pattern that stale local rows
+        # actually broke.
+        camera_numbers = sorted(set(get_camera_numbers()))
+
         if MOTION_DETECTION_ENABLED:
 
 
@@ -38536,7 +39276,7 @@ async def lifespan(app: FastAPI):
 
 
 
-                for camera_number in range(1, CAMERA_COUNT + 1)
+                for camera_number in camera_numbers
 
 
 
@@ -38564,32 +39304,21 @@ async def lifespan(app: FastAPI):
 
 
             ai_tasks = [
-
-
-
-
-
-
-
-
                 asyncio.create_task(ai_person_detector(camera_number))
+                for camera_number in camera_numbers
+            ]
 
-
-
-
-
-
-
-
-                for camera_number in range(1, CAMERA_COUNT + 1)
-
-
-
-
-
-
-
-
+        if PEOPLE_COUNTING_ENABLED:
+            # One task spawned per camera, exactly like ai_tasks above --
+            # each task idles harmlessly unless ITS OWN camera is both
+            # cloud-entitled and has a configured counting line (see
+            # people_counting_worker()'s own docstring). This master
+            # flag stays a separate, appliance-wide safety gate on top
+            # of the per-camera entitlement -- both must be true for
+            # anything to actually run.
+            people_counting_tasks = [
+                asyncio.create_task(people_counting_worker(camera_number))
+                for camera_number in camera_numbers
             ]
 
 
@@ -38691,14 +39420,107 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # camera_url is main.py's own credentialed-RTSP-URL builder -- injected
+    # rather than imported by webrtc_publisher.py, which this module
+    # imports to wire this task, exactly the same circular-import
+    # avoidance already used for register_live_playlist_routes(...,
+    # local_identity=lambda: own_appliance_identity()) below. The worker
+    # itself no-ops (sleeps forever) unless ANYAICAM_LIVE_P2P_ENABLED is
+    # set, so creating this task unconditionally for edge/combined has no
+    # effect until that flag is explicitly turned on.
+    webrtc_publisher_task = (
+        asyncio.create_task(webrtc_publisher.webrtc_publisher_worker(camera_url))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    # recording_start/cloud_recording_s3_key are main.py's own filename-
+    # parsing/catalog-key functions -- injected rather than imported by
+    # local_storage_manager.py for the same circular-import-avoidance
+    # reason as camera_url above. The worker no-ops unless
+    # ANYAICAM_LOCAL_STORAGE_MANAGEMENT_ENABLED is set (and only actually
+    # deletes anything if ANYAICAM_LOCAL_STORAGE_AUTO_DELETE_ENABLED is
+    # ALSO set -- see that module's own docstring), so creating this task
+    # unconditionally for edge/combined has no effect until both flags
+    # are explicitly turned on.
+    local_storage_manager_task = (
+        asyncio.create_task(local_storage_manager.local_storage_manager_worker(
+            RECORDINGS_FOLDER, recording_start_fn=recording_start, cloud_recording_s3_key_fn=cloud_recording_s3_key,
+        ))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    # 2026-09-15: `or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE` added.
+    # Confirmed live on Ryzen during the Camera 1 recording-upload pilot: a
+    # second, independent instance of the exact same dead-code class 2672fb4
+    # fixed inside recording_upload_worker() itself -- that fix made the
+    # function's OWN top-of-body gate respect a pilot scope, but this
+    # call site, which decides whether the function is ever invoked as a
+    # task AT ALL, still checked RECORDING_UPLOAD_ENABLED alone. With
+    # RECORDING_UPLOAD_ENABLED correctly staying false, recording_upload_
+    # worker() was never scheduled, so 2672fb4's own fix could never run
+    # -- confirmed live: no "recording_upload.worker_started" log line
+    # ever appeared, even after the cloud-side credential-gate fix
+    # (71e911f) let a pilot camera's *event-media* uploads (a separate,
+    # already-working path -- event_media_uploader.py calls recording_
+    # uploader._ensure_session() directly, never through this task)
+    # succeed. RECORDING_UPLOAD_ENABLED=false still means every
+    # non-pilot camera is skipped by the per-camera scope check inside
+    # the function itself, unchanged.
     recording_upload_task = (
         asyncio.create_task(recording_uploader.recording_upload_worker())
-        if RUNTIME_ROLE in {"edge", "combined"} and recording_uploader.RECORDING_UPLOAD_ENABLED
+        if RUNTIME_ROLE in {"edge", "combined"} and (recording_uploader.RECORDING_UPLOAD_ENABLED or recording_uploader.RECORDING_UPLOAD_CAMERA_SCOPE)
         else None
     )
     recording_retention_sweep_task = (
         asyncio.create_task(recording_retention_sweep.recording_retention_sweep_worker())
         if RUNTIME_ROLE in {"cloud", "combined"} and recording_retention_sweep.RETENTION_SWEEP_ENABLED
+        else None
+    )
+    analytics_sync_task = (
+        asyncio.create_task(analytics_sync.analytics_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and analytics_sync.ANALYTICS_SYNC_ENABLED
+        else None
+    )
+    event_media_retry_task = (
+        asyncio.create_task(event_media_uploader.event_media_retry_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and event_media_uploader.EVENT_MEDIA_UPLOAD_ENABLED
+        else None
+    )
+    # notification_retry_worker() already internally gates on RUNTIME_ROLE
+    # (cloud/combined only, sleep-forever otherwise -- an edge appliance
+    # has no notifications/notification_deliveries rows of its own), so
+    # this call site's own role check is a plain optimization (never
+    # spawn the task at all on edge), not a second, independently-
+    # maintained copy of that gate.
+    notification_retry_task = (
+        asyncio.create_task(notification_retry_worker.notification_retry_worker())
+        if RUNTIME_ROLE in {"cloud", "combined"}
+        else None
+    )
+    # Cloud->edge camera-configuration sync: unconditional for every edge/
+    # combined appliance, unlike the AWS/Motion-Cloud-adjacent workers
+    # above -- this is core local-VMS plumbing (making a successfully
+    # cloud-provisioned camera actually streamable/recordable locally),
+    # never an optional cloud-upload feature, so it is never gated behind
+    # an ANYAICAM_*_ENABLED flag the way those are.
+    camera_config_sync_task = (
+        asyncio.create_task(edge_camera_sync.camera_configuration_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    talk_down_discovery_task = (
+        asyncio.create_task(talk_down_discovery.talk_down_discovery_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    talk_audio_relay_client_task = (
+        asyncio.create_task(talk_audio_relay_client.talk_audio_relay_client_worker())
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
+    facial_embedding_sync_task = (
+        asyncio.create_task(facial_embedding_sync.facial_embedding_sync_worker())
+        if RUNTIME_ROLE in {"edge", "combined"} and facial_embedding_sync.FACIAL_EMBEDDING_SYNC_ENABLED
         else None
     )
 
@@ -38858,10 +39680,26 @@ async def lifespan(app: FastAPI):
             live_relay_task.cancel()
         if live_relay_idle_sweep_task:
             live_relay_idle_sweep_task.cancel()
+        if webrtc_publisher_task:
+            webrtc_publisher_task.cancel()
+        if local_storage_manager_task:
+            local_storage_manager_task.cancel()
         if recording_upload_task:
             recording_upload_task.cancel()
         if recording_retention_sweep_task:
             recording_retention_sweep_task.cancel()
+        if event_media_retry_task:
+            event_media_retry_task.cancel()
+        if notification_retry_task:
+            notification_retry_task.cancel()
+        if camera_config_sync_task:
+            camera_config_sync_task.cancel()
+        if talk_down_discovery_task:
+            talk_down_discovery_task.cancel()
+        if talk_audio_relay_client_task:
+            talk_audio_relay_client_task.cancel()
+        if facial_embedding_sync_task:
+            facial_embedding_sync_task.cancel()
 
 
 
@@ -38956,10 +39794,26 @@ async def lifespan(app: FastAPI):
             pending.append(live_relay_task)
         if live_relay_idle_sweep_task:
             pending.append(live_relay_idle_sweep_task)
+        if webrtc_publisher_task:
+            pending.append(webrtc_publisher_task)
+        if local_storage_manager_task:
+            pending.append(local_storage_manager_task)
         if recording_upload_task:
             pending.append(recording_upload_task)
         if recording_retention_sweep_task:
             pending.append(recording_retention_sweep_task)
+        if event_media_retry_task:
+            pending.append(event_media_retry_task)
+        if notification_retry_task:
+            pending.append(notification_retry_task)
+        if camera_config_sync_task:
+            pending.append(camera_config_sync_task)
+        if talk_down_discovery_task:
+            pending.append(talk_down_discovery_task)
+        if talk_audio_relay_client_task:
+            pending.append(talk_audio_relay_client_task)
+        if facial_embedding_sync_task:
+            pending.append(facial_embedding_sync_task)
 
 
 
@@ -39210,7 +40064,6 @@ async def request_context_middleware(request: Request, call_next):
 
 
 
-
     token = REQUEST_CONTEXT.set(request)
 
 
@@ -39284,7 +40137,6 @@ async def request_context_middleware(request: Request, call_next):
 
 
 async def maintenance_mode_middleware(request: Request, call_next):
-
 
 
 
@@ -39850,7 +40702,7 @@ if cloud_settings.deployed:
 
 
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=cloud_settings.trusted_hosts)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=cloud_settings.effective_trusted_hosts)
 
 
 
@@ -39895,20 +40747,78 @@ app.mount("/recordings", StaticFiles(directory="/app/recordings"), name="recordi
 
 
 
+# The customer portal's own nav (NAV_ITEMS, filtered by navigation_
+# keys_for_role() for role in CUSTOMER_PORTAL_ROLES) links to a MIX of
+# "/customer"-prefixed paths (already covered below by the plain
+# path.startswith("/customer") branch) and bare top-level paths that
+# were not -- confirmed by reading NAV_ITEMS directly rather than
+# guessing from the URL alone: "/customer-live" and "/customer-app-
+# settings" already had the prefix, but "/dashboard", "/playback",
+# "/events", "/alerts", "/investigate", and "/subscription-portal" did
+# not, so an unauthenticated (or session-expired) customer clicking
+# any of THOSE landed on the local-emergency-recovery /login instead
+# of the customer sign-in page -- reported live on app.anyaicam.com
+# (RUNTIME_ROLE=cloud) as "/dashboard and /playback redirect to
+# /login". ("/mobile-app", NAV_ITEMS' remaining bare-path entry, is
+# deliberately NOT listed here -- it's already in PUBLIC_PATH_PREFIXES
+# below, so authentication_middleware never reaches this branch for it
+# at all; that page currently has no route handler behind it, a real
+# but separate missing-page gap, out of scope for this auth-routing
+# fix.) Only applied when RUNTIME_ROLE == "cloud": on an edge
+# appliance, an unauthenticated visitor to these exact same shared
+# dual-purpose routes (see e.g. playback()'s own _customer_playback_
+# cameras() branch) is the appliance's own local owner, not a cloud
+# customer account, and the existing local-emergency-recovery /login
+# is the correct destination for them -- unchanged here.
+CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
+    "/dashboard",
+    "/playback",
+    "/events",
+    "/alerts",
+    "/investigate",
+    "/subscription-portal",
+    # /aaco (app/aaco_web.py) is the same shape bug as every other entry
+    # above: a bare, cloud-only, customer-facing nav path that
+    # authentication_middleware had no way to distinguish from an
+    # admin/partner/legacy path, so an unauthenticated browser hit the
+    # local-emergency-recovery /login instead of the real customer
+    # sign-in page. Confirmed live on staging (2026-09-19): a real
+    # browser navigating to https://portal-staging.anyaicam.com/aaco
+    # landed on "Local emergency recovery sign-in", not
+    # /customer-login.html. aaco_web.py's own _require_customer() was
+    # never the bug -- it correctly requires a customer session either
+    # way -- this only fixes which login PAGE an unauthenticated
+    # browser is sent to first.
+    "/aaco",
+)
+
+
 PUBLIC_PATH_PREFIXES = (
-
-
-
-
-
-
-
-
     "/login",
 
     "/customer-login.html",
 
+    "/customer-register",
+
+    "/logout",
+
+    "/partner.html",
+
+    "/customer-forgot-password",
+
+    "/customer-reset-password",
+
+    "/forgot-password",
+
+    "/reset-password",
+
+    "/settings/notifications",
+
     "/api/partner-login",
+
+    "/api/portal-login",
+
+    "/api/password-reset/",
 
 
 
@@ -39982,6 +40892,31 @@ PUBLIC_PATH_PREFIXES = (
 
     "/api/payments/stripe/webhook",
     "/api/appliance/",
+    # Appliance-authenticated (authenticate_appliance(): signed X-Appliance-Id/
+    # X-Request-Timestamp/X-Request-Nonce/Bearer credential, never a browser
+    # session), same as every /api/appliance/* route above -- but this one
+    # route lives under a different path prefix, so it was never covered by
+    # the "/api/appliance/" entry. Found by this session's own real-HTTP
+    # sandbox-purchase E2E test: a genuinely claimed, activated test
+    # appliance calling this exact route got a generic 401 "Authentication
+    # required" from THIS middleware -- authenticate_appliance() inside the
+    # route was never even reached. An exact-path entry, not a broader
+    # "/api/provisioning/" prefix: POST /api/provisioning/release
+    # (provisioning_api.py) is deliberately browser-session-authenticated
+    # (_customer_owner()) and must stay behind this middleware.
+    "/api/provisioning/refresh",
+    # Same exact defect, same fix, confirmed live (2026-09-13): the
+    # appliance-agent's own one-time local credential handoff (POST
+    # .../provisioned-camera-credential, see main.py's own
+    # provisioned_camera_credential()) got a generic 401 "Authentication
+    # required" from THIS middleware, and its own loopback+bearer checks
+    # were never reached at all -- confirmed via a real failed delivery
+    # in anyaicam-vms's own access log (Camera 1, AIC-C814766E). An
+    # exact-path entry, same reasoning as /api/provisioning/refresh
+    # above: this is the only route under /api/local/, so a broader
+    # prefix isn't needed, and an exact path is the more conservative
+    # choice regardless if that ever changes.
+    "/api/local/provisioned-camera-credential",
 
 
 
@@ -40036,6 +40971,10 @@ async def authentication_middleware(request: Request, call_next):
 
 
     path = request.url.path
+    # Exact paths only; handlers independently enforce deployment and empty DB.
+    if path in {'/first-admin-setup', '/api/first-admin-setup'}:
+        return await call_next(request)
+
 
 
 
@@ -40175,12 +41114,29 @@ async def authentication_middleware(request: Request, call_next):
 
     next_url = quote(path + (f"?{request.url.query}" if request.url.query else ""), safe="/?=&")
 
+    # A request whose path belongs to the customer-facing surface
+    # belongs on the customer-facing login page when unauthenticated,
+    # never the legacy local-emergency-recovery /login -- confirmed live
+    # on Samsung: an unauthenticated (or session-revoked) real
+    # customer_owner request to /customer/cameras/{id}/live landed on
+    # /login?next=..., not /customer-login.html. Every non-customer
+    # protected path (admin/partner/legacy/unknown) keeps the exact
+    # prior /login fallback -- this only adds a second, narrower branch,
+    # it never changes who is or isn't authenticated.
+    if path.startswith("/customer"):
+        return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
 
-
-
-
-
-
+    # Cloud-only widening of the same customer-login redirect to the
+    # bare-path half of the customer nav (see CLOUD_CUSTOMER_NAV_PATH_
+    # PREFIXES's own comment for exactly which paths and why). Gated to
+    # RUNTIME_ROLE == "cloud" specifically: these are the same shared
+    # dual-purpose routes an edge appliance's own local owner also
+    # legitimately reaches unauthenticated, and for them /login (this
+    # function's existing, unchanged fallback below) remains correct.
+    if RUNTIME_ROLE == "cloud" and any(
+        path == prefix or path.startswith(prefix + "/") for prefix in CLOUD_CUSTOMER_NAV_PATH_PREFIXES
+    ):
+        return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
 
     return RedirectResponse(f"/login?next={next_url}", status_code=303)
 
@@ -40237,6 +41193,41 @@ CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer"}
 
 
 ADMIN_PORTAL_ROLES = {"administrator", "support_admin", "admin"}
+
+
+# Sidebar nav keys whose route is gated by partner_identity()/
+# require_partner_access() -- the newer partner/customer identity system --
+# rather than by has_permission()/current_user(), the legacy VMS identity
+# that every ADMIN_PORTAL_ROLES account (including the bootstrapped
+# admin@local) actually uses. An administrator was never given a
+# partner_identity() record, so these routes always bounce it to
+# /partner-login or /admin-portal regardless of its own broad permissions.
+# Advertising them in the sidebar just sent admin@local into a confusing
+# dead end; navigation_keys_for_role() hides exactly these for
+# ADMIN_PORTAL_ROLES instead of guessing a full allowlist, so every other
+# admin-appropriate item (including anything added later) stays visible.
+PARTNER_IDENTITY_ONLY_NAV_KEYS = {
+    "live", "appliances", "partner",
+    "partner-sales", "partner-quotes", "partner-install", "partner-performance",
+    "setup", "subscription", "pricing",
+}
+
+# Customer video/footage nav items -- Events, Smart alerts, Playback,
+# Media, Dashboard -- that an Administrator Portal identity (current_
+# user()'s legacy JSON-store account) must never see just by virtue of
+# being an administrator. That identity has no camera_access.py-scoped
+# customer_camera_permissions row and no customer_id at all -- unlike
+# PARTNER_IDENTITY_ONLY_NAV_KEYS (items that 404/dead-end for an admin
+# because they need a partner_identity() record), these items DO
+# render for an admin today, they just show real customer footage/
+# event data the admin was never granted -- see camera_access.py's own
+# "customer_owner/administrator: always authorized" rule, which
+# deliberately does not extend to this legacy identity at all. There is
+# currently no "explicit customer-video permission" grant for an
+# Administrator Portal account; until one exists, these stay hidden
+# unconditionally for every ADMIN_PORTAL_ROLES identity -- being an
+# administrator must never be read as customer-video access.
+CUSTOMER_VIDEO_NAV_KEYS = {"events", "alerts", "playback", "media", "dashboard"}
 
 
 
@@ -40540,6 +41531,101 @@ def portal_destination_for_user(user: dict | None) -> str:
 
 
 
+
+
+PORTAL_SELECTOR_OPTIONS = ("administrator", "partner", "technician")
+
+
+def resolve_portal_login(*, selected_portal: str | None, legacy_role: str | None, partner_role: str | None, partner_administrator_scope: str | None = None) -> dict:
+    """Pure decision for POST /api/portal-login -- the blue Portal login
+    page's own selector (Administrator/Partner/Technician), added
+    because this app's two independent identity systems (the legacy
+    Admin Portal's users.json, and the Partner Portal's SQL partner_users)
+    both use the exact role string "administrator" for two different
+    things, and can share the same email: before this function existed,
+    a person with an account in both systems always landed on the
+    Partner Portal no matter which one they meant, because /api/partner-
+    login only ever checked partner_db at all. This function never
+    verifies a password itself -- the route already checked both systems
+    before calling it -- it only decides, from what already validated,
+    which single session (if any) to establish and where it goes. It
+    never guesses when a selection is missing and more than one identity
+    is available, and it never lets a selection grant something that
+    didn't independently validate.
+
+    legacy_role: the caller's legacy Admin Portal role if their
+    submitted password verified there, else None. partner_role: their
+    partner_db role if their submitted password verified there, else
+    None. partner_administrator_scope: when partner_role=='administrator'
+    came from the cloud-delegated grant contract (appliance_identity.py),
+    this is that grant's own scope_type ('global' or 'partner') --
+    None for a direct (non-delegated) partner_db login, which has no
+    grant/scope concept and keeps its existing behavior unchanged.
+    Only a 'global' scope reaches /admin-portal here; a 'partner'
+    (company-level) administrator grant stays on the Partner Portal --
+    it must never silently gain global Admin Portal reach. main.py's
+    current_user() independently re-verifies this same global-scope
+    requirement against live grants before actually honoring an
+    Admin Portal request (see cloud_administrator_bridge()) -- this
+    function only decides where the browser is *sent*, it grants
+    nothing on its own.
+
+    Returns {"system": "legacy"|"partner"|None, "role": str|None,
+    "destination": str|None, "available": [...]}. "available" lists
+    every portal bucket this account could have chosen ("administrator"/
+    "partner"/"technician"), so a rejected or ambiguous request can tell
+    the caller its real options without this function ever guessing on
+    their behalf."""
+    available: list[str] = []
+    if legacy_role in ADMIN_PORTAL_ROLES:
+        available.append("administrator")
+    if partner_role == "administrator" and "administrator" not in available:
+        available.append("administrator")
+    if partner_role in {"partner_owner", "salesperson"}:
+        available.append("partner")
+    if partner_role == "technician":
+        available.append("technician")
+
+    def _for_administrator() -> dict:
+        if legacy_role in ADMIN_PORTAL_ROLES:
+            return {"system": "legacy", "role": legacy_role, "destination": "/admin-portal"}
+        if partner_role == "administrator":
+            destination = "/admin-portal" if partner_administrator_scope == "global" else "/partner?tab=customers"
+            return {"system": "partner", "role": "administrator", "destination": destination}
+        return {"system": None, "role": None, "destination": None}
+
+    from customer_policy import role_destination  # partner_db's own role vocabulary/destinations -- portal_destination_for_user() above answers the *legacy* system's, a different mapping
+
+    def _for_partner() -> dict:
+        if partner_role in {"partner_owner", "salesperson"}:
+            return {"system": "partner", "role": partner_role, "destination": role_destination(partner_role)}
+        return {"system": None, "role": None, "destination": None}
+
+    def _for_technician() -> dict:
+        if partner_role == "technician":
+            return {"system": "partner", "role": "technician", "destination": role_destination("technician")}
+        return {"system": None, "role": None, "destination": None}
+
+    resolvers = {"administrator": _for_administrator, "partner": _for_partner, "technician": _for_technician}
+
+    if selected_portal in resolvers:
+        result = resolvers[selected_portal]()
+        result["available"] = available
+        return result
+
+    # No (valid) selection: preserve single-identity behavior for old
+    # clients/tests that don't send one, but never guess between two --
+    # including the one ambiguity "available" can't show on its own:
+    # legacy_role and partner_role=='administrator' both validating at
+    # once collapse into the *same* "administrator" bucket entry (they're
+    # still two different sessions/destinations), so len(available)==1
+    # alone isn't enough to prove there's only one real identity here.
+    administrator_ambiguous = bool(legacy_role in ADMIN_PORTAL_ROLES) and partner_role == "administrator"
+    if len(available) == 1 and not administrator_ambiguous:
+        result = resolvers[available[0]]()
+        result["available"] = available
+        return result
+    return {"system": None, "role": None, "destination": None, "available": available}
 
 
 def safe_login_destination(user: dict, requested_path: str) -> str:
@@ -41055,7 +42141,18 @@ def login_page_html(error: str = "", next_url: str = "/", message: str = "") -> 
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Sign in</h1><p class="auth-subtitle">Secure customer, salesperson, installer, and administrator portal access</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/login" id="login-form"><input type="hidden" name="next_url" value="{escape(next_url)}"><input type="hidden" name="csrf_token" value=""><label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><label class="auth-remember"><input name="remember_me" type="checkbox" value="true"><span>Keep me signed in for 30 days</span></label><button class="action-button" type="submit">Sign in</button></form><script>document.getElementById('login-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-register">Create customer account</a></div><div class="auth-footer">New accounts remain pending until the master administrator approves them.</div></section></main></body></html>"""
+    # Relabeled from a generic "Sign in" page: this is main.py's legacy,
+    # JSON-file-backed current_user() login -- reachable only by
+    # navigating here directly, since nothing in the product links to
+    # it any more (the public entry point for Administrator/Partner/
+    # Technician sign-in is partner.html's Portal login, with its own
+    # role selector; the customer entry point is customer-login.html).
+    # Its one real remaining purpose is admin@local: local bootstrap
+    # access during first install, and emergency recovery if the
+    # cloud/Partner Portal identity path is unavailable. The copy below
+    # makes that explicit so a normal operator never mistakes this for
+    # their day-to-day sign-in page, and is pointed at the real one.
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Local emergency recovery sign-in · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Local emergency recovery sign-in</h1><p class="auth-subtitle">Bootstrap and emergency recovery access for this appliance only -- not the normal day-to-day sign-in. Administrators, partners, and technicians should use the <a href="/partner.html">Portal login</a> instead.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/login" id="login-form"><input type="hidden" name="next_url" value="{escape(next_url)}"><input type="hidden" name="csrf_token" value=""><label>Email<input name="email" type="email" autocomplete="username" required autofocus></label><label>Password<span style="position:relative;display:block"><input name="password" type="password" autocomplete="current-password" required id="login-password" style="padding-right:52px;box-sizing:border-box;width:100%"><button type="button" id="login-password-toggle" aria-label="Show password" aria-pressed="false" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);border:none;background:none;cursor:pointer;font-size:13px;color:inherit;padding:4px">Show</button></span></label><label class="auth-remember"><input name="remember_me" type="checkbox" value="true"><span>Keep me signed in for 30 days</span></label><button class="action-button" type="submit">Sign in</button></form><script>document.getElementById('login-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});document.getElementById('login-password-toggle').addEventListener('click',function(){{var f=document.getElementById('login-password');var hidden=f.type==='password';f.type=hidden?'text':'password';this.setAttribute('aria-pressed',hidden?'true':'false');this.setAttribute('aria-label',hidden?'Hide password':'Show password');this.textContent=hidden?'Hide':'Show';}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-register">Create customer account</a></div><div class="auth-footer">New accounts remain pending until the master administrator approves them.</div></section></main></body></html>"""
 
 
 
@@ -41118,7 +42215,7 @@ def customer_register_page_html(error: str = "", message: str = "") -> str:
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register"><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required></label><button class="action-button" type="submit">Submit customer account request</button></form><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/login">Already approved? Sign in</a></div><div class="auth-footer">Your request remains pending until the master administrator approves it. After approval, signing in sends you directly to your customer VMS portal.</div></section></main></body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register" id="customer-register-form"><input type="hidden" name="csrf_token" value=""><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required></label><button class="action-button" type="submit">Submit customer account request</button></form><script>document.getElementById('customer-register-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-login.html">Already approved? Sign in</a></div><div class="auth-footer">Your request remains pending until the master administrator approves it. After approval, signing in sends you directly to your customer VMS portal.</div></section></main></body></html>"""
 
 
 
@@ -41649,571 +42746,32 @@ def customer_register_submit(
 
 
 
-    users = load_users()
-
-
-
-
-
-
-
-
-    existing = next(
-
-
-
-
-
-
-
-
-        (
-
-
-
-
-
-
-
-
-            item for item in users
-
-
-
-
-
-
-
-
-            if item.get("email", "").strip().lower() == normalized_email
-
-
-
-
-
-
-
-
-        ),
-
-
-
-
-
-
-
-
-        None,
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    if existing:
-
-
-
-
-
-
-
-
-        if existing.get("invitation_status") == "pending":
-
-
-
-
-
-
-
-
-            return HTMLResponse(
-
-
-
-
-
-
-
-
-                customer_register_page_html(
-
-
-
-
-
-
-
-
-                    message="Your customer account request is already pending approval."
-
-
-
-
-
-
-
-
-                ),
-
-
-
-
-
-
-
-
-                status_code=200,
-
-
-
-
-
-
-
-
-            )
-
-
-
-
-
-
-
-
+    from customer_registration import create_pending_registration
+    try:
+        status, created = create_pending_registration(normalized_name, normalized_email, password)
+    except HTTPException as error:
+        return HTMLResponse(customer_register_page_html(str(error.detail)), status_code=error.status_code)
+    if not created:
+        message = (
+            "Your customer account request is already pending approval."
+            if status == "pending"
+            else "That email is already registered. Use the sign-in page."
+        )
         return HTMLResponse(
-
-
-
-
-
-
-
-
-            customer_register_page_html(
-
-
-
-
-
-
-
-
-                "That email is already registered. Use the sign-in page."
-
-
-
-
-
-
-
-
-            ),
-
-
-
-
-
-
-
-
-            status_code=409,
-
-
-
-
-
-
-
-
+            customer_register_page_html(message=message),
+            status_code=200 if status == "pending" else 409,
         )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    payload = UserModel(
-
-
-
-
-
-
-
-
-        display_name=normalized_name,
-
-
-
-
-
-
-
-
-        email=normalized_email,
-
-
-
-
-
-
-
-
-        role="customer_owner",
-
-
-
-
-
-
-
-
-        enabled=False,
-
-
-
-
-
-
-
-
-        super_admin=False,
-
-
-
-
-
-
-
-
-        site_ids=["home"],
-
-
-
-
-
-
-
-
-        camera_ids=[],
-
-
-
-
-
-
-
-
-        password_hash=hash_password(password),
-
-
-
-
-
-
-
-
-        invitation_status="pending",
-
-
-
-
-
-
-
-
-    ).model_dump(mode="json")
-
-
-
-
-
-
-
-
-    payload["requested_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    payload["registration_source"] = "public_customer_registration"
-
-
-
-
-
-
-
-
-    users.append(payload)
-
-
-
-
-
-
-
-
-    save_users(users)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    append_audit_entry(
-
-
-
-
-
-
-
-
-        AuditEntryModel(
-
-
-
-
-
-
-
-
-            user_id=payload["id"],
-
-
-
-
-
-
-
-
-            user_name=normalized_name,
-
-
-
-
-
-
-
-
-            role="customer_owner",
-
-
-
-
-
-
-
-
-            action="customer_account_request",
-
-
-
-
-
-
-
-
-            resource=f"user:{payload['id']}",
-
-
-
-
-
-
-
-
-            detail="Requested customer portal access from the public website.",
-
-
-
-
-
-
-
-
-            device=request.headers.get("user-agent", "Web browser")[:160],
-
-
-
-
-
-
-
-
-            outcome="pending",
-
-
-
-
-
-
-
-
-        ).model_dump(mode="json")
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     return HTMLResponse(
-
-
-
-
-
-
-
-
-        login_page_html(
-
-
-
-
-
-
-
-
+        customer_register_page_html(
             message=(
-
-
-
-
-
-
-
-
                 "Your customer account request was submitted. "
-
-
-
-
-
-
-
-
                 "After the master administrator approves it, sign in to open your VMS portal."
-
-
-
-
-
-
-
-
             )
-
-
-
-
-
-
-
-
         ),
-
-
-
-
-
-
-
-
         status_code=200,
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -43926,6 +44484,228 @@ def login_submit(
 
 
 
+def own_appliance_identity() -> dict | None:
+    """This running instance's own appliance credentials, for calling
+    the cloud-delegated identity endpoints (appliance_identity.py,
+    POST /api/appliance/{cloud_id}/authenticate-operator) as itself,
+    the same way any other activated appliance would.
+
+    Two sources, checked in order:
+      1. ANYAICAM_APPLIANCE_ID/CLOUD_ID/CREDENTIAL env vars -- an
+         intentional development/override mechanism only. Not the
+         normal production activation path; if all three are set they
+         win outright, which is exactly what makes them useful for
+         tests and local dev, and exactly why production activation
+         must never depend on them being set by a human.
+      2. The durably persisted local activation identity (appliance_
+         activation.load_persisted_identity()) -- written by POST
+         /api/appliance/activate as its last step (see appliance_cloud.
+         activate_appliance()) and read back here automatically after
+         any restart or reboot, with zero environment configuration
+         required. This is the real, normal path once an appliance has
+         actually been activated.
+
+    Returns None when neither source has a complete identity, and
+    portal_login_submit() falls back to checking partner_db directly --
+    byte-for-byte the same as before this contract existed. This keeps
+    every deployment that hasn't been activated (Samsung today) or
+    hasn't set the override vars completely unaffected."""
+    appliance_id = os.environ.get("ANYAICAM_APPLIANCE_ID", "").strip()
+    cloud_id = os.environ.get("ANYAICAM_APPLIANCE_CLOUD_ID", "").strip()
+    credential = os.environ.get("ANYAICAM_APPLIANCE_CREDENTIAL", "").strip()
+    if appliance_id and cloud_id and credential:
+        return {"appliance_id": appliance_id, "cloud_id": cloud_id, "credential": credential}
+
+    from appliance_activation import load_persisted_identity
+
+    persisted = load_persisted_identity()
+    if persisted:
+        return {"appliance_id": persisted["appliance_id"], "cloud_id": persisted["cloud_id"], "credential": persisted["credential"]}
+    return None
+
+
+@app.post("/api/portal-login")
+def portal_login_submit(request: Request, payload: dict):
+    """The blue Portal login page's (partner.html) Administrator/Partner/
+    Technician selector. Checks BOTH independent identity systems this
+    app has always had -- the legacy Admin Portal (users.json, checked
+    the same way login_submit()/POST /login already does) and the
+    Partner Portal (partner_db, checked the same way partner_login_submit()/
+    POST /api/partner-login already does) -- against the submitted
+    password, then hands what validated to resolve_portal_login() to
+    decide which single session to establish. Neither system's own
+    password check, rate limiting, or session cookie is touched here in
+    a new way -- this only adds the missing step of consulting both
+    before picking one, instead of only ever consulting one (see
+    resolve_portal_login()'s own docstring for why that mattered)."""
+    email = str(payload.get("email", "")).strip().lower()
+    password = str(payload.get("password", ""))
+    selected_portal = payload.get("portal") or None
+    if selected_portal not in PORTAL_SELECTOR_OPTIONS:
+        selected_portal = None
+
+    from cloud_security import clear_login_failures, login_blocked, record_login_failure
+
+    if login_blocked(email):
+        raise HTTPException(status_code=429, detail="Account is temporarily locked after repeated sign-in failures. Try again later or reset your password.")
+
+    users = load_users()
+    legacy_user = next((item for item in users if item.get("email", "").strip().lower() == email), None)
+    legacy_role: str | None = None
+    if legacy_user and legacy_user.get("enabled", True) and verify_password(password, legacy_user.get("password_hash", "")):
+        candidate_role = str(legacy_user.get("role") or "").strip().lower()
+        if candidate_role in ADMIN_PORTAL_ROLES:
+            legacy_role = candidate_role
+
+    # Partner/Administrator/Technician password verification delegates to
+    # the cloud-identity contract (appliance_identity.py) once this
+    # instance is configured as an activated appliance -- see
+    # own_appliance_identity(). Until then (Samsung today), this falls
+    # back to checking partner_db directly, byte-for-byte the same as
+    # before that contract existed -- nothing changes for a deployment
+    # that hasn't been wired up to it.
+    own_appliance = own_appliance_identity()
+    partner_role: str | None = None
+    partner_user: dict | None = None
+    partner_authorization_version: int | None = None
+    partner_administrator_scope: str | None = None
+    if own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS:
+        from appliance_identity import CloudIdentityUnavailable, ManifestError, get_cloud_identity_backend, verify_assertion
+
+        backend = get_cloud_identity_backend()
+        try:
+            result = backend.authenticate_operator(email=email, password=password, portal=selected_portal, cloud_id=own_appliance["cloud_id"])
+        except CloudIdentityUnavailable:
+            # A brand-new login can never be trusted without the cloud --
+            # see CloudIdentityUnavailable's own docstring. An already-
+            # established session is unaffected by this branch entirely;
+            # it keeps working via its own cookie, no cloud call involved.
+            raise HTTPException(
+                status_code=503,
+                detail="Cloud authentication is required and unavailable right now. Try again once connectivity "
+                       "returns, or use local emergency recovery access if you administer this appliance.",
+            )
+        if result.get("status") == "ok":
+            try:
+                verify_assertion(result, expected_cloud_id=own_appliance["cloud_id"], public_keys=backend.public_keys())
+            except ManifestError:
+                result = {"status": "denied", "reason": "invalid_assertion"}
+        if result.get("status") == "ok":
+            assertion = result["assertion"]
+            partner_role = assertion["role"]
+            partner_user = {
+                "id": assertion["user_id"], "email": assertion["email"],
+                "partner_id": assertion["scope_id"] if assertion["scope_type"] == "partner" else None,
+                "customer_id": assertion["scope_id"] if assertion["scope_type"] in {"customer", "site"} else None,
+            }
+            partner_authorization_version = assertion["authorization_version"]
+            if partner_role == "administrator":
+                partner_administrator_scope = assertion["scope_type"]
+    elif not own_appliance:
+        from partner_db import authenticate_detailed as partner_authenticate_detailed
+
+        partner_user, _partner_reason = partner_authenticate_detailed(email, password)
+        if partner_user:
+            candidate_role = str(partner_user.get("role") or "").strip().lower()
+            if candidate_role in {"administrator", "partner_owner", "salesperson", "technician"}:
+                partner_role = candidate_role
+            else:
+                partner_user = None
+    # own_appliance is set but no (valid) portal was selected: the
+    # delegated contract requires a portal to check one bucket against
+    # (see authenticate_operator()'s own docstring) -- resolve_portal_
+    # login() below still correctly reports this as "no selection made"
+    # rather than silently guessing.
+
+    decision = resolve_portal_login(selected_portal=selected_portal, legacy_role=legacy_role, partner_role=partner_role, partner_administrator_scope=partner_administrator_scope)
+
+    if not decision["system"]:
+        if not legacy_role and not partner_role:
+            record_login_failure(email)
+            raise HTTPException(status_code=401, detail="Invalid email or password.")
+        labels = {"administrator": "Administrator", "partner": "Partner", "technician": "Technician"}
+        options = ", ".join(labels[key] for key in decision["available"])
+        if selected_portal:
+            detail = f"This account is not authorized for the {labels[selected_portal]} portal." + (f" Available: {options}." if options else "")
+        else:
+            detail = f"This email has more than one portal available ({options}). Choose one from the Portal selector."
+        raise HTTPException(status_code=403, detail=detail)
+
+    clear_login_failures(email)
+
+    if decision["system"] == "legacy":
+        legacy_user["failed_login_attempts"] = 0
+        legacy_user["locked_until"] = None
+        legacy_user["last_login"] = datetime.now().isoformat()
+        save_users(users)
+        token = create_session(legacy_user["id"], False)
+        append_audit_entry(AuditEntryModel(
+            user_id=legacy_user["id"], user_name=legacy_user.get("display_name", email), role=legacy_user.get("role", "viewer"),
+            action="login", resource="session", detail="Signed in via the blue portal login's Administrator selector.",
+            device=request.headers.get("user-agent", "Web browser")[:160], outcome="success",
+        ).model_dump(mode="json"))
+        response = RedirectResponse(decision["destination"], status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE_NAME, token, max_age=SESSION_MAX_AGE_SECONDS,
+            httponly=True, secure=SECURE_COOKIES, samesite="lax", path="/",
+        )
+        return response
+
+    from partner_portal import establish_partner_session
+
+    return establish_partner_session(
+        decision["destination"], request=request, email=email, role=decision["role"], user=partner_user,
+        authorization_version_at_login=partner_authorization_version,
+    )
+
+
+CUSTOMER_LOGIN_DESTINATION = "/customer-login.html"
+PORTAL_LOGIN_DESTINATION = "/partner.html"
+# Where a real customer_owner/customer_viewer identity lands after
+# POST /logout -- the public marketing homepage, not a sign-in page
+# inside this app (see logout_destination()'s own docstring). A
+# literal absolute external URL, deliberately not read from an env
+# var: this is the one production marketing domain, not a per-
+# deployment setting.
+CUSTOMER_LOGOUT_DESTINATION = "https://anyaicam.com/"
+
+
+def logout_destination(legacy_role: str | None, portal_role: str | None) -> str:
+    """Decides where POST /logout redirects to. This route is reached
+    from the exact same shared sidebar (page_shell()'s logout form,
+    action="/logout") on every page that uses it -- legacy Admin Portal
+    pages, Partner/Admin/Salesperson/Technician pages, and customer
+    portal pages alike -- so it cannot hardcode a single destination;
+    it must look at whichever identity (legacy current_user()/
+    authenticated_user(), Partner Portal partner_identity(), or both)
+    was actually present on this request.
+
+    A real customer identity -- on the Partner Portal side (customer_
+    owner/customer_viewer, the active customer accounts) or the legacy
+    side (a vestigial customer_owner/customer_viewer row in the old
+    JSON store, if one exists) -- signs the customer out entirely and
+    sends them to the public marketing homepage (CUSTOMER_LOGOUT_
+    DESTINATION), not back to any sign-in page inside this app: a
+    logged-out customer has nothing left to do here until they choose
+    to sign in again from anyaicam.com itself. administrator/partner_
+    owner/salesperson/technician/admin/support_admin/installer all
+    still resolve to the blue portal login (PORTAL_LOGIN_DESTINATION),
+    unchanged. An identity that's absent or unrecognized on both sides
+    -- nothing meaningful was actually logged out -- falls back to the
+    local customer sign-in page (CUSTOMER_LOGIN_DESTINATION), the same
+    fail-safe default as before: the worse mistake here is a customer
+    landing on the wrong branded page, not a partner landing on the
+    wrong one."""
+    customer_roles = {"customer_owner", "customer_viewer"}
+    if portal_role in customer_roles:
+        return CUSTOMER_LOGOUT_DESTINATION
+    if legacy_role in customer_roles:
+        return CUSTOMER_LOGOUT_DESTINATION
+    if portal_role or legacy_role:
+        return PORTAL_LOGIN_DESTINATION
+    return CUSTOMER_LOGIN_DESTINATION
+
+
 @app.post("/logout")
 
 
@@ -43952,6 +44732,19 @@ def logout(request: Request):
 
 
 
+
+    from partner_portal import partner_identity, SESSION_COOKIE as PARTNER_SESSION_COOKIE
+    try:
+        portal_identity = partner_identity(request)
+    except Exception:
+        portal_identity = None
+    if portal_identity and portal_identity.get("session_id"):
+        from partner_db import connection as partner_connection
+        with partner_connection() as db:
+            db.execute(
+                "UPDATE user_sessions SET revoked_at=? WHERE id=?",
+                (datetime.now().isoformat(), portal_identity["session_id"]),
+            )
 
     destroy_session(request.cookies.get(SESSION_COOKIE_NAME))
 
@@ -44079,7 +44872,11 @@ def logout(request: Request):
 
 
 
-    response = RedirectResponse("/login", status_code=303)
+    destination = logout_destination(
+        user.get("role") if user else None,
+        portal_identity.get("role") if portal_identity else None,
+    )
+    response = RedirectResponse(destination, status_code=303)
 
 
 
@@ -44089,6 +44886,8 @@ def logout(request: Request):
 
 
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    if portal_identity:
+        response.delete_cookie(PARTNER_SESSION_COOKIE, domain=cloud_settings.cookie_domain or None)
 
 
 
@@ -44151,7 +44950,7 @@ STYLES = """
 
 
 
-.sidebar{display:flex;flex-direction:column}.nav{flex:1}.sidebar-auth{margin-top:auto;padding:10px 5px 4px}.sidebar-logout{width:100%;min-height:54px;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 6px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:#24292c;color:#fff;font:inherit;font-weight:750;cursor:pointer}.sidebar-logout:hover,.sidebar-logout:focus-visible{background:#343b3f;border-color:var(--brand);outline:none}.sidebar-logout-icon{font-size:18px;line-height:1}@media(max-width:760px){.sidebar-auth{display:none}}:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--panel2:#181e28;--line:#27303d;--text:#f4f7fb;--muted:#8f9baa;--accent:#47d7ac;--blue:#70a5ff;--danger:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;border-right:1px solid var(--line);background:#0e1218}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 28px;font-weight:750;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:#07110e;font-size:18px}.nav{display:grid;gap:6px}.nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:650}.nav a:hover{background:var(--panel2);color:var(--text)}.nav a.active{background:#193329;color:#7ee8c7}.sidebar-foot{position:absolute;left:16px;right:16px;bottom:22px;padding:13px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.sidebar-foot strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.content{min-width:0;padding:30px 34px 50px;max-width:1600px;width:100%;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.eyebrow{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,3vw,34px);letter-spacing:-.035em}h2{margin:0;font-size:18px}.clock{color:var(--muted);font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:24px}.stat{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.stat-label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}.stat-value{font-size:18px;font-weight:750}.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(71,215,172,.1)}.section-head{display:flex;align-items:end;justify-content:space-between;margin:0 0 14px}.section-head p{margin:0;color:var(--muted);font-size:13px}.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.camera-card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}.camera-view{position:relative;display:grid;place-items:center;aspect-ratio:16/9;background:#080a0e;overflow:hidden}.camera-view video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}.camera-placeholder{text-align:center;color:var(--muted);padding:20px}.camera-placeholder .signal{display:block;margin:0 auto 12px;font-size:25px}.camera-placeholder strong{display:block;color:#cad2dd;margin-bottom:4px}.live-badge{position:absolute;z-index:2;top:12px;left:12px;padding:6px 9px;border-radius:8px;background:rgba(8,10,14,.78);font-size:11px;font-weight:800;letter-spacing:.08em}.live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--danger)}.camera-meta{display:flex;justify-content:space-between;gap:15px;padding:14px 16px}.camera-name{font-weight:700}.camera-state{color:var(--muted);font-size:12px}.camera-state.ready{color:var(--accent)}.library-toolbar{display:flex;gap:10px;margin-bottom:18px;overflow:auto}.filter{border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);padding:8px 13px;cursor:pointer;white-space:nowrap}.filter.active{background:var(--text);border-color:var(--text);color:#0b0e13}.camera-section{margin-bottom:28px}.recording-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}.clip{overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.clip video{display:block;width:100%;aspect-ratio:16/9;background:#07090c}.clip-body{padding:13px}.clip-time{font-weight:700;font-size:14px}.clip-meta{margin:5px 0 12px;color:var(--muted);font-size:12px}.download{color:var(--blue);text-decoration:none;font-size:13px;font-weight:700}.empty{padding:28px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);text-align:center;background:rgba(18,23,32,.5)}.mobile-nav{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:980px){.recording-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:23px 16px 90px}.clock{display:none}.summary{grid-template-columns:1fr}.camera-grid,.recording-grid{grid-template-columns:1fr}.mobile-nav{position:fixed;z-index:20;display:grid;grid-template-columns:1fr 1fr;left:12px;right:12px;bottom:12px;padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(18,23,32,.94);backdrop-filter:blur(14px)}.mobile-nav a{text-align:center;padding:10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:700;font-size:13px}.mobile-nav a.active{background:#193329;color:#7ee8c7}}
+.sidebar{display:flex;flex-direction:column}.nav{flex:1}.sidebar-auth{margin-top:auto;padding:10px 5px 4px}.sidebar-logout{width:100%;min-height:54px;display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 6px;border:1px solid rgba(255,255,255,.2);border-radius:9px;background:#24292c;color:#fff;font:inherit;font-weight:750;cursor:pointer}.sidebar-logout:hover,.sidebar-logout:focus-visible{background:#343b3f;border-color:var(--brand);outline:none}.sidebar-logout-icon{font-size:18px;line-height:1}.sidebar-build-badge{margin-top:8px;padding:4px 5px 0;color:var(--muted,#8f9baa);font-size:10px;letter-spacing:.02em;text-align:center;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}@media(max-width:760px){.sidebar-auth{display:none}}:root{color-scheme:dark;--bg:#0a0d12;--panel:#121720;--panel2:#181e28;--line:#27303d;--text:#f4f7fb;--muted:#8f9baa;--accent:#47d7ac;--blue:#70a5ff;--danger:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}.shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.sidebar{position:sticky;top:0;height:100vh;padding:24px 16px;border-right:1px solid var(--line);background:#0e1218}.brand{display:flex;align-items:center;gap:11px;padding:0 9px 28px;font-weight:750;letter-spacing:-.02em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--accent);color:#07110e;font-size:18px}.nav{display:grid;gap:6px}.nav a{display:flex;align-items:center;gap:12px;padding:12px 13px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:650}.nav a:hover{background:var(--panel2);color:var(--text)}.nav a.active{background:#193329;color:#7ee8c7}.sidebar-foot{position:absolute;left:16px;right:16px;bottom:22px;padding:13px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:12px}.sidebar-foot strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.content{min-width:0;padding:30px 34px 50px;max-width:1600px;width:100%;margin:0 auto}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.eyebrow{margin:0 0 5px;color:var(--accent);font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,3vw,34px);letter-spacing:-.035em}h2{margin:0;font-size:18px}.clock{color:var(--muted);font-size:13px}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:24px}.stat{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.stat-label{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}.stat-value{font-size:18px;font-weight:750}.dot{display:inline-block;width:8px;height:8px;margin-right:8px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(71,215,172,.1)}.section-head{display:flex;align-items:end;justify-content:space-between;margin:0 0 14px}.section-head p{margin:0;color:var(--muted);font-size:13px}.camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.camera-card{overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--panel)}.camera-view{position:relative;display:grid;place-items:center;aspect-ratio:16/9;background:#080a0e;overflow:hidden}.camera-view video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}.camera-placeholder{text-align:center;color:var(--muted);padding:20px}.camera-placeholder .signal{display:block;margin:0 auto 12px;font-size:25px}.camera-placeholder strong{display:block;color:#cad2dd;margin-bottom:4px}.live-badge{position:absolute;z-index:2;top:12px;left:12px;padding:6px 9px;border-radius:8px;background:rgba(8,10,14,.78);font-size:11px;font-weight:800;letter-spacing:.08em}.live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--danger)}.camera-meta{display:flex;justify-content:space-between;gap:15px;padding:14px 16px}.camera-name{font-weight:700}.camera-state{color:var(--muted);font-size:12px}.camera-state.ready{color:var(--accent)}.library-toolbar{display:flex;gap:10px;margin-bottom:18px;overflow:auto}.filter{border:1px solid var(--line);border-radius:999px;background:transparent;color:var(--muted);padding:8px 13px;cursor:pointer;white-space:nowrap}.filter.active{background:var(--text);border-color:var(--text);color:#0b0e13}.camera-section{margin-bottom:28px}.recording-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:12px}.clip{overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--panel)}.clip video{display:block;width:100%;aspect-ratio:16/9;background:#07090c}.clip-body{padding:13px}.clip-time{font-weight:700;font-size:14px}.clip-meta{margin:5px 0 12px;color:var(--muted);font-size:12px}.download{color:var(--blue);text-decoration:none;font-size:13px;font-weight:700}.empty{padding:28px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);text-align:center;background:rgba(18,23,32,.5)}.mobile-nav{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:980px){.recording-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:23px 16px 90px}.clock{display:none}.summary{grid-template-columns:1fr}.camera-grid,.recording-grid{grid-template-columns:1fr}.mobile-nav{position:fixed;z-index:20;display:grid;grid-template-columns:1fr 1fr;left:12px;right:12px;bottom:12px;padding:6px;border:1px solid var(--line);border-radius:15px;background:rgba(18,23,32,.94);backdrop-filter:blur(14px)}.mobile-nav a{text-align:center;padding:10px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:700;font-size:13px}.mobile-nav a.active{background:#193329;color:#7ee8c7}}
 
 
 
@@ -45141,15 +45940,6 @@ NAV_ITEMS = [
 
 
 
-    ("customer-onboarding", "/customer-onboarding", "→", "Onboarding"),
-
-
-
-
-
-
-
-
     ("onboarding-admin", "/onboarding-admin", "⇢", "Onboarding admin"),
 
 
@@ -45404,6 +46194,13 @@ NAV_ITEMS = [
 
     ("analytics-entitlements", "/analytics-entitlements", "◆", "Analytics entitlements"),
 
+    # AAC (facial recognition / access-control analytics), Phase 2.
+    # Visibility is further gated below (see visible_nav_items) by the
+    # viewer's own facial.view permission, not by role membership in
+    # this list -- being in NAV_ITEMS at all only makes "aac" eligible
+    # to appear, the same as every other entry here.
+    ("aac", "/aac/people", "◎", "Facial Recognition"),
+
 
 
 
@@ -45483,7 +46280,12 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-        return None  # Administrators see every navigation item.
+        # Broad access, but not to the handful of items that require a
+        # partner/customer identity record an administrator doesn't have --
+        # see PARTNER_IDENTITY_ONLY_NAV_KEYS -- and not to customer video/
+        # footage nav items, which being an administrator must never imply
+        # -- see CUSTOMER_VIDEO_NAV_KEYS. Every other item stays visible.
+        return {key for key, _url, _icon, _label in NAV_ITEMS} - PARTNER_IDENTITY_ONLY_NAV_KEYS - CUSTOMER_VIDEO_NAV_KEYS
 
 
 
@@ -45618,7 +46420,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "dashboard",
+            "live", "events", "alerts", "playback", "investigate", "dashboard", "aac",
 
 
 
@@ -45870,6 +46672,26 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
+def _facial_view_permitted(shell_user: dict | None, shell_role: str) -> bool:
+    """AAC (facial recognition) nav-visibility gate: True only for an
+    identity partner_db.ROLE_PERMISSIONS actually grants 'facial.view'
+    to -- the exact same check every AAC route already enforces (see
+    facial_recognition_ui.py's own _require()), so the nav link and the
+    pages it points to can never disagree about who's allowed to see
+    them. shell_user may be the newer partner_portal identity dict or
+    the legacy current_user() one (see this function's caller in
+    page_shell()) -- allowed() only ever reads .get('role'), so either
+    shape works; a role partner_db.ROLE_PERMISSIONS doesn't recognize
+    at all (e.g. a legacy-only role name) simply isn't granted, same as
+    an anonymous visitor."""
+    try:
+        from partner_db import allowed as partner_db_allowed
+    except Exception:
+        return False
+    identity = shell_user if isinstance(shell_user, dict) else {}
+    return partner_db_allowed({**identity, "role": shell_role}, "facial.view")
+
+
 def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
@@ -45955,6 +46777,20 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
         if (allowed_keys is None or item[0] in allowed_keys)
         and (item[0] != "customer-app-settings" or shell_role in CUSTOMER_PORTAL_ROLES)
+        # AAC (facial recognition), Phase 2: being in allowed_keys above
+        # (added for administrator/customer_owner/customer_viewer) only
+        # makes "aac" ELIGIBLE -- this is the actual permission gate,
+        # using the exact same partner_db.ROLE_PERMISSIONS/allowed()
+        # this whole feature's own routes already enforce, so a role
+        # granted facial.view there is never out of sync with what the
+        # nav link itself checks. Known gap, not introduced by this
+        # change: partner_owner/salesperson/technician aren't wired
+        # into ANY branch of navigation_keys_for_role() yet (a
+        # pre-existing limitation of this legacy nav system, not
+        # specific to AAC) -- those roles won't see this link even
+        # though partner_owner/technician do hold facial.view/
+        # facial.manage. See the Phase 2 report's own nav section.
+        and (item[0] != "aac" or _facial_view_permitted(shell_user, shell_role))
 
 
 
@@ -46310,7 +47146,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-    content = license_warning_banner() + content
+    content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
 
 
 
@@ -46319,7 +47155,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071032"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="ANY AI CAM"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/static/brand-icon.png"><link rel="icon" type="image/png" href="/static/brand-icon.png"><title>{escape(title)} · AnyAiCam</title><style>{STYLES}</style></head><body><div class="shell"><aside class="sidebar"><div class="brand"><img class="brand-logo" src="/static/brand-icon.png" alt="AnyAiCam"></div><nav class="nav" aria-label="Primary">{navigation}</nav><form class="sidebar-auth" method="post" action="/logout" id="logout-form"><input type="hidden" name="csrf_token" value=""><button class="sidebar-logout" type="submit" aria-label="Log out of AnyAiCam"><span class="sidebar-logout-icon" aria-hidden="true">↪</span><span>Log out</span></button></form><script>document.getElementById('logout-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script></aside><main class="content">{content}</main></div><nav class="mobile-nav" aria-label="Mobile">{mobile}</nav><div class="toast" id="toast" role="status"></div><script>const nativeFetch=window.fetch.bind(window);window.fetch=(input,options={{}})=>{{const method=(options.method||'GET').toUpperCase(),sameOrigin=typeof input==='string'?(!input.startsWith('http://')&&!input.startsWith('https://')):input.url.startsWith(location.origin);if(sameOrigin&&['POST','PUT','PATCH','DELETE'].includes(method)){{const csrf=document.cookie.split('; ').find(item=>item.startsWith('anyaicam_csrf='));if(csrf)options.headers={{...(options.headers||{{}}),'X-CSRF-Token':decodeURIComponent(csrf.split('=').slice(1).join('='))}}}}return nativeFetch(input,options)}};function showToast(message){{const toast=document.getElementById('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>toast.classList.remove('show'),3200)}}function comingSoon(label){{showToast(/saved|error|failed|no live/i.test(label)?label:label+' is ready for a future update.')}}if('serviceWorker' in navigator){{window.addEventListener('load',()=>navigator.serviceWorker.register('/service-worker.js').catch(()=>{{}}));}}document.addEventListener('DOMContentLoaded',()=>{{const activeTab=document.querySelector('.sidebar .nav a.active');if(activeTab){{requestAnimationFrame(()=>activeTab.scrollIntoView({{block:'center',inline:'nearest',behavior:'auto'}}));}}const mobileActive=document.querySelector('.mobile-nav a.active');if(mobileActive){{requestAnimationFrame(()=>mobileActive.scrollIntoView({{block:'nearest',inline:'center',behavior:'auto'}}));}}}});</script>{scripts}</body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071032"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="ANY AI CAM"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/static/brand-icon.png"><link rel="icon" type="image/png" href="/static/brand-icon.png"><title>{escape(title)} · AnyAiCam</title><style>{STYLES}</style></head><body><div class="shell"><aside class="sidebar"><div class="brand"><img class="brand-logo" src="/static/brand-icon.png" alt="AnyAiCam"></div><nav class="nav" aria-label="Primary">{navigation}</nav><form class="sidebar-auth" method="post" action="/logout" id="logout-form"><input type="hidden" name="csrf_token" value=""><button class="sidebar-logout" type="submit" aria-label="Log out of AnyAiCam"><span class="sidebar-logout-icon" aria-hidden="true">↪</span><span>Log out</span></button></form><script>document.getElementById('logout-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div class="sidebar-build-badge" title="Cloud ID: {escape(build_identifier()['cloud_id'] or 'not activated')}">v{escape(APP_VERSION)} · {escape(BUILD_ID)} · {escape(appliance_hostname())}</div></aside><main class="content">{content}</main></div><nav class="mobile-nav" aria-label="Mobile">{mobile}</nav><div class="toast" id="toast" role="status"></div><script>const nativeFetch=window.fetch.bind(window);window.fetch=(input,options={{}})=>{{const method=(options.method||'GET').toUpperCase(),sameOrigin=typeof input==='string'?(!input.startsWith('http://')&&!input.startsWith('https://')):input.url.startsWith(location.origin);if(sameOrigin&&['POST','PUT','PATCH','DELETE'].includes(method)){{const csrf=document.cookie.split('; ').find(item=>item.startsWith('anyaicam_csrf='));if(csrf)options.headers={{...(options.headers||{{}}),'X-CSRF-Token':decodeURIComponent(csrf.split('=').slice(1).join('='))}}}}return nativeFetch(input,options)}};function showToast(message){{const toast=document.getElementById('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>toast.classList.remove('show'),3200)}}function comingSoon(label){{showToast(/saved|error|failed|no live/i.test(label)?label:label+' is ready for a future update.')}}if('serviceWorker' in navigator){{window.addEventListener('load',()=>navigator.serviceWorker.register('/service-worker.js').catch(()=>{{}}));}}document.addEventListener('DOMContentLoaded',()=>{{const activeTab=document.querySelector('.sidebar .nav a.active');if(activeTab){{requestAnimationFrame(()=>activeTab.scrollIntoView({{block:'center',inline:'nearest',behavior:'auto'}}));}}const mobileActive=document.querySelector('.mobile-nav a.active');if(mobileActive){{requestAnimationFrame(()=>mobileActive.scrollIntoView({{block:'nearest',inline:'center',behavior:'auto'}}));}}}});</script>{scripts}</body></html>"""
 
 
 
@@ -46392,11 +47228,27 @@ from partner_workspace import register_partner_workspace_routes, render_partner_
 
 
 from appliance_cloud import register_appliance_cloud_routes
+from appliance_claims import register_appliance_claim_routes
+from notification_settings_page import register_notification_settings_routes
 from live_playlist import register_live_playlist_routes
 from live_view_sessions import register_live_view_session_routes
 from live_view_page import register_live_view_page_routes
+from live_view_p2p import register_live_view_p2p_customer_routes, register_live_view_p2p_appliance_routes
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
+from door_access import register_door_access_routes
+from wireguard_remote import register_wireguard_remote_appliance_routes
+# 2026-09-16: edge-side counterpart to the cloud relay above -- ONVIF
+# backchannel transport, capability discovery, and the WebSocket relay
+# client that connects the two. Recovered from an old, unrelated-history
+# branch (real Camera 2 hardware validation) and ported onto the
+# current dynamic camera-provisioning/encrypted-credential model; see
+# talk_audio_relay_client.py's and talk_down_discovery.py's own module
+# docstrings. Both workers are inert by default (ANYAICAM_TALK_AUDIO_
+# ENABLED / ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED default false).
+import talk_down_discovery
+import talk_audio_relay_client
+from facial_recognition_ui import register_facial_recognition_routes
 
 
 
@@ -46442,6 +47294,7 @@ from pwa_routes import register_pwa_routes
 
 
 from mobile_notifications import register_mobile_notification_routes
+from customer_registration import register_customer_registration_routes
 
 
 
@@ -46479,6 +47332,7 @@ register_pricing_routes(app, page_shell)
 
 register_partner_routes(app, page_shell)
 
+register_customer_registration_routes(app, page_shell, current_user, is_master_admin)
 
 
 
@@ -46486,21 +47340,66 @@ register_partner_routes(app, page_shell)
 
 
 
+
+
+
+
+
+
+# Registered before register_partner_workspace_routes() specifically:
+# partner_workspace.py's POST /api/partner/appliances/{appliance_id}/{action}
+# (a wildcard placeholder, its own docstring literally says "hardware
+# execution is not connected yet") was silently shadowing this module's
+# more specific POST /api/partner/appliances/{appliance_id}/commands --
+# Starlette matches routes in registration order, first match wins, so
+# the real, fully-implemented RDM4 command-queue endpoint had never
+# actually been reachable over HTTP, for any identity, direct or
+# bridged, even before this bridge existed. Registering the specific
+# route first fixes that; nothing about either route's own behavior
+# changed.
+register_appliance_cloud_routes(app, page_shell, current_user)
+# Phase 1 of the non-interactive/self-service claim flow (see
+# docs/non-interactive-activation-phase1-plan.md) -- a fully separate,
+# additive route set from the admin-driven activation routes just
+# registered above. No shared route paths with either
+# register_appliance_cloud_routes() or register_partner_workspace_routes(),
+# so registration order relative to those two does not matter here.
+# page_shell (Phase 2A) renders the one new customer-facing page,
+# GET /customer/claim-appliance -- not shadowed by anything registered
+# before or after this line (no /customer/{...} wildcard exists
+# anywhere in this codebase).
+register_appliance_claim_routes(app, page_shell)
+# Registered before register_partner_workspace_routes() runs the
+# generic @app.get("/settings/{settings_slug}") catch-all it (or later
+# code in this file) may match against -- see that route's own handling
+# of unknown/not-yet-implemented slugs. /settings/notifications is a
+# specific path; registering it first means it is never shadowed,
+# following the exact route-ordering lesson this session's earlier
+# appliance-commands fix already established for this codebase.
+register_notification_settings_routes(app, page_shell)
 register_partner_workspace_routes(app, page_shell)
-
-
-
-
-
-
-
-
-register_appliance_cloud_routes(app, page_shell)
-register_live_playlist_routes(app)
+# Provisioning Phase 1 (website -> Stripe -> AWS -> customer -> camera
+# slots -> installation activation): additive routes only -- GET
+# /api/customer/entitlements, GET /api/customer/installations, POST
+# /api/provisioning/release, POST /api/provisioning/refresh. Does not
+# touch the existing Stripe checkout/webhook routes or
+# register_partner_workspace_routes()'s own POST /api/customer/
+# appliances/link (that endpoint already is the claim flow -- see
+# provisioning_api.py's module docstring).
+from provisioning_api import register_provisioning_api_routes
+register_provisioning_api_routes(app)
+register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
+register_live_view_p2p_customer_routes(app)
+register_live_view_p2p_appliance_routes(app)
+from live_view_wireguard import register_live_view_wireguard_routes
+register_live_view_wireguard_routes(app)
 register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
+register_facial_recognition_routes(app, page_shell)
+register_door_access_routes(app)
+register_wireguard_remote_appliance_routes(app)
 
 
 
@@ -46700,7 +47599,7 @@ def camera_detail(camera_number: int) -> str:
 
 
 
-    if camera_number < 1 or camera_number > CAMERA_COUNT:
+    if camera_number not in get_camera_numbers():
 
 
 
@@ -47031,6 +47930,24 @@ def version_endpoint() -> dict:
 
 
 
+        "hostname": appliance_hostname(),
+
+
+
+
+
+
+
+
+        "cloud_id": (own_appliance_identity() or {}).get("cloud_id"),
+
+
+
+
+
+
+
+
         "environment": DEPLOYMENT_ENV,
 
 
@@ -47077,6 +47994,174 @@ def version_endpoint() -> dict:
 
 
     }
+
+
+@app.get("/api/appliance/local-storage-state")
+def local_storage_state_endpoint() -> dict:
+    """Local recording storage management (2026-09-17): the appliance-
+    agent's own heartbeat gathering (metrics.py, a separate host process,
+    not this container) reads this to fold local_storage_manager.py's
+    live in-process state into the real heartbeat payload the cloud
+    already receives disk_capacity/disk_used through.
+
+    This replaced an earlier file-based cross-process handoff design
+    (STATE_DIR/local_storage_state.json) that turned out to be
+    fundamentally incompatible with a real, deliberate security boundary
+    confirmed live on Ryzen: /var/lib/anyaicam (STATE_DIR) is mounted
+    READ-ONLY inside this container by design, so the containerized VMS
+    app can read the appliance's own credential/identity files but can
+    never write into that directory -- correct and intentional, not a
+    bug to route around with a different writable path. An HTTP status
+    route the agent polls over localhost avoids the whole problem: no
+    shared file, no write permission needed, and the data is always
+    live rather than however stale the last successful file write left
+    it.
+
+    Deliberately unauthenticated, matching /health//version/ready's own
+    convention for basic local status -- exposes only non-sensitive
+    operational numbers (free%, state, timestamps), same sensitivity
+    class as those. Never returns worker internals beyond the same four
+    fields the cloud already stores (storage_state/storage_free_percent/
+    storage_last_cleanup_at, plus worker_status for local debugging)."""
+    import local_storage_manager
+    state = local_storage_manager.local_storage_manager_state
+    return {
+        "worker_status": state.get("worker_status"),
+        "storage_state": state.get("storage_state"),
+        "free_percent": state.get("free_percent"),
+        "last_cleanup_at": state.get("last_cleanup_at"),
+        "last_scan_at": state.get("last_scan_at"),
+    }
+
+
+_DOCKER_GATEWAY_IP_CACHE: dict = {}
+
+
+def _docker_bridge_gateway_ip() -> str | None:
+    """This container's own default-route gateway, read fresh from
+    /proc/net/route and cached in-process (the route doesn't change
+    during a container's lifetime, so one read is enough).
+
+    Exists for exactly one reason: confirmed live (2026-09-13) that a
+    genuine call from the appliance-agent -- a host-level systemd
+    process on Ryzen -- to this exact box's own published loopback port
+    (http://127.0.0.1:8000/...) arrives inside the anyaicam-vms
+    container with source address 172.18.0.1, not 127.0.0.1. This is
+    standard Docker behavior, not a misconfiguration: port publishing
+    only needs to rewrite ("hairpin NAT") the source address to the
+    bridge gateway for the specific case of the HOST talking to its own
+    published port on localhost, because the container's own network
+    namespace has no route back to a literal 127.0.0.1 peer -- the
+    gateway address is the one the container CAN route a reply through.
+    A genuinely external LAN or remote caller hitting this same
+    published port (0.0.0.0:8000, confirmed not loopback-restricted at
+    the Docker layer -- see this endpoint's own docstring) is not
+    subject to this rewrite at all: their own real source address
+    reaches the container untouched, since there is no localhost-
+    loopback ambiguity for Docker to resolve in that case.
+
+    Trusting this ONE dynamically-read address (never a subnet, never
+    127.0.0.0/8 broadened, never an arbitrary RFC1918 range) is
+    therefore exactly as narrow as trusting literal loopback was always
+    meant to be on a non-containerized host: it identifies "this exact
+    box, via Docker's own hairpin path to itself," never "anything else
+    on this network." Returns None (never a wildcard) if the route
+    can't be determined, in which case only literal loopback is
+    accepted -- failing closed, not open."""
+    if "value" in _DOCKER_GATEWAY_IP_CACHE:
+        return _DOCKER_GATEWAY_IP_CACHE["value"]
+    gateway = None
+    try:
+        with open("/proc/net/route", "r", encoding="ascii") as handle:
+            next(handle, None)  # header row
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 3 or fields[1] != "00000000":
+                    continue
+                hex_gateway = fields[2]
+                if len(hex_gateway) == 8:
+                    gateway = ".".join(str(int(hex_gateway[i:i + 2], 16)) for i in (6, 4, 2, 0))
+                break
+    except (OSError, ValueError, IndexError):
+        gateway = None
+    _DOCKER_GATEWAY_IP_CACHE["value"] = gateway
+    return gateway
+
+
+@app.post("/api/local/provisioned-camera-credential")
+def provisioned_camera_credential(request: Request, payload: dict) -> dict:
+    """Cloud->edge camera-configuration sync (2026-09-12), local half.
+
+    The appliance-agent already legitimately receives one camera's
+    plaintext RTSP credential, once, in memory, during provisioning
+    (poll_provisioning()'s job payload -- unchanged, pre-existing
+    behavior; see appliance-agent/anyaicam_agent/service.py). That
+    credential was never persisted anywhere before this endpoint existed
+    -- this is the first and only place it is ever written to disk, and
+    it is written encrypted, never plaintext.
+
+    Deliberately NOT a cloud API: this route only ever makes sense called
+    by this exact process's own appliance-agent, over loopback, on the
+    same box -- there is no cloud_id path segment, no cross-appliance
+    routing, nothing for a remote caller to address. Two independent
+    checks enforce that boundary (both required, neither sufficient
+    alone):
+      1. request.client.host must be a loopback address -- this
+         container's port is published on 0.0.0.0, not restricted to
+         loopback at the Docker layer, so this check is load-bearing,
+         not redundant.
+      2. The request must carry this exact appliance's own activation
+         credential (own_appliance_identity()) as a bearer token -- the
+         SAME secret the agent already holds and already uses to
+         authenticate to the cloud, reused here rather than inventing a
+         second local-only secret. An appliance with no completed
+         activation yet (own_appliance_identity() returns None) has
+         nothing valid to compare against, so the endpoint fails closed.
+
+    Stores only ciphertext (appliance_protocol.encrypt_camera_credentials()
+    using this appliance's own local ANYAICAM_CAMERA_CREDENTIAL_KEY) into
+    pending_camera_credentials, keyed by device_key -- camera_number/
+    camera_id are not yet known to the agent at this exact moment (the
+    cloud assigns them only after receiving the agent's success report,
+    which happens after this call). edge_camera_sync.sync_provisioned_
+    cameras() later moves this into the real camera_credentials table
+    once GET /api/appliance/configuration reports the assigned camera_id
+    for this device_key.
+
+    Never logs, returns, or echoes username/password in any form -- the
+    response and every error path below carry only a message string."""
+    client_host = request.client.host if request.client else None
+    allowed_hosts = {"127.0.0.1", "::1", "localhost"}
+    gateway_ip = _docker_bridge_gateway_ip()
+    if gateway_ip:
+        allowed_hosts.add(gateway_ip)
+    if client_host not in allowed_hosts:
+        raise HTTPException(status_code=403, detail="This endpoint is only reachable from the appliance's own loopback interface.")
+
+    identity = own_appliance_identity()
+    if not identity:
+        raise HTTPException(status_code=403, detail="This appliance has no completed activation identity.")
+    presented = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    if not presented or presented != identity["credential"]:
+        raise HTTPException(status_code=403, detail="Invalid local credential.")
+
+    device_key = str(payload.get("device_key") or "").strip()
+    username = str(payload.get("username") or "")
+    password = str(payload.get("password") or "")
+    if not device_key or not (username or password):
+        raise HTTPException(status_code=400, detail="device_key and at least one of username/password are required.")
+
+    from appliance_protocol import encrypt_camera_credentials
+    from partner_db import connection
+    encrypted_blob = encrypt_camera_credentials(username, password)
+    now = datetime.now().isoformat()
+    with connection() as db:
+        db.execute(
+            "INSERT INTO pending_camera_credentials(device_key,encrypted_blob,created_at) VALUES(?,?,?) "
+            "ON CONFLICT(device_key) DO UPDATE SET encrypted_blob=excluded.encrypted_blob,created_at=excluded.created_at",
+            (device_key, encrypted_blob, now),
+        )
+    return {"message": "Credential received and stored encrypted."}
 
 
 
@@ -48150,6 +49235,7 @@ def operations_page(request: Request) -> str:
             <a class="ghost-button" href="/ready" target="_blank">Readiness JSON</a>
 
 
+            <a class="ghost-button" href="/operations/rdm">Remote device management</a>
 
 
 
@@ -49320,6 +50406,498 @@ def operations_page(request: Request) -> str:
     return page_shell("Operations", "operations", content, scripts)
 
 
+@app.get("/operations/rdm", response_class=HTMLResponse)
+def operations_rdm_page(request: Request) -> str:
+    """Admin Portal view onto the existing RDM4 appliance-command backend
+    (appliance_protocol.ALLOWED_COMMANDS / appliance_cloud.py's
+    POST /api/partner/appliances/{id}/commands, already shipped and used
+    today by /partner/appliance-dashboard) -- this page invents no new
+    backend behavior of its own: it reads the same appliances/
+    appliance_health_history/appliance_camera_status tables and, for the
+    two destructive actions, submits to the exact same command-queue
+    endpoint with the exact same confirmation-dialog contract that page
+    already uses, so a click here goes through the identical de-dup,
+    validation (ALLOWED_COMMANDS), and require_permission(identity,
+    'appliance.action') enforcement that endpoint already had.
+
+    Gated by two identities, both required, neither weakened:
+    - Admin Portal access (manage_settings, the legacy current_user()
+      identity every /operations page already requires) controls
+      whether this page renders at all.
+    - The actual appliance data and the two action buttons additionally
+      require a real partner_identity() session with appliance.action
+      permission -- the same authorization the existing command endpoint
+      already independently re-checks server-side on every submit. An
+      admin-portal identity with no partner-portal session sees an
+      honest explanation and a link to sign in, never a silent failure,
+      invented data, or an automatic redirect."""
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page("Remote device management", "operations", "manage_settings")
+    record_audit(request, "view", "operations:rdm", "Opened remote device management.")
+
+    from partner_portal import partner_identity
+    from partner_db import allowed as partner_allowed, rows as partner_rows, connection as partner_connection
+    from admin_partner_bridge import bridge_partner_identity, get_link
+
+    ELIGIBLE_PARTNER_ROLES = {"administrator", "partner_owner", "salesperson", "technician"}
+
+    # Direct Partner Portal session takes priority, completely unchanged
+    # from before this bridge existed. Only when there isn't one (or its
+    # role can't manage appliances) do we fall back to an explicit,
+    # revocable admin_partner_links bridge -- see that module's own
+    # docstring for every check applied before a bridge is ever trusted.
+    direct_identity = partner_identity(request)
+    identity = direct_identity if direct_identity and direct_identity.get("role") in ELIGIBLE_PARTNER_ROLES else None
+    via_bridge = False
+    link_row = None
+    if identity is None:
+        with partner_connection() as db:
+            link_row = get_link(db, admin_user_id=user.get("id", ""))
+            bridged = bridge_partner_identity(db, admin_user=user)
+        if bridged:
+            identity = bridged
+            via_bridge = True
+
+    if identity is None:
+        if direct_identity and direct_identity.get("role") not in ELIGIBLE_PARTNER_ROLES:
+            explanation = "Your Partner Portal account type can't manage appliances."
+        elif link_row and not link_row.get("revoked_at"):
+            explanation = (
+                "Your linked partner account is no longer valid -- it may have been revoked, removed, or its "
+                "role changed. Sign in to the Partner Portal directly to view or manage appliances, then link "
+                "a current account from this page."
+            )
+        else:
+            explanation = (
+                "This appliance data and its restart/reboot actions are served by the Partner Portal's "
+                "already-existing appliance backend. Sign in there to view or manage appliances from this page."
+            )
+        content = (
+            '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Remote device management</h1></div>'
+            '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+            '<section class="panel"><div class="panel-head"><h2>Partner Portal sign-in required</h2></div>'
+            f'<div class="empty">{escape(explanation)}</div>'
+            '<a class="action-button" href="/partner-login" style="margin-top:12px;display:inline-block">'
+            'Sign in to Partner Portal</a></section>'
+        )
+        return page_shell("Remote device management", "operations", content)
+
+    can_act = partner_allowed(identity, "appliance.action")
+
+    bridge_banner = ""
+    if via_bridge:
+        bridge_banner = (
+            '<div class="mock-banner">Viewing via your linked partner account '
+            f'({escape(identity.get("email", ""))}). '
+            '<button class="ghost-button" id="unlink-partner-account" type="button">Unlink</button></div>'
+        )
+    else:
+        with partner_connection() as db:
+            existing_link = get_link(db, admin_user_id=user.get("id", ""))
+        already_linked_to_this = bool(
+            existing_link and not existing_link.get("revoked_at")
+            and str(existing_link.get("partner_email", "")).lower() == str(identity.get("email", "")).lower()
+        )
+        if not already_linked_to_this:
+            bridge_banner = (
+                '<section class="panel"><div class="panel-head"><h2>Skip Partner Portal sign-in next time</h2></div>'
+                '<div class="health-detail">Link this Partner Portal account to your Admin Portal login so future '
+                'visits to this page don\'t need a second sign-in.</div>'
+                '<button class="action-button" id="link-partner-account" type="button" style="margin-top:10px">'
+                'Link this account</button></section>'
+            )
+
+    # HIGH fix (2026-09-14 partner-scoped-administrator follow-up, Codex
+    # tenant-isolation re-audit): sibling-audit finding, same pattern and
+    # same fix as partner_workspace.py's render_partner_workspace()
+    # customer listing and appliance_cloud.py's appliance_dashboard() --
+    # identity["role"] != "administrator" was a bare role-name shortcut,
+    # byte-identical for a true platform-global administrator and a
+    # company-scoped one linked in here via admin_partner_bridge. It let a
+    # partner-scoped administrator drop the partner_id filter entirely and
+    # enumerate every other partner's real appliances on this operations
+    # page. Only a live-verified GLOBAL administrator grant may see
+    # appliances across every partner.
+    from appliance_identity import has_global_administrator_grant
+    with partner_connection() as _grant_db:
+        identity_is_global = has_global_administrator_grant(_grant_db, email=identity.get("email", ""))
+    clauses = ["1=1"]
+    params: list = []
+    if not identity_is_global:
+        clauses.append("a.partner_id=?")
+        params.append(identity.get("partner_id") or "anyaicam-primary")
+    appliances = partner_rows(
+        "SELECT a.*, c.name customer_name, s.name site_name FROM appliances a "
+        "LEFT JOIN customers c ON c.id=a.customer_id LEFT JOIN sites s ON s.id=a.site_id "
+        "WHERE " + " AND ".join(clauses) + " ORDER BY a.last_check_in DESC",
+        params,
+    )
+
+    cards = []
+    for item in appliances:
+        history = partner_rows(
+            "SELECT * FROM appliance_health_history WHERE appliance_id=? ORDER BY created_at DESC LIMIT 5",
+            (item["id"],),
+        )
+        camera_status = partner_rows(
+            "SELECT * FROM appliance_camera_status WHERE appliance_id=?", (item["id"],)
+        )
+        online_cameras = sum(1 for c in camera_status if c.get("online"))
+        recording_cameras = sum(1 for c in camera_status if c.get("online") and c.get("recording"))
+        actions = ""
+        if can_act:
+            actions = (
+                '<div class="library-toolbar">'
+                f'<button class="filter queue-command" data-appliance="{escape(item["id"], quote=True)}" data-command="restart_vms">Restart VMS</button>'
+                f'<button class="filter queue-command danger" data-appliance="{escape(item["id"], quote=True)}" data-command="reboot_appliance">Reboot appliance</button>'
+                '</div>'
+            )
+        else:
+            actions = '<div class="health-detail">Your Partner Portal role can view this appliance but not act on it (appliance.action permission required).</div>'
+        cards.append(
+            '<article class="panel">'
+            f'<div class="panel-head"><div><h2>{escape(item.get("cloud_id") or item["id"])}</h2>'
+            f'<div class="health-detail">{escape(item.get("customer_name") or "Unassigned")} · {escape(item.get("site_name") or "No site")} · {escape(item.get("software_version") or "Unknown version")}</div></div>'
+            f'<span class="pill">{escape(item.get("state") or item.get("online_status") or "offline")}</span></div>'
+            f'<div class="health-row"><span>Last check-in</span><strong>{escape(item.get("last_check_in") or "Never")}</strong></div>'
+            f'<div class="health-row"><span>CPU / Memory / Disk</span><strong>{item.get("cpu") or 0}% / {item.get("memory") or 0}% / {item.get("disk") or 0} GB</strong></div>'
+            f'<div class="health-row"><span>Cameras online / recording</span><strong>{online_cameras}/{len(camera_status)} · {recording_cameras} recording</strong></div>'
+            f'<div class="health-row"><span>IP address</span><strong>{escape(item.get("ip_address") or "Unknown")}</strong></div>'
+            f'{actions}'
+            f'<details style="margin-top:10px"><summary>Recent diagnostics ({len(history)})</summary>'
+            + "".join(
+                f'<p>{escape(h["created_at"])} · {escape(h["status"])} · CPU {h.get("cpu") or 0}% · '
+                f'Mem {h.get("memory") or 0}% · Disk {h.get("disk_used") or 0}/{h.get("disk_capacity") or 0} GB'
+                + (f' · {escape(h["last_error"])}' if h.get("last_error") else '') + '</p>'
+                for h in history
+            ) + '</details></article>'
+        )
+
+    # HIGH fix (2026-09-14 final tenant-isolation re-audit, Codex): this
+    # query previously had no tenant predicate at all, so any partner-
+    # scoped administrator who could reach this operations page (already
+    # scoped above for the appliance cards using the same
+    # identity_is_global / has_global_administrator_grant() result) saw
+    # every other partner's restart/reboot command history -- foreign
+    # appliance identifiers, command state, timestamps, and errors.
+    command_clauses = ["c.command IN ('restart_vms','reboot_appliance')"]
+    command_params: list = []
+    if not identity_is_global:
+        command_clauses.append("a.partner_id=?")
+        command_params.append(identity.get("partner_id") or "anyaicam-primary")
+    command_rows = partner_rows(
+        "SELECT c.*, a.cloud_id FROM appliance_commands c JOIN appliances a ON a.id=c.appliance_id "
+        "WHERE " + " AND ".join(command_clauses) + " ORDER BY c.created_at DESC LIMIT 20",
+        command_params,
+    )
+    command_table = "".join(
+        f'<tr><td>{escape(item["cloud_id"])}</td><td>{escape(item["command"].replace("_", " "))}</td>'
+        f'<td><span class="pill">{escape(item["status"])}</span></td><td>{escape(item["created_at"])}</td>'
+        f'<td>{escape(item.get("error") or "")}</td></tr>'
+        for item in command_rows
+    ) or '<tr><td colspan="5">No restart/reboot actions have been queued.</td></tr>'
+
+    content = (
+        '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Remote device management</h1></div>'
+        '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+        f'{bridge_banner}'
+        f'<div class="account-grid" style="margin-top:18px">{"".join(cards) or "<div class=\'empty\'>No appliances found for this account.</div>"}</div>'
+        '<section class="panel" style="margin-top:18px;overflow:auto"><h2>Restart / reboot history</h2>'
+        f'<table class="data-table"><thead><tr><th>Appliance</th><th>Command</th><th>Status</th><th>Created</th><th>Error</th></tr></thead>'
+        f'<tbody>{command_table}</tbody></table></section>'
+    )
+    scripts = (
+        "<script>"
+        "const DISRUPTIVE_COMMAND_WARNINGS={reboot_appliance:'This reboots the physical appliance. All cameras and recording will be briefly interrupted.',"
+        "restart_vms:'This restarts the AnyAiCam VMS service on this appliance. Live view and recording will be briefly interrupted.'};"
+        "document.querySelectorAll('.queue-command').forEach(button=>button.onclick=async()=>{"
+        "const warning=DISRUPTIVE_COMMAND_WARNINGS[button.dataset.command];"
+        "if(!confirm(warning?`${warning} Continue?`:`Queue ${button.textContent} for this appliance?`))return;"
+        "const response=await fetch(`/api/partner/appliances/${button.dataset.appliance}/commands`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:button.dataset.command,confirmed:true})}),"
+        "r=await response.json();showToast(r.message||r.detail)"
+        "});"
+        "const linkButton=document.getElementById('link-partner-account');"
+        "if(linkButton)linkButton.onclick=async()=>{"
+        "const response=await fetch('/api/operations/rdm/link-partner-account',{method:'POST'}),r=await response.json();"
+        "showToast(r.message||r.detail);if(response.ok)location.reload()"
+        "};"
+        "const unlinkButton=document.getElementById('unlink-partner-account');"
+        "if(unlinkButton)unlinkButton.onclick=async()=>{"
+        "if(!confirm('Unlink this partner account from your Admin Portal login?'))return;"
+        "const response=await fetch('/api/operations/rdm/unlink-partner-account',{method:'POST'}),r=await response.json();"
+        "showToast(r.message||r.detail);if(response.ok)location.reload()"
+        "};"
+        "</script>"
+    )
+    return page_shell("Remote device management", "operations", content, scripts)
+
+
+@app.post("/api/operations/rdm/link-partner-account")
+def link_partner_account(request: Request) -> dict:
+    """Creates (or replaces) this Admin Portal user's admin_partner_links
+    row -- see admin_partner_bridge.py's own module docstring for the
+    full design. Requires the requesting browser to hold a currently-
+    valid session on *both* systems at this exact moment: current_user()
+    proves who the Admin Portal operator is, partner_identity() proves
+    they *also* control a real, already-existing, eligible Partner
+    Portal account right now -- that simultaneous proof is the entire
+    authorization for creating a link; no password is ever read, copied,
+    or compared, and no partner_users row is ever created or edited.
+    Every creation is audited (record_audit below)."""
+    user = current_user(request)
+    if not has_permission(user, "manage_settings") or user.get("role") not in {"administrator", "admin", "support_admin"}:
+        raise HTTPException(status_code=403, detail="Admin Portal access is required to link an account.")
+    from partner_portal import partner_identity
+    identity = partner_identity(request)
+    if not identity:
+        raise HTTPException(status_code=400, detail="Sign in to the Partner Portal in this same browser before linking.")
+    from admin_partner_bridge import can_create_link, create_link
+    if not can_create_link(str(user.get("role") or ""), str(identity.get("role") or "")):
+        raise HTTPException(status_code=403, detail="This partner account type can't be linked for appliance management.")
+    from partner_db import connection, row as partner_row
+    partner_user = partner_row("SELECT id,email FROM partner_users WHERE lower(email)=lower(?)", (identity.get("email", ""),))
+    if not partner_user:
+        raise HTTPException(status_code=404, detail="Partner account not found.")
+    now = datetime.now().isoformat()
+    with connection() as db:
+        create_link(
+            db,
+            admin_user_id=user["id"],
+            admin_email=user.get("email", ""),
+            partner_user_id=partner_user["id"],
+            partner_email=partner_user["email"],
+            linked_by=user.get("email") or user["id"],
+            now=now,
+        )
+    record_audit(request, "link", "admin_partner_link", "Linked partner account for remote device management.")
+    return {"status": "linked", "message": "Partner account linked. You won't need to sign in there again on this Admin Portal account."}
+
+
+@app.post("/api/operations/rdm/unlink-partner-account")
+def unlink_partner_account(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from admin_partner_bridge import revoke_link
+    from partner_db import connection
+    with connection() as db:
+        revoke_link(db, admin_user_id=user.get("id", ""), now=datetime.now().isoformat())
+    record_audit(request, "unlink", "admin_partner_link", "Unlinked partner account for remote device management.")
+    return {"status": "unlinked", "message": "Partner account unlinked."}
+
+
+@app.post("/api/operations/appliance-identity/reset")
+def reset_appliance_activation_identity(request: Request) -> dict:
+    """The explicit re-provisioning path appliance_activation.
+    persist_activation() requires before a different Cloud ID may
+    activate this box -- see that module's own docstring. A destructive,
+    admin-gated, audited local action: this only clears this appliance's
+    OWN durably-persisted identity file (own_appliance_identity()'s
+    source once activated), never anything in the cloud/partner_db --
+    the appliance row, its credentials, and its grants are untouched."""
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from appliance_activation import load_persisted_identity, reset_persisted_identity
+    previous = load_persisted_identity()
+    reset_persisted_identity()
+    record_audit(
+        request, "reset", "appliance_activation_identity",
+        f"Reset local activation identity (was {previous['cloud_id']!r})." if previous else "Reset local activation identity (none was set).",
+    )
+    return {"status": "reset", "message": "Local activation identity cleared. This appliance can now be activated as a different Cloud ID."}
+
+
+# =============================================================== identity grant management (admin-only, audited)
+#
+# The only sanctioned way to authorize an operator on an appliance --
+# see appliance_identity.py's own module docstring. Grants an EXISTING
+# partner_users identity (never creates one -- see create_identity_
+# grant()'s 404 below); explicit scope only, never inferred from
+# partner_id. authorization_version/manifest_version bump automatically
+# (appliance_identity.create_grant()/revoke_grant() already do this --
+# nothing extra required here).
+
+_GRANT_ROLE_LABELS = {
+    "administrator": "Administrator", "partner_owner": "Partner Owner", "salesperson": "Salesperson",
+    "technician": "Technician", "customer_owner": "Customer Owner", "customer_viewer": "Customer Viewer",
+}
+
+
+@app.get("/api/operations/identity-grants")
+def list_identity_grants(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        grants = db.execute(
+            "SELECT g.id,g.user_id,g.role,g.scope_type,g.scope_id,g.granted_at,g.granted_by,g.revoked_at,"
+            "u.email,u.authorization_version FROM identity_grants g JOIN partner_users u ON u.id=g.user_id "
+            "ORDER BY (g.revoked_at IS NOT NULL),g.granted_at DESC"
+        ).fetchall()
+    return {"grants": [dict(item) for item in grants]}
+
+
+@app.post("/api/operations/identity-grants")
+def create_identity_grant(request: Request, payload: dict) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    email = str(payload.get("email", "")).strip().lower()
+    role = str(payload.get("role", "")).strip()
+    scope_type = str(payload.get("scope_type", "")).strip()
+    scope_id = (str(payload.get("scope_id")).strip() or None) if payload.get("scope_id") else None
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+    from appliance_identity import create_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        target = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email,)).fetchone()
+        if not target:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No existing account for {email!r}. A grant authorizes an existing identity -- it doesn't create one.",
+            )
+        try:
+            grant_id = create_grant(db, user_id=target["id"], role=role, scope_type=scope_type, scope_id=scope_id, granted_by=user.get("email", "admin"))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    scope_label = f"{scope_type}:{scope_id}" if scope_id else scope_type
+    record_audit(request, "grant", "identity_grant", f"Granted {role} ({scope_label}) to {email}.")
+    return {"status": "granted", "grant_id": grant_id}
+
+
+@app.post("/api/operations/identity-grants/{grant_id}/revoke")
+def revoke_identity_grant(request: Request, grant_id: str) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    from appliance_identity import revoke_grant
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        existing = db.execute("SELECT id,role,scope_type,scope_id,revoked_at FROM identity_grants WHERE id=?", (grant_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Grant not found.")
+        if existing["revoked_at"]:
+            return {"status": "already_revoked"}
+        revoke_grant(db, grant_id=grant_id)
+    record_audit(request, "revoke", "identity_grant", f"Revoked {existing['role']} ({existing['scope_type']}) grant {grant_id}.")
+    return {"status": "revoked"}
+
+
+@app.get("/operations/identity-grants", response_class=HTMLResponse)
+def identity_grants_page(request: Request) -> str:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page("Identity grants", "operations", "manage_settings")
+    record_audit(request, "view", "operations:identity-grants", "Opened identity grant management.")
+    from partner_db import connection as partner_connection
+    with partner_connection() as db:
+        grants = db.execute(
+            "SELECT g.id,g.role,g.scope_type,g.scope_id,g.granted_at,g.granted_by,g.revoked_at,u.email "
+            "FROM identity_grants g JOIN partner_users u ON u.id=g.user_id ORDER BY (g.revoked_at IS NOT NULL),g.granted_at DESC"
+        ).fetchall()
+    def _grant_row(g: dict) -> str:
+        status_html = '<span class="pill">Revoked</span>' if g["revoked_at"] else '<span class="pill" style="background:#e2f3ec;color:#136a4d">Active</span>'
+        action_html = "" if g["revoked_at"] else f'<button class="ghost-button revoke-grant" data-id="{g["id"]}">Revoke</button>'
+        scope_label = escape(g["scope_type"]) + (":" + escape(g["scope_id"]) if g["scope_id"] else "")
+        return (
+            f'<tr><td>{escape(g["email"])}</td><td>{escape(_GRANT_ROLE_LABELS.get(g["role"], g["role"]))}</td>'
+            f'<td>{scope_label}</td><td>{escape(g["granted_by"] or "")}</td><td>{status_html}</td><td>{action_html}</td></tr>'
+        )
+
+    rows_html = "".join(_grant_row(g) for g in grants) or '<tr><td colspan="6">No grants yet.</td></tr>'
+    role_options = "".join(f'<option value="{key}">{label}</option>' for key, label in _GRANT_ROLE_LABELS.items())
+    content = f'''<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Identity grants</h1></div><a class="ghost-button" href="/operations">Back to operations</a></header>
+<p class="health-detail">Authorizes an existing operator account for a specific scope -- global, one partner, one customer, one site, or one appliance. This never creates an account; the email must already exist as a real identity.</p>
+<section class="panel"><h2>Grant access</h2><form id="grant-form" class="rule-form"><label>Email<input id="grant-email" type="email" required placeholder="operator@example.com"></label><label>Role<select id="grant-role">{role_options}</select></label><label>Scope type<select id="grant-scope-type"><option value="global">Global</option><option value="partner">Partner</option><option value="customer">Customer</option><option value="site">Site</option><option value="appliance">Appliance</option></select></label><label>Scope ID <span class="health-detail">(leave blank for Global)</span><input id="grant-scope-id" placeholder="partner-1 / cust-1 / site-1 / AIC-XXXX"></label><button class="action-button" type="submit">Grant access</button></form><div id="grant-message" class="health-detail"></div></section>
+<section class="panel" style="overflow:auto;margin-top:18px"><h2>Current grants</h2><table class="data-table"><thead><tr><th>Email</th><th>Role</th><th>Scope</th><th>Granted by</th><th>Status</th><th></th></tr></thead><tbody>{rows_html}</tbody></table></section>'''
+    scripts = '''<script>
+document.getElementById('grant-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/operations/identity-grants',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('grant-email').value,role:document.getElementById('grant-role').value,scope_type:document.getElementById('grant-scope-type').value,scope_id:document.getElementById('grant-scope-id').value})}),r=await response.json();document.getElementById('grant-message').textContent=response.ok?'Granted.':(r.detail||'Could not create grant.');if(response.ok)setTimeout(()=>location.reload(),600)});
+document.querySelectorAll('.revoke-grant').forEach(btn=>btn.onclick=async()=>{if(!confirm('Revoke this grant?'))return;await fetch(`/api/operations/identity-grants/${btn.dataset.id}/revoke`,{method:'POST'});location.reload()});
+</script>'''
+    return page_shell("Identity grants", "operations", content, scripts)
+
+
+# =============================================================== appliance activation UX
+#
+# Wraps the existing, real POST /api/appliance/activate (unauthenticated
+# by design -- there is no credential yet) and the durable local
+# identity storage from gap #1. Never displays the permanent appliance
+# credential -- neither route below returns it, and activate_appliance()
+# itself is called directly by this page's own JS, never proxied
+# through a route that could log or echo it back.
+
+
+@app.post("/api/operations/appliance-identity/fetch-manifest")
+def fetch_appliance_identity_manifest(request: Request) -> dict:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        raise HTTPException(status_code=403, detail="Admin Portal access is required.")
+    identity = own_appliance_identity()
+    if not identity:
+        raise HTTPException(status_code=409, detail="This appliance has not been activated yet.")
+    from appliance_identity import get_cloud_identity_backend
+    try:
+        manifest = get_cloud_identity_backend().fetch_manifest(cloud_id=identity["cloud_id"])
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    record_audit(
+        request, "fetch", "appliance_identity_manifest",
+        f"Fetched identity manifest ({len(manifest['identities'])} identities, version {manifest['manifest_version']}).",
+    )
+    return {"status": "connected", "cloud_id": manifest["appliance"]["cloud_id"], "identity_count": len(manifest["identities"]), "manifest_version": manifest["manifest_version"]}
+
+
+@app.get("/operations/appliance-activation", response_class=HTMLResponse)
+def appliance_activation_page(request: Request) -> str:
+    user = current_user(request)
+    if not has_permission(user, "manage_settings"):
+        return permission_denied_page("Appliance activation", "operations", "manage_settings")
+    record_audit(request, "view", "operations:appliance-activation", "Opened appliance activation.")
+    from appliance_activation import load_persisted_identity
+    identity = load_persisted_identity()
+    if identity:
+        status_html = (
+            '<section class="panel"><h2>Activated</h2>'
+            f'<div class="health-row"><span>Cloud ID</span><strong>{escape(identity["cloud_id"])}</strong></div>'
+            f'<div class="health-row"><span>Customer</span><strong>{escape(identity["customer_id"] or "—")}</strong></div>'
+            f'<div class="health-row"><span>Site</span><strong>{escape(identity["site_id"] or "—")}</strong></div>'
+            f'<div class="health-row"><span>Partner</span><strong>{escape(identity["partner_id"] or "—")}</strong></div>'
+            f'<div class="health-row"><span>Activated</span><strong>{escape(identity["activated_at"][:19])}</strong></div>'
+            f'<div class="health-row"><span>Activation version</span><strong>{identity["activation_version"]}</strong></div>'
+            '<p id="cloud-status" class="health-detail">Checking cloud connection…</p>'
+            '<button class="ghost-button" id="reset-activation" style="margin-top:12px">Reset / re-provision</button></section>'
+        )
+    else:
+        status_html = (
+            '<section class="panel"><h2>Not yet activated</h2>'
+            '<form id="activate-form" class="rule-form">'
+            '<label>Cloud ID<input id="activate-cloud-id" required placeholder="AIC-XXXXXXXX"></label>'
+            '<label>Activation token<input id="activate-token" required></label>'
+            '<button class="action-button" type="submit">Activate</button></form>'
+            '<div id="activate-message" class="health-detail"></div></section>'
+        )
+    content = (
+        '<header class="topbar"><div><p class="eyebrow">Operations</p><h1>Appliance activation</h1></div>'
+        '<a class="ghost-button" href="/operations">Back to operations</a></header>'
+        '<p class="health-detail">Connects this appliance to its authoritative cloud identity -- customer, site, and '
+        'authorized operators all come from the cloud after this, never a locally recreated account. The permanent '
+        f'credential issued here is never shown.</p>{status_html}'
+    )
+    scripts = '''<script>
+const activateForm=document.getElementById('activate-form');
+if(activateForm)activateForm.addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/appliance/activate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cloud_id:document.getElementById('activate-cloud-id').value,activation_token:document.getElementById('activate-token').value})}),r=await response.json();if(!response.ok){document.getElementById('activate-message').textContent=r.detail||'Activation failed.';return}document.getElementById('activate-message').textContent='Activated. Connecting to cloud…';setTimeout(()=>location.reload(),400)});
+const cloudStatus=document.getElementById('cloud-status');
+if(cloudStatus)fetch('/api/operations/appliance-identity/fetch-manifest',{method:'POST'}).then(r=>r.json()).then(r=>{cloudStatus.textContent=r.status==='connected'?`Cloud connected -- ${r.identity_count} authorized identit${r.identity_count===1?'y':'ies'} (manifest v${r.manifest_version}).`:'Cloud connection failed.'}).catch(()=>{cloudStatus.textContent='Cloud connection failed.'});
+const resetButton=document.getElementById('reset-activation');
+if(resetButton)resetButton.onclick=async()=>{if(!confirm('Reset local activation identity? This appliance will need to be activated again with a Cloud ID and token.'))return;await fetch('/api/operations/appliance-identity/reset',{method:'POST'});location.reload()};
+</script>'''
+    return page_shell("Appliance activation", "operations", content, scripts)
+
+
 
 
 
@@ -49353,7 +50931,66 @@ def operations_page(request: Request) -> str:
 
 
 
-def camera_status() -> dict:
+def camera_status(request: Request = None) -> dict:
+    # request is optional: /ready's own readiness_snapshot() calls this
+    # directly (no HTTP request in scope at all -- confirmed live during
+    # disposable installer validation, GET /ready always 500'd with
+    # "camera_status() missing 1 required positional argument: 'request'").
+    # request=None flows into _customer_playback_cameras(None), whose
+    # existing try/except around partner_identity(request) already
+    # catches that and returns None (no customer identity), which is
+    # exactly the correct fallback here: an internal readiness check has
+    # no portal session to scope to, so it must use this edge appliance's
+    # own local _legacy_camera_status(), the same as any anonymous/non-
+    # customer caller.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        # Customer-portal identity: scope to only this customer's own
+        # cameras -- never the shared, multi-tenant camera_number
+        # sequence _legacy_camera_status() below iterates -- and source
+        # online/recording from the appliance's own live heartbeat
+        # (appliance_camera_status, keyed by the real camera.id) instead
+        # of the local HLS-manifest/camera_process_state check further
+        # down. That check is edge-appliance-only (correct on
+        # Samsung/Ryzen, where a local relay actually writes those
+        # files); this cloud host runs no local relay for a customer's
+        # cameras at all, so it always reported every camera offline
+        # regardless of the appliance's real, live state.
+        return _customer_camera_status(customer_cameras)
+    return _legacy_camera_status()
+
+
+def _customer_camera_status(customer_cameras: list[dict]) -> dict:
+    from partner_db import connection
+    cameras = []
+    with connection() as db:
+        for camera in customer_cameras:
+            camera_number = camera.get("camera_number")
+            if camera_number is None:
+                continue
+            status_row = db.execute(
+                "SELECT online, recording FROM appliance_camera_status WHERE camera_id=?",
+                (camera["id"],),
+            ).fetchone()
+            online = bool(status_row["online"]) if status_row else False
+            recording_running = bool(status_row["recording"]) if status_row else False
+            cameras.append(
+                {
+                    "camera": camera_number,
+                    "online": online,
+                    "stream": "online" if online else "offline",
+                    "recording": "running" if recording_running else "stopped",
+                    "last_stream_update_seconds": None,
+                    "reconnects": 0,
+                    "last_exit_code": None,
+                    "last_error": None,
+                    "last_error_at": None,
+                }
+            )
+    return {"cameras": cameras, "checked_at": datetime.now().isoformat()}
+
+
+def _legacy_camera_status() -> dict:
 
 
 
@@ -49380,7 +51017,7 @@ def camera_status() -> dict:
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1):
+    for camera_number in get_camera_numbers():
 
 
 
@@ -50667,7 +52304,7 @@ def read_event_settings(camera_number: int) -> dict:
 
 
 
-    if not 1 <= camera_number <= CAMERA_COUNT:
+    if camera_number not in get_camera_numbers():
 
 
 
@@ -50847,7 +52484,7 @@ def read_alert_rule(camera_number: int) -> dict:
 
 
 
-    if not 1 <= camera_number <= CAMERA_COUNT:
+    if camera_number not in get_camera_numbers():
 
 
 
@@ -51714,7 +53351,7 @@ def analytics_events() -> list[dict]:
     return stored if stored else mock_analytics_events()
 
 
-def _customer_detection_events(request: Request) -> list[dict] | None:
+def _customer_detection_events(request: Request, *, limit: int | None = None) -> list[dict] | None:
     """This portal customer's own detection_events rows for the
     customer-facing analytics API, or None when the caller isn't a
     portal customer_owner/customer_viewer identity at all -- callers
@@ -51730,6 +53367,8 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
     authenticated identity and server-side joins here -- never from
     any request parameter, so a caller cannot widen their own view by
     passing e.g. a different camera/site value."""
+    if limit is not None:
+        return _customer_recent_events_bounded(request,limit)
     try:
         from partner_portal import partner_identity
         identity = partner_identity(request)
@@ -51739,11 +53378,14 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
         return None
     from partner_db import connection
     select = (
-        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, '
-        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name '
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'dem.thumbnail_s3_key AS thumbnail_s3_key '
         'FROM detection_events de '
         'JOIN cameras c ON c.id = de.camera_id '
         'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
     )
     with connection() as db:
         if identity.get("role") == "customer_owner":
@@ -51767,6 +53409,7 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
         {
             "id": row["id"],
             "camera": row["camera"],
+            "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
             "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
@@ -51774,14 +53417,355 @@ def _customer_detection_events(request: Request) -> list[dict] | None:
             "direction": None,
             "timestamp": row["event_timestamp"],
             "confidence": row["confidence"],
-            "thumbnail": None,
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
             "linked_recording": None,
+            "has_event_clip": bool(row["has_event_clip"]),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
         }
         for row in rows
     ]
+
+
+# Module-level (not local to _customer_investigate_events()) so tests
+# can monkeypatch them down to a small number and prove the "smart_motion
+# is never crowded out of the window by ordinary events" property at a
+# fast, direct scale, without needing to seed thousands of rows.
+INVESTIGATE_SMART_MOTION_CEILING = 2000
+INVESTIGATE_OTHER_EVENTS_CEILING = 500
+
+
+def _customer_investigate_events(request: Request) -> list[dict] | None:
+    """Investigate's own event feed -- NOT a call to
+    _customer_detection_events() with no limit, on purpose.
+
+    Root cause (2026-09-14 Investigate reliability phase): Investigate
+    was the one remaining caller still using _customer_detection_
+    events()'s unbounded branch directly (every other caller either
+    passes a real limit or, like /api/analytics/events and
+    /api/analytics/summary, genuinely needs the customer's complete
+    history to compute correct filtered/aggregated results and so
+    keeps that branch as-is here). For a customer with a large real
+    event history this meant embedding this customer's *entire*
+    detection_events table into the rendered page HTML, then keeping
+    only the 500 most recent rows *overall* for client-side filtering.
+
+    Measured against real production data (customer with 13,796 total
+    events, 361 of them smart_motion): the naive "500 most recent
+    overall" window contained only 16 of those 361 smart_motion events
+    -- 345 (95.6%) were silently unreachable by any Investigate search
+    or filter, indistinguishable from "no such event exists," because
+    smart_motion is a small fraction of this customer's total event
+    volume (dominated by ordinary YOLO detections) and a purely-recency
+    window starves it out almost completely. This is Investigate's own
+    defect, not a redesign of the shared analytics-events query other
+    callers correctly still rely on.
+
+    Fix: two separate, always-SQL-bounded queries -- every smart_motion
+    event (LIMIT high enough that this ceiling is never realistically
+    hit; smart_motion volume is inherently a small fraction of total
+    detections in this system) merged with the most recent ordinary
+    (non-smart_motion) events, same window size Investigate has always
+    shown for that majority case. Every real detection_events row this
+    customer owns is still visible on the Events page (whose own
+    bounded polling already has its own correct limit) -- this only
+    changes which slice of a large history Investigate itself embeds
+    for browsing.
+
+    Deterministic tie-break: ORDER BY event_timestamp DESC, id DESC --
+    a correlated Motion+Smart Motion pair always shares the exact same
+    event_timestamp (see appliance_cloud.py's own parent-correlation
+    design), so ties are a real, common occurrence here, not a
+    theoretical edge case; a plain ORDER BY on timestamp alone does not
+    guarantee the same relative order across repeated page loads.
+
+    Same identity/role/camera-permission scoping and None/[]-vs-list
+    contract as _customer_detection_events() -- customer_id/camera
+    scope always comes from the authenticated identity, never from any
+    request parameter."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+
+    select = (
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'dem.thumbnail_s3_key AS thumbnail_s3_key '
+        'FROM detection_events de '
+        'JOIN cameras c ON c.id = de.camera_id '
+        'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
+    )
+    from partner_db import connection
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            rows = db.execute(
+                select + "WHERE de.customer_id = ? AND de.event_type = 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (identity["customer_id"], INVESTIGATE_SMART_MOTION_CEILING),
+            ).fetchall()
+            rows += db.execute(
+                select + "WHERE de.customer_id = ? AND de.event_type != 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (identity["customer_id"], INVESTIGATE_OTHER_EVENTS_CEILING),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            permission_join = (
+                'JOIN customer_camera_permissions p ON p.camera_id = de.camera_id AND p.user_id = ? '
+            )
+            rows = db.execute(
+                select + permission_join
+                + "WHERE de.customer_id = ? AND p.can_playback = 1 AND de.event_type = 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (user["id"], identity["customer_id"], INVESTIGATE_SMART_MOTION_CEILING),
+            ).fetchall()
+            rows += db.execute(
+                select + permission_join
+                + "WHERE de.customer_id = ? AND p.can_playback = 1 AND de.event_type != 'smart_motion' "
+                'ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ?',
+                (user["id"], identity["customer_id"], INVESTIGATE_OTHER_EVENTS_CEILING),
+            ).fetchall()
+
+    events = [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
+            "site": row["site_name"],
+            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "event_type": row["event_type"],
+            "direction": None,
+            "timestamp": row["event_timestamp"],
+            "confidence": row["confidence"],
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
+            "linked_recording": None,
+            "has_event_clip": bool(row["has_event_clip"]),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "plate_number": None,
+            "vehicle_color": None,
+            "mock": False,
+        }
+        for row in rows
+    ]
+    # Merging two independently-LIMIT-ed queries can interleave out of
+    # strict order (each half is only sorted within itself) -- one
+    # final, deterministic sort over the merged, already-bounded set
+    # restores it. id is a real column on every row here (never
+    # missing), so this sort is always fully deterministic, matching
+    # the two queries' own ORDER BY tie-break.
+    events.sort(key=lambda event: (event["timestamp"], event["id"]), reverse=True)
+    return events
+
+
+def _customer_notifications(request: Request, *, camera_number: int | None = None, limit: int = 100) -> list[dict] | None:
+    """This portal customer's own real notifications rows for the
+    customer-facing Smart Alerts page, or None when the caller isn't a
+    portal customer_owner/customer_viewer identity at all -- same
+    None-vs-empty-list contract as _customer_detection_events(), same
+    reason (callers must render the existing legacy experience
+    unchanged for a non-portal caller, never "no alerts").
+
+    Reads the notifications table notification_engine.fanout_
+    appliance_event() already writes on every real analytics event
+    whose event_type is in its own SUPPORTED set (smart_motion, person,
+    vehicle, people_counting, lpr once a plate is actually read, camera/
+    appliance health signals, etc.) -- this function only ever reads
+    that existing table; it creates no notifications and duplicates no
+    event. A handful of notification types (camera_offline,
+    appliance_offline, low_disk, high_cpu, software_update) are
+    system-level and carry no camera_id -- LEFT JOINed rather than
+    excluded, so real system alerts still surface here instead of
+    silently disappearing, with camera_name reported as None so the
+    caller can render them without a camera badge.
+
+    Scoping mirrors _customer_detection_events() exactly: customer_owner
+    sees every notification for their own customer_id; customer_viewer
+    is restricted to cameras they hold can_playback=1 on (reusing that
+    existing permission, same smallest-change reasoning), and never
+    sees a camera-less system alert (no camera to check permission
+    against). camera_number optionally narrows to one camera -- used by
+    the focused Live View's own Smart Alerts panel, resolved server-side
+    from the authenticated identity's own fleet, never trusted from a
+    request parameter."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    select = (
+        'SELECT n.id, n.event_type, n.severity, n.title, n.message, n.timestamp, n.thumbnail, '
+        'n.recording_id, n.event_id, n.camera_id, n.read_at, c.camera_number AS camera, c.name AS camera_display_name, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip '
+        'FROM notifications n '
+        'LEFT JOIN cameras c ON c.id = n.camera_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = n.event_id '
+    )
+    params: list = [identity["customer_id"]]
+    camera_filter = ''
+    if camera_number is not None:
+        camera_filter = 'AND c.camera_number = ? '
+        params.append(camera_number)
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            # Intentional account-wide visibility -- see this function's
+            # own docstring ("customer_owner sees every notification for
+            # their own customer_id"), not narrowed to n.user_id.
+            rows = db.execute(
+                select + f'WHERE n.customer_id = ? {camera_filter}ORDER BY n.timestamp DESC LIMIT ?',
+                (*params, limit),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            # Notifications Reliability Phase (2026-09-14) fix, two gaps in
+            # the same JOIN: (1) it never checked a permission COLUMN at
+            # all -- any customer_camera_permissions row for this camera_id/
+            # user_id, even one with every flag explicitly 0 (access fully
+            # revoked), satisfied it, contradicting this function's own
+            # docstring ("restricted to cameras they hold can_playback=1
+            # on") and the proven-correct sibling pattern _customer_
+            # detection_events() already uses for the identical shape of
+            # query. Matches can_alerts specifically here, not can_playback
+            # -- notifications are about alerts, the same permission
+            # column fanout_appliance_event() itself already gates
+            # creation on, so retrieval and creation now agree. (2) it
+            # never filtered n.user_id at all, so ANY customer_viewer
+            # holding a permission row for a camera saw every recipient's
+            # own notification row for that camera -- the account owner's
+            # and every other viewer's, not just their own -- because
+            # fanout_appliance_event() inserts one independent row per
+            # recipient. Both close the same class of gap this phase's
+            # own audit exists to find.
+            rows = db.execute(
+                select + 'JOIN customer_camera_permissions p ON p.camera_id = n.camera_id AND p.user_id = ? AND p.can_alerts = 1 '
+                f'WHERE n.customer_id = ? {camera_filter}AND n.user_id = ? ORDER BY n.timestamp DESC LIMIT ?',
+                (user["id"], *params, user["id"], limit),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": ((row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}') if row["camera"] is not None else None,
+            "event_type": row["event_type"],
+            "severity": row["severity"],
+            "title": row["title"],
+            "message": row["message"],
+            "timestamp": row["timestamp"],
+            "thumbnail": row["thumbnail"],
+            "recording_id": row["recording_id"],
+            "event_id": row["event_id"],
+            "has_event_clip": bool(row["has_event_clip"]),
+            "read_at": row["read_at"],
+            "read": row["read_at"] is not None,
+        }
+        for row in rows
+    ]
+
+
+def _customer_notification_identity(request: Request) -> tuple[dict, str] | None:
+    """Resolves (identity, this identity's own partner_users.id) for a
+    portal customer_owner/customer_viewer caller, or None otherwise --
+    same identity contract as _customer_notifications() itself. The
+    notifications table's own user_id column is per-recipient (one row
+    per real customer_owner/customer_viewer fanout_appliance_event()
+    already created), so mark-read mutations below are always scoped to
+    this specific resolved id, never to every row a caller's LIST view
+    happens to include -- _customer_notifications()'s customer_owner
+    branch intentionally shows the whole account's notifications, but
+    that is a read-only visibility choice, not license for one user's
+    mark-read click to mutate another user's own row."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    with connection() as db:
+        user = db.execute(
+            "SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
+            (identity.get("email", ""), identity.get("customer_id")),
+        ).fetchone()
+    if not user:
+        return None
+    return identity, user["id"]
+
+
+@app.post("/api/customer/notifications/{notification_id}/read")
+def mark_customer_notification_read(request: Request, notification_id: str) -> dict:
+    resolved = _customer_notification_identity(request)
+    if not resolved:
+        raise HTTPException(status_code=403, detail="Customer portal access required.")
+    identity, user_id = resolved
+    from partner_db import connection
+    now = datetime.now().isoformat()
+    with connection() as db:
+        # id + user_id + customer_id all required for a match: the same
+        # 404-not-403, never-confirm-a-foreign-id convention this
+        # codebase's own tenant-authorization primitives already use --
+        # a notification_id belonging to a different customer, or to a
+        # different user under this same customer, is indistinguishable
+        # from one that simply does not exist.
+        cursor = db.execute(
+            "UPDATE notifications SET read_at=? WHERE id=? AND user_id=? AND customer_id=? AND read_at IS NULL",
+            (now, notification_id, user_id, identity["customer_id"]),
+        )
+        if cursor.rowcount == 0:
+            existing = db.execute(
+                "SELECT 1 FROM notifications WHERE id=? AND user_id=? AND customer_id=?",
+                (notification_id, user_id, identity["customer_id"]),
+            ).fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Notification not found.")
+            # Already read -- idempotent success, not an error, so a
+            # retried/duplicate click never surfaces as a failure.
+    return {"status": "ok", "id": notification_id, "read_at": now}
+
+
+@app.post("/api/customer/notifications/read-all")
+def mark_all_customer_notifications_read(request: Request) -> dict:
+    resolved = _customer_notification_identity(request)
+    if not resolved:
+        raise HTTPException(status_code=403, detail="Customer portal access required.")
+    identity, user_id = resolved
+    from partner_db import connection
+    now = datetime.now().isoformat()
+    with connection() as db:
+        cursor = db.execute(
+            "UPDATE notifications SET read_at=? WHERE user_id=? AND customer_id=? AND read_at IS NULL",
+            (now, user_id, identity["customer_id"]),
+        )
+        marked = cursor.rowcount
+    return {"status": "ok", "marked_read": marked}
 
 
 def _build_analytics_summary(events: list[dict], mock_data: bool) -> dict:
@@ -51814,7 +53798,7 @@ def _build_analytics_summary(events: list[dict], mock_data: bool) -> dict:
     recent_7 = [(event, stamp) for event, stamp in valid_events if stamp >= last_7_start]
 
     type_counts: dict[str, int] = {}
-    camera_counts = {str(camera): 0 for camera in range(1, CAMERA_COUNT + 1)}
+    camera_counts = {str(camera): 0 for camera in get_camera_numbers()}
     confidence_values: list[float] = []
     for event, _ in recent_7:
         event_type = str(event.get("event_type", "unknown"))
@@ -52267,7 +54251,7 @@ def ai_detection_status() -> dict:
 
 
 
-            for camera_number in range(1, CAMERA_COUNT + 1)
+            for camera_number in get_camera_numbers()
 
 
 
@@ -52474,7 +54458,7 @@ def ai_detection_page(request: Request) -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -55778,6 +57762,49 @@ def natural_analytics_search(request: NaturalSearchModel) -> dict:
 
 
 
+def _customer_authorized_event_id(request: Request, event_id: str) -> bool:
+    """True only when the caller isn't a portal customer_owner/
+    customer_viewer identity at all (the legacy/admin path below keeps
+    its own separate check), OR when it is one and event_id names a
+    detection_events row this identity is actually authorized to see --
+    same customer_id scoping as _customer_detection_events(), and the
+    same can_playback-gated camera restriction for customer_viewer, so
+    a viewer can never bookmark an event on a camera they were never
+    granted. Prevents a customer-portal caller from writing a review
+    for an event_id belonging to another customer (or, for a viewer,
+    to a camera on their own account they don't have access to) just
+    by guessing/enumerating ids -- this PUT route has no other camera
+    scoping of its own."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return True
+    from partner_db import connection
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            row = db.execute(
+                "SELECT 1 FROM detection_events WHERE id=? AND customer_id=?",
+                (event_id, identity["customer_id"]),
+            ).fetchone()
+        else:
+            user = db.execute(
+                "SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return False
+            row = db.execute(
+                "SELECT 1 FROM detection_events de "
+                "JOIN customer_camera_permissions p ON p.camera_id=de.camera_id AND p.user_id=? "
+                "WHERE de.id=? AND de.customer_id=? AND p.can_playback=1",
+                (user["id"], event_id, identity["customer_id"]),
+            ).fetchone()
+    return row is not None
+
+
 @app.put("/api/analytics/events/{event_id}/review")
 
 
@@ -55787,9 +57814,9 @@ def natural_analytics_search(request: NaturalSearchModel) -> dict:
 
 
 
-def review_analytics_event(event_id: str, review: EventReviewModel) -> dict:
-
-
+def review_analytics_event(event_id: str, review: EventReviewModel, request: Request) -> dict:
+    if not _customer_authorized_event_id(request, event_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this event.")
 
 
 
@@ -56498,10 +58525,21 @@ async def build_manual_clip(
 
 
 
-async def create_clip(request: ClipRequest) -> dict:
-
-
-
+async def create_clip(request: ClipRequest, http_request: Request) -> dict:
+    # This job-based manual-clip tool predates the multi-tenant cloud
+    # customer/camera.id split (its camera field is still the legacy,
+    # single-appliance camera_number -- see ClipRequest) and has no
+    # customer-portal caller today; it had no authorization check of
+    # any kind, so any direct POST -- authenticated or not -- could
+    # queue a clip job for any camera_number on this appliance. Gated
+    # the same way the rest of the legacy VMS pages are: an
+    # authenticated identity with view_analytics, restricted to the
+    # cameras that identity is actually allowed to see.
+    caller = current_user(http_request)
+    if not has_permission(caller, "view_analytics"):
+        raise HTTPException(status_code=403, detail="Analytics permission is required.")
+    if request.camera not in set(user_camera_ids(caller)):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
 
 
@@ -68486,7 +70524,7 @@ def home() -> str:
 
 
 
-        for n in range(1, CAMERA_COUNT + 1)
+        for n in get_camera_numbers()
 
 
 
@@ -69063,7 +71101,7 @@ def dashboard_intelligence_api() -> dict:
 
 
 
-    camera_counts = {camera_number: 0 for camera_number in range(1, CAMERA_COUNT + 1)}
+    camera_counts = {camera_number: 0 for camera_number in get_camera_numbers()}
 
 
 
@@ -69690,7 +71728,34 @@ def dashboard_intelligence_api() -> dict:
 
 
 
-def camera_health_page() -> str:
+def camera_health_page(request: Request) -> str:
+
+
+
+
+
+
+
+
+    user = current_user(request)
+
+
+
+
+
+
+
+
+    if not has_permission(user, "view_analytics"):
+
+
+
+
+
+
+
+
+        return permission_denied_page("Camera health", "camera-health", "view_analytics")
 
 
 
@@ -69708,7 +71773,7 @@ def camera_health_page() -> str:
 
 
 
-    for camera_number in range(1, CAMERA_COUNT + 1):
+    for camera_number in get_camera_numbers():
 
 
 
@@ -69891,6 +71956,15 @@ def camera_health_page() -> str:
 
 
         )
+
+    if not rows:
+        # A fresh dynamic-provisioning appliance with zero cameras --
+        # get_camera_numbers() now honestly returns [] instead of the
+        # old phantom Camera 1-4 fallback (see legacy_camera_numbers_
+        # in_use()) -- must not render an empty table with no
+        # explanation; a real legacy install still populates rows above
+        # and never reaches this branch.
+        rows = ['<tr><td colspan="9" class="empty">No cameras configured yet. Add a camera via Remote Device Management or camera discovery to see its health here.</td></tr>']
 
 
 
@@ -70223,7 +72297,7 @@ def camera_health_page() -> str:
 
 
 
-    const CAMERA_COUNT=__CAMERA_COUNT__;
+    const get_camera_count()=__CAMERA_COUNT__;
 
 
 
@@ -70873,7 +72947,7 @@ def camera_health_page() -> str:
 
 
 
-        document.getElementById('health-online-count').textContent=`${onlineCount}/${cameras.length||CAMERA_COUNT}`;
+        document.getElementById('health-online-count').textContent=`${onlineCount}/${cameras.length||get_camera_count()}`;
 
 
 
@@ -70882,7 +72956,7 @@ def camera_health_page() -> str:
 
 
 
-        document.getElementById('health-recording-count').textContent=`${recordingCount}/${cameras.length||CAMERA_COUNT}`;
+        document.getElementById('health-recording-count').textContent=`${recordingCount}/${cameras.length||get_camera_count()}`;
 
 
 
@@ -71062,7 +73136,7 @@ def camera_health_page() -> str:
 
 
 
-    """.replace("__CAMERA_COUNT__", str(CAMERA_COUNT))
+    """.replace("__CAMERA_COUNT__", str(get_camera_count()))
 
 
 
@@ -71107,7 +73181,20 @@ def camera_health_page() -> str:
 
 
 
-def dashboard() -> str:
+def dashboard(request: Request) -> str:
+    _customer_dashboard_cameras = _customer_playback_cameras(request)
+    if _customer_dashboard_cameras is not None:
+        # Customer-portal identity: only this customer's own camera
+        # numbers -- see camera_status()'s own comment for why the
+        # shared, multi-tenant get_camera_numbers() sequence below must
+        # never be used to build a real customer's Dashboard.
+        _dashboard_camera_numbers = [
+            camera["camera_number"]
+            for camera in _customer_dashboard_cameras
+            if camera.get("camera_number") is not None
+        ]
+    else:
+        _dashboard_camera_numbers = list(get_camera_numbers())
 
 
 
@@ -71413,7 +73500,7 @@ def dashboard() -> str:
 
 
 
-        for camera_number in range(1, CAMERA_COUNT + 1)
+        for camera_number in _dashboard_camera_numbers
 
 
 
@@ -74725,7 +76812,34 @@ def sales_training_resource_file(item_id: str, request: Request) -> Response:
 
 
 
-def analytics() -> str:
+def analytics(request: Request) -> str:
+
+
+
+
+
+
+
+
+    user = current_user(request)
+
+
+
+
+
+
+
+
+    if not has_permission(user, "view_analytics"):
+
+
+
+
+
+
+
+
+        return permission_denied_page("Analytics", "analytics", "view_analytics")
 
 
 
@@ -74752,7 +76866,7 @@ def analytics() -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -75526,7 +77640,7 @@ def analytics_rule_builder(analytic_type: str) -> str:
 
 
 
-    camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in range(1, CAMERA_COUNT + 1))
+    camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in get_camera_numbers())
 
 
 
@@ -75607,7 +77721,7 @@ def lpr_analytics_page() -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Modular analytic</p><h1>License plate recognition</h1></div></header><div class="mock-banner">Mock detection data: plate-search storage and filtering are functional; live OCR requires an installed LPR model.</div><section class="panel"><div class="library-toolbar"><input class="portal-search" id="plate-search" placeholder="Search full or partial plate"><select class="date-filter" id="plate-camera"><option value="">All cameras</option>{''.join(f'<option value="{n}">Camera {n}</option>' for n in range(1,CAMERA_COUNT+1))}</select><input class="date-filter" id="plate-from" type="date"><input class="date-filter" id="plate-to" type="date"></div><table class="data-table"><thead><tr><th>Time</th><th>Plate</th><th>Vehicle</th><th>Confidence</th><th>Camera</th><th>Clip</th></tr></thead><tbody>{rows or '<tr><td colspan="6">No plate records.</td></tr>'}</tbody></table></section>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Modular analytic</p><h1>License plate recognition</h1></div></header><div class="mock-banner">Mock detection data: plate-search storage and filtering are functional; live OCR requires an installed LPR model.</div><section class="panel"><div class="library-toolbar"><input class="portal-search" id="plate-search" placeholder="Search full or partial plate"><select class="date-filter" id="plate-camera"><option value="">All cameras</option>{''.join(f'<option value="{n}">Camera {n}</option>' for n in get_camera_numbers())}</select><input class="date-filter" id="plate-from" type="date"><input class="date-filter" id="plate-to" type="date"></div><table class="data-table"><thead><tr><th>Time</th><th>Plate</th><th>Vehicle</th><th>Confidence</th><th>Camera</th><th>Clip</th></tr></thead><tbody>{rows or '<tr><td colspan="6">No plate records.</td></tr>'}</tbody></table></section>"""
 
 
 
@@ -75679,7 +77793,7 @@ def people_analytics_page(title: str) -> str:
 
 
 
-    summaries = "".join(f'<article class="stat"><span class="stat-label">Camera {n}</span><span class="stat-value">{(n*7)+3} entries</span><div class="health-detail">{n*4+1} exits · {n+2} current</div></article>' for n in range(1,CAMERA_COUNT+1))
+    summaries = "".join(f'<article class="stat"><span class="stat-label">Camera {n}</span><span class="stat-value">{(n*7)+3} entries</span><div class="health-detail">{n*4+1} exits · {n+2} current</div></article>' for n in get_camera_numbers())
 
 
 
@@ -76399,7 +78513,7 @@ def smart_search_page() -> str:
 
 
 
-        for n in range(1, CAMERA_COUNT + 1)
+        for n in get_camera_numbers()
 
 
 
@@ -78010,6 +80124,200 @@ def smart_search_page() -> str:
 
 
 
+def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
+    """Customer-portal Investigate: same page shape as the legacy/admin
+    Investigate below, but every input is re-derived from the
+    already-authorized customer identity instead of the legacy
+    current_user()/user_camera_ids()/load_motion_events()+
+    analytics_events() path.
+
+    cameras is the caller's own already-scoped list from
+    _customer_playback_cameras() (full fleet for customer_owner, only
+    can_playback-granted cameras for customer_viewer -- the exact same
+    authorization Playback and Live already trust). Events come from
+    _customer_detection_events(), the exact same tenant-scoped,
+    per-camera-permissioned detection_events rows the Events page and
+    /api/analytics/events already serve -- Investigate is deliberately
+    NOT given its own separate query here, so there is only ever one
+    place that decides which of a customer's events exist to see.
+
+    No admin/partner data ever reaches this function: cameras and
+    events are both pre-filtered to this one identity's own customer_id
+    (and, for customer_viewer, further to their own granted cameras)
+    before this function is ever called.
+
+    "Create case" is intentionally omitted here -- case management
+    (/api/investigation-cases and friends) remains an
+    administrator/installer-only workflow with no per-tenant scoping
+    yet; see that route's own docstring. Bookmarking a single event via
+    PUT /api/analytics/events/{id}/review is kept (it stays scoped to
+    events this identity was already shown), and evidence export stays
+    a pure client-side JSON download of the same already-authorized
+    events -- neither call touches another customer's data.
+
+    events comes from _customer_investigate_events(), NOT the generic
+    _customer_detection_events() with no limit -- see that function's
+    own docstring for why: a plain most-recent-500-overall window
+    measurably starves out the large majority of a real customer's
+    smart_motion events once their total history grows past a few
+    hundred events, which is not a hypothetical edge case in this
+    system's real usage pattern."""
+    events = _customer_investigate_events(request) or []
+
+    camera_options = "".join(
+        f'<option value="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</option>'
+        for camera in cameras
+    )
+
+    normalized = []
+    for event in events:
+        camera_id = event.get("camera_id")
+        timestamp = str(event.get("timestamp") or "")
+        normalized.append({
+            "id": event["id"],
+            "camera_id": camera_id,
+            "camera": event.get("camera_name") or f'Camera {event.get("camera")}',
+            "site": event.get("site") or "",
+            "timestamp": timestamp,
+            "end_time": timestamp,
+            "event_type": str(event.get("event_type") or "motion").lower(),
+            "thumbnail": event.get("thumbnail") or "",
+            "recording": _customer_event_playback_href(camera_id, timestamp, event.get("id"), bool(event.get("has_event_clip"))),
+            "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
+            "confidence": event.get("confidence"),
+            "plate": event.get("plate_number") or "",
+            "color": event.get("vehicle_color") or "",
+            "rule": event.get("rule_name") or "",
+            "review": load_json_file(EVENT_REVIEWS_FILE, {}).get(event["id"], {}),
+        })
+    # id tie-break for the same reason _customer_investigate_events()
+    # already sorts this way: a correlated Motion+Smart Motion pair
+    # shares an identical timestamp, so a timestamp-only sort key does
+    # not guarantee the same relative order across repeated renders.
+    # Stable re-sort over an already-bounded (<= 2500) list -- no new
+    # truncation happens here, only the display order is fixed.
+    normalized.sort(key=lambda item: (item.get("timestamp", ""), item.get("id", "")), reverse=True)
+    investigation_data = json.dumps(normalized, default=str)
+
+    if not cameras:
+        content = (
+            '<header class="topbar"><div><p class="eyebrow">AI event investigation</p><h1>Investigate</h1></div>'
+            '<a class="ghost-button" href="/customer-account">Account</a></header>'
+            '<section class="panel"><div class="empty">No cameras are available for investigation on this account.</div></section>'
+        )
+        return page_shell("Investigate", "investigate", content)
+
+    content = f"""<header class="topbar"><div><p class="eyebrow">AI event investigation</p><h1>Investigate</h1></div><a class="ghost-button" href="/customer-account">Account</a></header>
+    <section class="investigation-shell">
+      <aside class="investigation-filters">
+        <h2>Search evidence</h2>
+        <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
+        <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select></label>
+        <label>Camera<select id="investigation-camera"><option value="">All cameras</option>{camera_options}</select></label>
+        <label>Vehicle or clothing color<input id="investigation-color" placeholder="red, blue, silver"></label>
+        <label>License plate<input id="investigation-plate" placeholder="Plate text"></label>
+        <label>From<input id="investigation-from" type="datetime-local"></label>
+        <label>To<input id="investigation-to" type="datetime-local"></label>
+        <div class="investigation-actions"><button class="action-button" id="run-investigation" type="button">Search</button><button class="ghost-button" id="clear-investigation" type="button">Clear</button></div>
+      </aside>
+      <div>
+        <section class="investigation-summary">
+          <div class="stat"><span class="stat-label">Results</span><span class="stat-value" id="investigation-result-count">0</span></div>
+          <div class="stat"><span class="stat-label">People</span><span class="stat-value" id="investigation-people-count">0</span></div>
+          <div class="stat"><span class="stat-label">Vehicles</span><span class="stat-value" id="investigation-vehicle-count">0</span></div>
+          <div class="stat"><span class="stat-label">Bookmarked</span><span class="stat-value" id="investigation-bookmark-count">0</span></div>
+        </section>
+        <div class="investigation-grid" id="investigation-grid"></div>
+        <section class="evidence-panel">
+          <div class="panel-head"><div><h2>Evidence export</h2><div class="health-detail">Select results and export a JSON evidence manifest. Video export continues to use existing playback tools.</div></div></div>
+          <div class="investigation-actions"><button id="select-visible-evidence" type="button">Select visible results</button><button id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Export manifest</button></div>
+        </section>
+      </div>
+    </section>"""
+
+    scripts = f"""<script>
+    const investigationEvents={investigation_data};
+    const selectedEvidence=new Set();
+    const queryInput=document.getElementById('investigation-query');
+    const typeInput=document.getElementById('investigation-type');
+    const cameraInput=document.getElementById('investigation-camera');
+    const colorInput=document.getElementById('investigation-color');
+    const plateInput=document.getElementById('investigation-plate');
+    const fromInput=document.getElementById('investigation-from');
+    const toInput=document.getElementById('investigation-to');
+    const grid=document.getElementById('investigation-grid');
+    function isVehicle(type){{return ['car','truck','bus','motorcycle','bicycle','vehicle'].includes(type)}}
+    function naturalMatches(event,query){{
+      if(!query)return true;
+      const combined=[event.event_type,event.camera,event.site,event.color,event.plate,event.rule,event.timestamp,event.review?.notes,(event.review?.tags||[]).join(' ')].join(' ').toLowerCase();
+      return query.toLowerCase().split(/\\s+/).filter(Boolean).every(token=>combined.includes(token));
+    }}
+    function visibleEvents(){{
+      const from=fromInput.value?new Date(fromInput.value):null;
+      const to=toInput.value?new Date(toInput.value):null;
+      return investigationEvents.filter(event=>{{
+        const stamp=event.timestamp?new Date(event.timestamp):null;
+        const requested=typeInput.value;
+        return (!requested||event.event_type===requested||(requested==='vehicle'&&isVehicle(event.event_type)))
+          &&(!cameraInput.value||String(event.camera_id)===cameraInput.value)
+          &&(!colorInput.value||String(event.color||'').toLowerCase().includes(colorInput.value.toLowerCase()))
+          &&(!plateInput.value||String(event.plate||'').toLowerCase().includes(plateInput.value.toLowerCase()))
+          &&(!from||!stamp||stamp>=from)
+          &&(!to||!stamp||stamp<=to)
+          &&naturalMatches(event,queryInput.value.trim());
+      }});
+    }}
+    function card(event){{
+      const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
+      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      return `<article class="investigation-card" data-event-id="${{event.id}}">
+        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{event.event_type.replaceAll('_',' ')}}</span></div>
+        <div class="investigation-body">
+          <div class="investigation-title"><h3>${{event.event_type.replaceAll('_',' ')}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
+          <div class="investigation-meta">${{event.camera}} · ${{String(event.timestamp||'').replace('T',' ').slice(0,19)}}<br>Confidence ${{confidence}}${{event.color?` · ${{event.color}}`:''}}${{event.plate?` · ${{event.plate}}`:''}}</div>
+          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.live?`<a href="${{event.live}}">Live camera</a>`:''}}</div>
+        </div>
+      </article>`;
+    }}
+    function render(){{
+      const results=visibleEvents();
+      grid.innerHTML=results.map(card).join('')||'<div class="investigation-empty">No events matched this investigation.</div>';
+      document.getElementById('investigation-result-count').textContent=results.length;
+      document.getElementById('investigation-people-count').textContent=results.filter(event=>event.event_type==='person').length;
+      document.getElementById('investigation-vehicle-count').textContent=results.filter(event=>isVehicle(event.event_type)).length;
+      document.getElementById('investigation-bookmark-count').textContent=results.filter(event=>event.review?.bookmarked).length;
+      grid.querySelectorAll('.investigation-card').forEach(cardElement=>{{
+        const event=investigationEvents.find(item=>item.id===cardElement.dataset.eventId);
+        cardElement.querySelector('.evidence-checkbox').addEventListener('change',change=>{{
+          if(change.target.checked)selectedEvidence.add(event.id);else selectedEvidence.delete(event.id);
+        }});
+        cardElement.querySelector('.bookmark-investigation').addEventListener('click',async click=>{{
+          const payload={{event_id:event.id,acknowledged:Boolean(event.review?.acknowledged),bookmarked:true,false_positive:Boolean(event.review?.false_positive),tags:event.review?.tags||[],notes:event.review?.notes||''}};
+          const response=await fetch(`/api/analytics/events/${{event.id}}/review`,{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
+          const result=await response.json();
+          if(!response.ok||result.status!=='complete')return showToast(result.message||'Bookmark failed.');
+          event.review=result.review;click.currentTarget.textContent='Bookmarked';render();showToast('Event bookmarked.');
+        }});
+      }});
+    }}
+    function clearFilters(){{[queryInput,typeInput,cameraInput,colorInput,plateInput,fromInput,toInput].forEach(input=>input.value='');render()}}
+    document.getElementById('run-investigation').addEventListener('click',render);
+    document.getElementById('clear-investigation').addEventListener('click',clearFilters);
+    queryInput.addEventListener('keydown',event=>{{if(event.key==='Enter')render()}});
+    document.getElementById('select-visible-evidence').addEventListener('click',()=>{{visibleEvents().forEach(event=>selectedEvidence.add(event.id));render()}});
+    document.getElementById('clear-evidence-selection').addEventListener('click',()=>{{selectedEvidence.clear();render()}});
+    document.getElementById('export-evidence').addEventListener('click',()=>{{
+      const selected=investigationEvents.filter(event=>selectedEvidence.has(event.id));
+      if(!selected.length)return showToast('Select at least one event first.');
+      const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,color:colorInput.value,plate:plateInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
+      const blob=new Blob([JSON.stringify(manifest,null,2)],{{type:'application/json'}});
+      const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='anyaicam_evidence_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(link.href);
+    }});
+    render();
+    </script>"""
+    return page_shell("Investigate", "investigate", content, scripts)
+
+
 @app.get("/investigate", response_class=HTMLResponse)
 
 
@@ -78020,6 +80328,18 @@ def smart_search_page() -> str:
 
 
 def investigation_page(request: Request) -> str:
+
+    # Customer-portal identity, if any, gets its own tenant-scoped,
+    # per-camera-permissioned Investigate experience -- the same
+    # partner_identity()/customer_camera_permissions boundary Live,
+    # Playback, Events and Smart Alerts already enforce (see
+    # _customer_playback_cameras()/_customer_detection_events()).
+    # Mirrors playback()'s own dual-mode dispatch below: everyone else
+    # (administrator/support_admin/installer -- the legacy VMS identity)
+    # falls through to the existing behavior, completely unchanged.
+    _customer_cameras = _customer_playback_cameras(request)
+    if _customer_cameras is not None:
+        return _render_customer_investigate(_customer_cameras, request)
 
 
 
@@ -79018,7 +81338,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
 
 
 
@@ -83104,7 +85424,7 @@ def evidence_integrity_page(request: Request) -> str:
 
 
 
-        return permission_denied_page("Evidence integrity", "cases", "view_analytics")
+        return permission_denied_page("Evidence integrity", "evidence", "view_analytics")
 
 
 
@@ -83509,7 +85829,7 @@ def evidence_integrity_page(request: Request) -> str:
 
 
 
-    return page_shell("Evidence integrity", "cases", content, scripts)
+    return page_shell("Evidence integrity", "evidence", content, scripts)
 
 
 
@@ -86344,7 +88664,7 @@ def create_notification_rule(payload: NotificationRuleCreateModel, request: Requ
 
 
 
-        "camera_ids": sorted(set(int(item) for item in payload.camera_ids if 1 <= int(item) <= CAMERA_COUNT)),
+        "camera_ids": sorted(set(int(item) for item in payload.camera_ids if int(item) in get_camera_numbers())),
 
 
 
@@ -86686,7 +89006,7 @@ def update_notification_rule(rule_id: str, payload: NotificationRuleUpdateModel,
 
 
 
-            value = sorted(set(int(item) for item in value if 1 <= int(item) <= CAMERA_COUNT))
+            value = sorted(set(int(item) for item in value if int(item) in get_camera_numbers()))
 
 
 
@@ -87091,7 +89411,7 @@ def enterprise_notifications_page(request: Request) -> str:
 
 
 
-    camera_options = "".join(f'<option value="{camera}">Camera {camera}</option>' for camera in range(1,CAMERA_COUNT+1))
+    camera_options = "".join(f'<option value="{camera}">Camera {camera}</option>' for camera in get_camera_numbers())
 
 
 
@@ -104137,7 +106457,50 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
 
-    content = f'''<header class="topbar"><div><p class="eyebrow">Administrator portal</p><h1>Customer account operations</h1></div><span class="pill">Account data only</span></header>
+    # Real, live customer -> site -> appliance -> camera records
+    # (partner_db's SQL customers/sites/appliances/cameras tables -- the
+    # same data the Partner Portal's /partner?tab=customers and the Add
+    # New Customer wizard already read/write) are a separate data model
+    # from the billing/subscription-request JSON stores this page has
+    # always used below. Rather than duplicate the onboarding workflow
+    # with a second implementation, Add New Customer here opens the
+    # exact same /partner/onboarding wizard the Partner Portal uses --
+    # see partner_workspace.py's _dual_mode_identity(), which accepts
+    # this admin session (via a live admin_partner_links bridge, see
+    # admin_partner_bridge.py) with no second manual Partner Portal
+    # login and no new backend workflow. Global scope for an
+    # administrator identity -- see render_partner_workspace() and
+    # onboard_customer() in partner_workspace.py's own comments -- means
+    # every real customer across every partner appears here, not just
+    # one partner's bucket.
+    from partner_db import rows as _pdb_rows
+
+    _global_customers = _pdb_rows('SELECT * FROM customers ORDER BY created_at DESC')
+    _global_customer_rows = []
+    for _customer in _global_customers:
+        _site_count = len(_pdb_rows('SELECT id FROM sites WHERE customer_id=?', (_customer['id'],)))
+        _appliance_rows = _pdb_rows('SELECT online_status FROM appliances WHERE customer_id=?', (_customer['id'],))
+        _camera_count = len(_pdb_rows('SELECT id FROM cameras WHERE customer_id=?', (_customer['id'],)))
+        _online_count = sum(1 for _a in _appliance_rows if _a.get('online_status') == 'online')
+        _global_customer_rows.append(
+            f'<tr><td>{escape(_customer.get("name") or "Unnamed customer")}</td>'
+            f'<td>{escape(_customer.get("company") or "")}</td>'
+            f'<td>{escape(_customer.get("partner_id") or "")}</td>'
+            f'<td>{escape((_customer.get("status") or "active").replace("_"," ").title())}</td>'
+            f'<td>{_site_count}</td>'
+            f'<td>{len(_appliance_rows)} ({_online_count} online)</td>'
+            f'<td>{_camera_count}</td>'
+            f'<td><a class="download" href="/partner/customers/{_customer["id"]}">Inspect</a></td></tr>'
+        )
+    _global_customers_table = (
+        '<table class="data-table"><thead><tr><th>Customer</th><th>Company</th><th>Partner</th><th>Status</th>'
+        '<th>Sites</th><th>Appliances</th><th>Cameras</th><th></th></tr></thead><tbody>'
+        + (''.join(_global_customer_rows) if _global_customer_rows else '<tr><td colspan="8">No real customer records yet.</td></tr>')
+        + '</tbody></table>'
+    )
+    _global_customers_section = f'<section class="panel" style="overflow:auto;margin-top:18px"><div class="panel-head"><h2>All customers &middot; every partner</h2></div>{_global_customers_table}</section>'
+
+    content = f'''<header class="topbar"><div><p class="eyebrow">Administrator portal</p><h1>Customer account operations</h1></div><div class="dialog-actions"><a class="action-button" href="/partner/onboarding">Add New Customer</a><span class="pill">Account data only</span></div></header>{_global_customers_section}
 
 
 
@@ -105524,15 +107887,6 @@ def administrator_activation_operations_page(request: Request) -> str:
 
 
             ("Deployment", "deployment" in completed),
-
-
-
-
-
-
-
-
-            ("Cameras", "cameras" in completed),
 
 
 
@@ -108918,6 +111272,22 @@ def create_stripe_checkout(
 
     user = current_user(request)
 
+    # Provisioning Phase 2: prefer the authoritative customer identity
+    # (partner_identity()/customers.id) over the legacy current_user()/
+    # users.json identity when a real customer_owner session exists --
+    # see customer_entitlements.py's module docstring for the audit
+    # finding this closes. current_user() is still consulted (both here
+    # and below) so a legacy/internal account with no authoritative
+    # customer record keeps working exactly as before -- additive, not
+    # a replacement.
+    from partner_portal import partner_identity as _authoritative_identity
+    _identity = _authoritative_identity(request)
+    authoritative_customer_id = ""
+    authoritative_email = ""
+    if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
+        authoritative_customer_id = str(_identity["customer_id"])
+        authoritative_email = str(_identity.get("email") or "")
+
 
 
 
@@ -109150,7 +111520,13 @@ def create_stripe_checkout(
 
 
 
-        ("line_items[0][quantity]", str(quantity)),
+        # Provisioning Phase 3: fixed camera-slot tiers -- the Stripe
+        # line-item quantity is hard-coded to 1 (one subscription to one
+        # specific fixed-tier price), never the customer-submitted
+        # `quantity` field, so it can never become a slot-count multiplier
+        # even if a future maintainer starts reading Stripe's own
+        # quantity value instead of the server-side tier map.
+        ("line_items[0][quantity]", "1"),
 
 
 
@@ -109178,6 +111554,15 @@ def create_stripe_checkout(
 
 
         ("metadata[anyaicam_plan]", plan),
+        # Provisioning Phase 3: fixed camera-slot tiers -- price_id is
+        # chosen server-side above (stripe_price_map()), never from the
+        # request body, and is the sole key the webhook handler uses to
+        # look up the server-verified camera-slot maximum (see
+        # customer_entitlements.py's PRICE_ID_CAMERA_SLOT_MAP). The
+        # customer-submitted `quantity` is deliberately NOT sent as
+        # entitlement-bearing metadata any more -- see the hard-coded
+        # line_items[0][quantity] below.
+        ("metadata[anyaicam_stripe_price_id]", price_id),
 
 
 
@@ -109196,6 +111581,7 @@ def create_stripe_checkout(
 
 
         ("subscription_data[metadata][anyaicam_plan]", plan),
+        ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
 
 
 
@@ -109214,6 +111600,15 @@ def create_stripe_checkout(
 
 
     ]
+    if authoritative_customer_id:
+        # Provisioning Phase 2: carry the authoritative customers.id
+        # through Stripe metadata on both the session and the
+        # subscription it creates, so the webhook handler can resolve
+        # identity directly instead of ever re-deriving it from
+        # customer-supplied email (see customer_entitlements.py's
+        # _sync_checkout_completed()/_sync_subscription_change()).
+        fields.append(("metadata[anyaicam_customer_id]", authoritative_customer_id))
+        fields.append(("subscription_data[metadata][anyaicam_customer_id]", authoritative_customer_id))
 
 
 
@@ -109249,7 +111644,7 @@ def create_stripe_checkout(
 
 
 
-    elif account.get("billing_email") or user.get("email"):
+    elif authoritative_email or account.get("billing_email") or user.get("email"):
 
 
 
@@ -109276,7 +111671,7 @@ def create_stripe_checkout(
 
 
 
-            str(account.get("billing_email") or user.get("email")),
+            str(authoritative_email or account.get("billing_email") or user.get("email")),
 
 
 
@@ -109639,6 +112034,95 @@ def create_stripe_checkout(
     }
 
 
+@app.post("/api/customer/camera-slots/checkout")
+def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Request) -> dict:
+    """Provisioning Phase 8: the customer-facing checkout that was
+    missing for camera-slot capacity. customer_entitlements.PLAN_TIERS
+    already has real, configured Stripe test-mode Price IDs, and the
+    webhook side (resolve_tier()/_sync_checkout_completed()/
+    upsert_entitlement()) already correctly turns a completed session
+    into a real entitlement -- but nothing in this app ever CREATED a
+    Checkout Session for one of those prices. The only purchase button
+    that existed, create_stripe_checkout() above, is for the unrelated
+    starter/professional/enterprise LICENSE tiers (stripe_price_map()),
+    a completely different product line. Confirmed live on
+    anyaicam-staging (2026-09-12): a real, newly-activated appliance
+    with zero configured cameras was refused at its very first camera
+    provisioning attempt with "Camera limit reached... licensed for 0
+    camera(s)" -- total_camera_slots() was correctly summing zero real
+    entitlement rows, because there was never a way to create one.
+
+    mode=subscription (a recurring camera-slot plan, matching create_
+    stripe_checkout()'s own mode -- NOT mode=payment like the one-time
+    create_hardware_checkout() below). The tier is resolved server-side
+    only from PLAN_TIERS, never from a browser-submitted price_id --
+    the same discipline every other checkout endpoint in this file
+    already applies. customer_owner identity is REQUIRED here (not
+    optional the way the older two endpoints treat it), so metadata[
+    anyaicam_customer_id] is always present: _sync_checkout_completed()
+    only falls back to email-based pending_customer_links reconciliation
+    when that's missing, and an already-authenticated customer buying
+    capacity for their own account should never need that fallback.
+    """
+    from partner_portal import partner_identity as _authoritative_identity
+    identity = _authoritative_identity(request)
+    if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
+        raise HTTPException(status_code=403, detail="Customer owner permission required.")
+    from customer_entitlements import PLAN_TIERS
+    plan_type = payload.plan_type.strip().lower()
+    tier_label = payload.tier_label.strip()
+    tier = next((t for t in PLAN_TIERS if t[0] == plan_type and t[1] == tier_label), None)
+    if not tier:
+        raise HTTPException(status_code=400, detail="Unknown camera-slot tier.")
+    _, _, _, _, camera_slot_maximum, _, env_var = tier
+    price_id = os.environ.get(env_var, "").strip()
+    if not price_id:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {plan_type} {tier_label}.")
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    customer_id = identity["customer_id"]
+    fields = [
+        ("mode", "subscription"),
+        ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=cancelled"),
+        ("client_reference_id", customer_id),
+        ("line_items[0][price]", price_id),
+        # Fixed-tier subscription -- always exactly one, never a
+        # customer-submitted multiplier (see create_stripe_checkout()'s
+        # own comment on this same discipline).
+        ("line_items[0][quantity]", "1"),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_customer_id]", customer_id),
+        ("metadata[anyaicam_camera_slot_plan_type]", plan_type),
+        ("metadata[anyaicam_camera_slot_tier_label]", tier_label),
+        ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
+        ("subscription_data[metadata][anyaicam_customer_id]", customer_id),
+        ("allow_promotion_codes", "true"),
+    ]
+    if identity.get("email"):
+        fields.append(("customer_email", str(identity["email"])))
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+    structured_log(
+        "stripe.camera_slot_checkout_created",
+        session_id=session_id,
+        customer_id=customer_id,
+        plan_type=plan_type,
+        tier_label=tier_label,
+        camera_slot_maximum=camera_slot_maximum,
+    )
+    return {
+        "status": "complete",
+        "session_id": session_id,
+        "checkout_url": checkout_url,
+        "plan_type": plan_type,
+        "tier_label": tier_label,
+        "camera_slot_maximum": camera_slot_maximum,
+        "message": "Stripe Checkout Session created.",
+    }
 
 
 
@@ -109661,6 +112145,95 @@ def create_stripe_checkout(
 
 
 
+
+
+
+
+
+@app.post("/api/payments/hardware-checkout")
+def create_hardware_checkout(payload: HardwareCheckoutCreateModel, request: Request) -> dict:
+    """Provisioning Phase 5: one-time HARDWARE purchase checkout (Ryzen
+    appliances, the Numato relay module) -- mode=payment, deliberately
+    separate from create_stripe_checkout() above (subscription mode,
+    legacy plan/camera-slot flow). The customer selects a catalog `sku`
+    (see HardwareCheckoutCreateModel); the Stripe Price ID is resolved
+    server-side from hardware_orders.HARDWARE_CATALOG only -- a browser
+    can never submit an arbitrary Price ID here, matching the same
+    discipline create_stripe_checkout() already applies to `plan`. See
+    hardware_orders.py's module docstring for why this is a separate
+    catalog/table from customer_entitlements' camera-slot tiers, and
+    stays that way end to end: this endpoint never touches
+    customer_entitlements, and the webhook-side sync this feeds
+    (hardware_orders.sync_hardware_order_from_stripe_event()) never
+    grants a camera slot.
+    """
+    user = current_user(request)
+
+    from partner_portal import partner_identity as _authoritative_identity
+    _identity = _authoritative_identity(request)
+    authoritative_customer_id = ""
+    authoritative_email = ""
+    if _identity and _identity.get("role") == "customer_owner" and _identity.get("customer_id"):
+        authoritative_customer_id = str(_identity["customer_id"])
+        authoritative_email = str(_identity.get("email") or "")
+
+    from hardware_orders import HARDWARE_CATALOG
+    sku = payload.sku.strip()
+    catalog_entry = next((item for item in HARDWARE_CATALOG if item[0] == sku), None)
+    if not catalog_entry:
+        raise HTTPException(status_code=400, detail="Unknown hardware SKU.")
+    _, product, name, amount_cents, env_var = catalog_entry
+    price_id = os.environ.get(env_var, "").strip()
+    if not price_id:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {sku}.")
+
+    quantity = max(1, min(10, int(payload.quantity)))
+
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+
+    fields = [
+        ("mode", "payment"),
+        ("success_url", f"{PUBLIC_BASE_URL}/subscription-portal?hardware_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/subscription-portal?hardware_payment=cancelled"),
+        ("line_items[0][price]", price_id),
+        ("line_items[0][quantity]", str(quantity)),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_hardware_sku]", sku),
+        ("metadata[anyaicam_hardware_quantity]", str(quantity)),
+        ("allow_promotion_codes", "false"),
+    ]
+    if authoritative_customer_id:
+        fields.append(("metadata[anyaicam_customer_id]", authoritative_customer_id))
+
+    account = billing_account_for_user(user)
+    customer_id_for_stripe = stripe_customer_id_for_account(account)
+    if customer_id_for_stripe:
+        fields.append(("customer", customer_id_for_stripe))
+    elif authoritative_email or account.get("billing_email") or user.get("email"):
+        fields.append(("customer_email", str(authoritative_email or account.get("billing_email") or user.get("email"))))
+
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+
+    structured_log(
+        "stripe.hardware_checkout_created",
+        session_id=session_id,
+        sku=sku,
+        quantity=quantity,
+        user_id=user.get("id"),
+    )
+    return {
+        "status": "complete",
+        "session_id": session_id,
+        "checkout_url": checkout_url,
+        "sku": sku,
+        "product_name": name,
+        "message": "Stripe Checkout Session created.",
+    }
 
 
 @app.post("/api/payments/customer-portal")
@@ -110311,61 +112884,121 @@ async def stripe_webhook(request: Request) -> dict:
 
 
 
-    if not record_stripe_webhook_event(event):
+    # Provisioning Phase 7: record_stripe_webhook_event() below is the
+    # pre-existing, unchanged Stripe-event dedup gate -- still the sole
+    # authority on "have we seen this exact event id before" and still
+    # never weakened. What changed: a duplicate no longer short-circuits
+    # the ENTIRE route before the notification layer gets a turn. Root
+    # cause this fixes (found by this session's own real-HTTP-route
+    # staging validation, not by a unit test that calls sync/notify
+    # functions directly and therefore never passes through this gate at
+    # all): the old code returned {"status":"complete","duplicate":True}
+    # immediately on a duplicate, before EVER reaching notify_from_
+    # stripe_event() -- so a "service is ready" email that failed to send
+    # on the first delivery had no real trigger that could ever retry it,
+    # since Stripe only redelivers an event it has already seen, and that
+    # redelivery hit this exact gate every time.
+    is_new_event = record_stripe_webhook_event(event)
 
+    if is_new_event:
+        process_stripe_webhook_event(event)
 
+        # Provisioning Phase 2: additive authoritative-entitlement sync,
+        # on its own DB-backed idempotency (provisioning_webhook_events) --
+        # never the legacy record_stripe_webhook_event()/billing_accounts.
+        # json path above, which is untouched. Wrapped so a failure here
+        # can never break the 200 response Stripe needs to stop retrying,
+        # nor prevent the legacy processing above from having already run.
+        # Only ever runs for a genuinely NEW event id -- see is_new_event
+        # above -- so a redelivered event can never re-process/duplicate
+        # an entitlement.
+        try:
+            from customer_entitlements import sync_entitlement_from_stripe_event
+            sync_entitlement_from_stripe_event(event)
+        except Exception:
+            structured_log(
+                "provisioning.entitlement_sync_failed",
+                level="error",
+                event_id=event.get("id"),
+                event_type=event.get("type"),
+            )
 
+        # Provisioning Phase 5: additive one-time HARDWARE order sync, fully
+        # independent of the entitlement sync directly above -- see hardware_
+        # orders.py's module docstring for the fail-closed separation
+        # contract (a hardware Price ID is never in PRICE_ID_CAMERA_SLOT_MAP,
+        # a camera-slot Price ID is never in HARDWARE_PRICE_MAP, so neither
+        # sync can ever act on the other's event). Wrapped the same way, for
+        # the same reason: never break the 200 response Stripe needs, never
+        # block the entitlement sync above from having already run. Also
+        # only ever runs for a genuinely new event id, for the same reason --
+        # a redelivered event can never create a duplicate hardware order.
+        try:
+            from hardware_orders import sync_hardware_order_from_stripe_event
+            sync_hardware_order_from_stripe_event(event)
+        except Exception:
+            structured_log(
+                "provisioning.hardware_order_sync_failed",
+                level="error",
+                event_id=event.get("id"),
+                event_type=event.get("type"),
+            )
 
+        # Stripe TEST analytics wiring: additive analytics-add-on sync,
+        # fully independent of both syncs above -- see analytics_
+        # entitlements.py's module docstring for the fail-closed
+        # separation (an analytics Price ID is never in PRICE_ID_CAMERA_
+        # SLOT_MAP or HARDWARE_PRICE_MAP, and a camera-slot/hardware Price
+        # ID is never in ANALYTICS_PRICE_MAP, so none of the three syncs
+        # can ever act on another's event). Wrapped the same way, for the
+        # same reason: never break the 200 response Stripe needs, never
+        # block the syncs above from having already run. Also only ever
+        # runs for a genuinely new event id -- a redelivered event can
+        # never double-grant or double-revoke an analytics entitlement.
+        try:
+            from analytics_entitlements import sync_analytics_from_stripe_event
+            sync_analytics_from_stripe_event(event)
+        except Exception:
+            structured_log(
+                "provisioning.analytics_sync_failed",
+                level="error",
+                event_id=event.get("id"),
+                event_type=event.get("type"),
+            )
 
+    # Provisioning Phase 6/7: customer-facing post-purchase email. Runs on
+    # EVERY delivery of this event -- fresh (is_new_event True) or a
+    # genuine Stripe redelivery (is_new_event False) -- never gated behind
+    # is_new_event, unlike the entitlement/hardware syncs above. This is
+    # deliberate and safe, not a weakening of Stripe-event idempotency:
+    # notify_from_stripe_event() is independently idempotent per (event_
+    # id, notification_type) via its own provisioning_notifications table
+    # (see purchase_notifications.py's module docstring) -- a notification
+    # already marked 'sent' is skipped every time, so a fresh event and
+    # every later redelivery of it converge on sending at most one email.
+    # What redelivery now enables that it couldn't before this fix: a
+    # notification still marked 'failed' from an earlier delivery gets a
+    # real retry, because this call is no longer unreachable behind the
+    # duplicate-event gate. An email failure here still can never roll
+    # back or block the entitlement/order commit above (which, on a
+    # redelivery, already happened during a PRIOR delivery -- nothing to
+    # roll back on this one), nor the 200 response Stripe needs.
+    try:
+        from purchase_notifications import notify_from_stripe_event
+        notify_from_stripe_event(event)
+    except Exception:
+        structured_log(
+            "provisioning.purchase_notification_failed",
+            level="error",
+            event_id=event.get("id"),
+            event_type=event.get("type"),
+        )
 
-
-
+    if not is_new_event:
         return {
-
-
-
-
-
-
-
-
             "status": "complete",
-
-
-
-
-
-
-
-
             "duplicate": True,
-
-
-
-
-
-
-
-
         }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    process_stripe_webhook_event(event)
 
 
 
@@ -117142,6 +119775,872 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
+def _event_confidence_percent(confidence) -> str:
+    """Same defensive 0-1-vs-0-100 handling the customer analytics
+    search results view (renderResults()'s own JS) already uses --
+    reused here rather than assuming a scale, since different analytic
+    pipelines have historically stored confidence in different native
+    ranges (PPE/YOLO: 0-1, LPR: rescaled to 0-1 at write time, but nothing
+    here promises every future event type will be)."""
+    if confidence is None:
+        return "—"
+    value = float(confidence)
+    percent = value * 100 if value <= 1 else value
+    return f"{percent:.1f}%"
+
+
+def _naive_utc_timestamp_to_epoch_ms(raw_timestamp) -> int | None:
+    """Converts one of this system's naive-UTC event/recording
+    timestamp strings into an unambiguous epoch-millisecond integer for
+    embedding in a URL -- see _customer_event_actions()'s own docstring
+    for why. The naive string is explicitly labeled UTC (matching every
+    other place in this codebase that has confirmed these values are
+    UTC -- see _customer_camera_events()'s own docstring), then
+    converted; no ambiguous, timezone-less string is ever handed to a
+    browser's Date parser for this value. Returns None (never raises)
+    for anything that doesn't parse, so a caller can fail open to a
+    plain, non-deep-linked href."""
+    try:
+        text = str(raw_timestamp)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def _is_customer_event_pending(event: dict) -> bool:
+    return customer_event_media_state(event.get('has_event_clip'),event.get('timestamp')) == 'processing'
+
+
+def _customer_event_playback_href(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
+    """The one canonical Playback deep-link for a customer event --
+    every "jump to Playback" action for an event row builds its href
+    through here, never inline. Two known callers today:
+    _customer_event_actions() (Events page, Alerts) and
+    investigation_page() (Investigate).
+
+    Root cause history (2026-09-02, "playable events depend on a
+    nearby continuous recording" bug): an earlier version of this
+    logic (formerly inline in _customer_event_actions() only) routed
+    Playback to the event's own camera, but always via ?t=<event
+    time> -> renderCamera()'s findClipNear() against catalog
+    *recordings* -- i.e. "find whatever 5-minute recording happens to
+    cover this moment", never the event's own short clip. For any
+    event whose moment falls in a real gap between recordings (not
+    rare -- see the per-camera gap data in this project's earlier
+    timeline investigation), findClipNear() legitimately finds
+    nothing, playClip() is never called, and the event silently "does
+    not play" even though a real, playable, already-authorized event
+    clip exists at the object detection pipeline's own
+    detection_event_media/{event_id}. Deliberately not widening the
+    near= match window to paper over this -- that would risk playing
+    unrelated footage instead of fixing the actual mismatch.
+
+    Fix: for an event with a real clip (has_event_clip and a real
+    event_id), the link carries the event's own id (?event=<event_id>)
+    instead of a timestamp, and _render_customer_playback()'s
+    renderCamera() uses it to call the existing, already-authorized,
+    already-working /api/customer/events/{camera_id}/{event_id}/media/url
+    route directly -- the same route event-marker/mobile-event clicks
+    on the Playback timeline have always used, completely bypassing
+    findClipNear()/the recordings catalog. Analytics-only events (no
+    clip) keep the ?t=<epoch-ms>&autoplay=event / nearby-recording
+    behavior -- t is always a naive-UTC timestamp string converted to
+    an unambiguous epoch-ms integer via _naive_utc_timestamp_to_epoch_
+    ms(), never handed to a browser as a raw ISO string.
+
+    Root cause (2026-09-05, "Investigate -> Playback handoff" bug):
+    investigation_page() built its own separate, outdated inline
+    version of this exact URL -- ?camera=...&t=<raw ISO string>, no
+    event=, no autoplay=event -- so Investigate alone regressed to the
+    original 2026-09-02 bug (and never autoplayed even when a nearby
+    recording did exist) while Events/Alerts had already been fixed.
+    Extracted here so there is exactly one place this logic lives, and
+    investigation_page() now calls it too.
+
+    Returns the bare '/playback' path (no query string) when camera_id
+    is falsy -- a safe, always-valid href, never a broken deep link
+    built from a missing id."""
+    if not camera_id:
+        return '/playback'
+    href = f'/playback?camera={escape(str(camera_id), quote=True)}'
+    if event_id:
+        href += f'&event={escape(str(event_id), quote=True)}&autoplay=event'
+    elif timestamp:
+        epoch_ms = _naive_utc_timestamp_to_epoch_ms(timestamp)
+        if epoch_ms is not None:
+            href += f'&t={epoch_ms}&autoplay=event'
+    return href
+
+
+def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_clip=False) -> str:
+    """The same two useful actions on every real customer event/alert
+    row: jump to that camera's live view, or to Playback. The Playback
+    href itself is built by the shared _customer_event_playback_href()
+    -- see that function's own docstring for the full root-cause
+    history of why its exact shape (event= over t= whenever a real
+    clip exists; t= always as epoch-ms, never a raw ISO string)
+    matters."""
+    live_link = (
+        f'<a class="download" href="/customer/cameras/{escape(str(camera_id), quote=True)}/live">Live view</a> '
+        if camera_id else ''
+    )
+    if event_id and not has_event_clip:
+        state=customer_event_media_state(False,timestamp)
+        label='Processing…' if state=='processing' else 'Not ready yet'
+        return f'{live_link}<span class="event-action-pending" aria-disabled="true">{label}</span>'
+    playback_href = _customer_event_playback_href(camera_id, timestamp, event_id, has_event_clip)
+    return f'{live_link}<a class="download" href="{playback_href}">Playback</a>'
+
+
+def _render_customer_events(request: Request) -> str:
+    """Real, tenant-scoped Events page for a portal customer. Reuses
+    _customer_playback_cameras() (the real per-customer camera fleet,
+    including Camera 5 -- analytics being off for it just means it
+    never contributes any real rows here, an honest empty state rather
+    than a special case) for the camera picker/count, and
+    _customer_detection_events() (real detection_events rows, the same
+    data _render_customer_playback()'s timeline and the /analytics
+    search page already read) for the table -- no new event store, no
+    duplicated query. Falls back to the exact original legacy events()
+    body for any non-portal caller (see events() below)."""
+    cameras = _customer_playback_cameras(request) or []
+    events_list = _customer_detection_events(request, limit=200) or []
+
+    camera_options = "".join(
+        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}" '
+        f'data-camera-id="{escape(str(camera.get("id") or ""), quote=True)}"> '
+        f'{escape(_camera_display_label(camera))}</label>'
+        for camera in cameras
+    )
+
+    rows = []
+    for event in events_list[:200]:
+        raw_timestamp = str(event.get("timestamp") or "")
+        try:
+            # Root cause (2026-09-02, five-hour timestamp offset --
+            # Events-table portion): event.get("timestamp") is the same
+            # naive-UTC event_timestamp column _customer_camera_events()
+            # already documents as UTC (see that function's own
+            # docstring and APPLIANCE_TIMEZONE's). This table's "Time"
+            # column was formatting that value directly with strftime()
+            # -- no conversion at all -- displaying the raw UTC clock
+            # digits as if already Central, ~5-6 hours (DST-dependent)
+            # ahead of the customer's real local time. Label the naive
+            # value as UTC, then convert to APPLIANCE_TIMEZONE exactly
+            # once for display, the same "one correct conversion" this
+            # investigation already applied on the Playback page's own
+            # timeline/tooltips (playbackDate()).
+            occurred_at_utc = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            if occurred_at_utc.tzinfo is None:
+                occurred_at_utc = occurred_at_utc.replace(tzinfo=timezone.utc)
+            occurred_at = occurred_at_utc.astimezone(APPLIANCE_TIMEZONE)
+            timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
+        except ValueError:
+            timestamp_label = raw_timestamp or "Unknown time"
+        thumb_img = (
+            # 2026-09-16: loading="lazy" -- found live, real production
+            # data now has enough accumulated events (multi-thousand
+            # smart_motion volume, see _customer_investigate_events()'s
+            # own docstring on why that window exists) that eagerly
+            # requesting every row's own thumbnail as soon as the HTML
+            # parses was measured driving real 302-redirect S3 thumbnail
+            # traffic into the thousands per single page load, pushing
+            # the browser's load-completion past 30s even though every
+            # individual request itself succeeds -- confirmed via
+            # server access logs (clean 302s, zero AccessDenied) during
+            # the exact page loads that timed out. Off-screen rows now
+            # defer their image fetch until scrolled near, which is the
+            # standard fix for this exact "correct per-request but too
+            # many requests at once" shape and changes no visible
+            # behavior for a normal-sized event list.
+            f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" loading="lazy" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">'
+            if event.get("thumbnail") else "—"
+        )
+        # Inline event-clip player (2026-09-02): a same-page thumbnail
+        # click is a genuine, synchronous user gesture -- browsers give
+        # that the best real chance of allowing audible autoplay, unlike
+        # a cross-page navigation to /playback?event=..., where activation
+        # does not reliably carry over to the freshly-loaded document
+        # (see playEventClipDeepLink()'s own docstring on the Playback
+        # page). Reuses the exact same authorized
+        # /api/customer/events/{camera_id}/{event_id}/media/url route --
+        # no second media API, no change to that route's authorization.
+        # Analytics-only events (no has_event_clip) get no wrapper here
+        # at all -- their thumbnail stays exactly the plain, non-
+        # interactive image it already was; they keep using the
+        # existing nearby-recording Playback link in the Action column,
+        # unchanged.
+        camera_id_val = event.get("camera_id")
+        event_id_val = event.get("id")
+        # P0 #5 Phase 3 (2026-09-05): a genuinely fresh event can render
+        # here before its clip/thumbnail exists yet -- same reasoning as
+        # the mobile Playback cards' own isMobileEventPending() check
+        # (see that function's docstring). is_pending narrows "no
+        # thumbnail" to "no thumbnail AND still within the window this
+        # pipeline could plausibly still be working on it", computed
+        # once and reused for both the thumbnail and action cells so
+        # they never disagree with each other.
+        is_pending = _is_customer_event_pending(event)
+        if event.get("has_event_clip") and camera_id_val and event_id_val:
+            thumbnail = (
+                f'<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" '
+                f'data-camera-id="{escape(str(camera_id_val), quote=True)}" '
+                f'data-event-id="{escape(str(event_id_val), quote=True)}" '
+                f'data-thumb-html="{escape(thumb_img, quote=True)}">'
+                f'{thumb_img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span>'
+                f'</div>'
+            )
+        elif is_pending:
+            thumbnail = '<span class="event-thumb-pending">Processing…</span>'
+        else:
+            thumbnail = thumb_img
+        if is_pending:
+            # "Enable Playback only when ready" (P0 #5 Phase 3): while
+            # still processing, offer Live view (if this event has a
+            # camera at all) but not a Playback link yet -- there is
+            # deliberately no href here to click through to a recording
+            # that may not resolve to anything useful yet.
+            live_link = (
+                f'<a class="download" href="/customer/cameras/{escape(str(camera_id_val), quote=True)}/live">Live view</a> '
+                if camera_id_val else ''
+            )
+            action_html = (
+                f'{live_link}<span class="download event-action-pending" aria-disabled="true" '
+                f'title="Playback will be available once processing completes">Playback</span>'
+            )
+        else:
+            action_html = _customer_event_actions(camera_id_val, raw_timestamp, event_id_val, event.get("has_event_clip"))
+        type_label = str(event.get("event_type") or "event").replace("_", " ").title()
+        camera_number = event.get("camera")
+        event_id_attr = escape(str(event_id_val or ""), quote=True)
+        # P0 #5 remediation round 2 (2026-09-05, Codex second review):
+        # media_state is this row's own explicit, currently-rendered
+        # state -- tracked once here at render time (and again on the
+        # client at reconcile time, see reconcileDesktopEvent() in the
+        # script below) rather than re-derived from timestamp age at
+        # settlement time. See settleExpiredDesktopEvents()'s own
+        # docstring for exactly why re-deriving it from age was the
+        # bug: by the time the real 120s deadline arrives, every
+        # event's own age has already crossed that same 120s window, so
+        # the age-based predicate is false for everything regardless of
+        # whether a real response was ever received.
+        media_state = "ready" if event.get("has_event_clip") else ("processing" if is_pending else "unavailable")
+        rows.append(
+            f'<tr data-event-camera="{escape(str(camera_number or ""), quote=True)}" '
+            f'data-event-type="{escape(str(event.get("event_type") or ""), quote=True)}" '
+            f'data-event-id="{event_id_attr}" '
+            f'data-event-timestamp="{escape(raw_timestamp, quote=True)}" '
+            f'data-event-has-clip="{"1" if event.get("has_event_clip") else "0"}" '
+            f'data-media-state="{media_state}">'
+            f'<td>{escape(timestamp_label)}</td>'
+            f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
+            f'<td class="event-thumbnail-cell">{thumbnail}</td>'
+            f'<td><span class="pill">{escape(type_label)}</span></td>'
+            f'<td>{_event_confidence_percent(event.get("confidence"))}</td>'
+            f'<td class="event-action-cell">{action_html}</td></tr>'
+        )
+    event_body = "".join(rows) or (
+        '<tr><td colspan="6"><div class="empty-stage">No analytics events yet.<br>'
+        'Events appear here as soon as your cameras detect real activity.</div></td></tr>'
+    )
+
+    content = f"""<style>
+.event-thumb-player{{position:relative;width:96px;cursor:pointer;border-radius:4px;overflow:hidden}}
+.event-thumb-player:focus-visible{{outline:2px solid var(--accent,#47d7ac);outline-offset:2px}}
+.event-thumb-play-badge{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(8,10,14,.35);color:#fff;font-size:20px;pointer-events:none}}
+.event-thumb-player.playing .event-thumb-play-badge{{display:none}}
+.event-thumb-player video{{width:96px;aspect-ratio:16/9;object-fit:cover;background:#000;display:block}}
+.event-thumb-loading{{width:96px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
+.event-thumb-pending{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:#e8b93f;font-size:11px;background:#0b1018;border-radius:4px;text-align:center;padding:0 6px}}
+.event-action-pending{{opacity:.55;cursor:default;pointer-events:none}}
+</style>
+<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
+<div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
+<div class="playback-workspace">
+<aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
+<input class="picker-search" id="events-search" type="search" placeholder="Search"><div id="events-camera-filters">{camera_options}</div></aside>
+<section class="work-area"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
+<table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
+<tbody>{event_body}</tbody></table></section></div>"""
+
+    scripts = """<script>
+(function(){
+  const search=document.getElementById('events-search');
+  const filters=document.getElementById('events-camera-filters');
+  const rows=[...document.querySelectorAll('#events-table tbody tr[data-event-camera]')];
+  // P0 #5 Phase 3 (2026-09-05): tracked in the same mutable array
+  // `apply()` below already filters from -- a newly-inserted row (see
+  // reconcileDesktopEvent()) is pushed onto this array so it
+  // immediately participates in the existing camera/search filters
+  // instead of silently bypassing them until the next full page load.
+
+  // Smart Motion Events-visibility fix (2026-09-14): the fleet-wide
+  // initial render (and the fleet-wide poll below) both share one
+  // RECENT_EVENTS_POLL_LIMIT-bounded window across every camera, so a
+  // low-volume camera's real event can be crowded out of that shared
+  // window by high-volume cameras (confirmed live: a real Camera 1
+  // smart_motion event ranked outside the top 200 of this customer's
+  // combined event history). When the customer narrows the filter down
+  // to exactly one specific camera, fetch that camera's OWN
+  // server-side-bounded recent events from the existing, already-
+  // authorized /api/customer/events/recent/{camera_id} route (built
+  // for the mobile Playback view's per-camera poll, reused here
+  // as-is -- no new backend route) and merge them in via the same
+  // reconcileDesktopEvent() every other row already goes through, so
+  // Smart Motion (and everything else) keeps rendering with the exact
+  // same generic label, no special-casing. Left completely untouched
+  // when more than one camera is checked -- the ordinary fleet-wide
+  // view keeps its existing bounded behavior exactly as before.
+  const cameraScopedEventsLoaded=new Set();
+  async function ensureCameraScopedEvents(cameraId){
+    if(!cameraId||cameraScopedEventsLoaded.has(cameraId))return;
+    cameraScopedEventsLoaded.add(cameraId);
+    try{
+      const response=await fetch(`/api/customer/events/recent/${encodeURIComponent(cameraId)}`,{cache:'no-store'});
+      if(!response.ok)return;
+      const payload=await response.json();
+      const tbody=document.querySelector('#events-table tbody');
+      [...(payload.events||[])].reverse().forEach(event=>{
+        try{
+          const newRow=reconcileDesktopEvent(event);
+          if(newRow&&tbody){
+            tbody.insertBefore(newRow,tbody.firstChild);
+            wireEventThumbPlayer(newRow);
+            rows.push(newRow);
+          }
+        }catch(eventError){
+          console.error('ensureCameraScopedEvents: failed to reconcile event',event&&event.id,eventError);
+        }
+      });
+    }catch(error){
+      // Transient network failure -- forget this camera was "loaded" so
+      // the next filter change (or a future retry) can try again,
+      // rather than permanently showing an incomplete result for it.
+      cameraScopedEventsLoaded.delete(cameraId);
+    }
+  }
+  async function apply(){
+    const checkedBoxes=[...filters.querySelectorAll('input:checked')];
+    const checked=new Set(checkedBoxes.map(box=>box.dataset.camera));
+    if(checkedBoxes.length===1&&filters.querySelectorAll('input').length>1){
+      await ensureCameraScopedEvents(checkedBoxes[0].dataset.cameraId);
+    }
+    const query=(search.value||'').toLowerCase();
+    rows.forEach(row=>{
+      const cameraMatch=checked.has(row.dataset.eventCamera);
+      const textMatch=!query||row.textContent.toLowerCase().includes(query);
+      row.hidden=!(cameraMatch&&textMatch);
+    });
+  }
+  filters.addEventListener('change',apply);
+  search.addEventListener('input',apply);
+
+  // Inline event-clip player -- see this row's own Python docstring
+  // (the has_event_clip branch building .event-thumb-player) for why
+  // this exists: a same-page click carries real user activation, the
+  // best real chance of audible autoplay, unlike the cross-page
+  // /playback?event= deep link (kept working as a secondary path,
+  // untouched here). Reuses the exact same authorized
+  // /api/customer/events/{camera_id}/{event_id}/media/url route --
+  // no second media API.
+  let currentlyPlaying=null;
+
+  function revertToThumbnail(container){
+    const video=container.querySelector('video');
+    if(video){video.pause();video.removeAttribute('src');video.load()}
+    container.innerHTML=(container.dataset.thumbHtml||'—')+'<span class="event-thumb-play-badge" aria-hidden="true">▶</span>';
+    container.classList.remove('playing');
+  }
+
+  function playEventClipInline(container){
+    // Single-player rule: starting a new inline clip always stops
+    // whatever else was playing first -- never two at once.
+    if(currentlyPlaying&&currentlyPlaying!==container){
+      revertToThumbnail(currentlyPlaying);
+    }
+    currentlyPlaying=container;
+    const cameraId=container.dataset.cameraId;
+    const eventId=container.dataset.eventId;
+    container.innerHTML='<div class="event-thumb-loading">Loading…</div>';
+    container.innerHTML='<p role="status"></p><video controls playsinline></video>';
+    const inlineVideo=container.querySelector('video');
+    container.classList.add('playing');
+    if(window.inlineEventPlayer)window.inlineEventPlayer.cancel();
+    window.inlineEventPlayer=AnyAiCamEventMedia.player({video:inlineVideo,status:container.querySelector('p'),isCurrent:()=>currentlyPlaying===container});
+    inlineVideo.addEventListener('ended',()=>{window.inlineEventPlayer.cancel();revertToThumbnail(container);if(currentlyPlaying===container)currentlyPlaying=null;});
+    window.inlineEventPlayer.start(cameraId,eventId,true);
+  }
+
+  function wireEventThumbPlayer(scope){
+    scope.querySelectorAll('.event-thumb-player').forEach(container=>{
+      if(container.dataset.wired)return;
+      container.dataset.wired='1';
+      container.addEventListener('click',()=>playEventClipInline(container));
+      container.addEventListener('keydown',event=>{
+        if(event.key==='Enter'||event.key===' '){
+          event.preventDefault();
+          playEventClipInline(container);
+        }
+      });
+    });
+  }
+  wireEventThumbPlayer(document);
+
+  // P0 #5 remediation round 3 (2026-09-05, real P0 blocker found by
+  // ChatGPT Work QA): round 2 made scheduleEventPoll() exit for good
+  // the moment nothing was processing -- anyDesktopRowStillProcessing()
+  // false meant "clear the timer, forget eventPollState, return" with
+  // nothing left to ever call this function again. A page loaded when
+  // the visible 200 rows happened to have zero rows inside their own
+  // 120s window (the overwhelmingly common case -- most pages load
+  // long after their most recent event) could never discover a brand
+  // new event created after that load, no matter how long the tab
+  // stayed open; only a manual reload could ever show it. Fixed by
+  // never permanently stopping: discovery polling continues
+  // indefinitely at EVENT_SLOW_POLL_INTERVAL_MS while nothing is
+  // processing, and speeds up to EVENT_FAST_POLL_INTERVAL_MS the
+  // moment a poll reconciles a row into "processing" -- switching back
+  // to the slow cadence again once nothing is left processing. Same
+  // two round-2 fixes remain in force (see scheduleMobileEventPoll()'s
+  // own docstring for the full rationale): EVENT_FETCH_TIMEOUT_MS
+  // bounds a single fetch attempt so a never-responding server cannot
+  // stall this loop, and settlement is still driven by real elapsed
+  // time, not an attempt count -- now checked per row (see
+  // settleOverdueDesktopRows() below) against that row's own
+  // data-event-timestamp, since new rows can start their own 120s
+  // window at any moment, not only at whatever instant polling itself
+  // happened to start.
+  const EVENT_PENDING_WINDOW_MS=120000;
+  const EVENT_FAST_POLL_INTERVAL_MS=4000;
+  const EVENT_SLOW_POLL_INTERVAL_MS=15000;
+  const EVENT_FETCH_TIMEOUT_MS=8000;
+  let eventPollState=null;
+
+  function desktopEventDate(timestamp){
+    const text=String(timestamp||'');
+    return new Date(/Z$|[+-]\d\d:?\d\d$/.test(text)?text:text+'Z');
+  }
+
+  function isEventPending(hasClip,timestamp){
+    if(hasClip)return false;
+    const ageMs=Date.now()-desktopEventDate(timestamp).getTime();
+    return ageMs>=0&&ageMs<EVENT_PENDING_WINDOW_MS;
+  }
+
+  // Round 2 fix: media_state is a row's own explicit, currently-
+  // rendered state ("processing"/"ready"/"none"/"settled") -- computed
+  // from isEventPending() only at the moment a row is first rendered
+  // or reconciled, then tracked on the row itself (data-media-state)
+  // from then on. Settlement below reads that tracked state, never
+  // re-derives it from timestamp age -- age-based re-derivation is
+  // exactly why round 1's settlement could silently never fire: by the
+  // time the real 120s deadline arrives, every event's own age has
+  // already crossed that same 120s window, so isEventPending() is
+  // false for all of them regardless of whether a real response was
+  // ever received, and "is anything still pending" looked false even
+  // while every row was still visibly showing "Processing…".
+  function mediaStateFor(hasClip,timestamp){
+    return AnyAiCamEventMedia.state(hasClip,timestamp);
+  }
+
+  // JS mirror of _customer_event_playback_href() (main.py) -- same
+  // contract: event= whenever a real clip is ready, otherwise a real
+  // timestamp converted to epoch-ms (never a raw ISO string), otherwise
+  // no autoplay at all. Kept in sync with that function deliberately;
+  // this table can't call back into Python mid-poll.
+  function eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip){
+    if(!cameraId)return '/playback';
+    let href=`/playback?camera=${encodeURIComponent(cameraId)}`;
+    if(hasEventClip&&eventId){
+      href+=`&event=${encodeURIComponent(eventId)}&autoplay=event`;
+    }else if(timestamp){
+      const epochMs=desktopEventDate(timestamp).getTime();
+      if(!Number.isNaN(epochMs))href+=`&t=${epochMs}&autoplay=event`;
+    }
+    return href;
+  }
+
+  function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,mediaState){
+    const liveLink=cameraId?`<a class="download" href="/customer/cameras/${encodeURIComponent(cameraId)}/live">Live view</a> `:'';
+    if(mediaState!=='ready'){
+      return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Playback</span>`;
+    }
+    return `${liveLink}<a class="download" href="${eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip)}">Playback</a>`;
+  }
+
+  function eventThumbnailCellHtml(event,mediaState){
+    if(event.thumbnail||event.has_event_clip){
+      const img=event.thumbnail?`<img src="${AnyAiCamEventMedia.escape(event.thumbnail)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`:'<span>Event clip</span>';
+      if(event.has_event_clip&&event.camera_id&&event.id){
+        const escapedImg=img.replace(/"/g,'&quot;');
+        return `<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" data-camera-id="${AnyAiCamEventMedia.escape(event.camera_id)}" data-event-id="${AnyAiCamEventMedia.escape(event.id)}" data-thumb-html="${escapedImg}">${img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span></div>`;
+      }
+      return img;
+    }
+    return mediaState==='processing'?'<span class="event-thumb-pending">Processing…</span>':'—';
+  }
+
+  // Round 2 fix: updates both server-rendered "N event(s)" pill
+  // displays (topbar + panel-head, see the Python template's own
+  // event-count-pill class/data-count) -- these were static counts
+  // baked in at page-load in round 1, never updated when reconciliation
+  // actually adds a genuinely new row to the table.
+  function updateVisibleEventCount(delta){
+    document.querySelectorAll('.event-count-pill').forEach(pill=>{
+      const next=Math.max(0,parseInt(pill.dataset.count||'0',10)+delta);
+      pill.dataset.count=String(next);
+      pill.textContent=`${next} event(s)`;
+    });
+  }
+
+  // Reconciles one fresh event against the table: updates an existing
+  // row's thumbnail/action cells and tracked media_state in place, or
+  // returns a new, not-yet-inserted <tr> for a genuinely new event.
+  // Insertion order across a whole batch is the caller's
+  // responsibility (see scheduleEventPoll()'s fetch success handler
+  // below) -- specifically so multiple simultaneously-new events keep
+  // this page's own newest-first order. Round 1 bug: inserting each
+  // new row at tbody.firstChild while iterating a DESC-ordered batch
+  // top-to-bottom reversed their relative order (the batch's own
+  // newest event ended up below its own older siblings).
+  function reconcileDesktopEvent(event){
+    if(!event||!event.id)return null;
+    const tbody=document.querySelector('#events-table tbody');
+    if(!tbody)return null;
+    const mediaState=mediaStateFor(event.has_event_clip,event.timestamp);
+    const thumbHtml=eventThumbnailCellHtml(event,mediaState);
+    const actionHtml=eventActionCellHtml(event.camera_id,event.timestamp,event.id,event.has_event_clip,mediaState);
+    const existing=tbody.querySelector(`tr[data-event-id="${CSS.escape(String(event.id))}"]`);
+    if(existing){
+      if(currentlyPlaying && existing.contains(currentlyPlaying))return null;
+      const thumbCell=existing.querySelector('.event-thumbnail-cell');
+      const actionCell=existing.querySelector('.event-action-cell');
+      if(thumbCell)thumbCell.innerHTML=thumbHtml;
+      if(actionCell)actionCell.innerHTML=actionHtml;
+      existing.dataset.eventHasClip=event.has_event_clip?'1':'0';
+      existing.dataset.mediaState=mediaState;
+      wireEventThumbPlayer(existing);
+      return null;
+    }
+    const placeholder=tbody.querySelector('tr td.empty-stage')?.closest('tr');
+    if(placeholder)placeholder.remove();
+    const row=document.createElement('tr');
+    row.dataset.eventCamera=String(event.camera||'');
+    row.dataset.eventType=String(event.event_type||'');
+    row.dataset.eventId=String(event.id);
+    row.dataset.eventTimestamp=String(event.timestamp||'');
+    row.dataset.eventHasClip=event.has_event_clip?'1':'0';
+    row.dataset.mediaState=mediaState;
+    const typeLabel=String(event.event_type||'event').replace(/_/g,' ').replace(/\\b\\w/g,c=>c.toUpperCase());
+    const confidence=event.confidence;
+    const confidencePercent=(confidence===null||confidence===undefined)?'—':`${(confidence<=1?confidence*100:confidence).toFixed(1)}%`;
+    row.innerHTML=`<td>${desktopEventDate(event.timestamp).toLocaleString()}</td>`+
+      `<td>${AnyAiCamEventMedia.escape(event.camera_name||(event.camera?`Camera ${event.camera}`:'—'))}</td>`+
+      `<td class="event-thumbnail-cell">${thumbHtml}</td>`+
+      `<td><span class="pill">${AnyAiCamEventMedia.escape(typeLabel)}</span></td>`+
+      `<td>${confidencePercent}</td>`+
+      `<td class="event-action-cell">${actionHtml}</td>`;
+    return row;
+  }
+
+  // Round 3 fix: settles only the rows whose OWN 120s window (from
+  // their own data-event-timestamp, never a shared page-load-relative
+  // deadline) has actually elapsed -- a row still tracks its explicit
+  // data-media-state (never re-derived from age for the "is anything
+  // still processing" decision, exactly as round 2 fixed), but a
+  // *newly-discovered* processing row starts its own independent
+  // countdown from its own real detection time, since discovery can
+  // now happen at any point after page load, not only once at the
+  // start of a single page-load-scoped session.
+  function settleOverdueDesktopRows(){
+    document.querySelectorAll('#events-table tbody tr[data-media-state="processing"]').forEach(row=>{
+      const ageMs=Date.now()-desktopEventDate(row.dataset.eventTimestamp).getTime();
+      if(ageMs<EVENT_PENDING_WINDOW_MS)return;
+      row.dataset.mediaState='unavailable';
+      const pendingLabel=row.querySelector('.event-thumbnail-cell .event-thumb-pending');
+      if(pendingLabel)pendingLabel.textContent='Not ready yet';
+      const actionPending=row.querySelector('.event-action-cell .event-action-pending');
+      if(actionPending)actionPending.title='Still processing -- check back soon';
+    });
+  }
+
+  function anyDesktopRowStillProcessing(){
+    return document.querySelector('#events-table tbody tr[data-media-state="processing"]')!==null;
+  }
+
+  // Round 3 (2026-09-05, real P0 blocker): never permanently exits.
+  // Discovery keeps running for as long as the page is open, at
+  // EVENT_SLOW_POLL_INTERVAL_MS while nothing is processing (cheap,
+  // infrequent -- just enough to notice a brand new event without a
+  // manual reload) and at EVENT_FAST_POLL_INTERVAL_MS the moment
+  // anyDesktopRowStillProcessing() is true (the existing
+  // Processing…-> ready reconciliation cadence, unchanged).
+  //
+  // Round 4 fix (2026-09-05, Codex final review): round 3's guard
+  // against a second concurrent timer/fetch only checked
+  // eventPollState.timer -- but state.timer is deliberately nulled out
+  // at the very top of the timer callback below, BEFORE the fetch
+  // itself even starts, so that guard was blind for this request's
+  // entire in-flight lifetime. Any call to scheduleEventPoll() landing
+  // during that window (present or future -- a visibility-change
+  // rewake, a manual retry hook, anything) would see
+  // eventPollState.timer===null and schedule a second, fully
+  // independent timer/fetch pair against the very same state object,
+  // violating the "only one timer/fetch in flight at a time" invariant
+  // this loop is required to hold. inFlight is now the single source
+  // of truth for "a request is currently outstanding": set the instant
+  // the timer fires, before the fetch call, and cleared only in
+  // `finally` -- after the response (or failure) has already been
+  // fully handled and settlement has already run -- so the very next
+  // scheduleEventPoll() call, whether it's this function's own
+  // self-rearm or an external one, always sees an accurate picture.
+  function scheduleEventPoll(){
+    if(eventPollState&&(eventPollState.timer||eventPollState.inFlight))return;
+    if(!eventPollState)eventPollState={timer:null,controller:null,inFlight:false};
+    const state=eventPollState;
+    const interval=anyDesktopRowStillProcessing()?EVENT_FAST_POLL_INTERVAL_MS:EVENT_SLOW_POLL_INTERVAL_MS;
+    state.timer=setTimeout(async()=>{
+      state.timer=null;
+      state.inFlight=true;
+      const controller=new AbortController();
+      state.controller=controller;
+      const fetchTimeoutId=setTimeout(()=>controller.abort(),EVENT_FETCH_TIMEOUT_MS);
+      try{
+        const response=await fetch('/api/customer/events/recent',{cache:'no-store',signal:controller.signal});
+        if(eventPollState!==state)return;
+        if(response.ok){
+          const payload=await response.json();
+          if(eventPollState!==state)return;
+          const tbody=document.querySelector('#events-table tbody');
+          // Reversed (oldest-of-this-batch first) so consecutive
+          // tbody.insertBefore(firstChild) calls end up in the correct
+          // newest-first visual order -- see reconcileDesktopEvent()'s
+          // own docstring.
+          // Round 5 fix (2026-09-05, staging QA root-cause trace): each
+          // event is reconciled inside its own try/catch. Array.forEach()
+          // does not catch a callback's own exception -- it propagates
+          // immediately and skips every remaining, not-yet-visited
+          // element. Before this fix, one bad event anywhere in the
+          // batch (this array is oldest-of-this-batch first, so a
+          // failure on an older/already-known event would silently
+          // block every genuinely new event ordered after it) could
+          // silently prevent every event after it from ever being
+          // reconciled, forever, on every subsequent poll -- with
+          // nothing logged anywhere, since the outer catch below
+          // swallowed it identically to an ordinary network failure.
+          // One bad event must never block the rest of its own batch.
+          [...(payload.events||[])].reverse().forEach(event=>{
+            try{
+              const newRow=reconcileDesktopEvent(event);
+              if(newRow&&tbody){
+                tbody.insertBefore(newRow,tbody.firstChild);
+                wireEventThumbPlayer(newRow);
+                rows.push(newRow);
+                updateVisibleEventCount(1);
+              }
+            }catch(eventError){
+              console.error('scheduleEventPoll: failed to reconcile event',event&&event.id,eventError);
+            }
+          });
+          const ordered=[...tbody.querySelectorAll('tr[data-event-id]')];
+          const active=currentlyPlaying?.closest('tr');
+          const keep=new Set(ordered.slice(0,active&&!ordered.slice(0,200).includes(active)?199:200));
+          if(active)keep.add(active);
+          ordered.forEach(row=>{if(!keep.has(row))row.remove();});
+          rows.splice(0,rows.length,...ordered.filter(row=>keep.has(row)));
+          document.querySelectorAll('.event-count-pill').forEach(pill=>{pill.dataset.count=String(rows.length);pill.textContent=`${rows.length} event(s)`;});
+          apply();
+        }
+        // non-2xx: transient, retried below via finally -- never a
+        // permanent stop.
+      }catch(error){
+        // Round 5: AbortError (a fetch that exceeded
+        // EVENT_FETCH_TIMEOUT_MS) and a genuine network-level failure
+        // (fetch() itself rejects with a TypeError for those -- "Failed
+        // to fetch" and friends, the same signature real browsers use)
+        // are both expected, ordinary conditions -- retried below via
+        // finally, quietly, exactly as before. Anything else reaching
+        // this catch is, by construction, NOT a per-event reconciliation
+        // failure (those are now caught above, inside the forEach) --
+        // it's something unexpected in the surrounding fetch/parse
+        // logic itself, and must be surfaced rather than silently
+        // swallowed alongside routine network retries.
+        if(error&&error.name==='AbortError'){
+          // expected timeout -- quiet.
+        }else if(error instanceof TypeError){
+          // expected network failure -- quiet, retried below.
+        }else{
+          console.error('scheduleEventPoll: unexpected error while polling for events',error);
+        }
+      }finally{
+        clearTimeout(fetchTimeoutId);
+        // Checked every tick regardless of this attempt's own
+        // success/failure -- a row's own 120s window elapsing is a
+        // real-clock fact independent of whether THIS particular fetch
+        // happened to succeed, so a final failed request landing
+        // exactly at a row's deadline still settles it here rather
+        // than only ever settling on a successful reconcile.
+        settleOverdueDesktopRows();
+        // Cleared before the self-rearm below so that rearm (or any
+        // other caller landing here concurrently) sees inFlight===false
+        // and is allowed to schedule the next tick -- never the other
+        // way around, which would deadlock discovery forever.
+        state.inFlight=false;
+        if(eventPollState===state){
+          scheduleEventPoll();
+        }
+      }
+    },interval);
+  }
+
+  scheduleEventPoll();
+})();
+</script>"""
+
+    return page_shell("Events", "events", content, '<script src="/static/event_media.js"></script>' + scripts)
+
+
+def _render_customer_alerts(request: Request) -> str:
+    """Real, tenant-scoped Smart Alerts page. Reuses _customer_notifications()
+    (real notifications rows, written by notification_engine.fanout_
+    appliance_event() on every real analytics event whose type is in
+    its own SUPPORTED set -- smart_motion, person, vehicle,
+    people_counting, lpr once a plate is actually read) -- creates no
+    alerts, duplicates no event. The "New alert" button is left exactly
+    as before (customer-created alert rules are a distinct, not-yet-
+    built feature this milestone does not touch). Falls back to the
+    exact original legacy alerts() body for any non-portal caller (see
+    alerts() below)."""
+    cameras = _customer_playback_cameras(request) or []
+    notifications_list = _customer_notifications(request) or []
+
+    camera_options = "".join(
+        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}"> '
+        f'{escape(_camera_display_label(camera))}</label>'
+        for camera in cameras
+    )
+
+    cards = []
+    unread_count = 0
+    for notification in notifications_list[:100]:
+        raw_timestamp = str(notification.get("timestamp") or "")
+        try:
+            # Same fix, same root cause, as _render_customer_events()'s own
+            # "five-hour timestamp offset" fix (2026-09-02): this naive
+            # value is UTC (notification_engine.fanout_appliance_event()
+            # writes the source event's own event_timestamp/now.isoformat()
+            # verbatim, never localized), so it must be labeled UTC and
+            # converted to APPLIANCE_TIMEZONE exactly once for display --
+            # not formatted directly, which silently displayed raw UTC
+            # clock digits as if already local. This page had never
+            # received that fix; notifications' displayed times were off
+            # by the same several hours the Events table's already were.
+            occurred_at_utc = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            if occurred_at_utc.tzinfo is None:
+                occurred_at_utc = occurred_at_utc.replace(tzinfo=timezone.utc)
+            occurred_at = occurred_at_utc.astimezone(APPLIANCE_TIMEZONE)
+            timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
+        except ValueError:
+            timestamp_label = raw_timestamp or "Unknown time"
+        thumbnail = (
+            f'<img src="{escape(notification["thumbnail"], quote=True)}" alt="Alert thumbnail" style="width:120px;aspect-ratio:16/9;object-fit:cover;border-radius:7px">'
+            if notification.get("thumbnail") else '<div class="feature-icon">♢</div>'
+        )
+        camera_label = notification.get("camera_name") or "System"
+        camera_number = notification.get("camera")
+        is_read = bool(notification.get("read"))
+        if not is_read:
+            unread_count += 1
+        # Deep link fix: previously called with only camera_id, so every
+        # card fell back to a generic, non-deep-linked Playback href even
+        # though the notification's own timestamp/event_id (now selected
+        # by _customer_notifications()) were available -- the exact same
+        # timestamp/event_id/has_event_clip shape _render_customer_events()
+        # already passes correctly for the identical action-button helper.
+        actions_html = _customer_event_actions(
+            notification.get("camera_id"), raw_timestamp, notification.get("event_id"), notification.get("has_event_clip")
+        )
+        mark_read_html = (
+            '' if is_read else
+            f'<button class="ghost-button mark-alert-read" type="button" data-notification-id="{escape(str(notification["id"]), quote=True)}">Mark read</button>'
+        )
+        cards.append(
+            f'<article class="feature-card{"" if is_read else " alert-unread"}" data-alert-camera="{escape(str(camera_number or ""), quote=True)}" data-notification-id="{escape(str(notification["id"]), quote=True)}" data-read="{"1" if is_read else "0"}">{thumbnail}'
+            f'<h2>{escape(str(notification.get("title") or "Alert"))} · {escape(camera_label)}</h2>'
+            f'<p>{escape(str(notification.get("message") or ""))}</p>'
+            f'<p class="health-detail">{escape(timestamp_label)}</p>'
+            f'<div class="dashboard-event-actions">{actions_html}{mark_read_html}</div></article>'
+        )
+    alert_body = "".join(cards) or (
+        '<div class="empty-stage">No alerts yet.<br>Real alerts appear here as your cameras detect activity.</div>'
+    )
+
+    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div>
+<div><button class="ghost-button" id="mark-all-alerts-read" type="button"{" hidden" if not unread_count else ""}>Mark all read</button> <button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header>
+<div class="playback-workspace">
+<aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
+<div id="alerts-camera-filters">{camera_options}</div></aside>
+<section class="work-area"><div class="panel-head"><h2>Recent alerts</h2><span class="pill" id="alerts-unread-pill">{unread_count} unread &middot; {len(notifications_list)} alert(s)</span></div>
+<div class="feature-grid" id="alerts-grid">{alert_body}</div></section></div>"""
+
+    scripts = """<script>
+(function(){
+  const filters=document.getElementById('alerts-camera-filters');
+  const cards=[...document.querySelectorAll('#alerts-grid [data-alert-camera]')];
+  if(filters){
+    filters.addEventListener('change',()=>{
+      const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));
+      cards.forEach(card=>{
+        const camera=card.dataset.alertCamera;
+        card.hidden=Boolean(camera)&&!checked.has(camera);
+      });
+    });
+  }
+  const pill=document.getElementById('alerts-unread-pill');
+  const markAllButton=document.getElementById('mark-all-alerts-read');
+  function updatePill(){
+    const total=document.querySelectorAll('#alerts-grid [data-notification-id]').length;
+    const unread=document.querySelectorAll('#alerts-grid [data-read="0"]').length;
+    if(pill)pill.textContent=`${unread} unread · ${total} alert(s)`;
+    if(markAllButton)markAllButton.hidden=unread===0;
+  }
+  function markCardRead(card){
+    if(card.dataset.read==='1')return;
+    card.dataset.read='1';
+    card.classList.remove('alert-unread');
+    const button=card.querySelector('.mark-alert-read');
+    if(button)button.remove();
+    updatePill();
+  }
+  document.getElementById('alerts-grid')?.addEventListener('click',async event=>{
+    const button=event.target.closest('.mark-alert-read');
+    if(!button)return;
+    const card=button.closest('[data-notification-id]');
+    const id=card?.dataset.notificationId;
+    if(!id)return;
+    button.disabled=true;
+    try{
+      const response=await fetch(`/api/customer/notifications/${encodeURIComponent(id)}/read`,{method:'POST'});
+      if(response.ok)markCardRead(card);
+      else button.disabled=false;
+    }catch(error){button.disabled=false;}
+  });
+  markAllButton?.addEventListener('click',async()=>{
+    markAllButton.disabled=true;
+    try{
+      const response=await fetch('/api/customer/notifications/read-all',{method:'POST'});
+      if(response.ok)cards.forEach(markCardRead);
+    }finally{markAllButton.disabled=false;}
+  });
+})();
+</script>"""
+
+    return page_shell("Alerts", "alerts", content, scripts)
+
+
 @app.get("/alerts", response_class=HTMLResponse)
 
 
@@ -117151,7 +120650,14 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
-def alerts() -> str:
+def alerts(request: Request) -> str:
+    # Customer-portal identity, if any, gets the real tenant-scoped
+    # page (real notifications, real cameras including Camera 5) --
+    # everyone else falls through to the exact original legacy body,
+    # completely unchanged below.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        return _render_customer_alerts(request)
 
 
 
@@ -117160,7 +120666,8 @@ def alerts() -> str:
 
 
 
-    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in range(1, CAMERA_COUNT + 1))
+
+    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in get_camera_numbers())
 
 
 
@@ -117271,7 +120778,7 @@ def alerts() -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div><div><button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({CAMERA_COUNT})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion alerts</h2><span class="pill">{len(events)} event(s)</span></div><div class="feature-grid">{alert_body}</div></section></div>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div><div><button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion alerts</h2><span class="pill">{len(events)} event(s)</span></div><div class="feature-grid">{alert_body}</div></section></div>"""
 
 
 
@@ -117316,7 +120823,11 @@ def alerts() -> str:
 
 
 
-def events() -> str:
+def events(request: Request) -> str:
+    # Same dispatch pattern as alerts() above.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        return _render_customer_events(request)
 
 
 
@@ -117325,7 +120836,8 @@ def events() -> str:
 
 
 
-    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in range(1, CAMERA_COUNT + 1))
+
+    cameras = "".join(f'<label class="picker-camera"><input type="checkbox" checked> Camera {n}</label>' for n in get_camera_numbers())
 
 
 
@@ -117469,7 +120981,7 @@ def events() -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div><div><span class="pill">Motion detection: {detector_status}</span></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({CAMERA_COUNT})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion</h2><span class="health-detail">{len(recent_events)} event(s)</span></div><table class="data-table"><thead><tr><th>Start time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead><tbody>{event_body}</tbody></table></section></div>"""
+    content = f"""<header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div><div><span class="pill">Motion detection: {detector_status}</span></div></header><div class="playback-workspace"><aside class="camera-picker"><div class="picker-head">▣ Cameras ({get_camera_count()})</div><input class="picker-search" type="search" placeholder="Search"><div>{cameras}</div></aside><section class="work-area"><div class="panel-head"><h2>Recent motion</h2><span class="health-detail">{len(recent_events)} event(s)</span></div><table class="data-table"><thead><tr><th>Start time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead><tbody>{event_body}</tbody></table></section></div>"""
 
 
 
@@ -122950,7 +126462,7 @@ def users_page(request: Request) -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -124948,7 +128460,16 @@ def site_monitoring_summary() -> dict:
 
 
 
-    statuses = camera_status().get("cameras", [])
+    # _legacy_camera_status(), not camera_status(): none of this file's
+    # three request-less callers (readiness_snapshot(), health_monitor(),
+    # site_monitoring_summary()) have an HTTP request/customer-session to
+    # scope by -- that's what camera_status(request)'s customer-portal
+    # branch needs. Calling camera_status() with no arguments at all is
+    # what crashed GET /ready with a 500 (TypeError: missing required
+    # argument 'request') -- confirmed live on a fresh install. The
+    # legacy, appliance-wide camera listing is exactly what a system-
+    # level status check wants regardless of who (if anyone) is logged in.
+    statuses = _legacy_camera_status().get("cameras", [])
 
 
 
@@ -125155,7 +128676,7 @@ def site_monitoring_summary() -> dict:
 
 
 
-            "status": "online" if online_cameras == CAMERA_COUNT else "warning",
+            "status": "online" if online_cameras == get_camera_count() else "warning",
 
 
 
@@ -125164,7 +128685,7 @@ def site_monitoring_summary() -> dict:
 
 
 
-            "camera_count": CAMERA_COUNT,
+            "camera_count": get_camera_count(),
 
 
 
@@ -125434,7 +128955,7 @@ def site_monitoring_summary() -> dict:
 
 
 
-        "camera_count": CAMERA_COUNT,
+        "camera_count": get_camera_count(),
 
 
 
@@ -125614,7 +129135,7 @@ def sites() -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -125686,7 +129207,7 @@ def sites() -> str:
 
 
 
-        for camera in range(1, CAMERA_COUNT + 1)
+        for camera in get_camera_numbers()
 
 
 
@@ -126976,6 +130497,14 @@ SETTINGS_CATEGORIES = [
 ]
 
 
+# Only these SETTINGS_CATEGORIES names have a real settings_detail()
+# implementation today (see the events-alerts branch below); every other
+# category renders an honest "coming soon" placeholder there. Hiding the
+# unimplemented ones from the clickable /settings list (see settings())
+# keeps the sidebar from presenting a dead end as if it were a working page.
+IMPLEMENTED_SETTINGS_CATEGORIES = {"Events & alerts"}
+
+
 
 
 
@@ -127063,7 +130592,11 @@ def settings(request: Request) -> str:
 
 
 
-        f'<a class="setting-link" href="/settings/{slugify(name)}"><div><strong>{escape(name)}</strong><div class="health-detail">{escape(description)}</div></div><span>›</span></a>'
+        (
+            f'<a class="setting-link" href="/settings/{slugify(name)}"><div><strong>{escape(name)}</strong><div class="health-detail">{escape(description)}</div></div><span>›</span></a>'
+            if name in IMPLEMENTED_SETTINGS_CATEGORIES else
+            f'<div class="setting-link" aria-disabled="true" title="Coming soon"><div><strong>{escape(name)}</strong><div class="health-detail">{escape(description)}</div></div><span class="pill wait">Coming soon</span></div>'
+        )
 
 
 
@@ -127189,7 +130722,7 @@ def settings_detail(settings_slug: str, request: Request) -> str:
 
 
 
-        camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in range(1, CAMERA_COUNT + 1))
+        camera_options = "".join(f'<option value="{n}">Camera {n}</option>' for n in get_camera_numbers())
 
 
 
@@ -136759,10 +140292,42 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
 
     from partner_db import connection
     with connection() as db:
+        # 2026-09-16 correction (real regression, found live by the user
+        # then independently confirmed by Codex's own source review):
+        # this function used to return every cameras row for the
+        # customer, placeholders included, then just sorted a
+        # camera_number-NULL placeholder to the back so it was never
+        # picked as the *default* camera (the 2026-09-15 fix whose own
+        # comment used to live here). That fix solved the "default lands
+        # on an empty placeholder" bug but left every placeholder fully
+        # selectable in the camera-tile row -- confirmed live: Cameras
+        # 6/7/8 (pending_installation, camera_number NULL, no real
+        # device, will never have recordings) shown as real, clickable
+        # tiles alongside the 5 actually-provisioned cameras.
+        #
+        # `camera_number IS NOT NULL` -- the exact same signal
+        # live_view_page.py's own _customer_live_cameras() already uses
+        # to exclude these same placeholders from Live View's fleet grid
+        # (see that function's own 2026-09-13 "Live-tile grid fix"
+        # docstring) -- is reused here rather than inventing a second,
+        # possibly-diverging filter. Deliberately NOT `device_key IS NOT
+        # NULL` or any online/offline signal: camera_number is assigned
+        # once a camera is genuinely provisioned/discovered and stays
+        # assigned regardless of whether the camera is currently online,
+        # so an installer-provisioned or currently-offline real camera
+        # still renders correctly, and a camera's past recording history
+        # is untouched by this filter either way -- it only ever
+        # excludes a row that was never a real camera to begin with. With
+        # placeholders excluded outright, the NULLS-last ordering trick
+        # the previous version of this query needed is now moot (there
+        # is never a NULL camera_number row left to sort around) -- a
+        # plain `ORDER BY camera_number, id` is both simpler and
+        # sufficient.
         if identity.get("role") == "customer_owner":
             return [
                 dict(camera) for camera in db.execute(
-                    'SELECT id, name, camera_number FROM cameras WHERE customer_id=? '
+                    'SELECT id, name, camera_number FROM cameras '
+                    'WHERE customer_id=? AND camera_number IS NOT NULL '
                     'ORDER BY camera_number, id',
                     (identity["customer_id"],),
                 ).fetchall()
@@ -136779,7 +140344,7 @@ def _customer_playback_cameras(request: Request) -> list[dict] | None:
             dict(camera) for camera in db.execute(
                 'SELECT c.id, c.name, c.camera_number FROM cameras c '
                 'JOIN customer_camera_permissions p ON p.camera_id=c.id AND p.user_id=? '
-                'WHERE c.customer_id=? AND p.can_playback=1 '
+                'WHERE c.customer_id=? AND p.can_playback=1 AND c.camera_number IS NOT NULL '
                 'ORDER BY c.camera_number, c.id',
                 (user["id"], identity["customer_id"]),
             ).fetchall()
@@ -136800,7 +140365,65 @@ def _camera_display_label(camera: dict) -> str:
     return f"Camera {number}" if number is not None else str(camera.get("id", "Camera"))
 
 
-def _presigned_recording_url(s3_key: str) -> str | None:
+_recording_read_credentials_cache: dict | None = None
+_recording_read_credentials_lock = threading.Lock()
+
+
+def _recording_read_credentials(role_arn: str, region: str) -> dict | None:
+    """Assumes ANYAICAM_RECORDING_READ_ROLE_ARN at most once every ~14
+    minutes and reuses those temporary credentials for every
+    _presigned_recording_url() call in between, instead of a fresh STS
+    AssumeRole network round-trip per recording. generate_presigned_url()
+    itself is a pure local computation once real credentials are held --
+    it never touches the network -- so the STS call was always the only
+    genuinely expensive step here.
+
+    Found and fixed as a real production incident: with the recording
+    catalog actually populated (R3's uploader now enabled), a single
+    camera's Playback render was doing one AssumeRole per recording --
+    192 recordings measured at ~15 seconds server-side for that one
+    camera alone, times every camera on the account. The customer saw a
+    populated timeline (cheap: one SQL query) but a player that never
+    received a source, because the page render either timed out or
+    took long enough to feel completely broken. This was invisible
+    before today only because the catalog was empty, never because the
+    STS-per-row pattern was actually cheap.
+
+    The refreshed 900s DurationSeconds window is used with a 60s safety
+    margin so a presign never fires on a credential set that expires
+    mid-request. Failure here (network blip, role misconfigured) is
+    never cached -- the next call simply tries again, exactly like the
+    uncached code already did on every call."""
+    global _recording_read_credentials_cache
+    with _recording_read_credentials_lock:
+        cached = _recording_read_credentials_cache
+        if cached and cached['expiration'] > datetime.now(timezone.utc) + timedelta(seconds=60):
+            return cached
+        try:
+            import boto3
+        except ImportError:
+            return None
+        try:
+            sts = boto3.client('sts', region_name=region)
+            assumed = sts.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=f'recording-read-{secrets.token_hex(6)}',
+                DurationSeconds=900,
+            )
+        except Exception:
+            logging.getLogger('anyaicam.recording_read').exception('recording_read.assume_role_failed')
+            return None
+        creds = assumed['Credentials']
+        _recording_read_credentials_cache = {
+            'access_key_id': creds['AccessKeyId'],
+            'secret_access_key': creds['SecretAccessKey'],
+            'session_token': creds['SessionToken'],
+            'expiration': creds['Expiration'],
+        }
+        return _recording_read_credentials_cache
+
+
+def _generate_presigned_recording_url(s3_key: str) -> str | None:
     """R4 (recording-pipeline roadmap): signs a short-lived GET URL for
     one recording object. Fails closed (returns None) whenever the
     read-capable role isn't configured -- see
@@ -136811,7 +140434,18 @@ def _presigned_recording_url(s3_key: str) -> str | None:
     URL requires assuming a dedicated, read-only, GetObject-scoped role
     via STS -- never the write-only upload role, which cannot read.
     A recording with no signable URL is skipped by the caller rather
-    than shown as a dead link -- see _customer_camera_recordings()."""
+    than shown as a dead link -- see _customer_camera_recordings().
+
+    Credentials for the assumed role are cached and reused across calls
+    -- see _recording_read_credentials()'s own comment for why; nothing
+    about which recordings are shown or how they're signed changed,
+    only how often STS gets called to do it.
+
+    Callers should almost never call this directly -- see
+    _presigned_recording_url_and_ttl()/_presigned_recording_url() just
+    below, which wrap this with a reuse cache. This function always
+    performs a fresh sign; it exists as its own name only so the cache
+    wrapper has something real to call on a miss."""
     role_arn = os.getenv('ANYAICAM_RECORDING_READ_ROLE_ARN', '').strip()
     bucket = os.getenv('ANYAICAM_RECORDING_S3_BUCKET', '').strip()
     region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', '')).strip()
@@ -136822,23 +140456,1457 @@ def _presigned_recording_url(s3_key: str) -> str | None:
     except ImportError:
         return None
     try:
-        sts = boto3.client('sts', region_name=region)
-        assumed = sts.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=f'recording-read-{secrets.token_hex(6)}',
-            DurationSeconds=900,
-        )
-        creds = assumed['Credentials']
+        creds = _recording_read_credentials(role_arn, region)
+        if not creds:
+            return None
         s3 = boto3.client(
             's3', region_name=region,
-            aws_access_key_id=creds['AccessKeyId'],
-            aws_secret_access_key=creds['SecretAccessKey'],
-            aws_session_token=creds['SessionToken'],
+            aws_access_key_id=creds['access_key_id'],
+            aws_secret_access_key=creds['secret_access_key'],
+            aws_session_token=creds['session_token'],
         )
         return s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': s3_key}, ExpiresIn=900)
     except Exception:
         logging.getLogger('anyaicam.recording_read').exception('recording_read.presign_failed')
         return None
+
+
+# Reuse window for an already-signed presigned URL (see
+# _presigned_recording_url_and_ttl() below). Found via the Hybrid
+# transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
+# every event thumbnail/clip URL was re-signed from scratch on every
+# single request, and nothing ever told the browser it could reuse a
+# prior response -- so a dashboard/mobile poll loop that redraws the
+# same unchanged thumbnail every 4-15 seconds (see
+# MOBILE_EVENT_POLL_INTERVAL_MS/updateRecentEvents() in the rendered
+# customer pages) re-fetched the identical image bytes from S3 on every
+# single redraw, at full data-transfer-out cost, for as long as a
+# customer kept that page open. 300s is chosen to comfortably cover
+# that entire polling range while staying well inside the underlying
+# object's own 900s ExpiresIn/STS-session window (600s of margin left
+# before the signed URL this cache hands out could ever actually
+# expire).
+PRESIGNED_URL_REUSE_SECONDS = 300
+
+_presigned_url_cache: dict[str, dict] = {}
+_presigned_url_cache_lock = threading.Lock()
+
+
+def _presigned_recording_url_and_ttl(s3_key: str) -> tuple[str | None, int]:
+    """Returns (url, browser_cache_seconds) for one recording/event-media
+    object, reusing an already-signed URL for up to
+    PRESIGNED_URL_REUSE_SECONDS instead of paying a fresh sign (and,
+    upstream, a fresh STS round trip once the credential cache itself
+    is cold) on every call. browser_cache_seconds is how long a caller
+    may safely tell the browser to cache the resulting redirect/response
+    for -- it counts down as the cached entry ages, so it always stays
+    inside PRESIGNED_URL_REUSE_SECONDS and never outlives the signed
+    URL's own real validity. 0 means "don't set a Cache-Control header"
+    (a signing failure, or an entry that just expired), never a
+    negative number.
+
+    The cache key is the raw s3_key -- this app uses exactly one
+    recording-read bucket (ANYAICAM_RECORDING_S3_BUCKET), so no bucket
+    qualifier is needed to keep keys collision-free."""
+    with _presigned_url_cache_lock:
+        entry = _presigned_url_cache.get(s3_key)
+        if entry is not None:
+            remaining = entry['generated_monotonic'] + PRESIGNED_URL_REUSE_SECONDS - time.monotonic()
+            if remaining > 0:
+                return entry['url'], int(remaining)
+            del _presigned_url_cache[s3_key]
+
+    url = _generate_presigned_recording_url(s3_key)
+    if not url:
+        return None, 0
+
+    with _presigned_url_cache_lock:
+        _presigned_url_cache[s3_key] = {'url': url, 'generated_monotonic': time.monotonic()}
+    return url, PRESIGNED_URL_REUSE_SECONDS
+
+
+def _presigned_recording_url(s3_key: str) -> str | None:
+    """Thin, return-shape-compatible wrapper around
+    _presigned_recording_url_and_ttl() for the many existing call sites
+    that only ever wanted the URL itself. See that function's docstring
+    for the reuse-cache behavior this now benefits from automatically."""
+    url, _reuse_seconds = _presigned_recording_url_and_ttl(s3_key)
+    return url
+
+
+def _cacheable_presigned_redirect(s3_key: str) -> "RedirectResponse | None":
+    """Builds a 302 to a presigned media URL the same way a plain
+    RedirectResponse(url=_presigned_recording_url(s3_key)) already did,
+    but additionally sets a `Cache-Control: private, max-age=<n>` header
+    sized to the URL's own real remaining reuse window (see
+    _presigned_recording_url_and_ttl()). `private` (never `public`) is
+    deliberate: this response is only ever safe for the one already-
+    authorized browser that requested it to cache -- a shared/
+    intermediate cache (a corporate proxy, a CDN in front of this
+    route) must never be allowed to serve one customer's signed
+    thumbnail/clip URL to a different request. This is what actually
+    stops a polling UI (dashboard/mobile "recent events", both of which
+    redraw on a several-second timer) from re-fetching the same
+    unchanged image/clip bytes from S3 on every redraw -- the browser
+    now satisfies the repeat request from its own cache instead of
+    re-hitting this route at all. Returns None (same as a plain
+    _presigned_recording_url() miss) when no signable URL exists, so
+    every caller's existing 404-on-None handling is unchanged."""
+    from fastapi.responses import RedirectResponse
+
+    url, reuse_seconds = _presigned_recording_url_and_ttl(s3_key)
+    if not url:
+        return None
+    response = RedirectResponse(url=url, status_code=302)
+    if reuse_seconds > 0:
+        response.headers["Cache-Control"] = f"private, max-age={reuse_seconds}"
+    return response
+
+
+# How many of a camera's most recent recordings the customer Playback
+# page's initial load embeds (metadata only -- see _customer_recording_
+# rows()). Older history stays reachable via Browse recordings'
+# "Load older recordings" pagination and event-to-playback deep links,
+# both of which query past this limit on demand instead of it ever
+# being a hard ceiling on what a customer can reach.
+#
+# 200 (this route's own hard cap -- see the limit clamp in
+# customer_recordings_metadata() below) rather than the original 50:
+# traced 2026-09-02 against real production recording history, this
+# camera's actual cadence is ~85-87% back-to-back 5-minute segments,
+# roughly up to ~120 real recordings on a normal day for the busiest
+# camera observed. At 50, the Playback timeline (which renders every
+# loaded clip -- see renderTimeline()) never saw enough of a day's
+# real, already-recorded history to show it, making genuinely
+# continuous recording look sparse/gapped. Metadata-only rows are ~100
+# bytes each (id/start/end/name, no presigned URL), so even 200 of
+# them is a trivial payload -- nothing like the fully-presigned-URL
+# incident that originally motivated a low initial limit here.
+# Every recording/detection-event timestamp in this system is a naive
+# string with no timezone marker, written by the appliance's own local
+# clock (recording_uploader.py's own "naive local-time throughout"
+# convention on the edge side) -- for every real deployment so far,
+# that clock is set to US Central time, not UTC. The cloud server's own
+# datetime.now() is UTC (its OS clock, unlike the appliance's, is not
+# timezone-configured), so using it directly to compute "today" for a
+# calendar-day boundary was comparing a UTC date against Central-time-
+# stamped data -- wrong for roughly five hours a day (the gap between
+# UTC midnight and Central midnight), silently hiding or misdating a
+# customer's own recent recordings/events. APPLIANCE_TIMEZONE exists so
+# every "what date is it, for the purpose of matching appliance-
+# stamped data" computation uses the same zone the data was actually
+# written in. Sites/customers have no stored per-site timezone today
+# (only an onboarding form placeholder, never persisted) -- this is
+# the smallest correct fix until that exists, not a claim that every
+# future customer is in Central time.
+APPLIANCE_TIMEZONE = ZoneInfo("America/Chicago")
+
+CUSTOMER_PLAYBACK_INITIAL_LIMIT = 200
+
+
+def _row_to_recording_metadata(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "start": row["started_at"],
+        "end": row["ended_at"],
+        "name": row["s3_key"].rsplit("/", 1)[-1],
+    }
+
+
+def _catalog_local_recordings_for_camera(camera_id: str) -> int:
+    """Backfills the recordings table from local .mkv files still on
+    disk for this camera -- reconciled verbatim from the accepted,
+    live production implementation (EC2/Samsung), not invented.
+    recording_start() (filename parsing) is the sole authoritative
+    timestamp source; filesystem mtime is used only as a safety gate
+    to skip a segment ffmpeg may still be actively writing (a file
+    younger than CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS), never as the
+    recorded time itself. (camera_id, s3_key) is UNIQUE on the
+    recordings table, so this is naturally idempotent -- calling it
+    repeatedly, on every date this camera's Playback is queried for,
+    never creates duplicate rows."""
+    from partner_db import connection
+
+    with connection() as db:
+        camera = db.execute(
+            "SELECT id, customer_id, site_id, appliance_id, camera_number "
+            "FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+
+        if not camera or camera["camera_number"] is None:
+            return 0
+
+        camera_number = int(camera["camera_number"])
+        camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+        if not camera_folder.is_dir():
+            return 0
+
+        cutoff = time.time() - CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS
+        added = 0
+
+        for path in sorted(camera_folder.glob("*.mkv")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+
+            if stat.st_size <= 0 or stat.st_mtime > cutoff:
+                continue
+
+            started = recording_start(path, camera_number)
+            if not started:
+                continue
+
+            ended = started + timedelta(minutes=5)
+            s3_key = cloud_recording_s3_key(path, camera_number)
+
+            existing = db.execute(
+                "SELECT id FROM recordings WHERE camera_id=? AND s3_key=?",
+                (camera_id, s3_key),
+            ).fetchone()
+
+            if existing:
+                continue
+
+            db.execute(
+                "INSERT INTO recordings("
+                "id,customer_id,site_id,appliance_id,camera_id,s3_key,"
+                "started_at,ended_at,duration_seconds,size_bytes,status,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    secrets.token_hex(12),
+                    camera["customer_id"],
+                    camera["site_id"],
+                    camera["appliance_id"],
+                    camera_id,
+                    s3_key,
+                    started.isoformat(),
+                    ended.isoformat(),
+                    300,
+                    stat.st_size,
+                    "available",
+                    datetime.now().isoformat(),
+                ),
+            )
+            added += 1
+
+    return added
+
+
+def _customer_recording_rows(camera_id: str, *, limit: int | None = None, before: str | None = None, before_id: str | None = None, near: str | None = None) -> list[dict]:
+    """Recording METADATA only -- {id, start, end, name}, no presigned
+    URL -- the bounded, cheap counterpart _customer_camera_recordings()
+    never was: that function signs every single matching row up front
+    (see its own docstring), which is exactly what made a real
+    customer's Playback page grow past 5MB and take 8+ seconds to
+    render as their catalog grew, and is why real browser requests
+    were being canceled before the page ever finished loading. This
+    function only ever touches the database; _customer_recording_url()
+    below is the paired, one-at-a-time presign for whichever single
+    recording a customer actually selects.
+
+    Same WHERE camera_id=? AND status='available' scoping as
+    _customer_camera_recordings() -- ownership/permission
+    authorization for camera_id is the caller's job (see
+    _customer_authorized_camera_id()), exactly as it already was for
+    the un-bounded function.
+
+    - limit: most recent N rows, returned oldest-first (matching the
+      ordering _customer_camera_recordings() and the frontend's own
+      clips[clips.length-1]-is-newest convention already use).
+    - before / before_id: pagination for "load older recordings" once
+      the initial bounded page has been exhausted -- rows strictly
+      after (started_at, id) in the same DESC, DESC order this query
+      itself uses, i.e. started_at<before, OR (started_at==before AND
+      id<before_id). before_id is optional and purely additive: a
+      caller passing before alone (the pre-existing contract, still
+      honored exactly as before) gets a plain started_at<before
+      comparison, which is correct as long as no two of this camera's
+      rows ever share an identical started_at. In real operation that
+      is already true (recordings are ~5 minutes apart), but it is not
+      a database constraint, so the id tie-break is here to make
+      "never duplicated, never skipped" a guarantee rather than an
+      assumption -- the one real gap the plain single-column cursor
+      had. Ignored if near is set.
+    - near: returns at most the single recording that covers this
+      timestamp, or the closest one within 5 minutes -- the exact same
+      "covering, else nearest within 5 min" contract findClipNear() in
+      the page's own JS already implements client-side, so an
+      event-to-playback deep link lands on the same recording whether
+      or not it happens to already be in the initially-loaded page.
+      Ignores limit/before/before_id."""
+    _catalog_local_recordings_for_camera(camera_id)
+    from partner_db import connection
+    with connection() as db:
+        if near:
+            covering = db.execute(
+                "SELECT id, s3_key, started_at, ended_at FROM recordings "
+                "WHERE camera_id=? AND status='available' AND started_at<=? AND ended_at>=? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (camera_id, near, near),
+            ).fetchone()
+            if covering:
+                return [_row_to_recording_metadata(covering)]
+            before_row = db.execute(
+                "SELECT id, s3_key, started_at, ended_at FROM recordings "
+                "WHERE camera_id=? AND status='available' AND started_at<=? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (camera_id, near),
+            ).fetchone()
+            after_row = db.execute(
+                "SELECT id, s3_key, started_at, ended_at FROM recordings "
+                "WHERE camera_id=? AND status='available' AND started_at>=? "
+                "ORDER BY started_at ASC LIMIT 1",
+                (camera_id, near),
+            ).fetchone()
+            candidates = [row for row in (before_row, after_row) if row]
+            if not candidates:
+                return []
+            try:
+                target = datetime.fromisoformat(near)
+                best = min(candidates, key=lambda row: abs((datetime.fromisoformat(row["started_at"]) - target).total_seconds()))
+                if abs((datetime.fromisoformat(best["started_at"]) - target).total_seconds()) > 300:
+                    return []
+            except ValueError:
+                return []
+            return [_row_to_recording_metadata(best)]
+
+        query = "SELECT id, s3_key, started_at, ended_at FROM recordings WHERE camera_id=? AND status='available'"
+        params: list = [camera_id]
+        if before and before_id:
+            query += " AND (started_at<? OR (started_at=? AND id<?))"
+            params.extend([before, before, before_id])
+        elif before:
+            query += " AND started_at<?"
+            params.append(before)
+        query += " ORDER BY started_at DESC, id DESC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = db.execute(query, params).fetchall()
+    return [_row_to_recording_metadata(row) for row in reversed(rows)]
+
+
+def _local_date_bounds_to_utc(date: str) -> tuple[str, str]:
+    """Converts a customer-local calendar date (YYYY-MM-DD) to the
+    [start, end) naive-UTC ISO bounds covering that local day -- the
+    exact same APPLIANCE_TIMEZONE conversion _customer_camera_events()
+    already uses for the event timeline, reused here rather than a
+    second, possibly-drifting implementation."""
+    local_start = datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=APPLIANCE_TIMEZONE
+    )
+    local_end = local_start + timedelta(days=1)
+
+    utc_zone = ZoneInfo("UTC")
+    query_start = (
+        local_start.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    query_end = (
+        local_end.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    return query_start, query_end
+
+
+def _recordings_overlapping_utc_range(camera_id: str, query_start: str, query_end: str) -> list[dict]:
+    """All available recordings for one customer camera whose
+    [started_at, ended_at) interval overlaps the given naive-UTC
+    [query_start, query_end) range, ordered oldest-first -- the shared
+    query body behind _customer_recordings_for_date() (bounds computed
+    server-side via the fixed APPLIANCE_TIMEZONE guess) and
+    customer_recordings_metadata()'s own day_start_utc/day_end_utc
+    request path (bounds computed in the customer's actual browser, the
+    only party that genuinely knows their real local timezone absent a
+    stored per-site one -- see that route's own comment).
+
+    Catalogs local .mkv files for this camera before querying (see
+    _catalog_local_recordings_for_camera()) so a day whose Playback page
+    has never been opened before -- an old retained day -- is still
+    discoverable, without any new always-running background service.
+
+    Uses an interval-overlap test (started_at < query_end AND ended_at >
+    query_start), not a started_at-only bound -- a recording that starts
+    the previous day and runs past local midnight, or one that starts
+    within this range and runs past its end, must still appear here: it
+    genuinely overlaps this range's footage, even though its own
+    started_at may fall outside [query_start, query_end)."""
+    _catalog_local_recordings_for_camera(camera_id)
+
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT id, s3_key, started_at, ended_at FROM recordings "
+            "WHERE camera_id=? AND status='available' "
+            "AND started_at<? AND ended_at>? "
+            "ORDER BY started_at ASC",
+            (camera_id, query_end, query_start),
+        ).fetchall()
+    return [_row_to_recording_metadata(row) for row in rows]
+
+
+def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
+    """All available recordings for one customer camera that overlap a
+    given customer-local calendar date, ordered oldest-first --
+    chronological order so a future continuous-playback phase can
+    chain adjacent segments directly off this list without re-sorting.
+
+    Fallback path only, for a caller that sends `date` alone (an older
+    client, or a direct API call) -- bounds are computed via the fixed
+    APPLIANCE_TIMEZONE below, which is not necessarily this particular
+    customer's/site's real timezone (there is no stored per-site
+    timezone yet). customer_recordings_metadata()'s day_start_utc/
+    day_end_utc path is authoritative whenever the caller (the page's
+    own JS) provides it, precisely to avoid this guess -- see that
+    route's own comment."""
+    _catalog_local_recordings_for_camera(camera_id)
+
+    query_start, query_end = _local_date_bounds_to_utc(date)
+    return _recordings_overlapping_utc_range(camera_id, query_start, query_end)
+
+
+def _customer_recording_dates(camera_id: str) -> list[str]:
+    """Every customer-local calendar date (YYYY-MM-DD) this camera has
+    at least one available recording for -- powers the Playback
+    calendar's "which days have footage" indication, without the
+    browser ever scanning video files itself. A recording spanning
+    local midnight contributes both dates it actually overlaps,
+    matching _customer_recordings_for_date()'s own overlap semantics.
+
+    Deliberately computed in Python, not a bare SQL date() extraction
+    on the stored (UTC) started_at column -- a naive UTC-date group-by
+    would misattribute recordings near a UTC-day boundary to the wrong
+    customer-local date. The recordings table is retention-bounded
+    (days to weeks per camera, not an unbounded history), so fetching
+    every row's own two timestamps and converting each in Python is
+    the smallest safe approach -- no second index, no new query
+    complexity for a rarely-called, cheap endpoint."""
+    _catalog_local_recordings_for_camera(camera_id)
+
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT started_at, ended_at FROM recordings "
+            "WHERE camera_id=? AND status='available'",
+            (camera_id,),
+        ).fetchall()
+
+    utc_zone = ZoneInfo("UTC")
+    dates: set[str] = set()
+    for row in rows:
+        try:
+            start = datetime.fromisoformat(row["started_at"]).replace(tzinfo=utc_zone)
+            end = datetime.fromisoformat(row["ended_at"]).replace(tzinfo=utc_zone)
+        except ValueError:
+            continue
+        start_local = start.astimezone(APPLIANCE_TIMEZONE)
+        end_local = end.astimezone(APPLIANCE_TIMEZONE)
+        dates.add(start_local.strftime("%Y-%m-%d"))
+        dates.add(end_local.strftime("%Y-%m-%d"))
+    return sorted(dates)
+
+
+def _customer_recording_url(camera_id: str, recording_id: str) -> str | None:
+    """Return a playable URL for one authorized catalog recording.
+    Cloud deployments keep using the existing presigned S3 URL.
+    Edge/local appliances fall back to an authenticated local recording
+    route when the exact cataloged MKV still exists on this appliance.
+    """
+    from partner_db import connection
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+    if not row:
+        return None
+    cloud_url = _presigned_recording_url(row["s3_key"])
+    if cloud_url:
+        return cloud_url
+    camera_number = row["camera_number"]
+    if camera_number is None:
+        return None
+    filename = Path(row["s3_key"]).name
+    if not filename.endswith(".mkv"):
+        return None
+    if filename != Path(filename).name:
+        return None
+    if not filename.startswith(f"camera{camera_number}_"):
+        return None
+    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not local_path.is_file():
+        return None
+    return f"/api/customer/recordings/{camera_id}/{recording_id}/local"
+
+
+def _customer_authorized_camera_id(request: Request, camera_id: str) -> bool:
+    """Shared authorization check for the two bounded-Playback API
+    routes below -- reuses _customer_playback_cameras() exactly, the
+    same function the Playback page itself already trusts for which
+    cameras an identity may see, so this is never a second scoping
+    rule that could drift from the page's own."""
+    cameras = _customer_playback_cameras(request)
+    if cameras is None:
+        return False
+    return camera_id in {camera["id"] for camera in cameras}
+
+
+@app.post("/api/customer/clips")
+async def customer_create_clip(request: Request) -> dict:
+    payload = await request.json()
+    camera_id = str(payload.get("camera_id") or "")
+    start_raw = payload.get("start_time")
+    end_raw = payload.get("end_time")
+    if not camera_id or not start_raw or not end_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="camera_id, start_time and end_time are required.",
+        )
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    try:
+        start_time = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+        end_time = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid clip timestamp.")
+    start_time = start_time.replace(tzinfo=None)
+    end_time = end_time.replace(tzinfo=None)
+    duration = end_time - start_time
+    if duration <= timedelta(0):
+        raise HTTPException(status_code=400, detail="End time must be after start time.")
+    if duration > timedelta(hours=1):
+        raise HTTPException(status_code=400, detail="Manual clips are limited to one hour.")
+    from partner_db import connection
+    with connection() as db:
+        camera = db.execute(
+            "SELECT camera_number FROM cameras WHERE id=?",
+            (camera_id,),
+        ).fetchone()
+    if not camera or camera["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    camera_number = int(camera["camera_number"])
+    job_id = uuid.uuid4().hex
+    clip_jobs[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 2,
+        "message": "Clip queued…",
+    }
+    task = asyncio.create_task(
+        build_manual_clip(
+            job_id,
+            camera_number,
+            start_time,
+            end_time,
+        )
+    )
+    clip_tasks.add(task)
+    task.add_done_callback(clip_tasks.discard)
+    return clip_jobs[job_id]
+
+
+@app.get("/api/customer/clips/{job_id}")
+def customer_clip_status(job_id: str, request: Request) -> dict:
+    # A customer must at least have a valid portal identity to inspect
+    # customer clip jobs. The clip itself was already authorized by
+    # camera ownership/access when the job was created.
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        raise HTTPException(status_code=403, detail="Authentication required.")
+    return clip_jobs.get(
+        job_id,
+        {
+            "id": job_id,
+            "status": "error",
+            "progress": 0,
+            "message": "Clip job not found.",
+        },
+    )
+
+
+@app.get("/api/customer/recordings/{camera_id}")
+def customer_recordings_metadata(camera_id: str, request: Request, before: str | None = None, before_id: str | None = None, near: str | None = None, date: str | None = None, day_start_utc: str | None = None, day_end_utc: str | None = None, limit: int = 50) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    # date= is a distinct, whole-day query mode -- returns every segment
+    # overlapping that customer-local calendar date, chronologically,
+    # ignoring before/near/limit entirely (a day's worth of 5-minute
+    # segments is already a small, bounded result, unlike the
+    # unbounded-history concern before/limit exist to guard against).
+    # Existing near=/before= pagination behavior is completely
+    # unchanged when date is absent.
+    if date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD.")
+        # 2026-09-15: day_start_utc/day_end_utc are optional, additive
+        # params the page's own JS now always sends alongside `date` --
+        # exact UTC instants for that LOCAL calendar day, computed in the
+        # customer's own browser (loadRecordingsForDate()'s own comment
+        # explains why: this appliance/product has no stored per-site
+        # timezone, so the browser's native Date -- which always knows
+        # its own real local offset, DST included -- is the only party
+        # that can compute this correctly, rather than the server
+        # guessing via the fixed APPLIANCE_TIMEZONE constant below).
+        # `date` itself is still validated/used as the fallback query for
+        # any older client or direct API caller that doesn't send them.
+        if day_start_utc and day_end_utc:
+            try:
+                datetime.fromisoformat(day_start_utc)
+                datetime.fromisoformat(day_end_utc)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="day_start_utc/day_end_utc must be ISO timestamps.")
+            return {"clips": _recordings_overlapping_utc_range(camera_id, day_start_utc, day_end_utc)}
+        return {"clips": _customer_recordings_for_date(camera_id, date)}
+    # A malformed cursor must fail cleanly (400) rather than being
+    # passed straight into a raw SQL text comparison, where a garbage
+    # string would silently produce wrong -- not erroring -- results
+    # (before is a plain, unsigned ISO timestamp; camera_id scoping,
+    # already enforced above, is what actually prevents any cross-
+    # camera/cross-customer authorization bypass through this
+    # parameter, not the format check here).
+    if before is not None:
+        try:
+            datetime.fromisoformat(before)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="before must be an ISO timestamp.")
+    limit = max(1, min(200, limit))
+    return {"clips": _customer_recording_rows(camera_id, limit=limit, before=before, before_id=before_id, near=near)}
+
+
+@app.get("/api/customer/recordings/{camera_id}/dates")
+def customer_recording_dates(camera_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    return {"dates": _customer_recording_dates(camera_id)}
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/url")
+def customer_recording_url(camera_id: str, recording_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    url = _customer_recording_url(camera_id, recording_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Recording not found or not yet available.")
+    return {"url": url}
+
+
+def _customer_event_media_url(camera_id: str, event_id: str) -> str | None:
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.s3_key "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return _presigned_recording_url(row["s3_key"])
+
+
+def _event_media_direct_row(camera_id: str, event_id: str) -> dict | None:
+    """One lookup shared by both routes below: the clip's own id/s3_key/
+    local_relative_path/size_bytes plus its camera's appliance_id --
+    everything customer_event_media_direct() needs to decide eligibility
+    and, on any failure, fall back to the exact same S3 lookup
+    _customer_event_media_url() already does. Re-scopes by camera_id in
+    the same query shape as every other event-media lookup in this file,
+    for the same cross-camera-authorization reason."""
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.id AS media_id, dem.s3_key, dem.local_relative_path, dem.size_bytes, c.appliance_id "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "JOIN cameras c ON c.id=de.camera_id "
+            "WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _event_media_active_peer(appliance_id: str | None) -> dict | None:
+    """None if WireGuard direct fetch isn't even worth attempting for
+    this appliance right now -- no live network call, just the same
+    active_peers_for_appliance() lookup live_view_wireguard.py's own
+    live-HLS path already uses. Returns the full peer row (tunnel_address
+    AND media_fetch_secret both live here) rather than just the address:
+    a NULL media_fetch_secret -- every appliance today, until a separate,
+    later enrollment step -- makes this appliance ineligible even with a
+    live tunnel, never a naive raw-path fetch that would hit Ryzen's own
+    local-admin-session gate the way this feature's first, unauthenticated
+    version did."""
+    from live_view_wireguard import EVENT_MEDIA_WIREGUARD_ENABLED
+    from wireguard_remote import active_peers_for_appliance
+    from partner_db import connection
+
+    if not EVENT_MEDIA_WIREGUARD_ENABLED or not appliance_id:
+        return None
+    with connection() as db:
+        peers = active_peers_for_appliance(db, appliance_id)
+    if not peers or not peers[0].get("tunnel_address") or not peers[0].get("media_fetch_secret"):
+        return None
+    return peers[0]
+
+
+def _log_event_media_fetch(media_id: str, source: str, bytes_served: int, outcome: str) -> None:
+    from partner_db import connection
+
+    with connection() as db:
+        db.execute(
+            "INSERT INTO event_media_fetch_log(id,media_id,source,bytes_served,outcome,created_at) VALUES(?,?,?,?,?,?)",
+            (secrets.token_hex(12), media_id, source, int(bytes_served or 0), outcome, datetime.now().isoformat()),
+        )
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/media/url")
+def customer_event_media_url(camera_id: str, event_id: str, request: Request) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    # Cheap, no-network eligibility check only -- the real fetch-with-
+    # fallback attempt (and its own re-check of the same authorization)
+    # happens in customer_event_media_direct() below, every time it's
+    # called, never trusted from this decision alone.
+    from live_view_wireguard import local_relative_path_allowed
+
+    row = _event_media_direct_row(camera_id, event_id)
+    if row and local_relative_path_allowed(row["local_relative_path"]) and _event_media_active_peer(row["appliance_id"]):
+        return {"url": f"/api/customer/events/{camera_id}/{event_id}/media/direct"}
+
+    url = _customer_event_media_url(camera_id, event_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+
+    return {"url": url}
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/media/direct")
+def customer_event_media_direct(camera_id: str, event_id: str, request: Request):
+    """The one place a real fetch is attempted over WireGuard for an
+    event clip, with an automatic, transparent fallback to the existing
+    S3/CloudFront path on any failure -- ineligible, no active tunnel,
+    gateway unreachable, or a real timeout all resolve the same way.
+    Re-checks authorization independently of customer_event_media_url()
+    above (never trusts a decision made by an earlier request) --
+    exactly the same re-check-every-request discipline
+    live_view_wireguard.py's own module docstring documents for the live
+    HLS path. The browser only ever sees this one portal-relative URL or
+    the existing presigned CloudFront one on fallback -- never a tunnel
+    address, gateway hostname, port, or media-fetch token.
+
+    2026-09-19 redesign, after a real live-staging finding: this no
+    longer asks the gateway to fetch the raw /recordings/... path at all
+    (that path requires a local Ryzen admin session and redirected to a
+    login page the first time this was tried live -- silently counted as
+    success by the bug this redesign also fixes). It now mints a
+    short-lived, path-scoped HMAC token (appliance_media_fetch.mint()) and
+    asks for /api/appliance/media-fetch instead -- an appliance-
+    authenticated route (main.py's own appliance_media_fetch_endpoint()
+    below) that verifies the token locally and serves ONLY that one file,
+    no directory browsing, no session. And it never trusts a 200 alone --
+    response_looks_like_real_video() must also agree before this is ever
+    logged or served as a real success."""
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    import appliance_media_fetch
+    from live_view_wireguard import GATEWAY_APPLIANCE_PORT, GatewayUnavailable, _fetch_via_gateway, local_relative_path_allowed
+
+    row = _event_media_direct_row(camera_id, event_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+
+    peer = None
+    if local_relative_path_allowed(row["local_relative_path"]):
+        peer = _event_media_active_peer(row["appliance_id"])
+
+    if peer:
+        expires, token = appliance_media_fetch.mint(peer["media_fetch_secret"], row["local_relative_path"])
+        forward_path = "/api/appliance/media-fetch?" + urlencode({
+            "path": row["local_relative_path"], "expires": expires, "token": token,
+        })
+        try:
+            body = _fetch_via_gateway(peer["tunnel_address"], GATEWAY_APPLIANCE_PORT, forward_path)
+        except GatewayUnavailable:
+            _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "direct_failed_fallback")
+        else:
+            if appliance_media_fetch.response_looks_like_real_video(body, expected_size=row["size_bytes"]):
+                _log_event_media_fetch(row["media_id"], "wireguard", len(body), "direct_success")
+                return Response(content=body, media_type="video/mp4")
+            _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "direct_invalid_response_fallback")
+    else:
+        _log_event_media_fetch(row["media_id"], "aws", row["size_bytes"] or 0, "not_eligible")
+
+    url = _presigned_recording_url(row["s3_key"])
+    if not url:
+        raise HTTPException(status_code=404, detail="Event clip not found or not yet available.")
+    return RedirectResponse(url, status_code=302)
+
+
+@app.get("/api/appliance/media-fetch")
+def appliance_media_fetch_endpoint(path: str, expires: int, token: str):
+    """The appliance-side half of customer_event_media_direct()'s
+    authenticated fetch (2026-09-19) -- runs identically whether this
+    process is the cloud portal or a real edge appliance, but is only
+    ever actually reached over the WireGuard tunnel on a real Ryzen box.
+    Deliberately NOT the raw /recordings StaticFiles mount and not gated
+    by the browser-session authentication_middleware at all: it falls
+    under the existing "/api/appliance/" PUBLIC_PATH_PREFIXES entry (the
+    same one covering every other appliance-authenticated route, all of
+    which do their own internal credential check instead of relying on a
+    browser session) and does its own check here -- a short-lived,
+    path-scoped HMAC token, verified against this appliance's own local
+    secret file, never a database round trip. No directory listing, no
+    arbitrary path capability: a token authorizes exactly one path, for
+    about a minute, and this route still independently re-validates that
+    path is safely contained under RECORDINGS_FOLDER before ever opening
+    it -- defense in depth even though the token itself already commits
+    to the exact path requested.
+
+    Fails closed at every stage: no local secret provisioned yet (real
+    for every appliance today, until a separate, later, explicitly-
+    authorized enrollment step), an expired or mismatched token, an
+    unsafe path, or a file that doesn't exist all return a real 4xx --
+    never a redirect to any login page, which is exactly what let the
+    2026-09-19 finding this route replaces slip past as a false-positive
+    200 in the first place."""
+    import appliance_media_fetch
+
+    secret = appliance_media_fetch.load_local_secret()
+    if not secret:
+        raise HTTPException(status_code=503, detail="Media-fetch is not provisioned on this appliance.")
+    if not appliance_media_fetch.verify(secret, path, expires, token):
+        raise HTTPException(status_code=401, detail="Invalid or expired media-fetch token.")
+    if not path.startswith("/recordings/") or ".." in path:
+        raise HTTPException(status_code=400, detail="Invalid path.")
+
+    root = RECORDINGS_FOLDER.resolve()
+    resolved = (root / path.removeprefix("/recordings/")).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path.")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Media file not found.")
+
+    return FileResponse(resolved, media_type="video/mp4")
+
+
+def _customer_event_thumbnail_s3_key(camera_id: str, event_id: str) -> str | None:
+    """Resolves one event's own captured-thumbnail S3 key (detection_
+    event_media.thumbnail_s3_key) -- pure DB lookup, no presigning.
+    Re-scopes by camera_id in the same query as
+    _customer_event_media_url(), for the same reason: an event_id must
+    never resolve media for a camera other than the one the caller was
+    already authorized against. Split out from the old
+    _customer_event_thumbnail_url() (still below, now a thin wrapper)
+    so the actual route can hand this key to
+    _cacheable_presigned_redirect() and get the browser-caching benefit
+    described there, without a second, separate presign call."""
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.thumbnail_s3_key "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.id=? AND de.camera_id=?",
+            (event_id, camera_id),
+        ).fetchone()
+
+    if not row or not row["thumbnail_s3_key"]:
+        return None
+    return row["thumbnail_s3_key"]
+
+
+def _customer_event_thumbnail_url(camera_id: str, event_id: str) -> str | None:
+    """Presigns the still-frame preview captured alongside one event's
+    own clip -- generated by the same ingestion pipeline that writes
+    s3_key (see _customer_event_media_url() above), but never
+    previously read by any customer-facing code: _customer_detection_
+    events() always reported thumbnail=None regardless of whether a
+    real preview image existed, so every Events row rendered the same
+    "--" placeholder and the only visible difference between a row
+    with a real clip and one without was the clickable has_event_clip
+    wrapper itself.
+
+    Retained for any caller that only wants a plain URL string; the
+    live customer_event_thumbnail() route below calls
+    _customer_event_thumbnail_s3_key() + _cacheable_presigned_redirect()
+    directly instead, so it can also set a browser Cache-Control
+    header -- this function does not."""
+    key = _customer_event_thumbnail_s3_key(camera_id, event_id)
+    if not key:
+        return None
+    return _presigned_recording_url(key)
+
+
+@app.get("/api/customer/events/{camera_id}/{event_id}/thumbnail")
+def customer_event_thumbnail(camera_id: str, event_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    key = _customer_event_thumbnail_s3_key(camera_id, event_id)
+    response = _cacheable_presigned_redirect(key) if key else None
+    if response is None:
+        raise HTTPException(status_code=404, detail="Event thumbnail not available.")
+
+    return response
+
+
+_recording_media_cache_locks: dict = {}
+_recording_media_cache_locks_guard = threading.Lock()
+
+
+def _recording_media_cache_lock(recording_id: str) -> threading.Lock:
+    with _recording_media_cache_locks_guard:
+        lock = _recording_media_cache_locks.get(recording_id)
+        if lock is None:
+            lock = threading.Lock()
+            _recording_media_cache_locks[recording_id] = lock
+        return lock
+
+
+RECORDING_MEDIA_CACHE_FOLDER = RECORDINGS_FOLDER / "_media_cache"
+RECORDING_MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB soft cap -- oldest cached remuxes evicted first
+
+
+def _evict_recording_media_cache_if_full() -> None:
+    try:
+        entries = sorted(RECORDING_MEDIA_CACHE_FOLDER.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    except FileNotFoundError:
+        return
+    total = sum(p.stat().st_size for p in entries)
+    i = 0
+    while total > RECORDING_MEDIA_CACHE_MAX_BYTES and i < len(entries):
+        try:
+            total -= entries[i].stat().st_size
+            entries[i].unlink()
+        except OSError:
+            pass
+        i += 1
+
+
+def _download_recording_object(s3_key: str, dest_path: Path) -> bool:
+    """Downloads one archived recording object using the same read-only,
+    GetObject-scoped assumed role _presigned_recording_url() already signs
+    with -- see that function's docstring for why a dedicated STS role is
+    required here rather than the instance's own (deliberately S3-less)
+    IAM identity."""
+    role_arn = os.getenv('ANYAICAM_RECORDING_READ_ROLE_ARN', '').strip()
+    bucket = os.getenv('ANYAICAM_RECORDING_S3_BUCKET', '').strip()
+    region = os.getenv('AWS_REGION', os.getenv('AWS_DEFAULT_REGION', '')).strip()
+    if not role_arn or not bucket or not region:
+        return False
+    try:
+        import boto3
+    except ImportError:
+        return False
+    try:
+        creds = _recording_read_credentials(role_arn, region)
+        if not creds:
+            return False
+        s3 = boto3.client(
+            's3', region_name=region,
+            aws_access_key_id=creds['access_key_id'],
+            aws_secret_access_key=creds['secret_access_key'],
+            aws_session_token=creds['session_token'],
+        )
+        s3.download_file(bucket, s3_key, str(dest_path))
+        return dest_path.is_file() and dest_path.stat().st_size > 0
+    except Exception:
+        logging.getLogger('anyaicam.recording_read').exception('recording_read.download_failed')
+        return False
+
+
+def _fix_cloud_recording_audio_for_playback(recording_id: str, s3_key: str) -> Path | None:
+    """Root cause of the 2026-09-01 continuous-Playback freeze: every
+    cloud recording's AAC audio track is 8kHz mono and starts ~0.05-0.1s
+    after the video track (confirmed with ffprobe against live production
+    recordings -- clean, monotonic PTS/DTS on both streams end to end,
+    so the archived file itself is not corrupt). Chrome's <video> element
+    adopts the audio track as its playback clock once one is present;
+    with this specific low-sample-rate/late-start combination, Chrome's
+    audio renderer never begins advancing that clock even though
+    readyState reaches 4 and data is buffered -- video presentation,
+    gated on the same clock, freezes at/near currentTime=0 with no
+    error and no console signal. Forcibly muting the element made the
+    freeze disappear during diagnosis, proving the audio path was the
+    blocker (muting is not shipped -- see customer_recording_media()
+    below and the product requirement that audio must work).
+
+    Fix: a fast, video-stream-copy remux that re-encodes only the tiny
+    8kHz mono audio track to 48kHz and aligns its first sample to t=0.
+    Every video frame byte is copied, not re-encoded -- no quality loss,
+    no risk to the already-proven-correct H.264 stream. Runs once per
+    recording, lazily, on first request; the result is cached on local
+    disk keyed by recording_id, so replay/Download/Share after the
+    first play are a plain cached-file read, not a re-remux."""
+    RECORDING_MEDIA_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+    cache_path = RECORDING_MEDIA_CACHE_FOLDER / f"{recording_id}.mp4"
+    if cache_path.is_file() and cache_path.stat().st_size > 0:
+        return cache_path
+
+    with _recording_media_cache_lock(recording_id):
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path
+
+        tmp_source = cache_path.with_name(cache_path.name + ".src.tmp")
+        tmp_out = cache_path.with_name(cache_path.name + ".tmp")
+        try:
+            if not _download_recording_object(s3_key, tmp_source):
+                return None
+
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-i", str(tmp_source),
+                    "-c:v", "copy",
+                    "-c:a", "aac", "-ar", "48000",
+                    "-af", "aresample=async=1:first_pts=0",
+                    "-movflags", "+faststart",
+                    "-f", "mp4",
+                    str(tmp_out),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                logging.getLogger("anyaicam.recording_media").error(
+                    "recording_media.remux_failed recording_id=%s stderr=%s",
+                    recording_id, result.stderr.decode("utf-8", "replace")[-2000:],
+                )
+                return None
+
+            os.replace(tmp_out, cache_path)
+            _evict_recording_media_cache_if_full()
+            return cache_path
+        except Exception:
+            logging.getLogger("anyaicam.recording_media").exception(
+                "recording_media.remux_error recording_id=%s", recording_id
+            )
+            return None
+        finally:
+            for tmp in (tmp_source, tmp_out):
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/media")
+def customer_recording_media(camera_id: str, recording_id: str, request: Request):
+    """Serves a browser-safe copy of a customer recording for the
+    continuous-Playback player -- see _fix_cloud_recording_audio_for_
+    playback()'s docstring for the root cause this exists to work
+    around. Authorization is checked exactly like every other bounded-
+    Playback route (_customer_authorized_camera_id(), reusing
+    _customer_playback_cameras()) before anything else, unchanged.
+
+    Cloud recordings (.mp4 in the recordings bucket) are lazily
+    remuxed and served directly so the browser's <video> element
+    receives a locally-fixed file instead of a raw redirect straight
+    to the archived, audio-clock-freezing original. Local-appliance
+    (.mkv) recordings are unaffected by this bug and keep the original
+    same-origin redirect to /local exactly as before. If the remux
+    path fails for any reason (network blip, ffmpeg error, role/bucket
+    not configured), this fails open to the original redirect-to-
+    presigned-URL behavior rather than returning a dead player."""
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+
+    if row and row["s3_key"] and str(row["s3_key"]).lower().endswith(".mp4"):
+        fixed_path = _fix_cloud_recording_audio_for_playback(recording_id, row["s3_key"])
+        if fixed_path is not None:
+            return FileResponse(
+                fixed_path,
+                media_type="video/mp4",
+                filename=f"{recording_id}.mp4",
+                content_disposition_type="inline",
+            )
+        # Remux failed -- fail open to the original passthrough
+        # redirect rather than a dead player.
+
+    url = _customer_recording_url(camera_id, recording_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Recording not found or not yet available.")
+    return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/local")
+def customer_recording_local(camera_id: str, recording_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+
+    if not row or row["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    camera_number = row["camera_number"]
+    filename = Path(row["s3_key"]).name
+
+    if (
+        not filename.endswith(".mkv")
+        or filename != Path(filename).name
+        or not filename.startswith(f"camera{camera_number}_")
+    ):
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    local_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not local_path.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    return FileResponse(
+        local_path,
+        media_type="video/x-matroska",
+        filename=filename,
+        content_disposition_type="inline",
+    )
+
+
+
+@app.get("/api/customer/recordings/{camera_id}/{recording_id}/thumbnail")
+def customer_recording_thumbnail(camera_id: str, recording_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT r.s3_key, c.camera_number "
+            "FROM recordings r "
+            "JOIN cameras c ON c.id=r.camera_id "
+            "WHERE r.id=? AND r.camera_id=? AND r.status='available'",
+            (recording_id, camera_id),
+        ).fetchone()
+
+    if not row or row["camera_number"] is None:
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    camera_number = int(row["camera_number"])
+    s3_key = str(row["s3_key"] or "")
+    filename = Path(s3_key).name
+
+    if (
+        filename != Path(filename).name
+        or not filename.startswith(f"camera{camera_number}_")
+    ):
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    # Cloud recording pipeline:
+    #
+    # Samsung uploads:
+    #   cameraN_timestamp.mp4
+    #   cameraN_timestamp.jpg
+    #
+    # beside each other under the same S3 prefix. Reuse the existing
+    # recording read-role presigner rather than proxying image bytes
+    # through EC2.
+    if filename.lower().endswith(".mp4"):
+        thumbnail_key = s3_key.rsplit(".", 1)[0] + ".jpg"
+        response = _cacheable_presigned_redirect(thumbnail_key)
+
+        if response is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Thumbnail not available.",
+            )
+
+        return response
+
+    # Preserve the original edge/local MKV behavior.
+    if not filename.lower().endswith(".mkv"):
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    recording_path = RECORDINGS_FOLDER / f"camera{camera_number}" / filename
+    if not recording_path.is_file():
+        raise HTTPException(status_code=404, detail="Recording not found.")
+
+    thumbnail_dir = RECORDINGS_FOLDER / "thumbnails" / f"camera{camera_number}"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+
+    thumbnail_path = thumbnail_dir / f"{Path(filename).stem}.jpg"
+
+    if not thumbnail_path.is_file():
+        import subprocess
+
+        temporary_path = thumbnail_path.with_suffix(".tmp.jpg")
+
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-ss", "3",
+                "-i", str(recording_path),
+                "-frames:v", "1",
+                "-vf", "scale=320:-2",
+                "-q:v", "4",
+                "-y",
+                str(temporary_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+
+        if result.returncode != 0 or not temporary_path.is_file():
+            temporary_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=404,
+                detail="Thumbnail not available.",
+            )
+
+        temporary_path.replace(thumbnail_path)
+
+    return FileResponse(
+        thumbnail_path,
+        media_type="image/jpeg",
+        filename=thumbnail_path.name,
+        content_disposition_type="inline",
+    )
+
+
+def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
+    """Timeline events for one customer-local calendar date.
+
+    Detection-event timestamps currently arrive from the appliance as
+    naive UTC strings. Playback displays those values as UTC and converts
+    them in the browser, so the database query must use the UTC interval
+    corresponding to the requested America/Chicago calendar day.
+    """
+    from partner_db import connection
+
+    local_start = datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=APPLIANCE_TIMEZONE
+    )
+    local_end = local_start + timedelta(days=1)
+
+    utc_zone = ZoneInfo("UTC")
+    query_start = (
+        local_start.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+    query_end = (
+        local_end.astimezone(utc_zone)
+        .replace(tzinfo=None)
+        .isoformat()
+    )
+
+    with connection() as db:
+        rows = db.execute(
+            "SELECT de.id, de.event_type, de.event_timestamp, "
+            "CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip "
+            "FROM detection_events de "
+            "LEFT JOIN detection_event_media dem ON dem.detection_event_id=de.id "
+            "WHERE de.camera_id=? AND de.event_timestamp>=? AND de.event_timestamp<? "
+            "ORDER BY de.event_timestamp",
+            (camera_id, query_start, query_end),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "event_type": row["event_type"],
+            "timestamp": row["event_timestamp"],
+            "has_event_clip": bool(row["has_event_clip"]),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+        }
+        for row in rows
+    ]
+
+
+RECENT_EVENTS_POLL_LIMIT = 200
+
+def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str | None = None) -> list[dict] | None:
+    """SQL-bounded, tenant-scoped recent-event feed backing the
+    Events/Playback page's own Processing... -> ready polling loop
+    (P0 #5). Reused by both the mobile Playback per-camera poll
+    (camera_id given -- additionally checked against
+    _customer_authorized_camera_id(), the same helper the existing
+    bounded-Playback routes already trust) and the desktop Events
+    page's fleet-wide poll (camera_id=None -- the same identity-scoped
+    fleet _customer_detection_events() already serves for that page's
+    own initial render).
+
+    Root cause this replaces (2026-09-05, Codex review of P0 #5): the
+    original polling endpoint reused _customer_detection_events()
+    as-is -- correct for a one-time page-load render, but that query
+    has no SQL LIMIT at all and returns this customer's *entire* event
+    history across every camera; the polling endpoint only truncated
+    to RECENT_EVENTS_POLL_LIMIT in Python *after* the full unbounded
+    fetch. For a customer with a large real history this meant a full
+    table scan/sort every poll tick (as often as every 4s while
+    anything is processing) for a screen that only ever renders 30
+    rows. This function always carries a real SQL LIMIT and, when
+    camera_id is given, an additional WHERE clause -- a poll tick never
+    pulls more rows, or more cameras, than it can ever use.
+
+    Returns None when the caller isn't a portal customer identity at
+    all, or (camera_id given) isn't authorized for that specific
+    camera -- exactly _customer_detection_events()'s own None-vs-
+    empty-list contract, so a caller can tell "not allowed to ask"
+    apart from "allowed, and there's nothing new". Returns the exact
+    same per-event dict shape _customer_detection_events() already
+    returns -- callers/frontend code don't need to know which query
+    produced it."""
+    limit = max(1, min(200, int(limit)))
+    if camera_id is not None and not _customer_authorized_camera_id(request, camera_id):
+        return None
+    from partner_portal import partner_identity
+    identity = partner_identity(request)
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+    from partner_db import connection
+    select = (
+        'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
+        'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+        'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+        'dem.thumbnail_s3_key AS thumbnail_s3_key '
+        'FROM detection_events de '
+        'JOIN cameras c ON c.id = de.camera_id '
+        'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
+    )
+    camera_clause = 'AND de.camera_id = ? ' if camera_id is not None else ''
+    camera_param = (camera_id,) if camera_id is not None else ()
+    with connection() as db:
+        if identity.get("role") == "customer_owner":
+            rows = db.execute(
+                select + f'WHERE de.customer_id = ? {camera_clause}ORDER BY de.event_timestamp DESC LIMIT ?',
+                (identity["customer_id"], *camera_param, limit),
+            ).fetchall()
+        else:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not user:
+                return []
+            rows = db.execute(
+                select + 'JOIN customer_camera_permissions p ON p.camera_id = de.camera_id AND p.user_id = ? '
+                f'WHERE de.customer_id = ? {camera_clause}AND p.can_playback = 1 '
+                'ORDER BY de.event_timestamp DESC LIMIT ?',
+                (user["id"], identity["customer_id"], *camera_param, limit),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
+            "site": row["site_name"],
+            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "event_type": row["event_type"],
+            "direction": None,
+            "timestamp": row["event_timestamp"],
+            "confidence": row["confidence"],
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
+            "linked_recording": None,
+            "has_event_clip": bool(row["has_event_clip"]),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            "plate_number": None,
+            "vehicle_color": None,
+            "mock": False,
+        }
+        for row in rows
+    ]
+
+
+@app.get("/api/customer/events/recent")
+def customer_events_recent(request: Request) -> dict:
+    """Polling endpoint backing the desktop Events page's own
+    Processing... -> ready reconciliation (P0 #5 Phase 3). Fleet-wide
+    (no camera_id) -- the desktop Events table shows this customer's
+    whole authorized fleet in one list, unlike the mobile Playback
+    view's single selected camera (see customer_events_recent_for_
+    camera() below). SQL-bounded via _customer_recent_events_bounded();
+    see that function's own docstring for why this replaced an
+    unbounded fetch.
+
+    Registered BEFORE customer_camera_events() below on purpose --
+    Starlette matches routes in registration order, and
+    "/api/customer/events/{camera_id}" is a path-parameter route that
+    would otherwise swallow a literal request for
+    "/api/customer/events/recent", treating "recent" itself as a
+    camera_id and failing authorization for a camera that doesn't
+    exist. Confirmed live in staging before this fix -- see the P0 #5
+    staging report."""
+    events = _customer_recent_events_bounded(request, RECENT_EVENTS_POLL_LIMIT)
+    if events is None:
+        raise HTTPException(status_code=403, detail="Customer portal sign-in required.")
+    return {"events": events}
+
+
+@app.get("/api/customer/events/recent/{camera_id}")
+def customer_events_recent_for_camera(camera_id: str, request: Request) -> dict:
+    """Polling endpoint backing the mobile Playback view's own
+    Processing... -> ready reconciliation (P0 #5), scoped to exactly
+    the one camera currently selected/visible -- see
+    _customer_recent_events_bounded()'s own docstring for the
+    authorization and bounding contract. Two path segments after
+    /events/ ("recent", then {camera_id}) so this never collides with
+    "/api/customer/events/{camera_id}" below regardless of
+    registration order -- unlike the fleet-wide route above, which
+    does need that ordering."""
+    events = _customer_recent_events_bounded(request, RECENT_EVENTS_POLL_LIMIT, camera_id=camera_id)
+    if events is None:
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    return {"events": events}
+
+
+@app.get("/api/customer/events/{camera_id}")
+def customer_camera_events(camera_id: str, request: Request, date: str | None = None) -> dict:
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+    # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
+    # that constant's own comment.
+    date = date or datetime.now(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d")
+    return {"events": _customer_camera_events(camera_id, date)}
 
 
 def _customer_camera_recordings(camera_id: str) -> list[dict]:
@@ -136884,17 +141952,36 @@ def _customer_camera_recordings(camera_id: str) -> list[dict]:
     return recordings
 
 
-def _render_customer_playback(cameras: list[dict]) -> str:
+def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     """Renders the customer Playback page for an already-scoped camera
     list (see _customer_playback_cameras()). Never shows live video --
     the video element only ever receives a recorded clip's own URL.
-    _customer_camera_recordings() now queries R2's real catalog (R4),
-    but still returns [] in practice today: the catalog is empty until
-    R3's appliance uploader is enabled, and even a populated catalog
-    entry is skipped rather than shown until R4's own read-role
-    (docs/r4-recording-read-iam.md) is applied in AWS -- so this page
-    still honestly shows "No recordings available yet" exactly as
-    before, for real reasons rather than a hardcoded stub."""
+
+    Bounded initial load (fixes a real production incident: this page
+    used to embed every recording, fully presigned, for every camera
+    on the account -- 5MB+ and 8+ seconds for a real customer, which
+    real browser requests were being canceled before completing). Only
+    the initially-selected camera's most recent CUSTOMER_PLAYBACK_
+    INITIAL_LIMIT recordings are embedded, as bare metadata (id/start/
+    end/name, no URL). A recording is presigned only once a customer
+    actually selects it, via GET /api/customer/recordings/{camera_id}/
+    {recording_id}/url. Switching cameras, paging to older recordings,
+    and event-to-playback deep links (even to a recording outside the
+    initial page) all go through GET /api/customer/recordings/
+    {camera_id} on demand -- see that route and _customer_recording_
+    rows() for the near-timestamp/pagination contract. Nothing about
+    which recordings exist, their retention, or the catalog itself
+    changes -- this only changes how much of it one page load embeds.
+
+    The timeline's event markers still reuse _customer_detection_events()
+    (the exact same real, tenant-scoped detection_events rows the
+    Events page and /api/analytics/events already read), but bounded to
+    today's calendar date here -- the timeline itself is a single 24h
+    axis (see timelinePercent()'s own hour-of-day-only math below), so
+    an event from a different day was never meaningfully plottable on
+    it anyway; embedding a customer's entire event history (thousands
+    of rows) to show a one-day axis was the same unbounded-payload
+    mistake as the recordings list, just for a second dataset."""
     if not cameras:
         content = (
             '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
@@ -136903,16 +141990,58 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         )
         return page_shell("Playback", "playback", content)
 
+    # Deep-link support: the focused Live View's own "recent activity"
+    # rows link here as /playback?camera=<id>&t=<event_timestamp> so a
+    # customer never has to re-select the camera or re-hunt for the
+    # moment they already know happened -- ?camera picks the initial
+    # tile (falling back to the first camera exactly as before when
+    # absent/invalid/not owned by this identity), ?t is handed to the
+    # client, which always resolves it via a fresh near= API lookup
+    # (see the module docstring above) rather than assuming it falls
+    # within whatever happens to be in the initially-embedded page.
+    requested_camera_id = request.query_params.get("camera")
+    valid_camera_ids = {camera["id"] for camera in cameras}
+    initial_camera_id = requested_camera_id if requested_camera_id in valid_camera_ids else cameras[0]["id"]
+    initial_timestamp = request.query_params.get("t") or None
+    # An event with its own real clip (see _customer_event_actions())
+    # -- takes priority over initial_timestamp below: renderCamera()
+    # loads this directly via the existing authorized event-media
+    # route, never via findClipNear()/the recordings catalog, so an
+    # event whose moment falls in a real gap between recordings still
+    # plays its own clip instead of silently finding nothing.
+    initial_event_id = request.query_params.get("event") or None
+    # Explicit, narrow autoplay signal -- see _customer_event_actions()'s
+    # own docstring for why this exists. Only ever "event" today (the
+    # one place that sets it), checked exactly, never inferred from the
+    # mere presence of ?t=/?event= -- an ordinary/future deep link that
+    # carries one of those without this exact marker still gets the
+    # safe select-only behavior, matching "ordinary Playback never
+    # autoplays".
+    autoplay_from_event = request.query_params.get("autoplay") == "event"
+
     camera_tiles = "".join(
-        f'<button type="button" class="playback-camera-tile{" active" if index == 0 else ""}" '
+        f'<button type="button" class="playback-camera-tile{" active" if camera["id"] == initial_camera_id else ""}" '
         f'data-camera-id="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</button>'
-        for index, camera in enumerate(cameras)
+        for camera in cameras
     )
     recordings_by_camera = {
-        camera["id"]: _customer_camera_recordings(camera["id"])
+        camera["id"]: (_customer_recording_rows(camera["id"], limit=CUSTOMER_PLAYBACK_INITIAL_LIMIT) if camera["id"] == initial_camera_id else [])
         for camera in cameras
     }
-    first_camera_id = cameras[0]["id"]
+    # APPLIANCE_TIMEZONE, not the cloud server's own UTC clock -- see
+    # that constant's own comment for why: recording/event timestamps
+    # are naive strings written in the appliance's local time.
+    today = datetime.now(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d")
+    # Only the initially-selected camera's today's event markers are
+    # embedded -- same bounded-load reasoning as recordings_by_camera
+    # above (see _customer_camera_events()'s own docstring). Other
+    # cameras' markers are fetched on demand via GET /api/customer/
+    # events/{camera_id} when their tile is actually clicked.
+    analytics_by_camera = {
+        camera["id"]: (_customer_camera_events(camera["id"], today) if camera["id"] == initial_camera_id else [])
+        for camera in cameras
+    }
+    first_camera_id = initial_camera_id
 
     content = (
         '<header class="topbar"><div><p class="eyebrow">Playback</p><h1>Recordings</h1></div>'
@@ -136922,40 +142051,217 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '.playback-camera-tile{padding:8px 16px;border-radius:999px;border:1px solid var(--line);'
         'background:transparent;color:inherit;font:inherit;cursor:pointer}'
         '.playback-camera-tile.active{background:var(--brand-action,#2f6f6b);color:#fff;border-color:transparent}'
-        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;max-height:70vh}'
-        '@media(min-width:900px){.playback-workspace-solo .camera-view{aspect-ratio:21/9}}'
+        # 2026-09-16 usability fix: the video and the timeline must both
+        # be visible together on a normal desktop viewport, without
+        # scrolling, per direct user requirement -- confirmed broken by
+        # a real e2e screenshot at 1440x900 (video alone ran to ~523px
+        # tall via the 21:9-at-full-container-width rule this replaces,
+        # pushing the ~285px-tall timeline section below the fold
+        # entirely). Height-first sizing instead of width-first: capped
+        # by max-height (viewport-relative, budgeted against the
+        # timeline section's own real measured height so both fit),
+        # width:auto derives from the real 16:9 aspect-ratio instead of
+        # stretching to the full container width and then being forced
+        # short/wide -- centered via the sibling .panel rule below.
+        # Nothing removed: the player is smaller, not gone, and every
+        # existing control/feature on this page is unchanged.
+        #
+        # 2026-09-16 correction (real regression, found live by the user
+        # then independently confirmed by Codex's own source review):
+        # `width:auto` above was silently relying on a child element's
+        # own in-flow content size to give this box any width at all --
+        # the shared base `.camera-view{display:grid;aspect-ratio:16/9}`
+        # rule needs a definite width OR height from somewhere to derive
+        # the other via aspect-ratio, and neither of this box's two real
+        # children can ever provide one: `.camera-view video` is a
+        # shared, unrelated rule that makes every video `position:
+        # absolute` (out of flow, contributes nothing), and
+        # `#playback-placeholder` is `display:none` the moment playback
+        # actually starts. Confirmed live via computed styles: before
+        # playback (placeholder visible, incidentally providing a
+        # nonzero fit-content width) the box measured a correct
+        # 408x229.5px; the instant a clip was clicked (placeholder
+        # hidden, video absolutely positioned) it collapsed to exactly
+        # 0x0 -- fit-content of literally nothing. `width:auto` is
+        # replaced with an explicit, content-independent width (the same
+        # 16:9-at-the-old-height-budget size, just expressed width-first
+        # instead of height-first) so aspect-ratio always has a real
+        # value to work from regardless of playback/loading/error state
+        # or which child happens to be visible. max-height is kept as a
+        # defensive, now-normally-inert cap, not the primary driver.
+        '.playback-workspace-solo .camera-view{aspect-ratio:16/9;'
+        'width:min(calc(34vh * 16 / 9),calc(340px * 16 / 9));max-height:min(34vh,340px);'
+        'max-width:100%;margin:0 auto}'
+        # Vertical-space trim (2026-09-16, same pass as the timeline
+        # nested-scroll fix above): once the timeline shows its full
+        # real content instead of clipping it, this page's total height
+        # at 1440x900 measured 993px against the 900px budget -- 93px
+        # over. The shared `.panel{padding:19px}` rule (used broadly,
+        # not Playback-specific) was the single biggest contributor
+        # here: 40px of padding around a video that itself only needs
+        # 342px, real weight-bearing content nowhere in that padding.
+        # Trimmed to 6px, scoped to this one solo video panel only --
+        # every other page's own `.panel` padding is completely
+        # untouched. Saves real, no-tradeoff space rather than shrinking
+        # the video itself (the one thing this whole feature exists to
+        # keep usable) to force-fit the remainder.
+        '.playback-workspace-solo .panel{display:flex;justify-content:center;padding:6px}'
+        # The .event-* classes were already used by this legend (and by
+        # the /analytics search results legend) but never actually had
+        # a background color defined anywhere -- every dot rendered
+        # empty. Defined once here for real, matching the palette this
+        # page's own JS below also uses for the timeline's event
+        # markers themselves, so the legend and the markers agree.
+        '.legend-dot.event-motion{background:#f0b94d}'
+        '.legend-dot.event-person{background:#4d9ef0}'
+        '.legend-dot.event-vehicle{background:#a06df0}'
+        '.legend-dot.event-lpr{background:#3dbfae}'
+        '.legend-dot.event-people_counting{background:#4dcf7a}'
+        '.legend-dot.event-intrusion{background:#f0954d}'
+        '.event-segment{cursor:pointer}'
+        # Playhead: a thin vertical indicator overlaid on the same
+        # position:relative lane the recording bars already draw into
+        # (see #playback-timeline-lane's own height rule below) --
+        # pointer-events:none so it never intercepts the drag/click
+        # handlers meant for the lane underneath it. --gap recolors it
+        # to signal "no recording here" without a second DOM element.
+        '.timeline-playhead{position:absolute;top:0;height:70px;width:2px;'
+        'background:#1c6dd0;pointer-events:none;z-index:5}'
+        '.timeline-playhead--gap{background:#9aa7b5}'
+        '#playback-timeline-lane{cursor:grab;touch-action:none}'
+        # 2026-09-04 lane fix (v2): the 2026-09-03 attempt above set
+        # #playback-timeline-lane's height to a hand-picked 88px, WITHOUT
+        # !important -- and never actually took effect, because this
+        # page's shared/global stylesheet already has an older, unrelated
+        # rule (.timeline-lane{...height:28px!important;...}, used by
+        # e.g. Live View's own Monitor timeline) that carries !important.
+        # CSS importance always beats specificity regardless of selector,
+        # so that 28px silently won over this ID selector's 88px every
+        # time, no matter how specific -- the real container rendered at
+        # 28px while the JS below still absolutely-positioned content up
+        # to ~80px down inside it (7 stacked analytics lanes +
+        # RECORDING_ROW_TOP_PX/HEIGHT below), spilling past the visible
+        # box (a second, unopposed global rule sets overflow:visible) --
+        # exactly the "markers floating at odd heights, recording
+        # coverage pushed toward the bottom" appearance reported live.
+        # Fixed two ways together: this rule now carries !important too,
+        # so ID-selector-vs-class-selector specificity is the deciding
+        # tiebreak between two equally-!important declarations (ID wins,
+        # correctly, this time) -- and the value itself now matches the
+        # JS's own tightened, derived geometry below (7 stacked lanes at
+        # a smaller EVENT_LANE_HEIGHT_PX/GAP_PX, RECORDING_ROW_TOP_PX
+        # computed from them instead of hardcoded) instead of a second,
+        # independent guess that could again drift out of sync with what
+        # the JS actually draws.
+        '#playback-timeline-lane{height:70px!important}'
+        # The outer "Recorded activity / Timeline" section (.monitor-
+        # timeline) has NINE separately-added rules in this page's
+        # shared stylesheet from different points in this app's history
+        # (Live View's own Monitor page also uses this class).
+        #
+        # 2026-09-16 correction (real regression, found live by the user
+        # then independently confirmed by Codex's own source review): the
+        # min-height:0 override below was aimed at the wrong one of
+        # those nine rules. Confirmed live via computed styles: the rule
+        # actually winning this cascade is
+        # `.monitor-timeline{flex:0 0 285px!important;height:285px!important;
+        # max-height:285px!important;overflow:auto!important;...}` -- a
+        # genuinely FIXED 285px box, not just a 285px floor, and this
+        # section's real content measured 370px tall against a 283px
+        # visible box -- an ~87px nested scrollbar inside the primary
+        # timeline, on top of the page's own normal scroll. min-height
+        # was never the constraining property here at all. Fixed for
+        # real this time by overriding every property that rule actually
+        # sets: height/max-height/flex all forced back to content-driven
+        # values, overflow to visible (nothing needs its own scrollbar
+        # once nothing is being clipped). Still scoped to
+        # id=playback-monitor-timeline so Live View's own Monitor page,
+        # which reuses the bare .monitor-timeline class, is completely
+        # unaffected.
+        # margin-top and padding also trimmed here (12px/15px -> 6px/8px):
+        # part of the same 993px-vs-900px vertical-space accounting as
+        # the .playback-workspace-solo .panel padding trim above -- real,
+        # no-content-lost space, not a content reduction.
+        '#playback-monitor-timeline{min-height:0!important;height:auto!important;'
+        'max-height:none!important;flex:none!important;overflow:visible!important;'
+        'margin-top:6px!important;padding:5px!important}'
+        # Compact primary controls (2026-09-16, same usability pass as
+        # the video-sizing fix above): smaller padding/min-height than
+        # this page's shared button style, and icon-only glyphs (see the
+        # buttons themselves and their title/aria-label attributes
+        # below) instead of full words, so the toolbar takes less
+        # vertical room -- every control is still present and still a
+        # real <button>, just visually lighter. Scoped by the
+        # #playback-monitor-timeline id (already added to this page's
+        # own <section> for the min-height override above) so Live
+        # View's own Monitor page, which reuses the bare .monitor-
+        # toolbar class, is completely unaffected.
+        '#playback-monitor-timeline .monitor-toolbar button{padding:6px 10px;min-height:32px;'
+        'font-size:15px;line-height:1}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
-        '<section class="playback-workspace-solo" style="margin-top:14px">'
+        '<section class="playback-workspace-solo" style="margin-top:6px">'
         '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
-        '</div></div>'
+        '</div>'
+        '</div>'
         '</section>'
-        '<section class="monitor-timeline" style="margin-top:14px">'
+        '<style>@media (max-width:900px){.monitor-timeline{display:none!important}.mobile-recent-events{display:block!important}}@media (min-width:901px){.mobile-recent-events{display:none!important}.monitor-timeline{display:block}}</style>'
+        # 2026-09-04: video-first mobile cards -- the section's own
+        # container (.mobile-recent-events) is already hidden above
+        # 900px by the media query directly above, so these rules never
+        # need their own breakpoint; desktop's .monitor-timeline markup
+        # is a completely separate tree, untouched by any of this.
+        '<style>'
+        '.mobile-media-card{position:relative;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#0b1018;margin-bottom:8px}'
+        '.mobile-media-card:last-child{margin-bottom:0}'
+        '.mobile-media-card[role="button"]{cursor:pointer}'
+        '.mobile-media-thumb{width:100%;height:100%;object-fit:cover;display:block}'
+        '.mobile-media-time{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;line-height:1;padding:4px 7px;border-radius:6px;font-weight:600}'
+        '.mobile-media-badge{position:absolute;top:8px;right:36px;color:#fff;font-size:10px;font-weight:700;padding:3px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:.02em}'
+        '.mobile-media-menu{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:15px;display:flex;align-items:center;justify-content:center;pointer-events:none}'
+        '.mobile-media-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:0 12px;background:#141b26}'
+        '.mobile-media-fallback--pending{color:#e8b93f}'
+        '.mobile-media-fallback--expired{color:#8f9baa;font-style:italic}'
+        '</style>'
+        '<section class="panel mobile-recent-events" style="margin-top:14px">'
+        '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
+        '<div id="mobile-recent-events-list" class="health-list"></div>'
+        '</section>'
+        '<section class="monitor-timeline" id="playback-monitor-timeline" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Timeline</h2></div></div>'
         '<div class="monitor-toolbar">'
         '<div class="monitor-toolbar-group">'
-        '<button id="skip-back" type="button" disabled>Back 10</button>'
-        '<button id="timeline-play" type="button" disabled>Play</button>'
-        '<button id="skip-forward" type="button" disabled>Forward 10</button>'
+        '<button id="skip-back" type="button" disabled title="Back 10 seconds" aria-label="Back 10 seconds">⏪</button>'
+        '<button id="timeline-play" type="button" disabled title="Play" aria-label="Play">▶</button>'
+        '<button id="skip-forward" type="button" disabled title="Forward 10 seconds" aria-label="Forward 10 seconds">⏩</button>'
         '</div>'
         '<div class="monitor-toolbar-group">'
-        '<button id="download-selected" type="button" disabled>Download</button>'
-        '<button id="share-selected" type="button" disabled>Share</button>'
+        '<button id="download-selected" type="button" disabled title="Download" aria-label="Download">⬇</button>'
+        '<button id="share-selected" type="button" disabled title="Share" aria-label="Share">⤴</button>'
         '<button id="create-clip" type="button" disabled>Create clip</button>'
-        '<button id="bookmark-selected" type="button" disabled>Bookmark</button>'
+        '<button id="bookmark-selected" type="button" disabled title="Bookmarking from Playback is not available yet." aria-label="Bookmark">☆</button>'
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
+        '<div class="monitor-toolbar-group" id="playback-date-bar" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">'
+        '<label for="playback-date-input" class="health-detail">Date</label>'
+        '<input id="playback-date-input" type="date">'
+        '<button id="playback-date-prev" type="button" class="ghost-button" aria-label="Previous day">\u2190 Previous Day</button>'
+        '<button id="playback-date-today" type="button" class="ghost-button">Today</button>'
+        '<button id="playback-date-next" type="button" class="ghost-button" aria-label="Next day">Next Day \u2192</button>'
+        '<span id="playback-selected-date-label" class="health-detail"></span>'
+        '</div>'
+        '<div id="playback-available-dates" class="health-detail" style="margin-top:2px"></div>'
         '<div class="monitor-filters">'
-        '<button class="monitor-filter active" data-filter="all" type="button" disabled>All</button>'
-        '<button class="monitor-filter" data-filter="motion" type="button" disabled>Motion</button>'
-        '<button class="monitor-filter" data-filter="person" type="button" disabled>Person</button>'
-        '<button class="monitor-filter" data-filter="vehicle" type="button" disabled>Vehicle</button>'
-        '<button class="monitor-filter" data-filter="lpr" type="button" disabled>License plate</button>'
-        '<button class="monitor-filter" data-filter="people_counting" type="button" disabled>People count</button>'
-        '<button class="monitor-filter" data-filter="intrusion" type="button" disabled>Intrusion</button>'
+        '<button class="monitor-filter active" data-filter="all" type="button">All</button>'
+        '<button class="monitor-filter active" data-filter="motion" type="button">Motion</button>'
+        '<button class="monitor-filter active" data-filter="person" type="button">Person</button>'
+        '<button class="monitor-filter active" data-filter="vehicle" type="button">Vehicle</button>'
+        '<button class="monitor-filter active" data-filter="lpr" type="button">License plate</button>'
+        '<button class="monitor-filter active" data-filter="people_counting" type="button">People count</button>'
+        '<button class="monitor-filter active" data-filter="intrusion" type="button">Intrusion</button>'
         '</div>'
         '<div class="timeline-hours"><span>00:00</span><span>02:00</span><span>04:00</span><span>06:00</span>'
         '<span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span>'
@@ -136976,33 +142282,259 @@ def _render_customer_playback(cameras: list[dict]) -> str:
         '<section class="panel" id="playback-clip-panel" hidden style="margin-top:14px">'
         '<div class="panel-head"><div><h2>Recordings</h2><div class="health-detail">Select a point on the timeline, or browse below.</div></div></div>'
         '<div id="playback-clip-list" class="settings-list"></div>'
+        '<button id="playback-load-older" type="button" class="ghost-button" style="margin-top:8px" hidden>Load older recordings</button>'
         '</section>'
     )
 
     scripts = f'''<script>
 (function(){{
   const recordingsByCamera={json.dumps(recordings_by_camera)};
+  const recordingsLoaded=new Set([{json.dumps(first_camera_id)}]);
+  const analyticsByCamera={json.dumps(analytics_by_camera)};
+  const analyticsLoaded=new Set([{json.dumps(first_camera_id)}]);
   const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
+  const debugLine=document.getElementById('playback-debug');
+  // TEMPORARY, safe playback diagnostics -- no secrets, no full signed
+  // URLs (only the recording filename), removed once real-browser proof
+  // is captured for the event-autoplay investigation (2026-09-02).
+  // Accumulates every entry with an elapsed-ms timestamp (relative to
+  // page load) instead of overwriting a single line, specifically so a
+  // multi-stage flow like event-autoplay (autoplayFromEvent -> clip
+  // found -> playClip() called -> src assigned -> loadedmetadata/
+  // canplay -> seek applied -> play()/muted-fallback resolved) can be
+  // read back afterward as one ordered trace, on-page, without
+  // devtools. Also still mirrors to console.log. Capped so a long
+  // session can't grow the panel unboundedly.
+  const debugEntries=[];
+  function debugLog(message){{
+    const elapsedMs=Math.round(performance.now());
+    const line=`+${{elapsedMs}}ms ${{message}}`;
+    console.log('[playback-debug]',line);
+    debugEntries.push(line);
+    if(debugEntries.length>40)debugEntries.shift();
+    if(debugLine){{
+      debugLine.style.display='block';
+      debugLine.textContent=debugEntries.join('\\n');
+      debugLine.scrollTop=debugLine.scrollHeight;
+    }}
+  }}
+  debugLog('[boot] playback script executing');
+  // Reported 2026-09-02: on a real event-autoplay deep link, ZERO
+  // debugLog lines appeared at all (not even this ordinary page-load
+  // one), after 15+ seconds. That is only possible if this script
+  // never ran, or an uncaught exception aborted it before reaching
+  // any debugLog call further down -- and an exception thrown inside
+  // renderCamera() (an async function called bare, with no .catch(),
+  // at the very bottom of this script) would be an invisible,
+  // unhandled promise rejection: no console error banner most users
+  // would notice, no on-page sign anything went wrong. These two
+  // handlers make ANY such failure, anywhere on this page, show up in
+  // the same visible/timestamped log as every other checkpoint,
+  // instead of vanishing silently.
+  window.addEventListener('error',event=>{{
+    debugLog(`[fatal] window error: ${{event.message}} at ${{event.filename}}:${{event.lineno}}:${{event.colno}}`);
+  }});
+  window.addEventListener('unhandledrejection',event=>{{
+    const reason=event.reason;
+    debugLog(`[fatal] unhandled promise rejection: ${{reason && reason.message ? reason.message : reason}}`);
+  }});
+  // Recording-card thumbnails (renderClipList() below): the /thumbnail
+  // route's own auth->S3-key->presign->302 chain has been traced and
+  // proven correct end to end (server logs, S3 HEAD, full redirect
+  // follow) for a real reported failure -- the failure was not
+  // reproducible server-side, which points at a client-side timing
+  // issue (a transient network hiccup on the second, cross-origin S3
+  // hop, or a lazy-load/layout-race on slower mobile rendering) rather
+  // than a data, auth, or CSP defect. This is a global function (not
+  // IIFE-local) because it's wired via an inline onerror="" attribute,
+  // which only resolves identifiers in the global scope. Exactly one
+  // retry, then the existing "Thumbnail unavailable" fallback --
+  // never an infinite loop.
+  window.__anyaicamThumbnailRetry=function(img){{
+    if(img.dataset.thumbRetried){{
+      img.style.display='none';
+      img.parentElement.innerHTML='<span class="health-detail">Thumbnail unavailable</span>';
+      return;
+    }}
+    img.dataset.thumbRetried='1';
+    img.src=img.src.split('?')[0]+'?retry='+Date.now();
+  }};
+  ['loadstart','loadedmetadata','canplay','playing','stalled','waiting','error'].forEach(eventName=>{{
+    video.addEventListener(eventName,()=>{{
+      if(eventName==='error'){{
+        const mediaError=video.error;
+        debugLog(`[checkpoint 5] event=error code=${{mediaError?mediaError.code:'?'}} message=${{mediaError?mediaError.message:'unknown'}}`);
+      }}else{{
+        debugLog(`[checkpoint 5] event=${{eventName}} duration=${{video.duration||0}} currentSrcSet=${{!!video.currentSrc}} readyState=${{video.readyState}}`);
+      }}
+    }});
+  }});
   const placeholder=document.getElementById('playback-placeholder');
   const status=document.getElementById('playback-status');
   const clipList=document.getElementById('playback-clip-list');
   const clipPanel=document.getElementById('playback-clip-panel');
   const browseButton=document.getElementById('browse-recordings');
+  const loadOlderButton=document.getElementById('playback-load-older');
   const viewFrame=document.getElementById('playback-view-frame');
+  const skipBackButton=document.getElementById('skip-back');
+  const timelinePlayButton=document.getElementById('timeline-play');
+  const skipForwardButton=document.getElementById('skip-forward');
+  const downloadButton=document.getElementById('download-selected');
+  const shareButton=document.getElementById('share-selected');
+  const createClipButton=document.getElementById('create-clip');
+  const dateInput=document.getElementById('playback-date-input');
+  const datePrevButton=document.getElementById('playback-date-prev');
+  const dateTodayButton=document.getElementById('playback-date-today');
+  const dateNextButton=document.getElementById('playback-date-next');
+  const selectedDateLabel=document.getElementById('playback-selected-date-label');
+  const availableDatesEl=document.getElementById('playback-available-dates');
+  const datesByCamera={{}};
+  const datesLoaded=new Set();
 
+  let selectedClip=null;
+  // True only while a genuine drag (past DRAG_THRESHOLD_PX) is in
+  // progress on the timeline -- see the pointerdown/pointermove/pointerup
+  // handlers and their own comments, further down this script.
+  let isScrubbing=false;
+  // The playhead is a single persistent element (not recreated by
+  // renderTimeline()'s own innerHTML clear-and-rebuild -- it's simply
+  // re-appended at the end of that function every time) so its own
+  // state/listeners never need re-wiring on every render.
+  const playheadEl=document.createElement('div');
+  playheadEl.className='timeline-playhead';
+  playheadEl.hidden=true;
+  // Whichever clips array the timeline/clip-list are currently
+  // showing -- the default (most-recent-page) view or a date-mode
+  // view -- kept in sync at each renderTimeline() call site below,
+  // so the ruler click-to-exact-time handler (see timelineLane's
+  // own listener further down) always searches the right set
+  // regardless of which mode is active.
+  let currentClips=[];
+  // null = the existing default/most-recent view (unchanged pagination).
+  // A YYYY-MM-DD string means the customer explicitly picked a
+  // calendar date -- see loadRecordingsForDate()/dateTodayButton below.
+  let viewingDate=null;
   let selectedCameraId={json.dumps(first_camera_id)};
+  const eventPlayer=AnyAiCamEventMedia.player({{video,status,isCurrent:cameraId=>cameraId===selectedCameraId,onReady:()=>{{
+    // playheadEl.hidden: an event clip is a different media identity
+    // than any recording in currentClips -- the recording-timeline
+    // playhead has nothing real to point at during event playback, so
+    // it's hidden rather than left showing a stale recording position.
+    placeholder.hidden=true;selectedClip=null;playheadEl.hidden=true;timelinePlayButton.disabled=false;skipBackButton.disabled=false;skipForwardButton.disabled=false;revealClipPanel();
+  }}}});
+  window.addEventListener('pagehide',()=>{{eventPlayer.cancel();stopMobileEventPoll();}});
+
+  // ?t= is now built server-side as an unambiguous UTC epoch-ms integer
+  // (see _customer_event_actions()) -- URL query values always arrive
+  // as strings, so a digit-only one is converted to a real JS number
+  // here, letting playbackDate() take the exact/no-guessing epoch-ms
+  // path below. A non-digit value (an older/legacy naive-ISO ?t=, if
+  // one is ever hit) is left as a string, which playbackDate() still
+  // handles by explicit UTC labeling -- never a raw, timezone-naive
+  // browser parse either way.
+  const initialTimestampRaw={json.dumps(initial_timestamp)};
+  const initialTimestamp=(initialTimestampRaw&&/^\d+$/.test(initialTimestampRaw))
+    ? Number(initialTimestampRaw)
+    : initialTimestampRaw;
+  const autoplayFromEvent={json.dumps(autoplay_from_event)};
+  const initialEventId={json.dumps(initial_event_id)};
+
+  function playbackDate(value){{
+    // VMS timestamps are stored in UTC but older rows are ISO strings
+    // without a Z/offset. Tell the browser they are UTC, then normal
+    // Date formatting automatically converts them to the customer's
+    // local timezone (Central Time in this browser).
+    //
+    // A number is always treated as UTC epoch milliseconds -- the one
+    // genuinely unambiguous representation, and what the event deep
+    // link's ?t= is now built from server-side (see
+    // _customer_event_actions()/its epoch-ms helper) precisely so no
+    // naive-string guess is ever needed for that value.
+    if(value===null||value===undefined||value==='')return new Date(NaN);
+    if(typeof value==='number')return new Date(value);
+    const text=String(value);
+    const hasZone=/Z$|[+-]\d{{2}}:\d{{2}}$/.test(text);
+    return new Date(hasZone?text:text+'Z');
+  }}
 
   function revealClipPanel(){{clipPanel.hidden=false}}
   browseButton.addEventListener('click',()=>{{clipPanel.hidden=!clipPanel.hidden}});
 
+  // Bounded-load fetch helpers: every recording in recordingsByCamera
+  // is metadata only (id/start/end/name) -- see this route's own
+  // Python docstring (_render_customer_playback) for why. A URL is
+  // only ever requested for the one recording actually selected.
+  //
+  // Returns null on a genuine fetch failure (network error or a
+  // non-2xx response) and [] only for a confirmed, successful, empty
+  // result -- these are NOT the same thing to a caller doing
+  // pagination: conflating them (the previous behavior) made a single
+  // transient network blip indistinguishable from "no more older
+  // recordings," permanently hiding the Load older button for the
+  // rest of the session even though older history still existed. See
+  // loadOlderButton's own click handler and ensureClipsLoaded() below,
+  // both of which now treat null as retryable and [] as final.
+  // === PAGINATION_FETCH_START ===
+  async function fetchClipsMetadata(cameraId,params){{
+    const query=new URLSearchParams(params||{{}});
+    try{{
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}?${{query}}`);
+      if(!response.ok)return null;
+      const data=await response.json();
+      return Array.isArray(data.clips)?data.clips:null;
+    }}catch(error){{
+      debugLog(`metadata fetch failed: ${{error && error.message}}`);
+      return null;
+    }}
+  }}
+  // === PAGINATION_FETCH_END ===
+  async function fetchCameraEvents(cameraId){{
+    try{{
+      const response=await fetch(`/api/customer/events/${{encodeURIComponent(cameraId)}}`);
+      if(!response.ok)return [];
+      const data=await response.json();
+      return Array.isArray(data.events)?data.events:[];
+    }}catch(error){{
+      debugLog(`events fetch failed: ${{error && error.message}}`);
+      return [];
+    }}
+  }}
+  function recordingMediaUrl(cameraId,recordingId){{
+    return `/api/customer/recordings/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(recordingId)}}/media`;
+  }}
+
   cameraTiles.forEach(tile=>{{
-    tile.addEventListener('click',()=>{{
+    tile.addEventListener('click',async()=>{{
       cameraTiles.forEach(item=>item.classList.remove('active'));
       tile.classList.add('active');
+      eventPlayer.cancel();
       selectedCameraId=tile.dataset.cameraId;
+      // P0 #5 remediation round 2 (2026-09-05, Codex second review):
+      // stop the OLD camera's poll session (clear its timer, abort its
+      // in-flight request) the instant selectedCameraId changes --
+      // never waiting for scheduleMobileEventPoll()'s own lazy
+      // cameraId-mismatch detection, which only runs the next time it
+      // happens to be called. See scheduleMobileEventPoll()'s own
+      // docstring for the remaining two, independently-redundant
+      // guards against a stale response from this same race.
+      stopMobileEventPoll();
       clipPanel.hidden=true;
-      renderCamera();
+      renderAvailableDates(selectedCameraId).catch(()=>{{}});
+      if(viewingDate){{
+        // Preserve the selected date across a camera switch "when
+        // possible" -- i.e. whenever a date was actually active.
+        // loadRecordingsForDate() already handles the no-recordings-
+        // for-this-date case honestly (status text below), so nothing
+        // extra is needed here for that.
+        await loadRecordingsForDate(selectedCameraId,viewingDate).catch(error=>{{
+          debugLog(`loadRecordingsForDate (camera switch) failed: ${{error && error.message}}`);
+        }});
+      }}else{{
+        visibleRecordingCount=6;
+        loadOlderButton.hidden=false;
+        await renderCamera();
+      }}
     }});
   }});
 
@@ -137020,74 +142552,1422 @@ def _render_customer_playback(cameras: list[dict]) -> str:
   const timelineLane=document.getElementById('playback-timeline-lane');
   const timelineEmpty=document.getElementById('playback-timeline-empty');
 
-  function playClip(clip){{
+  // === CHAIN_CORE_START ===
+  // Real inter-segment gaps on the Samsung appliance were measured
+  // directly (5,835 real transitions across all 5 cameras' full
+  // retained history at the time this was written): 99%+ are within
+  // +/-1s of exact back-to-back, and the full observed jitter tail
+  // (segment-rotation timing noise, container-restart-era overlap
+  // included) never exceeds +/-10s. The one confirmed genuine
+  // recording outage in that same dataset was 286s -- nearly 30x past
+  // the jitter tail. 10s sits safely inside that margin: it swallows
+  // every real-world jitter case observed without ever bridging an
+  // actual outage.
+  const CHAIN_GAP_TOLERANCE_SECONDS=10;
+
+  // Given the clip that just finished playing and the chronologically-
+  // ordered clips currently loaded for this camera/date (currentClips
+  // -- never a fresh API call, chaining only ever walks the already-
+  // loaded page), returns the next clip to chain into, or null if
+  // chaining should stop here: the ended clip wasn't found (stale),
+  // it was already the last loaded segment, or the next segment is
+  // separated by more than CHAIN_GAP_TOLERANCE_SECONDS in either
+  // direction -- a genuine gap (or a restart-era overlapping
+  // duplicate), never silently bridged. Pure and synchronous by
+  // design -- reconciled verbatim from the accepted Samsung
+  // implementation (tests/test_playback_segment_chaining.py/.mjs).
+  function _planNextChainedClip(clips,endedClip){{
+    if(!endedClip)return null;
+    const index=clips.findIndex(clip=>clip.id===endedClip.id);
+    if(index===-1||index+1>=clips.length)return null;
+    const next=clips[index+1];
+    const gapSeconds=(new Date(next.start).getTime()-new Date(endedClip.end).getTime())/1000;
+    if(Math.abs(gapSeconds)>CHAIN_GAP_TOLERANCE_SECONDS)return null;
+    return next;
+  }}
+  // === CHAIN_CORE_END ===
+
+  function playClip(cameraId,clip,options){{
+    // options.autoplay (default true): every existing trigger (manual
+    // click, event marker, deep link, chain) omits this and gets the
+    // exact original always-play behavior, unchanged. false is used
+    // only by the new timeline scrub/seek path below, while a drag is
+    // actively in progress -- scrubbing must show the correct frame at
+    // the pointer's position without forcing playback (audio) to start
+    // on every intermediate position crossed.
+    const autoplay=!options||options.autoplay!==false;
+    eventPlayer.cancel();
     placeholder.hidden=true;
-    video.src=clip.url;
-    video.play().catch(()=>{{}});
+    const url=recordingMediaUrl(cameraId,clip.id);
+    debugLog(`[checkpoint 4] playClip() invoked camera=${{cameraId}} recording=${{clip.name}} url=${{url}} autoplay=${{autoplay}}`);
+    selectedClip=clip;
+    video.pause();
+    video.src=url;
+    video.load();
+
+    skipBackButton.disabled=false;
+    timelinePlayButton.disabled=false;
+    skipForwardButton.disabled=false;
+    downloadButton.disabled=false;
+    shareButton.disabled=false;
+
+    const isCloudMp4=String(clip.name||'').toLowerCase().endsWith('.mp4');
+
+    createClipButton.disabled=isCloudMp4;
+    createClipButton.title=isCloudMp4
+      ? 'Create clip is not available yet for cloud recordings.'
+      : '';
+
+    // Never silently swallow a rejected play() -- the customer must
+    // always be told what actually happened. First attempt is always
+    // full, audible playback (this is what every plain click-to-play
+    // already relies on and must keep working unchanged). Only if the
+    // browser rejects THAT (typically an autoplay-policy block on the
+    // event-deep-link path, since that's the one case here without a
+    // same-tick user click) do we fall back to a muted start -- which
+    // browsers universally allow -- with the native <video controls>
+    // bar's own speaker icon as the (already-present, no new custom
+    // UI needed) one-tap unmute control, and an explicit status
+    // message pointing at it. This is a temporary, customer-
+    // correctable fallback, never the permanent forced-mute the
+    // original Playback/audio fix explicitly ruled out.
+    if(autoplay){{
+      debugLog('[checkpoint 7] calling video.play() (unmuted, first attempt)');
+      video.play().then(()=>{{
+        debugLog('[checkpoint 7] video.play() resolved -- unmuted playback started');
+      }}).catch(error=>{{
+        debugLog(`[checkpoint 7] video.play() rejected: ${{error && error.name}} -- retrying muted`);
+        video.muted=true;
+        video.play().then(()=>{{
+          debugLog('[checkpoint 7] muted video.play() resolved -- playback started muted');
+          status.textContent='Audio was blocked by the browser — tap the speaker icon on the player to unmute.';
+        }}).catch(mutedError=>{{
+          debugLog(`[checkpoint 7] muted video.play() ALSO rejected: ${{mutedError && mutedError.name}}`);
+          status.textContent='Autoplay was blocked by the browser — press Play to start.';
+        }});
+      }});
+    }}
     revealClipPanel();
   }}
 
   function timelinePercent(dateStr){{
-    const d=new Date(dateStr);
+    // Traced 2026-09-02 (five-hour timestamp offset investigation):
+    // clip.start/clip.end/event.timestamp are all naive UTC strings
+    // from the database (no Z/offset -- see playbackDate()'s own
+    // comment). A bare `new Date(dateStr)` on a string with no zone
+    // marker is parsed by the JS Date spec as LOCAL time, not UTC, so
+    // this was silently placing every segment/marker at its raw UTC
+    // clock position on the 00:00-24:00 axis instead of the viewer's
+    // actual local time-of-day -- a ~5-6 hour (DST-dependent) shift,
+    // consistent everywhere but wrong everywhere. playbackDate()
+    // already does the one correct UTC-aware parse used elsewhere on
+    // this page (the mobile events list, the clip list); reusing it
+    // here instead of a second, inconsistent raw parse is the fix.
+    const d=playbackDate(dateStr);
     return (d.getHours()*3600+d.getMinutes()*60+d.getSeconds())/864;
   }}
 
-  function renderTimeline(clips){{
+  // Real event_type strings the analytics pipelines actually write
+  // (see detection_events) collapsed to the filter/legend categories
+  // this page's UI already ships -- "already supported" per this
+  // integration's own scope, not a new filter category.
+  const EVENT_COLORS={{motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d'}};
+  function filterCategory(eventType){{
+    if(eventType==='motion'||eventType==='smart_motion')return 'motion';
+    if(eventType==='person')return 'person';
+    if(['car','truck','bus','motorcycle','bicycle','vehicle'].includes(eventType))return 'vehicle';
+    if(eventType==='plate'||eventType==='lpr')return 'lpr';
+    if(eventType==='people_counting_in'||eventType==='people_counting_out'||eventType==='people_counting')return 'people_counting';
+    if(eventType==='intrusion')return 'intrusion';
+    return null;   // e.g. ppe -- no dedicated filter/legend slot on this page yet, shown under "All" only, in a neutral color
+  }}
+
+  // A clip actually covering the event's own timestamp is preferred;
+  // failing that, the closest clip within 5 minutes is still a useful
+  // jump-off point. Only ever searches the currently-loaded page of
+  // clips -- a marker for a moment outside that page (rare: the
+  // timeline only plots today's events, and today's events should
+  // already be covered by the initially-loaded recent recordings) has
+  // nothing to search client-side, matching the honest "nothing close
+  // enough" behavior this already had.
+  function findClipNear(clips,timestamp){{
+    // Routed entirely through playbackDate() (epoch-ms numbers handled
+    // exactly, naive strings always explicitly treated as UTC) --
+    // never a bare new Date() on a timezone-naive value anywhere in
+    // this match.
+    const target=playbackDate(timestamp).getTime();
+    if(Number.isNaN(target))return null;
+    const covering=clips.find(clip=>target>=playbackDate(clip.start).getTime()&&target<=playbackDate(clip.end).getTime());
+    if(covering)return covering;
+    let closest=null,closestDelta=5*60*1000;
+    [...clips].reverse().slice(0,8).forEach(clip=>{{
+      const delta=Math.abs(playbackDate(clip.start).getTime()-target);
+      if(delta<closestDelta){{closest=clip;closestDelta=delta}}
+    }});
+    return closest;
+  }}
+
+  let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
+  const filterButtons=[...document.querySelectorAll('.monitor-filter')];
+
+  // P0 #5 remediation round 2 (2026-09-05, Codex second review) --
+  // two further gaps in round 1's design: (1) MOBILE_EVENT_FETCH_
+  // TIMEOUT_MS bounds a single fetch attempt -- round 1 had no bound
+  // here at all, so a server that never responds stalled this whole
+  // loop forever (no response -> `finally` never runs -> no retry is
+  // ever scheduled -> the give-up ceiling is never reached either);
+  // (2) deadlineAt is a real wall-clock deadline (Date.now()-based),
+  // replacing round 1's attempt-count ceiling, which assumed every
+  // attempt costs the same ~0 extra time -- a handful of genuinely
+  // slow (not literally hanging) responses could already blow past the
+  // real 120s window while the attempt counter was nowhere near its
+  // limit, or vice versa.
+  const MOBILE_EVENT_PENDING_WINDOW_MS=120000;
+  const MOBILE_EVENT_POLL_INTERVAL_MS=4000;
+  const MOBILE_EVENT_FETCH_TIMEOUT_MS=8000;
+  // One mutable "current poll session" object, replaced (never mutated
+  // across a camera change) whenever scheduleMobileEventPoll() is asked
+  // to track a different cameraId than the one it's already tracking.
+  // Three independent, redundant guards against a stale response
+  // repainting the wrong camera: the camera-tile click handler's own
+  // immediate stopMobileEventPoll() call (clears the timer, aborts the
+  // in-flight request the instant selectedCameraId changes -- never
+  // waiting for this object's own lazy mismatch detection below);
+  // this object's own identity check inside the fetch callback; and an
+  // explicit cameraId!==selectedCameraId check there too, reading the
+  // page's own live selection state directly rather than trusting this
+  // object alone.
+  let mobileEventPollState=null;
+
+  function isMobileEventPending(event){{
+    return AnyAiCamEventMedia.state(event.has_event_clip,event.timestamp)==='processing';
+  }}
+
+  function stopMobileEventPoll(){{
+    if(mobileEventPollState){{
+      if(mobileEventPollState.timer)clearTimeout(mobileEventPollState.timer);
+      if(mobileEventPollState.controller)mobileEventPollState.controller.abort();
+    }}
+    mobileEventPollState=null;
+  }}
+
+  // Deliberately polls /api/customer/events/recent/<cameraId> -- the
+  // same customer-scoped, self-authorizing, SQL-bounded-to-this-camera
+  // list the page already rendered once at load -- rather than a
+  // per-event endpoint keyed on an id that may not exist yet. Re-
+  // invokes renderMobileRecentEvents() itself on the merged result
+  // instead of hand-patching DOM nodes: that keeps this reconciliation
+  // exactly as correct as the render path it reuses, and merging fresh
+  // rows into existing ones by id (never appending) is what makes a
+  // duplicate row structurally impossible here.
+  function scheduleMobileEventPoll(cameraId,clips,events){{
+    if(cameraId!==selectedCameraId)return;
+    if(!mobileEventPollState||mobileEventPollState.cameraId!==cameraId){{
+      stopMobileEventPoll();
+      mobileEventPollState={{cameraId,timer:null,controller:null,inFlight:false,events:[]}};
+    }}
+    const state=mobileEventPollState;
+    state.events=events;
+    if(state.timer||state.inFlight)return;
+    const interval=events.some(isMobileEventPending)?MOBILE_EVENT_POLL_INTERVAL_MS:15000;
+    state.timer=setTimeout(async()=>{{
+      state.timer=null;state.inFlight=true;
+      const controller=new AbortController();state.controller=controller;
+      const timeout=setTimeout(()=>controller.abort(),MOBILE_EVENT_FETCH_TIMEOUT_MS);
+      try{{
+        const response=await fetch(`/api/customer/events/recent/${{encodeURIComponent(cameraId)}}`,{{cache:'no-store',signal:controller.signal}});
+        if(mobileEventPollState!==state||cameraId!==selectedCameraId)return;
+        if(response.ok){{
+          const payload=await response.json();
+          if(mobileEventPollState!==state||cameraId!==selectedCameraId)return;
+          const byId=new Map(state.events.filter(e=>e&&e.id).map(e=>[e.id,e]));
+          for(const event of Array.isArray(payload.events)?payload.events:[]){{
+            if(event&&typeof event.id==='string'&&typeof event.timestamp==='string')byId.set(event.id,event);
+          }}
+          state.events=[...byId.values()].sort((a,b)=>playbackDate(a.timestamp)-playbackDate(b.timestamp)).slice(-200);
+        }}
+      }}catch(error){{
+        if(error?.name!=='AbortError'&&!(error instanceof TypeError))console.error('Mobile event polling failed',error);
+      }}finally{{
+        clearTimeout(timeout);state.inFlight=false;
+        if(mobileEventPollState===state&&cameraId===selectedCameraId){{
+          // Re-render on failed requests as well: elapsed time still expires.
+          renderMobileRecentEvents(cameraId,clips,state.events);
+        }}
+      }}
+    }},interval);
+  }}
+
+  function renderMobileRecentEvents(cameraId,clips,events,options){{
+    const settled=Boolean(options&&options.settled);
+    const mobileList=document.getElementById('mobile-recent-events-list');
+    if(!mobileList)return;
+    // Video-first mobile cards (2026-09-04): one large 16:9 thumbnail
+    // card per row -- timestamp/duration and (for events) a colored
+    // event-type badge overlaid directly on the image, replacing the
+    // old plain-text "Clip"/"No preview" list rows this section used to
+    // render. Tapping a card reuses the existing, unmodified
+    // playClip()/openEvent() playback paths below completely unchanged
+    // -- revealClipPanel() (already called by both) is the existing
+    // "detail screen" Download/Share/Bookmark/Create-clip controls
+    // already live in, so no new action-menu logic is needed: the small
+    // decorative ⋮ glyph on each card (pointer-events:none, see its own
+    // CSS above) is purely a visual affordance for that same existing
+    // tap-to-open behavior, not a second interaction path.
+    //
+    // Root-cause fix, same date: an event's own thumbnail was
+    // previously never read here at all -- findClipNear(clips,event.
+    // timestamp) substituted a *nearby recording's* thumbnail instead,
+    // unrelated to the event's own clip, which frequently found nothing
+    // (recording outside the currently-loaded page, a genuine gap
+    // between the event and the nearest recording, etc.) and showed
+    // "No preview" even for an event correctly flagged has_event_clip
+    // with a real, already-working thumbnail sitting one field away:
+    // event.thumbnail, populated by _customer_detection_events() as
+    // /api/customer/events/{{camera_id}}/{{event_id}}/thumbnail -- the
+    // exact same URL the desktop Events page already uses correctly.
+    // findClipNear() is no longer called anywhere in this function; an
+    // event with no real thumbnail (event.thumbnail is null -- it
+    // genuinely has no captured preview, not a lookup failure) now
+    // renders the compact "<Type> · No clip available" fallback below
+    // instead of a large empty preview box.
+    const clipRows=[...clips].reverse().slice(0,15).map(clip=>{{
+      const durationMin=Math.max(1,Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000));
+      const timeLabel=playbackDate(clip.start).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
+      return `<div class="mobile-media-card" data-mobile-clip role="button" tabindex="0">
+        <img class="mobile-media-thumb" src="/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">
+        <span class="mobile-media-time">${{timeLabel}} · ${{durationMin}} min</span>
+        <span class="mobile-media-menu" aria-hidden="true">⋮</span>
+      </div>`;
+    }}).join('');
+
+    // Each row represents analytics activity; a row with a real clip
+    // (has_event_clip) opens that event's own clip directly via
+    // openEvent() below -- never a nearby-recording guess.
+    const recentEvents=[...events]
+      .filter(event=>{{
+        const category=filterCategory(event.event_type);
+        return category && activeFilters.has(category);
+      }})
+      .reverse()
+      .slice(0,20);
+
+    const eventRows=recentEvents.map(event=>{{
+      const category=filterCategory(event.event_type)||'event';
+      const label=AnyAiCamEventMedia.escape(String(event.event_type||'event').replaceAll('_',' '));
+      const playable=Boolean(event.has_event_clip&&event.id);
+      const interaction=playable?'role="button" tabindex="0"':'';
+      const timeLabel=playbackDate(event.timestamp).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
+      const badge=`<span class="mobile-media-badge" style="background:${{category?EVENT_COLORS[category]:'#6b7785'}}">${{label}}</span>`;
+      const menu=playable?'<span class="mobile-media-menu" aria-hidden="true">⋮</span>':'';
+      // P0 #5 (2026-09-04): a genuinely fresh event (Samsung's own
+      // event->media pipeline now takes single-digit-to-low-double-
+      // digit seconds, not the ~33min it used to) can render here
+      // before its clip/thumbnail exists yet -- previously
+      // indistinguishable from an event that will NEVER get one (most
+      // detection types, by design). isMobileEventPending() below
+      // narrows "no thumbnail" to "no thumbnail AND still within the
+      // window this pipeline could plausibly still be working on it",
+      // so only that case gets the Processing state; a genuinely old
+      // clipless event still renders exactly as before.
+      const stillWatching=isMobileEventPending(event);
+      const pending=stillWatching&&!settled;
+      const gaveUp=!event.has_event_clip&&!stillWatching;
+      const media=event.thumbnail
+        ? `<img class="mobile-media-thumb" src="${{AnyAiCamEventMedia.escape(event.thumbnail)}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
+        : gaveUp
+          ? `<div class="mobile-media-fallback mobile-media-fallback--expired">${{label}} · Not ready yet</div>`
+          : pending
+            ? `<div class="mobile-media-fallback mobile-media-fallback--pending">${{label}} · Processing…</div>`
+            : `<div class="mobile-media-fallback">${{label}} · ${{playable?'Event clip':'Not ready yet'}}</div>`;
+
+      return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{AnyAiCamEventMedia.escape(event.timestamp)}}" data-mobile-event-id="${{AnyAiCamEventMedia.escape(event.id||'')}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
+        ${{media}}
+        <span class="mobile-media-time">${{timeLabel}}</span>
+        ${{badge}}
+        ${{menu}}
+      </div>`;
+    }}).join('');
+
+    mobileList.innerHTML=(clipRows+eventRows)||
+      '<div class="empty">No recent activity for this camera.</div>';
+
+    [...clips].reverse().slice(0,15).forEach((clip,index)=>{{
+      const row=mobileList.querySelectorAll('[data-mobile-clip]')[index];
+      if(row)row.addEventListener('click',()=>playClip(cameraId,clip));
+    }});
+
+    // P0 #5: keep polling the existing, self-authorizing recent-events
+    // API (never a per-event endpoint keyed on an id that may not
+    // exist yet -- see isMobileEventPending()'s own docstring) and
+    // re-run this exact same render function on fresh data for as
+    // long as anything visible is still pending. Re-rendering through
+    // the one already-correct code path above -- rather than hand-
+    // patching individual DOM nodes -- is what guarantees this can
+    // never produce a duplicate row: mobileList.innerHTML is always
+    // fully rebuilt from a deduplicated-by-id merge, never appended to.
+    // Never re-armed from a `settled` pass (options.settled above) --
+    // that pass exists specifically to stop polling and paint the
+    // final fallback state, not to loop forever.
+    if(!settled){{
+      scheduleMobileEventPoll(cameraId,clips,events);
+    }}
+
+    mobileList.querySelectorAll('[data-mobile-event]').forEach(row=>{{
+      // Analytics-only detections remain visible as event details but
+      // are deliberately not presented as playable controls.
+      if(row.dataset.mobileEventClip!=='1'||!row.dataset.mobileEventId)return;
+
+      const openEvent=()=>playEventClipDeepLink(cameraId,row.dataset.mobileEventId,true);
+
+      row.addEventListener('click',openEvent);
+      row.addEventListener('keydown',event=>{{
+        if(event.key==='Enter'||event.key===' '){{
+          event.preventDefault();
+          openEvent();
+        }}
+      }});
+    }});
+  }}
+
+  // === LANE_CORE_START ===
+  const EVENT_LANE_ORDER=['motion','person','vehicle','lpr','people_counting','intrusion'];
+  // Tightened 2026-09-04 (was 8/2) for a compact, professional timeline
+  // -- see #playback-timeline-lane's own CSS comment above for the full
+  // story of why the box these are drawn into used to render far
+  // shorter than intended. Purely a size/spacing change: still one
+  // fixed-height row per category (6 lanes) plus the existing fallback
+  // row, same left/width-from-timestamp math (timelinePercent(), a few
+  // lines up), same colors, same click/filter/seek behavior -- nothing
+  // about which events exist or where they sit on the time axis changes.
+  const EVENT_LANE_HEIGHT_PX=7;
+  const EVENT_LANE_GAP_PX=1;
+  const RECORDING_ROW_HEIGHT_PX=6;
+  // Gap between the last analytics lane and the recording-coverage row
+  // below it -- kept as its own named constant (rather than folded into
+  // RECORDING_ROW_TOP_PX's math inline) so it reads as the one number
+  // actually meant to be a deliberate design choice, not derived.
+  const RECORDING_ROW_GAP_PX=6;
+  function eventLaneTop(category){{
+    const index=category?EVENT_LANE_ORDER.indexOf(category):-1;
+    const lane=index===-1?EVENT_LANE_ORDER.length:index;
+    return (lane*(EVENT_LANE_HEIGHT_PX+EVENT_LANE_GAP_PX))+'px';
+  }}
+  // Derived from the lane constants above, not hand-picked -- eventLaneTop
+  // (null) is exactly where the fallback lane (the 7th and last stacked
+  // row) starts, so its own bottom edge plus RECORDING_ROW_GAP_PX is
+  // exactly where the recording-coverage row belongs, however many lanes
+  // there are or however tall each one is. This was the actual source of
+  // the visual bug: a hardcoded 74 here had drifted out of sync with a
+  // separately-hardcoded 88px container height (see the CSS comment
+  // above) -- neither of those two numbers could ever verify itself
+  // against the other. They can't drift apart again because there's now
+  // only one place (this line) that computes where the coverage row goes.
+  const RECORDING_ROW_TOP_PX=Number(eventLaneTop(null).slice(0,-2))+EVENT_LANE_HEIGHT_PX+RECORDING_ROW_GAP_PX;
+  // === LANE_CORE_END ===
+
+  // Genuine bug found 2026-09-15 (customer-reported: "recordings from
+  // last night appear on today's timeline"): this function used to plot
+  // every passed-in clip/event using only timelinePercent()'s time-of-day
+  // fraction, never checking which actual calendar day that clip/event
+  // falls on. That's correct only when every item in `clips`/`events`
+  // genuinely belongs to the one day the 00:00-24:00 axis represents --
+  // true for loadRecordingsForDate()'s own date=-scoped fetch, but NOT
+  // true for renderCamera()'s default view, whose `clips` are simply
+  // "the most recent N recordings" with no date filter at all (see
+  // ensureClipsLoaded()) -- e.g. first thing in the morning, before
+  // today has N recordings yet, that most-recent page is silently
+  // last night's footage, previously plotted onto an unlabeled axis that
+  // looked exactly like "today". `dayString` (every call site now passes
+  // one -- the viewed date, or today's/the deep-linked moment's own local
+  // date when none is explicitly selected) makes the day being
+  // represented explicit, and only clips/events whose real local time
+  // actually overlaps that one day are ever plotted -- an overlap test
+  // (start<dayEnd AND end>dayStart), not an exact-day match, so a
+  // recording that genuinely straddles local midnight still correctly
+  // appears (partially) on both of its adjacent days, matching this same
+  // overlap contract the server's own _customer_recordings_for_date()
+  // already uses. Computed here in the browser's own local time (native
+  // Date, via the already-existing playbackDate()) rather than any
+  // server-supplied timezone -- see loadRecordingsForDate()'s own
+  // comment for why no timezone needs to be guessed at all here.
+  function renderTimeline(cameraId,clips,events,dayString){{
+    renderMobileRecentEvents(cameraId,clips,events);
     timelineLane.innerHTML='';
-    if(!clips.length){{timelineEmpty.hidden=false;return}}
+    // playheadEl is a single persistent element (see its own creation
+    // comment above) -- re-appended here every render since the
+    // innerHTML clear just above just discarded it along with the old
+    // segments/markers.
+    timelineLane.appendChild(playheadEl);
+    const [dayY,dayM,dayD]=dayString.split('-').map(Number);
+    const dayStartMs=new Date(dayY,dayM-1,dayD,0,0,0,0).getTime();
+    const dayEndMs=dayStartMs+86400000;
+    const dayClips=clips.filter(clip=>playbackDate(clip.end).getTime()>dayStartMs&&playbackDate(clip.start).getTime()<dayEndMs);
+    const dayEvents=events.filter(event=>{{
+      const t=playbackDate(event.timestamp).getTime();
+      return t>=dayStartMs&&t<dayEndMs;
+    }});
+    if(!dayClips.length&&!dayEvents.length){{timelineEmpty.hidden=false;return}}
     timelineEmpty.hidden=true;
-    clips.forEach(clip=>{{
+    // Every loaded recording gets its own proportional bar -- not just
+    // the 6 most recent. Real recording data (traced 2026-09-02) shows
+    // this camera's clips are ~85-87% back-to-back (near-zero gap) with
+    // only a handful of genuine multi-hour gaps/day; slicing to 6 was
+    // silently dropping the other ~90% of a day's real, playable
+    // recordings from the timeline (though they remained reachable via
+    // the Recordings list below), making a mostly-continuous day look
+    // sparse. Each bar's left/width still comes from the clip's own
+    // real start/end -- true gaps stay visibly empty, nothing here
+    // fabricates continuity.
+    [...dayClips].reverse().forEach(clip=>{{
       const startPct=timelinePercent(clip.start);
       const endPct=Math.max(startPct+0.3,timelinePercent(clip.end));
       const segment=document.createElement('div');
       segment.className='event-segment';
       segment.style.left=startPct+'%';
       segment.style.width=(endPct-startPct)+'%';
+      segment.style.top=RECORDING_ROW_TOP_PX+'px';
+      segment.style.height=RECORDING_ROW_HEIGHT_PX+'px';
       segment.style.background='#e8eef6';
-      segment.title=new Date(clip.start).toLocaleString();
-      segment.addEventListener('click',()=>playClip(clip));
+      segment.title=playbackDate(clip.start).toLocaleString();
+      segment.addEventListener('click',()=>playClip(cameraId,clip));
       timelineLane.appendChild(segment);
+    }});
+    dayEvents.forEach(event=>{{
+      const category=filterCategory(event.event_type);
+      if(category&&!activeFilters.has(category))return;
+      const pct=timelinePercent(event.timestamp);
+      const marker=document.createElement('div');
+      marker.className='event-segment';
+      marker.style.left=pct+'%';
+      marker.style.width='0.4%';
+      marker.style.top=eventLaneTop(category);
+      marker.style.height=EVENT_LANE_HEIGHT_PX+'px';
+      marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';
+      const label=(event.event_type||'event').replaceAll('_',' ');
+      const playable=Boolean(event.has_event_clip&&event.id);
+      marker.style.cursor=playable?'pointer':'default';
+      marker.style.opacity=playable?'1':'0.65';
+      marker.title=`${{label}} · ${{playbackDate(event.timestamp).toLocaleString()}} · ${{playable?'Event clip':'Analytics only'}}`;
+      if(playable){{
+        marker.addEventListener('click',()=>playEventClipDeepLink(cameraId,event.id,true));
+      }}
+      timelineLane.appendChild(marker);
     }});
   }}
 
-  function renderCamera(){{
-    const clips=recordingsByCamera[selectedCameraId]||[];
-    video.pause();
-    video.removeAttribute('src');
-    video.load();
-    placeholder.hidden=false;
-    status.textContent=clips.length?'Select a recording to play.':'No recordings available yet.';
+  let visibleRecordingCount=6;
+
+  function renderClipList(cameraId,clips){{
     clipList.innerHTML=clips.length?'':'<div class="empty">No recordings available yet for this camera.</div>';
-    clips.forEach(clip=>{{
+
+    const visible=[...clips].reverse().slice(0,visibleRecordingCount);
+
+    visible.forEach(clip=>{{
       const row=document.createElement('button');
       row.type='button';
       row.className='setting-link';
       row.style.cssText='width:100%;text-align:left;border:0;cursor:pointer';
-      const durationMin=Math.max(1,Math.round((new Date(clip.end)-new Date(clip.start))/60000));row.innerHTML=`<div><strong>${{new Date(clip.start).toLocaleString()}}</strong><div class="health-detail">${{durationMin}} min recording</div></div><span>Play →</span>`;
-      row.addEventListener('click',()=>playClip(clip));
+
+      const durationMin=Math.max(
+        1,
+        Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000)
+      );
+
+      const thumbnailUrl=
+        `/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail`;
+
+      row.innerHTML=`<div style="display:flex;align-items:center;gap:14px;width:100%">
+        <div style="width:160px;height:90px;border-radius:10px;background:#0b1018;flex:0 0 auto;overflow:hidden;display:grid;place-items:center">
+          <img
+            src="${{thumbnailUrl}}"
+            alt="Recording thumbnail"
+            loading="lazy"
+            style="width:100%;height:100%;object-fit:cover"
+            onerror="window.__anyaicamThumbnailRetry(this)"
+          >
+        </div>
+        <div style="min-width:0;flex:1">
+          <strong>${{playbackDate(clip.start).toLocaleString()}}</strong>
+          <div class="health-detail">${{durationMin}} min recording</div>
+        </div>
+        <span style="white-space:nowrap">Play →</span>
+      </div>`;
+
+      row.addEventListener('click',()=>playClip(cameraId,clip));
       clipList.appendChild(row);
     }});
-    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===selectedCameraId);
-    timelineLabel.textContent=activeTile?activeTile.textContent:'—';
-    renderTimeline(clips);
+
+    loadOlderButton.hidden=clips.length===0;
   }}
 
-  renderCamera();
+  // === PAGINATION_CORE_START ===
+  // Named (not an inline arrow) so it can be extracted and exercised
+  // directly by test_playback_pagination_core.mjs against the exact
+  // deployed source -- see that file for the null-vs-empty and
+  // camera-switch-race regression tests this handler exists to pass.
+  async function handleLoadOlderClick(){{
+    // Captured once, up front: selectedCameraId can change while this
+    // handler is suspended at the await below (the customer is free
+    // to click a different camera tile mid-fetch -- nothing else on
+    // this page blocks that). Every use below reads this local
+    // constant, never selectedCameraId directly, so a camera switch
+    // in flight can never write one camera's older page into another
+    // camera's cache/render -- the same cameraId-capture guard this
+    // file already uses for renderAvailableDates()/loadRecordingsForDate().
+    const cameraId=selectedCameraId;
+    const clips=recordingsByCamera[cameraId]||[];
+
+    if(visibleRecordingCount<clips.length){{
+      visibleRecordingCount+=6;
+      renderClipList(cameraId,clips);
+      return;
+    }}
+
+    const oldest=clips[0];
+    if(!oldest)return;
+
+    loadOlderButton.disabled=true;
+    loadOlderButton.textContent='Loading…';
+
+    const older=await fetchClipsMetadata(
+      cameraId,
+      {{before:oldest.start,before_id:oldest.id,limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}}
+    );
+
+    loadOlderButton.disabled=false;
+    loadOlderButton.textContent='Load older recordings';
+
+    if(older===null){{
+      // A genuine fetch failure -- not confirmed end-of-history.
+      // Leave the button visible/enabled exactly as it was so the
+      // customer's next click (or the next automatic call once this
+      // camera is reselected) can simply retry; hiding it here would
+      // permanently and incorrectly present a transient error as "no
+      // older recordings exist."
+      debugLog('load older recordings: fetch failed, will allow retry');
+      return;
+    }}
+
+    if(cameraId!==selectedCameraId){{
+      // The customer switched to a different camera while this fetch
+      // was in flight. The page they're now looking at belongs to a
+      // different camera entirely, so re-rendering here would show
+      // camera A's older recordings under camera B's tile. Still
+      // commit the successful result into cameraId's own cache entry
+      // (so the work isn't wasted and Load older behaves correctly
+      // next time this camera is reselected), but do not touch the
+      // currently-visible UI.
+      if(older.length)recordingsByCamera[cameraId]=[...older,...clips];
+      return;
+    }}
+
+    if(!older.length){{
+      loadOlderButton.hidden=true;
+      return;
+    }}
+
+    recordingsByCamera[cameraId]=[...older,...clips];
+    visibleRecordingCount+=older.length;
+    renderClipList(
+      cameraId,
+      recordingsByCamera[cameraId]
+    );
+    // Deliberately not re-rendering the timeline for older pages: the
+    // timeline is a single day's 0-24h axis (see timelinePercent()),
+    // so a recording from a previous day has no meaningful position on
+    // it -- Browse recordings' own list, extended here, is the correct
+    // place for older history, exactly as the task called for.
+  }}
+  loadOlderButton.addEventListener('click',handleLoadOlderClick);
+  // === PAGINATION_CORE_END ===
+
+  // === PAGINATION_ENSURE_START ===
+  async function ensureClipsLoaded(cameraId){{
+    if(recordingsLoaded.has(cameraId))return recordingsByCamera[cameraId]||[];
+    const clips=await fetchClipsMetadata(cameraId,{{limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}});
+    if(clips===null){{
+      // A genuine fetch failure, not a confirmed empty catalog --
+      // deliberately NOT marked as loaded, so the next time this
+      // camera is selected (or ensureClipsLoaded is otherwise called
+      // again) a fresh attempt is made instead of permanently treating
+      // a transient error as "this camera has zero recordings."
+      return recordingsByCamera[cameraId]||[];
+    }}
+    recordingsByCamera[cameraId]=clips;
+    recordingsLoaded.add(cameraId);
+    return clips;
+  }}
+  // === PAGINATION_ENSURE_END ===
+
+  async function ensureEventsLoaded(cameraId){{
+    if(analyticsLoaded.has(cameraId))return analyticsByCamera[cameraId]||[];
+    const events=await fetchCameraEvents(cameraId);
+    analyticsByCamera[cameraId]=events;
+    analyticsLoaded.add(cameraId);
+    return events;
+  }}
+
+  // Local (customer-browser) calendar date of a naive-UTC timestamp,
+  // via the same playbackDate() UTC-aware parse used everywhere else
+  // on this page -- never a second, inconsistent date computation.
+  function localDateStringOf(value){{
+    const d=(value instanceof Date)?value:playbackDate(value);
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,'0');
+    const day=String(d.getDate()).padStart(2,'0');
+    return `${{y}}-${{m}}-${{day}}`;
+  }}
+
+  // Genuine bug found 2026-09-15: the server's own APPLIANCE_TIMEZONE
+  // (America/Chicago, hardcoded) is used to convert a plain `date=`
+  // string into UTC query bounds -- correct only for a customer/site
+  // that genuinely is in Central time, wrong for any other, and there is
+  // no stored per-customer/per-site timezone anywhere in this product
+  // yet to read instead. The browser itself always knows its own real
+  // local offset (DST included) via native Date, so it computes the
+  // exact UTC instant of this LOCAL date's own midnight-to-midnight
+  // bounds directly -- day_start_utc/day_end_utc below -- and sends
+  // those alongside `date`, instead of asking the server to guess a
+  // timezone at all. .slice(0,19) matches the naive (no trailing Z/
+  // milliseconds) UTC-ISO format started_at/ended_at are already stored
+  // and compared in everywhere else on this page.
+  function localDayBoundsToUtcNaiveIso(dateString){{
+    const [y,m,d]=dateString.split('-').map(Number);
+    const start=new Date(y,m-1,d,0,0,0,0);
+    const end=new Date(y,m-1,d+1,0,0,0,0);
+    return [start.toISOString().slice(0,19),end.toISOString().slice(0,19)];
+  }}
+
+  // The already-loaded event cache is not itself date-scoped (it's the
+  // existing recent-events list), so a date-mode timeline filters it
+  // client-side rather than requesting a second, new events-by-date
+  // endpoint for what is already an in-memory, per-camera list.
+  function eventsForLocalDate(events,date){{
+    return events.filter(event=>localDateStringOf(event.timestamp)===date);
+  }}
+
+  async function ensureDatesLoaded(cameraId){{
+    if(datesLoaded.has(cameraId))return datesByCamera[cameraId]||[];
+    try{{
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}/dates`);
+      const data=response.ok?await response.json():{{dates:[]}};
+      datesByCamera[cameraId]=Array.isArray(data.dates)?data.dates:[];
+    }}catch(error){{
+      debugLog(`dates fetch failed: ${{error && error.message}}`);
+      datesByCamera[cameraId]=[];
+    }}
+    datesLoaded.add(cameraId);
+    return datesByCamera[cameraId];
+  }}
+
+  // Lightweight recorded-date availability indicator -- deliberately a
+  // capped, most-recent-first strip of clickable date chips, not a
+  // full calendar widget: the browser never scans video files itself
+  // to determine this (see _customer_recording_dates()'s own
+  // docstring), and any older retained date not shown here is still
+  // directly reachable via the date input above.
+  async function renderAvailableDates(cameraId){{
+    const dates=await ensureDatesLoaded(cameraId);
+    if(cameraId!==selectedCameraId)return;
+    availableDatesEl.innerHTML='';
+    if(!dates.length){{
+      availableDatesEl.textContent='No retained recordings found yet for this camera.';
+      return;
+    }}
+    const label=document.createElement('span');
+    label.textContent='Dates with recordings: ';
+    availableDatesEl.appendChild(label);
+    [...dates].reverse().slice(0,14).forEach(date=>{{
+      const chip=document.createElement('button');
+      chip.type='button';
+      chip.className='ghost-button';
+      chip.style.cssText='padding:3px 8px;margin:2px;font-size:12px';
+      chip.textContent=date;
+      if(date===viewingDate)chip.style.fontWeight='700';
+      chip.addEventListener('click',()=>{{
+        loadRecordingsForDate(cameraId,date).catch(error=>{{
+          debugLog(`loadRecordingsForDate failed: ${{error && error.message}}`);
+        }});
+      }});
+      availableDatesEl.appendChild(chip);
+    }});
+  }}
+
+  // Selecting a date reloads the timeline for that date (a fresh
+  // date=-scoped fetch, replacing what's shown) rather than merely
+  // paginating backward through recordingsByCamera's own cached list
+  // -- that existing cache/pagination (ensureClipsLoaded/loadOlderButton)
+  // is left completely untouched by date mode, and resumes exactly as
+  // before once dateTodayButton is pressed.
+  async function loadRecordingsForDate(cameraId,date){{
+    if(cameraId!==selectedCameraId)return;
+    viewingDate=date;
+    dateInput.value=date;
+    selectedDateLabel.textContent=`Showing recordings for ${{date}}`;
+    clipPanel.hidden=false;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    selectedClip=null;
+    playheadEl.hidden=true;
+    skipBackButton.disabled=true;
+    timelinePlayButton.disabled=true;
+    skipForwardButton.disabled=true;
+    downloadButton.disabled=true;
+    shareButton.disabled=true;
+    createClipButton.disabled=true;
+    placeholder.hidden=false;
+    status.textContent=`Loading recordings for ${{date}}\u2026`;
+    // null (a genuine fetch failure -- see fetchClipsMetadata's own
+    // docstring) is normalized to [] here: this date-mode view has no
+    // separate retry affordance of its own the way loadOlderButton
+    // does, so a failed load simply renders as "no recordings for
+    // this date" rather than throwing on the array operations below.
+    const [day_start_utc,day_end_utc]=localDayBoundsToUtcNaiveIso(date);
+    const clips=(await fetchClipsMetadata(cameraId,{{date,day_start_utc,day_end_utc}}))||[];
+    if(cameraId!==selectedCameraId||date!==viewingDate){{
+      debugLog('[date-mode] aborted: camera or date changed while loading');
+      return;
+    }}
+    // A whole day's worth of fixed 5-minute segments is already a
+    // small, bounded result (see the date= route's own docstring) --
+    // show every returned segment, not just the default page size.
+    visibleRecordingCount=clips.length||6;
+    renderClipList(cameraId,clips);
+    // A date query already returns every overlapping segment for that
+    // day -- older-page pagination has nothing left to add here.
+    loadOlderButton.hidden=true;
+    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
+    timelineLabel.textContent=(activeTile?activeTile.textContent:'\u2014')+` \u2014 ${{date}}`;
+    currentClips=clips;
+    renderTimeline(cameraId,clips,eventsForLocalDate(analyticsByCamera[cameraId]||[],date),date);
+    status.textContent=clips.length
+      ?`${{clips.length}} recording(s) found for ${{date}}. Select one, or a point on the timeline, to play.`
+      :`No recordings are available for ${{date}}.`;
+    renderAvailableDates(cameraId).catch(()=>{{}});
+  }}
+
+  dateInput.addEventListener('change',()=>{{
+    if(!dateInput.value)return;
+    loadRecordingsForDate(selectedCameraId,dateInput.value).catch(error=>{{
+      debugLog(`loadRecordingsForDate failed: ${{error && error.message}}`);
+    }});
+  }});
+
+  dateTodayButton.addEventListener('click',()=>{{
+    viewingDate=null;
+    dateInput.value='';
+    selectedDateLabel.textContent='';
+    visibleRecordingCount=6;
+    loadOlderButton.hidden=false;
+    renderCamera().catch(error=>{{
+      debugLog(`renderCamera (today) failed: ${{error && error.message}}`);
+    }});
+  }});
+
+  // Previous/Next Day: shift by exactly one LOCAL calendar day from
+  // whichever date is currently in view -- today's own local date if
+  // none is selected yet (the Today button/default view case).
+  // Date's own local-time setDate() is used deliberately instead of
+  // any fixed-24-hour-offset math specifically because it is DST-safe:
+  // it operates on the wall-clock day-of-month field itself, so it
+  // still lands on the correct next/previous calendar date on a
+  // spring-forward (23-hour) or fall-back (25-hour) day, unlike adding
+  // a fixed 86400000ms would. localDateStringOf() is the exact same
+  // formatter dateInput.max and loadRecordingsForDate() already use,
+  // reused here rather than introduced a second time.
+  // === DATE_NAV_CORE_START ===
+  function localDateStringOf_forDateNavCore(value){{
+    const d=(value instanceof Date)?value:new Date(value);
+    const y=d.getFullYear();
+    const m=String(d.getMonth()+1).padStart(2,'0');
+    const day=String(d.getDate()).padStart(2,'0');
+    return `${{y}}-${{m}}-${{day}}`;
+  }}
+  function shiftedDateString(dateString,deltaDays){{
+    const [y,m,d]=dateString.split('-').map(Number);
+    const shifted=new Date(y,m-1,d);
+    shifted.setDate(shifted.getDate()+deltaDays);
+    return localDateStringOf_forDateNavCore(shifted);
+  }}
+  // === DATE_NAV_CORE_END ===
+
+  function navigateByOneDay(deltaDays){{
+    const base=viewingDate||localDateStringOf(new Date());
+    const target=shiftedDateString(base,deltaDays);
+    if(target>dateInput.max)return;  // never navigate into the future, matching the date input's own existing max=
+    loadRecordingsForDate(selectedCameraId,target).catch(error=>{{
+      debugLog(`loadRecordingsForDate (${{deltaDays>0?'next':'previous'}} day) failed: ${{error && error.message}}`);
+    }});
+  }}
+
+  datePrevButton.addEventListener('click',()=>navigateByOneDay(-1));
+  dateNextButton.addEventListener('click',()=>navigateByOneDay(1));
+
+  // Genuine feature added 2026-09-15 (customer request: "a true video
+  // scrubbing timeline, like a professional VMS"): click OR drag the
+  // playhead anywhere on the ruler to seek. Superseded the previous
+  // click-only exact-seek handler below it used to live in -- that
+  // handler's own findClipNear()-based "covering, else nearest within 5
+  // minutes" leniency was right for a one-off deep-link jump, but wrong
+  // for a scrub bar, whose whole point is showing real recording
+  // coverage: scrubbing into a genuine gap must say so, never silently
+  // snap to nearby footage. resolveScrubTarget() below is the single,
+  // pure, DOM-free decision core both click and drag now share.
+  //
+  // === SCRUB_CORE_START ===
+  // parseDate is injected (never closes over the outer playbackDate())
+  // so this block stays extractable/testable standalone, exactly like
+  // CHAIN_CORE above -- see test_playback_timeline_scrubbing_core.mjs.
+  function timelineFractionToLocalMs(dayString,fraction){{
+    const [y,m,d]=dayString.split('-').map(Number);
+    const dayStart=new Date(y,m-1,d,0,0,0,0).getTime();
+    return dayStart+Math.min(1,Math.max(0,fraction))*86400000;
+  }}
+  function coveringClipAt(clips,timestampMs,parseDate){{
+    return clips.find(clip=>timestampMs>=parseDate(clip.start).getTime()&&timestampMs<=parseDate(clip.end).getTime())||null;
+  }}
+  function resolveScrubTarget(clips,dayString,fraction,parseDate){{
+    const targetMs=timelineFractionToLocalMs(dayString,fraction);
+    const covering=coveringClipAt(clips,targetMs,parseDate);
+    if(!covering)return {{targetMs,covering:null,offsetSeconds:null}};
+    const offsetSeconds=Math.max(0,(targetMs-parseDate(covering.start).getTime())/1000);
+    return {{targetMs,covering,offsetSeconds}};
+  }}
+  // === SCRUB_CORE_END ===
+
+  function currentTimelineDayString(){{
+    return viewingDate||localDateStringOf(new Date());
+  }}
+
+  function positionPlayhead(fraction,hasCoverage){{
+    playheadEl.hidden=false;
+    playheadEl.style.left=(fraction*100)+'%';
+    playheadEl.classList.toggle('timeline-playhead--gap',!hasCoverage);
+  }}
+
+  function timelineFractionFromClientX(clientX){{
+    const rect=timelineLane.getBoundingClientRect();
+    if(rect.width<=0)return 0;
+    return Math.min(1,Math.max(0,(clientX-rect.left)/rect.width));
+  }}
+
+  // Drives one seek from a ruler fraction, for both click and drag.
+  // options.autoplay: whether to actually (re)start playback here --
+  // true for a plain click (the pre-existing "click always plays"
+  // behavior) and for a drag release that resumes what was already
+  // playing before the drag started, but deliberately false for every
+  // live in-progress drag position, so scrubbing shows the correct
+  // frame without forcing playback/audio to start on every intermediate
+  // position crossed. options.announceGap: whether a gap gets the
+  // existing toast -- suppressed during a live drag (status.textContent
+  // already updates continuously; a toast per intermediate position
+  // would be noise) but shown for a plain click or a drag's real
+  // release point, matching the pre-existing single-toast behavior.
+  function seekToTimelineFraction(fraction,options){{
+    const autoplay=Boolean(options&&options.autoplay);
+    const announceGap=Boolean(options&&options.announceGap);
+    const dayString=currentTimelineDayString();
+    const {{covering,offsetSeconds}}=resolveScrubTarget(currentClips,dayString,fraction,playbackDate);
+    positionPlayhead(fraction,Boolean(covering));
+    if(!covering){{
+      video.pause();
+      status.textContent='No recording available at this time.';
+      if(announceGap&&typeof showToast==='function')showToast('No recording available at that time.');
+      return;
+    }}
+    if(selectedClip&&selectedClip.id===covering.id){{
+      // Same file already loaded -- an instant, local seek, no reload.
+      video.currentTime=offsetSeconds;
+      if(autoplay&&video.paused)video.play().catch(()=>{{}});
+      return;
+    }}
+    // Scrubbed into a different (possibly non-adjacent) recording file
+    // -- reuses the existing playClip() media-load path (never a second
+    // one), so the correct file is resolved and loaded automatically;
+    // the customer never has to pick an individual recording first.
+    playClip(selectedCameraId,covering,{{autoplay}});
+    video.addEventListener('loadedmetadata',()=>{{video.currentTime=offsetSeconds;}},{{once:true}});
+  }}
+
+  // Continuous sync while playing/paused: the playhead always reflects
+  // selectedClip's own real recording time + however far into it the
+  // video actually is -- not just wherever it was last explicitly
+  // seeked to. Skipped while a drag owns the playhead directly (below)
+  // to avoid the two fighting over its position on the same frame.
+  video.addEventListener('timeupdate',()=>{{
+    if(isScrubbing||!selectedClip)return;
+    const dayString=currentTimelineDayString();
+    const dayStartMs=timelineFractionToLocalMs(dayString,0);
+    const nowMs=playbackDate(selectedClip.start).getTime()+video.currentTime*1000;
+    const fraction=(nowMs-dayStartMs)/86400000;
+    if(fraction<0||fraction>1){{playheadEl.hidden=true;return}}  // playing clip isn't part of the day currently shown (e.g. a deep link to a different day)
+    positionPlayhead(fraction,true);
+  }});
+
+  // Drag-to-scrub: pointerdown arms the gesture; only past
+  // SCRUB_DRAG_THRESHOLD_PX of real movement does this take over from
+  // an ordinary click (so a plain click on a segment/marker/the bare
+  // ruler is completely unaffected below the threshold -- their own
+  // click handlers still fire normally). rAF-throttled during the drag
+  // itself (scrubRafPending) so a fast, high-frequency pointermove burst
+  // never issues more than one seek/reload per animation frame; the
+  // final released position is always applied synchronously, never
+  // dropped by the throttle.
+  const SCRUB_DRAG_THRESHOLD_PX=3;
+  let scrubPointerId=null;
+  let scrubStartClientX=null;
+  let scrubHasDragged=false;
+  let scrubWasPlayingBeforeDrag=false;
+  let scrubRafPending=false;
+  let scrubLatestClientX=null;
+
+  timelineLane.addEventListener('pointerdown',(event)=>{{
+    if(event.isPrimary===false)return;
+    scrubPointerId=event.pointerId;
+    scrubStartClientX=event.clientX;
+    scrubHasDragged=false;
+    scrubWasPlayingBeforeDrag=!video.paused&&!video.ended;
+  }});
+
+  timelineLane.addEventListener('pointermove',(event)=>{{
+    if(scrubStartClientX===null||event.pointerId!==scrubPointerId)return;
+    if(!scrubHasDragged){{
+      if(Math.abs(event.clientX-scrubStartClientX)<SCRUB_DRAG_THRESHOLD_PX)return;
+      scrubHasDragged=true;
+      isScrubbing=true;
+      try{{timelineLane.setPointerCapture(scrubPointerId);}}catch(error){{}}
+    }}
+    event.preventDefault();
+    scrubLatestClientX=event.clientX;
+    if(scrubRafPending)return;
+    scrubRafPending=true;
+    requestAnimationFrame(()=>{{
+      scrubRafPending=false;
+      if(!isScrubbing)return;
+      seekToTimelineFraction(timelineFractionFromClientX(scrubLatestClientX),{{autoplay:false,announceGap:false}});
+    }});
+  }});
+
+  // Set the instant a real drag is detected (pointermove above), read
+  // and cleared by the capture-phase click guard below -- set here
+  // rather than read directly off scrubHasDragged from a second
+  // pointerup listener, since listener execution order would otherwise
+  // matter (this function already resets scrubHasDragged=false below
+  // before any second listener could see it).
+  let justDragged=false;
+
+  function endTimelineScrub(event){{
+    if(scrubStartClientX===null||(event&&event.pointerId!==scrubPointerId))return;
+    if(scrubHasDragged){{
+      justDragged=true;
+      // Always apply the exact release position synchronously -- never
+      // subject to the rAF throttle above, so the gesture's real
+      // endpoint is never silently dropped in favor of a stale frame.
+      // Resume playback only if it was already playing before the drag
+      // started -- a scrub-then-release must not silently start audio
+      // that wasn't already going.
+      seekToTimelineFraction(timelineFractionFromClientX(event.clientX),{{autoplay:scrubWasPlayingBeforeDrag,announceGap:true}});
+    }}
+    scrubPointerId=null;
+    scrubStartClientX=null;
+    scrubHasDragged=false;
+    isScrubbing=false;
+  }}
+  timelineLane.addEventListener('pointerup',endTimelineScrub);
+  timelineLane.addEventListener('pointercancel',endTimelineScrub);
+
+  // Click-to-seek on the bare ruler -- the exact pre-existing gesture,
+  // now routed through the same resolveScrubTarget() core the drag
+  // above uses. Capture phase + the justDragged guard above is what
+  // stops the browser's own trailing click (which always fires after
+  // pointerup, even after a real drag) from ALSO triggering here or
+  // re-triggering whichever segment/marker the drag happened to end on
+  // -- segment.addEventListener('click',...)/marker's own click stay
+  // completely unaffected for an ordinary (non-dragged) click, since
+  // capture-phase stopPropagation only ever fires when a drag actually
+  // just happened.
+  timelineLane.addEventListener('click',(event)=>{{
+    if(justDragged){{justDragged=false;event.stopPropagation();event.preventDefault();return;}}
+    if(event.target!==timelineLane)return;
+    seekToTimelineFraction(timelineFractionFromClientX(event.clientX),{{autoplay:true,announceGap:true}});
+  }},{{capture:true}});
+
+  async function renderCamera(seekTimestamp){{
+    debugLog(`[renderCamera] start cameraId=${{selectedCameraId}} seekTimestamp=${{seekTimestamp}}`);
+    const cameraId=selectedCameraId;
+    const [clips,events]=await Promise.all([ensureClipsLoaded(cameraId),ensureEventsLoaded(cameraId)]);
+    debugLog(`[renderCamera] clips loaded: ${{clips.length}}, events loaded: ${{events.length}}`);
+    if(cameraId!==selectedCameraId){{debugLog('[renderCamera] aborted: camera changed while loading');return}}  // camera changed again while this fetch was in flight
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    selectedClip=null;
+    playheadEl.hidden=true;
+    skipBackButton.disabled=true;
+    timelinePlayButton.disabled=true;
+    skipForwardButton.disabled=true;
+    downloadButton.disabled=true;
+    shareButton.disabled=true;
+    createClipButton.disabled=true;
+    placeholder.hidden=false;
+    // Genuine bug found 2026-09-15 (customer-reported: had to click the
+    // timeline before any recording became visible/accessible):
+    // renderClipList() below already populates #playback-clip-list with
+    // real data on every load, but the panel that actually contains it
+    // (#playback-clip-panel) starts `hidden` in the page's own markup
+    // and previously was only ever revealed by playClip() or the Browse
+    // button -- loadRecordingsForDate() (the date-picker path) already
+    // unconditionally reveals it; this default (just-opened-Playback)
+    // path must do the same, for the same reason.
+    clipPanel.hidden=false;
+    status.textContent=clips.length?'Select a recording to play.':'No recordings available yet.';
+    renderClipList(cameraId,clips);
+    debugLog('[renderCamera] renderClipList done');
+    const activeTile=cameraTiles.find(item=>item.dataset.cameraId===cameraId);
+    timelineLabel.textContent=activeTile?activeTile.textContent:'—';
+    currentClips=clips;
+    // dayString: the deep-linked moment's own local calendar date when
+    // one exists (so a deep link to an older event still shows that
+    // event's own day, not an empty "today" timeline), else today's --
+    // see renderTimeline()'s own docstring for why this is required now.
+    const dayString=seekTimestamp?localDateStringOf(playbackDate(seekTimestamp)):localDateStringOf(new Date());
+    renderTimeline(cameraId,clips,events,dayString);
+    debugLog('[renderCamera] renderTimeline done, entering seekTimestamp branch check');
+    // Deep-link landing: arrived here with a specific moment in mind
+    // (e.g. from the focused Live View's own recent-activity list) --
+    // always resolved via a fresh near= lookup against the database,
+    // never just the currently-loaded page of clips, so a deep link
+    // to a recording older than the initial page still lands
+    // correctly -- see _customer_recording_rows()'s own near=
+    // contract.
+    //
+    // No deep-link timestamp (the ordinary case: a customer just
+    // opened Playback) auto-loads the single most recent clip (clips
+    // is oldest-first, so the last entry is the newest) instead of
+    // leaving the player at a permanently black 0:00 until something
+    // is clicked.
+    if(initialEventId){{
+      // Root cause (2026-09-02): an event with its own real clip must
+      // never depend on a nearby *recording* existing -- see
+      // playEventClipDeepLink()'s own docstring. This branch never
+      // touches findClipNear()/the recordings catalog at all.
+      debugLog(`[checkpoint 1] initialEventId=${{initialEventId}} -- event-clip path, no recording lookup`);
+      await playEventClipDeepLink(cameraId,initialEventId);
+    }}else if(seekTimestamp){{
+      debugLog(`[checkpoint 1] seekTimestamp=${{seekTimestamp}} autoplayFromEvent=${{autoplayFromEvent}}`);
+      // Analytics-only event (no clip) or an ordinary timestamp deep
+      // link -- unchanged: look for the recording that actually
+      // covers/is nearest this moment, never widening the existing
+      // near= match threshold just to force a match.
+      //
+      // The server's near= contract is an unchanged naive-UTC string
+      // (see _customer_recording_rows()) -- always rebuilt from the
+      // one correctly-parsed playbackDate(seekTimestamp) rather than
+      // forwarding seekTimestamp itself, since that may now be an
+      // epoch-ms number (see initialTimestamp above) that the server
+      // route was never meant to parse directly.
+      const nearby=findClipNear(clips,seekTimestamp)||((await fetchClipsMetadata(cameraId,{{near:playbackDate(seekTimestamp).toISOString().replace('Z','')}}))||[])[0];
+      if(cameraId!==selectedCameraId){{debugLog('[checkpoint 2] aborted: camera changed while resolving nearby clip');return}}
+      debugLog(`[checkpoint 2] nearby=${{nearby?nearby.id:'null'}}${{nearby?(' start='+nearby.start+' end='+nearby.end):''}}`);
+      if(nearby){{
+        if(autoplayFromEvent){{
+          // Explicit signal set only by a real Events-row "Playback"
+          // click (see _customer_event_actions()) -- seek to that
+          // event's own offset inside the covering recording, then
+          // attempt playback. Ordinary Playback navigation and camera
+          // switching never set this flag, so they always take the
+          // select-only branch below, unchanged. Status text makes
+          // clear this is *recording* footage, not an event clip.
+          const offsetSeconds=(playbackDate(seekTimestamp).getTime()-playbackDate(nearby.start).getTime())/1000;
+          debugLog(`[checkpoint 3] computed offsetSeconds=${{offsetSeconds}}`);
+          if(Number.isFinite(offsetSeconds)&&offsetSeconds>=0){{
+            video.addEventListener('loadedmetadata',()=>{{
+              video.currentTime=offsetSeconds;
+              debugLog(`[checkpoint 6] loadedmetadata fired -- seeked to ${{offsetSeconds}}s, video.currentTime now=${{video.currentTime}}, duration=${{video.duration}}`);
+            }},{{once:true}});
+          }}else{{
+            debugLog(`[checkpoint 6] SKIPPED seek -- offsetSeconds not finite/non-negative`);
+          }}
+          debugLog(`[checkpoint 4] calling playClip(${{cameraId}}, ${{nearby.id}})`);
+          playClip(cameraId,nearby);
+          status.textContent='Recording footage near this event. Playing…';
+        }}else{{
+          selectedClip=nearby;
+          timelinePlayButton.disabled=false;
+          status.textContent='Recording ready. Press Play to begin.';
+        }}
+      }}
+      else{{status.textContent='No recording is available for this event.'}}
+    }}else if(clips.length){{
+      selectedClip=clips[clips.length-1];
+      timelinePlayButton.disabled=false;
+      status.textContent='Recording ready. Press Play or select a recording.';
+    }}
+  }}
+
+  async function playEventClipDeepLink(cameraId,eventId,autoplay=autoplayFromEvent){{
+    if(cameraId!==selectedCameraId)return;
+    await eventPlayer.start(cameraId,eventId,autoplay);
+  }}
+
+  skipBackButton.addEventListener('click',()=>{{
+    if(!video.currentSrc)return;
+    video.currentTime=Math.max(0,video.currentTime-10);
+  }});
+
+  skipForwardButton.addEventListener('click',()=>{{
+    if(!video.currentSrc)return;
+    const end=Number.isFinite(video.duration)?video.duration:video.currentTime+10;
+    video.currentTime=Math.min(end,video.currentTime+10);
+  }});
+
+  timelinePlayButton.addEventListener('click',()=>{{
+    if(!video.currentSrc){{
+      if(selectedClip)playClip(selectedCameraId,selectedClip);
+      return;
+    }}
+    if(video.paused){{
+      video.play().catch(error=>debugLog(`play() rejected: ${{error && error.name}}`));
+    }}else{{
+      video.pause();
+    }}
+  }});
+
+  function setPlayButtonState(isPlaying){{
+    timelinePlayButton.textContent=isPlaying?'⏸':'▶';
+    timelinePlayButton.title=isPlaying?'Pause':'Play';
+    timelinePlayButton.setAttribute('aria-label',isPlaying?'Pause':'Play');
+  }}
+
+  video.addEventListener('play',()=>{{
+    setPlayButtonState(true);
+  }});
+
+  video.addEventListener('pause',()=>{{
+    setPlayButtonState(false);
+  }});
+
+  video.addEventListener('ended',()=>{{
+    setPlayButtonState(false);
+    const next=_planNextChainedClip(currentClips,selectedClip);
+    if(next)playClip(selectedCameraId,next);
+  }});
+
+  downloadButton.addEventListener('click',()=>{{
+    if(!video.currentSrc||!selectedClip)return;
+    const link=document.createElement('a');
+    link.href=video.currentSrc;
+    link.download=selectedClip.name||'recording';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }});
+
+  shareButton.addEventListener('click',async()=>{{
+    if(!video.currentSrc||!selectedClip){{
+      if(typeof showToast==='function')showToast('Select a recording first.');
+      return;
+    }}
+
+    const url=video.currentSrc;
+    const title=selectedClip.name||'AnyAiCam recording';
+
+    // Native share first when the browser supports it.
+    if(navigator.share){{
+      try{{
+        await navigator.share({{title,url}});
+        return;
+      }}catch(error){{
+        if(error && error.name==='AbortError')return;
+        debugLog(`native share unavailable: ${{error.message||error}}`);
+      }}
+    }}
+
+    // Modern clipboard works only in a secure context in many browsers.
+    if(navigator.clipboard && window.isSecureContext){{
+      try{{
+        await navigator.clipboard.writeText(url);
+        if(typeof showToast==='function')showToast('Recording link copied.');
+        return;
+      }}catch(error){{
+        debugLog(`clipboard API failed: ${{error.message||error}}`);
+      }}
+    }}
+
+    // HTTP/local-network fallback for browsers where Clipboard API
+    // is blocked because the VMS is not being served over HTTPS.
+    const box=document.createElement('textarea');
+    box.value=url;
+    box.setAttribute('readonly','');
+    box.style.position='fixed';
+    box.style.left='-9999px';
+    box.style.top='0';
+
+    document.body.appendChild(box);
+    box.focus();
+    box.select();
+
+    let copied=false;
+    try{{
+      copied=document.execCommand('copy');
+    }}catch(error){{
+      copied=false;
+    }}
+
+    box.remove();
+
+    if(copied){{
+      if(typeof showToast==='function')showToast('Recording link copied.');
+      return;
+    }}
+
+    // Last-resort fallback: display the URL so it can be copied manually.
+    window.prompt('Copy this recording link:',url);
+  }});
+
+  createClipButton.addEventListener('click',async()=>{{
+    if(!selectedClip||!video.currentSrc)return;
+
+    const clipStart=playbackDate(selectedClip.start);
+    const clipEnd=playbackDate(selectedClip.end);
+
+    if(Number.isNaN(clipStart.getTime())||Number.isNaN(clipEnd.getTime())){{
+      if(typeof showToast==='function')showToast('Unable to determine recording time.');
+      return;
+    }}
+
+    const position=Math.max(0,Number(video.currentTime)||0);
+    const center=new Date(clipStart.getTime()+position*1000);
+
+    const start=new Date(
+      Math.max(
+        clipStart.getTime(),
+        center.getTime()-15000
+      )
+    );
+
+    const end=new Date(
+      Math.min(
+        clipEnd.getTime(),
+        center.getTime()+15000
+      )
+    );
+
+    if(end<=start){{
+      if(typeof showToast==='function')showToast('Not enough recording available for a clip.');
+      return;
+    }}
+
+    createClipButton.disabled=true;
+    createClipButton.textContent='Creating…';
+
+    try{{
+      const response=await fetch('/api/customer/clips',{{
+        method:'POST',
+        headers:{{'Content-Type':'application/json'}},
+        body:JSON.stringify({{
+          camera_id:selectedCameraId,
+          start_time:start.toISOString(),
+          end_time:end.toISOString()
+        }})
+      }});
+
+      const job=await response.json();
+
+      if(!response.ok){{
+        throw new Error(job.detail||job.message||'Could not create clip.');
+      }}
+
+      const jobId=job.id;
+
+      for(let attempt=0;attempt<120;attempt++){{
+        await new Promise(resolve=>setTimeout(resolve,1000));
+
+        const statusResponse=await fetch(
+          `/api/customer/clips/${{encodeURIComponent(jobId)}}`
+        );
+
+        const statusData=await statusResponse.json();
+
+        if(!statusResponse.ok){{
+          throw new Error(
+            statusData.detail||
+            statusData.message||
+            'Could not check clip status.'
+          );
+        }}
+
+        if(statusData.status==='complete'){{
+          createClipButton.textContent='Create clip';
+
+          if(statusData.url){{
+            const link=document.createElement('a');
+            link.href=statusData.url;
+            link.download=statusData.filename||'clip.mp4';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+          }}
+
+          if(typeof showToast==='function')showToast('Clip created.');
+          return;
+        }}
+
+        if(statusData.status==='error'){{
+          throw new Error(statusData.message||'Clip creation failed.');
+        }}
+      }}
+
+      throw new Error('Clip creation timed out.');
+
+    }}catch(error){{
+      if(typeof showToast==='function'){{
+        showToast(error.message||'Clip creation failed.');
+      }}
+      debugLog(`clip creation failed: ${{error.message||error}}`);
+    }}finally{{
+      createClipButton.disabled=false;
+      createClipButton.textContent='Create clip';
+    }}
+  }});
+
+  filterButtons.forEach(button=>{{
+    button.addEventListener('click',()=>{{
+      if(button.dataset.filter==='all'){{
+        activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
+      }}else if(activeFilters.has(button.dataset.filter)){{
+        activeFilters.delete(button.dataset.filter);
+      }}else{{
+        activeFilters.add(button.dataset.filter);
+      }}
+      filterButtons.forEach(item=>item.classList.toggle('active',item.dataset.filter==='all'?activeFilters.size===6:activeFilters.has(item.dataset.filter)));
+      // currentClips, not recordingsByCamera directly -- so toggling a
+      // filter while a date is selected re-renders that date's
+      // timeline instead of silently reverting to the default
+      // most-recent-page view. eventsForLocalDate() mirrors
+      // loadRecordingsForDate()'s own date-scoping of the event markers.
+      renderTimeline(selectedCameraId,currentClips,viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):(analyticsByCamera[selectedCameraId]||[]),viewingDate||localDateStringOf(new Date()));
+    }});
+  }});
+
+  dateInput.max=localDateStringOf(new Date());
+  renderAvailableDates(selectedCameraId).catch(error=>{{
+    debugLog(`available dates fetch failed: ${{error && error.message}}`);
+  }});
+
+  debugLog(`[boot] calling renderCamera(initialTimestamp=${{initialTimestamp}})`);
+  renderCamera(initialTimestamp).catch(error=>{{
+    debugLog(`[fatal] renderCamera() threw/rejected: ${{error && error.message ? error.message : error}}`);
+  }});
 }})();
 </script>'''
 
-    return page_shell("Playback", "playback", content, scripts)
+    return page_shell("Playback", "playback", content, '<script src="/static/event_media.js"></script>' + scripts)
 
 
 @app.get("/playback", response_class=HTMLResponse)
-
-
-
-
-
-
-
-
 def playback(request: Request) -> str:
 
 
@@ -137099,9 +143979,9 @@ def playback(request: Request) -> str:
 
     _customer_cameras = _customer_playback_cameras(request)
     if _customer_cameras is not None:
-        return _render_customer_playback(_customer_cameras)
+        return _render_customer_playback(_customer_cameras, request)
 
-    camera_numbers = list(range(1, CAMERA_COUNT + 1))
+    camera_numbers = list(get_camera_numbers())
 
 
 
@@ -141591,7 +148471,7 @@ def _phase6e_load(path: Path, default):
 
 def phase6e_operational_snapshot() -> dict:
     now = datetime.now()
-    total_cameras = max(1, CAMERA_COUNT)
+    total_cameras = max(1, get_camera_count())
     online_cameras = sum(
         1 for camera in camera_process_state.values()
         if camera.get("live") in {"online", "running", "healthy"}
@@ -146105,3 +152985,349 @@ def v111_camera_verification_page(request: Request):
     </script>
     """
     return page_shell("Camera verification", "settings", content, scripts)
+
+
+# AACO Phase 2 is deliberately registered after the existing customer VMS
+# helpers above.  Its web module is a thin command UI only; this binding is
+# the sole place it can reach Classic's existing, tenant-scoped services.
+from aaco_web import register_aaco_routes
+
+
+def _aaco_identity_provider(request: Request) -> dict | None:
+    # Local import, matching this file's own established convention
+    # (17 other call sites do the same) rather than a module-level
+    # import: every existing test that simulates a logged-in identity
+    # does `monkeypatch.setattr(partner_portal, "partner_identity", ...)`,
+    # which only takes effect on a fresh `from partner_portal import
+    # partner_identity` performed at call time -- a module-level import
+    # here would bind a stale reference before any such patch applies.
+    from partner_portal import partner_identity
+    return partner_identity(request)
+
+
+def _aaco_event_category(raw_event_type: object) -> str | None:
+    """The exact same raw-event-type -> filter-category bucketing the
+    Investigate/dashboard page's own client-side filterCategory() JS
+    already ships (see main.py's EVENT_COLORS/filterCategory near the
+    Investigate page markup) -- ported to Python so AACO's event_type
+    filter matches real stored values (e.g. "smart_motion", "plate",
+    "people_counting_in") the same way a customer clicking the existing
+    UI filter chips already does, instead of a narrower reimplementation
+    that would silently miss events the existing UI already finds."""
+    value = str(raw_event_type or "")
+    if value in {"motion", "smart_motion"}:
+        return "motion"
+    if value == "person":
+        return "person"
+    if value in {"car", "truck", "bus", "motorcycle", "bicycle", "vehicle"}:
+        return "vehicle"
+    if value in {"plate", "lpr"}:
+        return "lpr"
+    if value in {"people_counting_in", "people_counting_out", "people_counting"}:
+        return "people_counting"
+    if value == "intrusion":
+        return "intrusion"
+    return None
+
+
+class _ClassicAacoBoundary:
+    """Adapter from AACO's strict command schema to existing Classic VMS.
+
+    It returns presentation metadata/deep links only.  Live sessions and
+    playback media continue to be created and authorized by their established
+    Classic routes; an AACO event search never creates a clip or touches S3.
+    """
+
+    def __init__(self, request: Request):
+        self.request = request
+
+    def _camera(self, camera_token: str) -> dict | None:
+        # Phase-1's deterministic language adapter names cameras as
+        # camera-<number>.  Resolve that display token through Classic's
+        # customer-scoped camera list, never a request-supplied database id.
+        cameras = _customer_playback_cameras(self.request) or []
+        return self._find_camera(cameras, camera_token)
+
+    @staticmethod
+    def _find_camera(cameras: list[dict], camera_token: str) -> dict | None:
+        # "camera-name:" is checked first because it is itself a
+        # "camera-"-prefixed string -- checking the plain numeric prefix
+        # first would swallow every display-name token into
+        # int("name:front entrance"), which always raises and returns
+        # None before the name branch below is ever reached. Found via
+        # a real integration test exercising this against a seeded
+        # camera named "Front Entrance"; the pre-existing 32 AACO unit
+        # tests never caught this because they inject an independent
+        # fake VmsBoundary that never calls this method at all.
+        if camera_token.startswith("camera-name:"):
+            requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
+            return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
+        if camera_token.startswith("camera-"):
+            try:
+                number = int(camera_token.removeprefix("camera-"))
+            except ValueError:
+                return None
+            return next((camera for camera in cameras if camera.get("camera_number") == number), None)
+        return None
+
+    def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
+        # Reuse the established Live authorization helper, including its
+        # customer_viewer can_live permission, instead of inferring Live
+        # access from Playback access.
+        from live_view_page import _customer_live_cameras
+        from partner_db import connection
+        with connection() as db:
+            cameras = _customer_live_cameras(db, identity, "")
+        return self._find_camera(cameras, camera_token)
+
+    def authorized_camera(self, identity: dict, camera_id: str) -> dict | None:
+        # This common Phase-1 gate establishes that the camera belongs to
+        # this identity through at least one existing customer VMS surface.
+        # The operation methods below then apply their stricter, operation-
+        # specific Classic access rule (can_live versus can_playback).
+        return self._camera(camera_id) or self._live_camera(identity, camera_id)
+
+    def live_view(self, identity: dict, camera_id: str) -> dict:
+        camera = self._live_camera(identity, camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        # The destination independently enforces Classic's can_live check.
+        return {
+            "kind": "live",
+            "message": f"Opening authorized Live view for {_camera_display_label(camera)}.",
+            "href": f'/customer/cameras/{quote(str(camera["id"]), safe="")}/live',
+            "context": {"camera_id": camera_id},
+        }
+
+    def playback(self, identity: dict, camera_id: str, start: datetime, end: datetime) -> dict:
+        # Playback continues to require Classic's can_playback scope even
+        # when the caller separately has Live permission for the camera.
+        camera = self._camera(camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        # Existing catalog lookup is metadata-only and bounded.  AACO never
+        # calls /api/customer/clips, never exports, and never presigns media.
+        recordings = _customer_recording_rows(camera["id"], limit=10, near=start.isoformat())
+        timestamp = start.isoformat()
+        message = (
+            f"Found {len(recordings)} existing recording metadata result(s) near {timestamp}. "
+            "Open Classic Playback to select authorized media."
+            if recordings else
+            f"Playback media is currently unavailable near {timestamp}. Classic Playback remains the authorized destination when recordings are available."
+        )
+        return {
+            "kind": "playback",
+            "message": message,
+            "href": f'/playback?{urlencode({"camera": camera["id"], "t": timestamp})}',
+            "context": {"camera_id": camera_id, "playback_at": timestamp},
+        }
+
+    def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> dict:
+        normalized_type = _aaco_event_category(event_type) if event_type else None
+        # Reuses Classic's own customer-scoped event representation.  The
+        # bounded response is filtered before presentation, with no media
+        # lookup and no creation/export side effect.
+        candidates = _customer_detection_events(self.request) or []
+        matches = []
+        for event in candidates:
+            if normalized_type and _aaco_event_category(event.get("event_type")) != normalized_type:
+                continue
+            try:
+                occurred = datetime.fromisoformat(str(event.get("timestamp")))
+            except (TypeError, ValueError):
+                continue
+            if start <= occurred <= end:
+                matches.append({
+                    "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
+                    "timestamp": str(event.get("timestamp")),
+                    "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
+                    "context": {"camera_id": f'camera-{event.get("camera")}', "event_at": str(event.get("timestamp"))},
+                })
+            if len(matches) >= 100:
+                break
+        return {"kind": "events", "message": f"{len(matches)} authorized event result(s).", "events": matches, "context": matches[0]["context"] if matches else None}
+
+    def previous_event(self, identity: dict, camera_id: str, before: datetime) -> dict:
+        camera = self._camera(camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        candidates = _customer_detection_events(self.request) or []
+        prior = []
+        for event in candidates:
+            if event.get("camera_id") != camera["id"]:
+                continue
+            try:
+                occurred = datetime.fromisoformat(str(event.get("timestamp")))
+            except (TypeError, ValueError):
+                continue
+            if occurred < before:
+                prior.append((occurred, event))
+        if not prior:
+            return {"kind": "events", "message": "No earlier authorized event is available for this camera.", "events": []}
+        occurred, event = max(prior, key=lambda item: item[0])
+        context = {"camera_id": camera_id, "event_at": occurred.isoformat()}
+        return {
+            "kind": "events",
+            "message": "Previous authorized event.",
+            "events": [{
+                "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
+                "timestamp": str(event.get("timestamp")),
+                "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
+                "context": context,
+            }],
+            "context": context,
+        }
+
+    def camera_status(self, identity: dict) -> dict:
+        # Reuses the real, already customer-scoped /api/cameras/status
+        # route function (camera_status(request) at module scope -- not
+        # to be confused with this method of the same name) rather than
+        # a per-camera lookup: that function already excludes
+        # placeholder cameras (camera_number IS NULL) the same way
+        # _customer_playback_cameras()/_customer_live_cameras() do, so
+        # AACO's "which cameras are offline" answer matches Classic's
+        # own dashboard exactly instead of maintaining a second,
+        # independently-scoped status read.
+        by_number = {camera.get("camera_number"): camera for camera in (_customer_playback_cameras(self.request) or [])}
+        status = camera_status(self.request)
+        rows = []
+        for entry in status.get("cameras", []):
+            camera = by_number.get(entry.get("camera"))
+            label = _camera_display_label(camera) if camera else f'Camera {entry.get("camera")}'
+            rows.append({"label": label, "state": "online" if entry.get("online") else "offline"})
+        return {"kind": "status", "message": f"Status requested for {len(rows)} authorized camera(s).", "cameras": rows}
+
+    @staticmethod
+    def _door_matches(doors: list[dict], door_token: str) -> list[dict]:
+        # Deliberately a separate lookup from _find_camera() above:
+        # that method returns the FIRST match only (correct for Live/
+        # Playback, where two identically-named cameras just means the
+        # first one wins), but an unlock command must never silently
+        # pick one of two doors sharing a display name -- it must ask
+        # which one, so this returns every match and lets unlock_door()
+        # decide.
+        if door_token.startswith("camera-name:"):
+            requested = " ".join(door_token.removeprefix("camera-name:").lower().split())
+            return [door for door in doors if " ".join(str(door.get("name") or "").lower().split()) == requested]
+        if door_token.startswith("camera-"):
+            try:
+                number = int(door_token.removeprefix("camera-"))
+            except ValueError:
+                return []
+            return [door for door in doors if door.get("camera_number") == number]
+        return []
+
+    def unlock_door(self, identity: dict, door_id: str) -> dict:
+        """AACO's own path to the exact same authorization/execution/
+        audit code the manual "Unlock Door" button uses
+        (door_access.py) -- never a second, parallel relay-control
+        mechanism, and never a raw relay call of its own. Every attempt
+        -- denied, failed, or successful -- is audited via the same
+        record_door_access_event() the manual button writes to,
+        distinguished only by trigger_type='aaco' instead of 'manual'.
+
+        Deliberately fails closed the same generic way as live_view()/
+        playback() above (raising PermissionError, which
+        aaco_web.py's own command route turns into a uniform 403
+        "Camera is unavailable.") for every kind of failure -- wrong
+        tenant, nonexistent door, missing can_unlock grant, a door with
+        no relay configured, a relay that raised, or a relay the
+        provider itself suppressed (e.g. cooldown). This never reveals
+        which of those actually happened to the caller, matching this
+        codebase's own established no-oracle convention for
+        authorization failures -- the true reason is always the one
+        thing the audit row records, never the customer-facing message.
+        """
+        import door_access
+        import relay_control
+        from aaco import Clarification
+        from partner_db import connection
+
+        with connection() as db:
+            doors = door_access.customer_door_cameras(db, identity["customer_id"])
+        matches = self._door_matches(doors, door_id)
+        if len(matches) > 1:
+            return Clarification("More than one authorized door matches that name -- try a camera number instead.")
+        if not matches:
+            raise PermissionError("Door is unavailable.")
+        door = matches[0]
+
+        now = datetime.now()
+        try:
+            with connection() as db:
+                camera, user_id = door_access._authorized_door_camera(db, door["id"], identity)
+        except HTTPException as error:
+            if error.status_code != 404 or "not configured for door access" in error.detail:
+                with connection() as audit_db:
+                    door_access.record_door_access_event(
+                        audit_db, customer_id=identity["customer_id"], camera_id=door["id"],
+                        door_name="", relay_channel=None, trigger_type="aaco",
+                        actor_user_id=None, actor_email=identity["email"],
+                        authorization_result="denied" if error.status_code == 403 else "no_door",
+                        relay_result="skipped", success=False, error=error.detail, now=now,
+                    )
+            raise PermissionError("Door is unavailable.") from error
+
+        request_obj = relay_control.RelayRequest(
+            channel=camera["door_relay_channel"],
+            pulse_ms=camera["door_relay_pulse_ms"] or relay_control.DEFAULT_PULSE_MS,
+            reason=f"aaco_unlock:{camera['id']}",
+            dry_run=False,
+            requested_by=identity["email"],
+        )
+        try:
+            result = relay_control.get_provider().trigger(request_obj)
+        except Exception as error:
+            with connection() as audit_db:
+                door_access.record_door_access_event(
+                    audit_db, customer_id=identity["customer_id"], camera_id=camera["id"], door_name=camera["name"],
+                    relay_channel=camera["door_relay_channel"], trigger_type="aaco",
+                    actor_user_id=user_id, actor_email=identity["email"],
+                    authorization_result="authorized", relay_result="failed", success=False,
+                    error=str(error), now=now,
+                )
+            raise PermissionError("The door could not be unlocked.") from error
+
+        relay_result = "activated" if result.activated else ("suppressed" if result.suppressed_reason else "failed")
+        with connection() as audit_db:
+            door_access.record_door_access_event(
+                audit_db, customer_id=identity["customer_id"], camera_id=camera["id"], door_name=camera["name"],
+                relay_channel=camera["door_relay_channel"], trigger_type="aaco",
+                actor_user_id=user_id, actor_email=identity["email"],
+                authorization_result="authorized", relay_result=relay_result, success=result.activated,
+                error=result.suppressed_reason, now=now,
+            )
+        if not result.activated:
+            raise PermissionError("The door could not be unlocked.")
+
+        # result.activated only ever describes a timed relay pulse
+        # (relay_control.RelayRequest.pulse_ms, DEFAULT_PULSE_MS if the
+        # door has none configured) -- the same hardware behavior the
+        # manual button triggers, which relocks itself once the pulse
+        # ends. AACO never holds a door open and never issues a second,
+        # separate relock action.
+        return {
+            "kind": "door_unlock",
+            "message": f"{camera['name']} unlocked.",
+            "context": {"camera_id": door_id},
+        }
+
+
+def _aaco_language_adapter():
+    # NaturalAacoLanguageAdapter(None) (local inference disabled, the
+    # default -- ANYAICAM_AACO_LOCAL_LLM_ENABLED is unset everywhere
+    # today) always falls straight through to its own internal
+    # DeterministicLanguageAdapter, so wiring this in unconditionally
+    # is a no-op today and the only place a future local-inference
+    # rollout needs to touch to turn on.
+    import aaco_llm
+    return aaco_llm.NaturalAacoLanguageAdapter(aaco_llm.default_interpreter())
+
+
+register_aaco_routes(
+    app,
+    page_shell,
+    identity_provider=_aaco_identity_provider,
+    vms_factory=lambda request: _ClassicAacoBoundary(request),
+    language_adapter_factory=_aaco_language_adapter,
+)
