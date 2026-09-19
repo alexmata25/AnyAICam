@@ -150,7 +150,7 @@ def test_aaco_mic_handles_permission_denied_and_no_speech_without_breaking_typin
     assert "event.error==='not-allowed'" in body
     assert "Microphone permission was denied. Type your command instead." in body
     assert "event.error==='no-speech'" in body
-    assert "check that the correct microphone is selected and unmuted" in body.lower()
+    assert "No audio detected. Check that your microphone is unmuted and the correct input device is selected." in body
     # The typed-command <form> and its own submit listener exist
     # completely independently of whether voice support/permission
     # succeeds -- confirmed by their both being present regardless.

@@ -221,7 +221,7 @@ return;
 }}
 stopListening();
 if(event.error==='not-allowed'||event.error==='permission-denied'){{status.textContent='Microphone permission was denied. Type your command instead.'}}
-else if(event.error==='no-speech'){{status.textContent='No speech detected. Check that the correct microphone is selected and unmuted in your system sound settings, then try again or type your command.'}}
+else if(event.error==='no-speech'){{status.textContent='No audio detected. Check that your microphone is unmuted and the correct input device is selected.'}}
 else{{status.textContent='Voice input is unavailable right now. Type your command instead.'}}
 }};
 recognition.onend=function(){{if(!retrying)stopListening()}};

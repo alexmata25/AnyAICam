@@ -56,13 +56,16 @@ before it registered any usable audio. That is consistent with either:
 2. Exactly one silent, automatic retry on a *first* `no-speech` error,
    before reporting failure -- directly covers "the window ended before
    the user started talking."
-3. If `no-speech` recurs after that retry, the final message now says so
-   plainly and points at the likely cause: *"Check that the correct
-   microphone is selected and unmuted in your system sound settings."*
+3. If `no-speech` recurs after that retry, a small, permanent,
+   customer-friendly status message replaces it (not raw diagnostics):
+   *"No audio detected. Check that your microphone is unmuted and the
+   correct input device is selected."*
 
 The temporary diagnostics block (`show_voice_diagnostics`) that produced
 the report above has been removed from the shipped customer UI now that
-its purpose -- identifying the exact failure -- is done.
+its purpose -- identifying the exact failure -- is done. Nothing
+resembling it is shown by default; the one-line message above is the
+only user-facing trace of this investigation left in the product.
 
 ## What was deliberately not done
 
