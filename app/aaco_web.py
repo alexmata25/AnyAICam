@@ -70,7 +70,7 @@ return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',header
 # application, not one per embedding page.
 
 
-def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placeholder: str = "What would you like to see?", intro: str = "") -> str:
+def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placeholder: str = "What would you like to see?", intro: str = "", show_voice_diagnostics: bool = True) -> str:
     """A compact, embeddable AACO command box: one text input, one
     submit button, one status line, and a tap-to-record microphone
     control -- everything a page needs to let a customer speak or type
@@ -84,6 +84,14 @@ def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placehold
     why it stays out of this shared helper). id_prefix keeps this
     embeddable more than once per page (or alongside the standalone
     workspace's own element ids) without a collision.
+
+    show_voice_diagnostics (default True, TEMPORARY): renders a small
+    always-visible <pre> block showing speech-API support, mic button
+    state, whether recognition actually started, the last error code,
+    and any transcript received -- see its own inline comment below
+    for why. Set False once the real-browser voice failure this was
+    added to diagnose is confirmed and fixed, and delete this
+    parameter and the block it controls in the same pass.
 
     Voice input, exactly as narrow as the requirement asks: the
     browser's own SpeechRecognition API (feature-detected; the button
@@ -101,9 +109,31 @@ def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placehold
     SpeechRecognition at all are all handled explicitly (see onerror/
     the feature-detection branch below) and always leave typing fully
     available -- voice is additive, never a replacement path."""
-    input_id, mic_id, status_id, form_id = (
-        f"{id_prefix}-command", f"{id_prefix}-mic", f"{id_prefix}-status", f"{id_prefix}-form",
+    input_id, mic_id, status_id, form_id, diag_id = (
+        f"{id_prefix}-command", f"{id_prefix}-mic", f"{id_prefix}-status", f"{id_prefix}-form", f"{id_prefix}-voice-diag",
     )
+    # TEMPORARY (2026-09-19): a real staging browser test found typed
+    # AACO commands work but voice does not, with no visibility into
+    # which of window.SpeechRecognition/webkitSpeechRecognition,
+    # microphone permission, onstart, onresult, or onerror is the
+    # actual failure point. This diagnostics block makes every one of
+    # those five states visible directly in the page -- no devtools
+    # needed -- so the next real browser test identifies the exact
+    # failure instead of another "voice doesn't work" report with
+    # nothing to act on. Exposes only booleans, a short error-code
+    # enum, and the customer's own just-spoken transcript (already
+    # destined for the same input box regardless) -- no cookie,
+    # token, camera id, or other backend/customer detail of any kind.
+    # Remove this block (and show_voice_diagnostics) once the root
+    # cause is confirmed and fixed.
+    diagnostics_html = f"""
+<pre id="{diag_id}" class="aaco-muted" style="margin-top:8px;padding:8px;border:1px dashed var(--line,#444);border-radius:8px;font-size:11px;white-space:pre-line">AACO voice diagnostics (temporary)
+Speech API supported: checking…
+Mic button: checking…
+Listening started: not yet
+Last error: none
+Transcript received: none</pre>
+""" if show_voice_diagnostics else ""
     return f"""
 <style>
 .aaco-mic-listening{{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}}
@@ -117,11 +147,21 @@ def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placehold
 <button class="action-button" type="submit">Ask AACO</button>
 </form>
 <p id="{status_id}" class="aaco-muted" role="status" aria-live="polite" style="margin-top:6px"></p>
-</div>
+{diagnostics_html}</div>
 <script>{_AACO_CLIENT_CORE_JS}
 (function(){{
-var form=document.getElementById({form_id!r}),input=document.getElementById({input_id!r}),status=document.getElementById({status_id!r}),micButton=document.getElementById({mic_id!r});
+var form=document.getElementById({form_id!r}),input=document.getElementById({input_id!r}),status=document.getElementById({status_id!r}),micButton=document.getElementById({mic_id!r}),diag=document.getElementById({diag_id!r});
 if(!form)return;
+var diagState={{supported:null,micEnabled:false,listening:false,lastError:'none',transcript:'none'}};
+function renderDiag(){{
+if(!diag)return;
+diag.textContent='AACO voice diagnostics (temporary)\\n'+
+'Speech API supported: '+(diagState.supported===null?'checking…':(diagState.supported?'yes':'no'))+'\\n'+
+'Mic button: '+(diagState.micEnabled?'enabled':'disabled')+'\\n'+
+'Listening started: '+(diagState.listening?'yes':'not yet')+'\\n'+
+'Last error: '+diagState.lastError+'\\n'+
+'Transcript received: '+diagState.transcript;
+}}
 form.addEventListener('submit',function(event){{
 event.preventDefault();
 var text=input.value.trim();
@@ -143,10 +183,14 @@ status.textContent=error.detail||'AACO could not complete that command.';
 // listener above via form.requestSubmit(), never a parallel call to
 // window.aacoSubmitCommand of its own.
 var SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition;
+diagState.supported=!!SpeechRecognitionCtor;
+renderDiag();
 if(micButton&&SpeechRecognitionCtor){{
 micButton.disabled=false;
 micButton.title='Press to speak a command';
 micButton.setAttribute('aria-label','Press to speak a command');
+diagState.micEnabled=true;
+renderDiag();
 var recognition=null,listening=false;
 function stopListening(){{
 listening=false;
@@ -156,13 +200,23 @@ if(recognition){{try{{recognition.stop()}}catch(e){{}}}}
 }}
 micButton.addEventListener('click',function(){{
 if(listening){{stopListening();return}}
-try{{recognition=new SpeechRecognitionCtor()}}catch(e){{status.textContent='Voice input is unavailable right now. Type your command instead.';return}}
+diagState.lastError='none';
+diagState.transcript='none';
+diagState.listening=false;
+renderDiag();
+try{{recognition=new SpeechRecognitionCtor()}}catch(e){{diagState.lastError='constructor: '+e.message;renderDiag();status.textContent='Voice input is unavailable right now. Type your command instead.';return}}
 recognition.lang=navigator.language||'en-US';
 recognition.interimResults=false;
 recognition.maxAlternatives=1;
+recognition.onstart=function(){{
+diagState.listening=true;
+renderDiag();
+}};
 recognition.onresult=function(event){{
 var alt=event.results&&event.results[0]&&event.results[0][0];
 var transcript=alt&&alt.transcript;
+diagState.transcript=transcript||'(empty result)';
+renderDiag();
 stopListening();
 if(!transcript){{status.textContent='Did not catch that -- try again or type your command.';return}}
 input.value=transcript;
@@ -170,17 +224,18 @@ status.textContent='Heard: “'+transcript+'” — sending to AACO…';
 if(typeof form.requestSubmit==='function'){{form.requestSubmit()}}else{{form.dispatchEvent(new Event('submit',{{cancelable:true}}))}}
 }};
 recognition.onerror=function(event){{
+diagState.lastError=event.error||'unknown';
+renderDiag();
 stopListening();
 if(event.error==='not-allowed'||event.error==='permission-denied'){{status.textContent='Microphone permission was denied. Type your command instead.'}}
 else if(event.error==='no-speech'){{status.textContent='No speech detected. Try again or type your command.'}}
 else{{status.textContent='Voice input is unavailable right now. Type your command instead.'}}
 }};
 recognition.onend=function(){{stopListening()}};
-listening=true;
 micButton.classList.add('aaco-mic-listening');
 micButton.setAttribute('aria-pressed','true');
 status.textContent='Listening…';
-try{{recognition.start()}}catch(e){{stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
+try{{recognition.start()}}catch(e){{diagState.lastError='start(): '+e.message;renderDiag();stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
 }});
 }}
 }})();

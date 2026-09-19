@@ -177,6 +177,97 @@ def test_aaco_mic_never_touches_getusermedia_or_mediarecorder_directly(client):
     assert "MediaRecorder" not in panel_script
 
 
+# --------------------------------------------------- temporary voice diagnostics
+# (2026-09-19: a real browser test found typed AACO works, voice does not,
+# with no visibility into which step failed. These tests cover the
+# diagnostic instrumentation added to find out -- remove alongside it
+# once the root cause is confirmed and fixed.)
+
+
+def test_voice_diagnostics_block_renders_by_default(client):
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert '<pre id="aaco-live-voice-diag"' in body
+    assert "Speech API supported:" in body
+    assert "Mic button:" in body
+    assert "Listening started:" in body
+    assert "Last error:" in body
+    assert "Transcript received:" in body
+
+
+def test_voice_diagnostics_can_be_turned_off_without_touching_the_working_js():
+    """The generator itself supports disabling the visible block (for
+    when this is removed later or embedded somewhere that shouldn't
+    show it) -- the underlying voice logic is completely unaffected
+    either way, since the diagnostics only ever read state, never
+    drive behavior."""
+    from aaco_web import render_aaco_command_panel
+    panel_on = render_aaco_command_panel(id_prefix="aaco-x", on_result_js_fn="f", show_voice_diagnostics=True)
+    panel_off = render_aaco_command_panel(id_prefix="aaco-x", on_result_js_fn="f", show_voice_diagnostics=False)
+    assert '<pre id="aaco-x-voice-diag"' in panel_on
+    assert '<pre id="aaco-x-voice-diag"' not in panel_off
+    # renderDiag()'s own null-check makes this a safe no-op when the
+    # element doesn't exist -- confirmed present in both variants.
+    assert "if(!diag)return" in panel_on and "if(!diag)return" in panel_off
+
+
+def test_voice_diagnostics_reports_speech_api_support_immediately(client):
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "diagState.supported=!!SpeechRecognitionCtor" in body
+    assert "renderDiag();" in body
+
+
+def test_voice_diagnostics_tracks_recognition_onstart_which_was_previously_never_wired(client):
+    """Real gap found while investigating the report: onstart was never
+    handled before this pass, so there was no way to distinguish
+    "recognition.start() was called but the browser never actually
+    began listening" from every other failure mode. Now wired
+    specifically to update the diagnostic state."""
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "recognition.onstart=function()" in body
+    assert "diagState.listening=true" in body
+
+
+def test_voice_diagnostics_captures_the_real_error_code_from_onerror(client):
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "diagState.lastError=event.error||'unknown'" in body
+    # Both the constructor call and recognition.start() are wrapped so a
+    # synchronous throw is captured too -- not just the async onerror
+    # event -- since a real failure could surface either way.
+    assert "diagState.lastError='constructor: '" in body
+    assert "diagState.lastError='start(): '" in body
+
+
+def test_voice_diagnostics_captures_the_transcript_on_a_result(client):
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "diagState.transcript=transcript||'(empty result)'" in body
+
+
+def test_voice_diagnostics_never_exposes_a_secret(client):
+    """Only booleans, a short error-code string, and the customer's own
+    just-spoken transcript (already destined for the same visible input
+    box regardless) ever populate the diagnostics block -- no cookie,
+    CSRF token, session id, or camera/customer identifier is read into
+    it anywhere in the generated script."""
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    diag_script_start = body.index("var diagState=")
+    diag_script_end = body.index("})();", diag_script_start)
+    diag_scope = body[diag_script_start:diag_script_end]
+    for forbidden in ("document.cookie", "csrf", "session_id", "customer_id"):
+        assert forbidden not in diag_scope.lower()
+
+
 def test_aaco_panel_makes_no_backend_call_on_page_load(client):
     """The fetch to /api/aaco/command only ever happens inside the
     form's own submit handler -- confirmed structurally: the string
