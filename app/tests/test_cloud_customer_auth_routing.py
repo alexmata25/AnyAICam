@@ -322,5 +322,78 @@ def test_runtime_role_reads_cloud_from_environment(monkeypatch):
 def test_cloud_customer_nav_path_prefixes_defined_and_matches_the_customer_nav():
     assert set(main.CLOUD_CUSTOMER_NAV_PATH_PREFIXES) == {
         "/dashboard", "/playback", "/events", "/alerts",
-        "/investigate", "/subscription-portal",
+        "/investigate", "/subscription-portal", "/aaco",
     }
+
+
+# =============================================================== /aaco: the same bug found again, live, 2026-09-19
+
+def test_aaco_unauthenticated_cloud_browser_visit_lands_on_customer_login(http_client, monkeypatch):
+    """Reproduces the exact live report: a real browser navigating to
+    https://portal-staging.anyaicam.com/aaco while unauthenticated
+    landed on "Local emergency recovery sign-in" instead of the real
+    customer sign-in page. /aaco is a bare, cloud-only, customer-facing
+    nav path -- the identical shape as every path in
+    PREVIOUSLY_BROKEN_CUSTOMER_PATHS above -- that was simply never
+    added to CLOUD_CUSTOMER_NAV_PATH_PREFIXES when app/aaco_web.py's
+    routes were built. aaco_web.py's own _require_customer() was never
+    the bug; it already correctly requires a customer session on both
+    /aaco and /api/aaco/command regardless of this fix."""
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    response = http_client.get("/aaco")
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith("/customer-login.html?next="), location
+    assert "next=%2Faaco" in location or "next=/aaco" in location
+
+
+def test_aaco_edge_role_still_uses_local_recovery_login(http_client, monkeypatch):
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
+    response = http_client.get("/aaco")
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith("/login?next="), location
+    assert "customer-login" not in location
+
+
+def test_aaco_command_endpoint_still_returns_a_plain_401_not_a_redirect(http_client, monkeypatch):
+    """/api/aaco/command is an API route, not a browser page -- this fix
+    only concerns which HTML login page a browser GET is redirected to.
+    aaco_web.py's own _require_customer() 403 is what actually gates
+    this route (see test_aaco_web.py); confirms this fix left the API
+    behavior completely alone."""
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    response = http_client.post("/api/aaco/command", json={"command": "Show Camera 1"})
+    assert response.status_code == 401
+
+
+def test_aaco_after_real_customer_login_reaches_the_workspace_not_the_login_page(http_client, db_path, monkeypatch):
+    """The full previously-broken flow, now fixed, exactly the way
+    test_next_round_trips_through_a_real_customer_login_post above
+    proves it for the original set of paths: unauthenticated /aaco ->
+    /customer-login.html?next=/aaco -> a real POST /api/partner-login
+    -> the browser's next request to /aaco (now carrying the real
+    session cookie the login response set) succeeds, never falling
+    back to /login."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    _seed_customer(conn, email="aaco-owner@example.test", password="a genuinely long passphrase")
+    conn.close()
+
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    redirect = http_client.get("/aaco")
+    assert redirect.status_code == 303
+    assert redirect.headers["location"].startswith("/customer-login.html?next=")
+
+    login_response = http_client.post(
+        "/api/partner-login",
+        json={"email": "aaco-owner@example.test", "password": "a genuinely long passphrase", "customer_only": True, "next": "/aaco"},
+        headers=_csrf_headers(http_client),
+    )
+    assert login_response.status_code in (200, 303)
+
+    workspace = http_client.get("/aaco")
+    assert workspace.status_code == 200
+    assert "Local emergency recovery sign-in" not in workspace.text
+    assert "AACO" in workspace.text

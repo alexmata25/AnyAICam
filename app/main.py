@@ -40777,6 +40777,19 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     "/alerts",
     "/investigate",
     "/subscription-portal",
+    # /aaco (app/aaco_web.py) is the same shape bug as every other entry
+    # above: a bare, cloud-only, customer-facing nav path that
+    # authentication_middleware had no way to distinguish from an
+    # admin/partner/legacy path, so an unauthenticated browser hit the
+    # local-emergency-recovery /login instead of the real customer
+    # sign-in page. Confirmed live on staging (2026-09-19): a real
+    # browser navigating to https://portal-staging.anyaicam.com/aaco
+    # landed on "Local emergency recovery sign-in", not
+    # /customer-login.html. aaco_web.py's own _require_customer() was
+    # never the bug -- it correctly requires a customer session either
+    # way -- this only fixes which login PAGE an unauthenticated
+    # browser is sent to first.
+    "/aaco",
 )
 
 
