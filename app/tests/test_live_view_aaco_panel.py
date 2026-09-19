@@ -101,20 +101,80 @@ def test_aaco_panel_reuses_the_shared_client_helper_not_a_second_implementation(
     assert "aacoLiveHandleResult" in response.text
 
 
-def test_aaco_panel_has_a_disabled_microphone_placeholder(client):
+def test_aaco_mic_button_starts_disabled_with_an_unsupported_tooltip(client):
+    """The button's own initial HTML is always safe-by-default --
+    disabled with an explanatory tooltip -- before any feature
+    detection JS has even run, so a browser that never executes the
+    script (or one that lacks SpeechRecognition) never shows a mic
+    that looks clickable but silently does nothing."""
     response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     assert (
-        '<button type="button" class="camera-tool aaco-mic-placeholder" id="aaco-live-mic" '
-        'title="Voice command (coming soon)" aria-label="Voice command, coming soon" disabled>'
+        '<button type="button" class="camera-tool aaco-mic-button" id="aaco-live-mic" '
+        'title="Voice commands are not supported in this browser" '
+        'aria-label="Voice commands are not supported in this browser" aria-pressed="false" disabled>'
     ) in response.text
-    # This page's separate, already-existing talk-down mic feature is a
-    # real getUserMedia()/MediaRecorder push-to-talk control (unrelated
-    # to AACO) -- so those strings legitimately exist elsewhere on this
-    # page. What must NOT exist is any reference to the AACO
-    # placeholder's own id inside an event-wiring call.
-    assert "getElementById('aaco-live-mic')" not in response.text
-    assert "aaco-live-mic').addEventListener" not in response.text
+
+
+def test_aaco_mic_is_feature_detected_and_enabled_only_when_supported(client):
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "window.SpeechRecognition||window.webkitSpeechRecognition" in body
+    # The button is only ever re-enabled inside the feature-detected
+    # branch -- never unconditionally.
+    assert "if(micButton&&SpeechRecognitionCtor){" in body
+    assert "micButton.disabled=false" in body
+
+
+def test_aaco_mic_recognized_speech_goes_through_the_same_form_submit_never_a_second_aaco_call(client):
+    """The one and only invocation of window.aacoSubmitCommand in this
+    panel is inside the form's own 'submit' listener -- confirmed by
+    counting occurrences. Voice recognition writes into the existing
+    input and calls form.requestSubmit(), which re-enters that exact
+    same listener; it never calls window.aacoSubmitCommand a second
+    time on its own, which would be a real second, undisciplined path
+    to AACO."""
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert body.count("window.aacoSubmitCommand(text") == 1
+    assert "form.requestSubmit()" in body
+    assert "input.value=transcript" in body
+
+
+def test_aaco_mic_handles_permission_denied_and_no_speech_without_breaking_typing(client):
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    assert "event.error==='not-allowed'" in body
+    assert "Microphone permission was denied. Type your command instead." in body
+    assert "event.error==='no-speech'" in body
+    assert "No speech detected. Try again or type your command." in body
+    # The typed-command <form> and its own submit listener exist
+    # completely independently of whether voice support/permission
+    # succeeds -- confirmed by their both being present regardless.
+    assert 'id="aaco-live-form"' in body
+    assert "form.addEventListener('submit'" in body
+
+
+def test_aaco_mic_never_touches_getusermedia_or_mediarecorder_directly(client):
+    """SpeechRecognition performs its own microphone capture inside the
+    browser -- this page's own code never calls getUserMedia() or
+    MediaRecorder itself, unlike this same page's separate, unrelated
+    talk-down feature (real push-to-talk camera audio), which
+    legitimately does use those APIs elsewhere on this page. The
+    assertion is scoped to the AACO panel's own script block so the
+    talk-down feature's real, legitimate use of those APIs elsewhere
+    on the page can never make this test pass by accident."""
+    response = client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert response.status_code == 200
+    body = response.text
+    panel_script_start = body.index("data-aaco-embed=\"aaco-live\"")
+    panel_script_end = body.index("</script>", panel_script_start) + len("</script>")
+    panel_script = body[panel_script_start:panel_script_end]
+    assert "getUserMedia" not in panel_script
+    assert "MediaRecorder" not in panel_script
 
 
 def test_aaco_panel_makes_no_backend_call_on_page_load(client):

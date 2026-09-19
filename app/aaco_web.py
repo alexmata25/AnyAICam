@@ -72,39 +72,55 @@ return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',header
 
 def render_aaco_command_panel(*, id_prefix: str, on_result_js_fn: str, placeholder: str = "What would you like to see?", intro: str = "") -> str:
     """A compact, embeddable AACO command box: one text input, one
-    submit button, one status line, and a disabled placeholder for a
-    future microphone/push-to-talk control -- everything a page needs
-    to let a customer type an AACO command without writing its own
-    fetch/CSRF/error-handling plumbing (that part lives once, in
-    _AACO_CLIENT_CORE_JS above). The embedding page supplies only
-    on_result_js_fn: the name of a JS function IT defines, called with
-    the parsed response body on success (this module never assumes
-    what a page should do with a "live"/"playback"/"events"/
-    "door_unlock"/"status" result -- that is legitimately page-specific
-    presentation, not AACO logic, which is why it stays out of this
-    shared helper). id_prefix keeps this embeddable more than once per
-    page (or alongside the standalone workspace's own element ids)
-    without a collision.
+    submit button, one status line, and a tap-to-record microphone
+    control -- everything a page needs to let a customer speak or type
+    an AACO command without writing its own fetch/CSRF/error-handling
+    plumbing (that part lives once, in _AACO_CLIENT_CORE_JS above). The
+    embedding page supplies only on_result_js_fn: the name of a JS
+    function IT defines, called with the parsed response body on
+    success (this module never assumes what a page should do with a
+    "live"/"playback"/"events"/"door_unlock"/"status" result -- that is
+    legitimately page-specific presentation, not AACO logic, which is
+    why it stays out of this shared helper). id_prefix keeps this
+    embeddable more than once per page (or alongside the standalone
+    workspace's own element ids) without a collision.
 
-    The microphone button is deliberately inert (disabled, no click
-    handler, no MediaRecorder/getUserMedia call anywhere) -- reserved
-    space for a future push-to-talk control, not a half-built one."""
-    input_id, button_id, mic_id, status_id, form_id = (
-        f"{id_prefix}-command", f"{id_prefix}-submit", f"{id_prefix}-mic", f"{id_prefix}-status", f"{id_prefix}-form",
+    Voice input, exactly as narrow as the requirement asks: the
+    browser's own SpeechRecognition API (feature-detected; the button
+    stays disabled with an explanatory tooltip when unsupported)
+    converts speech to text entirely client-side -- this file never
+    receives audio, never opens a WebSocket, never calls any speech
+    API of its own, local or external. The ONLY thing that ever
+    reaches this page's own code is the recognized text string, which
+    is written into the exact same <input> a typed command uses and
+    submitted through the exact same form 'submit' handler below via
+    form.requestSubmit() -- there is no second code path to AACO, and
+    no way for recognized speech to reach /api/aaco/command by any
+    route other than the one a typed command already uses. A denied
+    microphone permission, no speech detected, or the browser lacking
+    SpeechRecognition at all are all handled explicitly (see onerror/
+    the feature-detection branch below) and always leave typing fully
+    available -- voice is additive, never a replacement path."""
+    input_id, mic_id, status_id, form_id = (
+        f"{id_prefix}-command", f"{id_prefix}-mic", f"{id_prefix}-status", f"{id_prefix}-form",
     )
     return f"""
+<style>
+.aaco-mic-listening{{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}}
+@keyframes aaco-mic-pulse{{0%,100%{{opacity:1}}50%{{opacity:.55}}}}
+</style>
 <div class="aaco-embed-panel" data-aaco-embed="{id_prefix}">
 {f'<p class="aaco-muted">{intro}</p>' if intro else ''}
 <form id="{form_id}" class="aaco-command-row" style="display:flex;gap:8px;align-items:center">
 <input id="{input_id}" name="command" maxlength="500" autocomplete="off" required placeholder="{placeholder}" style="min-width:0;flex:1">
-<button type="button" class="camera-tool aaco-mic-placeholder" id="{mic_id}" title="Voice command (coming soon)" aria-label="Voice command, coming soon" disabled>🎤</button>
+<button type="button" class="camera-tool aaco-mic-button" id="{mic_id}" title="Voice commands are not supported in this browser" aria-label="Voice commands are not supported in this browser" aria-pressed="false" disabled>🎤</button>
 <button class="action-button" type="submit">Ask AACO</button>
 </form>
 <p id="{status_id}" class="aaco-muted" role="status" aria-live="polite" style="margin-top:6px"></p>
 </div>
 <script>{_AACO_CLIENT_CORE_JS}
 (function(){{
-var form=document.getElementById({form_id!r}),input=document.getElementById({input_id!r}),status=document.getElementById({status_id!r});
+var form=document.getElementById({form_id!r}),input=document.getElementById({input_id!r}),status=document.getElementById({status_id!r}),micButton=document.getElementById({mic_id!r});
 if(!form)return;
 form.addEventListener('submit',function(event){{
 event.preventDefault();
@@ -120,6 +136,53 @@ input.focus();
 status.textContent=error.detail||'AACO could not complete that command.';
 }});
 }});
+// Voice input: tap to start listening, tap again (or silence/a
+// result) to stop. Recognized speech is never sent to AACO directly
+// by this code -- it is written into the same <input> a typed
+// command uses, then submitted through the exact same submit
+// listener above via form.requestSubmit(), never a parallel call to
+// window.aacoSubmitCommand of its own.
+var SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(micButton&&SpeechRecognitionCtor){{
+micButton.disabled=false;
+micButton.title='Press to speak a command';
+micButton.setAttribute('aria-label','Press to speak a command');
+var recognition=null,listening=false;
+function stopListening(){{
+listening=false;
+micButton.classList.remove('aaco-mic-listening');
+micButton.setAttribute('aria-pressed','false');
+if(recognition){{try{{recognition.stop()}}catch(e){{}}}}
+}}
+micButton.addEventListener('click',function(){{
+if(listening){{stopListening();return}}
+try{{recognition=new SpeechRecognitionCtor()}}catch(e){{status.textContent='Voice input is unavailable right now. Type your command instead.';return}}
+recognition.lang=navigator.language||'en-US';
+recognition.interimResults=false;
+recognition.maxAlternatives=1;
+recognition.onresult=function(event){{
+var alt=event.results&&event.results[0]&&event.results[0][0];
+var transcript=alt&&alt.transcript;
+stopListening();
+if(!transcript){{status.textContent='Did not catch that -- try again or type your command.';return}}
+input.value=transcript;
+status.textContent='Heard: “'+transcript+'” — sending to AACO…';
+if(typeof form.requestSubmit==='function'){{form.requestSubmit()}}else{{form.dispatchEvent(new Event('submit',{{cancelable:true}}))}}
+}};
+recognition.onerror=function(event){{
+stopListening();
+if(event.error==='not-allowed'||event.error==='permission-denied'){{status.textContent='Microphone permission was denied. Type your command instead.'}}
+else if(event.error==='no-speech'){{status.textContent='No speech detected. Try again or type your command.'}}
+else{{status.textContent='Voice input is unavailable right now. Type your command instead.'}}
+}};
+recognition.onend=function(){{stopListening()}};
+listening=true;
+micButton.classList.add('aaco-mic-listening');
+micButton.setAttribute('aria-pressed','true');
+status.textContent='Listening…';
+try{{recognition.start()}}catch(e){{stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
+}});
+}}
 }})();
 </script>
 """
