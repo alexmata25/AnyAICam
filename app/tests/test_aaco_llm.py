@@ -289,17 +289,17 @@ class TestLlamaCppInterpreterPlumbing:
 
     def test_interpret_extracts_json_from_surrounding_model_chatter(self, monkeypatch):
         interpreter = LlamaCppInterpreter(model_path="/unused")
-        monkeypatch.setattr(interpreter, "_generate", lambda prompt: 'Sure! {"operation": "camera_status"} -- hope that helps.')
+        monkeypatch.setattr(interpreter, "_generate", lambda text: 'Sure! {"operation": "camera_status"} -- hope that helps.')
         assert interpreter.interpret("Which of my cameras are down?", now=NOW) == AacoCommand("camera_status")
 
     def test_interpret_returns_clarification_for_non_json_output(self, monkeypatch):
         interpreter = LlamaCppInterpreter(model_path="/unused")
-        monkeypatch.setattr(interpreter, "_generate", lambda prompt: "I don't know what you mean.")
+        monkeypatch.setattr(interpreter, "_generate", lambda text: "I don't know what you mean.")
         assert isinstance(interpreter.interpret("garbage", now=NOW), Clarification)
 
     def test_interpret_still_validates_a_syntactically_valid_but_unsafe_model_output(self, monkeypatch):
         interpreter = LlamaCppInterpreter(model_path="/unused")
-        monkeypatch.setattr(interpreter, "_generate", lambda prompt: '{"operation": "unlock_door", "camera_id": "; rm -rf /"}')
+        monkeypatch.setattr(interpreter, "_generate", lambda text: '{"operation": "unlock_door", "camera_id": "; rm -rf /"}')
         assert isinstance(interpreter.interpret("open the door", now=NOW), Clarification)
 
     def test_generate_wraps_a_real_inference_failure_as_interpreter_unavailable(self, tmp_path, monkeypatch):
@@ -308,9 +308,9 @@ class TestLlamaCppInterpreterPlumbing:
         interpreter = LlamaCppInterpreter(model_path=str(model_file))
 
         class _ExplodingModel:
-            def __call__(self, *args, **kwargs):
+            def create_chat_completion(self, *args, **kwargs):
                 raise RuntimeError("inference backend crashed")
 
         interpreter._model = _ExplodingModel()
         with pytest.raises(InterpreterUnavailable):
-            interpreter._generate("prompt")
+            interpreter._generate("some customer text")

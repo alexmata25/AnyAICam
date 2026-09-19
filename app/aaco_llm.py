@@ -62,7 +62,7 @@ from aaco import AacoCommand, Clarification, Operation
 
 LOCAL_LLM_ENABLED = os.environ.get("ANYAICAM_AACO_LOCAL_LLM_ENABLED", "false").strip().lower() == "true"
 LOCAL_LLM_MODEL_PATH = os.environ.get("ANYAICAM_AACO_LLM_MODEL_PATH", "").strip()
-LOCAL_LLM_MAX_TOKENS = 200
+LOCAL_LLM_MAX_TOKENS = 100
 LOCAL_LLM_TIMEOUT_SECONDS = 8
 
 _ALLOWED_OPERATIONS = frozenset(get_args(Operation))
@@ -234,20 +234,35 @@ class LlamaCppInterpreter:
             raise InterpreterUnavailable(f"Local AACO language model failed to load: {error}") from error
         return self._model
 
-    def _generate(self, prompt: str) -> str:
+    def _generate(self, text: str) -> str:
+        # 2026-09-19 staging validation found this MUST be the chat-
+        # completion API, not a raw single-string completion: Qwen2.5-
+        # Instruct GGUF models are fine-tuned specifically against the
+        # ChatML template, and calling them as a bare text completion
+        # (the previous implementation) measured a real 0% validator
+        # pass rate across every test phrase, including trivial ones
+        # like "Which cameras are down?", plus 38-77 second latency per
+        # request (the model rambling to the full token budget instead
+        # of recognizing a natural stopping point). Switching to
+        # create_chat_completion() with the exact same _SYSTEM_PROMPT
+        # as the system role measured correct structured JSON output in
+        # 3.5-8.3 seconds on the same hardware -- the prompt content
+        # was never the problem, only how it was submitted to the model.
         model = self._load()
         try:
-            completion = model(
-                prompt, max_tokens=self.max_tokens, temperature=0.0,
-                stop=["\n\n", "</s>"],
+            completion = model.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=self.max_tokens, temperature=0.0,
             )
         except Exception as error:
             raise InterpreterUnavailable(f"Local AACO language model inference failed: {error}") from error
-        return completion["choices"][0]["text"]
+        return completion["choices"][0]["message"]["content"]
 
     def interpret(self, text: str, *, now: datetime, context: dict | None = None) -> AacoCommand | Clarification:
-        prompt = f'{_SYSTEM_PROMPT}\n"{text}" -> '
-        raw_text = self._generate(prompt).strip()
+        raw_text = self._generate(text).strip()
         try:
             raw = json.loads(raw_text[raw_text.find("{"): raw_text.rfind("}") + 1] or "null")
         except (ValueError, json.JSONDecodeError):
