@@ -398,7 +398,32 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         with connection() as db:
             cloud_policy=cloud_policy_for_customer(db,appliance['customer_id'])
             storage_policy=local_storage_policy_for_customer(db,appliance['customer_id'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy}
+            # identity (2026-09-20): the appliance's own customer/site/
+            # partner rows, real records from THIS cloud database -- not
+            # fabricated -- so edge_camera_sync.py can materialize valid
+            # local parent rows for the same foreign keys it already
+            # writes into every camera row (identity['customer_id']/
+            # ['site_id']/['appliance_id'], sourced from this exact
+            # appliance's own load_persisted_identity()). Confirmed live
+            # on Ryzen: without a local customers/sites/appliances row,
+            # any INSERT into the local recordings table (cataloging a
+            # newly-discovered recording file for cloud upload) 500s with
+            # sqlite3.IntegrityError -- affecting every camera on the
+            # appliance, Event-mode and Continuous-mode alike, not
+            # anything specific to this feature. Selected columns are
+            # exactly what the local schema's NOT NULL constraints
+            # require (see partner_db.py's customers/sites/appliances/
+            # partners table definitions) -- nothing more.
+            customer_row=row('SELECT id,partner_id,name,company,email,phone,status,trial_status,billing_status FROM customers WHERE id=?',(appliance['customer_id'],))
+            site_row=row('SELECT id,customer_id,name,address,site_type FROM sites WHERE id=?',(appliance['site_id'],))
+            partner_row=row('SELECT id,name,approval_status FROM partners WHERE id=?',(appliance['partner_id'],)) if appliance.get('partner_id') else None
+            identity={
+                'customer':dict(customer_row) if customer_row else None,
+                'site':dict(site_row) if site_row else None,
+                'partner':dict(partner_row) if partner_row else None,
+                'appliance':{'id':appliance['id'],'customer_id':appliance['customer_id'],'site_id':appliance['site_id'],'cloud_id':appliance['cloud_id'],'partner_id':appliance.get('partner_id')},
+            }
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-

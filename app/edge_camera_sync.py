@@ -144,20 +144,71 @@ def sync_provisioned_cameras() -> dict:
     credentials_moved = 0
     with connection() as db:
         # cameras.customer_id/site_id carry a FOREIGN KEY (see partner_db.
-        # py's schema) written for the cloud's own multi-tenant admin/
-        # partner CRUD flows, where a customers/sites row always exists
-        # before a camera does. On a genuine edge appliance the local
-        # database only ever mirrors this one appliance's own cameras --
-        # it was never meant to hold a full local replica of the tenant
-        # hierarchy (customers/sites/partners), and building one here
-        # would mean fabricating placeholder customer/site records this
-        # module has no real data for. The customer_id/site_id values
-        # themselves are not fabricated -- they come from this exact
-        # appliance's own cryptographically-issued activation identity
-        # (load_persisted_identity()) -- only the referential-integrity
-        # check against local parent rows that don't exist here is
-        # skipped, scoped to this one connection only.
-        db.execute("PRAGMA foreign_keys=OFF")
+        # py's schema), and so does the recordings table's own customer_
+        # id/site_id/appliance_id (written by main.py's _catalog_local_
+        # recordings_for_camera() whenever a new recording file is
+        # discovered, for both Event-mode and Continuous-mode cameras
+        # alike). Confirmed live on Ryzen (2026-09-20): with no local
+        # customers/sites/appliances row, that INSERT 500'd every time a
+        # genuinely new file appeared -- an appliance-wide Playback
+        # defect, not specific to any one camera or recording mode.
+        #
+        # response['identity'] (appliance_cloud.py's appliance_
+        # configuration()) carries this exact appliance's own real
+        # partner/customer/site/appliance rows -- not fabricated
+        # placeholders, the actual cloud records this appliance's own
+        # cryptographically-issued activation identity already
+        # authorizes it to read (customer_id/site_id/appliance_id come
+        # from that same identity for the camera upsert below). Written
+        # here, in FK dependency order (partner -> customer -> site ->
+        # appliance), before the camera upsert loop, so referential
+        # integrity is genuinely satisfied rather than bypassed.
+        identity_payload = response.get("identity") if isinstance(response.get("identity"), dict) else {}
+        partner_data = identity_payload.get("partner")
+        customer_data = identity_payload.get("customer")
+        site_data = identity_payload.get("site")
+        appliance_data = identity_payload.get("appliance")
+
+        if partner_data and partner_data.get("id"):
+            db.execute(
+                "INSERT INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,approval_status=excluded.approval_status",
+                (partner_data["id"], partner_data.get("name") or "Partner", partner_data.get("approval_status") or "approved", "real", now),
+            )
+        if customer_data and customer_data.get("id") and customer_data.get("email"):
+            db.execute(
+                "INSERT INTO customers(id,partner_id,name,company,email,phone,status,trial_status,billing_status,source,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET partner_id=excluded.partner_id,name=excluded.name,company=excluded.company,"
+                "email=excluded.email,phone=excluded.phone,status=excluded.status,trial_status=excluded.trial_status,billing_status=excluded.billing_status",
+                (
+                    customer_data["id"], customer_data.get("partner_id"), customer_data.get("name") or "Customer",
+                    customer_data.get("company"), customer_data["email"], customer_data.get("phone"),
+                    customer_data.get("status") or "active", customer_data.get("trial_status"), customer_data.get("billing_status"),
+                    "real", now,
+                ),
+            )
+        if site_data and site_data.get("id") and site_data.get("customer_id"):
+            db.execute(
+                "INSERT INTO sites(id,customer_id,name,address,site_type,created_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET customer_id=excluded.customer_id,name=excluded.name,address=excluded.address,site_type=excluded.site_type",
+                (site_data["id"], site_data["customer_id"], site_data.get("name") or "Site", site_data.get("address"), site_data.get("site_type"), now),
+            )
+        if appliance_data and appliance_data.get("id") and appliance_data.get("customer_id") and appliance_data.get("site_id") and appliance_data.get("cloud_id"):
+            db.execute(
+                "INSERT INTO appliances(id,customer_id,site_id,cloud_id,partner_id,created_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET customer_id=excluded.customer_id,site_id=excluded.site_id,cloud_id=excluded.cloud_id,partner_id=excluded.partner_id",
+                (appliance_data["id"], appliance_data["customer_id"], appliance_data["site_id"], appliance_data["cloud_id"], appliance_data.get("partner_id"), now),
+            )
+
+        # Transitional fallback only: an older control-plane deployment
+        # that hasn't shipped the identity payload yet would otherwise
+        # leave cameras.customer_id/site_id (still sourced from this
+        # appliance's own activation identity, exactly as before)
+        # pointing at parent rows this pass had no data to materialize --
+        # never the normal path once both sides of a deployment are current.
+        if not (partner_data and customer_data and site_data and appliance_data):
+            db.execute("PRAGMA foreign_keys=OFF")
         for item in cloud_cameras:
             if not isinstance(item, dict):
                 continue
