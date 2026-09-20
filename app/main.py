@@ -16299,6 +16299,26 @@ def start_event_recording_buffer(camera_number: int) -> subprocess.Popen:
     return subprocess.Popen(command)
 
 
+def _buffer_segment_start(clip: Path, camera_number: int) -> datetime | None:
+    """recording_start()'s exact parsing logic, but for start_event_
+    recording_buffer()'s own filename convention (buf{N}_...), never
+    the real recording's camera{N}_ prefix. Confirmed live on Ryzen
+    (2026-09-20): event_buffer_janitor() called recording_start()
+    directly against buffer segments, whose prefix never matches
+    camera{N}_ -- str.removeprefix() is then a no-op, the resulting
+    strptime() always raises ValueError, and the janitor treated every
+    single segment as unparseable and never deleted anything. A
+    Driveway Right pilot camera accumulated 2,800 buffer segments
+    (~33GB) over 24+ hours of continuous idle-footage retention as a
+    direct result -- exactly the failure mode this whole feature exists
+    to prevent."""
+    prefix = f"buf{camera_number}_"
+    try:
+        return datetime.strptime(clip.stem.removeprefix(prefix), "%Y-%m-%d_%H-%M-%S")
+    except ValueError:
+        return None
+
+
 async def event_buffer_janitor(camera_number: int) -> None:
     """Deletes this camera's short buffer segments once they age past
     the configured pre-roll lookback -- the actual mechanism that stops
@@ -16327,7 +16347,7 @@ async def event_buffer_janitor(camera_number: int) -> None:
             # Never touch a file ffmpeg may still be actively writing.
             if time.time() - stat.st_mtime < EVENT_BUFFER_SEGMENT_SECONDS:
                 continue
-            segment_start = recording_start(path, camera_number)
+            segment_start = _buffer_segment_start(path, camera_number)
             if segment_start is None:
                 continue
             segment_end = segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS)
