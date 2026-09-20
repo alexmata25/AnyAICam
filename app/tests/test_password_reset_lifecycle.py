@@ -30,6 +30,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import cloud_features
+import cloud_security
 import main
 from cloud_config import Settings
 from cloud_security import consume_password_reset
@@ -214,3 +215,132 @@ def test_the_old_password_no_longer_works_after_reset(http_client, db_path, monk
         follow_redirects=False,
     )
     assert old_password_login.status_code == 403
+
+
+# --------------------------------------------------------------- CSRF-enabled real flow (2026-09-20)
+#
+# Confirmed live on staging: every one of the four self-service password-
+# reset pages (/forgot-password, /customer-forgot-password, /reset-
+# password, /customer-reset-password) posts to /api/password-reset/
+# request or /api/password-reset/complete WITHOUT an X-CSRF-Token header
+# -- unlike every other authenticated form in this app (partner.html,
+# customer-login.html), which read the anyaicam_csrf cookie via a csrf()
+# helper and attach it. With ANYAICAM_CSRF_ENABLED=true (every staging/
+# production deployment), every real submission to these four pages was
+# unconditionally rejected 403 "CSRF validation failed" before the token
+# was ever consumed -- confirmed by two consecutive real admin password-
+# reset attempts on staging that both silently failed this way, with the
+# token's used_at staying NULL and must_change_password staying set.
+# Every existing test above passes with CSRF genuinely disabled (no test
+# in this file ever monkeypatches cloud_security.settings, only cloud_
+# features.settings -- a separate name binding to the same module-level
+# Settings instance, so patching one never changes what the real
+# ProductionSecurityMiddleware.dispatch() actually enforces), which is
+# exactly how this shipped unnoticed. The tests below monkeypatch cloud_
+# security.settings itself so the real middleware genuinely enforces
+# CSRF, then drive the exact same GET-page/read-cookie/POST-with-header
+# sequence a real browser performs.
+
+
+def _csrf_enabled_cloud_production(**overrides):
+    kwargs = dict(
+        environment="production", runtime_role="cloud", app_secrets=[STRONG_SECRET],
+        csrf_enabled=True,
+        password_reset_url="https://portal.anyaicam.com/reset-password",
+        allowed_origins=["https://portal.anyaicam.com"],
+    )
+    kwargs.update(overrides)
+    return Settings(**kwargs)
+
+
+def test_every_reset_page_source_includes_the_csrf_header():
+    """Fast, deterministic guard directly on the served markup -- proves
+    the fix (and any future regression) without needing the real
+    middleware engaged at all. Mirrors test_website_partner_session_nav_
+    links.py's own established pattern for this exact class of bug."""
+    with TestClient(main.app) as client:
+        for path in ("/forgot-password", "/customer-forgot-password", "/reset-password", "/customer-reset-password"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert "'X-CSRF-Token':csrf()" in response.text, path
+
+
+def test_reset_password_completes_with_real_csrf_middleware_enforced(db_path, monkeypatch):
+    """The actual bug, proven end to end: with CSRF genuinely enforced by
+    the real middleware (not just disabled-by-default in every other test
+    in this file), the real browser sequence -- GET the page, read the
+    anyaicam_csrf cookie it sets, POST with that value as X-CSRF-Token --
+    must actually succeed and consume the token. Before this fix, this
+    exact sequence 403'd with "CSRF validation failed" and left used_at
+    NULL, which is precisely what happened live on staging."""
+    csrf_settings = _csrf_enabled_cloud_production()
+    monkeypatch.setattr(cloud_security, "settings", csrf_settings)
+    monkeypatch.setattr(cloud_features, "settings", csrf_settings)
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        _seed_customer(db_path, email="admin-like@example.test", password="old-temp-password-123")
+        with TestClient(main.app) as client:
+            request_page = client.get("/forgot-password")
+            request_csrf = request_page.cookies.get("anyaicam_csrf")
+            client.post(
+                "/api/password-reset/request",
+                json={"email": "admin-like@example.test"},
+                headers={"X-CSRF-Token": request_csrf},
+            )
+            token = capturing.sent[-1]["text"].split("token=")[1].strip()
+
+            client.get(f"/reset-password?token={token}")
+            csrf_cookie = client.cookies.get("anyaicam_csrf")
+            assert csrf_cookie, "the CSRF cookie must be available to the browser by the time the page loads"
+
+            complete = client.post(
+                "/api/password-reset/complete",
+                json={"token": token, "password": "brand-new-password-789"},
+                headers={"X-CSRF-Token": csrf_cookie},
+            )
+            assert complete.status_code == 200, complete.text
+
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute("SELECT used_at FROM password_reset_tokens WHERE user_id='cust-user-1'").fetchone()
+            assert row[0] is not None, "used_at must be populated once the real flow completes"
+            must_change = conn.execute("SELECT must_change_password FROM partner_users WHERE id='cust-user-1'").fetchone()[0]
+            assert must_change == 0
+
+
+def test_reset_password_without_the_csrf_header_is_the_confirmed_live_failure(db_path, monkeypatch):
+    """Negative control: proves the test above is actually exercising the
+    real bug, not a fixture artifact -- the exact same sequence, minus
+    the X-CSRF-Token header, must still fail exactly as it did live."""
+    csrf_settings = _csrf_enabled_cloud_production()
+    monkeypatch.setattr(cloud_security, "settings", csrf_settings)
+    monkeypatch.setattr(cloud_features, "settings", csrf_settings)
+    capturing = _CapturingEmailService()
+    monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
+
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        _seed_customer(db_path, email="admin-like@example.test", password="old-temp-password-123")
+        with TestClient(main.app) as client:
+            request_page = client.get("/forgot-password")
+            request_csrf = request_page.cookies.get("anyaicam_csrf")
+            client.post(
+                "/api/password-reset/request",
+                json={"email": "admin-like@example.test"},
+                headers={"X-CSRF-Token": request_csrf},
+            )
+            token = capturing.sent[-1]["text"].split("token=")[1].strip()
+            client.get(f"/reset-password?token={token}")
+
+            complete = client.post(
+                "/api/password-reset/complete",
+                json={"token": token, "password": "brand-new-password-789"},
+            )
+            assert complete.status_code == 403
+            assert complete.json()["detail"] == "CSRF validation failed."
+
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute("SELECT used_at FROM password_reset_tokens WHERE user_id='cust-user-1'").fetchone()
+            assert row[0] is None
