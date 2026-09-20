@@ -56,11 +56,15 @@ def _seed_partner(conn, partner_id):
 
 
 def _seed_customer(conn, customer_id, partner_id, name="Existing Customer"):
-    # company/trial_status left as '' rather than NULL -- real onboarding
-    # (onboard_customer()) always writes a string there via payload.get(...,''),
-    # so render_partner_workspace()'s escape(customer.get('company','')) never
-    # sees a real NULL; matching that shape here instead of exercising an
-    # unreachable-in-practice code path.
+    # company/trial_status left as '' here to match onboard_customer()'s own
+    # payload.get(...,'') normalization for a customer created through the
+    # real onboarding flow. A genuinely NULL company/trial_status is NOT
+    # unreachable, though -- confirmed live on staging (2026-09-20): a row
+    # inserted outside that flow (a raw fixture, a migration) can carry a
+    # real NULL and 500'd render_partner_workspace() until customer.get(key,
+    # default) was fixed to customer.get(key) or default everywhere on that
+    # line -- see test_customer_list_survives_a_row_with_genuinely_null_
+    # optional_fields below.
     _seed_partner(conn, partner_id)
     conn.execute(
         "INSERT INTO customers(id,partner_id,name,company,email,status,trial_status,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -230,6 +234,39 @@ def test_administrator_sees_customers_across_every_partner(http_client):
     assert response.status_code == 200
     assert "CustomerA" in response.text
     assert "CustomerB" in response.text
+
+
+def test_customer_list_survives_a_row_with_genuinely_null_optional_fields(http_client):
+    """Confirmed live on staging (2026-09-20): a real customer row
+    (a leftover E2E WireGuard test fixture, company/trial_status
+    genuinely NULL rather than '') 500'd this exact page for every
+    administrator, with AttributeError: 'NoneType' object has no
+    attribute 'replace' -- customer.get('company','') (and the same
+    shape for 'status'/'name'/'email') only substitutes the default
+    when the KEY is absent, never when its value is None, so escape()/
+    .replace() received None directly. _seed_customer()'s own docstring
+    above called this "unreachable in practice" -- it wasn't; any row
+    inserted outside onboard_customer()'s own payload.get(...,'')
+    normalization (a raw fixture insert, a migration, a manual test
+    seed) can carry a real NULL. Fixed by switching every field on that
+    line to `.get(key) or default`, matching trial_status's own
+    already-correct pattern on the same line."""
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner(conn, "partner-1")
+    conn.execute(
+        "INSERT INTO customers(id,partner_id,name,company,email,status,trial_status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("cust-null-fields", "partner-1", "Null Fields Customer", None, "null-fields@example.com", "active", None, "2026-01-01"),
+    )
+    conn.commit()
+    _seed_global_administrator_grant(conn)
+    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+
+    response = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: token})
+
+    assert response.status_code == 200
+    assert "Null Fields Customer" in response.text
+    assert "no trial" in response.text
 
 
 def test_administrator_can_view_any_partners_customer_detail(http_client):
