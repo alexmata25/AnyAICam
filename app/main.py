@@ -16432,7 +16432,7 @@ async def persist_event_recording(camera_number: int, event_start: datetime, eve
         return
     sources = [
         path for path in sorted(buffer_folder.glob("*.mkv"))
-        if (segment_start := recording_start(path, camera_number)) is not None
+        if (segment_start := _buffer_segment_start(path, camera_number)) is not None
         and segment_start < window.end
         and segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS) > window.start
     ]

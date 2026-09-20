@@ -55,3 +55,23 @@ def test_janitor_uses_the_dedicated_buffer_parser_not_recording_start():
     source = inspect.getsource(main.event_buffer_janitor)
     assert "_buffer_segment_start(" in source
     assert "recording_start(" not in source
+
+
+def test_persist_event_recording_also_uses_the_dedicated_buffer_parser():
+    """The second, more severe occurrence of the exact same bug,
+    confirmed live on Ryzen (2026-09-20): persist_event_recording() --
+    the function that actually builds the customer-facing event clip --
+    ALSO called recording_start() (the camera{N}_ parser) directly
+    against buffer segments (buf{N}_) when selecting which segments to
+    concatenate. Since recording_start() always returned None for a
+    buf{N}_ filename, `sources` was always empty and the function
+    silently no-op'd via its own `if not sources: return` -- on every
+    single real motion event, for the entire pilot, despite motion
+    being correctly detected multiple times on Camera 2. This is a
+    strictly worse instance of the same root cause already fixed in
+    event_buffer_janitor() above, missed in that same pass because it's
+    a second, independent call site."""
+    import inspect
+    source = inspect.getsource(main.persist_event_recording)
+    assert "_buffer_segment_start(" in source
+    assert "recording_start(" not in source
