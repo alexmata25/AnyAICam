@@ -32004,7 +32004,24 @@ def linked_recording_for(
     camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
     for source in sorted(camera_folder.glob("*.mkv"), reverse=True):
         source_start = recording_start(source, camera_number)
-        if source_start and source_start <= event_time < source_start + timedelta(minutes=5):
+        if not source_start:
+            continue
+        # Real ffprobe duration, not an assumed 5 minutes -- confirmed
+        # live on Ryzen (2026-09-20): Event mode's own recordings
+        # (persist_event_recording()'s output, 8s/18s/23s/etc., never a
+        # fixed length) mean a hardcoded 5-minute containment window can
+        # both wrongly match a segment that doesn't actually cover
+        # event_time and wrongly miss one that does -- the exact same
+        # class of bug already fixed in _catalog_local_recordings_for_
+        # camera() for Playback's own duration/end metadata. Events
+        # (save_yolo_events()) and Investigate both resolve their clip
+        # links through this one function, so this single fix covers
+        # both. Falls back to the historical 5-minute assumption only if
+        # ffprobe genuinely can't determine a real duration (an actively-
+        # written file, or a probe failure) -- never raises.
+        duration_seconds = _probe_recording_duration_seconds(source)
+        source_end = source_start + timedelta(seconds=duration_seconds if duration_seconds is not None else 300.0)
+        if source_start <= event_time < source_end:
             start_offset = max(0, (window.start - source_start).total_seconds())
             end_offset = max(start_offset, (window.end - source_start).total_seconds())
             return f"/recordings/camera{camera_number}/{quote(source.name)}#t={start_offset:.1f},{end_offset:.1f}"
@@ -141011,6 +141028,31 @@ def _row_to_recording_metadata(row: dict) -> dict:
     }
 
 
+def _probe_recording_duration_seconds(path: Path) -> float | None:
+    """Real ffprobe duration for a completed local recording file --
+    used by _catalog_local_recordings_for_camera() instead of assuming
+    every recording is exactly 5 minutes long, which was only ever true
+    for Continuous mode's own fixed-length segments and is wrong for
+    Event mode's variable-duration clips (persist_event_recording()'s
+    output is 8s, 18s, 23s, etc., never a fixed length). Same ffprobe
+    invocation shape as _probe_motion_clip_candidates() above, but for
+    exactly one already-completed file rather than a shortlist being
+    matched against an event window. Never raises -- returns None on
+    any failure so the caller can fall back to a documented default."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        duration_text = probe.stdout.strip()
+        if not duration_text or duration_text.upper() == "N/A":
+            return None
+        duration = float(duration_text)
+        return duration if duration > 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
 def _catalog_local_recordings_for_camera(camera_id: str) -> int:
     """Backfills the recordings table from local .mkv files still on
     disk for this camera -- reconciled verbatim from the accepted,
@@ -141056,7 +141098,21 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
             if not started:
                 continue
 
-            ended = started + timedelta(minutes=5)
+            # Real ffprobe duration, not an assumed 5 minutes. Confirmed
+            # live on Ryzen (2026-09-20): this was hardcoded to
+            # timedelta(minutes=5)/300 unconditionally, which happened
+            # to be correct for Continuous mode's own fixed-length
+            # segments but produced wrong ended_at/duration_seconds
+            # metadata for every Event-mode clip (persist_event_
+            # recording()'s output is 8s, 18s, 23s, etc., never a fixed
+            # length) -- Playback's own displayed duration and end time
+            # were wrong for every single Event-mode recording. Falls
+            # back to the historical 300s assumption only if ffprobe
+            # genuinely can't determine a real duration (never raises).
+            duration_seconds = _probe_recording_duration_seconds(path)
+            if duration_seconds is None:
+                duration_seconds = 300.0
+            ended = started + timedelta(seconds=duration_seconds)
             s3_key = cloud_recording_s3_key(path, camera_number)
 
             existing = db.execute(
@@ -141081,7 +141137,7 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
                     s3_key,
                     started.isoformat(),
                     ended.isoformat(),
-                    300,
+                    int(round(duration_seconds)),
                     stat.st_size,
                     "available",
                     datetime.now().isoformat(),
@@ -144487,7 +144543,7 @@ def playback(request: Request) -> str:
 
 
 
-                "end": (started + timedelta(minutes=5)).isoformat(),
+                "end": (started + timedelta(seconds=_probe_recording_duration_seconds(clip) or 300.0)).isoformat(),
 
 
 

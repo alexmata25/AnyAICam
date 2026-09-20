@@ -103,6 +103,94 @@ def test_local_filename_backfill_creates_a_recording_row(db_path, tmp_path, monk
     assert rows[0][2] == "2026-08-25T14:05:00"
 
 
+# --------------------------------------------------- real-duration metadata (2026-09-20)
+#
+# Confirmed live on Ryzen: _catalog_local_recordings_for_camera()
+# hardcoded ended_at/duration_seconds to started + 5 minutes / 300
+# unconditionally -- correct by coincidence for Continuous mode's own
+# fixed-length segments, but wrong for persist_event_recording()'s
+# variable-duration Event-mode clips (8s/18s/23s/etc.), which made
+# Playback's own displayed duration and end time wrong for every single
+# Event-mode recording. _probe_recording_duration_seconds() (real
+# ffprobe) is monkeypatched directly in these tests rather than
+# depending on a real ffmpeg-encoded fixture file being available in
+# every test environment -- this project's own dev machine has no
+# ffmpeg/ffprobe installed at all, so the function would otherwise
+# always hit its documented "probe failed" fallback here regardless of
+# what's under test.
+
+
+def test_a_short_event_mode_clip_uses_its_real_duration_not_five_minutes(db_path, tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", lambda path: 23.093)
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_base_tenant(conn)
+
+        camera_folder = tmp_path / "recordings" / "camera1"
+        _write_recording_file(camera_folder, 1, datetime(2026, 9, 20, 23, 10, 8))
+
+        added = main._catalog_local_recordings_for_camera("cam-1")
+        row = conn.execute("SELECT started_at, ended_at, duration_seconds FROM recordings").fetchone()
+
+    assert added == 1
+    assert row[0] == "2026-09-20T23:10:08"
+    # 23:10:08 + 23.093s, not + 5 minutes.
+    assert row[1] == "2026-09-20T23:10:31.093000"
+    assert row[2] == 23  # rounded, matches duration_seconds' integer column
+
+
+def test_a_normal_continuous_mode_clip_still_gets_its_real_measured_duration(db_path, tmp_path, monkeypatch):
+    """Continuous mode is unaffected in the sense that its real duration
+    genuinely is ~300s -- this proves the fix measures that correctly
+    via ffprobe rather than merely preserving the old hardcoded value by
+    coincidence."""
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", lambda path: 300.0)
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_base_tenant(conn)
+
+        camera_folder = tmp_path / "recordings" / "camera1"
+        _write_recording_file(camera_folder, 1, datetime(2026, 8, 25, 14, 0, 0))
+
+        added = main._catalog_local_recordings_for_camera("cam-1")
+        row = conn.execute("SELECT started_at, ended_at, duration_seconds FROM recordings").fetchone()
+
+    assert added == 1
+    assert row[0] == "2026-08-25T14:00:00"
+    assert row[1] == "2026-08-25T14:05:00"
+    assert row[2] == 300
+
+
+def test_ffprobe_failure_falls_back_to_the_documented_default_not_a_crash(db_path, tmp_path, monkeypatch):
+    """A genuinely unprobeable file (corrupt, or ffprobe unavailable --
+    this project's own dev machine has no ffmpeg installed at all) must
+    never crash cataloging; it falls back to the same 300s default the
+    whole function always used, exactly as documented."""
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", lambda path: None)
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_base_tenant(conn)
+
+        camera_folder = tmp_path / "recordings" / "camera1"
+        _write_recording_file(camera_folder, 1, datetime(2026, 8, 25, 14, 0, 0))
+
+        added = main._catalog_local_recordings_for_camera("cam-1")
+        row = conn.execute("SELECT ended_at, duration_seconds FROM recordings").fetchone()
+
+    assert added == 1
+    assert row[0] == "2026-08-25T14:05:00"
+    assert row[1] == 300
+
+
 def test_a_file_too_young_to_have_finished_writing_is_skipped(db_path, tmp_path, monkeypatch):
     monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
     with override_target(sqlite_path=db_path):
@@ -544,3 +632,60 @@ def test_dates_route_returns_the_available_dates_list(db_path, tmp_path, monkeyp
         result = main.customer_recording_dates(camera_id="cam-1", request=None)
 
     assert result == {"dates": ["2026-08-25"]}
+
+
+# --------------------------------------------- linked_recording_for() real-duration containment (2026-09-20)
+#
+# save_yolo_events() (real AI/Smart-Motion Events) and people_counting_
+# worker() both resolve their clip links through linked_recording_for()
+# -- so Events and Investigate inherit whatever containment logic it
+# uses to decide which segment file actually covers a given event_time.
+# It had the same hardcoded-5-minutes bug as _catalog_local_recordings_
+# for_camera() above: `source_start <= event_time < source_start +
+# timedelta(minutes=5)`. For an Event-mode recording (8s/18s/23s/etc.),
+# this could both wrongly accept a segment that doesn't actually cover
+# event_time and wrongly reject/skip past one that does. (Basic Motion
+# events no longer call this function at all -- see test_motion_event_
+# media_wiring.py's test_linked_recording_is_now_the_optimistic_clip_
+# path_matching_production -- so this scope is specifically Events/
+# Investigate via the AI and people-counting paths.)
+
+
+def test_linked_recording_for_rejects_an_event_time_past_a_short_clips_real_end(tmp_path, monkeypatch):
+    """The exact regression: a short Event-mode clip (23s real duration)
+    starting at 23:10:08 does NOT cover an event_time 40 seconds later
+    (23:10:48) -- but the old hardcoded 5-minute assumption would have
+    wrongly treated it as covered."""
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", lambda path: 23.093)
+    camera_folder = tmp_path / "recordings" / "camera1"
+    _write_recording_file(camera_folder, 1, datetime(2026, 9, 20, 23, 10, 8))
+
+    result = main.linked_recording_for(1, datetime(2026, 9, 20, 23, 10, 48))
+
+    assert result is None
+
+
+def test_linked_recording_for_accepts_an_event_time_within_a_short_clips_real_span(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", lambda path: 23.093)
+    camera_folder = tmp_path / "recordings" / "camera1"
+    _write_recording_file(camera_folder, 1, datetime(2026, 9, 20, 23, 10, 8))
+
+    result = main.linked_recording_for(1, datetime(2026, 9, 20, 23, 10, 20))
+
+    assert result is not None
+    assert "camera1_2026-09-20_23-10-08.mkv" in result
+
+
+def test_linked_recording_for_still_accepts_a_normal_continuous_clip(tmp_path, monkeypatch):
+    """Continuous mode's own genuinely-~300s segments are unaffected."""
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    monkeypatch.setattr(main, "_probe_recording_duration_seconds", lambda path: 300.0)
+    camera_folder = tmp_path / "recordings" / "camera1"
+    _write_recording_file(camera_folder, 1, datetime(2026, 8, 25, 14, 0, 0))
+
+    result = main.linked_recording_for(1, datetime(2026, 8, 25, 14, 3, 0))
+
+    assert result is not None
+    assert "camera1_2026-08-25_14-00-00.mkv" in result
