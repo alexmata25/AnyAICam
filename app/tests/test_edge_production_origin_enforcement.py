@@ -91,12 +91,19 @@ class EffectiveAllowedOriginsTests(unittest.TestCase):
         )
 
     def test_staging_is_unaffected_regardless_of_runtime_role(self):
+        # Staging's own app.anyaicam.com union (cloud_config.py's
+        # STAGING_SECONDARY_PUBLIC_HOST -- see test_cloud_config_edge_
+        # production.py's StagingSecondaryPublicHostTests) is a separate,
+        # deliberate behavior, so this is no longer the bare configured
+        # value -- but it's still exactly one wildcard-free, explicit
+        # list, proving edge_production's own "*" exemption still never
+        # leaks into staging regardless of runtime_role.
         self.assertEqual(
             Settings(
                 environment="staging", runtime_role="edge",
                 allowed_origins=["http://localhost:8000"],  # see _edge_production()'s comment above
             ).effective_allowed_origins,
-            ["http://localhost:8000"],
+            ["http://localhost:8000", "https://app.anyaicam.com"],
         )
 
 

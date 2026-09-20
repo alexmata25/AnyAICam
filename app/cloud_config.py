@@ -32,6 +32,28 @@ _DEFAULT_ALLOWED_ORIGINS = ["http://localhost:8000"]
 _DEFAULT_TRUSTED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
 
 
+# The one staging EC2 instance (portal-staging.anyaicam.com) also serves
+# app.anyaicam.com -- a real, second live domain, not a typo or a leftover
+# from testing -- following the account's single-EC2 consolidation.
+# Confirmed live (2026-09-20): a fresh container deploy that faithfully
+# reused the host's own persisted /etc/anyaicam-staging/vms-staging.env
+# still 500'd every app.anyaicam.com request with "Invalid host header",
+# because a *previous* incident response had added app.anyaicam.com to a
+# *running* container's ANYAICAM_TRUSTED_HOSTS/ANYAICAM_ALLOWED_ORIGINS
+# by hand (an extra -e flag, or a since-lost env file edit) without ever
+# writing it back into that persisted env file -- so the very next clean
+# rebuild-from-source-of-truth silently reverted it. Env files are host-
+# level operational config, not something a Docker image build touches,
+# so fixing the file this one time would still leave the guarantee
+# resting entirely on that file never drifting from the container again.
+# Unioned into staging's effective_trusted_hosts/effective_allowed_origins
+# below unconditionally -- regardless of what ANYAICAM_TRUSTED_HOSTS/
+# ANYAICAM_ALLOWED_ORIGINS are actually configured to on any given
+# deploy -- so this specific domain can never again be silently dropped
+# by an env file that falls out of sync with a container's live history.
+STAGING_SECONDARY_PUBLIC_HOST = "app.anyaicam.com"
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ANYAICAM_ENV", "development").lower()
@@ -234,6 +256,8 @@ class Settings:
         never silently widened."""
         if self.edge_production and self.trusted_hosts == _DEFAULT_TRUSTED_HOSTS:
             return ["*"]
+        if self.staging and STAGING_SECONDARY_PUBLIC_HOST not in self.trusted_hosts:
+            return [*self.trusted_hosts, STAGING_SECONDARY_PUBLIC_HOST]
         return self.trusted_hosts
 
     @property
@@ -263,6 +287,9 @@ class Settings:
         exact current behavior."""
         if self.edge_production and self.allowed_origins == _DEFAULT_ALLOWED_ORIGINS:
             return ["*"]
+        staging_origin = f"https://{STAGING_SECONDARY_PUBLIC_HOST}"
+        if self.staging and staging_origin not in self.allowed_origins:
+            return [*self.allowed_origins, staging_origin]
         return self.allowed_origins
 
     @property

@@ -225,10 +225,16 @@ class EffectiveTrustedHostsTests(unittest.TestCase):
 
     def test_staging_is_unaffected_regardless_of_runtime_role(self):
         # edge_production scopes strictly to production (see its own
-        # docstring) -- staging must never get the wildcard.
+        # docstring) -- staging must never get the wildcard. (Staging's
+        # own app.anyaicam.com union is a separate, deliberate behavior --
+        # see StagingSecondaryPublicHostTests below -- so this list is no
+        # longer the bare untouched default.)
         self.assertEqual(
             Settings(environment="staging", runtime_role="edge").effective_trusted_hosts,
-            ["localhost", "127.0.0.1", "testserver"],
+            ["localhost", "127.0.0.1", "testserver", "app.anyaicam.com"],
+        )
+        self.assertNotIn(
+            "*", Settings(environment="staging", runtime_role="edge").effective_trusted_hosts,
         )
 
 
@@ -287,6 +293,76 @@ class TrustedHostMiddlewareIntegrationTests(unittest.TestCase):
             _cloud_production(trusted_hosts=["portal.anyaicam.com"]).effective_trusted_hosts
         )
         resp = client.get("/", headers={"Host": "portal.anyaicam.com"})
+        self.assertEqual(resp.status_code, 200)
+
+
+class StagingSecondaryPublicHostTests(unittest.TestCase):
+    """Regression coverage for the confirmed-live release blocker
+    (2026-09-20): app.anyaicam.com (a real, second live domain the one
+    staging EC2 also serves, per the account's single-instance
+    consolidation) returned "Invalid host header" after a container
+    redeploy that faithfully reused the host's own persisted env file --
+    because a *previous* incident response had added app.anyaicam.com to
+    a *running* container's ANYAICAM_TRUSTED_HOSTS/ANYAICAM_
+    ALLOWED_ORIGINS by hand, without ever writing it back into that
+    persisted file. Every test below constructs Settings the same way
+    that broken env file actually does -- staging, with trusted_hosts/
+    allowed_origins explicitly set to their real configured values,
+    which do NOT include app.anyaicam.com -- proving the code itself,
+    not any particular env file's contents, is what now guarantees this
+    domain survives every future rebuild-from-source-of-truth."""
+
+    def _real_staging_env_without_the_domain(self, **overrides):
+        kwargs = dict(
+            environment="staging", runtime_role="cloud",
+            trusted_hosts=["portal-staging.anyaicam.com"],
+            allowed_origins=["https://portal-staging.anyaicam.com"],
+        )
+        kwargs.update(overrides)
+        return Settings(**kwargs)
+
+    def test_staging_trusted_hosts_always_include_app_domain(self):
+        settings = self._real_staging_env_without_the_domain()
+        self.assertIn("app.anyaicam.com", settings.effective_trusted_hosts)
+        # And the operator's own configured value is preserved, not
+        # replaced.
+        self.assertIn("portal-staging.anyaicam.com", settings.effective_trusted_hosts)
+
+    def test_staging_allowed_origins_always_include_app_domain(self):
+        settings = self._real_staging_env_without_the_domain()
+        self.assertIn("https://app.anyaicam.com", settings.effective_allowed_origins)
+        self.assertIn("https://portal-staging.anyaicam.com", settings.effective_allowed_origins)
+
+    def test_no_duplicate_when_already_explicitly_configured(self):
+        settings = self._real_staging_env_without_the_domain(
+            trusted_hosts=["portal-staging.anyaicam.com", "app.anyaicam.com"],
+            allowed_origins=["https://portal-staging.anyaicam.com", "https://app.anyaicam.com"],
+        )
+        self.assertEqual(settings.effective_trusted_hosts.count("app.anyaicam.com"), 1)
+        self.assertEqual(settings.effective_allowed_origins.count("https://app.anyaicam.com"), 1)
+
+    def test_non_staging_environments_are_unaffected(self):
+        self.assertNotIn(
+            "app.anyaicam.com",
+            Settings(environment="development", runtime_role="cloud").effective_trusted_hosts,
+        )
+        self.assertNotIn(
+            "app.anyaicam.com",
+            _cloud_production().effective_trusted_hosts,
+        )
+        self.assertNotIn(
+            "https://app.anyaicam.com",
+            _cloud_production().effective_allowed_origins,
+        )
+
+    def test_trusted_host_middleware_accepts_the_app_domain_on_staging(self):
+        client = TrustedHostMiddlewareIntegrationTests._make_client(
+            self._real_staging_env_without_the_domain().effective_trusted_hosts
+        )
+        resp = client.get("/", headers={"Host": "app.anyaicam.com"})
+        self.assertEqual(resp.status_code, 200)
+        # The primary staging domain must keep working too.
+        resp = client.get("/", headers={"Host": "portal-staging.anyaicam.com"})
         self.assertEqual(resp.status_code, 200)
 
 
