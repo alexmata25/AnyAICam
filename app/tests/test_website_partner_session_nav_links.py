@@ -153,6 +153,57 @@ def test_non_administrator_role_is_unaffected(http_client, db_path, monkeypatch)
     assert data["portal_url"] == "http://100.123.115.65:8000/partner?tab=customers"
 
 
+def test_anonymous_visitor_can_reach_partner_session_endpoint_directly(http_client, monkeypatch):
+    """Root cause of the confirmed-live "Partner Login" bug (2026-09-20):
+    /api/website/partner-session was never in main.py's
+    PUBLIC_PATH_PREFIXES, so authentication_middleware's own "/api/"
+    fallback blocked a truly anonymous request (no partner cookie at
+    all) with a generic {"status":"error",...} 401 body before
+    website_session()'s own graceful anonymous branch ever ran --
+    starving customer-login.html/partner.html of partner_url/
+    customer_url on first load for exactly the visitors who need those
+    links most. Fixed by adding this path to PUBLIC_PATH_PREFIXES."""
+    monkeypatch.setattr(website_partner, "settings", _cloud_production())
+
+    response = http_client.get("/api/website/partner-session")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["authenticated"] is False
+    assert data["partner_url"] == "https://portal.anyaicam.com/partner.html"
+    assert data["customer_url"] == "https://portal.anyaicam.com/customer-login.html"
+
+
+def test_customer_login_html_never_overwrites_nav_links_with_an_unauthenticated_error_body():
+    """Same confirmed-live bug and same fix as partner.html's own
+    test_partner_html_never_overwrites_nav_links_with_an_unauthenticated_
+    error_body above, applied to customer-login.html -- which had the
+    identical unguarded #partner-nav/#customer-nav href assignment but
+    never received the guard when partner.html was fixed. This is the
+    exact page a real anonymous visitor hit: clicking "Partner Login"
+    landed on /login?next=/undefined (the legacy emergency-recovery
+    sign-in) instead of /partner.html."""
+    source = (Path(__file__).resolve().parents[1] / "customer-login.html").read_text(encoding="utf-8")
+    assert "typeof session.authenticated==='undefined')return" in source
+    assert "if(session.partner_url)document.getElementById('partner-nav').href=session.partner_url" in source
+    assert "if(session.customer_url)document.getElementById('customer-nav').href=session.customer_url" in source
+
+
+def test_unauthenticated_partner_path_redirects_to_partner_login_not_emergency_recovery(http_client, monkeypatch):
+    """Partner Portal equivalent of the already-fixed customer-nav-path
+    bug (CLOUD_CUSTOMER_NAV_PATH_PREFIXES): an unauthenticated visit to
+    a real partner-facing route on a cloud deployment must land on
+    /partner.html, never the legacy local-emergency-recovery /login."""
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+
+    for path in ("/partner", "/partner-quotes", "/partner-applications", "/admin-portal"):
+        response = http_client.get(path, follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers["location"]
+        assert location.startswith("/partner.html?next="), (path, location)
+        assert "next=/undefined" not in location
+
+
 def test_partner_html_never_overwrites_nav_links_with_an_unauthenticated_error_body():
     """Separate confirmed-live bug found while diagnosing the
     Administration link above: /api/website/partner-session returns a

@@ -41086,6 +41086,30 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     "/aaco",
 )
 
+# The same shape bug as CLOUD_CUSTOMER_NAV_PATH_PREFIXES above, for the
+# Partner Portal side: an unauthenticated (or session-expired) visit to
+# any of these bare, cloud-only, partner/admin-facing nav paths had no
+# branch to distinguish it from a truly unknown/legacy path, so it fell
+# through to the legacy local-emergency-recovery /login instead of
+# /partner.html -- the real customer-facing entry point for
+# administrator/partner_owner/salesperson/technician identities on a
+# cloud/combined deployment. Gated to RUNTIME_ROLE == "cloud" for the
+# same reason as the customer list: these are Partner Portal
+# (multi-tenant company/commission) concepts with no meaning on a
+# single-appliance edge box, where /login (this function's existing,
+# unchanged fallback) remains the correct destination for an
+# unauthenticated local owner. /partner.html and /partner-login are
+# already in PUBLIC_PATH_PREFIXES and never reach this far.
+CLOUD_PARTNER_NAV_PATH_PREFIXES = (
+    "/partner",
+    "/partner-quotes",
+    "/partner-prices",
+    "/partner-revenue",
+    "/partner-pricing-admin",
+    "/partner-applications",
+    "/admin-portal",
+)
+
 
 PUBLIC_PATH_PREFIXES = (
     "/login",
@@ -41111,6 +41135,21 @@ PUBLIC_PATH_PREFIXES = (
     "/api/partner-login",
 
     "/api/portal-login",
+
+    # customer-login.html and partner.html both fetch this on every load,
+    # before any identity exists, to populate their own top-nav Partner/
+    # Customer Login links -- website_session() already has a graceful
+    # anonymous branch (identity=None -> {authenticated:False,
+    # **public_navigation}), but without this entry a truly anonymous
+    # visitor never reaches it: this middleware's own "/api/" fallback
+    # blocks the request first with a generic 401 body that has no
+    # partner_url/customer_url keys at all. Confirmed as the real root
+    # cause of the "Partner Login" nav link resolving to the literal
+    # string "undefined" (customer-login.html's fetch handler set
+    # #partner-nav's href from that missing key unguarded), which then
+    # sent an anonymous visitor to /login?next=/undefined -- the legacy
+    # local-emergency-recovery sign-in -- instead of /partner.html.
+    "/api/website/partner-session",
 
     "/api/password-reset/",
 
@@ -41431,6 +41470,13 @@ async def authentication_middleware(request: Request, call_next):
         path == prefix or path.startswith(prefix + "/") for prefix in CLOUD_CUSTOMER_NAV_PATH_PREFIXES
     ):
         return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
+
+    # Partner-Portal equivalent of the customer branch above -- see
+    # CLOUD_PARTNER_NAV_PATH_PREFIXES's own comment.
+    if RUNTIME_ROLE == "cloud" and any(
+        path == prefix or path.startswith(prefix + "/") for prefix in CLOUD_PARTNER_NAV_PATH_PREFIXES
+    ):
+        return RedirectResponse(f"/partner.html?next={next_url}", status_code=303)
 
     return RedirectResponse(f"/login?next={next_url}", status_code=303)
 

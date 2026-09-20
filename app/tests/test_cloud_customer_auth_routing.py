@@ -144,13 +144,27 @@ def test_customer_prefixed_paths_unaffected_by_this_fix_on_either_role(http_clie
         assert response.headers["location"].startswith("/customer-login.html?next="), role
 
 
-def test_admin_and_unrecognized_paths_still_fall_back_to_login_even_on_cloud(http_client, monkeypatch):
-    # Deliberately NOT in CLOUD_CUSTOMER_NAV_PATH_PREFIXES -- an
-    # unauthenticated visit to a genuinely admin/staff-only path must
-    # keep going to /login regardless of role. Proves the fix is a
-    # narrow widening, not a blanket default flip.
+def test_unrecognized_paths_still_fall_back_to_login_even_on_cloud(http_client, monkeypatch):
+    # Deliberately NOT in either CLOUD_CUSTOMER_NAV_PATH_PREFIXES or
+    # CLOUD_PARTNER_NAV_PATH_PREFIXES -- an unauthenticated visit to a
+    # genuinely unrecognized/legacy path must keep going to /login
+    # regardless of role. Proves the fix is a narrow widening, not a
+    # blanket default flip.
+    #
+    # /admin-portal itself moved OUT of this test (2026-09-20): it is
+    # not a "staff-only" path distinct from the Partner Portal -- it is
+    # the real destination for a true global-administrator identity
+    # (see website_partner.py's website_session(), which sets
+    # destination_path='/admin-portal' for exactly that role/grant
+    # combination), reached through the same /partner.html sign-in form
+    # as every other partner/admin role. An unauthenticated or session-
+    # expired visit to it belongs on /partner.html, not the legacy
+    # local-emergency-recovery page -- see
+    # CLOUD_PARTNER_NAV_PATH_PREFIXES's own comment and
+    # test_unauthenticated_partner_path_redirects_to_partner_login_not_
+    # emergency_recovery in test_website_partner_session_nav_links.py.
     monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
-    response = http_client.get("/admin-portal")
+    response = http_client.get("/some-genuinely-unrecognized-legacy-path")
     assert response.status_code == 303
     assert response.headers["location"].startswith("/login?next=")
 
