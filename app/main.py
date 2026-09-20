@@ -141098,21 +141098,6 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
             if not started:
                 continue
 
-            # Real ffprobe duration, not an assumed 5 minutes. Confirmed
-            # live on Ryzen (2026-09-20): this was hardcoded to
-            # timedelta(minutes=5)/300 unconditionally, which happened
-            # to be correct for Continuous mode's own fixed-length
-            # segments but produced wrong ended_at/duration_seconds
-            # metadata for every Event-mode clip (persist_event_
-            # recording()'s output is 8s, 18s, 23s, etc., never a fixed
-            # length) -- Playback's own displayed duration and end time
-            # were wrong for every single Event-mode recording. Falls
-            # back to the historical 300s assumption only if ffprobe
-            # genuinely can't determine a real duration (never raises).
-            duration_seconds = _probe_recording_duration_seconds(path)
-            if duration_seconds is None:
-                duration_seconds = 300.0
-            ended = started + timedelta(seconds=duration_seconds)
             s3_key = cloud_recording_s3_key(path, camera_number)
 
             existing = db.execute(
@@ -141122,6 +141107,26 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
 
             if existing:
                 continue
+
+            # Real ffprobe duration, not an assumed 5 minutes -- only for
+            # a file actually being newly inserted below (the existing-
+            # row check above must run first: this loop revisits every
+            # .mkv in the folder on every call, and a camera can easily
+            # have hundreds of already-cataloged files -- probing every
+            # one of them on every call, cataloged or not, turned a
+            # cheap per-call scan into a real, confirmed-live-on-Ryzen
+            # slowdown). Confirmed live: this was hardcoded to timedelta
+            # (minutes=5)/300 unconditionally, which happened to be
+            # correct for Continuous mode's own fixed-length segments but
+            # produced wrong ended_at/duration_seconds metadata for every
+            # Event-mode clip (persist_event_recording()'s output is 8s,
+            # 18s, 23s, etc., never a fixed length). Falls back to the
+            # historical 300s assumption only if ffprobe genuinely can't
+            # determine a real duration (never raises).
+            duration_seconds = _probe_recording_duration_seconds(path)
+            if duration_seconds is None:
+                duration_seconds = 300.0
+            ended = started + timedelta(seconds=duration_seconds)
 
             db.execute(
                 "INSERT INTO recordings("
