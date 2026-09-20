@@ -269,6 +269,41 @@ def test_customer_list_survives_a_row_with_genuinely_null_optional_fields(http_c
     assert "no trial" in response.text
 
 
+def test_customer_detail_survives_a_plan_row_with_null_pricing_and_resolution(http_client):
+    """Confirmed live on staging (2026-09-20): a real plan row (resolution,
+    retail_monthly, partner_monthly all genuinely NULL -- a plan that was
+    never fully priced/configured) 500'd the customer detail page for
+    every administrator with TypeError: unsupported format string passed
+    to NoneType.__format__ -- current.get('retail_monthly',0):,.2f applies
+    a numeric format spec directly to None, since dict.get(key, default)
+    only substitutes default when the KEY is absent, not when its value
+    is None. Fixed by switching every current.get(key, default) on this
+    line (and the matching ones in the plan-update script) to
+    `.get(key) or default`, the same fix already applied to the customer
+    list's analogous bug."""
+    client, db_path = http_client
+    conn = sqlite3.connect(db_path)
+    _seed_partner(conn, "partner-1")
+    conn.execute(
+        "INSERT INTO customers(id,partner_id,name,email,status,trial_status,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("cust-null-plan", "partner-1", "Null Plan Customer", "null-plan@example.com", "active", "eligible", "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO plans(id,customer_id,resolution,recording_mode,retention_days,camera_quantity,retail_monthly,partner_monthly,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ("plan-null", "cust-null-plan", None, "motion", 7, 5, None, None, "quote", "2026-01-01"),
+    )
+    conn.commit()
+    _seed_global_administrator_grant(conn)
+    token = partner_portal._token("admin@example.test", "administrator", "partner-1", None, None)
+
+    response = client.get("/partner/customers/cust-null-plan", cookies={partner_portal.SESSION_COOKIE: token})
+
+    assert response.status_code == 200
+    assert "Null Plan Customer" in response.text
+    assert "Retail $0.00" in response.text
+    assert "Partner $0.00" in response.text
+
+
 def test_administrator_can_view_any_partners_customer_detail(http_client):
     client, db_path = http_client
     conn = sqlite3.connect(db_path)
