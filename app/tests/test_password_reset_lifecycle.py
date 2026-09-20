@@ -25,6 +25,7 @@ deliberately duplicated, not imported.
 """
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -263,6 +264,137 @@ def test_every_reset_page_source_includes_the_csrf_header():
             response = client.get(path)
             assert response.status_code == 200, path
             assert "'X-CSRF-Token':csrf()" in response.text, path
+
+
+# --------------------------------------------------------------- legacy quoted/padded CSRF cookie (2026-09-20)
+#
+# Independently confirmed (Codex review of commit 1b9e5f5): token_
+# security.py's sign() strips base64 '=' padding specifically so http.
+# cookies never wraps the Set-Cookie value in double quotes for a
+# FRESHLY issued cookie -- but every hand-written client-side csrf()
+# helper across this app (partner.html, customer-login.html, and all
+# four cloud_features.py password-reset pages) read that cookie back
+# with `.split('=')[1]`, which only keeps the text up to the FIRST '='
+# in the whole "anyaicam_csrf=<value>" substring. A LEGACY cookie
+# issued before sign()'s own padding-stripping fix (still sitting in a
+# real browser that visited this deployment before that fix shipped --
+# unsign() itself already re-pads specifically to accept such a token)
+# is quoted AND contains internal '=' padding, so naive [1] truncates
+# it, and the truncated value is sent as X-CSRF-Token -- silently
+# mismatching the real (already-unquoted-by-Starlette) cookie value
+# server-side, 403ing every submission. The main.py shell() wrapper's
+# own auto-injected fetch patch already used the correct `.split('=').
+# slice(1).join('=')` extraction (which is exactly why /reset-password
+# and /forgot-password, both shell()-wrapped, were never provably
+# broken by this -- see this file's own note on that dead end); the
+# standalone pages had no such protection.
+_LEGACY_COOKIE_CSRF_SOURCES = (
+    "/forgot-password", "/customer-forgot-password", "/reset-password", "/customer-reset-password",
+)
+_NAIVE_BROKEN_CSRF_PATTERN = "?.split('=')[1]||''"
+_FIXED_CSRF_PATTERN = "m.split('=').slice(1).join('=')"
+
+
+def test_no_reset_page_uses_the_truncating_csrf_cookie_read():
+    with TestClient(main.app) as client:
+        for path in _LEGACY_COOKIE_CSRF_SOURCES:
+            response = client.get(path)
+            assert _NAIVE_BROKEN_CSRF_PATTERN not in response.text, path
+            assert _FIXED_CSRF_PATTERN in response.text, path
+
+
+def test_partner_html_and_customer_login_html_use_the_fixed_csrf_cookie_read():
+    """partner.html/customer-login.html are standalone pages (not shell()-
+    wrapped), so admin/partner login itself carried the exact same
+    truncation bug -- a real login attempt with a legacy quoted cookie
+    still present would 403 on CSRF before credentials are even checked."""
+    app_dir = Path(__file__).resolve().parents[1]
+    for name in ("partner.html", "customer-login.html"):
+        source = (app_dir / name).read_text(encoding="utf-8")
+        assert _NAIVE_BROKEN_CSRF_PATTERN not in source, name
+        assert _FIXED_CSRF_PATTERN in source, name
+
+
+def test_csrf_helper_correctly_extracts_a_legacy_quoted_padded_cookie_value():
+    """Proves the fixed extraction logic itself (not just its absence/
+    presence as a string) against the exact byte shape a legacy cookie
+    actually has: base64 padding ('=') plus the double-quote wrapping
+    http.cookies applies around any value containing it. Runs the real
+    extracted JS snippet under Node (already a project dependency via
+    the repo's own JS assets) against a mocked document.cookie -- more
+    rigorous than a source-text assertion alone."""
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available in this environment")
+
+    app_dir = Path(__file__).resolve().parents[1]
+    source = (app_dir / "partner.html").read_text(encoding="utf-8")
+    start = source.index("const csrf=()=>{")
+    end = source.index("};", start) + 2
+    csrf_fn_source = source[start:end]
+
+    # The exact shape a legacy pre-fix cookie has: quoted, with internal
+    # '=' padding -- e.g. Set-Cookie: anyaicam_csrf="MTIz:csrf:abc="
+    legacy_value = "MTIz:csrf:abcdef=="
+    mocked_document_cookie = f'other=1; anyaicam_csrf="{legacy_value}"; more=2'
+
+    script = f"""
+    const document = {{cookie: {json.dumps(mocked_document_cookie)}}};
+    {csrf_fn_source}
+    console.log(JSON.stringify(csrf()));
+    """
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    extracted = json.loads(result.stdout.strip())
+    assert extracted == legacy_value
+
+
+# --------------------------------------------------------------- reset-request pages must not fake success on error (2026-09-20)
+#
+# Independently confirmed (Codex review): /forgot-password and /customer-
+# forgot-password both unconditionally treated the response body as the
+# success shape (`r.message` / `r.message||'...prepared.'`) without ever
+# checking response.ok first. A CSRF failure (or any other error) returns
+# {"detail": "..."} with no `message` key -- so `r.message` is undefined,
+# and customer-forgot-password's own `||` fallback then displayed the
+# exact same reassuring "If the account exists..." text a real success
+# shows, silently hiding the failure from the user. /reset-password and
+# /customer-reset-password's own COMPLETE-step handlers were already
+# correct (`r.message||r.detail`, unconditional either way is fine there
+# since both fields never collide) -- this defect was specific to the
+# two REQUEST-step pages.
+
+
+def test_forgot_password_pages_surface_the_real_error_instead_of_fake_success():
+    app_dir = Path(__file__).resolve().parents[1]
+    source = (app_dir / "cloud_features.py").read_text(encoding="utf-8")
+    assert "showToast(response.ok?r.message:(r.detail||'Request failed.'))" in source
+    assert "box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed.')" in source
+
+
+def test_forgot_password_request_shows_the_real_csrf_failure_not_generic_success(db_path, monkeypatch):
+    """Real HTTP proof: submitting /api/password-reset/request WITHOUT a
+    CSRF header (the exact failure a stale/legacy cookie situation would
+    still produce for any request that somehow reaches the server without
+    a valid token) must be distinguishable from success at the response
+    level that the page's own JS branches on."""
+    csrf_settings = _csrf_enabled_cloud_production()
+    monkeypatch.setattr(cloud_security, "settings", csrf_settings)
+    monkeypatch.setattr(cloud_features, "settings", csrf_settings)
+
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        with TestClient(main.app) as client:
+            client.get("/forgot-password")
+            response = client.post("/api/password-reset/request", json={"email": "nobody@example.test"})
+            assert response.status_code == 403
+            body = response.json()
+            assert "message" not in body
+            assert body["detail"] == "CSRF validation failed."
 
 
 def test_reset_password_completes_with_real_csrf_middleware_enforced(db_path, monkeypatch):
