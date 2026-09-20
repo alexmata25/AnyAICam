@@ -10,6 +10,7 @@ APPLIANCE_* env vars are set does password verification for the
 Partner/Administrator/Technician buckets move to the signed,
 grant-scoped cloud-identity contract.
 """
+import logging
 import secrets
 import sqlite3
 import time
@@ -17,6 +18,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+import appliance_activation
 import appliance_identity
 import main
 import partner_portal
@@ -194,3 +196,94 @@ def test_cloud_unavailable_does_not_affect_an_already_established_session(http_c
 
     response = client.get("/partner", cookies={partner_portal.SESSION_COOKIE: cookie_value})
     assert response.status_code == 200  # the existing session still works; no cloud call was made to view this page
+
+
+# =============================================================== stray non-edge appliance identity (2026-09-20)
+#
+# Confirmed live on staging: a persisted appliance_identity.json left
+# over from unrelated activation testing 9 days earlier made THIS exact
+# cloud-role deployment's own_appliance_identity() return truthy,
+# silently diverting every /api/portal-login attempt into the cloud-
+# delegated branch above instead of ever checking partner_db -- a real
+# administrator account (a fresh password reset, correctly consumed,
+# password_hash genuinely changed) could not log in, and the failure
+# was byte-for-byte indistinguishable from a wrong password. own_
+# appliance_identity() being truthy makes sense only for a genuine edge
+# appliance authenticating against a separate cloud service; a cloud/
+# combined/staging portal is never itself "an activated appliance", so
+# portal_login_submit() now requires RUNTIME_ROLE=="edge" explicitly
+# before trusting either identity source, and logs loudly if a stray
+# identity is ever present without it.
+
+
+def test_stray_persisted_identity_on_a_non_edge_deployment_is_ignored(http_client, monkeypatch, caplog):
+    client, db_path = http_client
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    monkeypatch.delenv("ANYAICAM_APPLIANCE_ID", raising=False)
+    monkeypatch.delenv("ANYAICAM_APPLIANCE_CLOUD_ID", raising=False)
+    monkeypatch.delenv("ANYAICAM_APPLIANCE_CREDENTIAL", raising=False)
+    # The exact stray-file shape found live, standing in for
+    # load_persisted_identity()'s real file read.
+    monkeypatch.setattr(appliance_activation, "load_persisted_identity", lambda: {
+        "appliance_id": "stray-appl", "cloud_id": "AIC-STRAY0001", "credential": "irrelevant",
+        "customer_id": "stray-cust", "site_id": "stray-site", "partner_id": None,
+        "activated_at": "2026-09-11T07:23:02", "activation_version": 1,
+    })
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-1", "Partner", "approved", "real", "2026-08-27T00:00:00"))
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)", ("u1", "partner-1", "real-admin@example.test", "Admin", "administrator", password_hash("Sup3rSecret!"), 1, "2026-08-27T00:00:00"))
+
+    with caplog.at_level(logging.WARNING, logger="anyaicam.main"):
+        response = client.post(
+            "/api/portal-login",
+            json={"email": "real-admin@example.test", "password": "Sup3rSecret!", "portal": "administrator"},
+            follow_redirects=False,
+        )
+
+    # The real account authenticates normally through partner_db --
+    # the stray identity never gets a chance to divert it.
+    assert response.status_code == 303
+    assert partner_portal.SESSION_COOKIE in response.cookies
+    assert any("portal_login.stray_appliance_identity_ignored" in record.message for record in caplog.records), \
+        "a stray identity mismatch must be logged, never silent"
+
+
+def test_stray_persisted_identity_never_denies_login_even_with_a_wrong_password(http_client, monkeypatch):
+    """Distinguishes the fix from merely making the delegated path fail
+    open: with the stray identity ignored, a genuinely wrong password
+    must still be rejected exactly as it always was, through the normal
+    partner_db check -- not silently accepted."""
+    client, db_path = http_client
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    monkeypatch.delenv("ANYAICAM_APPLIANCE_ID", raising=False)
+    monkeypatch.delenv("ANYAICAM_APPLIANCE_CLOUD_ID", raising=False)
+    monkeypatch.delenv("ANYAICAM_APPLIANCE_CREDENTIAL", raising=False)
+    monkeypatch.setattr(appliance_activation, "load_persisted_identity", lambda: {
+        "appliance_id": "stray-appl", "cloud_id": "AIC-STRAY0001", "credential": "irrelevant",
+        "customer_id": "stray-cust", "site_id": "stray-site", "partner_id": None,
+        "activated_at": "2026-09-11T07:23:02", "activation_version": 1,
+    })
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-1", "Partner", "approved", "real", "2026-08-27T00:00:00"))
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)", ("u1", "partner-1", "real-admin@example.test", "Admin", "administrator", password_hash("Sup3rSecret!"), 1, "2026-08-27T00:00:00"))
+
+    response = client.post(
+        "/api/portal-login",
+        json={"email": "real-admin@example.test", "password": "wrong-password", "portal": "administrator"},
+    )
+    assert response.status_code == 401
+
+
+def test_a_stray_identity_on_a_genuine_edge_deployment_is_unaffected(http_client, monkeypatch):
+    """RUNTIME_ROLE=="edge" is the one case where own_appliance_identity()
+    being truthy is legitimate -- this fix must never break that."""
+    client, db_path = http_client
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
+    _seed_appliance_and_operator(db_path)
+    _configure_own_appliance(monkeypatch)
+
+    response = client.post("/api/portal-login", json={"email": "amata@anyaicam.com", "password": "Sup3rSecret!", "portal": "administrator"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin-portal"

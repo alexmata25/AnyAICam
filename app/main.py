@@ -44909,6 +44909,27 @@ def portal_login_submit(request: Request, payload: dict):
     partner_user: dict | None = None
     partner_authorization_version: int | None = None
     partner_administrator_scope: str | None = None
+    # Confirmed live on staging (2026-09-20): a persisted appliance_
+    # identity.json left over from unrelated activation testing 9 days
+    # earlier made this exact "cloud" role deployment's own_appliance_
+    # identity() return truthy, silently diverting EVERY /api/portal-
+    # login attempt into the cloud-delegated authenticate_operator()
+    # branch below -- which only ever makes sense for a real edge
+    # appliance authenticating against a SEPARATE cloud service -- and
+    # away from checking partner_db at all. A cloud/combined/staging
+    # portal is never itself "an activated appliance"; own_appliance_
+    # identity() being truthy here can only mean stray state, not a
+    # real activation, so this branch now requires RUNTIME_ROLE=="edge"
+    # explicitly rather than trusting the file's mere presence -- and
+    # logs loudly (not silently) if that mismatch is ever seen again,
+    # instead of producing an indistinguishable "Invalid email or
+    # password" for every account on the box.
+    if own_appliance and RUNTIME_ROLE != "edge":
+        logging.getLogger("anyaicam.main").warning(
+            "portal_login.stray_appliance_identity_ignored appliance_id=%s cloud_id=%s runtime_role=%s",
+            own_appliance.get("appliance_id"), own_appliance.get("cloud_id"), RUNTIME_ROLE,
+        )
+        own_appliance = None
     if own_appliance and selected_portal in PORTAL_SELECTOR_OPTIONS:
         from appliance_identity import CloudIdentityUnavailable, ManifestError, get_cloud_identity_backend, verify_assertion
 
