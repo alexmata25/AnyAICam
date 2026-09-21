@@ -37497,6 +37497,12 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     # own documented merge rule.
     event_clip_path: str | None = None
     primary_class_name: str | None = None
+    # Pre-initialized (2026-09-22, see the PPE dedup fix below): only ever
+    # reassigned inside `if qualifying_detections:` just below, so a scan
+    # with no qualifying detection at all -- meaning PPE's own "person"
+    # check further down can't fire either -- still leaves this name bound
+    # for the rest of the function instead of risking a NameError.
+    is_duplicate = False
     qualifying_detections = [
         detection for detection in detections
         if detection["class_name"] in AI_CLIP_EVENT_TYPES
@@ -37848,7 +37854,21 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # the first successful config poll) means not-yet-entitled, not
         # "assume yes".
         ppe_identity = recording_uploader._camera_identity(camera_number)
-        if class_name == "person" and ppe.is_camera_enabled(camera_number) and bool(ppe_identity and ppe_identity.get("ppe_enabled")):
+        # 2026-09-22: `and not is_duplicate` added -- confirmed live on
+        # Ryzen (real production data, staging customer
+        # d75bdbecdd4887de4d2b89a9fcea9092): Living Room alone had 1,419
+        # 'ppe' events over 11 hours, ~1 every 28s, because this loop
+        # created a brand new event on EVERY qualifying scan with zero
+        # merge/debounce of its own -- a person simply sitting in frame
+        # (never actually wearing PPE, since this is a residential room)
+        # was re-recorded as a fresh "PPE violation" every single scan
+        # for as long as they stayed in view. is_duplicate is the exact
+        # same per-camera should_merge() signal that already gives the
+        # primary AI-classified event's own Hybrid clip build "one clip
+        # per real continuous event, not one per scan" -- reused here so
+        # PPE gets the identical, already-proven duplicate-suppression
+        # semantics instead of a second, bespoke mechanism.
+        if class_name == "person" and ppe.is_camera_enabled(camera_number) and bool(ppe_identity and ppe_identity.get("ppe_enabled")) and not is_duplicate:
             for person_detection in class_detections:
                 try:
                     hx, hy, hw, hh = (

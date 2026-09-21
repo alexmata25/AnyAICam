@@ -183,15 +183,19 @@ def test_ppe_event_in_same_scan_as_its_own_clip_still_gets_no_shared_media(
     )
 
 
-def test_ppe_event_with_no_clip_in_this_scan_also_registers_nothing(
+def test_ppe_event_is_suppressed_when_merged_into_the_immediately_prior_window(
     monkeypatch, tmp_path, fake_media_pipeline
 ):
-    """No qualifying AI-clip class in this particular call (a bare 'person'
-    detection whose own scan produced no event_clip_path, e.g. because it
-    merged into the immediately-prior window) -- confirms the PPE event
-    still creates its own independent analytics record and still makes
-    zero media calls, exactly the pre-existing, unaffected shape for a
-    clip-less scan."""
+    """2026-09-22 fix, updated from this test's original characterization
+    (a bare 'person' detection whose own scan merged into the immediately-
+    prior window used to still get its own independent PPE analytics
+    record every time -- confirmed live on real production data: Living
+    Room alone produced 1,419 'ppe' events over 11 hours, ~1 every 28s,
+    because nothing suppressed a repeat scan of the same person still
+    sitting in frame). PPE now reuses the exact same is_duplicate signal
+    that already gives the primary AI-classified event's own Hybrid clip
+    build "one per real continuous event" semantics -- a merged/duplicate
+    scan now creates NO new PPE event at all, not just no media call."""
     monkeypatch.setattr(main, "_ai_event_media_loop", None)
     _standard_mocks(monkeypatch, tmp_path)
 
@@ -226,6 +230,47 @@ def test_ppe_event_with_no_clip_in_this_scan_also_registers_nothing(
     thread.start()
     thread.join(timeout=5)
 
-    assert any(e["event_type"] == "ppe" for e in analytics_events)
+    assert not any(e["event_type"] == "ppe" for e in analytics_events), (
+        "a scan merged into the immediately-prior window must not create "
+        "a second PPE event for the same continuous real-world presence"
+    )
     assert fake_media_pipeline.upload_calls == []
     assert fake_media_pipeline.register_calls == []
+
+
+def test_two_real_consecutive_scans_of_the_same_person_produce_one_ppe_event(
+    monkeypatch, tmp_path, fake_media_pipeline
+):
+    """Direct reproduction of the real production symptom (1,419 'ppe'
+    events on one camera over 11 hours): two genuine, independent
+    save_yolo_events() calls a moment apart for the same camera -- no
+    manual clip-window pre-seeding this time, just two real calls close
+    enough in wall-clock time to be should_merge()-classified as the same
+    continuous presence -- must produce exactly one PPE analytics event,
+    not two."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", None)
+    _standard_mocks(monkeypatch, tmp_path)
+
+    analytics_events = []
+    monkeypatch.setattr(main, "append_analytics_event", lambda event: analytics_events.append(event))
+    monkeypatch.setattr(main.ppe, "is_camera_enabled", lambda camera_number: True)
+    monkeypatch.setattr(
+        main.recording_uploader, "_camera_identity",
+        lambda camera_number: {"ppe_enabled": True, "smart_motion_enabled": False},
+    )
+    monkeypatch.setattr(
+        main.ppe, "detect_ppe",
+        lambda crop, camera_number=None: {
+            "hard_hat_present": False, "safety_vest_present": False, "confidence": 0.6,
+        },
+    )
+    monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda camera_number: False)
+    monkeypatch.setattr(main.lpr, "is_camera_enabled", lambda camera_number: False)
+
+    main.save_yolo_events(173, _fake_result("person"))
+    main.save_yolo_events(173, _fake_result("person"))  # a moment later -- same real presence
+
+    ppe_events = [e for e in analytics_events if e["event_type"] == "ppe"]
+    assert len(ppe_events) == 1, (
+        f"expected exactly one PPE event for one continuous presence, got {len(ppe_events)}"
+    )
