@@ -73911,6 +73911,23 @@ def dashboard(request: Request) -> str:
         _dashboard_recording_stat = "—"
     else:
         _dashboard_recording_stat = "Continuous"
+    # Plan indicator (2026-09-21): status only, deliberately no pricing
+    # here -- the dashboard's own job is "what plan am I on", never "how
+    # much does it cost" or a Local-vs-Hybrid comparison (that detail
+    # lives entirely on /subscription-portal, "My subscription", linked
+    # right below). Derived from the same product_mode_for_customer()
+    # a real customer_owner/customer_viewer session's own /subscription-
+    # portal branch uses -- never a second, possibly-diverging read of
+    # the same entitlement.
+    if _customer_dashboard_cameras is not None:
+        from customer_entitlements import product_mode_for_customer
+        from partner_portal import partner_identity
+        _dashboard_identity = partner_identity(request)
+        _dashboard_plan_stat = {"local": "Local", "hybrid": "Hybrid"}.get(
+            product_mode_for_customer(_dashboard_identity["customer_id"]) if _dashboard_identity else "", "No active plan",
+        )
+    else:
+        _dashboard_plan_stat = None
 
 
 
@@ -74828,6 +74845,7 @@ def dashboard(request: Request) -> str:
 
 
 
+        {f'<a class="stat" href="/subscription-portal" style="text-decoration:none;color:inherit"><span class="stat-label">Plan</span><span class="stat-value">{_dashboard_plan_stat}</span></a>' if _dashboard_plan_stat is not None else ''}
         <div class="stat"><span class="stat-label">Recording</span><span class="stat-value">{_dashboard_recording_stat}</span></div>
 
 
@@ -103258,6 +103276,112 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
+def _customer_subscription_portal_page(identity: dict) -> str:
+    """The real-customer branch of GET /subscription-portal -- see that
+    route's own comment for why this exists as a separate function
+    entirely rather than a branch threaded through the ~1400-line legacy
+    body below it (that body is current_user()-keyed staff/legacy
+    content this function must never touch or risk). Every fact shown
+    here comes from the same authoritative sources partner_workspace.py's
+    customer setup review step already established: customer_
+    entitlements (camera-slot plan + Local/Hybrid mode) and analytics_
+    entitlements (add-ons) -- never a static/mock JSON file."""
+    from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS, product_mode_for_customer
+    from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
+
+    customer_id = identity["customer_id"]
+    mode = product_mode_for_customer(customer_id)
+    entitlements = get_entitlements_for_customer(customer_id)
+    camera_entitlement = next((e for e in entitlements if e["product"] in ("camera_slots_local", "camera_slots_hybrid") and e["status"] == "active"), None)
+    licensed_slots = total_camera_slots(customer_id)
+    if camera_entitlement:
+        plan_type = "hybrid" if camera_entitlement["product"] == "camera_slots_hybrid" else "local"
+        tier_label = next((t[1] for t in PLAN_TIERS if t[0] == plan_type and t[4] == camera_entitlement["camera_slot_quantity"]), f"{licensed_slots} cameras")
+        plan_summary = f"{plan_type.title()} {tier_label} &middot; {licensed_slots} licensed camera slots"
+    else:
+        plan_summary = "No camera-slot plan purchased yet"
+
+    # Plan-badge text is deliberately derived from `mode` (product_mode_
+    # for_customer(), Hybrid-wins-if-both-active) rather than
+    # camera_entitlement['product'] alone -- see that function's own
+    # docstring for why Hybrid must win the instant an upgrade purchase
+    # completes, even before any decision is made about a now-redundant
+    # Local entitlement.
+    plan_badge = {"local": "Local", "hybrid": "Hybrid"}.get(mode, "No active plan")
+
+    hybrid_tier_options = [
+        {"tier_label": t[1], "camera_slot_maximum": t[4], "monthly_retail_usd": t[5]}
+        for t in PLAN_TIERS if t[0] == "hybrid" and os.environ.get(t[6], "").strip()
+    ]
+    upgrade_tier = None
+    if mode == "local" and camera_entitlement:
+        upgrade_tier = next((t for t in hybrid_tier_options if t["camera_slot_maximum"] == camera_entitlement["camera_slot_quantity"]), None)
+
+    active_analytics = set(get_active_analytics_for_customer(customer_id))
+    addon_rows = ""
+    for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
+        price_id = os.environ.get(env_var, "").strip()
+        if not price_id:
+            continue
+        is_active = bool(analytic_keys) and all(key in active_analytics for key in analytic_keys)
+        status_html = '<span class="pill">Active</span>' if is_active else f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
+        addon_rows += f'<div class="health-row"><span>{escape(label)}</span>{status_html}</div>'
+    if not addon_rows:
+        addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
+
+    upgrade_panel = ""
+    if upgrade_tier:
+        upgrade_panel = (
+            f'<div id="upgrade-to-hybrid" class="panel" style="margin-top:14px">'
+            f'<h3 style="margin-top:0">Upgrade to Hybrid</h3>'
+            f'<p class="health-detail">Get cloud identity, remote access, event-media upload, analytics sync, notifications, and relay/P2P live view -- {escape(upgrade_tier["tier_label"])} cameras for ${upgrade_tier["monthly_retail_usd"]}/mo. Your cameras, recordings, and analytics settings all carry over.</p>'
+            f'<button class="action-button" id="subscription-upgrade-button" data-tier-label="{escape(upgrade_tier["tier_label"],quote=True)}">Upgrade to Hybrid</button>'
+            f'<p id="subscription-upgrade-message" class="health-detail"></p>'
+            f'</div>'
+        )
+
+    content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
+    <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
+    <p>{plan_summary}</p>
+    <p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p>
+    </section>
+    <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
+    <div class="health-row"><span><strong>Local</strong> &middot; one-time purchase</span><span>Local recording, playback, live view, analytics, and licensing -- no required cloud dependency for normal operation.</span></div>
+    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything Local has, plus cloud identity/services, remote access, event-media upload, analytics sync, notifications, and relay/P2P live view.</span></div>
+    </section>
+    {upgrade_panel}
+    <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
+    {addon_rows}
+    <p id="subscription-addon-message" class="health-detail"></p>
+    </section>'''
+    scripts = '''<script>
+    const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
+    if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
+      const tier_label=subscriptionUpgradeButton.dataset.tierLabel;
+      subscriptionUpgradeButton.disabled=true;subscriptionUpgradeButton.textContent='Redirecting to Stripe…';
+      const messageEl=document.getElementById('subscription-upgrade-message');messageEl.textContent='';
+      let response,r;
+      try{response=await fetch('/api/customer/camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type:'hybrid',tier_label})});r=await response.json()}
+      catch(error){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+      if(!response.ok){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
+      location.href=r.checkout_url
+    };
+    document.querySelectorAll('.addon-buy-button').forEach(button=>{
+      button.onclick=async()=>{
+        const addon_key=button.dataset.addonKey;
+        button.disabled=true;button.textContent='Redirecting…';
+        const messageEl=document.getElementById('subscription-addon-message');messageEl.textContent='';
+        let response,r;
+        try{response=await fetch('/api/customer/analytics/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addon_key})});r=await response.json()}
+        catch(error){button.disabled=false;button.textContent='Add';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+        if(!response.ok){button.disabled=false;button.textContent='Add';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
+        location.href=r.checkout_url
+      }
+    });
+    </script>'''
+    return page_shell("My subscription", "subscription-portal", content, scripts)
+
+
 @app.get("/subscription-portal", response_class=HTMLResponse)
 
 
@@ -103268,6 +103392,33 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 def subscription_portal_page(request: Request) -> str:
+    # Real-customer branch (2026-09-21): current_user(request) below is
+    # the legacy local-VMS auth (authenticated_user()/cloud_
+    # administrator_bridge(), NEVER partner_identity()) -- a real
+    # customer_owner/customer_viewer session (the partner-portal cookie
+    # every other customer-facing page in this file already checks) is
+    # invisible to it and falls through to the anonymous/viewer stub,
+    # so this page's entire legacy body below (billing_account_for_
+    # user(), license_enforcement_snapshot(), static/mock subscription-
+    # request data) has never reflected a real customer's actual
+    # Local/Hybrid camera-slot entitlement or analytics add-ons -- it
+    # is a different, older subscription concept entirely (Starter/
+    # Professional/Enterprise license tiers, not camera_slots_local/
+    # camera_slots_hybrid). This branch gives a real customer session
+    # the genuinely correct page instead: current plan, a Local/Hybrid
+    # comparison, an entitlement/billing-driven Upgrade-to-Hybrid
+    # action (the exact same /api/customer/camera-slots/checkout
+    # endpoint and panel already proven on the customer setup page),
+    # and their real analytics add-ons (analytics_entitlements.
+    # ANALYTICS_CATALOG / get_active_analytics_for_customer() -- never
+    # a static/mock JSON file). Falls through to the untouched legacy
+    # body below for every other caller (staff, the old local-VMS
+    # identity, or no identity at all) -- zero behavior change there.
+    from partner_portal import partner_identity
+    _subscription_identity = partner_identity(request)
+    if _subscription_identity and _subscription_identity.get("role") in CUSTOMER_PORTAL_ROLES:
+        return _customer_subscription_portal_page(_subscription_identity)
+
 
 
 
