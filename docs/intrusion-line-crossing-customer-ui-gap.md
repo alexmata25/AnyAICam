@@ -179,3 +179,164 @@ What is explicitly still NOT real, and must not be described as working:
   branch's own still-non-tenant-safe JSON file) is the most direct next
   step, but was not done here per the explicit instruction not to fake
   detector behavior while building this foundation.
+
+## Update, 2026-09-21 (continued): full runtime-path trace, checkpoint by checkpoint
+
+Traced by direct code inspection (not inference) exactly what happens
+after a rule is saved, for both rule types, against the 7 checkpoints
+requested: storage -> edge appliance receipt -> worker -> frames/
+detections -> event-creation condition -> Event-mode clip link ->
+Events/Investigate. Documented here rather than only asserted, and
+backed by 4 new regression tests
+(`test_creating_updating_and_deleting_a_rule_never_writes_the_local_
+analytics_events_file`, `test_creating_and_updating_a_rule_never_
+creates_a_detection_events_row`, `test_no_existing_worker_or_sync_
+module_reads_the_new_rules_table_yet`, and a page-copy guard against
+ever implying live detection) that fail the moment any of these
+boundaries starts being crossed without a real implementation behind it.
+
+### First, the architecture this trace depends on (established by code, not assumed)
+
+The appliance and the cloud portal are two separate deployments of this
+codebase with two separate SQLite databases, linked only by a small set
+of narrow, purpose-built one-way channels -- confirmed directly from
+`analytics_sync.py`'s own module docstring: it runs ON the appliance,
+reads the appliance's own **local file** (`ANALYTICS_EVENTS_FILE`,
+written by `save_yolo_events()`/`append_analytics_event()`), and
+forwards each event with an outbound HTTP POST to
+`/api/appliance/analytics/{camera_id}/events` -- a route defined in
+`appliance_cloud.py` that runs on the **cloud** side and inserts into
+the cloud's own tenant-scoped `detection_events` table
+(`appliance_cloud.py:834-903`). This sync is gated by
+`ANYAICAM_ANALYTICS_SYNC_ENABLED`, one of the six flags this session's
+own product-mode work makes default-OFF in Local mode and default-ON in
+Hybrid mode. The only channel running the other direction (cloud ->
+appliance) found anywhere in this codebase is the coarse
+`appliance_commands` table, used today solely to request a `restart_vms`
+container restart (e.g. for a product-mode change) -- it carries no
+per-camera configuration or rule data of any kind.
+
+`customer_analytics_rules` (this new feature's table) is written and
+read exclusively through `partner_db.connection()` -- the same database
+every other customer-portal table already uses (`customers`, `cameras`,
+`customer_camera_permissions`, `live_view_sessions`, `recordings`,
+`detection_events`, etc.). Confirmed by a repository-wide grep: outside
+`customer_analytics_rules.py` itself, its own migration entry, and its
+own test file, **the string `customer_analytics_rules` appears nowhere
+else in this codebase.**
+
+### Line Crossing
+
+1. **Where the saved rule is stored.** Through this new feature:
+   `customer_analytics_rules` (real, tenant-scoped SQL table). The only
+   OTHER thing called "line crossing" that actually runs today is a
+   wholly separate, pre-existing feature -- People Counting's own line,
+   stored in the legacy, non-tenant-safe `analytics_rules.json`
+   (`ANALYTICS_RULES_FILE`) and read by `_load_people_counting_rule()`.
+   These are two disconnected storage locations; a rule saved through
+   this new customer UI is invisible to People Counting and vice versa.
+2. **How the edge appliance receives it.** For this new feature:
+   **no mechanism exists.** There is no code anywhere that reads a
+   `customer_analytics_rules` row and moves it onto an appliance for
+   local consumption, and (per the architecture section above) there is
+   no general-purpose cloud-to-appliance config-push channel it could
+   even ride on if one were written. For the legacy People-Counting
+   line: "receipt" is a non-issue by construction -- `analytics_rules.json`
+   is a local file written directly on the same machine
+   `people_counting_worker()` runs on (an admin/technician-configured
+   file, not something synced from anywhere).
+3. **Which worker/process reads it.** New feature: **none.** Legacy
+   People-Counting line: `people_counting_worker()`
+   (`app/main.py:38132`), one `asyncio` task per camera, started when
+   `PEOPLE_COUNTING_ENABLED` and re-checking entitlement + rule every
+   cycle.
+4. **What camera frames/detections feed it.** New feature: nothing --
+   no worker exists to call anything. Legacy People-Counting line:
+   `detect_objects_frame(camera_number)` -- the exact same YOLO
+   inference `ai_person_detector()` already uses, invoked under the
+   shared `ai_inference_semaphore` so it cannot starve other detectors
+   of the one shared model (a real, previously-fixed starvation bug --
+   see that function's own 2026-09-22 comment).
+5. **What condition creates an event.** New feature: no condition
+   exists -- there is no geometry evaluation code path for this table on
+   this branch. `app/analytics_rules_engine.py` (the real
+   `_signed_distance_to_line()` side-flip/direction state machine) exists
+   only on the divergent, unmerged `analytics-rules-foundation-20260821`
+   branch and is wired to nothing here. Legacy People-Counting line:
+   `people_counting.PeopleCounter.update(centroids)` -- a real,
+   deterministic tracker keyed on each detected person's foot-point
+   crossing the configured line, direction-aware.
+6. **How the event links to the Event-mode recording.** New feature:
+   N/A -- no event is ever created. Legacy People-Counting line:
+   `linked_recording_for(camera_number, now)` locates the real local
+   Event-mode `.mkv` segment covering the crossing's timestamp and
+   windows playback to pre-roll + event + post-roll via
+   `compute_clip_window()` -- the same clip-linking function every other
+   event type in this codebase uses.
+7. **How it appears in Events/Investigate.** New feature: it never does
+   -- nothing is ever appended anywhere. Legacy People-Counting line:
+   `append_analytics_event()` appends the event to the same local
+   `ANALYTICS_EVENTS_FILE`; `analytics_events()` reads that file back for
+   the Investigate page, which categorizes it under the existing
+   `people_counting` filter chip (`_aaco_event_category()`). In Hybrid
+   mode only, `analytics_sync.py` additionally forwards that same event
+   to the cloud's `detection_events` table (see architecture section
+   above) so it is also visible from a remote customer-portal session;
+   in Local mode it stays local-only, visible on-device immediately.
+
+### Intrusion
+
+1. **Where the saved rule is stored.** Through this new feature:
+   `customer_analytics_rules` (real, tenant-scoped SQL table, `rule_type
+   ='intrusion'`). Unlike line-crossing, there is no OTHER intrusion
+   storage anywhere that does anything -- the legacy admin rule builder
+   can save an `analytic_type="intrusion"` row into
+   `analytics_rules.json` too, but nothing has ever read that row back
+   for detection (confirmed by this doc's own earlier "second finding"
+   section, from before this new feature existed).
+2. **How the edge appliance receives it.** No mechanism exists -- same
+   finding as line-crossing, and here there is not even a legacy analog
+   to fall back on.
+3. **Which worker/process reads it.** None. There is no
+   `intrusion_worker()` or equivalent anywhere in this codebase, on this
+   branch or the legacy path.
+4. **What camera frames/detections feed it.** Nothing -- no worker
+   exists to call `detect_objects_frame()` or anything else on behalf of
+   an intrusion rule.
+5. **What condition creates an event.** No condition exists. The real
+   dwell-timer/point-in-polygon logic
+   (`_evaluate_intrusion()`/`_point_in_polygon()`) exists only on the
+   divergent `analytics-rules-foundation-20260821` branch and, even
+   there, still reads the same non-tenant-safe JSON file -- it was never
+   pointed at a real per-tenant table on any branch.
+6. **How the event links to the Event-mode recording.** N/A -- no event
+   is ever created, so `linked_recording_for()` is never invoked on
+   intrusion's behalf.
+7. **How it appears in Events/Investigate.** It never does. A customer
+   drawing and saving an intrusion zone today gets confirmation that the
+   zone was saved -- nothing more. No alert, no event, no clip, ever,
+   for this rule type on this branch.
+
+### The three real, independent gaps between "rule saved" and "customer sees a detection"
+
+Stated separately because each one is its own unit of future work, not
+one monolithic "wire it up" task:
+
+1. **No cloud -> appliance delivery channel** for this data type (or any
+   per-camera configuration/rule data) -- only the coarse `restart_vms`
+   command channel exists in that direction today.
+2. **No consuming worker** on the appliance side, even hypothetically --
+   confirmed by grep against `people_counting_worker()`, `analytics_
+   sync.py`, `appliance_cloud.py`, and `event_media_uploader.py`,
+   enforced going forward by
+   `test_no_existing_worker_or_sync_module_reads_the_new_rules_table_yet`.
+3. **No tenant-safe geometry/tracking engine wired to anything** --
+   `analytics_rules_engine.py`'s real implementation is stranded on an
+   unmerged branch and, even there, was never pointed at a real
+   per-tenant table.
+
+Any one of these being fixed in isolation would still leave "a customer
+draws a rule and it does nothing" true. All three need real
+implementations, in this order (storage -> delivery -> evaluation),
+before either rule type is an operating analytics feature rather than a
+drawing tool.

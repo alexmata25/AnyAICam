@@ -344,3 +344,92 @@ def test_the_analytics_rules_page_renders_for_an_authorized_owner(http_client, d
 def test_the_analytics_rules_page_redirects_a_non_customer_role(http_client, db_path):
     response = http_client.get("/customer/cameras/cam-1/analytics-rules")
     assert response.status_code == 303
+
+
+def test_the_analytics_rules_page_never_claims_live_detection_is_active(http_client, db_path):
+    """Companion to the 'edge worker' disclosure check above -- guards
+    against a future edit accidentally adding UI copy (a status pill,
+    a word like 'Active'/'Detecting'/'Monitoring') that would imply
+    this feature evaluates anything, which it does not (see the
+    runtime-path trace in docs/intrusion-line-crossing-customer-ui-gap.md)."""
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-1")
+    _seed_camera(conn, "cam-1", customer_id="cust-1", camera_number=1)
+    conn.commit()
+    conn.close()
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+    html = http_client.get("/customer/cameras/cam-1/analytics-rules", cookies=cookies).text
+    for forbidden in ("Detecting", "Monitoring", "Active now", "is watching"):
+        assert forbidden not in html
+
+
+# ------------------------------------------------------------- runtime-path boundary
+#
+# The rest of this file locks in, as executable regression tests rather
+# than only prose, the exact boundary documented in
+# docs/intrusion-line-crossing-customer-ui-gap.md's "Update, 2026-09-21"
+# section: saving a rule through this feature persists geometry only --
+# it must never produce a side effect that looks like a real detection
+# (a local analytics-events-file append, a detection_events row, or a
+# reference from any existing worker/sync module). If a future change
+# makes any of these fail, that change has started faking execution and
+# needs its own real edge-worker implementation plus an update to that
+# doc, not a quiet pass here.
+
+
+def test_creating_updating_and_deleting_a_rule_never_writes_the_local_analytics_events_file(http_client, db_path, monkeypatch, tmp_path):
+    import main
+
+    fake_events_file = tmp_path / "analytics_events.json"
+    monkeypatch.setattr(main, "ANALYTICS_EVENTS_FILE", fake_events_file)
+
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-1")
+    _seed_camera(conn, "cam-1", customer_id="cust-1", camera_number=1)
+    conn.commit()
+    conn.close()
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+
+    rule_id = http_client.post(_rules_url("cam-1"), json=LINE, cookies=cookies).json()["id"]
+    http_client.put(_rules_url("cam-1", rule_id), json={"enabled": False}, cookies=cookies)
+    http_client.delete(_rules_url("cam-1", rule_id), cookies=cookies)
+
+    assert not fake_events_file.exists()
+
+
+def test_creating_and_updating_a_rule_never_creates_a_detection_events_row(http_client, db_path):
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-1")
+    _seed_camera(conn, "cam-1", customer_id="cust-1", camera_number=1)
+    conn.commit()
+    conn.close()
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+
+    rule_id = http_client.post(_rules_url("cam-1"), json=ZONE, cookies=cookies).json()["id"]
+    http_client.put(_rules_url("cam-1", rule_id), json={"enabled": False}, cookies=cookies)
+
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM detection_events").fetchone()[0]
+    conn.close()
+    assert count == 0
+
+
+def test_no_existing_worker_or_sync_module_reads_the_new_rules_table_yet(monkeypatch):
+    """This is the concrete, checkable form of 'no execution path exists
+    yet' -- see the runtime-path trace in
+    docs/intrusion-line-crossing-customer-ui-gap.md. Reference to the
+    table name would show up here the moment someone starts wiring a
+    real consumer -- at which point this test (and that doc) need a
+    deliberate update, not a silent pass, per the explicit instruction
+    not to imply this feature is operational."""
+    import inspect
+
+    import analytics_sync
+    import appliance_cloud
+    import event_media_uploader
+    import main
+
+    assert "customer_analytics_rules" not in inspect.getsource(main.people_counting_worker)
+    assert "customer_analytics_rules" not in inspect.getsource(analytics_sync)
+    assert "customer_analytics_rules" not in inspect.getsource(appliance_cloud)
+    assert "customer_analytics_rules" not in inspect.getsource(event_media_uploader)
