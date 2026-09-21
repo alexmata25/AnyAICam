@@ -63,10 +63,15 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import product_mode
+
 logger = logging.getLogger("anyaicam.analytics_sync")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-ANALYTICS_SYNC_ENABLED = os.environ.get("ANYAICAM_ANALYTICS_SYNC_ENABLED", "false").strip().lower() == "true"
+# 2026-09-21: governed by product_mode.py (Local defaults this off,
+# Hybrid defaults it on) -- an explicit ANYAICAM_ANALYTICS_SYNC_ENABLED
+# still always wins, unchanged from before product modes existed.
+ANALYTICS_SYNC_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_ANALYTICS_SYNC_ENABLED")
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"

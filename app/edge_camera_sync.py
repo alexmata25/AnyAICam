@@ -77,6 +77,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+import product_mode
+
 logger = logging.getLogger("anyaicam.edge_camera_sync")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
@@ -137,6 +139,19 @@ def sync_provisioned_cameras() -> dict:
     cloud_cameras = response.get("cameras")
     if not isinstance(cloud_cameras, list):
         return {"status": "malformed_response"}
+
+    # product_mode (2026-09-21): this appliance's real, entitlement-
+    # derived Local/Hybrid mode, from the same already-polled response --
+    # no separate endpoint or cadence. persist_mode() itself no-ops (and
+    # returns False) for an empty/unrecognized value or a value equal to
+    # what's already persisted -- an appliance whose customer has no
+    # active camera-slot entitlement yet, or whose mode hasn't changed,
+    # writes nothing new here. A True return means the mode actually
+    # changed (e.g. a Hybrid upgrade purchase just completed) -- flags
+    # for the caller that this process needs a restart to pick up the
+    # new mode's flag defaults (see product_mode.resolve_cloud_flag()),
+    # since every governed flag is still read once at import time.
+    restart_required = product_mode.persist_mode(str(response.get("product_mode") or ""))
 
     from partner_db import connection
     now = datetime.now().isoformat()
@@ -283,7 +298,7 @@ def sync_provisioned_cameras() -> dict:
             db.execute("DELETE FROM pending_camera_credentials WHERE device_key=?", (device_key,))
             credentials_moved += 1
 
-    result = {"status": "ok", "synced": synced, "credentials_moved": credentials_moved}
+    result = {"status": "ok", "synced": synced, "credentials_moved": credentials_moved, "product_mode_restart_required": restart_required}
     sync_state["last_run_at"] = now
     sync_state["last_error"] = None
     sync_state["last_synced_count"] = synced

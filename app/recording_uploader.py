@@ -97,10 +97,17 @@ except ImportError:
     TransferConfig = None
     ClientError = None
 
+import product_mode
+
 logger = logging.getLogger("anyaicam.recording_uploader")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-RECORDING_UPLOAD_ENABLED = os.environ.get("ANYAICAM_RECORDING_UPLOAD_ENABLED", "false").strip().lower() == "true"
+# 2026-09-21: governed by product_mode.py (Local defaults this off,
+# Hybrid defaults it on) -- an explicit ANYAICAM_RECORDING_UPLOAD_
+# ENABLED still always wins, unchanged from before product modes
+# existed. This is the bulk/continuous cloud archive only -- local
+# recording/playback itself has no flag and is unaffected either way.
+RECORDING_UPLOAD_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_RECORDING_UPLOAD_ENABLED")
 
 # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
 # same rationale as event_media_uploader.EVENT_MEDIA_CACHE_CONTROL -- a

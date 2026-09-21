@@ -58,10 +58,15 @@ try:
 except ImportError:
     boto3 = None
 
+import product_mode
+
 logger = logging.getLogger("anyaicam.live_relay_uploader")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-LIVE_RELAY_ENABLED = os.environ.get("ANYAICAM_LIVE_RELAY_ENABLED", "false").strip().lower() == "true"
+# 2026-09-21: governed by product_mode.py (Local defaults this off,
+# Hybrid defaults it on) -- an explicit ANYAICAM_LIVE_RELAY_ENABLED
+# still always wins, unchanged from before product modes existed.
+LIVE_RELAY_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_LIVE_RELAY_ENABLED")
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"

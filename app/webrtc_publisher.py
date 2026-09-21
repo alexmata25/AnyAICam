@@ -107,10 +107,22 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import product_mode
+
 logger = logging.getLogger("anyaicam.webrtc_publisher")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-LIVE_P2P_ENABLED = os.environ.get("ANYAICAM_LIVE_P2P_ENABLED", "false").strip().lower() == "true"
+# 2026-09-21: governed by product_mode.py (Local defaults this off,
+# Hybrid defaults it on) -- an explicit ANYAICAM_LIVE_P2P_ENABLED still
+# always wins, unchanged from before product modes existed. Cloud-
+# brokered P2P signaling requires reaching CLOUD_URL below (see this
+# module's own docstring: SIGNALING BRIDGE only) -- there is no LAN-
+# only signaling path in this codebase today, so this flag is treated
+# as Hybrid-only rather than "Local, always on". live_view_p2p.py's own
+# same-named flag is a separate, cloud-side platform kill-switch (gates
+# whether the cloud SERVES signaling at all for any appliance) and is
+# deliberately left reading the raw env var directly, not product mode.
+LIVE_P2P_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_LIVE_P2P_ENABLED")
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"

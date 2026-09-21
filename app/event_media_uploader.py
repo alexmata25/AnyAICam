@@ -29,6 +29,7 @@ import recording_uploader as recording_upload
 import smart_motion
 from event_clips import compute_clip_window
 import event_media_outbox
+import product_mode
 
 logger = logging.getLogger("anyaicam.event_media_uploader")
 
@@ -50,7 +51,12 @@ RECORDINGS_ROOT = APP_ROOT / "recordings"
 # the control plane, or initializes an S3 client.  Keep it off by default so
 # existing installations do not start retaining new event media unexpectedly.
 EVENT_MEDIA_CAPTURE_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_CAPTURE_ENABLED", "false").strip().lower() == "true"
-EVENT_MEDIA_UPLOAD_ENABLED = os.environ.get("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED", "false").strip().lower() == "true"
+# 2026-09-21: governed by product_mode.py (Local defaults this off,
+# Hybrid defaults it on) -- an explicit ANYAICAM_EVENT_MEDIA_UPLOAD_
+# ENABLED still always wins, unchanged from before product modes
+# existed. EVENT_MEDIA_CAPTURE_ENABLED above is untouched by product
+# mode -- it never contacts the cloud at all (see its own comment).
+EVENT_MEDIA_UPLOAD_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED")
 
 # Hybrid transfer-cost audit (docs/hybrid-transfer-cost-reduction-audit.md):
 # every event clip/thumbnail object was written with no CacheControl

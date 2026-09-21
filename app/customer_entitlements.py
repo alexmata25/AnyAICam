@@ -186,6 +186,46 @@ def get_entitlements_for_customer(customer_id: str) -> list:
     return rows("SELECT * FROM customer_entitlements WHERE customer_id=? ORDER BY created_at", (customer_id,))
 
 
+def product_mode_for_customer(customer_id: str) -> str:
+    """The authoritative Local-vs-Hybrid product mode for this customer,
+    derived from their real camera-slot entitlement -- never a separate
+    admin-set flag, so an "Upgrade Local -> Hybrid" action is genuinely
+    entitlement/billing-driven: the moment a Hybrid checkout completes
+    (create_camera_slot_checkout() in main.py -> the existing Stripe
+    webhook -> upsert_entitlement(product="camera_slots_hybrid")), this
+    function starts returning "hybrid" for that customer with no
+    separate code path to keep in sync.
+
+    "hybrid" wins if both an active camera_slots_local AND an active
+    camera_slots_hybrid entitlement exist (upsert_entitlement() is
+    idempotent per (customer_id, product), so a customer's original
+    one-time Local purchase and a later Hybrid subscription are two
+    independent rows that can coexist) -- this is exactly the moment
+    right after an upgrade purchase, before any decision is made about
+    the now-redundant one-time Local entitlement, and "the customer
+    just paid for Hybrid" should take effect immediately regardless.
+
+    Returns "" (never a guessed default) when neither entitlement is
+    active -- a customer who cancelled Hybrid with no prior Local
+    entitlement on file has no product mode this function can honestly
+    report; see docs/product-mode-local-hybrid-2026-09-21.md for why
+    this is a flagged business decision (auto-grant an equivalent Local
+    entitlement on downgrade, or require a fresh purchase) rather than
+    something silently assumed here. Callers (appliance_cloud.
+    appliance_configuration()) must treat "" as "no mode to report",
+    the same fail-closed discipline resolve_tier()/resolve_addon() use
+    for an unconfigured Price ID."""
+    active_products = {
+        item["product"] for item in get_entitlements_for_customer(customer_id)
+        if item["status"] == "active"
+    }
+    if "camera_slots_hybrid" in active_products:
+        return "hybrid"
+    if "camera_slots_local" in active_products:
+        return "local"
+    return ""
+
+
 def total_camera_slots(customer_id: str) -> int:
     """The one function anything (claim/refresh endpoints, the setup
     wizard, a future installer) must call to learn camera-slot capacity.

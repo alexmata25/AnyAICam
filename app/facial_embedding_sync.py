@@ -55,11 +55,20 @@ from datetime import datetime
 from pathlib import Path
 
 from database_backend import connect
+import product_mode
 
 logger = logging.getLogger("anyaicam.facial_embedding_sync")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-FACIAL_EMBEDDING_SYNC_ENABLED = os.environ.get("ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED", "false").strip().lower() == "true"
+# 2026-09-21: governed by product_mode.py (Local defaults this off,
+# Hybrid defaults it on) -- an explicit ANYAICAM_FACIAL_EMBEDDING_SYNC_
+# ENABLED still always wins, unchanged from before product modes
+# existed. This is the cloud-sync direction only, independent of
+# ANYAICAM_FACIAL_RECOGNITION_ENABLED (facial_recognition.py), which
+# gates the paid Face Access entitlement itself and is NOT governed by
+# product mode -- a Local customer can buy Face Access without that
+# implying Hybrid.
+FACIAL_EMBEDDING_SYNC_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED")
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"

@@ -423,7 +423,20 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 'partner':dict(partner_row) if partner_row else None,
                 'appliance':{'id':appliance['id'],'customer_id':appliance['customer_id'],'site_id':appliance['site_id'],'cloud_id':appliance['cloud_id'],'partner_id':appliance.get('partner_id')},
             }
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity}
+            # product_mode (2026-09-21): the authoritative Local-vs-Hybrid
+            # mode for this appliance's customer, derived from their real
+            # camera-slot entitlement -- see customer_entitlements.
+            # product_mode_for_customer()'s own docstring. This is the one
+            # sync channel edge_camera_sync.py's own periodic config
+            # refresh reads to persist a mode change (product_mode.
+            # persist_mode()) after a Hybrid upgrade purchase or a Hybrid
+            # cancellation, mirroring cloud_policy/storage_policy's own
+            # "RDM/entitlement source of truth, resolved once per poll"
+            # pattern immediately above. "" (never a guess) when this
+            # customer has no active camera-slot entitlement at all.
+            from customer_entitlements import product_mode_for_customer
+            product_mode_value=product_mode_for_customer(appliance['customer_id'])
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
