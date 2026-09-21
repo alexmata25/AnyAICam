@@ -16406,6 +16406,24 @@ async def persist_event_recording(camera_number: int, event_start: datetime, eve
         pre_roll_seconds=settings["pre_roll_seconds"], post_roll_seconds=settings["post_roll_seconds"],
     )
 
+    # Do not hunt for post-roll footage before it has actually been
+    # recorded. Confirmed live on Ryzen (2026-09-20): this function is
+    # scheduled via asyncio.create_task() the moment a detection fires
+    # (store_motion_event()/save_yolo_events()'s own wiring), with
+    # nothing waiting for window.end -- which extends post_roll_seconds
+    # into the FUTURE relative to that moment -- to actually elapse in
+    # wall-clock time first. A real motion event whose post-roll segment
+    # genuinely didn't exist on disk yet silently produced zero sources
+    # below (no exception, no log -- the function's own designed-quiet
+    # "nothing to do yet" shape), and the event was permanently lost:
+    # by the time anything else runs, the janitor has already aged the
+    # relevant pre-roll segments out. build_motion_event_clip() (used by
+    # every camera regardless of mode) already has this exact wait for
+    # this exact reason -- mirrored here, not reinvented.
+    wait_seconds = max(0.0, (window.end - datetime.now()).total_seconds()) + 3.0
+    if wait_seconds:
+        await asyncio.sleep(wait_seconds)
+
     async with _event_recording_lock:
         open_recording = _open_event_recordings.get(camera_number)
         start_new = (

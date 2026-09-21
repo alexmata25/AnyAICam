@@ -75,3 +75,84 @@ def test_persist_event_recording_also_uses_the_dedicated_buffer_parser():
     source = inspect.getsource(main.persist_event_recording)
     assert "_buffer_segment_start(" in source
     assert "recording_start(" not in source
+
+
+# --------------------------------------------------------------- post-roll wait (2026-09-21)
+#
+# Confirmed live on Ryzen, after the fix above: a real motion event on
+# Camera 2 was correctly detected, but persist_event_recording() still
+# produced nothing -- no exception, no log, the function's own designed-
+# quiet "nothing to do yet" shape. Root cause: it is scheduled via
+# asyncio.create_task() the moment a detection fires, with nothing
+# waiting for window.end (event_end + post_roll_seconds, which extends
+# into the FUTURE relative to that moment) to actually elapse in wall-
+# clock time first -- the post-roll buffer segment genuinely didn't
+# exist on disk yet. By the time anything else ran, the janitor had
+# already aged the relevant pre-roll segments out, permanently losing
+# the event. build_motion_event_clip() (used by every camera regardless
+# of mode) already has this exact wait, for this exact reason -- this
+# was the one place that pattern was never mirrored.
+
+
+def test_persist_event_recording_waits_for_the_full_window_to_elapse_first(tmp_path, monkeypatch):
+    import asyncio
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    now = datetime.now()
+    main._open_event_recordings.pop(1, None)  # test isolation: module-level state
+    asyncio.run(main.persist_event_recording(1, now, now))
+
+    assert len(sleep_calls) == 1
+    # post_roll_seconds defaults to 5 (event_clips.DEFAULT_POST_ROLL_
+    # SECONDS) plus the same +3.0 safety margin build_motion_event_clip()
+    # already uses -- at least ~8s, never skipped entirely.
+    assert sleep_calls[0] >= 3.0
+
+
+def test_persist_event_recording_still_creates_the_clip_after_waiting(tmp_path, monkeypatch):
+    """Proves the wait doesn't break the success path: with the (mocked,
+    instant) wait satisfied and the needed buffer segments already on
+    disk, a real concatenated clip is still produced."""
+    import asyncio
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    now = datetime.now()
+    buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
+    buffer_folder.mkdir(parents=True, exist_ok=True)
+    # Covers pre-roll through post-roll for an event_start==event_end==now
+    # with default 5s pre/post-roll -- a single 30s segment starting
+    # 15s before now comfortably spans the whole window.
+    segment_start = now - timedelta(seconds=15)
+    segment_path = buffer_folder / f"buf1_{segment_start:%Y-%m-%d_%H-%M-%S}.mkv"
+    segment_path.write_bytes(b"fake video bytes")
+
+    def fake_run(args, **kwargs):
+        # Stand-in for the real ffmpeg concat subprocess -- writes the
+        # temp output (the command's last argument) the real call would
+        # produce, so .replace() below has something to promote.
+        Path(args[-1]).write_bytes(b"concatenated clip")
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    main._open_event_recordings.pop(1, None)  # test isolation: module-level state
+    asyncio.run(main.persist_event_recording(1, now, now))
+
+    produced = list((tmp_path / "recordings" / "camera1").glob("camera1_*.mkv"))
+    assert len(produced) == 1
