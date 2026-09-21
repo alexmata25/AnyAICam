@@ -430,3 +430,58 @@ def test_ai_classified_detection_does_not_persist_a_recording_for_a_continuous_m
 
     assert _wait_until(lambda: len(fake_uploader) == 1), "the existing clip/upload path must still run"
     assert persisted == [], "a Continuous-mode camera must never get an Event-mode recording persisted"
+
+
+def test_ai_detection_dedup_does_not_suppress_persist_event_recording_during_sustained_activity(
+    monkeypatch, tmp_path, fake_uploader, background_loop
+):
+    """Codex review item, confirmed by code inspection (2026-09-22):
+    persist_event_recording() scheduling used to sit INSIDE `if not
+    is_duplicate:` -- the same per-camera dedup gate that (correctly)
+    skips building a second, near-identical Hybrid clip for a burst of
+    rapidly repeated detections. During sustained activity (a person
+    lingering in frame, producing several qualifying scans a few seconds
+    apart), every scan after the first was should_merge()-classified as a
+    duplicate and its persist_event_recording() call was dropped entirely
+    -- even though that function has its own independent, correct merge/
+    extend logic that a suppressed call never gets the chance to run. Net
+    effect: a genuinely multi-minute event's LOCAL recording was silently
+    truncated to just the first scan's own pre-roll+post-roll window.
+
+    Two real, back-to-back save_yolo_events() calls (close enough in wall-
+    clock time that the second is a genuine should_merge() duplicate for
+    the Hybrid path) must still each schedule persist_event_recording() --
+    that function's own should_start_new_event_recording() is what decides
+    extend-vs-new, not this dedup gate."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+
+    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
+        return f"/recordings/clips/motion/motion_{event_id}.mp4"
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+    _standard_mocks(monkeypatch, tmp_path)
+
+    persisted = []
+
+    async def fake_persist_event_recording(camera_number, start, end, *, detector=None, trigger_id=None):
+        persisted.append((camera_number, detector, trigger_id))
+
+    monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
+
+    main.save_yolo_events(172, _fake_result("car"))
+    main.save_yolo_events(172, _fake_result("car"))  # same burst -- a Hybrid dedup duplicate
+
+    assert _wait_until(lambda: len(persisted) == 2), (
+        "both scans in the same burst must schedule persist_event_recording() "
+        "-- the Hybrid dedup gate must not suppress the second call"
+    )
+    assert _wait_until(lambda: len(fake_uploader) == 1), (
+        "the Hybrid clip/upload path itself must still be deduplicated -- "
+        "only the FIRST scan builds/uploads a clip"
+    )
+    assert persisted[0][0] == persisted[1][0] == 172
+    # Distinct trigger ids: persist_event_recording()'s own merge logic
+    # (not this dedup) is what should decide whether the second call
+    # extends the first recording or starts a new one.
+    assert persisted[0][2] != persisted[1][2]

@@ -1,5 +1,6 @@
 from event_media import media_state as customer_event_media_state
 import asyncio
+from collections import defaultdict
 
 
 
@@ -16364,11 +16365,19 @@ async def event_buffer_janitor(camera_number: int) -> None:
 
 # Per-camera bookkeeping for should_start_new_event_recording()'s merge
 # decision and event_buffer_janitor()'s "don't delete a segment a build
-# currently depends on" safety check. Guarded by _event_recording_lock
-# exactly like the existing ai_event_clip_windows_lock pattern this
-# file already uses for the same class of shared, per-camera state.
+# currently depends on" safety check.
 _open_event_recordings: dict[int, dict] = {}
-_event_recording_lock = asyncio.Lock()
+
+# One lock per camera (2026-09-22), not one shared lock for every camera:
+# persist_event_recording() below now holds its lock across the entire
+# read-decide-concat-replace sequence, not just the metadata decision --
+# necessary to stop two overlapping/merged builds for the SAME camera from
+# reusing the same .sources.txt/.tmp.mkv temp paths (confirmed reproducible
+# by code inspection: the old lock released before any file I/O, so two
+# near-simultaneous detections for one camera could both be mid-concat
+# against the same temp files at once). defaultdict so a camera's Lock is
+# only ever created lazily, on its own first persist call.
+_event_recording_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 def _in_flight_event_windows(camera_number: int) -> list[tuple[datetime, datetime]]:
@@ -16446,7 +16455,14 @@ async def persist_event_recording(
     if wait_seconds:
         await asyncio.sleep(wait_seconds)
 
-    async with _event_recording_lock:
+    # Per-camera lock, not the whole function's single shared lock this used
+    # to be (2026-09-22): this section now spans the entire read-decide-
+    # write-concat-replace sequence, not just the metadata decision, so two
+    # cameras with simultaneous motion no longer serialize behind one
+    # another's ffmpeg concat. It still fully serializes same-camera calls
+    # end to end -- see the temp-file-reuse fix below, which depends on that.
+    camera_lock = _event_recording_locks[camera_number]
+    async with camera_lock:
         open_recording = _open_event_recordings.get(camera_number)
         start_new = (
             open_recording is None
@@ -16467,54 +16483,77 @@ async def persist_event_recording(
             destination = open_recording["path"]
             _open_event_recordings[camera_number]["end"] = window.end
 
-    buffer_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
-    if not buffer_folder.is_dir():
-        log.warning(
-            "event_recording.no_buffer_folder camera=%s detector=%s trigger_id=%s path=%s",
-            camera_number, detector, trigger_id, buffer_folder,
-        )
-        return
-    sources = [
-        path for path in sorted(buffer_folder.glob("*.mkv"))
-        if (segment_start := _buffer_segment_start(path, camera_number)) is not None
-        and segment_start < window.end
-        and segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS) > window.start
-    ]
-    if not sources:
-        log.warning(
-            "event_recording.no_sources camera=%s detector=%s trigger_id=%s "
-            "window_start=%s window_end=%s",
-            camera_number, detector, trigger_id, window.start.isoformat(), window.end.isoformat(),
-        )
-        return
-    list_file = destination.with_suffix(".sources.txt")
-    try:
-        list_file.write_text("".join(f"file '{source}'\n" for source in sources))
-        temp_output = destination.with_suffix(".tmp.mkv")
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-             "-c", "copy", str(temp_output)],
-            capture_output=True, timeout=60, check=False,
-        )
-        if result.returncode == 0 and temp_output.exists():
-            temp_output.replace(destination)
-            duration = _probe_recording_duration_seconds(destination)
-            log.info(
-                "event_recording.persisted camera=%s detector=%s trigger_id=%s "
-                "path=%s duration_seconds=%s",
-                camera_number, detector, trigger_id, destination,
-                round(duration, 1) if duration is not None else None,
-            )
-        else:
+        # recording_start is the ORIGINAL event's start (unchanged across
+        # every extension), never this call's own window.start once
+        # start_new is False. Confirmed live (2026-09-22): a merge-gap-
+        # spaced extension previously rebuilt destination from only THIS
+        # call's window, silently dropping the beginning of the original
+        # event every time an extension landed -- destination.replace()
+        # unconditionally overwrites the whole file with whatever this
+        # call alone gathered. Sourcing and trimming must both span from
+        # the true original start through this call's updated end.
+        recording_start = _open_event_recordings[camera_number]["start"]
+
+        buffer_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
+        if not buffer_folder.is_dir():
             log.warning(
-                "event_recording.concat_failed camera=%s detector=%s trigger_id=%s "
-                "path=%s returncode=%s",
-                camera_number, detector, trigger_id, destination, result.returncode,
+                "event_recording.no_buffer_folder camera=%s detector=%s trigger_id=%s path=%s",
+                camera_number, detector, trigger_id, buffer_folder,
             )
-    finally:
-        list_file.unlink(missing_ok=True)
-        destination.with_suffix(".tmp.mkv").unlink(missing_ok=True)
+            return
+        sources = [
+            (segment_start, path)
+            for path in sorted(buffer_folder.glob("*.mkv"))
+            if (segment_start := _buffer_segment_start(path, camera_number)) is not None
+            and segment_start < window.end
+            and segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS) > recording_start
+        ]
+        if not sources:
+            log.warning(
+                "event_recording.no_sources camera=%s detector=%s trigger_id=%s "
+                "window_start=%s window_end=%s",
+                camera_number, detector, trigger_id, recording_start.isoformat(), window.end.isoformat(),
+            )
+            return
+        first_source_start = sources[0][0]
+        # -c copy can only cut on keyframe boundaries, so this trims close
+        # to -- not frame-exact at -- the requested window, same trade-off
+        # build_motion_event_clip()'s own -ss/-t already accepts for its
+        # (re-encoded) output. Previously absent here: the concat ran on
+        # whole 30s buffer segments with no trim at all, so every saved
+        # clip carried up to one full segment's worth of untrimmed padding
+        # on each end.
+        offset_seconds = max(0.0, (recording_start - first_source_start).total_seconds())
+        duration_seconds = max(0.0, (window.end - recording_start).total_seconds())
+        list_file = destination.with_suffix(".sources.txt")
+        try:
+            list_file.write_text("".join(f"file '{source}'\n" for _, source in sources))
+            temp_output = destination.with_suffix(".tmp.mkv")
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-ss", str(offset_seconds), "-t", str(duration_seconds),
+                 "-c", "copy", str(temp_output)],
+                capture_output=True, timeout=60, check=False,
+            )
+            if result.returncode == 0 and temp_output.exists():
+                temp_output.replace(destination)
+                duration = _probe_recording_duration_seconds(destination)
+                log.info(
+                    "event_recording.persisted camera=%s detector=%s trigger_id=%s "
+                    "path=%s duration_seconds=%s",
+                    camera_number, detector, trigger_id, destination,
+                    round(duration, 1) if duration is not None else None,
+                )
+            else:
+                log.warning(
+                    "event_recording.concat_failed camera=%s detector=%s trigger_id=%s "
+                    "path=%s returncode=%s",
+                    camera_number, detector, trigger_id, destination, result.returncode,
+                )
+        finally:
+            list_file.unlink(missing_ok=True)
+            destination.with_suffix(".tmp.mkv").unlink(missing_ok=True)
 
 
 
@@ -37566,33 +37605,45 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                     f"build/upload: no main event loop captured yet."
                 )
 
-            # 2026-09-20: the same Event-mode persistence the basic
-            # motion path already schedules (see store_motion_event()'s
-            # own build_and_upload_event_media() sibling call) -- Smart
-            # Motion/person/vehicle-triggered events must behave
-            # consistently with basic motion for a camera in Event
-            # mode, not just cloud-classified detections. Purely
-            # additive, alongside -- never instead of -- the clip
-            # build/upload scheduled immediately above. This whole
-            # function already runs off the shared event loop (see the
-            # asyncio.to_thread() comment above), so the synchronous
-            # mode check here is safe and does not need its own
-            # asyncio.to_thread() wrapper the way the basic motion
-            # path's event-loop-resident equivalent does.
-            if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        persist_event_recording(
-                            camera_number, now, now,
-                            detector="ai_detection", trigger_id=event_group_id,
-                        ),
-                        _ai_event_media_loop,
-                    )
-                except RuntimeError as error:
-                    print(
-                        f"AI event {event_group_id}: could not schedule "
-                        f"Event-mode recording persist: {type(error).__name__}: {error}"
-                    )
+        # 2026-09-20, moved outside `if not is_duplicate:` on 2026-09-22:
+        # the same Event-mode persistence the basic motion path already
+        # schedules (see store_motion_event()'s own build_and_upload_
+        # event_media() sibling call) -- Smart Motion/person/vehicle-
+        # triggered events must behave consistently with basic motion for
+        # a camera in Event mode, not just cloud-classified detections.
+        # Purely additive, alongside -- never instead of -- the Hybrid
+        # clip build/upload above.
+        #
+        # Confirmed reproducible by code inspection: this call used to sit
+        # INSIDE `if not is_duplicate:`, so during sustained activity --
+        # exactly the case a person lingers in frame, producing repeated
+        # qualifying scans a few seconds apart, each should_merge()-ing
+        # with the last -- only the very FIRST scan in the whole burst
+        # ever reached persist_event_recording(). Every later scan was
+        # dropped by the SAME dedup that (correctly) also avoids building
+        # a duplicate Hybrid clip, even though persist_event_recording()
+        # has its own independent, correct extend-vs-new decision
+        # (should_start_new_event_recording()) that a suppressed call
+        # never gets the chance to run. The practical effect: a genuinely
+        # multi-minute event's local recording was silently truncated to
+        # just the first scan's own pre-roll+post-roll window. The Hybrid
+        # dedup above is unchanged and still gates the clip build/upload;
+        # this call now runs on every qualifying scan regardless, letting
+        # persist_event_recording()'s own merge logic decide extend-vs-new.
+        if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    persist_event_recording(
+                        camera_number, now, now,
+                        detector="ai_detection", trigger_id=event_group_id,
+                    ),
+                    _ai_event_media_loop,
+                )
+            except RuntimeError as error:
+                print(
+                    f"AI event {event_group_id}: could not schedule "
+                    f"Event-mode recording persist: {type(error).__name__}: {error}"
+                )
 
 
 
