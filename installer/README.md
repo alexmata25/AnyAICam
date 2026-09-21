@@ -152,22 +152,21 @@ installer writes the authoritative value to `/etc/anyaicam/vms.env`, which the
 VMS Compose service already loads. Product mode is separate from
 `ANYAICAM_ENV`, `ANYAICAM_RUNTIME_ROLE`, and the agent development/production mode.
 
-| Fresh-install default | Local | Hybrid |
-| --- | --- | --- |
-| ANYAICAM_PRODUCT_MODE | local | hybrid |
-| ANYAICAM_CLOUD_UPLOAD_ENABLED | false | true |
-| ANYAICAM_LIVE_RELAY_ENABLED | false | true |
-| ANYAICAM_RECORDING_UPLOAD_ENABLED | false | true |
-| ANYAICAM_ANALYTICS_SYNC_ENABLED | false | true |
-
-Existing explicit per-feature values in the environment file or release template
-win over these defaults, including `false` in Hybrid and `true` in Local. Hybrid
-flags enable the existing workers; working cloud connections still require their
-normal endpoint, credential and provisioning configuration. This does not grant
-entitlements, change subscriptions, or configure AWS. The agent remains installed
-for camera/control-plane operation in both modes; its cloud activation wizard is
-unchanged. Local here disables these four cloud features by default, not all
-network traffic.
+The installer writes only `ANYAICAM_PRODUCT_MODE` itself -- it never
+materializes an individual `ANYAICAM_*_ENABLED` flag. `app/product_mode.py`'s
+`resolve_cloud_flag()`/`FLAG_REGISTRY` is the one place that defines what each
+mode implies for every cloud-dependent flag it governs (currently
+`ANYAICAM_ANALYTICS_SYNC_ENABLED`, `ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`,
+`ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED`, `ANYAICAM_LIVE_RELAY_ENABLED`,
+`ANYAICAM_LIVE_P2P_ENABLED`, `ANYAICAM_RECORDING_UPLOAD_ENABLED` -- Local
+defaults every one of them off, Hybrid defaults every one of them on), so the
+installer and the running application can never disagree about what a mode
+means. An explicit per-feature value already present in the environment file
+or release template still always wins over the mode, exactly as before. This
+does not grant entitlements, change subscriptions, or configure AWS. The agent
+remains installed for camera/control-plane operation in both modes; its cloud
+activation wizard is unchanged. Local here disables these cloud features by
+default, not all network traffic.
 
 ### Existing installations and reconciliation
 
@@ -175,19 +174,27 @@ Repair/reinstall reuses a valid saved product mode. A conflicting requested mode
 blank/invalid saved mode, or duplicate mode entries fails before deployment.
 Mode values must be unquoted, exact lowercase `local` or `hybrid`.
 
-For an existing or partial installation without the key, the installer assigns
-`hybrid` as a compatibility label and pins missing cloud flags to `false` (their
-previous runtime defaults). Existing flags are preserved. The legacy
-`/opt/anyaicam/.env` is inspected before migration too. This deliberately does
-not activate new cloud behavior during an upgrade. An explicitly requested mode
-on a legacy installation likewise preserves existing behavior. Changing a saved
-mode is an operator reconciliation task, not an installer/repair side effect.
+For an existing or partial installation without the key, the installer leaves
+`ANYAICAM_PRODUCT_MODE` completely **unset** rather than assigning a guessed
+compatibility label -- `resolve_cloud_flag()`'s own `legacy_default=False`
+already reproduces this exact appliance's prior behavior for every governed
+flag with no shell-side involvement at all, and leaving the variable itself
+unset is what keeps the appliance eligible for a future cloud-driven
+entitlement to apply a real mode automatically the first time one is resolved
+for it (see `docs/product-mode-local-hybrid-2026-09-21.md`'s own automatic-
+restart design) -- an explicit env var here would otherwise permanently block
+that. Existing flags are preserved untouched either way. The legacy
+`/opt/anyaicam/.env` is inspected before migration too. An explicitly
+requested mode on a legacy installation is written normally, the same as a
+fresh install. Changing a saved mode is an operator reconciliation task, not
+an installer/repair side effect.
 
-This source revision has no shared runtime product-mode resolver. The installer
-materializes defaults into the already-supported feature variables, keeping all
-application, dashboard, subscription and entitlement files outside this change.
-When reconciling the runtime abstraction, retain explicit-feature precedence and
-the legacy pins. Changing just the mode later does not replace persisted overrides.
+Reconciled 2026-09-21 against `app/product_mode.py`'s runtime resolver:
+this file originally also materialized four individual flags here (one of
+which, `ANYAICAM_CLOUD_UPLOAD_ENABLED`, gates a retired no-op worker on this
+branch -- see `app/tests/test_cloud_upload_worker_retired.py`), duplicating
+the mode-to-flag mapping in a second place and risking drift from the
+runtime's own definition. It now writes only the mode value, described above.
 
 Regression checks (Python plus Bash/coreutils; set TEST_BASH to Git Bash on Windows):
 
@@ -197,4 +204,9 @@ python -m unittest discover -s installer/tests -v
 
 Tests execute configuration functions in temporary directories only. They do not
 install packages, start services or connect to a deployment. A real Ubuntu fresh
-install/repair smoke test remains a release qualification step.
+install/repair smoke test remains a release qualification step -- see
+`UBUNTU_VALIDATION_CHECKLIST.md` for the exact, current list of what still
+needs disposable-Ubuntu re-validation and why the Windows-host Bash harness
+result (11 pre-existing failures, 2 skips, both due to missing Unix tooling/
+semantics -- `rsync`, POSIX execute bits -- not a code defect) is not
+sufficient for release sign-off on its own.
