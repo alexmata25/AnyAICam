@@ -186,3 +186,146 @@ No step above has been performed. This is the plan, not an action taken.
 2. **Ryzen's own `anyaicam-vms` container** is not running this branch's code either -- `product_mode.py` and the six migrated flags don't exist on the box yet (migration step 2 above).
 
 **Recommendation: yes, Ryzen can be safely used for a real Local-mode validation test, but only via the manual path (steps 2-5 above), not the fully-automatic entitlement-triggered path, until both deployments happen.** The manual path is low-risk and has a clean rollback (step 6): local recording, cameras, and analytics settings are never touched by any code this branch adds (confirmed by code review -- no path in `product_mode.py`, the six migrated flags, or `_queue_product_mode_restart()` writes to `analytics_subscriptions`, `camera_analytics_entitlements`, `cameras`, or any recording file), and the four cloud-dependent behaviors currently confirmed live (analytics sync, event-media upload, facial-embedding sync, live-relay-to-S3) are exactly what a Local-mode restart is designed to stop. Once this branch is deployed to both the cloud and the Ryzen edge, the same validation could be repeated end-to-end through the automatic path (grant/revoke a test entitlement and watch the restart happen with no SSH), which would additionally prove out the `restart_vms` command's full round trip on real hardware for the first time -- it is currently exercised only by this branch's own test suite (mocked SQLite, no real agent/watcher involved) and, per the code audit above, has never had a producer anywhere in the codebase until now.
+
+## Full entitlement-driven migration + rollback plan (2026-09-21) -- NOT PERFORMED
+
+This is the complete, exact plan for switching Ryzen from its current Hybrid-shaped state to true Local mode via the **automatic, entitlement-driven** path built in this branch (`_queue_product_mode_restart()` in `appliance_cloud.py`), rather than the manual env-var override. Nothing below has been executed.
+
+### 1. Code that must reach the cloud deployment first
+
+The cloud process serving this Ryzen unit's `ANYAICAM_CLOUD_URL` (`https://portal-staging.anyaicam.com`, confirmed live) must be running a build that includes:
+- `app/product_mode.py` (the `describe_transition()` helper the cloud route calls).
+- `app/customer_entitlements.py`'s `product_mode_for_customer()`.
+- `app/appliance_cloud.py`'s updated `appliance_configuration()` route and new `_queue_product_mode_restart()` function.
+- `app/db_migrations.py`'s new `appliances.last_reported_product_mode` column migration -- **this must run against the real cloud database** before the first poll after deployment, or the very first `UPDATE appliances SET last_reported_product_mode=...` will fail with `sqlite3.OperationalError: no such column` (or the Postgres equivalent). Confirm with a schema check against the live cloud DB, not assumed from a successful local test run.
+
+Verify with: `curl https://portal-staging.anyaicam.com/api/appliance/config` should still respond normally (this route is unauthenticated and unrelated, just a smoke test the deployment is up), and a real appliance's own next `GET /api/appliance/configuration` response should include a `"product_mode"` key at all (even `""`) -- its total absence means the old build is still serving.
+
+### 2. Code that must reach Ryzen
+
+Ryzen's own `anyaicam-vms` container needs:
+- `app/product_mode.py`.
+- The six migrated modules: `analytics_sync.py`, `event_media_uploader.py`, `facial_embedding_sync.py`, `live_relay_uploader.py`, `recording_uploader.py`, `webrtc_publisher.py`.
+- `app/edge_camera_sync.py`'s updated `sync_provisioned_cameras()` (the `persist_mode()` call).
+
+Verify with: `docker exec anyaicam-vms python3 -c "import product_mode; print('ok')"`.
+
+**Critical manual step, same deployment window** -- remove these five lines from `/opt/anyaicam/docker-compose.yml`'s `anyaicam-vms` service environment:
+```
+ANYAICAM_ANALYTICS_SYNC_ENABLED=true
+ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED=true
+ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED=true
+ANYAICAM_LIVE_RELAY_ENABLED=true
+ANYAICAM_LIVE_P2P_ENABLED=true
+```
+This is not optional: `resolve_cloud_flag()` always prefers an explicit env var over the mode. If these five lines stay in the compose file, the entitlement change below will still fire a real restart -- but the restart will change nothing, because each flag re-reads its own unchanged `=true` literal on the new process's startup. Do **not** run `docker compose up -d` yet after removing them -- that happens automatically in step 5, and doing it manually now would just make the appliance run with all six flags at their `""`/no-mode-configured legacy default (`false`, harmless, but skips the point of proving the automatic path).
+
+### 3. The entitlement/account change that sets this customer to Local
+
+Look up this Ryzen unit's real `customer_id` (via `appliances.customer_id` in the cloud DB, keyed by its `cloud_id`), then confirm its actual licensed camera count -- **do not assume 5**: this session's own read of the appliance found 12 `camera*` directories under `/app/recordings` (only cameras 1-5 showed active `_event_buffer` writes in earlier log samples; 6-12 may be inactive/placeholder slots). Query `cameras` for this `customer_id` to get the real count before picking a `PLAN_TIERS` tier.
+
+Two ways to create the entitlement, in order of preference:
+
+- **Real purchase (not available yet)**: Local's own Stripe Price IDs (`ANYAICAM_STRIPE_PRICE_LOCAL_1_8`/`9_16`/`17_32`/`33_64`) are still unset in every environment (confirmed earlier this session) -- `create_camera_slot_checkout()` would 503 with `PRICE_ID_REQUIRED` for `plan_type="local"` today. Not usable until those are created in Stripe.
+- **Direct entitlement grant (what's actually usable right now)**: an admin/support action calling `customer_entitlements.upsert_entitlement(customer_id=<real id>, product="camera_slots_local", camera_slot_quantity=<real count>, status="active")` directly against the cloud database. This is the same function the real checkout webhook would have called -- there is no separate/lesser code path, so a manually-granted entitlement is indistinguishable from a Stripe-driven one to every downstream reader (`product_mode_for_customer()`, the dashboard's Plan stat, `/subscription-portal`).
+
+If this customer currently holds an active `camera_slots_hybrid` entitlement (likely, given the pilot unit's current Hybrid-shaped config), decide explicitly whether to also cancel/deactivate that row (`status='cancelled'`) as part of this step -- `product_mode_for_customer()` returns `"hybrid"` whenever both are active simultaneously (Hybrid always wins), so the Local-only grant above would have **no visible effect** until the Hybrid row is no longer active.
+
+### 4. How the appliance detects the change
+
+No push mechanism -- pure poll, on the existing cadence:
+
+1. `edge_camera_sync.camera_configuration_sync_worker()` (already running on Ryzen, `~60s` interval via `ANYAICAM_CAMERA_CONFIG_SYNC_INTERVAL_SECONDS`) calls `sync_provisioned_cameras()`, which does its normal `GET /api/appliance/configuration` call.
+2. **Cloud side, same request**: `appliance_configuration()` computes `product_mode_for_customer(customer_id)` -> now `"local"` (assuming step 3's Hybrid row is deactivated), compares it against this appliance's stored `last_reported_product_mode` (still `"hybrid"` or `""` from before), finds a real transition, updates the column, and queues a `restart_vms` `appliance_commands` row (`created_by="product-mode-transition"`). The response body includes `"product_mode": "local"`.
+3. **Edge side, same response**: `sync_provisioned_cameras()` reads `response["product_mode"]` and calls `product_mode.persist_mode("local")`, which writes `/opt/anyaicam/data/config/product_mode.json` and logs `product_mode.changed previous=hybrid new=local restart_required=true`.
+4. Separately, `anyaicam_agent`'s own existing command-poll cycle (`GET /api/appliance/commands`) picks up the queued `restart_vms` row, writes a marker to `/var/lib/anyaicam/pending_actions/restart_vms.json` via `_queue_privileged_action()`.
+5. `anyaicam-privileged-watcher.path` (confirmed `active`/`enabled` on Ryzen right now) triggers the watcher, which waits a 10-second cancellation grace window, then runs `docker compose --project-directory /opt/anyaicam up -d`.
+
+Worst-case detection latency: one `edge_camera_sync` poll interval (~60s) plus one `anyaicam_agent` command-poll interval (check its own cadence before relying on a number) plus the 10s grace window.
+
+### 5. What turns off, automatically, once the new container starts
+
+With the five explicit overrides removed (step 2) and mode now `"local"`:
+- `ANALYTICS_SYNC_ENABLED` -> `False` (analytics_sync.py's worker never starts)
+- `EVENT_MEDIA_UPLOAD_ENABLED` -> `False`
+- `FACIAL_EMBEDDING_SYNC_ENABLED` -> `False`
+- `LIVE_RELAY_ENABLED` -> `False`
+- `LIVE_P2P_ENABLED` -> `False` (webrtc_publisher.py's worker never starts)
+- `RECORDING_UPLOAD_ENABLED` -> `False` (already was)
+
+Untouched by this or any other governed flag: `ANYAICAM_LPR_ENABLED`, `ANYAICAM_FACIAL_RECOGNITION_ENABLED`, `ANYAICAM_FACIAL_ACCESS_CONTROL_ENABLED`, `ANYAICAM_LOCAL_STORAGE_MANAGEMENT_ENABLED`, `ANYAICAM_LOCAL_STORAGE_AUTO_DELETE_ENABLED`, `ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED` -- these stay exactly as currently configured, since they're paid-entitlement/local-housekeeping flags, not product-mode-governed.
+
+### 6. What stays working locally, unaffected
+
+Local recording (per-camera `_event_buffer` writers), local playback, local live view over the LAN (direct connection to the appliance's own web UI/HLS -- not the relay/P2P/WireGuard remote-access paths), on-device analytics processing (smart motion/LPR/PPE detection itself, as opposed to syncing the *results* to the cloud), camera provisioning/access, and local storage management/retention. None of these read any of the six governed flags -- confirmed by code review, not inference.
+
+### 7. Does a controlled restart occur automatically?
+
+Yes -- see step 4's full chain. It is a container recreate (`docker compose up -d`), never a host `reboot`. It is controlled in three ways: a 10-second human-cancellable grace window (delete the marker file to abort), a hard dedup check that refuses to queue a second `restart_vms` while one is still `pending`/`delivered`, and the fact that only a genuine mode transition (not a repeated poll) ever queues one at all.
+
+### 8. Verifying recording, playback, analytics, local live view, and camera access still work
+
+Run these within a few minutes after the restart completes (`docker ps` shows a new `CONTAINER ID` for `anyaicam-vms`):
+
+```bash
+# Recording -- fresh local files continuing to appear
+docker exec anyaicam-vms sh -c 'find /app/recordings/camera1/_event_buffer -newermt "-2 minutes"'
+
+# Playback -- the existing local HLS-backed route still serves
+curl -sI https://<ryzen-lan-or-tailscale-address>/playback   # expect 200/303 to login, not 5xx
+
+# On-device analytics still detecting (not synced to cloud, just running)
+docker logs anyaicam-vms --since 2m | grep -i "smart_motion\|people_counting\|lpr\|ppe" | grep -v "analytics_sync"
+
+# Camera access/provisioning -- appliance-agent still healthy
+systemctl is-active anyaicam-agent.service   # active
+docker exec anyaicam-vms curl -s localhost:8000/health   # or whatever /health reports
+
+# Local live view -- from a browser ON THE SAME LAN (not remote), open
+# /customer-live and confirm at least one tile reaches 'playing' (see the
+# black-tile fix in this same branch) without any relay/P2P transport
+# available -- it should still resolve via direct local HLS.
+```
+
+### 9. Verifying AWS/cloud-dependent services are actually off
+
+```bash
+docker exec anyaicam-vms env | grep ANYAICAM_.*ENABLED   # expect empty output
+
+docker exec anyaicam-vms python3 -c "
+import analytics_sync, event_media_uploader, facial_embedding_sync, live_relay_uploader, recording_uploader, webrtc_publisher
+print('analytics_sync', analytics_sync.ANALYTICS_SYNC_ENABLED)
+print('event_media', event_media_uploader.EVENT_MEDIA_UPLOAD_ENABLED)
+print('facial_embedding', facial_embedding_sync.FACIAL_EMBEDDING_SYNC_ENABLED)
+print('live_relay', live_relay_uploader.LIVE_RELAY_ENABLED)
+print('recording_upload', recording_uploader.RECORDING_UPLOAD_ENABLED)
+print('live_p2p', webrtc_publisher.LIVE_P2P_ENABLED)
+"   # every line must print False
+
+# Absence of the exact log lines confirmed actively firing before migration:
+docker logs anyaicam-vms --since 5m | grep -E "analytics_sync\.(scan_tick_begin|http_call_begin)|event_media\.(registered|environmental_motion_skipped)|live_relay\.segment_upload_"
+# expect zero matches
+
+# No outbound connections to the cloud portal or S3 from this container
+docker exec anyaicam-vms sh -c "netstat -tn 2>/dev/null | grep -E 'ESTABLISHED' | grep -v 127.0.0.1"
+# cross-reference any remaining lines' remote IPs against portal-staging.anyaicam.com / *.amazonaws.com -- expect none related to the six disabled features (other unrelated local/LAN connections are fine)
+```
+
+### 10. Exact rollback steps, back to Hybrid
+
+**Fast path (seconds, doesn't wait for a poll cycle)** -- re-run steps 2-3 in reverse right on the box:
+```bash
+cp /opt/anyaicam/docker-compose.yml.pre-local-migration /opt/anyaicam/docker-compose.yml  # restores the five explicit =true lines
+cd /opt/anyaicam && docker compose up -d
+```
+This alone restores Hybrid-shaped behavior immediately, regardless of what the cloud-side entitlement says, since the explicit env vars always win.
+
+**Full rollback (also restores the entitlement-driven state)**:
+```sql
+-- against the cloud DB, for this customer_id
+UPDATE customer_entitlements SET status='active' WHERE customer_id=<id> AND product='camera_slots_hybrid';
+UPDATE customer_entitlements SET status='cancelled' WHERE customer_id=<id> AND product='camera_slots_local';
+```
+This makes `product_mode_for_customer()` report `"hybrid"` again; the next `edge_camera_sync` poll detects the reverse transition, the cloud queues a second `restart_vms` automatically (same dedup/grace-window protections), and Ryzen restarts back into Hybrid on its own -- no SSH required, mirroring the forward migration exactly. Use the fast path first if immediate reversal matters more than proving the automatic path both directions.
+
+Neither rollback path touches `cameras`, `analytics_subscriptions`, `camera_analytics_entitlements`, or any file under `/app/recordings` -- confirmed by code review, same as the forward migration.
