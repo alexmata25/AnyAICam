@@ -81,7 +81,11 @@ def _seed_tenant(db_path, customer_id="cust-1", email="signedin@example.test", p
 # ------------------------------------------------------------ happy path
 
 
-def test_customer_owner_checkout_creates_a_subscription_session_with_full_metadata(client, db_path):
+def test_local_checkout_is_a_one_time_payment_session_with_full_metadata(client, db_path):
+    """Business decision confirmed 2026-09-21: Local is a one-time
+    purchase -- mode="payment", and Stripe rejects subscription_data
+    params outright in that mode, so they must be completely absent
+    from the request, not just unused."""
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
     response = test_client.post(
@@ -94,27 +98,31 @@ def test_customer_owner_checkout_creates_a_subscription_session_with_full_metada
     assert body["status"] == "complete"
     assert body["checkout_url"] == "https://checkout.stripe.test/cs_test_camera_1"
     assert body["camera_slot_maximum"] == 8
+    assert body["billing_type"] == "one_time"
 
     fields = _fields_dict(captured["fields"])
-    assert fields["mode"] == "subscription"
+    assert fields["mode"] == "payment"
     assert fields["line_items[0][price]"] == "price_test_local_1_8"
-    # Fixed-tier subscription: always exactly one line item, never a
+    # Fixed-tier purchase: always exactly one line item, never a
     # customer-submitted multiplier -- same discipline as the existing
     # license-tier checkout.
     assert fields["line_items[0][quantity]"] == "1"
     assert fields["metadata[anyaicam_stripe_price_id]"] == "price_test_local_1_8"
     assert fields["metadata[anyaicam_customer_id]"] == "cust-1"
-    assert fields["subscription_data[metadata][anyaicam_stripe_price_id]"] == "price_test_local_1_8"
-    assert fields["subscription_data[metadata][anyaicam_customer_id]"] == "cust-1"
+    assert not any(key.startswith("subscription_data") for key in fields), (
+        "mode=payment must never carry subscription_data params -- Stripe rejects the whole session if it does"
+    )
     assert fields["client_reference_id"] == "cust-1"
     assert fields["customer_email"] == "owner@example.test"
     assert "customer/setup" in fields["success_url"]
     assert "customer/setup" in fields["cancel_url"]
 
 
-def test_hybrid_tier_resolves_to_the_hybrid_price_not_local(client, db_path):
-    """Cross-tier tampering guard: local and hybrid must never resolve to
-    each other's price even though both cover the same 1-8 camera range."""
+def test_hybrid_checkout_is_still_a_recurring_subscription_session(client, db_path):
+    """Cross-tier tampering guard (extended): local and hybrid must never
+    resolve to each other's price, AND hybrid must still get mode=
+    subscription with subscription_data metadata -- only Local's mode
+    changed on 2026-09-21, Hybrid did not."""
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
     response = test_client.post(
@@ -123,9 +131,14 @@ def test_hybrid_tier_resolves_to_the_hybrid_price_not_local(client, db_path):
         cookies={"anyaicam_partner_session": _owner_cookie(email="owner@example.test")},
     )
     assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["billing_type"] == "recurring"
     fields = _fields_dict(captured["fields"])
+    assert fields["mode"] == "subscription"
     assert fields["line_items[0][price]"] == "price_test_hybrid_1_8"
     assert fields["metadata[anyaicam_camera_slot_plan_type]"] == "hybrid"
+    assert fields["subscription_data[metadata][anyaicam_stripe_price_id]"] == "price_test_hybrid_1_8"
+    assert fields["subscription_data[metadata][anyaicam_customer_id]"] == "cust-1"
 
 
 # --------------------------------------------------------- ownership gate

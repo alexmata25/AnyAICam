@@ -7566,6 +7566,16 @@ class CameraSlotCheckoutModel(BaseModel):
     tier_label: str
 
 
+class AnalyticsAddonCheckoutModel(BaseModel):
+    # Commercial restructure confirmed 2026-09-21: Advanced Analytics
+    # (smart_motion/people_counting/lpr/ppe) and Face Access
+    # (facial_recognition) are both recurring add-ons, marketed under
+    # those two headings but individually purchasable per the existing
+    # analytics_entitlements.ANALYTICS_CATALOG keying -- the customer
+    # selects one catalog analytic_key, never a Stripe Price ID.
+    analytic_key: str
+
+
 class StripeCheckoutCreateModel(BaseModel):
 
 
@@ -112686,17 +112696,23 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
     camera(s)" -- total_camera_slots() was correctly summing zero real
     entitlement rows, because there was never a way to create one.
 
-    mode=subscription (a recurring camera-slot plan, matching create_
-    stripe_checkout()'s own mode -- NOT mode=payment like the one-time
-    create_hardware_checkout() below). The tier is resolved server-side
-    only from PLAN_TIERS, never from a browser-submitted price_id --
-    the same discipline every other checkout endpoint in this file
-    already applies. customer_owner identity is REQUIRED here (not
-    optional the way the older two endpoints treat it), so metadata[
-    anyaicam_customer_id] is always present: _sync_checkout_completed()
-    only falls back to email-based pending_customer_links reconciliation
-    when that's missing, and an already-authenticated customer buying
-    capacity for their own account should never need that fallback.
+    Stripe Checkout `mode` is derived from the tier's own billing_type
+    (customer_entitlements.PLAN_TIERS) -- "one_time" -> mode="payment"
+    (Local, confirmed 2026-09-21), "recurring" -> mode="subscription"
+    (Hybrid, matching create_stripe_checkout()'s own mode). This is read
+    off PLAN_TIERS, never hardcoded per plan_type string, so a future
+    third plan_type only needs a PLAN_TIERS row, not a new branch here.
+    `subscription_data[...]` fields are Stripe-rejected outright in
+    mode="payment" and are only appended for a recurring tier. The tier
+    is resolved server-side only from PLAN_TIERS, never from a browser-
+    submitted price_id -- the same discipline every other checkout
+    endpoint in this file already applies. customer_owner identity is
+    REQUIRED here (not optional the way the older two endpoints treat
+    it), so metadata[anyaicam_customer_id] is always present: _sync_
+    checkout_completed() only falls back to email-based pending_
+    customer_links reconciliation when that's missing, and an already-
+    authenticated customer buying capacity for their own account should
+    never need that fallback.
     """
     from partner_portal import partner_identity as _authoritative_identity
     identity = _authoritative_identity(request)
@@ -112708,20 +112724,21 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
     tier = next((t for t in PLAN_TIERS if t[0] == plan_type and t[1] == tier_label), None)
     if not tier:
         raise HTTPException(status_code=400, detail="Unknown camera-slot tier.")
-    _, _, _, _, camera_slot_maximum, _, env_var = tier
+    _, _, _, _, camera_slot_maximum, _, env_var, billing_type = tier
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:
         raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {plan_type} {tier_label}.")
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
+    stripe_mode = "payment" if billing_type == "one_time" else "subscription"
     fields = [
-        ("mode", "subscription"),
+        ("mode", stripe_mode),
         ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
         ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=cancelled"),
         ("client_reference_id", customer_id),
         ("line_items[0][price]", price_id),
-        # Fixed-tier subscription -- always exactly one, never a
+        # Fixed-tier purchase -- always exactly one, never a
         # customer-submitted multiplier (see create_stripe_checkout()'s
         # own comment on this same discipline).
         ("line_items[0][quantity]", "1"),
@@ -112729,10 +112746,11 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         ("metadata[anyaicam_customer_id]", customer_id),
         ("metadata[anyaicam_camera_slot_plan_type]", plan_type),
         ("metadata[anyaicam_camera_slot_tier_label]", tier_label),
-        ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
-        ("subscription_data[metadata][anyaicam_customer_id]", customer_id),
         ("allow_promotion_codes", "true"),
     ]
+    if stripe_mode == "subscription":
+        fields.append(("subscription_data[metadata][anyaicam_stripe_price_id]", price_id))
+        fields.append(("subscription_data[metadata][anyaicam_customer_id]", customer_id))
     if identity.get("email"):
         fields.append(("customer_email", str(identity["email"])))
     session = stripe_api_post("/v1/checkout/sessions", fields)
@@ -112747,6 +112765,8 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         plan_type=plan_type,
         tier_label=tier_label,
         camera_slot_maximum=camera_slot_maximum,
+        billing_type=billing_type,
+        stripe_mode=stripe_mode,
     )
     return {
         "status": "complete",
@@ -112755,6 +112775,93 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         "plan_type": plan_type,
         "tier_label": tier_label,
         "camera_slot_maximum": camera_slot_maximum,
+        "billing_type": billing_type,
+        "message": "Stripe Checkout Session created.",
+    }
+
+
+@app.post("/api/customer/analytics/checkout")
+def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, request: Request) -> dict:
+    """Commercial restructure confirmed 2026-09-21: Advanced Analytics
+    and Face Access are recurring add-ons, sold separately from Local/
+    Hybrid camera-slot capacity. The webhook side of this (analytics_
+    entitlements.resolve_analytic()/_sync_checkout_completed()/upsert_
+    analytics_subscription()) already exists and is already wired into
+    the live POST /api/payments/stripe/webhook route -- but, exactly
+    the same gap create_camera_slot_checkout() (Phase 8) closed for
+    camera-slot tiers, nothing ever CREATED a Checkout Session for one
+    of these analytics Price IDs. This closes that gap the same way.
+
+    mode="subscription" always: every entry in analytics_entitlements.
+    ANALYTICS_CATALOG is a recurring add-on (there is no one-time
+    analytics SKU), unlike camera-slot checkout where mode depends on
+    billing_type. One analytic_key per Checkout Session, matching
+    _sync_checkout_completed()'s own single-price-id-metadata design --
+    it reads exactly one metadata[anyaicam_stripe_price_id], so a
+    session is deliberately not allowed to bundle several analytics
+    line items into one purchase yet (see the restructure report for
+    this as a flagged possible future enhancement, not a limitation of
+    this endpoint alone). The catalog key is resolved server-side only
+    from ANALYTICS_CATALOG, never from a browser-submitted price_id --
+    the same discipline create_camera_slot_checkout() and create_
+    hardware_checkout() already apply. customer_owner identity is
+    required, matching create_camera_slot_checkout()'s own requirement
+    (an authenticated customer buying their own add-on never needs the
+    email-based pending_analytics_links fallback).
+    """
+    from partner_portal import partner_identity as _authoritative_identity
+    identity = _authoritative_identity(request)
+    if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
+        raise HTTPException(status_code=403, detail="Customer owner permission required.")
+    from analytics_entitlements import ANALYTICS_CATALOG
+    analytic_key = payload.analytic_key.strip().lower()
+    catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == analytic_key), None)
+    if not catalog_entry:
+        raise HTTPException(status_code=400, detail="Unknown analytics add-on.")
+    _, label, env_var = catalog_entry
+    price_id = os.environ.get(env_var, "").strip()
+    if not price_id:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {analytic_key}.")
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    customer_id = identity["customer_id"]
+    fields = [
+        ("mode", "subscription"),
+        ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?analytics_addon_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?analytics_addon_payment=cancelled"),
+        ("client_reference_id", customer_id),
+        ("line_items[0][price]", price_id),
+        # Fixed-tier subscription -- always exactly one, never a
+        # customer-submitted multiplier (same discipline as camera-slot
+        # and license-tier checkout above).
+        ("line_items[0][quantity]", "1"),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_customer_id]", customer_id),
+        ("metadata[anyaicam_analytic_key]", analytic_key),
+        ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
+        ("subscription_data[metadata][anyaicam_customer_id]", customer_id),
+        ("allow_promotion_codes", "true"),
+    ]
+    if identity.get("email"):
+        fields.append(("customer_email", str(identity["email"])))
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+    structured_log(
+        "stripe.analytics_addon_checkout_created",
+        session_id=session_id,
+        customer_id=customer_id,
+        analytic_key=analytic_key,
+    )
+    return {
+        "status": "complete",
+        "session_id": session_id,
+        "checkout_url": checkout_url,
+        "analytic_key": analytic_key,
+        "label": label,
+        "billing_type": "recurring",
         "message": "Stripe Checkout Session created.",
     }
 

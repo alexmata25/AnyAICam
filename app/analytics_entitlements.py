@@ -83,6 +83,43 @@ ANALYTICS_CATALOG = [
 
 ANALYTIC_KEYS = tuple(item[0] for item in ANALYTICS_CATALOG)
 
+# Commercial restructure confirmed 2026-09-21: the website's 5-item
+# product structure is Local, Hybrid, Advanced Analytics, Face Access,
+# AACO (future). This grouping is presentation-only -- it does NOT
+# change ANALYTICS_CATALOG's per-analytic_key keying, pricing, or
+# checkout/webhook behavior above; each key inside a category remains
+# individually purchasable through its own create_analytics_addon_
+# checkout() call and its own analytics_subscriptions row. "Advanced
+# Analytics" bundles the four pre-existing per-camera analytic types
+# under one marketing heading; "Face Access" is facial_recognition
+# alone, kept as its own heading because AACO (below) will build on it.
+# talk_down/ai_essentials/ai_professional/vehicle_intelligence/
+# cloud_overflow are pre-existing catalog entries not part of today's
+# 5-item structure -- left uncategorized here, not removed.
+ADDON_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "advanced_analytics": ("smart_motion", "people_counting", "lpr", "ppe"),
+    "face_access": ("facial_recognition",),
+}
+
+
+def aaco_product_status() -> dict:
+    """AACO ("future premium add-on" per the 2026-09-21 restructure
+    instruction) deliberately has NO ANALYTICS_CATALOG entry, NO price
+    env var, and NO checkout/webhook wiring -- inventing a placeholder
+    Price ID or analytic_key for a product whose scope, dependency on
+    Face Access, and price are all still undecided would be exactly the
+    kind of guess this codebase's other resolvers (resolve_tier(),
+    resolve_analytic(), hardware_orders' resolvers) are built to refuse.
+    This function exists only so a future website/pricing page has one
+    place to ask "can a customer buy this yet" and get an honest answer
+    instead of the page author having to know this history."""
+    return {
+        "key": "aaco",
+        "label": "AACO",
+        "sellable": False,
+        "reason": "Pricing, scope, and dependency on Face Access are not finalized -- business decision required before any catalog entry, Price ID, or checkout path is built.",
+    }
+
 
 def _load_price_map() -> dict:
     mapping = {}

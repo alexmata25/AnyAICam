@@ -284,22 +284,54 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
 # the other. Each tier's real Stripe Price ID -- when one is created and
 # verified -- goes in its own env var; unset (the default for all eight
 # today) means that tier is not purchasable/grantable yet, not a guess.
+#
+# Business decision confirmed 2026-09-21: Local is a one-time purchase
+# (billing_type="one_time" -> Stripe Checkout mode="payment"), Hybrid
+# remains a recurring subscription (billing_type="recurring" -> mode=
+# "subscription") -- see create_camera_slot_checkout() in main.py, which
+# branches Stripe Checkout `mode` off this field alone, never off a
+# hardcoded plan_type string, so a future third plan_type only needs an
+# entry here, not a new branch at every call site.
+#
+# IMPORTANT -- monthly_retail_usd for the four "local" rows below is a
+# CARRIED-OVER PLACEHOLDER from the pre-2026-09-21 monthly-subscription
+# model, not a confirmed one-time price. A monthly recurring price and a
+# fair one-time price are not the same number by any straightforward
+# conversion (they trade off against different customer lifetime-value
+# assumptions), so these four figures must not be read as "the" Local
+# price -- they exist only so the website pricing table has a non-empty
+# placeholder to render until a real one-time price is chosen. The four
+# "hybrid" rows are unaffected by this change and keep their verified
+# monthly figures from the AWS cost model.
+#
+# ALSO IMPORTANT -- test_local_hybrid_pricing_tiers.py's LIVE_PRICE_IDS
+# documents 8 real, live-mode Stripe Price IDs already created for this
+# table (not yet deployed). Those 4 "hybrid" Price IDs remain valid.
+# The 4 "local" Price IDs do NOT: they were created as recurring-monthly
+# Price objects, and a Stripe Price's recurring/one-time nature is fixed
+# permanently at creation time -- it cannot be edited into a one-time
+# price after the fact. Using mode="payment" (now correct for Local)
+# against one of those old recurring Price IDs will make Stripe reject
+# the Checkout Session outright. Four NEW one-time-mode Price objects
+# must be created in Stripe for Local before ANYAICAM_STRIPE_PRICE_
+# LOCAL_1_8/9_16/17_32/33_64 can be set to anything real again -- see
+# the restructure report for the full flagged list.
 PLAN_TIERS = [
-    # plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, price_id_env_var
-    ("local", "1-8", 1, 8, 8, 14.99, "ANYAICAM_STRIPE_PRICE_LOCAL_1_8"),
-    ("local", "9-16", 9, 16, 16, 19.99, "ANYAICAM_STRIPE_PRICE_LOCAL_9_16"),
-    ("local", "17-32", 17, 32, 32, 29.99, "ANYAICAM_STRIPE_PRICE_LOCAL_17_32"),
-    ("local", "33-64", 33, 64, 64, 49.99, "ANYAICAM_STRIPE_PRICE_LOCAL_33_64"),
-    ("hybrid", "1-8", 1, 8, 8, 29.99, "ANYAICAM_STRIPE_PRICE_HYBRID_1_8"),
-    ("hybrid", "9-16", 9, 16, 16, 49.99, "ANYAICAM_STRIPE_PRICE_HYBRID_9_16"),
-    ("hybrid", "17-32", 17, 32, 32, 89.99, "ANYAICAM_STRIPE_PRICE_HYBRID_17_32"),
-    ("hybrid", "33-64", 33, 64, 64, 149.99, "ANYAICAM_STRIPE_PRICE_HYBRID_33_64"),
+    # plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, price_id_env_var, billing_type
+    ("local", "1-8", 1, 8, 8, 14.99, "ANYAICAM_STRIPE_PRICE_LOCAL_1_8", "one_time"),
+    ("local", "9-16", 9, 16, 16, 19.99, "ANYAICAM_STRIPE_PRICE_LOCAL_9_16", "one_time"),
+    ("local", "17-32", 17, 32, 32, 29.99, "ANYAICAM_STRIPE_PRICE_LOCAL_17_32", "one_time"),
+    ("local", "33-64", 33, 64, 64, 49.99, "ANYAICAM_STRIPE_PRICE_LOCAL_33_64", "one_time"),
+    ("hybrid", "1-8", 1, 8, 8, 29.99, "ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "recurring"),
+    ("hybrid", "9-16", 9, 16, 16, 49.99, "ANYAICAM_STRIPE_PRICE_HYBRID_9_16", "recurring"),
+    ("hybrid", "17-32", 17, 32, 32, 89.99, "ANYAICAM_STRIPE_PRICE_HYBRID_17_32", "recurring"),
+    ("hybrid", "33-64", 33, 64, 64, 149.99, "ANYAICAM_STRIPE_PRICE_HYBRID_33_64", "recurring"),
 ]
 
 
 def _plan_tier_rows() -> list[dict]:
     rows = []
-    for plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, env_var in PLAN_TIERS:
+    for plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, env_var, billing_type in PLAN_TIERS:
         rows.append({
             "plan_type": plan_type,
             "tier_label": tier_label,
@@ -307,6 +339,7 @@ def _plan_tier_rows() -> list[dict]:
             "max_cameras": max_cameras,
             "camera_slot_maximum": camera_slot_maximum,
             "monthly_retail_usd": monthly_retail_usd,
+            "billing_type": billing_type,
             "product": f"camera_slots_{plan_type}",
             "stripe_price_id": os.environ.get(env_var, "").strip() or None,
         })
@@ -315,13 +348,15 @@ def _plan_tier_rows() -> list[dict]:
 
 def pricing_table_for_website() -> list[dict]:
     """Prepared, ready-to-render pricing data for the customer-facing VMS
-    website pricing section -- plan type, camera range, and verified
-    monthly retail price for all 8 tiers, straight from the AWS cost
-    model workbook. Does NOT include stripe_price_id (irrelevant to a
-    pricing page, and unset for all eight tiers today besides)."""
+    website pricing section -- plan type, camera range, billing_type
+    ("one_time" for Local, "recurring" for Hybrid -- the website must
+    render "one-time" vs "/mo" off this field, never infer it from
+    plan_type), and placeholder retail price for all 8 tiers. Does NOT
+    include stripe_price_id (irrelevant to a pricing page, and unset for
+    all eight tiers today besides)."""
     return [
         {"plan_type": r["plan_type"], "tier_label": r["tier_label"], "min_cameras": r["min_cameras"],
-         "max_cameras": r["max_cameras"], "monthly_retail_usd": r["monthly_retail_usd"]}
+         "max_cameras": r["max_cameras"], "monthly_retail_usd": r["monthly_retail_usd"], "billing_type": r["billing_type"]}
         for r in _plan_tier_rows()
     ]
 
@@ -336,7 +371,11 @@ def _load_price_tier_map() -> dict:
     mapping = {}
     for tier in _plan_tier_rows():
         if tier["stripe_price_id"]:
-            mapping[tier["stripe_price_id"]] = {"product": tier["product"], "camera_slot_maximum": tier["camera_slot_maximum"]}
+            mapping[tier["stripe_price_id"]] = {
+                "product": tier["product"],
+                "camera_slot_maximum": tier["camera_slot_maximum"],
+                "billing_type": tier["billing_type"],
+            }
     return mapping
 
 
@@ -346,8 +385,8 @@ SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
 
 
 def resolve_tier(price_id: str) -> Optional[dict]:
-    """Returns {"product": ..., "camera_slot_maximum": ...} for a
-    server-verified Stripe Price ID, or None if this Price ID has no
+    """Returns {"product": ..., "camera_slot_maximum": ..., "billing_type": ...}
+    for a server-verified Stripe Price ID, or None if this Price ID has no
     configured tier -- callers must treat None as "grant nothing",
     never fall back to a guessed quantity."""
     if not price_id:
@@ -362,7 +401,11 @@ def resolve_tier(price_id: str) -> Optional[dict]:
         return None
     if not product:
         return None
-    return {"product": product, "camera_slot_maximum": camera_slot_maximum}
+    return {
+        "product": product,
+        "camera_slot_maximum": camera_slot_maximum,
+        "billing_type": str(tier.get("billing_type") or "recurring"),
+    }
 
 
 def is_event_processed(event_id: str) -> bool:
