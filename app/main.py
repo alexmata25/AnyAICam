@@ -73849,10 +73849,26 @@ def dashboard(request: Request) -> str:
         # own auth gate), which would break this exact button for a
         # staff/admin session viewing this same shared /dashboard route.
         _dashboard_live_view_href = "/customer-live"
+        # camera_number is only unique PER APPLIANCE, not across a
+        # customer's whole fleet -- a customer with two appliances each
+        # provisioning their own "Camera 1" is a real, reachable shape
+        # (nothing in provisioning prevents it). A naive {camera_number:
+        # id} dict would silently let the second appliance's row
+        # overwrite the first's, sending one of the two dashboard cards
+        # to the WRONG camera's tools page. Built defensively here as a
+        # two-pass "only keep a number that maps to exactly one id"
+        # instead: an ambiguous number is simply omitted, so its card
+        # falls back to _dashboard_live_view_href (the safe, generic
+        # canonical page) rather than ever risking a wrong specific link.
+        _dashboard_camera_ids_seen: dict[int, set] = {}
+        for camera in _customer_dashboard_cameras:
+            if camera.get("camera_number") is None:
+                continue
+            _dashboard_camera_ids_seen.setdefault(camera["camera_number"], set()).add(camera["id"])
         _dashboard_camera_ids_by_number = {
-            camera["camera_number"]: camera["id"]
-            for camera in _customer_dashboard_cameras
-            if camera.get("camera_number") is not None
+            number: next(iter(ids))
+            for number, ids in _dashboard_camera_ids_seen.items()
+            if len(ids) == 1
         }
     else:
         _dashboard_camera_numbers = list(get_camera_numbers())
@@ -103309,12 +103325,23 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     # Local entitlement.
     plan_badge = {"local": "Local", "hybrid": "Hybrid"}.get(mode, "No active plan")
 
+    # Both customer_owner and customer_viewer reach this page (matching
+    # the legacy page's own no-role-distinction convention), but the
+    # underlying checkout endpoints (create_camera_slot_checkout()/
+    # create_analytics_addon_checkout()) are customer_owner-only,
+    # unconditionally 403ing a customer_viewer. Buy/upgrade actions are
+    # hidden here for a viewer rather than shown-then-403 on click --
+    # never a security boundary on their own (the real enforcement is
+    # server-side in those two routes, unchanged), just not offering an
+    # action this identity can never actually complete.
+    is_owner = identity.get("role") == "customer_owner"
+
     hybrid_tier_options = [
         {"tier_label": t[1], "camera_slot_maximum": t[4], "monthly_retail_usd": t[5]}
         for t in PLAN_TIERS if t[0] == "hybrid" and os.environ.get(t[6], "").strip()
     ]
     upgrade_tier = None
-    if mode == "local" and camera_entitlement:
+    if mode == "local" and camera_entitlement and is_owner:
         upgrade_tier = next((t for t in hybrid_tier_options if t["camera_slot_maximum"] == camera_entitlement["camera_slot_quantity"]), None)
 
     active_analytics = set(get_active_analytics_for_customer(customer_id))
@@ -103324,7 +103351,12 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         if not price_id:
             continue
         is_active = bool(analytic_keys) and all(key in active_analytics for key in analytic_keys)
-        status_html = '<span class="pill">Active</span>' if is_active else f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
+        if is_active:
+            status_html = '<span class="pill">Active</span>'
+        elif is_owner:
+            status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
+        else:
+            status_html = '<span class="health-detail">Not purchased</span>'
         addon_rows += f'<div class="health-row"><span>{escape(label)}</span>{status_html}</div>'
     if not addon_rows:
         addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'

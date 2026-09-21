@@ -340,3 +340,30 @@ UPDATE customer_entitlements SET status='cancelled' WHERE customer_id=<id> AND p
 This makes `product_mode_for_customer()` report `"hybrid"` again; the next `edge_camera_sync` poll detects the reverse transition, the cloud queues a second `restart_vms` automatically (same dedup/grace-window protections), and Ryzen restarts back into Hybrid on its own -- no SSH required, mirroring the forward migration exactly. Use the fast path first if immediate reversal matters more than proving the automatic path both directions.
 
 Neither rollback path touches `cameras`, `analytics_subscriptions`, `camera_analytics_entitlements`, or any file under `/app/recordings` -- confirmed by code review, same as the forward migration.
+
+## Cloud DB access blocker (checked 2026-09-21) -- retry commands for later
+
+The actual cloud database (needed to resolve/verify this Ryzen unit's real `customer_id`/`site_id`/appliance ownership and to perform the entitlement grant in step 3 above) could not be reached this session. **The customer/site/appliance identifiers found via Ryzen's own local cache earlier (`customer_id=d75bdbecdd4887de4d2b89a9fcea9092`, `site_id=f67fa371cd`, `appliance_id=2f941627b4`) are reference-only and NOT verified against the cloud DB** -- do not use them to perform the actual entitlement change in step 3 without re-confirming against the cloud source first.
+
+Retry these, in order, next time:
+```bash
+tailscale status | grep anyaicam-ec2                          # look for anything other than "offline"
+ssh -o ConnectTimeout=8 anyaicam-ec2 "hostname"                # Tailscale hostname
+ssh -o ConnectTimeout=8 100.91.105.97 "hostname"               # Tailscale IP direct
+ssh -o ConnectTimeout=8 anyaicam-staging "hostname"             # configured staging host (~/.ssh/config)
+ssh -o ConnectTimeout=8 34.194.19.113 "hostname"                # that host's raw public IP
+curl -sI https://portal-staging.anyaicam.com/                   # sanity: is the app itself up over the public internet
+```
+As of this check: the last command succeeds (HTTP 303, app is up and serving customers normally); every SSH path above times out. This means the blocker is specifically an administrative-access gap (no working SSH route to the box, no admin API credentials on hand), not a cloud outage -- the fix is either the EC2 instance/Tailscale daemon coming back up, a security-group rule allowing SSH from wherever this session runs next, or being handed working admin credentials for the web app itself as an alternate query path. No workaround (alternate keys, credential guessing, security-group edits) was attempted.
+
+## Session audit summary (2026-09-21) -- non-destructive review while cloud access was blocked
+
+With the Local/Hybrid switch paused, this pass reviewed the customer-facing UI and test coverage end to end (real HTTP requests against a local in-memory instance, not the live cloud or Ryzen) and found two real, fixed issues plus one documented-but-not-fixed gap:
+
+1. **Fixed**: `dashboard()`'s per-camera preview cards mapped `camera_number -> camera id` with a plain dict, and `camera_number` is only unique per appliance, not across a customer's whole fleet. A customer with two appliances each having their own "Camera 1" would have silently sent one of the two dashboard cards to the WRONG camera's live-tools page. Now built defensively: an ambiguous camera_number is omitted from the map entirely, falling back to the safe generic `/customer-live` link instead of ever guessing. Regression test added (`test_two_appliances_with_the_same_camera_number_never_link_to_the_wrong_camera`).
+2. **Fixed**: `/subscription-portal`'s real-customer branch showed "Upgrade to Hybrid" and add-on "Add" buttons to `customer_viewer` sessions, but `create_camera_slot_checkout()`/`create_analytics_addon_checkout()` are both `customer_owner`-only and would 403 a viewer who clicked them. Buttons are now hidden for a viewer (shown as "Not purchased" / no upgrade panel) rather than shown-then-403 -- the actual authorization boundary is unchanged, this only fixes what the UI offers. Two regression tests added.
+3. **Documented, not fixed (pre-existing, out of scope for a non-destructive audit pass)**: `dashboard()`'s whole camera list (`_customer_playback_cameras()`, scoped by the `can_playback` permission) is a different permission grant than what `/customer/cameras/{id}/live` itself requires (`can_live`, via `_customer_live_cameras()`) -- a `customer_viewer` granted playback-only access to a camera would see a dashboard card for it that leads to a page their own JS then 403s them out of. `_customer_live_cameras()` already has its own multi-appliance grouping fix (2026-09-12) that `dashboard()`'s camera list was never given -- both gaps predate this session's work and would need a product decision (which permission should gate the Dashboard's camera list, and whether to backport the appliance-grouping fix there) before touching, not a decision to make silently while auditing.
+
+Also audited: the Live page transport race (relay/P2P/WireGuard-local, `claimTransport()`'s blocked/claimed/already states, `pagehide` cleanup on both pages) -- no further issues found beyond the black-tile fix already shipped. The subscription page's data path was re-confirmed end to end (real HTTP against seeded Local/Hybrid/no-plan/viewer sessions) to trace entirely through `customer_entitlements`/`analytics_entitlements`, with zero legacy/mock fallback reachable for a real `partner_identity()` session. 5 new product-mode edge-case tests added: two-appliances-per-customer restart isolation, and non-"active" entitlement statuses (`past_due`, `trialing`) correctly never counted.
+
+No changes were made to any live entitlement, product mode, AWS security group, DNS record, or the Ryzen appliance itself during this pass -- every fix above is local-repo code/test/doc, verified only against an in-memory test database.

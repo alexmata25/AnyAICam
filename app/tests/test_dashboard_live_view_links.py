@@ -113,6 +113,33 @@ def test_camera_preview_cards_link_to_the_new_single_camera_page_not_the_old_one
         assert f'href="/camera/{n}" id="dashboard-camera-{n}"' not in html
 
 
+def test_two_appliances_with_the_same_camera_number_never_link_to_the_wrong_camera(http_client, db_path):
+    """camera_number is only unique PER APPLIANCE, not across a
+    customer's whole fleet -- nothing in provisioning prevents a
+    customer with two appliances each having their own "Camera 1".
+    _dashboard_camera_ids_by_number must never let one appliance's row
+    silently overwrite the other's, which would send one of the two
+    resulting dashboard cards to a real but WRONG camera's tools page.
+    An ambiguous camera_number must fall back to the safe generic
+    /customer-live href instead of guessing which id is correct."""
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-1")
+    conn.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-2','cust-1','Second Site','2026-01-01')")
+    conn.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('app-2','cust-1','site-2','cloud-2','2026-01-01')")
+    _seed_camera(conn, "cam-1a", customer_id="cust-1", camera_number=1, name="Front Door")
+    conn.execute(
+        "INSERT INTO cameras(id,customer_id,site_id,name,status,camera_number,created_at) VALUES(?,?,?,?,?,?,?)",
+        ("cam-1b", "cust-1", "site-2", "Back Door", "configured", 1, "2026-01-01"),
+    )
+    conn.commit()
+    conn.close()
+    response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
+    html = response.text
+    assert "/customer/cameras/cam-1a/live" not in html
+    assert "/customer/cameras/cam-1b/live" not in html
+    assert 'href="/customer-live" id="dashboard-camera-1"' in html
+
+
 def test_a_customer_with_no_camera_id_resolved_falls_back_to_customer_live_not_a_broken_link(http_client, db_path):
     """A camera_number this dashboard couldn't map to a real camera id
     (should not happen in practice, since _dashboard_camera_numbers and

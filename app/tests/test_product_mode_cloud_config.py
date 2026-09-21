@@ -375,3 +375,62 @@ def test_product_mode_changed_audit_entry_is_recorded(client, db_path):
     assert details["new_mode"] == "hybrid"
     assert set(details["changed_flags"]) == set(pm.FLAG_REGISTRY.keys())
     assert "restart_command_id" in details
+
+
+# ------------------------------------------- one customer, multiple appliances
+
+
+def test_two_appliances_under_the_same_customer_each_get_their_own_independent_restart(client, db_path):
+    """product_mode_for_customer() is customer-scoped (both appliances
+    resolve the same "hybrid"), but last_reported_product_mode and the
+    restart_vms dedup/queue are tracked per-APPLIANCE -- a customer with
+    two Ryzen units must get two independent restarts, one per box, not
+    a single shared one and not a second appliance silently skipped
+    because the first already "used up" the transition."""
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-a", "AIC-MULTI-A", "cred-a")
+    _seed_appliance(db_path, "cust-1", "appl-b", "AIC-MULTI-B", "cred-b")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+
+    response_a = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-a", "cred-a"))
+    response_b = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-b", "cred-b"))
+    assert response_a.json()["product_mode"] == "hybrid"
+    assert response_b.json()["product_mode"] == "hybrid"
+
+    commands_a = _pending_restart_commands(db_path, "appl-a")
+    commands_b = _pending_restart_commands(db_path, "appl-b")
+    assert len(commands_a) == 1
+    assert len(commands_b) == 1
+    assert commands_a[0]["id"] != commands_b[0]["id"]
+    assert _last_reported_mode(db_path, "appl-a") == "hybrid"
+    assert _last_reported_mode(db_path, "appl-b") == "hybrid"
+
+    # A repeat poll on EITHER appliance alone must not queue a second
+    # restart for the OTHER one that hasn't polled again yet.
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-a", "cred-a"))
+    assert len(_pending_restart_commands(db_path, "appl-a")) == 1
+    assert len(_pending_restart_commands(db_path, "appl-b")) == 1
+
+
+# ------------------------------------------------- non-active entitlement statuses
+
+
+def test_a_past_due_entitlement_is_not_counted_as_active(client, db_path):
+    """Only status=='active' counts -- any other real Stripe status
+    (past_due, incomplete, trialing, etc.) must be treated the same as
+    cancelled: not active, never guessed into a mode."""
+    _seed_tenant(db_path, "cust-1")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import product_mode_for_customer, upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8, status="past_due")
+        assert product_mode_for_customer("cust-1") == ""
+
+
+def test_a_trialing_entitlement_is_not_counted_as_active(client, db_path):
+    _seed_tenant(db_path, "cust-1")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import product_mode_for_customer, upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8, status="trialing")
+        assert product_mode_for_customer("cust-1") == ""
