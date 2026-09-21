@@ -60,7 +60,7 @@ This is why introducing this module is a **zero-behavior-change event** for the 
 
 `GET /api/appliance/configuration` (the cloud route every appliance already polls periodically for camera config) now includes a `product_mode` field sourced from this function. `edge_camera_sync.py`'s existing poll loop reads it and calls `product_mode.persist_mode(...)`, which writes the state file only when the mode actually changed and returns `True` in that case (surfaced in `sync_provisioned_cameras()`'s result as `product_mode_restart_required`).
 
-**This is the whole upgrade-is-billing-driven loop, already closed end to end in code:**
+**This is the whole upgrade-is-billing-driven loop, now closed end to end in code, including the automatic restart (see §4a below):**
 
 ```
 Customer clicks "Upgrade to Hybrid"
@@ -69,12 +69,62 @@ Customer clicks "Upgrade to Hybrid"
   -> Stripe Checkout -> webhook -> upsert_entitlement(product="camera_slots_hybrid")
      (already existed, reused as-is)
   -> product_mode_for_customer() now returns "hybrid"
-  -> next GET /api/appliance/configuration poll (edge_camera_sync.py, ~60s cadence)
-     reports product_mode="hybrid" -> persist_mode("hybrid") writes the state file,
-     returns True
-  -> (NOT YET WIRED -- see "What's still a decision" below) appliance restarts
-     to pick up the new mode's flag defaults
+  -> next GET /api/appliance/configuration poll (edge_camera_sync.py, ~60s cadence):
+     - cloud side (appliance_cloud.appliance_configuration()) detects
+       appliances.last_reported_product_mode != "hybrid", computes
+       product_mode.describe_transition("local","hybrid") -> 6 changed
+       flags, updates last_reported_product_mode, queues ONE
+       appliance_commands row (command="restart_vms", created_by=
+       "product-mode-transition"), logs old->new + changed flags,
+       records an audit_logs "appliance.product_mode_changed" entry
+     - edge side: response includes product_mode="hybrid" ->
+       edge_camera_sync.py calls persist_mode("hybrid"), writing the
+       local state file
+  -> appliance's own agent (anyaicam_agent) polls GET /api/appliance/commands
+     (its own existing, unrelated poll cycle), receives the queued
+     restart_vms command, writes a pending_actions marker (already-
+     existing, already-tested _queue_privileged_action())
+  -> anyaicam-privileged-watcher.service (host-side, root, already
+     existing) picks up the marker after a 10s cancellation grace
+     window and runs `docker compose --project-directory /opt/anyaicam
+     up -d` -- recreates the anyaicam-vms container only because its
+     resolved env actually changed, never a host reboot
+  -> the new container's process-start re-reads the persisted mode ->
+     every governed flag now resolves to its Hybrid default
 ```
+
+### 4a. Automatic restart -- now wired
+
+`appliance_cloud._queue_product_mode_restart()` (called from inside `appliance_configuration()`, in the same `connection()` already open for cloud_policy/storage_policy/identity) is the piece that closes the loop above. It:
+
+- Compares this specific appliance's `appliances.last_reported_product_mode` (a new column, migrated in `db_migrations.py`) against the freshly-computed `product_mode_for_customer()` value.
+- Calls `product_mode.describe_transition(old, new)` to compute which of the six governed flags would actually flip by default -- an empty result (e.g. a customer's very first Local purchase, `"" -> "local"`, which changes nothing since both resolve every flag to `False`) updates the tracking column but queues nothing.
+- On a real change, queues **exactly one** `restart_vms` `appliance_commands` row -- reusing the existing, already-fully-wired, already-tested edge/agent/watcher path (`appliance-agent/anyaicam_agent/commands.py` -> `appliance-agent/system/privileged_watcher.py`), the same `docker compose up -d` action an admin's manual "Restart VMS" button would trigger. No new command type, no new agent code, no new watcher dispatch entry.
+- Logs `product_mode.transition appliance_id=... old_mode=... new_mode=... changed_flags=[...] command_id=...` at `WARNING` (visible without raising log verbosity) and records an `audit_logs` entry (`appliance.product_mode_changed`) with the same old/new/changed-flags/command-id detail, addressing "log old mode -> new mode and which services/features changed."
+
+**Loop/duplicate prevention, two layers:**
+
+1. **Primary**: `last_reported_product_mode` is updated the moment a transition is detected, so the very next poll's `new_mode == stored` comparison is `False`-equivalent (no-op) -- no restart is queued again until a genuinely different mode is reported. This means any number of poll cycles with an unchanged mode queue nothing beyond the original one restart (tested: `test_repeated_polls_with_an_unchanged_mode_never_queue_a_second_restart`, 5 consecutive polls).
+2. **Secondary**: an explicit `SELECT ... WHERE command='restart_vms' AND status IN ('pending','delivered')` dedup check (mirroring `queue_command()`'s own existing "identical command already queued" guard immediately below it in the same file) refuses to queue a second `restart_vms` for this appliance if one from an earlier transition hasn't been consumed yet -- covers the edge case of the mode flipping again before the agent/watcher has processed the first one (tested: `test_a_rapid_flip_before_the_first_restart_is_consumed_does_not_double_queue`).
+
+`confirmed: true` is set in the queued command's payload deliberately, not as a bypass of a human safety gate -- `_queue_privileged_action()` on the agent side requires it before it will even write the marker (defense-in-depth, matching the cloud's own `queue_command()` requiring it from an admin's request body). Here, the customer's own completed Stripe purchase or cancellation **is** the confirmation; there is no separate human-in-the-loop step for an entitlement-driven mode change, by design -- this is what "without manual SSH" means.
+
+A cancelled entitlement with no fallback (`product_mode_for_customer()` returns `""`, "Decision B" below) deliberately neither updates `last_reported_product_mode` nor queues a restart -- the appliance keeps running its last real mode, untouched, until a real mode is reported again (tested: `test_a_lapsed_entitlement_never_clears_or_restarts`).
+
+### 4b. Hot-reload vs. restart-required, per service
+
+**None of the six governed services can hot-reload today -- all require a restart.** This is a structural fact about the current code, not a choice this feature made:
+
+| Service | Flag | Hot-reload? | Why |
+|---|---|---|---|
+| `analytics_sync.py` | `ANYAICAM_ANALYTICS_SYNC_ENABLED` | No | Read into a module-level constant once at import; `main.py`'s startup event decides whether to `asyncio.create_task()` the worker AT ALL based on that constant's value at that moment. |
+| `event_media_uploader.py` | `ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED` | No | Same shape as above. |
+| `facial_embedding_sync.py` | `ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED` | No | Same shape as above. |
+| `live_relay_uploader.py` | `ANYAICAM_LIVE_RELAY_ENABLED` | No | Same shape as above. |
+| `recording_uploader.py` | `ANYAICAM_RECORDING_UPLOAD_ENABLED` | No | Same shape as above. |
+| `webrtc_publisher.py` | `ANYAICAM_LIVE_P2P_ENABLED` | No | Same shape as above (gate checked once per worker invocation, but the underlying constant it checks is still import-time-frozen). |
+
+None of these workers' own loop bodies re-check their flag on each iteration -- the gate is evaluated once, before the loop/task is even created, and never again for the life of the process. Making any of them genuinely hot-reloadable would mean changing each worker's own loop to re-read `product_mode.resolve_cloud_flag(...)` fresh every iteration instead of trusting a cached import-time constant -- a real, separate change to each of the six modules, out of scope here. This is why a restart is the correct and only mechanism today, and why this feature's entire design centers on making that restart automatic, safe, and non-repeating rather than trying to avoid it.
 
 ### 5. Admin/partner portal: "Upgrade to Hybrid" button
 
@@ -83,21 +133,24 @@ Added to the customer setup/review page (`partner_workspace.py`), shown only whe
 ### 6. Tests
 
 - `tests/test_product_mode.py` (19 tests) -- resolver logic: env-var-always-wins, mode defaults, legacy fallback, persist/no-op/change detection, an empty-string env var treated as unset (matching every flag's pre-existing behavior).
-- `tests/test_product_mode_cloud_config.py` (10 tests) -- `product_mode_for_customer()` directly, and the real `GET /api/appliance/configuration` route end to end (TestClient), including the exact upgrade-flips-the-field-immediately scenario and per-customer isolation.
-- All six migrated worker modules' existing test suites (165 + additional files, ~200 tests total) re-run clean -- every test that toggles these flags does so via `monkeypatch.setattr(module, "FLAG_NAME", ...)` directly on the module attribute, which is completely unaffected by how that attribute was originally computed.
-- `tests/test_edge_camera_sync.py` updated (5 assertions) for the new `product_mode_restart_required` key in `sync_provisioned_cameras()`'s result.
+- `tests/test_product_mode_cloud_config.py` (17 tests) -- `product_mode_for_customer()` directly; the real `GET /api/appliance/configuration` route end to end (TestClient), including the upgrade-flips-the-field-immediately scenario and per-customer isolation; and the automatic-restart regression suite:
+  - `test_local_to_hybrid_upgrade_queues_exactly_one_restart_vms_command`
+  - `test_hybrid_to_local_downgrade_also_queues_a_restart`
+  - `test_repeated_polls_with_an_unchanged_mode_never_queue_a_second_restart` (5 consecutive polls, one command)
+  - `test_a_rapid_flip_before_the_first_restart_is_consumed_does_not_double_queue`
+  - `test_first_ever_local_purchase_queues_no_restart` (`"" -> "local"` changes nothing)
+  - `test_a_lapsed_entitlement_never_clears_or_restarts` (Decision B case)
+  - `test_product_mode_changed_audit_entry_is_recorded`
+- All six migrated worker modules' existing test suites, plus every test file touching `appliance_commands`/`queue_command()`/db migrations (501 tests total across the full combined run) re-run clean.
+- `tests/test_edge_camera_sync.py` updated (5 assertions) for the `product_mode_restart_required` key in `sync_provisioned_cameras()`'s result.
 
 19 pre-existing test failures were found and confirmed **unrelated** to this work (verified by reverting each changed file individually and re-running): 19 in `test_recording_uploader_*` (this dev machine's shell has no `AWS_REGION` set) and 26 in `test_camera_discovery_provisioning.py` plus 7 in the customer-setup-page test files (a pre-existing "licensed for 0 cameras" / stale-assertion issue in this environment, reproduced identically on the unmodified `main` branch state).
 
+A real SQLite concurrency bug was found and fixed during this work: calling `audit()` (which opens its own `connection()`) from inside the still-open write transaction already used to update `last_reported_product_mode` and insert the `appliance_commands` row deadlocked with `sqlite3.OperationalError: database is locked` on every test run until `_queue_product_mode_restart()` was changed to return the audit payload for the caller to record only after the `with connection() as db:` block closes.
+
 ## What's still a decision (not built yet)
 
-### A. Automatic restart on mode change
-
-Every governed flag is read once at process start (unchanged from before this module existed) -- a mode change only takes effect on the next restart of the `anyaicam-vms` container. `product_mode.persist_mode()` logs a `product_mode.changed ... restart_required=true` warning and `sync_provisioned_cameras()` surfaces `product_mode_restart_required: True`, but **nothing currently acts on that signal**.
-
-The appliance already has a real, existing cloud-to-edge privileged command channel that could close this loop: `appliance_protocol.ALLOWED_COMMANDS` includes `restart_vms`, handled by the host-side `anyaicam-privileged-watcher.service` already running on the Ryzen unit. The natural next step is: have the Stripe webhook handler (or `edge_camera_sync.py`, on detecting `product_mode_restart_required=True`) enqueue a `restart_vms` command for that appliance. **Not implemented in this branch** -- it touches the webhook/command-queue path, which felt like a decision to surface rather than bundle in silently. Until it exists, an upgrade/downgrade requires a manual restart (`docker compose restart` / `systemctl restart anyaicam-vms`) to take visible effect, even though the mode itself updates automatically.
-
-### B. Hybrid -> Local downgrade when no prior Local entitlement exists
+### A. Hybrid -> Local downgrade when no prior Local entitlement exists
 
 `product_mode_for_customer()` returns `""` (not `"local"`) for a customer whose Hybrid subscription is cancelled and who never held a `camera_slots_local` entitlement (e.g. a customer who started on Hybrid from day one). This is a genuine, flagged business decision, not something silently assumed:
 
@@ -113,8 +166,23 @@ In either case, **no local data is ever deleted** by a downgrade: `product_mode.
 1. **Confirm the customer's real entitlement first.** Query `customer_entitlements` for this Ryzen unit's `customer_id` -- if it has no `camera_slots_hybrid` row (likely, since this is a pilot unit predating this billing model), decide whether to backfill one before flipping the appliance, or set `ANYAICAM_PRODUCT_MODE=hybrid` explicitly as a manual override (bypassing entitlement-driven resolution entirely -- `current_mode()` prefers the env var first).
 2. **Pull this branch's code** onto the Ryzen unit (or wait for it to merge through the normal release path) -- `product_mode.py` must exist before any flag migration takes effect; deploying it alone changes nothing (see "zero-behavior-change" above).
 3. **Decide the target mode.** Given the pilot unit's current live config (`ANALYTICS_SYNC_ENABLED=true`, `EVENT_MEDIA_UPLOAD_ENABLED=true`, `FACIAL_EMBEDDING_SYNC_ENABLED=true`, `LIVE_RELAY_ENABLED=true`, `LIVE_P2P_ENABLED=true`, `RECORDING_UPLOAD_ENABLED=false`), it is already Hybrid-shaped except for bulk recording upload. Setting `ANYAICAM_PRODUCT_MODE=hybrid` and then **removing** the five individual `_ENABLED=true` overrides would make the mode itself the authoritative source going forward (recommended) -- or leave the explicit flags in place indefinitely, since they always win over the mode regardless.
-4. **Restart `anyaicam-vms`** to apply. Verify via `docker exec anyaicam-vms env | grep ANYAICAM_.*ENABLED` (should show nothing, if you removed the explicit overrides) and confirm each worker's own startup log line still shows it running (or not) as intended.
+4. **Restart `anyaicam-vms`** to apply -- either manually (`docker compose --project-directory /opt/anyaicam up -d`) or, once both the cloud deployment and Ryzen's own `anyaicam-vms` are actually running this branch's code (see "Is the automatic path usable yet?" below), by giving the customer a real `camera_slots_hybrid` entitlement and letting the automatic loop in §4a queue it. Verify via `docker exec anyaicam-vms env | grep ANYAICAM_.*ENABLED` (should show nothing, if you removed the explicit overrides) and confirm each worker's own startup log line still shows it running (or not) as intended.
 5. **To test Local instead**: set `ANYAICAM_PRODUCT_MODE=local`, remove the explicit overrides, restart, and verify: local recording continues (check `/app/recordings` for fresh files, exactly as confirmed live today), live view works from the LAN, and `docker logs anyaicam-vms` shows no further `analytics_sync.http_call_begin` / `event_media.registered` / `live_relay.segment_upload_*` lines (the three cloud-dependent behaviors confirmed actively running today).
 6. **Roll back** at any point by re-setting the explicit `_ENABLED` env vars to their prior values (they always override the mode) or unsetting `ANYAICAM_PRODUCT_MODE` entirely (falls back to whatever the explicit flags say, i.e. today's exact behavior).
 
 No step above has been performed. This is the plan, not an action taken.
+
+## Is the automatic path usable on Ryzen for a real validation test yet?
+
+**Checked live on Ryzen (read-only, 2026-09-21), independent of this branch's code:**
+
+- `anyaicam-agent.service`: `active` and `enabled`.
+- `anyaicam-privileged-watcher.path`: `active` and `enabled` (the systemd path-watch unit that arms `anyaicam-privileged-watcher.service` on a new marker file).
+- `anyaicam-privileged-watcher.service` itself: `inactive` -- this is its normal resting state (a oneshot triggered by the `.path` unit, not something that stays running).
+
+**The mechanism itself is alive and ready on the real hardware right now.** But two things this feature depends on have not been deployed anywhere yet:
+
+1. **The cloud deployment** (`portal-staging.anyaicam.com`, or whatever serves this Ryzen unit's `ANYAICAM_CLOUD_URL`) is not running this branch's code -- `_queue_product_mode_restart()` only exists in this git branch. Until the cloud side is deployed with it, `GET /api/appliance/configuration` will keep returning its current shape with no `product_mode` field at all, and nothing will ever queue a `restart_vms` command automatically no matter what this customer's entitlement says.
+2. **Ryzen's own `anyaicam-vms` container** is not running this branch's code either -- `product_mode.py` and the six migrated flags don't exist on the box yet (migration step 2 above).
+
+**Recommendation: yes, Ryzen can be safely used for a real Local-mode validation test, but only via the manual path (steps 2-5 above), not the fully-automatic entitlement-triggered path, until both deployments happen.** The manual path is low-risk and has a clean rollback (step 6): local recording, cameras, and analytics settings are never touched by any code this branch adds (confirmed by code review -- no path in `product_mode.py`, the six migrated flags, or `_queue_product_mode_restart()` writes to `analytics_subscriptions`, `camera_analytics_entitlements`, `cameras`, or any recording file), and the four cloud-dependent behaviors currently confirmed live (analytics sync, event-media upload, facial-embedding sync, live-relay-to-S3) are exactly what a Local-mode restart is designed to stop. Once this branch is deployed to both the cloud and the Ryzen edge, the same validation could be repeated end-to-end through the automatic path (grant/revoke a test entitlement and watch the restart happen with no SSH), which would additionally prove out the `restart_vms` command's full round trip on real hardware for the first time -- it is currently exercised only by this branch's own test suite (mocked SQLite, no real agent/watcher involved) and, per the code audit above, has never had a producer anywhere in the codebase until now.

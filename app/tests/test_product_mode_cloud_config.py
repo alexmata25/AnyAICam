@@ -12,6 +12,7 @@ Real HTTP throughout for the route-level tests (TestClient(main.app)),
 mirroring test_rdm_cloud_policy.py's own established pattern for testing
 this same GET /api/appliance/configuration route.
 """
+import json
 import secrets
 import sqlite3
 import time
@@ -20,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from database_backend import override_target
+import product_mode as pm
 
 
 @pytest.fixture()
@@ -185,3 +187,191 @@ def test_two_appliances_under_different_customers_see_their_own_mode_only(client
     response_b = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-b", "cred-b"))
     assert response_a.json()["product_mode"] == "local"
     assert response_b.json()["product_mode"] == "hybrid"
+
+
+# --------------------------------------- automatic restart_vms on mode change
+
+
+def _pending_restart_commands(db_path, appliance_id):
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM appliance_commands WHERE appliance_id=? AND command='restart_vms'", (appliance_id,)
+        ).fetchall()]
+
+
+def _last_reported_mode(db_path, appliance_id):
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT last_reported_product_mode FROM appliances WHERE id=?", (appliance_id,)).fetchone()
+        return row["last_reported_product_mode"]
+
+
+def test_local_to_hybrid_upgrade_queues_exactly_one_restart_vms_command(client, db_path):
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART1", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
+    # First poll establishes "local" as the baseline -- no prior mode to
+    # transition FROM yet, and local<->unset changes no flags anyway, so
+    # this alone must queue nothing.
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert _pending_restart_commands(db_path, "appl-1") == []
+    assert _last_reported_mode(db_path, "appl-1") == "local"
+
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert response.json()["product_mode"] == "hybrid"
+
+    commands = _pending_restart_commands(db_path, "appl-1")
+    assert len(commands) == 1
+    assert commands[0]["status"] == "pending"
+    assert commands[0]["created_by"] == "product-mode-transition"
+    payload = json.loads(commands[0]["payload_json"])
+    assert payload["confirmed"] is True
+    assert "local -> hybrid" in payload["reason"]
+    assert _last_reported_mode(db_path, "appl-1") == "hybrid"
+
+
+def test_hybrid_to_local_downgrade_also_queues_a_restart(client, db_path):
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART2", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    # The very first real mode (unset -> hybrid) DOES change flags (every
+    # governed flag flips from its legacy-false default to true), so this
+    # already queues a restart -- confirmed here rather than assumed, then
+    # cleared before testing the downgrade in isolation below.
+    first_commands = _pending_restart_commands(db_path, "appl-1")
+    assert len(first_commands) == 1
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE appliance_commands SET status='completed' WHERE id=?", (first_commands[0]["id"],))
+        conn.commit()
+
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8, status="cancelled")
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert response.json()["product_mode"] == "local"
+
+    commands = _pending_restart_commands(db_path, "appl-1")
+    assert len(commands) == 2  # the original (now completed) + this new downgrade one
+    downgrade_command = next(c for c in commands if c["status"] == "pending")
+    payload = json.loads(downgrade_command["payload_json"])
+    assert "hybrid -> local" in payload["reason"]
+    assert _last_reported_mode(db_path, "appl-1") == "local"
+
+
+def test_repeated_polls_with_an_unchanged_mode_never_queue_a_second_restart(client, db_path):
+    """The core loop-prevention guarantee: any number of poll cycles
+    with no real mode change must queue nothing beyond the one restart
+    from the original transition."""
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART3", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+
+    for _ in range(5):
+        client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    commands = _pending_restart_commands(db_path, "appl-1")
+    assert len(commands) == 1
+
+
+def test_a_rapid_flip_before_the_first_restart_is_consumed_does_not_double_queue(client, db_path):
+    """Loop prevention's second layer: even if the mode flips again
+    while the first restart_vms command is still pending/delivered
+    (not yet completed by the appliance), the existing-pending dedup
+    check must refuse to queue a second one."""
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART4", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert len(_pending_restart_commands(db_path, "appl-1")) == 1  # still pending/undelivered
+
+    # Flip back to local before the appliance has consumed the first command.
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8, status="cancelled")
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    commands = _pending_restart_commands(db_path, "appl-1")
+    assert len(commands) == 1, "the still-pending restart_vms command must not be duplicated"
+
+
+def test_first_ever_local_purchase_queues_no_restart(client, db_path):
+    """"" -> "local" changes no governed flag by default (both resolve
+    every flag to False), so a customer's very first Local purchase --
+    before this appliance has ever reported a real mode -- must queue
+    nothing. There is nothing running yet for a restart to change."""
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART5", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert _pending_restart_commands(db_path, "appl-1") == []
+    assert _last_reported_mode(db_path, "appl-1") == "local"
+
+
+def test_a_lapsed_entitlement_never_clears_or_restarts(client, db_path):
+    """A cancelled Hybrid subscription with no fallback Local
+    entitlement reports product_mode="" (see product_mode_for_customer()
+    -- "Decision B", never guessed) -- this must never clear
+    last_reported_product_mode or queue a restart of its own; the
+    appliance keeps running its last real mode until a real mode is
+    reported again."""
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART6", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert len(_pending_restart_commands(db_path, "appl-1")) == 1
+
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8, status="cancelled")
+    response = client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+    assert response.json()["product_mode"] == ""
+    assert _last_reported_mode(db_path, "appl-1") == "hybrid"  # untouched, not cleared
+    assert len(_pending_restart_commands(db_path, "appl-1")) == 1  # no new/second command queued
+
+
+def test_product_mode_changed_audit_entry_is_recorded(client, db_path):
+    _seed_tenant(db_path, "cust-1")
+    _seed_appliance(db_path, "cust-1", "appl-1", "AIC-RESTART7", "test-credential")
+    with override_target(sqlite_path=str(db_path)):
+        from customer_entitlements import upsert_entitlement
+        upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=8)
+    client.get("/api/appliance/configuration", headers=_appliance_auth_headers("appl-1", "test-credential"))
+
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        entry = conn.execute(
+            "SELECT * FROM audit_logs WHERE action='appliance.product_mode_changed' AND entity_id='appl-1'"
+        ).fetchone()
+    assert entry is not None
+    details = json.loads(entry["details_json"])
+    assert details["old_mode"] == "unset"
+    assert details["new_mode"] == "hybrid"
+    assert set(details["changed_flags"]) == set(pm.FLAG_REGISTRY.keys())
+    assert "restart_command_id" in details

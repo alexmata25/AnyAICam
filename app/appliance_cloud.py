@@ -21,6 +21,7 @@ from partner_portal import partner_identity, require_partner_access
 from notification_engine import fanout_appliance_event
 from recording_credentials import RECORDING_SESSION_DURATION_SECONDS, event_media_session_policy, recording_s3_prefix, recording_session_name, recording_session_policy
 from event_media_policy import allows_event_media
+import product_mode
 
 try:
     import boto3
@@ -142,6 +143,105 @@ def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
     if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
     return camera
+
+
+def _queue_product_mode_restart(db,appliance: dict,new_mode: str) -> dict | None:
+    """Called on every GET /api/appliance/configuration poll, inside the
+    same connection already open for cloud_policy/storage_policy/
+    identity above -- see product_mode.py's module docstring and
+    docs/product-mode-local-hybrid-2026-09-21.md's "Automatic restart on
+    mode change" section for the full design.
+
+    Returns the audit-log payload for the caller to record via audit()
+    AFTER this connection's own `with` block closes (never None only
+    when a restart was actually queued) -- audit() opens its own,
+    separate connection() internally, and this function's own writes
+    (the last_reported_product_mode UPDATE, the appliance_commands
+    INSERT) run on the SAME already-open `db` passed in here; calling
+    audit() from inside that still-open write transaction deadlocked
+    SQLite with "database is locked" every time (confirmed by this
+    function's own test suite) since a second connection cannot write
+    while the first's transaction hasn't committed yet.
+
+    Loop prevention: appliances.last_reported_product_mode is this
+    appliance's own last-known mode as of the PREVIOUS poll. A restart
+    is queued and this column is updated ONLY when (a) new_mode is a
+    real, non-empty mode (a customer with no active camera-slot
+    entitlement never triggers this -- see product_mode_for_customer()'s
+    own "never guess" discipline, left completely alone here) and (b)
+    product_mode.describe_transition() reports at least one flag that
+    would actually flip by default between the previous and new mode.
+    Once updated, the NEXT poll's new_mode==stored comparison is False
+    (no change) and nothing happens again until a genuinely different
+    mode is reported -- this is what makes repeated polls (every ~60s,
+    edge_camera_sync.SYNC_INTERVAL_SECONDS) never queue more than one
+    restart per real transition, with no separate "already requested"
+    flag needed. "" -> "local" (a customer's first-ever Local purchase)
+    deliberately queues nothing: describe_transition() reports no
+    changed flags for that pair (both resolve every governed flag to
+    False), so there is nothing for a restart to apply yet.
+
+    A customer's entitlement lapsing to "" (no active camera-slot
+    product at all) deliberately never updates or clears this column --
+    matching product_mode_for_customer()'s and product_mode.
+    persist_mode()'s own refusal to guess what "no entitlement" should
+    mean for an appliance mid-transition (see this feature's own
+    migration doc, "Decision B"). The stored mode is left exactly as it
+    was until a real mode (local or hybrid) is reported again.
+
+    Dedup with an already-queued-but-not-yet-delivered restart mirrors
+    queue_command()'s own "identical command already pending/delivered"
+    guard immediately below in this file -- necessary here too since a
+    customer could in principle flip modes again before the appliance's
+    privileged watcher has consumed the first restart_vms marker."""
+    if not new_mode:
+        return None
+    old_mode=appliance.get('last_reported_product_mode') or ''
+    if new_mode==old_mode:
+        return None
+    changed_flags=product_mode.describe_transition(old_mode,new_mode)
+    db.execute('UPDATE appliances SET last_reported_product_mode=? WHERE id=?',(new_mode,appliance['id']))
+    if not changed_flags:
+        return None
+    appliance_id=appliance['id']
+    existing=db.execute(
+        "SELECT id FROM appliance_commands WHERE appliance_id=? AND command='restart_vms' AND status IN ('pending','delivered') ORDER BY created_at LIMIT 1",
+        (appliance_id,),
+    ).fetchone()
+    if existing:
+        logger.warning(
+            'product_mode.transition_restart_already_queued appliance_id=%s old_mode=%s new_mode=%s command_id=%s',
+            appliance_id,old_mode or 'unset',new_mode,existing['id'],
+        )
+        return None
+    now=datetime.now(); expires=now+timedelta(minutes=60); command_id=secrets.token_hex(7)
+    db.execute(
+        'INSERT INTO appliance_commands(id,appliance_id,command,payload_json,status,created_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?,?)',
+        (
+            command_id,appliance_id,'restart_vms',
+            # confirmed=true here represents the customer's own explicit
+            # purchase/cancellation action (a real completed Stripe
+            # checkout or subscription cancellation already resolved
+            # into this entitlement change), not a human clicking a
+            # confirmation dialog -- see appliance-agent/anyaicam_agent/
+            # commands.py's _queue_privileged_action() docstring: this
+            # field is enforced defense-in-depth on the agent side too,
+            # and without it the agent would refuse to act on this
+            # marker at all.
+            json.dumps({'confirmed':True,'reason':f'product_mode {old_mode or "unset"} -> {new_mode}'}),
+            'pending',now.isoformat(),expires.isoformat(),'product-mode-transition',
+        ),
+    )
+    changed_env_vars=[item['env_var'] for item in changed_flags]
+    logger.warning(
+        'product_mode.transition appliance_id=%s old_mode=%s new_mode=%s changed_flags=%s command_id=%s',
+        appliance_id,old_mode or 'unset',new_mode,changed_env_vars,command_id,
+    )
+    return {
+        'actor':{'email':appliance['cloud_id'],'role':'appliance'},'action':'appliance.product_mode_changed',
+        'entity_type':'appliance','entity_id':appliance_id,
+        'details':{'old_mode':old_mode or 'unset','new_mode':new_mode,'changed_flags':changed_env_vars,'restart_command_id':command_id},
+    }
 
 
 def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_local_event_id: str) -> str | None:
@@ -436,6 +536,26 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # customer has no active camera-slot entitlement at all.
             from customer_entitlements import product_mode_for_customer
             product_mode_value=product_mode_for_customer(appliance['customer_id'])
+            # Auto-apply (2026-09-21): every governed flag (product_mode.
+            # FLAG_REGISTRY) is read once at process import time, so an
+            # appliance can never pick up a mode change on its own --
+            # this is the one place that detects a real transition (this
+            # exact appliance's last-known mode vs. what the customer's
+            # entitlement resolves to right now) and queues the
+            # already-existing, already-tested restart_vms privileged
+            # action (appliance-agent/anyaicam_agent/commands.py ->
+            # appliance-agent/system/privileged_watcher.py) for it --
+            # `docker compose up -d`, which re-reads env vars and
+            # recreates the container only on an actual diff, never a
+            # full host reboot. See _queue_product_mode_restart()'s own
+            # docstring for the loop-prevention and dedup discipline.
+            product_mode_audit=_queue_product_mode_restart(db,appliance,product_mode_value)
+        # audit() opens its own connection() -- called only after the
+        # `with connection() as db:` block above has closed/committed,
+        # never from inside it (see _queue_product_mode_restart()'s own
+        # docstring for the "database is locked" this avoids).
+        if product_mode_audit:
+            audit(product_mode_audit['actor'],product_mode_audit['action'],product_mode_audit['entity_type'],product_mode_audit['entity_id'],product_mode_audit['details'])
         return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:

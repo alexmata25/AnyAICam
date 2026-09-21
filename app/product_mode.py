@@ -157,29 +157,97 @@ def resolve_cloud_flag(env_var: str, *, legacy_default: bool = False) -> bool:
 # (an admin-facing status page, this feature's own migration doc) only;
 # resolve_cloud_flag() itself never consults this, it only ever needs
 # the one env_var name passed to it at each call site.
-FLAG_REGISTRY: dict[str, dict[str, str]] = {
+#
+# hot_reloadable is False for all six, uniformly, for the same
+# structural reason: each is read into a plain module-level constant
+# exactly ONCE at import time (e.g. analytics_sync.ANALYTICS_SYNC_
+# ENABLED = product_mode.resolve_cloud_flag(...)), and main.py's own
+# app-startup event decides whether to asyncio.create_task() that
+# module's worker AT ALL based on the constant's value at THAT moment
+# -- there is no code path anywhere in these six modules that re-reads
+# the flag, or re-evaluates whether to keep running, after process
+# start. A value change (whether from an explicit env var edit or a
+# persisted product-mode transition) is structurally invisible to an
+# already-running process; the only way to apply it is a restart of
+# the anyaicam-vms process (see apply_needs_restart() / restart_vms
+# below), never a lighter in-process reload. This is a genuine
+# constraint of the current implementation, not a design choice this
+# module made -- making any of these six truly hot-reloadable would
+# mean changing each worker's own loop to re-check the flag on every
+# iteration instead of once at task-creation time, which is out of
+# this module's scope.
+FLAG_REGISTRY: dict[str, dict] = {
     "ANYAICAM_ANALYTICS_SYNC_ENABLED": {
         "module": "analytics_sync",
         "description": "Sync local YOLO/motion-detection events to the cloud.",
+        "hot_reloadable": False,
     },
     "ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED": {
         "module": "event_media_uploader",
         "description": "Upload motion-event thumbnail/clip media to the cloud.",
+        "hot_reloadable": False,
     },
     "ANYAICAM_FACIAL_EMBEDDING_SYNC_ENABLED": {
         "module": "facial_embedding_sync",
         "description": "Sync facial-recognition embeddings with the cloud directory.",
+        "hot_reloadable": False,
     },
     "ANYAICAM_LIVE_RELAY_ENABLED": {
         "module": "live_relay_uploader",
         "description": "Relay live HLS segments through cloud S3/CloudFront for remote viewing.",
+        "hot_reloadable": False,
     },
     "ANYAICAM_RECORDING_UPLOAD_ENABLED": {
         "module": "recording_uploader",
         "description": "Upload the continuous/bulk recording archive to the cloud.",
+        "hot_reloadable": False,
     },
     "ANYAICAM_LIVE_P2P_ENABLED": {
         "module": "live_view_p2p / webrtc_publisher",
         "description": "Cloud-brokered WebRTC signaling for remote peer-to-peer live view -- signaling only requires the cloud; once negotiated, media itself flows directly.",
+        "hot_reloadable": False,
     },
 }
+
+
+def _default_for_mode(mode: str) -> bool:
+    """Every governed flag's default under a REAL (non-empty) mode,
+    ignoring any per-appliance env var override the cloud can never see
+    -- used only by describe_transition() below to log/decide what a
+    mode change would affect by default. "" (no mode / legacy) behaves
+    identically to "local" for every flag registered above (both
+    resolve_cloud_flag() branches return legacy_default=False, same as
+    "local"'s own False) -- this is what makes a customer's first-ever
+    purchase transitioning "" -> "local" correctly report no changed
+    flags below, while "" -> "hybrid" correctly reports all six."""
+    return mode == "hybrid"
+
+
+def describe_transition(old_mode: str, new_mode: str) -> list[dict]:
+    """Which governed flags would flip their DEFAULT between old_mode
+    and new_mode, assuming neither has an explicit per-appliance env
+    var override (the cloud has no visibility into an individual
+    appliance's own environment, so this is what changed BY DEFAULT,
+    not a guarantee of what will actually change on any specific real
+    appliance -- an explicit override there always wins regardless, see
+    resolve_cloud_flag()). Returns one dict per flag that actually
+    flips: {"env_var", "module", "before", "after"}. Empty old_mode or
+    new_mode is treated the same as "local" (see _default_for_mode()),
+    so "" -> "local" (a customer's first Local purchase) correctly
+    returns []. Used by appliance_cloud.appliance_configuration() to
+    decide whether a reported product_mode change is worth logging and
+    queuing a restart_vms command for -- an empty return means nothing
+    would actually change, so no restart is queued."""
+    changed = []
+    before_all = _default_for_mode(old_mode)
+    after_all = _default_for_mode(new_mode)
+    if before_all == after_all:
+        return changed
+    for env_var, meta in FLAG_REGISTRY.items():
+        changed.append({
+            "env_var": env_var,
+            "module": meta["module"],
+            "before": before_all,
+            "after": after_all,
+        })
+    return changed

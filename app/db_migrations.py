@@ -1126,6 +1126,21 @@ def apply_migrations():
         # -- 500'd here instead of registering the restart and moving on.
         if 'restart_count' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0')
 
+        # product_mode auto-apply (2026-09-21, see docs/product-mode-
+        # local-hybrid-2026-09-21.md and product_mode.py's module
+        # docstring): the Local/Hybrid mode this appliance's customer had
+        # the LAST time GET /api/appliance/configuration computed and
+        # reported it, tracked per-appliance (a customer can have more
+        # than one appliance, each independently transitioning). NULL for
+        # an appliance that has never had a real (non-empty)
+        # product_mode reported yet. appliance_configuration() compares
+        # this against a fresh product_mode_for_customer() call on every
+        # poll; only a genuine change queues a restart_vms command and
+        # updates this column -- an unchanged mode across any number of
+        # polls does neither, which is what keeps this a one-time
+        # transition trigger instead of a restart loop.
+        if 'last_reported_product_mode' not in appliance_columns: db.execute('ALTER TABLE appliances ADD COLUMN last_reported_product_mode TEXT')
+
         # Appliance identity contract (see appliance_identity.py):
         # authorization_version_at_login records the identity's
         # authorization_version at the moment this session was
