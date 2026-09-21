@@ -105,19 +105,27 @@ def register_business_routes(app: FastAPI, shell: Callable) -> None:
         scripts='''<script>document.getElementById('setup-form').addEventListener('submit',async e=>{e.preventDefault();const payload={customer_name:document.getElementById('customer-name').value,email:document.getElementById('customer-email').value,appliance_type:document.getElementById('appliance-type').value,camera_count:Number(document.getElementById('camera-count').value),sites:[{name:document.getElementById('site-name').value,site_type:'Home',camera_count:Number(document.getElementById('camera-count').value)}],pricing:{resolution:document.getElementById('resolution').value,retention:Number(document.getElementById('retention').value),recording_type:document.getElementById('recording-type').value,analytics_package:document.getElementById('analytics-package').value}},response=await fetch('/api/setup/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=await response.json(),box=document.getElementById('setup-result');box.hidden=false;box.innerHTML=`<h2>Installation checklist</h2><p><strong>Login:</strong> ${result.login}<br><strong>Temporary password:</strong> ${result.temporary_password}</p><ol><li>Prepare appliance and network</li><li>Connect and verify cameras</li><li>Confirm recording and retention</li><li>Change temporary password</li><li>Test remote Tailscale access</li><li>Review demo analytics status</li></ol>`;showToast(result.message)});</script>'''
         return shell('Setup wizard','setup','<header class="topbar"><div><p class="eyebrow">Installer workflow</p><h1>Customer setup wizard</h1></div></header>'+panel('Customer and installation details',body),scripts)
 
-    @app.get('/sites-management', response_class=HTMLResponse)
-    def sites_page() -> str:
-        data=load_data(); cards=''.join(f'<article class="feature-card"><div class="feature-icon">⌂</div><h2>{s["name"]}</h2><p>{s["site_type"]} · {s["camera_count"]} cameras</p><a class="download" href="/">Open cameras</a></article>' for s in data['sites']) or '<div class="empty">No sites configured.</div>'
-        switcher='<select class="date-filter"><option>All sites</option>'+''.join(f'<option>{s["name"]}</option>' for s in data['sites'])+'</select>'
-        return shell('Sites','sites','<header class="topbar"><div><p class="eyebrow">Multi-site account</p><h1>Sites</h1></div>'+switcher+'</header><div class="feature-grid">'+cards+'</div>')
-
-    @app.get('/users', response_class=HTMLResponse)
-    def users_page() -> str:
-        data=load_data(); rows=''.join(f'<tr><td>{u["email"]}</td><td>{u["role"]}</td><td>{len(u["site_ids"])} site(s)</td><td>{", ".join(u["permissions"])}</td></tr>' for u in data['users']) or '<tr><td colspan="4">No invited users.</td></tr>'
-        roles=''.join(f'<option>{r}</option>' for r in ['owner','administrator','installer','employee','family member','viewer'])
-        body=f'''<form id="invite-form" class="clip-form"><label>Email<input id="invite-email" type="email" required></label><label>Role<select id="invite-role">{roles}</select></label><label>Permissions<input id="invite-permissions" value="live view, playback"></label><button class="action-button">Invite user</button></form><table class="data-table" style="margin-top:22px"><thead><tr><th>Email</th><th>Role</th><th>Site access</th><th>Permissions</th></tr></thead><tbody>{rows}</tbody></table>'''
-        scripts='''<script>document.getElementById('invite-form').addEventListener('submit',async e=>{e.preventDefault();const payload={email:document.getElementById('invite-email').value,role:document.getElementById('invite-role').value,permissions:document.getElementById('invite-permissions').value.split(',').map(v=>v.trim()),site_ids:[],camera_ids:[]},response=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=await response.json();showToast(result.message);setTimeout(()=>location.reload(),600)});</script>'''
-        return shell('Users','users','<header class="topbar"><div><p class="eyebrow">Access control</p><h1>Users and permissions</h1></div></header>'+panel('Invite and manage users',body),scripts)
+    # 2026-09-22: the real /sites-management and /users pages
+    # (main.py, using the actual multi-tenant customers/sites/cameras
+    # DB and, for /users, a real manage_users permission check) were
+    # both being silently shadowed by this module's own mock,
+    # unauthenticated, single-JSON-file (account_management.json)
+    # versions -- register_business_routes(app, page_shell) runs
+    # before those real routes are declared, and Starlette dispatches
+    # to the FIRST-registered route for an identical exact path, so
+    # every real request to either page was actually served by the
+    # fake data below, never the real implementation. Confirmed live
+    # via direct route-table inspection (main.app.routes) on Ryzen:
+    # this is the root cause of an earlier real-customer report this
+    # session that /sites-management showed "No sites configured"
+    # regardless of the customer's actual configured sites. Removed
+    # here rather than in main.py so the real, already-fully-built
+    # handlers become reachable with no change to their own code.
+    # The account_management.json-backed data these used to render
+    # (and their sibling /appliances, /branding, /setup-legacy,
+    # /pricing-legacy pages, which have no confirmed real replacement)
+    # is untouched -- only these two specific shadowing GET handlers
+    # were removed.
 
     @app.get('/pricing-legacy', response_class=HTMLResponse, include_in_schema=False)
     def pricing_page() -> str:
