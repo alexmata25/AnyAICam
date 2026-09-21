@@ -32785,7 +32785,7 @@ def alert_link(alert: dict) -> str:
 
 
 
-        path = f"/camera/{int(camera)}"
+        path = "/customer-live"
 
 
 
@@ -73838,8 +73838,41 @@ def dashboard(request: Request) -> str:
             for camera in _customer_dashboard_cameras
             if camera.get("camera_number") is not None
         ]
+        # Live-view consolidation (2026-09-21): a real customer_owner/
+        # customer_viewer session gets the canonical, customer-scoped
+        # /customer-live page (live_view_page.py) -- the same signal
+        # ("_customer_dashboard_cameras is not None") this route already
+        # uses to mean "this is a real customer portal identity, never
+        # the shared/legacy grid". Never hardcoded to /customer-live
+        # unconditionally: that route 303-redirects any non-customer_
+        # owner/customer_viewer role straight to /partner-login (see its
+        # own auth gate), which would break this exact button for a
+        # staff/admin session viewing this same shared /dashboard route.
+        _dashboard_live_view_href = "/customer-live"
+        _dashboard_camera_ids_by_number = {
+            camera["camera_number"]: camera["id"]
+            for camera in _customer_dashboard_cameras
+            if camera.get("camera_number") is not None
+        }
     else:
         _dashboard_camera_numbers = list(get_camera_numbers())
+        _dashboard_live_view_href = "/"
+        _dashboard_camera_ids_by_number = {}
+    # Per-camera preview cards deep-link to the same canonical single-
+    # camera tools page /customer-live's own gear icon links to
+    # (live_view_page.py's /customer/cameras/{id}/live) whenever a real
+    # camera id is known for a real customer session -- never the old,
+    # unscoped /camera/{camera_number} page. Falls back to _dashboard_
+    # live_view_href (a staff/admin session's own "/", unaffected) for
+    # any camera_number this dashboard couldn't resolve an id for.
+    _dashboard_camera_hrefs = {
+        camera_number: (
+            f"/customer/cameras/{_dashboard_camera_ids_by_number[camera_number]}/live"
+            if camera_number in _dashboard_camera_ids_by_number
+            else _dashboard_live_view_href
+        )
+        for camera_number in _dashboard_camera_numbers
+    }
 
 
 
@@ -73974,7 +74007,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        f"""<a class="dashboard-camera-card" href="/camera/{camera_number}" id="dashboard-camera-{camera_number}">
+        f"""<a class="dashboard-camera-card" href="{_dashboard_camera_hrefs[camera_number]}" id="dashboard-camera-{camera_number}">
 
 
 
@@ -74604,7 +74637,7 @@ def dashboard(request: Request) -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">System overview</p><h1>Dashboard</h1></div><a class="action-button" href="/">Open live view</a></header>
+    content = f"""<header class="topbar"><div><p class="eyebrow">System overview</p><h1>Dashboard</h1></div><a class="action-button" href="{_dashboard_live_view_href}">Open live view</a></header>
 
 
 
@@ -74712,7 +74745,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            <a class="today-activity-link" href="/"><strong id="today-cameras-count">—</strong><span>Cameras online</span><small>Live camera status</small></a>
+            <a class="today-activity-link" href="{_dashboard_live_view_href}"><strong id="today-cameras-count">—</strong><span>Cameras online</span><small>Live camera status</small></a>
 
 
 
@@ -78195,7 +78228,7 @@ def analytics(request: Request) -> str:
 
 
 
-    function renderResults(events){const target=document.getElementById('analytics-results');document.getElementById('analytics-result-count').textContent=events.length+' result'+(events.length===1?'':'s');if(!events.length){target.innerHTML='<div class="empty">No events match those filters.</div>';return}target.innerHTML=events.slice(0,100).map(event=>{const title=typeLabels[event.event_type]||String(event.event_type||'Event').replaceAll('_',' '),confidence=Number(event.confidence||0),percent=Math.round(confidence<=1?confidence*100:confidence),stamp=String(event.timestamp||event.start_time||'').replace('T',' ').slice(0,19),image=event.thumbnail?`<img class="analytics-result-thumb" src="${esc(event.thumbnail)}" alt="${esc(title)}">`:'<div class="analytics-result-thumb"></div>',clip=event.linked_recording?`<a class="download" href="${esc(event.linked_recording)}">Open clip</a>`:'<span class="health-detail">No clip</span>';return `<article class="analytics-result">${image}<div><div class="analytics-result-title">${esc(title)} · ${esc(event.camera_name||('Camera '+event.camera))}</div><div class="analytics-result-meta">${esc(stamp)} · ${percent}% confidence${event.plate_number?' · Plate '+esc(event.plate_number):''}${event.vehicle_color?' · '+esc(event.vehicle_color):''}</div></div><div class="analytics-result-actions"><span class="analytics-pill">${esc(event.site||'home')}</span>${clip}<a class="download" href="/camera/${esc(event.camera)}">Camera</a></div></article>`}).join('')}
+    function renderResults(events){const target=document.getElementById('analytics-results');document.getElementById('analytics-result-count').textContent=events.length+' result'+(events.length===1?'':'s');if(!events.length){target.innerHTML='<div class="empty">No events match those filters.</div>';return}target.innerHTML=events.slice(0,100).map(event=>{const title=typeLabels[event.event_type]||String(event.event_type||'Event').replaceAll('_',' '),confidence=Number(event.confidence||0),percent=Math.round(confidence<=1?confidence*100:confidence),stamp=String(event.timestamp||event.start_time||'').replace('T',' ').slice(0,19),image=event.thumbnail?`<img class="analytics-result-thumb" src="${esc(event.thumbnail)}" alt="${esc(title)}">`:'<div class="analytics-result-thumb"></div>',clip=event.linked_recording?`<a class="download" href="${esc(event.linked_recording)}">Open clip</a>`:'<span class="health-detail">No clip</span>';return `<article class="analytics-result">${image}<div><div class="analytics-result-title">${esc(title)} · ${esc(event.camera_name||('Camera '+event.camera))}</div><div class="analytics-result-meta">${esc(stamp)} · ${percent}% confidence${event.plate_number?' · Plate '+esc(event.plate_number):''}${event.vehicle_color?' · '+esc(event.vehicle_color):''}</div></div><div class="analytics-result-actions"><span class="analytics-pill">${esc(event.site||'home')}</span>${clip}<a class="download" href="/customer-live">Camera</a></div></article>`}).join('')}
 
 
 
@@ -79077,7 +79110,7 @@ def smart_search_page() -> str:
 
 
 
-                  <a class="smart-search-action" href="/camera/{camera}">Live camera</a>
+                  <a class="smart-search-action" href="/customer-live">Live camera</a>
 
 
 
@@ -82037,7 +82070,7 @@ def investigation_page(request: Request) -> str:
 
 
 
-          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button><a href="/camera/${{event.camera}}">Live camera</a></div>
+          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button><a href="/customer-live">Live camera</a></div>
 
 
 
