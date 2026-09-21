@@ -25,26 +25,35 @@ analytics/{analytic_key} route (live_view_page.py), gated by
 `licensed_quantity` exactly as it already is today. Nothing here writes to
 `camera_analytics_entitlements`.
 
-Feature-key naming
--------------------
-smart_motion / people_counting / lpr / ppe match customer_analytics_panel.
-ANALYTIC_LABELS exactly -- the keys the existing per-camera assignment
-gate (assign_entitlement()) actually validates against, and the same keys
-pricing_config.py's wizard addon quotes already write into
-analytics_subscriptions.analytic_key via partner_workspace.py. (Note:
-customer_platform.py's separate admin-facing ANALYTICS_CATALOG spells the
-fourth one "ppe_detection" instead of "ppe" -- a pre-existing
-inconsistency between two already-existing catalogs, not something this
-module's scope changes.) talk_down / ai_essentials / ai_professional /
-vehicle_intelligence / cloud_overflow / facial_recognition have no prior
-analytic_key anywhere in the codebase; they are added here as new entries
-in this SAME existing table/keying scheme (ANALYTIC_LABELS's own comment
-already anticipates "a future analytic" being added this way), not as a
-parallel structure. facial_recognition here is the recurring analytics
-add-on ($0.89 TEST/mo) -- deliberately distinct from hardware_orders.py's
-one-time "ryzen_aac_facial_recognition" appliance SKU, per the explicit
-prior instruction that Facial Recognition remain a separate analytics
-add-on from the AAC hardware bundle.
+Billing SKU vs. internal feature-key naming
+--------------------------------------------
+Correction, 2026-09-21 (superseding this module's original one-SKU-per-
+analytic-key design from the same day): Advanced Analytics is ONE
+customer-billed, recurring product -- a single Stripe Price -- that
+unlocks smart_motion, people_counting, lpr, and ppe together. It is NOT
+four separate customer purchases. Face Access (facial_recognition)
+remains its own separate recurring add-on, unaffected by this
+correction. AACO stays unsellable (see aaco_product_status() below).
+
+This is why ANALYTICS_CATALOG's rows are keyed by a purchasable
+`addon_key` (a billing-level SKU: "advanced_analytics", "facial_
+recognition", ...), each carrying a tuple of the one or more internal
+`analytic_key` feature flags it grants -- NOT keyed by `analytic_key`
+directly the way the pre-correction version of this module was. The
+internal analytic_keys themselves (smart_motion / people_counting / lpr
+/ ppe / facial_recognition / ...) are UNCHANGED: they still match
+customer_analytics_panel.ANALYTIC_LABELS exactly, still gate per-camera
+assignment through assign_entitlement() exactly as before, and still
+each get their own independent analytics_subscriptions row (site_id=
+NULL) -- purchasing the "advanced_analytics" SKU simply grants all four
+of those rows from one Stripe event instead of requiring four separate
+purchases. (Note: customer_platform.py's separate admin-facing
+ANALYTICS_CATALOG spells the PPE one "ppe_detection" instead of "ppe" --
+a pre-existing inconsistency between two already-existing catalogs, not
+something this module's scope changes.) talk_down / ai_essentials /
+ai_professional / vehicle_intelligence / cloud_overflow remain single-
+analytic_key SKUs (their own addon_key equals their own analytic_key),
+unaffected by this correction.
 
 Fail-closed, same as PRICE_ID_CAMERA_SLOT_MAP/HARDWARE_PRICE_MAP
 -------------------------------------------------------------------
@@ -67,39 +76,31 @@ from typing import Optional
 
 from partner_db import connection, row, rows
 
-# analytic_key, display label, Stripe TEST Price ID env var.
+# addon_key (the customer-billed SKU), display label, the tuple of
+# internal analytic_key feature flags this SKU grants when purchased
+# (see customer_analytics_panel.ANALYTIC_LABELS for what each analytic_
+# key actually gates per-camera -- unchanged by this catalog), Stripe
+# TEST Price ID env var. "advanced_analytics" is the one row with more
+# than one analytic_key -- see the module docstring's 2026-09-21
+# correction. Every other row's addon_key equals its sole analytic_key,
+# same as before the correction.
 ANALYTICS_CATALOG = [
-    ("smart_motion", "Smart Motion", "ANYAICAM_STRIPE_PRICE_ANALYTICS_SMART_MOTION"),
-    ("people_counting", "People Counting", "ANYAICAM_STRIPE_PRICE_ANALYTICS_PEOPLE_COUNTING"),
-    ("lpr", "License Plate Recognition", "ANYAICAM_STRIPE_PRICE_ANALYTICS_LPR"),
-    ("ppe", "PPE Detection", "ANYAICAM_STRIPE_PRICE_ANALYTICS_PPE"),
-    ("talk_down", "Talk Down", "ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN"),
-    ("ai_essentials", "AnyAiCam AI Essentials", "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS"),
-    ("ai_professional", "AnyAiCam AI Professional", "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_PROFESSIONAL"),
-    ("vehicle_intelligence", "Vehicle Intelligence", "ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE"),
-    ("cloud_overflow", "Cloud Overflow", "ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW"),
-    ("facial_recognition", "Facial Recognition", "ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION"),
+    ("advanced_analytics", "Advanced Analytics", ("smart_motion", "people_counting", "lpr", "ppe"), "ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS"),
+    ("facial_recognition", "Face Access", ("facial_recognition",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION"),
+    ("talk_down", "Talk Down", ("talk_down",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN"),
+    ("ai_essentials", "AnyAiCam AI Essentials", ("ai_essentials",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS"),
+    ("ai_professional", "AnyAiCam AI Professional", ("ai_professional",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_PROFESSIONAL"),
+    ("vehicle_intelligence", "Vehicle Intelligence", ("vehicle_intelligence",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE"),
+    ("cloud_overflow", "Cloud Overflow", ("cloud_overflow",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW"),
 ]
 
-ANALYTIC_KEYS = tuple(item[0] for item in ANALYTICS_CATALOG)
+ADDON_KEYS = tuple(item[0] for item in ANALYTICS_CATALOG)
 
-# Commercial restructure confirmed 2026-09-21: the website's 5-item
-# product structure is Local, Hybrid, Advanced Analytics, Face Access,
-# AACO (future). This grouping is presentation-only -- it does NOT
-# change ANALYTICS_CATALOG's per-analytic_key keying, pricing, or
-# checkout/webhook behavior above; each key inside a category remains
-# individually purchasable through its own create_analytics_addon_
-# checkout() call and its own analytics_subscriptions row. "Advanced
-# Analytics" bundles the four pre-existing per-camera analytic types
-# under one marketing heading; "Face Access" is facial_recognition
-# alone, kept as its own heading because AACO (below) will build on it.
-# talk_down/ai_essentials/ai_professional/vehicle_intelligence/
-# cloud_overflow are pre-existing catalog entries not part of today's
-# 5-item structure -- left uncategorized here, not removed.
-ADDON_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "advanced_analytics": ("smart_motion", "people_counting", "lpr", "ppe"),
-    "face_access": ("facial_recognition",),
-}
+# Every internal analytic_key feature flag granted by ANY catalog entry,
+# flattened -- used by tests and callers that need "every analytic_key
+# this module can ever write to analytics_subscriptions", as opposed to
+# ADDON_KEYS ("every purchasable billing SKU").
+ANALYTIC_KEYS = tuple(sorted({key for item in ANALYTICS_CATALOG for key in item[2]}))
 
 
 def aaco_product_status() -> dict:
@@ -109,7 +110,7 @@ def aaco_product_status() -> dict:
     Price ID or analytic_key for a product whose scope, dependency on
     Face Access, and price are all still undecided would be exactly the
     kind of guess this codebase's other resolvers (resolve_tier(),
-    resolve_analytic(), hardware_orders' resolvers) are built to refuse.
+    resolve_addon(), hardware_orders' resolvers) are built to refuse.
     This function exists only so a future website/pricing page has one
     place to ask "can a customer buy this yet" and get an honest answer
     instead of the page author having to know this history."""
@@ -123,10 +124,10 @@ def aaco_product_status() -> dict:
 
 def _load_price_map() -> dict:
     mapping = {}
-    for analytic_key, label, env_var in ANALYTICS_CATALOG:
+    for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
         price_id = os.environ.get(env_var, "").strip()
         if price_id:
-            mapping[price_id] = {"analytic_key": analytic_key, "label": label}
+            mapping[price_id] = {"addon_key": addon_key, "label": label, "analytic_keys": analytic_keys}
     return mapping
 
 
@@ -135,20 +136,24 @@ ANALYTICS_PRICE_MAP = _load_price_map()
 SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
 
 
-def resolve_analytic(price_id: str) -> Optional[dict]:
-    """Returns {"analytic_key": ..., "label": ...} for a server-verified
-    Stripe Price ID, or None if this Price ID has no configured analytics
-    mapping -- callers must treat None as "grant nothing", never fall back
-    to a guessed analytic_key."""
+def resolve_addon(price_id: str) -> Optional[dict]:
+    """Returns {"addon_key": ..., "label": ..., "analytic_keys": (...)}
+    for a server-verified Stripe Price ID, or None if this Price ID has
+    no configured addon mapping -- callers must treat None as "grant
+    nothing", never fall back to a guessed key. `analytic_keys` is a
+    tuple of one (every SKU except "advanced_analytics") or more
+    (exactly "advanced_analytics", per the 2026-09-21 correction)
+    internal feature flags this one purchase grants together."""
     if not price_id:
         return None
     entry = ANALYTICS_PRICE_MAP.get(price_id)
     if not isinstance(entry, dict):
         return None
-    analytic_key = str(entry.get("analytic_key") or "").strip()
-    if not analytic_key:
+    addon_key = str(entry.get("addon_key") or "").strip()
+    analytic_keys = tuple(entry.get("analytic_keys") or ())
+    if not addon_key or not analytic_keys:
         return None
-    return {"analytic_key": analytic_key, "label": entry.get("label")}
+    return {"addon_key": addon_key, "label": entry.get("label"), "analytic_keys": analytic_keys}
 
 
 def _find_customer_by_email(email: str) -> Optional[dict]:
@@ -285,8 +290,8 @@ def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
     fields = _extract_checkout_fields(session_obj)
 
-    analytic = resolve_analytic(fields["price_id"])
-    if not analytic:
+    addon = resolve_addon(fields["price_id"])
+    if not addon:
         return {"status": "ignored", "reason": "no verified analytics mapping for this stripe price id", "price_id": fields["price_id"]}
 
     customer = None
@@ -298,17 +303,35 @@ def _sync_checkout_completed(event: dict) -> dict:
     if not customer:
         if not fields["email"]:
             return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
-        link = create_pending_link(
-            email=fields["email"], stripe_price_id=fields["price_id"], analytic_key=analytic["analytic_key"],
-            stripe_customer_id=fields["stripe_customer_id"], raw_event=event,
-        )
-        return {"status": "pending_link_created", "pending_link_id": link["id"], "analytic_key": analytic["analytic_key"]}
+        # One purchase can grant more than one analytic_key ("advanced_
+        # analytics" grants four) -- pending_analytics_links is keyed
+        # one row per analytic_key, so a multi-key addon creates one
+        # pending row per key. resolve_pending_links_for_customer()
+        # already resolves every pending row for an email in one pass,
+        # so this fans back out into all N subscriptions correctly once
+        # the customer registers, with no change needed there.
+        link_ids = []
+        for analytic_key in addon["analytic_keys"]:
+            link = create_pending_link(
+                email=fields["email"], stripe_price_id=fields["price_id"], analytic_key=analytic_key,
+                stripe_customer_id=fields["stripe_customer_id"], raw_event=event,
+            )
+            link_ids.append(link["id"])
+        return {"status": "pending_link_created", "pending_link_ids": link_ids, "addon_key": addon["addon_key"], "analytic_keys": list(addon["analytic_keys"])}
 
-    subscription = upsert_analytics_subscription(
-        customer_id=customer["id"], analytic_key=analytic["analytic_key"], status="active",
-        stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
-    )
-    return {"status": "analytics_subscription_updated", "subscription_id": subscription["id"], "analytic_key": analytic["analytic_key"]}
+    subscription_ids = []
+    for analytic_key in addon["analytic_keys"]:
+        subscription = upsert_analytics_subscription(
+            customer_id=customer["id"], analytic_key=analytic_key, status="active",
+            stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
+        )
+        subscription_ids.append(subscription["id"])
+    return {
+        "status": "analytics_subscription_updated",
+        "subscription_ids": subscription_ids,
+        "addon_key": addon["addon_key"],
+        "analytic_keys": list(addon["analytic_keys"]),
+    }
 
 
 def _current_subscription_price_id(subscription_obj: dict) -> str:
@@ -329,31 +352,49 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     if not stripe_customer_id or not price_id:
         return {"status": "ignored", "reason": "missing stripe customer id or anyaicam_stripe_price_id metadata"}
 
-    analytic = resolve_analytic(price_id)
-    if not analytic:
+    addon = resolve_addon(price_id)
+    if not addon:
         return {"status": "ignored", "reason": "no verified analytics mapping for this stripe price id", "price_id": price_id}
 
-    existing = row(
-        "SELECT * FROM analytics_subscriptions WHERE stripe_customer_id=? AND analytic_key=? AND site_id IS NULL",
-        (stripe_customer_id, analytic["analytic_key"]),
-    )
-    customer_id = existing["customer_id"] if existing else None
-    if not customer_id and metadata_customer_id:
-        # Self-healing path, same reasoning as customer_entitlements.
-        # _sync_subscription_change(): Stripe delivery order isn't
-        # guaranteed, so subscription.updated/deleted can in principle
-        # arrive before checkout.session.completed created this row.
-        customer_id = metadata_customer_id
-    if not customer_id:
-        return {"status": "ignored", "reason": "no existing analytics subscription for this stripe customer/analytic"}
-
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
-    subscription = upsert_analytics_subscription(
-        customer_id=customer_id, analytic_key=analytic["analytic_key"], status=new_status,
-        stripe_customer_id=stripe_customer_id, stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
-        stripe_price_id=price_id,
-    )
-    return {"status": "analytics_subscription_updated", "subscription_id": subscription["id"], "analytic_key": analytic["analytic_key"]}
+    subscription_ids = []
+    granted_keys = []
+    # One subscription can cover several analytic_keys ("advanced_
+    # analytics" covers four) -- update/cancel every one of them
+    # together from this one event, each still its own independent row,
+    # so a customer's four Advanced Analytics feature flags never drift
+    # out of sync with each other or with their single underlying
+    # subscription.
+    for analytic_key in addon["analytic_keys"]:
+        existing = row(
+            "SELECT * FROM analytics_subscriptions WHERE stripe_customer_id=? AND analytic_key=? AND site_id IS NULL",
+            (stripe_customer_id, analytic_key),
+        )
+        customer_id = existing["customer_id"] if existing else None
+        if not customer_id and metadata_customer_id:
+            # Self-healing path, same reasoning as customer_entitlements.
+            # _sync_subscription_change(): Stripe delivery order isn't
+            # guaranteed, so subscription.updated/deleted can in principle
+            # arrive before checkout.session.completed created this row.
+            customer_id = metadata_customer_id
+        if not customer_id:
+            continue
+        subscription = upsert_analytics_subscription(
+            customer_id=customer_id, analytic_key=analytic_key, status=new_status,
+            stripe_customer_id=stripe_customer_id, stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
+            stripe_price_id=price_id,
+        )
+        subscription_ids.append(subscription["id"])
+        granted_keys.append(analytic_key)
+
+    if not subscription_ids:
+        return {"status": "ignored", "reason": "no existing analytics subscription for this stripe customer/addon"}
+    return {
+        "status": "analytics_subscription_updated",
+        "subscription_ids": subscription_ids,
+        "addon_key": addon["addon_key"],
+        "analytic_keys": granted_keys,
+    }
 
 
 def sync_analytics_from_stripe_event(event: dict) -> dict:

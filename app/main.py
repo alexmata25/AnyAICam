@@ -7567,13 +7567,14 @@ class CameraSlotCheckoutModel(BaseModel):
 
 
 class AnalyticsAddonCheckoutModel(BaseModel):
-    # Commercial restructure confirmed 2026-09-21: Advanced Analytics
-    # (smart_motion/people_counting/lpr/ppe) and Face Access
-    # (facial_recognition) are both recurring add-ons, marketed under
-    # those two headings but individually purchasable per the existing
-    # analytics_entitlements.ANALYTICS_CATALOG keying -- the customer
-    # selects one catalog analytic_key, never a Stripe Price ID.
-    analytic_key: str
+    # Commercial restructure confirmed 2026-09-21, corrected same day:
+    # Advanced Analytics is ONE recurring, customer-billed add-on that
+    # unlocks smart_motion/people_counting/lpr/ppe together (not four
+    # separate purchases); Face Access (facial_recognition) is its own
+    # separate recurring add-on. The customer selects one catalog
+    # addon_key (analytics_entitlements.ANALYTICS_CATALOG), never a
+    # Stripe Price ID and never an internal analytic_key directly.
+    addon_key: str
 
 
 class StripeCheckoutCreateModel(BaseModel):
@@ -112782,46 +112783,46 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
 
 @app.post("/api/customer/analytics/checkout")
 def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, request: Request) -> dict:
-    """Commercial restructure confirmed 2026-09-21: Advanced Analytics
-    and Face Access are recurring add-ons, sold separately from Local/
-    Hybrid camera-slot capacity. The webhook side of this (analytics_
-    entitlements.resolve_analytic()/_sync_checkout_completed()/upsert_
-    analytics_subscription()) already exists and is already wired into
-    the live POST /api/payments/stripe/webhook route -- but, exactly
-    the same gap create_camera_slot_checkout() (Phase 8) closed for
-    camera-slot tiers, nothing ever CREATED a Checkout Session for one
-    of these analytics Price IDs. This closes that gap the same way.
+    """Commercial restructure confirmed 2026-09-21, corrected same day:
+    Advanced Analytics and Face Access are recurring add-ons, sold
+    separately from Local/Hybrid camera-slot capacity. The webhook side
+    of this (analytics_entitlements.resolve_addon()/_sync_checkout_
+    completed()/upsert_analytics_subscription()) already exists and is
+    already wired into the live POST /api/payments/stripe/webhook route
+    -- but, exactly the same gap create_camera_slot_checkout() (Phase 8)
+    closed for camera-slot tiers, nothing ever CREATED a Checkout
+    Session for one of these analytics Price IDs. This closes that gap
+    the same way.
 
     mode="subscription" always: every entry in analytics_entitlements.
     ANALYTICS_CATALOG is a recurring add-on (there is no one-time
     analytics SKU), unlike camera-slot checkout where mode depends on
-    billing_type. One analytic_key per Checkout Session, matching
-    _sync_checkout_completed()'s own single-price-id-metadata design --
-    it reads exactly one metadata[anyaicam_stripe_price_id], so a
-    session is deliberately not allowed to bundle several analytics
-    line items into one purchase yet (see the restructure report for
-    this as a flagged possible future enhancement, not a limitation of
-    this endpoint alone). The catalog key is resolved server-side only
-    from ANALYTICS_CATALOG, never from a browser-submitted price_id --
-    the same discipline create_camera_slot_checkout() and create_
-    hardware_checkout() already apply. customer_owner identity is
-    required, matching create_camera_slot_checkout()'s own requirement
-    (an authenticated customer buying their own add-on never needs the
-    email-based pending_analytics_links fallback).
+    billing_type. One addon_key per Checkout Session -- "advanced_
+    analytics" is one addon_key that resolves server-side to FOUR
+    internal analytic_keys (smart_motion/people_counting/lpr/ppe),
+    granted together by the webhook from this session's single Price
+    ID; the browser never selects analytic_keys directly. The catalog
+    key is resolved server-side only from ANALYTICS_CATALOG, never from
+    a browser-submitted price_id -- the same discipline create_camera_
+    slot_checkout() and create_hardware_checkout() already apply.
+    customer_owner identity is required, matching create_camera_slot_
+    checkout()'s own requirement (an authenticated customer buying
+    their own add-on never needs the email-based pending_analytics_
+    links fallback).
     """
     from partner_portal import partner_identity as _authoritative_identity
     identity = _authoritative_identity(request)
     if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
         raise HTTPException(status_code=403, detail="Customer owner permission required.")
     from analytics_entitlements import ANALYTICS_CATALOG
-    analytic_key = payload.analytic_key.strip().lower()
-    catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == analytic_key), None)
+    addon_key = payload.addon_key.strip().lower()
+    catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == addon_key), None)
     if not catalog_entry:
         raise HTTPException(status_code=400, detail="Unknown analytics add-on.")
-    _, label, env_var = catalog_entry
+    _, label, analytic_keys, env_var = catalog_entry
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:
-        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {analytic_key}.")
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {addon_key}.")
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
@@ -112837,7 +112838,7 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         ("line_items[0][quantity]", "1"),
         ("metadata[anyaicam_stripe_price_id]", price_id),
         ("metadata[anyaicam_customer_id]", customer_id),
-        ("metadata[anyaicam_analytic_key]", analytic_key),
+        ("metadata[anyaicam_addon_key]", addon_key),
         ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
         ("subscription_data[metadata][anyaicam_customer_id]", customer_id),
         ("allow_promotion_codes", "true"),
@@ -112853,13 +112854,15 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         "stripe.analytics_addon_checkout_created",
         session_id=session_id,
         customer_id=customer_id,
-        analytic_key=analytic_key,
+        addon_key=addon_key,
+        analytic_keys=list(analytic_keys),
     )
     return {
         "status": "complete",
         "session_id": session_id,
         "checkout_url": checkout_url,
-        "analytic_key": analytic_key,
+        "addon_key": addon_key,
+        "analytic_keys": list(analytic_keys),
         "label": label,
         "billing_type": "recurring",
         "message": "Stripe Checkout Session created.",

@@ -1,5 +1,11 @@
 # Commercial backend restructure -- Local one-time / Hybrid+addons recurring (2026-09-21)
 
+## Correction, same day (2026-09-21)
+
+Item 4 below ("Confirm the Advanced Analytics bundling model") is now resolved: **Advanced Analytics is ONE recurring, customer-billed add-on** -- a single Stripe Price -- that grants smart_motion, people_counting, lpr, and ppe together, not four separately purchasable add-ons. Face Access (facial_recognition) is unaffected and remains its own separate recurring add-on. AACO remains unsellable, also unaffected.
+
+This changed `analytics_entitlements.ANALYTICS_CATALOG` from one row per `analytic_key` to one row per purchasable `addon_key`, where each row carries a tuple of the one or more internal `analytic_key` feature flags it grants (`advanced_analytics` is the one row with four; every other row still grants exactly its own single analytic_key, unchanged). `resolve_analytic()` was renamed `resolve_addon()` to return `{"addon_key", "label", "analytic_keys"}`; `POST /api/customer/analytics/checkout` now takes `addon_key` instead of `analytic_key`; the webhook sync functions fan a single Stripe event out into one `analytics_subscriptions` row per granted `analytic_key`, all updated/cancelled together. `ADDON_CATEGORIES` (the presentation-only grouping mentioned in item 4's original text) was removed since the bundling is now the catalog's actual structure, not a layer on top of it. Env var `ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS` replaces the four separate `_SMART_MOTION`/`_PEOPLE_COUNTING`/`_LPR`/`_PPE` price env vars -- none of which were ever set in any real environment, so this is a pre-launch correction, not a migration of live data. Tests and this doc's items 3 and 8 below are updated to match.
+
 ## What was confirmed and built
 
 Product structure, confirmed 2026-09-21:
@@ -8,7 +14,7 @@ Product structure, confirmed 2026-09-21:
 |---|---|---|
 | Local (camera-slot capacity) | **One-time purchase** | Checkout mode fixed to `payment`; dollar amounts are placeholders (see below) |
 | Hybrid (camera-slot capacity) | Recurring subscription | Unchanged -- already correct |
-| Advanced Analytics (Smart Motion, People Counting, LPR, PPE) | Recurring add-on | New checkout endpoint built; no prices configured yet |
+| Advanced Analytics (Smart Motion, People Counting, LPR, PPE bundled as ONE add-on) | Recurring add-on | New checkout endpoint built; no price configured yet |
 | Face Access (Facial Recognition) | Recurring add-on | New checkout endpoint built; no price configured yet |
 | AACO | Future add-on | Deliberately not built -- see below |
 
@@ -38,17 +44,15 @@ Nothing was deployed to Ryzen or staging tonight. This is pure backend/checkout-
 
 ### 3. Advanced Analytics / Face Access have no prices configured at all
 
-Every env var in `analytics_entitlements.ANALYTICS_CATALOG` (`ANYAICAM_STRIPE_PRICE_ANALYTICS_SMART_MOTION`, `_PEOPLE_COUNTING`, `_LPR`, `_PPE`, `_FACIAL_RECOGNITION`) is unset in every environment -- these add-ons are not purchasable yet, by design (fail-closed).
+Every env var in `analytics_entitlements.ANALYTICS_CATALOG` (`ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS`, `_FACIAL_RECOGNITION`) is unset in every environment -- these add-ons are not purchasable yet, by design (fail-closed).
 
-Separately, `pricing_config.py` (the self-serve marketing quote calculator) already shows different placeholder monthly prices for these same 4 analytics ($1.79 / $10.99 / $18.99 / $17.99) for its own quote-estimate purpose. I did not touch or reconcile that file tonight -- it's a different, older subsystem (a quote estimator, not a checkout path) and reconciling the two wasn't in tonight's scope.
+Separately, `pricing_config.py` (the self-serve marketing quote calculator) already shows different placeholder monthly prices for the 4 individual analytics that now make up the Advanced Analytics bundle ($1.79 / $10.99 / $18.99 / $17.99) for its own quote-estimate purpose. I did not touch or reconcile that file tonight -- it's a different, older subsystem (a quote estimator, not a checkout path) and reconciling the two wasn't in tonight's scope.
 
-**You need to:** decide real Stripe prices for Smart Motion, People Counting, LPR, PPE, and Facial Recognition, and decide whether `pricing_config.py`'s existing placeholder figures should become those real prices or be treated as stale/unrelated.
+**You need to:** decide the real Stripe price for the bundled Advanced Analytics add-on and for Facial Recognition, and decide whether `pricing_config.py`'s existing per-analytic placeholder figures should inform that one bundled price or be treated as stale/unrelated.
 
-### 4. Confirm the "Advanced Analytics" bundling model
+### 4. Advanced Analytics bundling model -- resolved (see correction above)
 
-I implemented "Advanced Analytics" as a **marketing grouping** over 4 separately priced, separately purchasable add-ons (a customer buys Smart Motion, People Counting, LPR, and PPE individually, each its own Checkout Session and its own recurring charge) -- not as one bundled SKU with one price covering all 4 at once. This preserves the existing, already-tested per-analytic-key entitlement architecture (`analytics_subscriptions`, per-camera assignment caps) without touching it.
-
-**You need to:** confirm this is the intended model. If you actually want one bundled "Advanced Analytics" price covering all 4 analytics at once, that's a different (larger) change -- a single Price ID would need to grant 4 `analytics_subscriptions` rows from one webhook event, which the current webhook handler does not do.
+Confirmed 2026-09-21 (same day, before this ever shipped): Advanced Analytics is ONE bundled SKU with one Stripe Price covering Smart Motion, People Counting, LPR, and PPE together, granting all four `analytics_subscriptions` rows from one webhook event. This superseded the original implementation below this line, which treated the four as separately priced, separately purchasable add-ons -- see the "Correction, same day" section at the top of this document for what changed in code and tests.
 
 ### 5. AACO scope, price, and Face Access dependency
 
@@ -70,4 +74,4 @@ Per the standing instruction to preserve the existing working website unless a c
 
 ### 8. Optional: multi-item analytics checkout
 
-Tonight's `POST /api/customer/analytics/checkout` accepts exactly one `analytic_key` per Checkout Session, matching the existing webhook's single-price-id-metadata design. If you'd rather let a customer add several analytics to one cart/session, that requires extending the webhook to read multiple line items from the session object (not present in a webhook payload by default -- would need `line_items` expansion) -- a larger, separate change I did not make tonight to avoid touching already-tested webhook logic without your go-ahead.
+`POST /api/customer/analytics/checkout` accepts exactly one `addon_key` per Checkout Session, matching the existing webhook's single-price-id-metadata design -- `addon_key="advanced_analytics"` already covers the 4-analytic-key bundle case via the same-day correction above, so this item now only concerns a customer wanting to buy, e.g., Advanced Analytics AND Face Access in one cart/session. That would require extending the webhook to read multiple line items from the session object (not present in a webhook payload by default -- would need `line_items` expansion) -- a larger, separate change not made yet to avoid touching already-tested webhook logic without your go-ahead.

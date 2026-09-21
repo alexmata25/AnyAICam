@@ -589,7 +589,8 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         # source of what this customer is actually charged.
         from customer_entitlements import get_entitlements_for_customer, total_camera_slots, PLAN_TIERS
         from hardware_orders import get_orders_for_customer
-        from analytics_entitlements import get_active_analytics_for_customer, ANALYTICS_CATALOG
+        from analytics_entitlements import get_active_analytics_for_customer
+        from customer_analytics_panel import ANALYTIC_LABELS
         entitlements=get_entitlements_for_customer(identity['customer_id'])
         camera_entitlement=next((e for e in entitlements if e['product'] in ('camera_slots_local','camera_slots_hybrid') and e['status']=='active'),None)
         licensed_slots=total_camera_slots(identity['customer_id'])
@@ -609,7 +610,13 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
         camera_tier_options=[{'plan_type':t[0],'tier_label':t[1],'camera_slot_maximum':t[4],'monthly_retail_usd':t[5]} for t in PLAN_TIERS if _os.environ.get(t[6],'').strip()]
         hardware_orders_list=[o for o in get_orders_for_customer(identity['customer_id']) if o['status']=='paid']
         hardware_summary=', '.join(f"{escape(o['product_name'])} (paid)" for o in hardware_orders_list) or 'No hardware purchased yet'
-        analytics_labels={key:label for key,label,_env in ANALYTICS_CATALOG}
+        # analytics_subscriptions.analytic_key (what active_analytics
+        # actually contains) is an internal feature-flag key, never a
+        # customer-billed addon_key -- ANALYTIC_LABELS is the correct
+        # label source for it regardless of how many analytic_keys one
+        # Stripe purchase grants together (see analytics_entitlements.py's
+        # 2026-09-21 correction: "advanced_analytics" now grants four).
+        analytics_labels={key:label for key,(label,_event_types) in ANALYTIC_LABELS.items()}
         active_analytics=get_active_analytics_for_customer(identity['customer_id'])
         analytics_summary=', '.join(escape(analytics_labels.get(key,key)) for key in active_analytics) or 'None purchased'
         # Confirmed live on Samsung: refreshing this page always reset the
