@@ -53,6 +53,7 @@ INSTALLER_RUNTIME_FILES = (
     "01-preflight.sh",
     "02-storage-check.sh",
     "03-detect-install.sh",
+    "03-product-mode.sh",
     "04-docker-setup.sh",
     "05-provision-users-dirs.sh",
     "06-deploy-vms.sh",

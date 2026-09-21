@@ -132,6 +132,8 @@ ensure_vms_env() {
     grep -q '^ANYAICAM_CAMERA_CREDENTIAL_KEY=' "$VMS_ENV_FILE" 2>/dev/null || \
         printf 'ANYAICAM_CAMERA_CREDENTIAL_KEY=%s\n' "$(head -c 32 /dev/urandom | base64 | tr -d '\n' | tr '+/' '-_')" >> "$VMS_ENV_FILE"
 
+    persist_product_mode
+
     # These two keys are installer-owned build identity. They are updated on
     # every reinstall/repair while all other customer configuration survives.
     upsert_env_key "$VMS_ENV_FILE" "ANYAICAM_VMS_COMMIT" "$VMS_RELEASE_COMMIT"

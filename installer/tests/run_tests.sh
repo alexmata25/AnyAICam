@@ -28,6 +28,8 @@ FIXTURE_ROOT="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_ROOT"' EXIT
 
 reset_fixture() {
+    ANYAICAM_PRODUCT_MODE=local
+    PRODUCT_MODE_LEGACY=false
     rm -rf "$FIXTURE_ROOT"
     mkdir -p "$FIXTURE_ROOT"
     # Redirect every path constant the two functions under test read or

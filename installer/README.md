@@ -133,3 +133,68 @@ The validation target is one fresh disposable Ubuntu 24.04 `t3.xlarge`, with
 synthetic/local mocks only. Production EC2, Ryzen, and Samsung are out of scope.
 Samsung clean-install testing remains blocked until explicit user approval
 after the disposable validation report.
+
+## Local and Hybrid product setup
+
+The appliance installer (`install.sh`), not the customer portal or the agent's
+activation wizard, selects product mode before storage/package/deployment changes.
+For a fresh interactive install, answer `local` or `hybrid` when prompted. Blank
+and invalid answers fail. Unattended installs must use one of:
+
+```sh
+sudo ./install.sh --product-mode=local
+sudo ./install.sh --product-mode=hybrid
+```
+
+An explicitly supplied `ANYAICAM_PRODUCT_MODE` environment variable also works
+(if preserved through sudo); the command-line choice takes precedence. The
+installer writes the authoritative value to `/etc/anyaicam/vms.env`, which the
+VMS Compose service already loads. Product mode is separate from
+`ANYAICAM_ENV`, `ANYAICAM_RUNTIME_ROLE`, and the agent development/production mode.
+
+| Fresh-install default | Local | Hybrid |
+| --- | --- | --- |
+| ANYAICAM_PRODUCT_MODE | local | hybrid |
+| ANYAICAM_CLOUD_UPLOAD_ENABLED | false | true |
+| ANYAICAM_LIVE_RELAY_ENABLED | false | true |
+| ANYAICAM_RECORDING_UPLOAD_ENABLED | false | true |
+| ANYAICAM_ANALYTICS_SYNC_ENABLED | false | true |
+
+Existing explicit per-feature values in the environment file or release template
+win over these defaults, including `false` in Hybrid and `true` in Local. Hybrid
+flags enable the existing workers; working cloud connections still require their
+normal endpoint, credential and provisioning configuration. This does not grant
+entitlements, change subscriptions, or configure AWS. The agent remains installed
+for camera/control-plane operation in both modes; its cloud activation wizard is
+unchanged. Local here disables these four cloud features by default, not all
+network traffic.
+
+### Existing installations and reconciliation
+
+Repair/reinstall reuses a valid saved product mode. A conflicting requested mode,
+blank/invalid saved mode, or duplicate mode entries fails before deployment.
+Mode values must be unquoted, exact lowercase `local` or `hybrid`.
+
+For an existing or partial installation without the key, the installer assigns
+`hybrid` as a compatibility label and pins missing cloud flags to `false` (their
+previous runtime defaults). Existing flags are preserved. The legacy
+`/opt/anyaicam/.env` is inspected before migration too. This deliberately does
+not activate new cloud behavior during an upgrade. An explicitly requested mode
+on a legacy installation likewise preserves existing behavior. Changing a saved
+mode is an operator reconciliation task, not an installer/repair side effect.
+
+This source revision has no shared runtime product-mode resolver. The installer
+materializes defaults into the already-supported feature variables, keeping all
+application, dashboard, subscription and entitlement files outside this change.
+When reconciling the runtime abstraction, retain explicit-feature precedence and
+the legacy pins. Changing just the mode later does not replace persisted overrides.
+
+Regression checks (Python plus Bash/coreutils; set TEST_BASH to Git Bash on Windows):
+
+```sh
+python -m unittest discover -s installer/tests -v
+```
+
+Tests execute configuration functions in temporary directories only. They do not
+install packages, start services or connect to a deployment. A real Ubuntu fresh
+install/repair smoke test remains a release qualification step.

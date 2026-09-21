@@ -100,6 +100,7 @@ load_release_metadata() {
 source "$INSTALLER_DIR/01-preflight.sh"
 # shellcheck source=03-detect-install.sh
 source "$INSTALLER_DIR/03-detect-install.sh"
+source "$INSTALLER_DIR/03-product-mode.sh"
 # shellcheck source=02-storage-check.sh
 source "$INSTALLER_DIR/02-storage-check.sh"
 # shellcheck source=04-docker-setup.sh
@@ -122,6 +123,7 @@ run_install() {
     for arg in "$@"; do
         case "$arg" in
             --repair) mode="repair" ;;
+            --product-mode=*) ANYAICAM_PRODUCT_MODE="${arg#*=}" ;;
             *) echo "Unknown argument: $arg" >&2; return 2 ;;
         esac
     done
@@ -134,6 +136,7 @@ run_install() {
         log "Partial installation detected -- treating as repair, never silently as clean."
         mode="repair"
     fi
+    select_product_mode
     storage_preflight "$INSTALL_STATE"
     docker_setup
     provision_users_dirs "$INSTALL_STATE"
