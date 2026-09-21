@@ -143,6 +143,10 @@ def test_persist_event_recording_still_creates_the_clip_after_waiting(tmp_path, 
     segment_path.write_bytes(b"fake video bytes")
 
     def fake_run(args, **kwargs):
+        if args[0] == "ffprobe":
+            # Stand-in for the post-success duration probe (also added
+            # 2026-09-21, for the "event_recording.persisted" log line).
+            return type("Result", (), {"returncode": 0, "stdout": "1.0", "stderr": ""})()
         # Stand-in for the real ffmpeg concat subprocess -- writes the
         # temp output (the command's last argument) the real call would
         # produce, so .replace() below has something to promote.
@@ -152,7 +156,86 @@ def test_persist_event_recording_still_creates_the_clip_after_waiting(tmp_path, 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
 
     main._open_event_recordings.pop(1, None)  # test isolation: module-level state
-    asyncio.run(main.persist_event_recording(1, now, now))
+    asyncio.run(main.persist_event_recording(1, now, now, detector="basic_motion", trigger_id="evt-1"))
 
     produced = list((tmp_path / "recordings" / "camera1").glob("camera1_*.mkv"))
     assert len(produced) == 1
+
+
+# --------------------------------------------------------------- detector/trigger observability (2026-09-21)
+#
+# Requested directly after the Driveway Right post-roll fix above: that bug
+# was invisible in every log for the entire pilot because persist_event_
+# recording()'s "nothing to do yet" paths were silent. These tests prove a
+# caller's detector name and trigger id now surface on both the no-op and
+# the success path, so the next silent-seeming failure is diagnosable from
+# logs alone instead of requiring a live file-timestamp investigation.
+
+
+def test_persist_event_recording_logs_no_sources_with_detector_and_trigger_id(tmp_path, monkeypatch, caplog):
+    import asyncio
+    from datetime import datetime
+
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    now = datetime.now()
+    main._open_event_recordings.pop(1, None)
+    with caplog.at_level("WARNING", logger="anyaicam.event_recording"):
+        asyncio.run(
+            main.persist_event_recording(
+                1, now, now, detector="ai_detection", trigger_id="group-42",
+            )
+        )
+
+    assert "event_recording.no_buffer_folder" in caplog.text
+    assert "detector=ai_detection" in caplog.text
+    assert "trigger_id=group-42" in caplog.text
+
+
+def test_persist_event_recording_logs_persisted_clip_path_and_duration(tmp_path, monkeypatch, caplog):
+    import asyncio
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    now = datetime.now()
+    buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
+    buffer_folder.mkdir(parents=True, exist_ok=True)
+    segment_start = now - timedelta(seconds=15)
+    segment_path = buffer_folder / f"buf1_{segment_start:%Y-%m-%d_%H-%M-%S}.mkv"
+    segment_path.write_bytes(b"fake video bytes")
+
+    def fake_run(args, **kwargs):
+        if args[0] == "ffprobe":
+            return type("Result", (), {"returncode": 0, "stdout": "12.3", "stderr": ""})()
+        Path(args[-1]).write_bytes(b"concatenated clip")
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    main._open_event_recordings.pop(1, None)
+    with caplog.at_level("INFO", logger="anyaicam.event_recording"):
+        asyncio.run(
+            main.persist_event_recording(
+                1, now, now, detector="basic_motion", trigger_id="evt-99",
+            )
+        )
+
+    assert "event_recording.triggered" in caplog.text
+    assert "detector=basic_motion" in caplog.text
+    assert "event_recording.persisted" in caplog.text
+    assert "trigger_id=evt-99" in caplog.text
+    assert "duration_seconds=12.3" in caplog.text
+    produced = list((tmp_path / "recordings" / "camera1").glob("camera1_*.mkv"))
+    assert len(produced) == 1
+    assert str(produced[0]) in caplog.text

@@ -16378,7 +16378,14 @@ def _in_flight_event_windows(camera_number: int) -> list[tuple[datetime, datetim
     return [(open_recording["start"], open_recording["end"])]
 
 
-async def persist_event_recording(camera_number: int, event_start: datetime, event_end: datetime) -> None:
+async def persist_event_recording(
+    camera_number: int,
+    event_start: datetime,
+    event_end: datetime,
+    *,
+    detector: str = "unknown",
+    trigger_id: str | None = None,
+) -> None:
     """Event mode's replacement for "just let the continuous segmenter
     keep it": extracts event_start-pre_roll .. event_end+post_roll from
     the short rolling buffer and writes/extends a file in the camera's
@@ -16396,7 +16403,22 @@ async def persist_event_recording(camera_number: int, event_start: datetime, eve
     ever called for a camera whose local_recording_mode is 'event',
     alongside -- never instead of -- the existing customer-facing clip
     build (build_motion_event_clip()) that already runs for every
-    camera regardless of mode."""
+    camera regardless of mode.
+
+    detector/trigger_id (2026-09-21): purely for observability -- which
+    caller (the basic-motion path's store_motion_event() vs. the AI/
+    Smart Motion path's save_yolo_events()) scheduled this run, and
+    that caller's own event identifier, so a silent no-op (the exact
+    "no sources yet" shape that hid the post-roll race bug from every
+    log for the whole Driveway Right pilot) is now visible immediately
+    instead of requiring a live file-timestamp/process investigation to
+    even notice something didn't happen."""
+    log = logging.getLogger("anyaicam.event_recording")
+    log.info(
+        "event_recording.triggered camera=%s detector=%s trigger_id=%s "
+        "event_start=%s event_end=%s",
+        camera_number, detector, trigger_id, event_start.isoformat(), event_end.isoformat(),
+    )
     from event_clips import compute_clip_window
     from local_recording_policy import should_start_new_event_recording
 
@@ -16447,6 +16469,10 @@ async def persist_event_recording(camera_number: int, event_start: datetime, eve
 
     buffer_folder = RECORDINGS_FOLDER / f"camera{camera_number}" / EVENT_BUFFER_SUBFOLDER_NAME
     if not buffer_folder.is_dir():
+        log.warning(
+            "event_recording.no_buffer_folder camera=%s detector=%s trigger_id=%s path=%s",
+            camera_number, detector, trigger_id, buffer_folder,
+        )
         return
     sources = [
         path for path in sorted(buffer_folder.glob("*.mkv"))
@@ -16455,6 +16481,11 @@ async def persist_event_recording(camera_number: int, event_start: datetime, eve
         and segment_start + timedelta(seconds=EVENT_BUFFER_SEGMENT_SECONDS) > window.start
     ]
     if not sources:
+        log.warning(
+            "event_recording.no_sources camera=%s detector=%s trigger_id=%s "
+            "window_start=%s window_end=%s",
+            camera_number, detector, trigger_id, window.start.isoformat(), window.end.isoformat(),
+        )
         return
     list_file = destination.with_suffix(".sources.txt")
     try:
@@ -16468,6 +16499,19 @@ async def persist_event_recording(camera_number: int, event_start: datetime, eve
         )
         if result.returncode == 0 and temp_output.exists():
             temp_output.replace(destination)
+            duration = _probe_recording_duration_seconds(destination)
+            log.info(
+                "event_recording.persisted camera=%s detector=%s trigger_id=%s "
+                "path=%s duration_seconds=%s",
+                camera_number, detector, trigger_id, destination,
+                round(duration, 1) if duration is not None else None,
+            )
+        else:
+            log.warning(
+                "event_recording.concat_failed camera=%s detector=%s trigger_id=%s "
+                "path=%s returncode=%s",
+                camera_number, detector, trigger_id, destination, result.returncode,
+            )
     finally:
         list_file.unlink(missing_ok=True)
         destination.with_suffix(".tmp.mkv").unlink(missing_ok=True)
@@ -34697,7 +34741,10 @@ async def store_motion_event(
         # check.
         if (await asyncio.to_thread(_local_recording_settings, camera_number))["mode"] == "event":
             event_recording_task = asyncio.create_task(
-                persist_event_recording(camera_number, start_time, end_time)
+                persist_event_recording(
+                    camera_number, start_time, end_time,
+                    detector="basic_motion", trigger_id=event_id,
+                )
             )
             clip_tasks.add(event_recording_task)
             event_recording_task.add_done_callback(clip_tasks.discard)
@@ -37505,7 +37552,11 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        persist_event_recording(camera_number, now, now), _ai_event_media_loop
+                        persist_event_recording(
+                            camera_number, now, now,
+                            detector="ai_detection", trigger_id=event_group_id,
+                        ),
+                        _ai_event_media_loop,
                     )
                 except RuntimeError as error:
                     print(
