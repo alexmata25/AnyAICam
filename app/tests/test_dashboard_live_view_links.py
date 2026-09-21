@@ -154,7 +154,7 @@ def test_a_customer_with_no_camera_id_resolved_falls_back_to_customer_live_not_a
     source = inspect.getsource(main.dashboard)
     assert "_dashboard_camera_hrefs" in source
     assert "_dashboard_live_view_href" in source
-    assert "else _dashboard_live_view_href" in source
+    assert "_dashboard_camera_hrefs[camera_number] = _dashboard_live_view_href" in source
 
 
 def test_staff_session_open_live_view_button_still_links_to_the_legacy_grid(http_client, db_path):

@@ -73874,21 +73874,51 @@ def dashboard(request: Request) -> str:
         _dashboard_camera_numbers = list(get_camera_numbers())
         _dashboard_live_view_href = "/"
         _dashboard_camera_ids_by_number = {}
-    # Per-camera preview cards deep-link to the same canonical single-
-    # camera tools page /customer-live's own gear icon links to
-    # (live_view_page.py's /customer/cameras/{id}/live) whenever a real
-    # camera id is known for a real customer session -- never the old,
-    # unscoped /camera/{camera_number} page. Falls back to _dashboard_
-    # live_view_href (a staff/admin session's own "/", unaffected) for
-    # any camera_number this dashboard couldn't resolve an id for.
-    _dashboard_camera_hrefs = {
-        camera_number: (
-            f"/customer/cameras/{_dashboard_camera_ids_by_number[camera_number]}/live"
-            if camera_number in _dashboard_camera_ids_by_number
-            else _dashboard_live_view_href
-        )
-        for camera_number in _dashboard_camera_numbers
-    }
+    from partner_portal import partner_identity
+    _dashboard_identity = partner_identity(request) if _customer_dashboard_cameras is not None else None
+    # Permission-mismatch fix (2026-09-21): _customer_dashboard_cameras
+    # (this whole route's camera list) is scoped by can_playback --
+    # correct for what to SHOW, but not the same grant /customer/
+    # cameras/{id}/live itself requires (can_live, via live_view_page.
+    # _customer_live_cameras()). A customer_viewer with can_playback but
+    # not can_live for a camera used to get a card that led to a page
+    # their own JS then 403'd them out of. Never reduces which cameras
+    # appear here (that visibility is still can_playback-scoped, exactly
+    # as before) -- only changes where the card's action goes: a real
+    # can_live grant still opens Live tools; a playback-only grant now
+    # goes to Playback instead, never to a page that will refuse them.
+    # customer_owner has implicit full-fleet access to both (see
+    # _customer_live_cameras()'s own owner branch), so this only ever
+    # changes behavior for a real customer_viewer.
+    _dashboard_camera_can_live_ids: set = set()
+    if _dashboard_identity:
+        from live_view_page import _customer_live_cameras
+        from partner_db import connection as _dashboard_connection
+        with _dashboard_connection() as _dashboard_db:
+            _dashboard_camera_can_live_ids = {
+                camera["id"] for camera in _customer_live_cameras(_dashboard_db, _dashboard_identity)
+            }
+    # Per-camera preview cards deep-link to the canonical single-camera
+    # tools page /customer-live's own gear icon links to (live_view_
+    # page.py's /customer/cameras/{id}/live) when this identity has
+    # can_live for that camera; otherwise, if they can at least view
+    # Playback for it (which is why the card exists at all), the card
+    # goes there instead -- never to a page that will 403 them. Falls
+    # back to _dashboard_live_view_href (a staff/admin session's own
+    # "/", unaffected) for any camera_number this dashboard couldn't
+    # resolve an unambiguous id for at all (see the multi-appliance
+    # camera_number-collision fix above).
+    _dashboard_camera_hrefs = {}
+    _dashboard_camera_playback_only = set()
+    for camera_number in _dashboard_camera_numbers:
+        camera_id = _dashboard_camera_ids_by_number.get(camera_number)
+        if camera_id is None:
+            _dashboard_camera_hrefs[camera_number] = _dashboard_live_view_href
+        elif camera_id in _dashboard_camera_can_live_ids:
+            _dashboard_camera_hrefs[camera_number] = f"/customer/cameras/{camera_id}/live"
+        else:
+            _dashboard_camera_hrefs[camera_number] = f"/playback?camera={camera_id}"
+            _dashboard_camera_playback_only.add(camera_number)
     # Recording stat (2026-09-21 fix): this used to be the literal string
     # "Continuous", never read from any camera row -- confirmed live on
     # Ryzen: every one of that customer's 5 cameras is genuinely running
@@ -73937,8 +73967,6 @@ def dashboard(request: Request) -> str:
     # the same entitlement.
     if _customer_dashboard_cameras is not None:
         from customer_entitlements import product_mode_for_customer
-        from partner_portal import partner_identity
-        _dashboard_identity = partner_identity(request)
         _dashboard_plan_stat = {"local": "Local", "hybrid": "Hybrid"}.get(
             product_mode_for_customer(_dashboard_identity["customer_id"]) if _dashboard_identity else "", "No active plan",
         )
@@ -74195,7 +74223,7 @@ def dashboard(request: Request) -> str:
 
 
 
-                <div class="dashboard-camera-name">Camera {camera_number}</div>
+                <div class="dashboard-camera-name">Camera {camera_number}{' <span class=\"pill\">Playback only</span>' if camera_number in _dashboard_camera_playback_only else ''}</div>
 
 
 
@@ -74222,7 +74250,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            <span class="dashboard-open-icon" aria-hidden="true">↗</span>
+            <span class="dashboard-open-icon" aria-hidden="true">{('▶' if camera_number in _dashboard_camera_playback_only else '↗')}</span>
 
 
 
