@@ -48036,6 +48036,8 @@ register_provisioning_api_routes(app)
 register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
+from customer_analytics_rules import register_customer_analytics_rules_routes
+register_customer_analytics_rules_routes(app, page_shell)
 register_live_view_p2p_customer_routes(app)
 register_live_view_p2p_appliance_routes(app)
 from live_view_wireguard import register_live_view_wireguard_routes

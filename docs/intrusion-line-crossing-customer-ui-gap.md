@@ -107,3 +107,75 @@ write the way every other customer-scoped table in this codebase
 already is, and (3) the rules file (or a proper DB table) partitioned
 or filtered by tenant so two customers' camera-number rules can never
 collide on a shared multi-tenant cloud deployment.
+
+## Update, 2026-09-21: the tenant-safe UI/API/storage foundation above now exists -- execution still does not
+
+Built `app/customer_analytics_rules.py` (new `customer_analytics_rules`
+DB table, migration `20260921_customer_analytics_rules`) exactly along the
+lines this doc's own Recommendation section called for, as a second Codex
+session on this same rule-drawing task hit its session limit before
+writing any code (no checkout/commit/bundle was left behind to resume --
+confirmed absent before starting fresh from this branch).
+
+What is real and tenant-safe today:
+
+- `customer_analytics_rules` table: `customer_id`, `site_id`,
+  `appliance_id`, `camera_id` all present and enforced on every read and
+  write (a camera or rule belonging to another customer_id is a 404, never
+  a leak or a silent cross-tenant write) -- a genuine second, additive
+  store, completely separate from `analytics_rules.json`/
+  `AnalyticsRuleModel`. Nothing in this feature reads from or writes to
+  the legacy file, and People Counting's own worker/rule storage is
+  untouched.
+- Customer-authenticated routes under `/api/customer/cameras/{camera_id}/
+  analytics-rules` (list/get/create/update/delete) plus a customer-facing
+  drawing page at `/customer/cameras/{camera_id}/analytics-rules`, reusing
+  this camera's existing relay-only live preview (`.../live/start` +
+  `.../live/playlist.m3u8`) as the background to draw over -- a captured
+  video frame, not a live feed, is what a line/zone gets drawn onto.
+- Real validation: a line-crossing rule requires exactly 2 points and a
+  `direction` (`both`/`inbound`/`outbound`); an intrusion rule requires
+  3-20 points and rejects a `direction`; every point must be a normalized
+  `{x,y}` in `[0,1]`; an empty name is rejected. All fail with a 400 and a
+  specific message, never silently clamped or guessed.
+- Real permissions: `customer_owner` has full read/write across their own
+  fleet, matching every other customer-owner capability in this codebase.
+  A `customer_viewer` can read a camera's rules with either `can_live` or
+  `can_playback` (i.e. any existing visibility into that camera), but can
+  only create/update/delete rules with the existing `can_settings` grant
+  for that specific camera -- the same column, and the same owner-vs-
+  viewer split, `door_access.py`'s own `can_unlock` gate already
+  established for a different per-camera configuration action.
+- 21 regression tests (`app/tests/test_customer_analytics_rules.py`)
+  covering tenant isolation, camera-ownership validation, create/update/
+  delete, invalid geometry, invalid direction, and owner-vs-viewer
+  permissions, all passing alongside the full existing suite (3309 tests
+  collected, no new failures).
+
+What is explicitly still NOT real, and must not be described as working:
+
+- **No execution path exists for either rule type on this branch.**
+  Saving a rule here only persists geometry -- it does not evaluate
+  anything, ever. Traced in full: `app/analytics_rules_engine.py` (the
+  real IoU tracker, `_point_in_polygon()`/`_signed_distance_to_line()`
+  geometry, and per-rule dwell/crossing state machines) exists only on
+  the divergent, unmerged `analytics-rules-foundation-20260821` branch,
+  is not an ancestor of this branch, and is not wired to anything here --
+  grep for `analytics_rules_engine`/`evaluate_rules`/`update_tracker(`
+  across this branch returns zero matches.
+- Line-crossing detection that genuinely runs today does so only through
+  People Counting's own separate worker (`people_counting_worker()`)
+  reading People Counting's own rule/line, which this new feature
+  deliberately does not touch or share storage with (per explicit
+  instruction to keep People Counting separate unless intentionally
+  sharing geometry primitives -- it does not, yet).
+- Intrusion detection has zero execution anywhere on this branch, in
+  either the legacy admin path or this new one.
+- Building the real edge-worker execution path -- reading
+  `customer_analytics_rules`, running tracking/geometry against live
+  frames, and writing real detection events -- remains a separate,
+  unbuilt phase. Porting `analytics_rules_engine.py` from the divergent
+  branch and re-pointing it at this tenant-scoped table (instead of that
+  branch's own still-non-tenant-safe JSON file) is the most direct next
+  step, but was not done here per the explicit instruction not to fake
+  detector behavior while building this foundation.

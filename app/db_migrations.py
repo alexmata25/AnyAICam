@@ -837,6 +837,43 @@ CREATE TABLE IF NOT EXISTS event_media_fetch_log(
 CREATE INDEX IF NOT EXISTS idx_event_media_fetch_log_media ON event_media_fetch_log(media_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_event_media_fetch_log_source ON event_media_fetch_log(source,created_at);
 '''),
+    ('20260921_customer_analytics_rules','''
+-- Tenant-safe customer intrusion/line-crossing rule storage (2026-09-21,
+-- see docs/intrusion-line-crossing-customer-ui-gap.md and customer_
+-- analytics_rules.py's own module docstring for the full trace). The
+-- ONLY pre-existing rule storage for this feature -- analytics_rules.json
+-- (main.py's ANALYTICS_RULES_FILE), used by both the admin-only rule
+-- builder and People Counting's own worker -- has no customer_id/site_id/
+-- appliance_id at all and addresses a rule solely by a bare integer
+-- camera number, unique only within one appliance. This table is a
+-- SEPARATE, additive, real database store with full tenant scoping -- it
+-- does not read from, write to, or replace analytics_rules.json, and
+-- nothing in this migration touches People Counting's existing worker
+-- or that file. appliance_id is nullable (not NOT NULL) to match
+-- cameras.appliance_id's own nullability -- a camera can exist with no
+-- appliance_id yet, and a rule save must not 500 on that case.
+CREATE TABLE IF NOT EXISTS customer_analytics_rules(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    appliance_id TEXT,
+    camera_id TEXT NOT NULL,
+    rule_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    direction TEXT,
+    geometry_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    created_by TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(site_id) REFERENCES sites(id),
+    FOREIGN KEY(appliance_id) REFERENCES appliances(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id)
+);
+CREATE INDEX IF NOT EXISTS idx_customer_analytics_rules_customer ON customer_analytics_rules(customer_id);
+CREATE INDEX IF NOT EXISTS idx_customer_analytics_rules_camera ON customer_analytics_rules(camera_id);
+'''),
 ]
 
 
