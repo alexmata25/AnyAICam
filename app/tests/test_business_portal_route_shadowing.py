@@ -18,10 +18,16 @@ because the mock account_management.json store's own 'sites' list is
 always empty for a real deployment that never used that legacy setup
 wizard.
 
-Fixed by removing ONLY the two shadowing GET handlers from business_
-portal.py -- its POST endpoints (/api/sites, /api/users, etc.) and its
-other GET pages (/appliances, /branding, /setup-legacy, /pricing-
-legacy), which have no confirmed real replacement, are untouched.
+A follow-up full route-table audit (comparing every (path, method) pair
+across main.app.routes) found the identical pattern once more: POST
+/api/users also shadowed main.py's real create_user(). Fixed the same
+way.
+
+Fixed by removing ONLY these three shadowing handlers from business_
+portal.py -- its remaining POST endpoints (/api/sites, /api/setup/
+complete, /api/branding) and its other GET pages (/appliances,
+/branding, /setup-legacy, /pricing-legacy), which have no confirmed
+real replacement, are untouched.
 """
 import sys
 from pathlib import Path
@@ -74,9 +80,25 @@ def test_business_portal_other_legacy_pages_are_still_registered():
 
 
 def test_business_portal_post_endpoints_still_registered():
-    """The POST endpoints business_portal.py's own pages' own client-side
-    JS calls (invite_user, add_site, complete_setup, update_branding)
+    """The remaining POST endpoints business_portal.py's own pages'
+    client-side JS calls (add_site, complete_setup, update_branding)
     were never part of the shadowing bug and must be unaffected."""
-    for path in ("/api/sites", "/api/users", "/api/setup/complete", "/api/branding", "/api/account-management"):
+    for path in ("/api/sites", "/api/setup/complete", "/api/branding", "/api/account-management"):
         matches = [r for r in main.app.routes if getattr(r, "path", None) == path]
         assert matches, f"expected {path} to still be registered"
+
+
+def test_post_api_users_is_not_shadowed_by_the_legacy_mock_endpoint():
+    """POST /api/users was ALSO shadowed the same way: business_portal.py's
+    unauthenticated invite_user() mock (writing to account_management.json)
+    registered before main.py's own real, permission-checked create_user().
+    No confirmed live page still calls this shadowed path directly (the
+    real /users page uses a separate real invitations flow), but any
+    direct caller was silently getting the mock instead of real user
+    creation -- removed for the same reason as the two GET pages."""
+    matches = [r for r in main.app.routes if getattr(r, "path", None) == "/api/users" and "POST" in (getattr(r, "methods", None) or ())]
+    assert len(matches) == 1, f"expected exactly one POST /api/users route, found {len(matches)}"
+    assert matches[0].endpoint.__module__ == "main", (
+        "the real, permission-checked create_user() in main.py must be the one "
+        "Starlette actually dispatches to, not business_portal.py's unauthenticated mock"
+    )

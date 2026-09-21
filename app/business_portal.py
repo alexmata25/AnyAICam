@@ -90,9 +90,15 @@ def register_business_routes(app: FastAPI, shell: Callable) -> None:
     def add_site(payload: dict) -> dict:
         data=load_data(); site=Site(**payload); data['sites'].append(site.model_dump()); save_data(data); return {'status':'complete','site':site.model_dump(),'message':'Site added.'}
 
-    @app.post('/api/users')
-    def invite_user(payload: dict) -> dict:
-        data=load_data(); user=User(**payload); data['users'].append(user.model_dump()); save_data(data); return {'status':'complete','user':user.model_dump(),'message':'User invitation saved.'}
+    # 2026-09-22: POST /api/users removed for the same reason as the
+    # /sites-management and /users GET handlers just above -- it
+    # silently shadowed main.py's own real, permission-checked
+    # create_user() (found via the same route-table audit that found
+    # the GET shadowing). The real /users page never actually called
+    # this path (it uses a separate real invitations flow), so this
+    # had no confirmed live user-facing symptom the way the GET pages
+    # did, but any direct caller of POST /api/users was silently
+    # getting this unauthenticated mock instead of real user creation.
 
     @app.post('/api/branding')
     def update_branding(payload: dict) -> dict:
