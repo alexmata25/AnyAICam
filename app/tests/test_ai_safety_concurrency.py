@@ -349,3 +349,91 @@ def test_synthetic_five_camera_timing_shows_separated_not_synchronized_starts(mo
     # And camera order is preserved (camera 1 first, camera 5 last),
     # matching the stagger's own camera_number * STAGGER formula.
     assert [cam for cam, _ in ordered] == [1, 2, 3, 4, 5]
+
+
+# ---------------------------------------------------------------------------
+# 8. People Counting must not bypass the shared inference semaphore.
+#
+# Confirmed live on Ryzen (2026-09-22, real Living Room walk-test):
+# people_counting_worker() called detect_objects_frame() -- the exact
+# same appliance-wide YOLO call ai_person_detector() already wraps in
+# ai_inference_semaphore -- WITHOUT acquiring that semaphore itself. Over
+# one real ~7-minute test, people_counting_worker() ran 215 detect_
+# objects_frame() cycles on Living Room while ai_person_detector()'s own
+# qualifying scans for that SAME camera (the path facial recognition/
+# PPE/LPR all depend on) dropped to 2 -- not a matcher/confidence
+# problem, the person-detection scan those features depend on was
+# starved by unsynchronized contention on the one shared YOLO model.
+# Fixed by wrapping people_counting_worker()'s own detect_objects_frame()
+# call in the same ai_inference_semaphore. This does not touch People
+# Counting's geometry/rule, the tracker's matching tolerance, facial-
+# recognition thresholds, or detect_objects_frame()'s own per-call cost
+# (see docs/people-counting-sampling-rate-gap-report.md for that
+# separate, still-open gap) -- only the missing lock acquisition.
+# ---------------------------------------------------------------------------
+
+def test_people_counting_and_ai_person_detector_cannot_run_inference_concurrently(monkeypatch):
+    camera_number = 1
+    monkeypatch.setattr(main, "AI_DETECTOR_STARTUP_STAGGER_SECONDS", 0)
+    monkeypatch.setattr(main, "AI_DETECTION_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(main, "PEOPLE_COUNTING_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(main, "cv2", object())
+    monkeypatch.setattr(main, "YOLO", object())
+    monkeypatch.setattr(main, "get_yolo_model", lambda: object())
+    monkeypatch.setitem(main.ai_detection_state, camera_number, {})
+    monkeypatch.setitem(main.ai_person_last_event, camera_number, 0.0)
+
+    monkeypatch.setattr(
+        main.recording_uploader, "_camera_identity",
+        lambda cam: {"people_counting_enabled": True},
+    )
+    monkeypatch.setattr(
+        main, "_load_people_counting_rule",
+        lambda cam: {
+            "id": "rule-1", "name": "test line", "direction": "both",
+            "geometry": [{"x": 0.0, "y": 0.5}, {"x": 1.0, "y": 0.5}],
+        },
+    )
+    monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
+    monkeypatch.setattr(main, "_people_counting_state_save", lambda cam, counter: None)
+    monkeypatch.setattr(main, "append_analytics_event", lambda event: None)
+    monkeypatch.setattr(main, "save_yolo_events", lambda cam, result: [])
+
+    call_count = {"n": 0}
+    concurrent_count = {"n": 0}
+    max_concurrent = {"n": 0}
+    count_lock = threading.Lock()
+
+    def fake_detect(cam):
+        with count_lock:
+            call_count["n"] += 1
+            concurrent_count["n"] += 1
+            max_concurrent["n"] = max(max_concurrent["n"], concurrent_count["n"])
+        time.sleep(0.03)  # a short, fake "inference" -- wide enough for a real race to manifest
+        with count_lock:
+            concurrent_count["n"] -= 1
+        return {"ok": True, "error": None, "detections": []}
+
+    monkeypatch.setattr(main, "detect_objects_frame", fake_detect)
+
+    async def scenario():
+        tasks = [
+            asyncio.create_task(main.ai_person_detector(camera_number)),
+            asyncio.create_task(main.people_counting_worker(camera_number)),
+        ]
+        deadline = time.monotonic() + 3.0
+        while call_count["n"] < 20 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert call_count["n"] >= 20, f"expected at least 20 detect_objects_frame() calls, got {call_count['n']}"
+    assert max_concurrent["n"] == 1, (
+        f"people_counting_worker() and ai_person_detector() ran detect_objects_frame() "
+        f"concurrently -- observed {max_concurrent['n']} at once, expected the shared "
+        f"ai_inference_semaphore to always cap this at 1"
+    )
+    assert main.ai_inference_semaphore._value == 1, "semaphore must be fully released after both tasks stop"

@@ -38221,7 +38221,29 @@ async def people_counting_worker(camera_number: int) -> None:
                 if debug:
                     print(f"[PeopleCountingDebug][cam{camera_number}] line_in_use x1={line.x1:.4f} y1={line.y1:.4f} x2={line.x2:.4f} y2={line.y2:.4f} direction={line.direction}")
 
-                result = await asyncio.to_thread(detect_objects_frame, camera_number)
+                # 2026-09-22: acquires the SAME ai_inference_semaphore
+                # ai_person_detector() already wraps its own identical
+                # detect_objects_frame() call with -- confirmed live on
+                # Ryzen that this call site never did, so this worker's
+                # own detect_objects_frame() calls could run fully
+                # concurrently with (not queued behind) ai_person_
+                # detector()'s calls for this SAME camera and every
+                # other camera, all contending for the one shared YOLO
+                # model. Measured directly: over one ~7-minute Living
+                # Room walk-test, this worker ran 215 detect_objects_
+                # frame() cycles while ai_person_detector()'s own
+                # qualifying scans for the same camera -- the path
+                # facial recognition/PPE/LPR all depend on -- dropped to
+                # 2. Not a matcher/threshold problem; the person-
+                # detection scan those features depend on was starved
+                # almost entirely. This fix only adds the missing lock
+                # acquisition -- it does not touch detect_objects_
+                # frame()'s own per-call cost (see docs/people-counting-
+                # sampling-rate-gap-report.md for that separate, still-
+                # open gap), the counting line/geometry, or the
+                # tracker's matching tolerance.
+                async with ai_inference_semaphore:
+                    result = await asyncio.to_thread(detect_objects_frame, camera_number)
                 if debug:
                     print(f"[PeopleCountingDebug][cam{camera_number}] detect_objects_frame ok={result.get('ok')} error={result.get('error')} raw_detections={len(result.get('detections', []))}")
                 if result.get("ok"):
