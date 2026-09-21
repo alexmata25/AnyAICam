@@ -365,3 +365,113 @@ def test_heartbeat_keeps_ticking_during_clip_build(monkeypatch, _isolated_clip_p
         f"heartbeat only ticked {ticks_during_probe} times while the clip "
         f"was being built -- the event loop appears to have been blocked"
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Event mode: build_motion_event_clip() races persist_event_recording()
+#    for the same covering file (confirmed live on Front Door's very first
+#    post-switch motion event, 2026-09-21). A single check can lose this
+#    race by construction -- persist_event_recording() needs strictly more
+#    wall-clock time after waking (lock, ffmpeg concat, atomic rename)
+#    before its file exists. A short, bounded retry (Event mode only)
+#    re-globs and picks the file up once that rename lands.
+# ---------------------------------------------------------------------------
+
+def test_event_mode_retries_and_recovers_once_the_racing_file_appears(monkeypatch, _isolated_clip_paths):
+    recordings = _isolated_clip_paths["recordings"]
+    event_time = datetime(2026, 9, 21, 1, 4, 0)
+
+    monkeypatch.setattr(
+        main, "_local_recording_settings",
+        lambda camera_number: {"mode": "event", "pre_roll_seconds": 5, "post_roll_seconds": 5,
+                                "merge_gap_seconds": 10, "max_event_seconds": 300},
+    )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) == 2:
+            # Simulate persist_event_recording()'s concurrent concat+rename
+            # landing right after the first retry's wait.
+            _make_recording(recordings, 5, event_time - timedelta(seconds=10))
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main.subprocess, "run", _fake_ffprobe_factory([], {}))
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        from pathlib import Path as _Path
+
+        _Path(cmd[-1]).write_bytes(b"fake mp4 bytes")
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = asyncio.run(
+        main.build_motion_event_clip("evt-event-mode-race", 5, event_time, event_time)
+    )
+
+    assert result is not None, "should recover once the racing file appears on retry"
+    # sleep_calls[0] is the pre-existing initial post-roll wait (its exact
+    # value depends on the real wall clock vs. this fixed event_time, so
+    # it is not asserted here); exactly one 2.0s retry wait follows before
+    # the racing file is found and the loop breaks.
+    assert sleep_calls[1:] == [2.0]
+
+
+def test_continuous_mode_does_not_retry_when_nothing_covers_the_window(monkeypatch, _isolated_clip_paths):
+    event_time = datetime(2026, 9, 21, 2, 0, 0)
+
+    monkeypatch.setattr(
+        main, "_local_recording_settings",
+        lambda camera_number: {"mode": "continuous", "pre_roll_seconds": 5, "post_roll_seconds": 5,
+                                "merge_gap_seconds": 10, "max_event_seconds": 300},
+    )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main.subprocess, "run", _fake_ffprobe_factory([], {}))
+
+    result = asyncio.run(
+        main.build_motion_event_clip("evt-continuous-no-cover", 1, event_time, event_time)
+    )
+
+    assert result is None
+    assert len(sleep_calls) == 1, "no covering file and Continuous mode: must not enter the Event-mode retry loop"
+
+
+def test_event_mode_gives_up_after_bounded_retries_if_file_never_appears(monkeypatch, _isolated_clip_paths):
+    event_time = datetime(2026, 9, 21, 3, 0, 0)
+
+    monkeypatch.setattr(
+        main, "_local_recording_settings",
+        lambda camera_number: {"mode": "event", "pre_roll_seconds": 5, "post_roll_seconds": 5,
+                                "merge_gap_seconds": 10, "max_event_seconds": 300},
+    )
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main.subprocess, "run", _fake_ffprobe_factory([], {}))
+
+    result = asyncio.run(
+        main.build_motion_event_clip("evt-event-mode-never-appears", 3, event_time, event_time)
+    )
+
+    assert result is None
+    # Initial wait + exactly 4 bounded retry waits -- never an unbounded loop.
+    assert sleep_calls[1:] == [2.0, 2.0, 2.0, 2.0]

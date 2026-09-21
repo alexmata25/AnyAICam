@@ -34338,20 +34338,50 @@ async def build_motion_event_clip(
     earliest_start = window.start - timedelta(
         seconds=RECORDING_SEGMENT_SECONDS * 2
     )
-    shortlist: list[tuple[datetime, Path]] = []
-    for source in sorted(camera_folder.glob("*.mkv")):
-        source_start = recording_start(source, camera_number)
-        if source_start is None:
-            continue
-        if source_start > window.end:
-            continue
-        if source_start < earliest_start:
-            continue
-        shortlist.append((source_start, source))
+
+    def _shortlist() -> list[tuple[datetime, Path]]:
+        result: list[tuple[datetime, Path]] = []
+        for source in sorted(camera_folder.glob("*.mkv")):
+            source_start = recording_start(source, camera_number)
+            if source_start is None:
+                continue
+            if source_start > window.end:
+                continue
+            if source_start < earliest_start:
+                continue
+            result.append((source_start, source))
+        return result
 
     candidates = await asyncio.to_thread(
-        _probe_motion_clip_candidates, shortlist, window.start, window.end
+        _probe_motion_clip_candidates, _shortlist(), window.start, window.end
     )
+
+    # Event mode (2026-09-21): for a Continuous-mode camera the covering
+    # segment is a single long-lived ffmpeg process writing continuously
+    # for RECORDING_SEGMENT_SECONDS, so it is always present and readable
+    # (if mid-write, _probe_motion_clip_candidates()'s own mtime<=30s
+    # fallback above covers it) by the time this wait ends. Event mode
+    # has no such continuously-growing file: persist_event_recording()
+    # (scheduled independently, alongside this function, from the same
+    # detection) creates the covering file ATOMICALLY via its own
+    # concat-then-rename, only once its own wait+ffmpeg-concat finishes.
+    # Both functions target the same window.end, but persist_event_
+    # recording() needs strictly more wall-clock time after waking
+    # (acquire lock, run ffmpeg concat, rename) before that file exists,
+    # so a plain single check here loses this race by construction, not
+    # by chance -- confirmed live on Front Door's very first post-switch
+    # event, which had no older completed Event-mode file to fall back
+    # on. Retried, briefly and only in Event mode, rather than widening
+    # the single wait: retrying re-globs, so it picks up exactly that
+    # file once persist_event_recording()'s rename lands.
+    if not candidates and (await asyncio.to_thread(_local_recording_settings, camera_number))["mode"] == "event":
+        for _ in range(4):
+            await asyncio.sleep(2.0)
+            candidates = await asyncio.to_thread(
+                _probe_motion_clip_candidates, _shortlist(), window.start, window.end
+            )
+            if candidates:
+                break
 
     if not candidates:
         print(

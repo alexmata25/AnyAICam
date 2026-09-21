@@ -388,8 +388,8 @@ def test_ai_classified_detection_also_persists_an_event_recording_when_camera_is
 
     persisted = []
 
-    async def fake_persist_event_recording(camera_number, start, end):
-        persisted.append((camera_number, start, end))
+    async def fake_persist_event_recording(camera_number, start, end, *, detector=None, trigger_id=None):
+        persisted.append((camera_number, start, end, detector, trigger_id))
 
     monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
 
@@ -398,6 +398,10 @@ def test_ai_classified_detection_also_persists_an_event_recording_when_camera_is
     assert _wait_until(lambda: len(persisted) == 1), \
         "persist_event_recording() must actually be scheduled and run on the background loop"
     assert persisted[0][0] == 170
+    # 2026-09-21 observability fix: the AI/YOLO path must identify itself
+    # as such, distinctly from the basic-motion path's "basic_motion".
+    assert persisted[0][3] == "ai_detection"
+    assert persisted[0][4] is not None
 
 
 def test_ai_classified_detection_does_not_persist_a_recording_for_a_continuous_mode_camera(
@@ -417,7 +421,7 @@ def test_ai_classified_detection_does_not_persist_a_recording_for_a_continuous_m
 
     persisted = []
 
-    async def fake_persist_event_recording(camera_number, start, end):
+    async def fake_persist_event_recording(camera_number, start, end, *, detector=None, trigger_id=None):
         persisted.append((camera_number, start, end))
 
     monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
