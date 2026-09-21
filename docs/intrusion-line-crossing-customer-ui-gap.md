@@ -5,6 +5,46 @@ validation, per explicit instruction not to use `/sites-management` or
 any legacy static-JSON page and not to fabricate or restore the old
 admin Live view.
 
+## Second finding, added after further investigation: "intrusion" (zone) has NO backend implementation at all -- only "line_crossing" is real
+
+Checked every reference to `analytic_type=="intrusion"`/`"intrusion"`
+across `main.py`: every single one is UI plumbing -- a dropdown option,
+a filter-lane label, an event-type string in a select box (Events/
+Investigate filters, notification-preference options, the rule-builder
+page itself). There is no backend consumer anywhere that reads an
+`intrusion`-type `AnalyticsRuleModel` row and evaluates it against real
+detections, unlike `line_crossing`, whose one real consumer is
+`_load_people_counting_rule()`/`people_counting_worker()` -- confirmed
+working end-to-end earlier tonight (see the People Counting validation
+turns and `docs/people-counting-sampling-rate-gap-report.md`).
+
+In other words: **"Line Crossing" is not a separate analytic from
+People Counting -- it is the exact same feature, same rule storage,
+same worker.** There is no additional "line crossing" engine to
+validate beyond what People Counting's own validation already covered.
+"Intrusion" (a drawn zone, 3+ points) is unimplemented on the backend
+entirely -- an admin can draw and save an intrusion rule via the
+partner-only rule builder, but nothing ever reads it back for real
+detection. This matches the "Coming soon" / mock-banner findings above;
+it is not a new, separate defect, and it should not be reported as a
+runtime bug -- there is no runtime path to be buggy in.
+
+Per standing instruction not to request a physical test overnight:
+line-crossing's algorithmic correctness (exactly-once crossing count,
+reverse-direction handling, no duplicate counts while lingering near
+the line) is already proven by `people_counting.py`'s own 26+
+deterministic unit tests (`tests/test_people_counting.py`), and the
+integration-level pieces (rule loading, event/timestamp/camera
+association, thumbnail, `linked_recording_for()`-based clip linkage) are
+the same code paths already validated tonight for every other analytic
+event type on this appliance. What remains genuinely unverified is a
+live, physical crossing producing a real counted event on Living
+Room -- the one People Counting walk-test window tonight was spent
+proving/fixing the semaphore-starvation bug and testing facial
+recognition instead, and produced zero real `people_counting_in`/`_out`
+events. That live confirmation is the correct next daytime/physical-test
+item, not a new "intrusion" test.
+
 ## Finding: confirmed -- no multi-tenant customer drawing UI exists
 
 The only functional rule-drawing UI in this codebase is
