@@ -38262,6 +38262,33 @@ async def people_counting_worker(camera_number: int) -> None:
                         events = counter.update(centroids)
                     if events:
                         now = datetime.now()
+                        # 2026-09-22: thumbnail was unconditionally None --
+                        # confirmed by code inspection, the only analytics
+                        # event type in this codebase with no image at all
+                        # (motion/person/car/ppe/plate/facial all save one).
+                        # The frame this cycle's crossing was decided from
+                        # is already in hand (`frame`, used just above for
+                        # centroid extraction) -- saved once per cycle and
+                        # reused for every event this cycle, exactly the
+                        # same one-frame-per-batch shape save_yolo_events()
+                        # already uses for its own thumbnail.
+                        thumbnail_url = None
+                        if frame is not None:
+                            try:
+                                day_folder = AI_THUMBNAILS_FOLDER / now.strftime("%Y-%m-%d")
+                                day_folder.mkdir(parents=True, exist_ok=True)
+                                thumbnail_filename = (
+                                    f"camera{camera_number}_{now.strftime('%H-%M-%S')}_"
+                                    f"people_counting_{uuid.uuid4().hex[:12]}.jpg"
+                                )
+                                thumbnail_path = day_folder / thumbnail_filename
+                                if cv2.imwrite(str(thumbnail_path), frame):
+                                    thumbnail_url = (
+                                        f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
+                                        f"{quote(thumbnail_filename)}"
+                                    )
+                            except Exception as error:
+                                print(f"Camera {camera_number} People Counting thumbnail save skipped (non-fatal): {error}")
                         for event in events:
                             record = AnalyticsEventModel(
                                 camera=camera_number,
@@ -38270,7 +38297,7 @@ async def people_counting_worker(camera_number: int) -> None:
                                 event_type=f"people_counting_{event.direction}",
                                 direction=event.direction,
                                 confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
-                                thumbnail=None,
+                                thumbnail=thumbnail_url,
                                 linked_recording=linked_recording_for(camera_number, now),
                                 mock=False,
                             ).model_dump(mode="json")
