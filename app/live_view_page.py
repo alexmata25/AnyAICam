@@ -934,15 +934,28 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     stopPolling(id);
     destroyHls(id);  // guards against ever running two instances at once
     setStatus(id,'Connecting…');
+    // Black-tile fix (2026-09-21): the placeholder used to be hidden on
+    // MANIFEST_PARSED/loadedmetadata -- both fire once the PLAYLIST is
+    // parsed, well before any frame has actually decoded, exposing the
+    // <video> element's own default black background for however long
+    // the first segment takes to download and decode (worse under
+    // Event-mode's irregular segment cadence, where the live edge can
+    // sit several seconds behind). 'playing' is the one standard
+    // HTMLMediaElement event that only ever fires once a real frame is
+    // genuinely visible, regardless of transport (HLS.js, native HLS,
+    // or a WebRTC srcObject below) -- {{once:true}} so a reconnect's
+    // fresh attachPlayer() call never piles up a second listener on
+    // this same persistent <video> element.
+    tile.video.addEventListener('playing',()=>{{tile.placeholder.hidden=true}},{{once:true}});
     if(window.Hls&&Hls.isSupported()){{
       tile.hls=new Hls();
       tile.hls.loadSource(playlistUrl);
       tile.hls.attachMedia(tile.video);
-      tile.hls.on(Hls.Events.MANIFEST_PARSED,()=>{{tile.placeholder.hidden=true;tile.recoveryAttempts=0;tile.video.play().catch(()=>{{}})}});
+      tile.hls.on(Hls.Events.MANIFEST_PARSED,()=>{{tile.recoveryAttempts=0;tile.video.play().catch(()=>{{}})}});
       tile.hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(id,data)}});
     }}else if(tile.video.canPlayType('application/vnd.apple.mpegurl')){{
       tile.video.src=playlistUrl;
-      tile.video.addEventListener('loadedmetadata',()=>{{tile.placeholder.hidden=true;tile.video.play().catch(()=>{{}})}});
+      tile.video.addEventListener('loadedmetadata',()=>{{tile.video.play().catch(()=>{{}})}});
     }}else{{
       setStatus(id,'This browser cannot play live video.');
     }}
@@ -956,9 +969,9 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       const claim=claimTransport(id,'p2p');
       if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
       stopPolling(id);
+      tile.video.addEventListener('playing',()=>{{tile.placeholder.hidden=true}},{{once:true}});
       tile.video.srcObject=result.stream;
       tile.p2pConnection=result.pc;
-      tile.placeholder.hidden=true;
       tile.video.play().catch(()=>{{}});
       if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
     }}).catch(()=>{{
@@ -1431,15 +1444,22 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     stopPolling();
     destroyHls();  // guards against ever running two instances at once
     setStatus('Connecting…');
+    // Black-tile fix (2026-09-21): see the grid page's own attachPlayer()
+    // for the full root-cause comment -- MANIFEST_PARSED/loadedmetadata
+    // fire once the playlist is parsed, well before any frame has
+    // decoded, exposing the <video> element's own default black
+    // background. 'playing' only ever fires once a real frame is
+    // genuinely visible.
+    video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
     if(window.Hls&&Hls.isSupported()){{
       hls=new Hls();
       hls.loadSource(url);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{placeholder.hidden=true;recoveryAttempts=0;video.play().catch(()=>{{}})}});
+      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{recoveryAttempts=0;video.play().catch(()=>{{}})}});
       hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(data)}});
     }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
       video.src=url;
-      video.addEventListener('loadedmetadata',()=>{{placeholder.hidden=true;video.play().catch(()=>{{}})}});
+      video.addEventListener('loadedmetadata',()=>{{video.play().catch(()=>{{}})}});
     }}else{{
       setStatus('This browser cannot play live video.');
     }}
@@ -1452,9 +1472,9 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       const claim=claimTransport('p2p');
       if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
       stopPolling();
+      video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
       video.srcObject=result.stream;
       p2pConnection=result.pc;
-      placeholder.hidden=true;
       video.play().catch(()=>{{}});
       if(claim==='claimed')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
     }}).catch(()=>{{
