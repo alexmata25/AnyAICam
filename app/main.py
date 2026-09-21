@@ -73873,6 +73873,44 @@ def dashboard(request: Request) -> str:
         )
         for camera_number in _dashboard_camera_numbers
     }
+    # Recording stat (2026-09-21 fix): this used to be the literal string
+    # "Continuous", never read from any camera row -- confirmed live on
+    # Ryzen: every one of that customer's 5 cameras is genuinely running
+    # local_recording_mode="event" (writing to _event_buffer/), so the
+    # dashboard's own system-summary stat was flatly wrong for exactly
+    # the deployment it was supposed to describe. Reuses the SAME
+    # default-is-"continuous"/only-"event"-if-the-column-says-so
+    # interpretation _local_recording_settings_for_camera() (this file's
+    # own canonical reader of this column, used by the actual recording
+    # pipeline) already establishes -- never a second, possibly-diverging
+    # convention. A real customer session with a real mix of modes across
+    # cameras reports "Mixed" rather than silently picking one; a
+    # customer with zero real cameras yet reports "--", never a guess.
+    # The non-customer/legacy branch (staff/mock dashboard views, no
+    # per-customer camera_id to scope a query by) keeps the pre-existing
+    # "Continuous" literal -- out of scope for this fix, which is about
+    # a real customer's Dashboard reflecting a real appliance's config.
+    if _dashboard_camera_ids_by_number:
+        from partner_db import connection
+        with connection() as db:
+            _dashboard_recording_mode_rows = db.execute(
+                f"SELECT local_recording_mode FROM cameras WHERE id IN ({','.join('?' for _ in _dashboard_camera_ids_by_number)})",
+                tuple(_dashboard_camera_ids_by_number.values()),
+            ).fetchall()
+        _dashboard_recording_modes = {
+            "event" if row["local_recording_mode"] == "event" else "continuous"
+            for row in _dashboard_recording_mode_rows
+        }
+        if _dashboard_recording_modes == {"event"}:
+            _dashboard_recording_stat = "Event"
+        elif _dashboard_recording_modes == {"continuous"}:
+            _dashboard_recording_stat = "Continuous"
+        else:
+            _dashboard_recording_stat = "Mixed"
+    elif _customer_dashboard_cameras is not None:
+        _dashboard_recording_stat = "—"
+    else:
+        _dashboard_recording_stat = "Continuous"
 
 
 
@@ -74790,7 +74828,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="stat"><span class="stat-label">Recording</span><span class="stat-value">Continuous</span></div>
+        <div class="stat"><span class="stat-label">Recording</span><span class="stat-value">{_dashboard_recording_stat}</span></div>
 
 
 
