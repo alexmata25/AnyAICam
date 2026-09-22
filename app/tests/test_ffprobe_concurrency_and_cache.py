@@ -28,6 +28,20 @@ Two changes, both scoped to _probe_motion_clip_candidates():
      Only a real, final duration is ever cached -- the N/A ("still being
      actively written") case is deliberately never cached, matching the
      existing semantics for an in-progress file exactly.
+
+Second occurrence, found live minutes after deploying the fix above:
+_probe_recording_duration_seconds() (used by _catalog_local_recordings_
+for_camera(), reachable synchronously from the customer-facing GET
+/api/customer/recordings/{camera_id} route) is a SEPARATE ffprobe call
+site -- confirmed live on Ryzen, 4 concurrent ffprobe processes were
+observed with FFPROBE_MAX_CONCURRENCY already deployed and correctly
+bounding _probe_motion_clip_candidates() alone. A Playback/Events
+request landing while several cameras each have a small backlog of
+undiscovered local files can launch one real ffprobe subprocess per
+file with no bound of its own. Fixed by reusing the SAME appliance-wide
+_ffprobe_semaphore/_ffprobe_duration_cache this function already
+established, rather than a second, independent bound -- there is only
+one real appliance-wide ffprobe-concurrency budget to protect.
 """
 import subprocess
 import threading
@@ -246,3 +260,154 @@ def test_full_build_motion_event_clip_still_works_with_the_semaphore_and_cache(m
     )
 
     assert result == "/recordings/clips/motion/motion_evt-ffprobe-fix-sanity.mp4"
+
+
+# --------------------------- _probe_recording_duration_seconds() (second call site)
+
+
+def test_recording_duration_probe_shares_the_same_semaphore(monkeypatch, tmp_path):
+    """The real second occurrence: this is a SEPARATE ffprobe call site
+    from _probe_motion_clip_candidates()'s own, reachable independently
+    from the customer-facing recordings-catalog path. It must be bound
+    by the SAME appliance-wide semaphore, not left unprotected."""
+    monkeypatch.setattr(main, "FFPROBE_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(main, "_ffprobe_semaphore", threading.Semaphore(1))
+    monkeypatch.setattr(main, "_ffprobe_duration_cache", {})
+
+    lock = threading.Lock()
+    state = {"current": 0, "max_seen": 0}
+
+    def fake_run(cmd, **kwargs):
+        with lock:
+            state["current"] += 1
+            state["max_seen"] = max(state["max_seen"], state["current"])
+        time.sleep(0.05)
+        with lock:
+            state["current"] -= 1
+
+        class _Result:
+            stdout = "18.500000"
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    paths = [_make_recording(tmp_path, name=f"camera1_2026-09-22_00-1{i}-00.mkv") for i in range(5)]
+    threads = [
+        threading.Thread(target=main._probe_recording_duration_seconds, args=(path,))
+        for path in paths
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert state["max_seen"] == 1, (
+        f"expected at most 1 concurrent ffprobe subprocess from the recording-catalog "
+        f"probe path, observed {state['max_seen']} at once"
+    )
+
+
+def test_recording_duration_probe_and_motion_clip_probe_share_one_budget_not_two(monkeypatch, tmp_path):
+    """The real bug this whole fix closes: two DIFFERENT call sites
+    (the catalog path and the motion-clip-candidate path) must draw
+    from the SAME concurrency budget, not each get their own -- 4
+    concurrent ffprobe processes were observed live even with the
+    first fix alone deployed, precisely because this second call site
+    had an independent, unbounded path."""
+    monkeypatch.setattr(main, "FFPROBE_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(main, "_ffprobe_semaphore", threading.Semaphore(1))
+    monkeypatch.setattr(main, "_ffprobe_duration_cache", {})
+
+    lock = threading.Lock()
+    state = {"current": 0, "max_seen": 0}
+
+    def fake_run(cmd, **kwargs):
+        with lock:
+            state["current"] += 1
+            state["max_seen"] = max(state["max_seen"], state["current"])
+        time.sleep(0.05)
+        with lock:
+            state["current"] -= 1
+
+        class _Result:
+            stdout = "300.000000"
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    now = main.datetime(2026, 9, 22, 0, 20, 0)
+    catalog_path = _make_recording(tmp_path, name="camera1_2026-09-22_00-20-00.mkv")
+    clip_path = _make_recording(tmp_path, name="camera1_2026-09-22_00-21-00.mkv")
+
+    threads = [
+        threading.Thread(target=main._probe_recording_duration_seconds, args=(catalog_path,)),
+        threading.Thread(
+            target=main._probe_motion_clip_candidates,
+            args=([(now, clip_path)], now, now),
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert state["max_seen"] == 1, (
+        f"the catalog probe and the motion-clip probe must share ONE concurrency budget, "
+        f"observed {state['max_seen']} concurrent ffprobe subprocesses across both call sites"
+    )
+
+
+def test_recording_duration_probe_uses_the_shared_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "_ffprobe_duration_cache", {})
+    path = _make_recording(tmp_path)
+
+    call_log = []
+
+    def fake_run(cmd, **kwargs):
+        call_log.append(cmd[-1])
+
+        class _Result:
+            stdout = "18.500000"
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    first = main._probe_recording_duration_seconds(path)
+    second = main._probe_recording_duration_seconds(path)
+
+    assert len(call_log) == 1, "a second probe of the same (path, mtime) must be served from cache"
+    assert first == second == 18.5
+
+
+def test_recording_duration_probe_populates_the_cache_for_a_later_motion_clip_probe(monkeypatch, tmp_path):
+    """Cross-call-site cache reuse: a file already cataloged (probed via
+    the recordings route) must not be re-probed a second time just
+    because a motion event later wants to consider it as a clip
+    candidate for the SAME still-unmodified file."""
+    monkeypatch.setattr(main, "_ffprobe_duration_cache", {})
+    now = main.datetime(2026, 9, 22, 0, 25, 0)
+    path = _make_recording(tmp_path, name="camera1_2026-09-22_00-25-00.mkv")
+
+    call_log = []
+
+    def fake_run(cmd, **kwargs):
+        call_log.append(cmd[-1])
+
+        class _Result:
+            stdout = "300.000000"
+            returncode = 0
+
+        return _Result()
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    main._probe_recording_duration_seconds(path)
+    main._probe_motion_clip_candidates([(now, path)], now, now)
+
+    assert len(call_log) == 1, "the motion-clip probe must reuse the catalog probe's already-cached duration"

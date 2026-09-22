@@ -141937,17 +141937,45 @@ def _probe_recording_duration_seconds(path: Path) -> float | None:
     invocation shape as _probe_motion_clip_candidates() above, but for
     exactly one already-completed file rather than a shortlist being
     matched against an event window. Never raises -- returns None on
-    any failure so the caller can fall back to a documented default."""
+    any failure so the caller can fall back to a documented default.
+
+    2026-09-22 (second occurrence of the same restart-loop trigger,
+    found live minutes after deploying the first fix): this function is
+    a SEPARATE ffprobe call site from _probe_motion_clip_candidates()'s
+    own -- confirmed live, 4 concurrent ffprobe processes were observed
+    on Ryzen with FFPROBE_MAX_CONCURRENCY already deployed and correctly
+    limiting THAT function alone. _catalog_local_recordings_for_camera()
+    -- reachable synchronously from the customer-facing GET /api/
+    customer/recordings/{camera_id} route -- calls this once per newly-
+    discovered local file, with no bound of its own; a Playback/Events
+    request landing while several cameras each have a backlog of a few
+    undiscovered files can launch a real burst of concurrent subprocesses.
+    Reuses the SAME appliance-wide _ffprobe_semaphore/_ffprobe_duration_
+    cache _probe_motion_clip_candidates() already established, rather
+    than a second, independent bound -- there is only one real
+    appliance-wide ffprobe-concurrency budget to protect, not one per
+    call site."""
     try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
-            capture_output=True, text=True, timeout=15, check=False,
-        )
+        cache_key = (str(path), path.stat().st_mtime)
+        with _ffprobe_duration_cache_lock:
+            cached_duration = _ffprobe_duration_cache.get(cache_key)
+        if cached_duration is not None:
+            return cached_duration
+
+        with _ffprobe_semaphore:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
         duration_text = probe.stdout.strip()
         if not duration_text or duration_text.upper() == "N/A":
             return None
         duration = float(duration_text)
-        return duration if duration > 0 else None
+        if duration <= 0:
+            return None
+        with _ffprobe_duration_cache_lock:
+            _ffprobe_duration_cache[cache_key] = duration
+        return duration
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
 
