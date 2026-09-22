@@ -141924,6 +141924,7 @@ def _row_to_recording_metadata(row: dict) -> dict:
         "start": row["started_at"],
         "end": row["ended_at"],
         "name": row["s3_key"].rsplit("/", 1)[-1],
+        "kind": "recording",
     }
 
 
@@ -142300,11 +142301,71 @@ def _recordings_overlapping_utc_range(camera_id: str, query_start: str, query_en
     return [_row_to_recording_metadata(row) for row in rows]
 
 
+def _event_clips_overlapping_utc_range(camera_id: str, query_start: str, query_end: str) -> list[dict]:
+    """Current Event-mode clips (detection_event_media, joined to their
+    owning detection_events row for camera_id scoping and event_type)
+    overlapping a naive-UTC [query_start, query_end) range, ordered
+    oldest-first -- the Event-mode counterpart of
+    _recordings_overlapping_utc_range() above, sharing its exact
+    interval-overlap semantics and (id, start, end, name) row shape so
+    Playback's date-mode clip list and timeline can merge the two
+    without caring which pipeline produced a given item.
+
+    Deliberately reads detection_event_media directly rather than
+    copying rows into the legacy `recordings` table: a Hybrid/Event-
+    mode camera's cloud_recording_mode is never read, written, or
+    otherwise touched here (see recording_uploader.py's own
+    cloud_recording_mode gate) -- this function only ever surfaces
+    clips that already exist under a camera's own detection_events,
+    it never changes what gets uploaded or how.
+
+    Only clips that already have real media (a non-empty s3_key) are
+    returned -- an event still "Processing…"/"Not ready yet" has
+    nothing playable yet and is left out entirely, matching this
+    file's established "honest-empty beats broken-link" convention."""
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT de.id AS event_id, de.event_type, dem.started_at, dem.ended_at "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.camera_id=? AND length(dem.s3_key)>0 "
+            "AND dem.started_at<? AND dem.ended_at>? "
+            "ORDER BY dem.started_at ASC",
+            (camera_id, query_end, query_start),
+        ).fetchall()
+    return [
+        {
+            "id": row["event_id"],
+            "start": row["started_at"],
+            "end": row["ended_at"],
+            "name": f'{str(row["event_type"]).replace("_", " ").title()} event clip',
+            "kind": "event_clip",
+        }
+        for row in rows
+    ]
+
+
+def _playback_items_overlapping_utc_range(camera_id: str, query_start: str, query_end: str) -> list[dict]:
+    """Union of legacy continuous recordings and current Event-mode
+    clips overlapping a UTC range, merged and sorted oldest-first --
+    lets Playback's date-mode view show both recording generations for
+    a camera together (a camera with old continuous history and newer
+    Event-mode activity shows both). Purely a read-side merge of two
+    already-independent tables/pipelines: it never writes into either
+    one, and never touches a camera's configured recording mode."""
+    items = _recordings_overlapping_utc_range(camera_id, query_start, query_end)
+    items += _event_clips_overlapping_utc_range(camera_id, query_start, query_end)
+    items.sort(key=lambda item: item["start"])
+    return items
+
+
 def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
-    """All available recordings for one customer camera that overlap a
-    given customer-local calendar date, ordered oldest-first --
-    chronological order so a future continuous-playback phase can
-    chain adjacent segments directly off this list without re-sorting.
+    """All available recordings and Event-mode clips for one customer
+    camera that overlap a given customer-local calendar date, ordered
+    oldest-first -- chronological order so a future continuous-playback
+    phase can chain adjacent segments directly off this list without
+    re-sorting.
 
     Fallback path only, for a caller that sends `date` alone (an older
     client, or a direct API call) -- bounds are computed via the fixed
@@ -142317,16 +142378,48 @@ def _customer_recordings_for_date(camera_id: str, date: str) -> list[dict]:
     _catalog_local_recordings_for_camera(camera_id)
 
     query_start, query_end = _local_date_bounds_to_utc(date)
-    return _recordings_overlapping_utc_range(camera_id, query_start, query_end)
+    return _playback_items_overlapping_utc_range(camera_id, query_start, query_end)
+
+
+def _customer_event_clip_dates(camera_id: str) -> set[str]:
+    """Every customer-local calendar date this camera has at least one
+    playable Event-mode clip for -- the Event-mode counterpart of the
+    date-collection loop inside _customer_recording_dates(), same
+    UTC-to-APPLIANCE_TIMEZONE conversion and same span-both-days-a-clip-
+    overlaps-midnight semantics, kept as its own small set so
+    _customer_recording_dates() can union it in without duplicating
+    this loop."""
+    from partner_db import connection
+    with connection() as db:
+        rows = db.execute(
+            "SELECT dem.started_at, dem.ended_at "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.camera_id=? AND length(dem.s3_key)>0",
+            (camera_id,),
+        ).fetchall()
+
+    utc_zone = ZoneInfo("UTC")
+    dates: set[str] = set()
+    for row in rows:
+        try:
+            start = datetime.fromisoformat(row["started_at"]).replace(tzinfo=utc_zone)
+            end = datetime.fromisoformat(row["ended_at"]).replace(tzinfo=utc_zone)
+        except ValueError:
+            continue
+        dates.add(start.astimezone(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d"))
+        dates.add(end.astimezone(APPLIANCE_TIMEZONE).strftime("%Y-%m-%d"))
+    return dates
 
 
 def _customer_recording_dates(camera_id: str) -> list[str]:
     """Every customer-local calendar date (YYYY-MM-DD) this camera has
-    at least one available recording for -- powers the Playback
-    calendar's "which days have footage" indication, without the
-    browser ever scanning video files itself. A recording spanning
-    local midnight contributes both dates it actually overlaps,
-    matching _customer_recordings_for_date()'s own overlap semantics.
+    at least one available recording OR playable Event-mode clip for --
+    powers the Playback calendar's "which days have footage" indication,
+    without the browser ever scanning video files itself. A recording
+    or clip spanning local midnight contributes both dates it actually
+    overlaps, matching _customer_recordings_for_date()'s own overlap
+    semantics.
 
     Deliberately computed in Python, not a bare SQL date() extraction
     on the stored (UTC) started_at column -- a naive UTC-date group-by
@@ -142335,7 +142428,15 @@ def _customer_recording_dates(camera_id: str) -> list[str]:
     (days to weeks per camera, not an unbounded history), so fetching
     every row's own two timestamps and converting each in Python is
     the smallest safe approach -- no second index, no new query
-    complexity for a rarely-called, cheap endpoint."""
+    complexity for a rarely-called, cheap endpoint.
+
+    Unions in _customer_event_clip_dates() so a camera whose
+    cloud_recording_mode is Hybrid/'motion' (continuous cloud upload
+    intentionally skipped -- see recording_uploader.py's own gate)
+    still shows the dates its current Event-mode clips actually cover,
+    alongside any older dates it has legacy continuous recordings for.
+    Neither table is written here; this is a read-only merge of two
+    independent history sources for one camera."""
     _catalog_local_recordings_for_camera(camera_id)
 
     from partner_db import connection
@@ -142358,6 +142459,7 @@ def _customer_recording_dates(camera_id: str) -> list[str]:
         end_local = end.astimezone(APPLIANCE_TIMEZONE)
         dates.add(start_local.strftime("%Y-%m-%d"))
         dates.add(end_local.strftime("%Y-%m-%d"))
+    dates |= _customer_event_clip_dates(camera_id)
     return sorted(dates)
 
 
@@ -142519,7 +142621,7 @@ def customer_recordings_metadata(camera_id: str, request: Request, before: str |
                 datetime.fromisoformat(day_end_utc)
             except ValueError:
                 raise HTTPException(status_code=400, detail="day_start_utc/day_end_utc must be ISO timestamps.")
-            return {"clips": _recordings_overlapping_utc_range(camera_id, day_start_utc, day_end_utc)}
+            return {"clips": _playback_items_overlapping_utc_range(camera_id, day_start_utc, day_end_utc)}
         return {"clips": _customer_recordings_for_date(camera_id, date)}
     # A malformed cursor must fail cleanly (400) rather than being
     # passed straight into a raw SQL text comparison, where a garbage
@@ -144047,6 +144149,20 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // the pointer's position without forcing playback (audio) to start
     // on every intermediate position crossed.
     const autoplay=!options||options.autoplay!==false;
+    // Event-mode clips (detection_event_media, merged into date-mode
+    // clip lists by _playback_items_overlapping_utc_range() server-
+    // side) are a different media identity than a legacy `recordings`
+    // row -- same reason playEventClipDeepLink() never fetches
+    // recordingMediaUrl() for one. eventPlayer already owns the whole
+    // fetch-presigned-url/play/button-state sequence for an event id
+    // (see its own onReady, which deliberately clears selectedClip);
+    // reusing it here instead of duplicating that sequence is the
+    // entire fix -- nothing else about playClip() changes for this
+    // branch.
+    if(clip.kind==='event_clip'){{
+      eventPlayer.start(cameraId,clip.id,autoplay);
+      return;
+    }}
     eventPlayer.cancel();
     placeholder.hidden=true;
     const url=recordingMediaUrl(cameraId,clip.id);
@@ -144525,19 +144641,30 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       row.className='setting-link';
       row.style.cssText='width:100%;text-align:left;border:0;cursor:pointer';
 
-      const durationMin=Math.max(
-        1,
-        Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000)
-      );
+      const isEventClip=clip.kind==='event_clip';
 
-      const thumbnailUrl=
-        `/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail`;
+      // Event-mode clips run seconds, not minutes -- rounding to
+      // whole minutes (the legacy label below) would show "1 min
+      // recording" for a real 5-10s clip, which is honest-looking but
+      // wrong. Seconds for an event clip, minutes for everything else,
+      // same interval math either way.
+      const durationLabel=isEventClip
+        ? `Event clip · ${{Math.max(1,Math.round((playbackDate(clip.end)-playbackDate(clip.start))/1000))}}s`
+        : `${{Math.max(1,Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000))}} min recording`;
+
+      // Event-mode clips are cataloged in detection_event_media, not
+      // the legacy `recordings` table clip.id points into for every
+      // other item here -- they need the events thumbnail route, not
+      // the recordings one, or this would 404 for every event clip.
+      const thumbnailUrl=isEventClip
+        ? `/api/customer/events/${{cameraId}}/${{clip.id}}/thumbnail`
+        : `/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail`;
 
       row.innerHTML=`<div style="display:flex;align-items:center;gap:14px;width:100%">
         <div style="width:160px;height:90px;border-radius:10px;background:#0b1018;flex:0 0 auto;overflow:hidden;display:grid;place-items:center">
           <img
             src="${{thumbnailUrl}}"
-            alt="Recording thumbnail"
+            alt="${{isEventClip?'Event clip thumbnail':'Recording thumbnail'}}"
             loading="lazy"
             style="width:100%;height:100%;object-fit:cover"
             onerror="window.__anyaicamThumbnailRetry(this)"
@@ -144545,7 +144672,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         </div>
         <div style="min-width:0;flex:1">
           <strong>${{playbackDate(clip.start).toLocaleString()}}</strong>
-          <div class="health-detail">${{durationMin}} min recording</div>
+          <div class="health-detail">${{durationLabel}}</div>
         </div>
         <span style="white-space:nowrap">Play →</span>
       </div>`;

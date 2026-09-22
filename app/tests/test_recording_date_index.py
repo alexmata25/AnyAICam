@@ -598,7 +598,10 @@ def test_route_returns_date_scoped_clips_when_date_is_given(db_path, tmp_path, m
         monkeypatch.setattr(main, "_customer_authorized_camera_id", lambda request, camera_id: True)
         result = main.customer_recordings_metadata(camera_id="cam-1", request=None, date="2026-08-25")
 
-    assert result == {"clips": [{"id": "rec-seg-a.mkv", "start": "2026-08-25T12:00:00", "end": "2026-08-25T12:05:00", "name": "seg-a.mkv"}]}
+    # "kind": "recording" (2026-09-22) distinguishes a legacy `recordings`
+    # row from a merged-in Event-mode clip on this same date-scoped route
+    # -- see _playback_items_overlapping_utc_range()'s own docstring.
+    assert result == {"clips": [{"id": "rec-seg-a.mkv", "start": "2026-08-25T12:00:00", "end": "2026-08-25T12:05:00", "name": "seg-a.mkv", "kind": "recording"}]}
 
 
 def test_unauthorized_camera_is_rejected_for_the_date_route(db_path, monkeypatch):
