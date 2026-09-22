@@ -141699,8 +141699,41 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
     recorded time itself. (camera_id, s3_key) is UNIQUE on the
     recordings table, so this is naturally idempotent -- calling it
     repeatedly, on every date this camera's Playback is queried for,
-    never creates duplicate rows."""
+    never creates duplicate rows.
+
+    Per-file commit + bounded retry (2026-09-22): confirmed live on
+    Ryzen -- this function is called synchronously from the customer-
+    facing GET /api/customer/recordings/{camera_id} route (directly,
+    and via _recordings_overlapping_utc_range()/_customer_recordings_
+    for_date()), on an appliance running several other, independent
+    writers against this SAME SQLite file every few seconds (motion/AI
+    detection, People Counting, event recording, analytics sync, HLS
+    segmenting). The entire loop used to run as ONE transaction, held
+    open across every newly-discovered file's real ffprobe subprocess
+    call (see _probe_recording_duration_seconds()) until the whole scan
+    finished. Once this camera's catalog fell behind by any real
+    backlog (confirmed live: 22+ hours, ~900 files, after whatever first
+    caused it to fall behind even slightly), each attempt to catch up
+    held that single write transaction open for the ENTIRE backlog,
+    making a competing writer's "database is locked" collision (SQLite's
+    busy_timeout is 5s; a multi-file backlog scan routinely runs far
+    longer than that) increasingly likely the longer the backlog grew --
+    and because the whole transaction was still uncommitted, that one
+    collision rolled back EVERY file already found and inserted in that
+    same call, so the backlog never shrank and the customer's real
+    browser request 500'd instead of the page silently staying stale.
+    Each newly-discovered file is now committed the moment it's
+    inserted (a lock collision on file N no longer erases files
+    1..N-1's already-durable progress) and retried up to 3 times with a
+    short backoff before being skipped for this pass (logged, not
+    raised) -- a persistently-locked single file can no longer turn an
+    entire customer request into a 500; it is simply picked up on the
+    next call once the count reaches CLOUD_UPLOAD_MIN_FILE_AGE_SECONDS."""
+    import sqlite3
+    import logging
     from partner_db import connection
+
+    logger = logging.getLogger("anyaicam.recordings_catalog")
 
     with connection() as db:
         camera = db.execute(
@@ -141763,27 +141796,41 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
                 duration_seconds = 300.0
             ended = started + timedelta(seconds=duration_seconds)
 
-            db.execute(
-                "INSERT INTO recordings("
-                "id,customer_id,site_id,appliance_id,camera_id,s3_key,"
-                "started_at,ended_at,duration_seconds,size_bytes,status,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    secrets.token_hex(12),
-                    camera["customer_id"],
-                    camera["site_id"],
-                    camera["appliance_id"],
-                    camera_id,
-                    s3_key,
-                    started.isoformat(),
-                    ended.isoformat(),
-                    int(round(duration_seconds)),
-                    stat.st_size,
-                    "available",
-                    datetime.now().isoformat(),
-                ),
-            )
-            added += 1
+            for attempt in range(3):
+                try:
+                    db.execute(
+                        "INSERT INTO recordings("
+                        "id,customer_id,site_id,appliance_id,camera_id,s3_key,"
+                        "started_at,ended_at,duration_seconds,size_bytes,status,created_at"
+                        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            secrets.token_hex(12),
+                            camera["customer_id"],
+                            camera["site_id"],
+                            camera["appliance_id"],
+                            camera_id,
+                            s3_key,
+                            started.isoformat(),
+                            ended.isoformat(),
+                            int(round(duration_seconds)),
+                            stat.st_size,
+                            "available",
+                            datetime.now().isoformat(),
+                        ),
+                    )
+                    db.commit()
+                    added += 1
+                except sqlite3.OperationalError as error:
+                    if attempt == 2:
+                        logger.warning(
+                            "recordings_catalog.insert_skipped_after_retries camera_id=%s file=%s error=%s",
+                            camera_id, path.name, error,
+                        )
+                        break
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                else:
+                    break
 
     return added
 
