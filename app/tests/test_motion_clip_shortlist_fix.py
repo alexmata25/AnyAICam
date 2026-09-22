@@ -451,6 +451,73 @@ def test_continuous_mode_does_not_retry_when_nothing_covers_the_window(monkeypat
     assert len(sleep_calls) == 1, "no covering file and Continuous mode: must not enter the Event-mode retry loop"
 
 
+# ---------------------------------------------------------------------------
+# 8. 2026-09-22: the shortlist's early-side cutoff (2 * RECORDING_SEGMENT_
+#    SECONDS) is itself a "5-minute assumption" -- same class of bug as
+#    build_manual_clip()'s own hardcoded lookback window (see
+#    test_build_manual_clip_lookback_window.py). A camera with a real,
+#    explicitly configured local_recording_max_event_seconds longer than
+#    RECORDING_SEGMENT_SECONDS (persist_event_recording()'s own merge-
+#    extension cap for a long-lingering event) could have a real source
+#    file starting further back than the old fixed 10-minute cutoff --
+#    which this shortlist silently excluded, producing a missing/short
+#    clip for a request that should have found it.
+# ---------------------------------------------------------------------------
+
+def test_a_source_starting_past_the_old_hardcoded_shortlist_window_is_found_when_max_event_seconds_is_configured_longer(
+    monkeypatch, _isolated_clip_paths
+):
+    recordings = _isolated_clip_paths["recordings"]
+    event_time = datetime(2026, 2, 1, 4, 0, 0)
+
+    monkeypatch.setattr(
+        main, "_local_recording_settings",
+        lambda camera_number: {"mode": "continuous", "pre_roll_seconds": 5, "post_roll_seconds": 5,
+                                "merge_gap_seconds": 10, "max_event_seconds": 900},
+    )
+
+    # 12 minutes before the event -- past the OLD hardcoded 10-minute
+    # (2*300s) shortlist window, but within this camera's real configured
+    # 900s (15-minute) max_event_seconds cap.
+    far_source = _make_recording(recordings, 6, event_time - timedelta(minutes=12))
+
+    call_log = []
+    monkeypatch.setattr(main.subprocess, "run", _fake_ffprobe_factory(call_log, {}))
+
+    asyncio.run(main.build_motion_event_clip("evt-long-max-event", 6, event_time, event_time))
+
+    assert str(far_source) in call_log, (
+        "a source 12 minutes before the event must be probed when this camera's own "
+        "configured max_event_seconds (900s) allows a recording that long"
+    )
+
+
+def test_a_source_starting_past_both_real_maximums_is_still_correctly_excluded(monkeypatch, _isolated_clip_paths):
+    """The fix widens the shortlist, but must not make it unboundedly wide --
+    a file older than either mode's own real maximum span genuinely cannot
+    be the source for this event."""
+    recordings = _isolated_clip_paths["recordings"]
+    event_time = datetime(2026, 2, 1, 5, 0, 0)
+
+    monkeypatch.setattr(
+        main, "_local_recording_settings",
+        lambda camera_number: {"mode": "continuous", "pre_roll_seconds": 5, "post_roll_seconds": 5,
+                                "merge_gap_seconds": 10, "max_event_seconds": 300},
+    )
+
+    # 45 minutes before the event -- past both RECORDING_SEGMENT_SECONDS
+    # (300s) and this camera's own configured max_event_seconds (300s),
+    # even after doubling either.
+    too_far_source = _make_recording(recordings, 7, event_time - timedelta(minutes=45))
+
+    call_log = []
+    monkeypatch.setattr(main.subprocess, "run", _fake_ffprobe_factory(call_log, {}))
+
+    asyncio.run(main.build_motion_event_clip("evt-too-far", 7, event_time, event_time))
+
+    assert str(too_far_source) not in call_log
+
+
 def test_event_mode_gives_up_after_bounded_retries_if_file_never_appears(monkeypatch, _isolated_clip_paths):
     event_time = datetime(2026, 9, 21, 3, 0, 0)
 

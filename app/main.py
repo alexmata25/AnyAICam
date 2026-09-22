@@ -34466,8 +34466,19 @@ async def build_motion_event_clip(
     # HTTP outage. A file can only possibly overlap the event window if
     # it starts no later than the window's end, and no earlier than
     # 2 * RECORDING_SEGMENT_SECONDS before the window's start.
+    #
+    # 2026-09-22 (same "5-minute assumption" class as build_manual_clip()'s
+    # own lookback-window fix): a plain 2*RECORDING_SEGMENT_SECONDS (10min)
+    # cutoff is only ever correct by coincidence -- it silently excludes a
+    # real, still-relevant Event-mode source file for any camera whose own
+    # configured local_recording_max_event_seconds (persist_event_
+    # recording()'s merge-extension cap for a long-lingering event) is
+    # longer than that. Widened to the larger of RECORDING_SEGMENT_SECONDS
+    # and this camera's own configured max, so the shortlist is never
+    # narrower than either mode's own real maximum recording span.
+    max_event_seconds = _local_recording_settings(camera_number)["max_event_seconds"]
     earliest_start = window.start - timedelta(
-        seconds=RECORDING_SEGMENT_SECONDS * 2
+        seconds=max(RECORDING_SEGMENT_SECONDS, max_event_seconds) * 2
     )
 
     def _shortlist() -> list[tuple[datetime, Path]]:
