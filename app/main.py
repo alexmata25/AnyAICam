@@ -34375,6 +34375,42 @@ async def create_motion_thumbnail(
 RECORDING_SEGMENT_SECONDS = 300
 
 
+# 2026-09-22 (real restart-loop contributor found live on Ryzen, second
+# trigger beyond the camera-supervisor startup stagger fixed earlier the
+# same night): this appliance's baseline CPU already sits close to its
+# 8-core ceiling (live-HLS transcoding alone measured at ~407% of that,
+# more than half the box's total capacity), leaving almost no headroom.
+# _probe_motion_clip_candidates() had NO bound on how many ffprobe
+# subprocesses could run at once -- unlike the ffmpeg ENCODE step just
+# below (event_clip_encode_semaphore), which was already bounded for
+# exactly this reason after an earlier incident (see that semaphore's
+# own comment). Confirmed live: two Docker healthcheck timeouts each
+# correlated with a burst of 2-3 concurrent ffprobe processes landing on
+# top of the already-saturated baseline -- different cameras' (or
+# motion vs. AI-detection paths') build_motion_event_clip() calls each
+# running their own unbounded probe step simultaneously. A plain
+# threading.Semaphore (not asyncio.Semaphore) is correct here: this
+# function itself is synchronous, always run inside a asyncio.to_thread()
+# worker thread, so callers block on a real OS thread while probing --
+# threading.Semaphore is what actually serializes across those threads.
+FFPROBE_MAX_CONCURRENCY = max(1, int(os.environ.get("ANYAICAM_FFPROBE_MAX_CONCURRENCY", "1")))
+_ffprobe_semaphore = threading.Semaphore(FFPROBE_MAX_CONCURRENCY)
+
+# Duration cache, keyed by (path, mtime) so a file that gets rewritten
+# (never happens for a completed .mkv segment in this pipeline, but this
+# is a correctness guard, not an assumption) never returns a stale
+# value. Only a REAL, already-final duration is ever cached -- the N/A
+# "still being actively written" case is deliberately never cached,
+# since that value can only ever get more accurate on a later probe.
+# Same shortlist file is a common, expected re-probe target: a burst of
+# near-simultaneous events across different cameras/paths can each
+# independently shortlist and want to probe the SAME most-recent
+# segment for a camera; this cache turns every probe after the first
+# into a dict lookup instead of a second real ffprobe subprocess.
+_ffprobe_duration_cache: dict[tuple[str, float], float] = {}
+_ffprobe_duration_cache_lock = threading.Lock()
+
+
 def _probe_motion_clip_candidates(
     shortlist: list[tuple[datetime, Path]],
     window_start: datetime,
@@ -34387,30 +34423,49 @@ def _probe_motion_clip_candidates(
     expected to already be narrowed by filename timestamp (cheap, no
     subprocess) before this function ever runs, so it stays small
     (typically 1-3 files) regardless of how many recordings a camera has
-    retained in total."""
+    retained in total.
+
+    Real ffprobe subprocess launches are bounded appliance-wide by
+    _ffprobe_semaphore, and a completed file's own duration is served
+    from _ffprobe_duration_cache on any later re-probe -- see both
+    module-level comments just above for the real incident this closes."""
     candidates: list[tuple[datetime, datetime, Path]] = []
 
     for source_start, source in shortlist:
         try:
-            probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "default=nw=1:nk=1",
-                    str(source),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
+            cache_key = (str(source), source.stat().st_mtime)
+            with _ffprobe_duration_cache_lock:
+                cached_duration = _ffprobe_duration_cache.get(cache_key)
 
-            duration_text = probe.stdout.strip()
+            if cached_duration is not None:
+                source_duration = cached_duration
+            else:
+                with _ffprobe_semaphore:
+                    probe = subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v", "error",
+                            "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1",
+                            str(source),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
 
-            if duration_text and duration_text.upper() != "N/A":
-                source_duration = float(duration_text)
+                duration_text = probe.stdout.strip()
+                source_duration = (
+                    float(duration_text)
+                    if duration_text and duration_text.upper() != "N/A"
+                    else None
+                )
+                if source_duration is not None:
+                    with _ffprobe_duration_cache_lock:
+                        _ffprobe_duration_cache[cache_key] = source_duration
 
+            if source_duration is not None:
                 if source_duration <= 0:
                     continue
 
