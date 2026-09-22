@@ -2772,6 +2772,15 @@ PEOPLE_COUNTING_ENABLED = os.environ.get("PEOPLE_COUNTING_ENABLED", "false").low
 PEOPLE_COUNTING_INTERVAL_SECONDS = max(0.5, float(os.environ.get("PEOPLE_COUNTING_INTERVAL_SECONDS", "1.5")))
 PEOPLE_COUNTING_STATE_FILE = RECORDINGS_FOLDER / "people_counting_state.json"
 
+# Customer-facing Intrusion Zone / Line-Crossing rule editor's own edge
+# execution (2026-09-21) -- see customer_analytics_rule_worker.py's own
+# module docstring. Deliberately a separate master flag from
+# PEOPLE_COUNTING_ENABLED even though both gate a per-camera worker
+# task started the same way below: these are two independently
+# toggleable features that happen to share tracking/geometry
+# primitives, not one feature with two names.
+CUSTOMER_ANALYTICS_RULES_ENABLED = os.environ.get("CUSTOMER_ANALYTICS_RULES_ENABLED", "false").lower() == "true"
+
 # TEMPORARY, walk-test diagnostics only -- intentionally hardcoded, not
 # an env var, so it can't accidentally be left on for every camera in
 # a real deployment. 0 (or any camera number never actually entitled)
@@ -39615,6 +39624,7 @@ import lpr
 import ppe
 import smart_motion
 import people_counting
+from customer_analytics_rule_worker import customer_analytics_rule_worker
 import facial_embedding_sync
 import facial_events
 import facial_recognition
@@ -39879,6 +39889,18 @@ async def lifespan(app: FastAPI):
             # anything to actually run.
             people_counting_tasks = [
                 asyncio.create_task(people_counting_worker(camera_number))
+                for camera_number in camera_numbers
+            ]
+
+        if CUSTOMER_ANALYTICS_RULES_ENABLED:
+            # One task spawned per camera, exactly like people_counting_
+            # tasks above -- each task idles harmlessly unless ITS OWN
+            # camera has at least one enabled rule synced down from the
+            # cloud (see customer_analytics_rule_worker.py's own
+            # docstring). A separate master flag from PEOPLE_COUNTING_
+            # ENABLED on purpose -- see that flag's own comment.
+            customer_analytics_rule_tasks = [
+                asyncio.create_task(customer_analytics_rule_worker(camera_number))
                 for camera_number in camera_numbers
             ]
 
@@ -143743,7 +143765,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // (see detection_events) collapsed to the filter/legend categories
   // this page's UI already ships -- "already supported" per this
   // integration's own scope, not a new filter category.
-  const EVENT_COLORS={{motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d'}};
+  const EVENT_COLORS={{motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d',line_crossing:'#e0507a'}};
   function filterCategory(eventType){{
     if(eventType==='motion'||eventType==='smart_motion')return 'motion';
     if(eventType==='person')return 'person';
@@ -143751,6 +143773,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     if(eventType==='plate'||eventType==='lpr')return 'lpr';
     if(eventType==='people_counting_in'||eventType==='people_counting_out'||eventType==='people_counting')return 'people_counting';
     if(eventType==='intrusion')return 'intrusion';
+    // Customer-drawn Line Crossing rules (customer_analytics_rule_worker.py)
+    // -- deliberately its own category/color, distinct from People
+    // Counting's own line, even though both share the same underlying
+    // geometry primitives (see that module's own docstring).
+    if(eventType==='line_crossing')return 'line_crossing';
     return null;   // e.g. ppe -- no dedicated filter/legend slot on this page yet, shown under "All" only, in a neutral color
   }}
 
@@ -154099,6 +154126,8 @@ def _aaco_event_category(raw_event_type: object) -> str | None:
         return "people_counting"
     if value == "intrusion":
         return "intrusion"
+    if value == "line_crossing":
+        return "line_crossing"
     return None
 
 

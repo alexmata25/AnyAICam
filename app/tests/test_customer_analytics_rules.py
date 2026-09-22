@@ -3,9 +3,14 @@ customer_analytics_rules.py) -- tenant isolation, camera ownership
 validation, create/update/delete, invalid geometry, direction, and owner
 vs viewer permissions, per the user's own explicit regression-test list.
 
-Does NOT test detection/execution -- see customer_analytics_rules.py's own
-module docstring: a saved rule here is authorized, validated, and stored
-only. There is no edge worker yet that evaluates it.
+Does NOT test detection/execution itself -- see test_analytics_rules_
+engine.py (geometry/tracking), test_appliance_analytics_rules_delivery.py
+(cloud->appliance delivery), test_edge_camera_sync_analytics_rules.py
+(the local mirror), and test_customer_analytics_rule_worker.py (the real
+edge evaluator) for that, added 2026-09-21 once the execution backend
+was built. This file stays scoped to storage/API/permissions; it still
+proves (see the bottom of this file) that a rule saved here never
+fabricates a fake detection side effect on its own.
 
 Reuses the established TestClient-against-https://app.anyaicam.com harness
 (test_dashboard_live_view_links.py's own comment explains why the host
@@ -414,22 +419,45 @@ def test_creating_and_updating_a_rule_never_creates_a_detection_events_row(http_
     assert count == 0
 
 
-def test_no_existing_worker_or_sync_module_reads_the_new_rules_table_yet(monkeypatch):
-    """This is the concrete, checkable form of 'no execution path exists
-    yet' -- see the runtime-path trace in
-    docs/intrusion-line-crossing-customer-ui-gap.md. Reference to the
-    table name would show up here the moment someone starts wiring a
-    real consumer -- at which point this test (and that doc) need a
-    deliberate update, not a silent pass, per the explicit instruction
-    not to imply this feature is operational."""
+def test_people_counting_and_the_appliance_to_cloud_upload_workers_still_never_read_the_new_rules_table(monkeypatch):
+    """Updated 2026-09-21 now that a real execution path exists (see
+    customer_analytics_rule_worker.py, appliance_cloud.py's
+    analytics_rules exposure, and edge_camera_sync.py's reconciliation
+    -- docs/intrusion-line-crossing-customer-ui-gap.md's own "execution
+    backend" update). This test's scope narrows to what must STILL stay
+    untouched: People Counting's own worker (kept semantically separate
+    per explicit instruction, even though it shares analytics_rules_
+    engine.py's tracking primitives with the new worker) and the
+    APPLIANCE-TO-CLOUD upload workers (analytics_sync.py/event_media_
+    uploader.py), which have nothing to do with this CLOUD-TO-APPLIANCE
+    delivery feature and must never gain a reference to it."""
     import inspect
 
     import analytics_sync
-    import appliance_cloud
     import event_media_uploader
     import main
 
     assert "customer_analytics_rules" not in inspect.getsource(main.people_counting_worker)
     assert "customer_analytics_rules" not in inspect.getsource(analytics_sync)
-    assert "customer_analytics_rules" not in inspect.getsource(appliance_cloud)
     assert "customer_analytics_rules" not in inspect.getsource(event_media_uploader)
+
+
+def test_the_real_execution_path_now_exists_exactly_where_expected(monkeypatch):
+    """The other half of the update above: appliance_configuration()
+    (cloud->appliance delivery), edge_camera_sync.py (the local
+    mirror), and customer_analytics_rule_worker.py (the real edge
+    evaluator) now DO reference this table -- this test fails loudly if
+    any of these three is ever refactored away without a replacement,
+    which would silently regress this feature back to storage-only."""
+    import inspect
+
+    import appliance_cloud
+    import customer_analytics_rule_worker
+    import edge_camera_sync
+
+    # appliance_configuration() is a closure nested inside
+    # register_appliance_cloud_routes(), not a module-level attribute --
+    # checked against the whole module's source instead.
+    assert "customer_analytics_rules" in inspect.getsource(appliance_cloud)
+    assert "customer_analytics_rules" in inspect.getsource(edge_camera_sync._reconcile_analytics_rules)
+    assert "customer_analytics_rules" in inspect.getsource(customer_analytics_rule_worker.load_rules_for_camera)

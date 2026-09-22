@@ -120,6 +120,69 @@ def _control_plane_get(path: str, appliance_id: str, credential: str) -> dict | 
         return None
 
 
+def _reconcile_analytics_rules(db, appliance_id: str, cloud_rules: list, now: str) -> int:
+    """Fully replaces this appliance's LOCAL customer_analytics_rules
+    mirror with exactly what this poll's response just reported enabled
+    for it (2026-09-21) -- the cloud->appliance half of the rule-
+    delivery path documented as missing in docs/intrusion-line-
+    crossing-customer-ui-gap.md. Reuses the existing GET /api/appliance/
+    configuration poll -- no new endpoint, no new cadence, no second
+    uncontrolled channel -- and the exact same `appliance_id` ownership
+    boundary sync_provisioned_cameras() already trusts for cameras.
+
+    Deliberately NOT sync_provisioned_cameras()'s own "never delete a
+    stale camera locally" policy (see this module's own docstring for
+    why a camera briefly missing from a poll is treated as a possible
+    transient gap, not a real deprovision): appliance_configuration()
+    only ever reports a rule here while it is enabled=1 in the cloud, so
+    a rule's absence from this list always means exactly one thing --
+    it is no longer enabled for this appliance -- and continuing to
+    enforce a rule the customer just disabled or deleted (e.g. an
+    intrusion alert still firing for a zone they removed) is a real
+    customer-facing correctness bug, not a safe fail-open default.
+    Local rows for cameras belonging to a DIFFERENT appliance are never
+    touched (the DELETE below is scoped to `WHERE appliance_id=?`,
+    matching every other query in this reconciliation).
+
+    Written into the exact same `customer_analytics_rules` table name/
+    schema the cloud customer portal writes into (not a second, parallel
+    table) -- the same 1:1 table-mirroring convention already used for
+    customers/sites/appliances/cameras above, and per explicit
+    instruction, never the legacy analytics_rules.json file."""
+    cloud_ids: set[str] = set()
+    for item in cloud_rules:
+        if not isinstance(item, dict):
+            continue
+        rule_id = str(item.get("id") or "").strip()
+        camera_id = str(item.get("camera_id") or "").strip()
+        rule_type = str(item.get("rule_type") or "").strip()
+        if not rule_id or not camera_id or not rule_type:
+            continue
+        cloud_ids.add(rule_id)
+        geometry = item.get("geometry")
+        db.execute(
+            "INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at,created_by) "
+            "VALUES(?,?,?,?,?,?,?,?,?,1,?,?,NULL) "
+            "ON CONFLICT(id) DO UPDATE SET customer_id=excluded.customer_id,site_id=excluded.site_id,appliance_id=excluded.appliance_id,"
+            "camera_id=excluded.camera_id,rule_type=excluded.rule_type,name=excluded.name,direction=excluded.direction,"
+            "geometry_json=excluded.geometry_json,enabled=1,updated_at=excluded.updated_at",
+            (
+                rule_id, item.get("customer_id"), item.get("site_id"), appliance_id, camera_id,
+                rule_type, item.get("name") or "", item.get("direction"),
+                json.dumps(geometry if isinstance(geometry, list) else []),
+                now, item.get("updated_at") or now,
+            ),
+        )
+    existing_ids = {
+        row["id"] for row in db.execute(
+            "SELECT id FROM customer_analytics_rules WHERE appliance_id=?", (appliance_id,)
+        ).fetchall()
+    }
+    for stale_id in existing_ids - cloud_ids:
+        db.execute("DELETE FROM customer_analytics_rules WHERE id=?", (stale_id,))
+    return len(cloud_ids)
+
+
 def sync_provisioned_cameras() -> dict:
     """One reconciliation pass. Safe to call repeatedly (idempotent) and
     safe to call after any restart (reads only durable local/cloud
@@ -139,6 +202,15 @@ def sync_provisioned_cameras() -> dict:
     cloud_cameras = response.get("cameras")
     if not isinstance(cloud_cameras, list):
         return {"status": "malformed_response"}
+    # analytics_rules (2026-09-21): a missing/malformed field here is
+    # treated as "this control-plane response didn't carry rule data
+    # this cycle" -- local rule state is simply left untouched (None
+    # signals "skip" to the reconciliation call below), exactly the
+    # same fail-safe posture as this function's own malformed_response
+    # bail-out for cameras, but scoped to just this one field rather
+    # than aborting the whole cycle's camera sync over it.
+    cloud_rules = response.get("analytics_rules")
+    cloud_rules = cloud_rules if isinstance(cloud_rules, list) else None
 
     # product_mode (2026-09-21): this appliance's real, entitlement-
     # derived Local/Hybrid mode, from the same already-polled response --
@@ -298,7 +370,16 @@ def sync_provisioned_cameras() -> dict:
             db.execute("DELETE FROM pending_camera_credentials WHERE device_key=?", (device_key,))
             credentials_moved += 1
 
-    result = {"status": "ok", "synced": synced, "credentials_moved": credentials_moved, "product_mode_restart_required": restart_required}
+        # Runs inside this SAME transaction, after every camera above has
+        # already been upserted -- customer_analytics_rules' own FOREIGN
+        # KEY(camera_id) REFERENCES cameras(id) is only ever satisfiable
+        # once that camera's row genuinely exists locally, and (per
+        # appliance_configuration()'s own scoping) every rule reported
+        # here belongs to a camera that was in this exact same
+        # cloud_cameras list moments ago.
+        rules_synced = _reconcile_analytics_rules(db, identity["appliance_id"], cloud_rules, now) if cloud_rules is not None else None
+
+    result = {"status": "ok", "synced": synced, "credentials_moved": credentials_moved, "product_mode_restart_required": restart_required, "rules_synced": rules_synced}
     sync_state["last_run_at"] = now
     sync_state["last_error"] = None
     sync_state["last_synced_count"] = synced

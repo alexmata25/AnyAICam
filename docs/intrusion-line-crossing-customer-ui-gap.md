@@ -340,3 +340,134 @@ draws a rule and it does nothing" true. All three need real
 implementations, in this order (storage -> delivery -> evaluation),
 before either rule type is an operating analytics feature rather than a
 drawing tool.
+
+## Update, 2026-09-21 (continued again): all three gaps closed in software
+
+Built the execution backend the three-gap list above called for, in the
+same order: delivery, edge persistence, evaluation, event integration.
+Nothing here has been deployed or physically validated -- see the final
+section below for exactly what that leaves open.
+
+### 1. Cloud -> appliance rule delivery
+
+`GET /api/appliance/configuration` (`appliance_cloud.py`) -- the SAME
+route `edge_camera_sync.py`/`recording_uploader.py` already poll every
+cycle for camera config/entitlements/product_mode, reused rather than a
+new endpoint -- now also returns `analytics_rules`: every `enabled=1`
+`customer_analytics_rules` row belonging to the calling appliance's own
+cameras, scoped by the exact same `WHERE c.appliance_id=?` join the
+route already trusts for `cameras` itself. A disabled rule is never
+sent at all (disabled and deleted are deliberately indistinguishable to
+the edge). Proven by `test_appliance_analytics_rules_delivery.py`: a
+second appliance/customer's rule never appears in the first's poll, a
+disabled rule never appears, and an invalid credential reveals nothing.
+
+### 2. Edge rule persistence
+
+`edge_camera_sync.py`'s existing `sync_provisioned_cameras()` (the
+established cloud->edge reconciliation pass) now also calls a new
+`_reconcile_analytics_rules()`: it fully replaces this appliance's LOCAL
+`customer_analytics_rules` table (same schema/table name the cloud
+portal writes into -- a real, additive 1:1 mirror, exactly like
+`cameras`/`customers`/`sites`/`appliances` already are, never the legacy
+`analytics_rules.json`) with exactly what this poll reported. Unlike
+camera sync's own deliberate "never delete a camera locally" policy, a
+rule's disappearance from the response is trusted immediately (a
+disabled/deleted rule must actually stop being enforced) -- but a
+malformed or missing `analytics_rules` field in the response leaves
+local state untouched entirely, the same fail-safe posture as the
+camera list's own `malformed_response` bail-out. Proven by
+`test_edge_camera_sync_analytics_rules.py`: upsert, in-place geometry
+update, deletion on removal, multi-camera/multi-rule sync, and identity
+stamping.
+
+### 3 & 4. Line-Crossing and Intrusion execution, and event integration
+
+Ported `app/analytics_rules_engine.py` (and its own 32-test unit suite)
+unmodified from the divergent `analytics-rules-foundation-20260821`
+branch -- real per-camera IoU tracking (`update_tracker()`), real
+geometry (`_point_in_polygon()`, `_signed_distance_to_line()`), and a
+real per-rule state machine (`evaluate_rules()`): a dwell timer for
+intrusion (enter -> dwell -> fire once per continuous dwell -> clear on
+exit, re-arms only after a real re-entry) and a confirmed-side-flip
+detector for line-crossing (fires once per actual crossing, with a
+small refire floor against boundary jitter, filtered by the rule's own
+`direction`). This is the debounce answer to "one person lingering
+does not create endless events" -- proven at the unit level in the
+ported suite and again at the integration level (a lingering person
+produces zero events before the real dwell threshold).
+
+New `app/customer_analytics_rule_worker.py` -- one asyncio task per
+camera, gated by a new `CUSTOMER_ANALYTICS_RULES_ENABLED` master flag
+(mirroring `PEOPLE_COUNTING_ENABLED`'s own shape, deliberately
+separate), started in main.py's existing per-camera worker-startup
+block alongside `people_counting_tasks`. Each cycle: resolves this
+camera's real `camera_id` (reusing `recording_uploader._camera_
+identity()`'s existing cache -- no new cloud round-trip), loads its
+enabled rules from the LOCAL mirror table, and -- only if any exist --
+calls the exact same `detect_objects_frame()` every other detector uses
+(under the same `ai_inference_semaphore`, avoiding the exact YOLO-
+starvation bug People Counting's own worker already hit once), tracks
+detections through `analytics_rules_engine.update_tracker()`, and
+evaluates them against this camera's rules. A fired event becomes a
+real `AnalyticsEventModel` row -- correct `camera`/`timestamp`/
+`rule_id`/`track_id`, a real thumbnail (one saved frame per cycle,
+reused across every event that cycle, matching every other detector's
+convention), and a real Event-mode clip link via the same
+`linked_recording_for()` every other event type uses -- appended
+through the same `append_analytics_event()` path, which is what makes
+it readable back through `analytics_events()`/Investigate with zero
+Investigate-page-specific code needed. `event_type="line_crossing"`
+deliberately reuses a value that already existed, unreachable, in
+main.py's own Investigate/analytics filter dropdowns; `event_type=
+"intrusion"` matches the pre-existing category exactly. Both got their
+own entry in `_aaco_event_category()`/the client-side `filterCategory()`/
+`EVENT_COLORS` map so they render with a real category/color rather
+than falling into the generic "All" bucket. Deliberately kept semantically
+separate from People Counting throughout -- its own worker, its own
+master flag, its own event_type family -- even though both now share
+`analytics_rules_engine.py`'s tracking/geometry code.
+
+Proven by `test_customer_analytics_rule_worker.py`: rule loading/
+translation, event metadata correctness, Event-mode clip linkage,
+real Investigate-path visibility and categorization, an idle-harmless
+no-op when no camera/rules resolve, a full real line-crossing cycle
+producing a thumbnailed event, and the dwell-threshold debounce holding
+under the real worker loop.
+
+### What is now real, and what still is not
+
+Real, tested, in software on this branch: the full path from a
+customer-drawn rule through cloud storage, cloud->appliance delivery,
+local edge persistence, real per-camera tracking/geometry evaluation,
+debounced event firing, and Event-mode/Investigate integration.
+Combined regression count for this feature: 161 tests, all passing
+alongside the full existing suite.
+
+Still true, and explicitly not claimed otherwise:
+
+- **Nothing has been deployed.** `customer_analytics_rule_worker.py`,
+  the extended `appliance_configuration()` response, and edge_camera_
+  sync.py's rule reconciliation exist only in this repository -- Ryzen
+  is still running whatever it was running before this branch, and
+  `CUSTOMER_ANALYTICS_RULES_ENABLED` has not been set true anywhere.
+- **No physical validation has been performed.** Every test above uses
+  synthetic detections (`detect_objects_frame()` monkeypatched) --
+  real-camera geometry accuracy (does a customer's actually-drawn line/
+  polygon, viewed through a real lens at a real mounting angle, produce
+  the crossing/intrusion decision they expect), real YOLO confidence/
+  class behavior against this rule type, and real multi-rule/multi-
+  camera CPU cost on real appliance hardware are all unverified.
+- `analytics_rules_engine.py`'s dwell/line-side state is per-process,
+  in-memory only (matching the ported module's own original design,
+  and `people_counting.py`'s own equivalent limitation) -- an appliance
+  restart mid-dwell loses that one in-flight state, exactly like a
+  restart mid-crossing already does for People Counting.
+- A pre-existing, unrelated bug was found (not fixed, out of scope):
+  `appliance_configuration()`'s `configuration_version` field computes
+  `max()` over camera statuses and raises `TypeError` if two or more of
+  an appliance's cameras share a `NULL` status -- surfaced only because
+  this work's own test harness was the first to seed two cameras
+  through this exact route in one test. Worked around in this feature's
+  own tests by giving seeded cameras a real status; left unfixed
+  because it is unrelated to rule delivery.

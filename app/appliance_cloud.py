@@ -460,6 +460,32 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # be the exact same unreachable-in-practice gap this comment
         # already documents for people_counting_enabled.
         appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
+        # analytics_rules (2026-09-21): the tenant-safe customer-drawn
+        # Intrusion Zone / Line-Crossing rules (customer_analytics_
+        # rules.py) for THIS appliance's own cameras only -- the same
+        # `WHERE appliance_id=?` ownership boundary authenticate_
+        # appliance() + this JOIN already enforce for camera_items
+        # above, never a second/looser scope. Only enabled=1 rows are
+        # ever exposed here: a disabled rule has nothing useful to
+        # enforce on the edge, and this keeps "disabled" and "deleted"
+        # indistinguishable to the edge sync below by design (both mean
+        # "stop enforcing this id"), avoiding a second signal for the
+        # exact same outcome. geometry is expanded from its stored JSON
+        # string into a real list here so edge_camera_sync.py's own
+        # reconciliation never needs to know this column is JSON-
+        # encoded in the cloud schema.
+        analytics_rule_items=rows(
+            'SELECT r.id,r.customer_id,r.site_id,r.camera_id,r.rule_type,r.name,r.direction,r.geometry_json,r.updated_at '
+            'FROM customer_analytics_rules r JOIN cameras c ON c.id=r.camera_id '
+            'WHERE c.appliance_id=? AND r.enabled=1 ORDER BY r.camera_id,r.id',
+            (appliance['id'],),
+        )
+        for rule_item in analytics_rule_items:
+            raw_geometry=rule_item.pop('geometry_json',None)
+            try:
+                rule_item['geometry']=json.loads(raw_geometry) if raw_geometry else []
+            except (TypeError,ValueError):
+                rule_item['geometry']=[]
         for item in camera_items:
             raw_metadata=item.pop('talk_down_metadata',None)
             supported=item.pop('talk_down_supported',None)
@@ -556,7 +582,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # docstring for the "database is locked" this avoids).
         if product_mode_audit:
             audit(product_mode_audit['actor'],product_mode_audit['action'],product_mode_audit['entity_type'],product_mode_audit['entity_id'],product_mode_audit['details'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value}
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'analytics_rules':analytics_rule_items}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
