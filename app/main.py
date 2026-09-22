@@ -141820,6 +141820,24 @@ def _catalog_local_recordings_for_camera(camera_id: str) -> int:
                     )
                     db.commit()
                     added += 1
+                except sqlite3.IntegrityError:
+                    # (camera_id, s3_key) is UNIQUE -- this means a
+                    # CONCURRENT call for this same camera (a real
+                    # customer double-clicking Playback, two overlapping
+                    # page loads, or this same request's own client
+                    # retrying while the first attempt was still running
+                    # server-side -- confirmed live: reproduced this
+                    # exact race between two near-simultaneous real
+                    # /api/customer/recordings/{camera_id} requests for
+                    # the same camera) already inserted this exact row
+                    # between this loop's own existing-row SELECT above
+                    # and this INSERT. The row is already there and
+                    # correct -- nothing to retry, nothing to warn about,
+                    # this is the UNIQUE constraint doing exactly its
+                    # documented job (see this function's own docstring:
+                    # "naturally idempotent"), not a failure.
+                    db.rollback()
+                    break
                 except sqlite3.OperationalError as error:
                     if attempt == 2:
                         logger.warning(

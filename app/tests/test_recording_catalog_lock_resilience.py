@@ -34,6 +34,21 @@ that still can't be inserted after retries is skipped (logged) rather
 than raising -- so a lock collision can only ever cost one file's worth
 of retry time, never erase earlier progress in the same call, and can
 never turn a real customer's Playback request into a 500.
+
+Second defect, found live during the very redeploy that shipped the
+fix above: two near-simultaneous real /api/customer/recordings/
+{camera_id} requests for the SAME camera raced each other -- both
+found no existing row for a file in this loop's own existing-row
+SELECT, then both tried to INSERT it, and the loser hit
+`sqlite3.IntegrityError: UNIQUE constraint failed: recordings.
+camera_id, recordings.s3_key` -- a different exception class the
+original fix's `except sqlite3.OperationalError` never caught, so it
+still reached the customer as a 500. Fixed the same day: an
+IntegrityError on this exact (camera_id, s3_key) pair means a
+concurrent call already inserted this precise row -- the UNIQUE
+constraint doing exactly its documented job, not a real failure -- so
+it's caught separately and treated as an immediate, non-retried skip
+(the row is already there and correct).
 """
 import os
 import sqlite3
@@ -62,26 +77,27 @@ class _FlakyDB:
     call (`from partner_db import connection`, inside the function
     body) -- monkeypatching the module-level name is enough."""
 
-    def __init__(self, real_db, should_fail):
+    def __init__(self, real_db, should_fail, error_factory=None):
         self._real_db = real_db
         self._should_fail = should_fail
+        self._error_factory = error_factory or (lambda: sqlite3.OperationalError("database is locked"))
 
     def execute(self, sql, params=()):
         if self._should_fail(sql, params):
-            raise sqlite3.OperationalError("database is locked")
+            raise self._error_factory()
         return self._real_db.execute(sql, params)
 
     def __getattr__(self, name):
         return getattr(self._real_db, name)
 
 
-def _flaky_connection_factory(should_fail):
+def _flaky_connection_factory(should_fail, error_factory=None):
     real_connection = partner_db.connection
 
     @contextmanager
     def flaky_connection():
         with real_connection() as db:
-            yield _FlakyDB(db, should_fail)
+            yield _FlakyDB(db, should_fail, error_factory)
 
     return flaky_connection
 
@@ -208,3 +224,43 @@ def test_a_persistently_locked_file_is_retried_on_the_next_call_not_lost_forever
         second_pass = main._catalog_local_recordings_for_camera("cam-1")
     assert second_pass == 1
     assert _recording_count(db_path) == 1
+
+
+def test_a_concurrent_insert_of_the_same_file_raises_integrity_error_and_is_skipped_not_500d(db_path, tmp_path, monkeypatch):
+    """The second real defect, found live during the redeploy that
+    shipped the fix above: two near-simultaneous real GET /api/customer/
+    recordings/{camera_id} requests for the SAME camera both found no
+    existing row for a file in this loop's own existing-row SELECT,
+    both tried to INSERT it, and the loser hit `sqlite3.IntegrityError:
+    UNIQUE constraint failed: recordings.camera_id, recordings.s3_key`
+    -- a different exception class the original OperationalError-only
+    retry never caught, so it still reached the customer as a 500.
+    Reproduced by injecting that exact exception on this one file's
+    INSERT (standing in for a real concurrent winner) while leaving
+    every other statement, including a second file's own INSERT in the
+    same call, completely real."""
+    _seed(db_path)
+    monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
+    camera_folder = tmp_path / "recordings" / "camera1"
+    _write_file(camera_folder, 1, datetime(2026, 9, 21, 10, 0, 0))
+    _write_file(camera_folder, 1, datetime(2026, 9, 21, 10, 5, 0))
+
+    state = {"insert_calls": 0}
+
+    def should_fail(sql, params):
+        if not sql.startswith("INSERT INTO recordings"):
+            return False
+        state["insert_calls"] += 1
+        return state["insert_calls"] == 1  # only the first file's insert loses the race
+
+    def integrity_error():
+        return sqlite3.IntegrityError("UNIQUE constraint failed: recordings.camera_id, recordings.s3_key")
+
+    monkeypatch.setattr(partner_db, "connection", _flaky_connection_factory(should_fail, integrity_error))
+
+    with override_target(sqlite_path=str(db_path)):
+        added = main._catalog_local_recordings_for_camera("cam-1")  # must not raise
+
+    assert added == 1  # only the second file -- the first lost its race, correctly not retried or counted
+    assert _recording_count(db_path) == 1
+    assert state["insert_calls"] == 2  # both files were attempted; the race loser was never retried
