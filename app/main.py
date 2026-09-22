@@ -37531,7 +37531,17 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
     saved_events = []
 
-
+    # 2026-09-22: facial_recognition events (below) are deliberately
+    # never added to saved_events -- that list is this function's own
+    # return value, and no existing caller expects a facial_recognition
+    # entry in it -- but they share this same scan's eagerly-resolved
+    # `linked_recording` value and were being silently excluded from
+    # the backfill fix's own id list as a result, the one event type in
+    # this function that would have stayed null forever even after
+    # that fix shipped. Collected separately so the backfill call at
+    # the end of this function can include them without changing what
+    # save_yolo_events() itself returns.
+    facial_event_ids: list[str] = []
 
 
 
@@ -38079,6 +38089,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                                 "door_notify_message": aac_event.get("door_notify_message"),
                             }
                         )
+                        facial_event_ids.append(aac_event["id"])
                 except Exception as error:
                     print(f"Camera {camera_number} AAC facial recognition skipped (non-fatal): {error}")
         # 2026-09-16: same real per-camera RDM entitlement check as the
@@ -38138,18 +38149,22 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     # linked_recording backfill (2026-09-22): the SAME trigger condition
     # already used to schedule persist_event_recording() above -- this
     # batch's events (person/car/vehicle/ppe/plate, every entry in
-    # saved_events) all currently carry the eagerly-resolved
-    # `linked_recording` snapshot taken before this camera's Event-mode
-    # clip existed (see _backfill_ai_event_linked_recording()'s own
-    # docstring for the full trace). Scheduled once per detection batch,
-    # after every event in it has been constructed, so it has every id
-    # that needs patching -- not per-class-name, which would schedule a
-    # redundant duplicate backfill per detected class in the same scan.
-    if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and saved_events:
+    # saved_events, PLUS facial_recognition -- facial_event_ids, deliberately
+    # tracked separately since facial_recognition events are never added to
+    # saved_events itself, see that list's own comment) all currently carry
+    # the eagerly-resolved `linked_recording` snapshot taken before this
+    # camera's Event-mode clip existed (see _backfill_ai_event_linked_
+    # recording()'s own docstring for the full trace). Scheduled once per
+    # detection batch, after every event in it has been constructed, so it
+    # has every id that needs patching -- not per-class-name, which would
+    # schedule a redundant duplicate backfill per detected class in the
+    # same scan.
+    backfill_event_ids = [saved["id"] for saved in saved_events] + facial_event_ids
+    if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and backfill_event_ids:
         try:
             asyncio.run_coroutine_threadsafe(
                 _backfill_ai_event_linked_recording(
-                    camera_number, [saved["id"] for saved in saved_events], now,
+                    camera_number, backfill_event_ids, now,
                 ),
                 _ai_event_media_loop,
             )
@@ -38436,6 +38451,34 @@ async def people_counting_worker(camera_number: int) -> None:
                                     )
                             except Exception as error:
                                 print(f"Camera {camera_number} People Counting thumbnail save skipped (non-fatal): {error}")
+                        # Event-mode recording + linked_recording backfill
+                        # (2026-09-22): a real, separate gap from save_yolo_
+                        # events()'s own -- this worker never called
+                        # persist_event_recording() at all, for ANY camera,
+                        # ever. On an Event-mode camera whose only active
+                        # detector is People Counting (no separately-firing
+                        # motion/AI detection to coincidentally trigger a
+                        # clip covering the same window), a crossing event's
+                        # linked_recording_for() call above finds nothing
+                        # and NOTHING ever builds the clip it would need to
+                        # find, unlike the AI-detection path where the clip
+                        # eventually appears once persist_event_recording()
+                        # runs -- so this was not just "too early", it was
+                        # unresolvable. Scheduled once per cycle (matching
+                        # save_yolo_events()'s own "one persist call per
+                        # scan, not per event" shape) -- this coroutine
+                        # already runs on the main event loop (unlike save_
+                        # yolo_events()'s worker-thread call), so a plain
+                        # asyncio.create_task() is correct here, no cross-
+                        # thread scheduling needed.
+                        event_ids = []
+                        if _local_recording_settings(camera_number)["mode"] == "event":
+                            asyncio.create_task(
+                                persist_event_recording(
+                                    camera_number, now, now,
+                                    detector="people_counting", trigger_id=uuid.uuid4().hex[:12],
+                                )
+                            )
                         for event in events:
                             record = AnalyticsEventModel(
                                 camera=camera_number,
@@ -38452,6 +38495,9 @@ async def people_counting_worker(camera_number: int) -> None:
                             record["in_count"] = counter.in_count
                             record["out_count"] = counter.out_count
                             append_analytics_event(record)
+                            event_ids.append(record["id"])
+                        if event_ids and _local_recording_settings(camera_number)["mode"] == "event":
+                            asyncio.create_task(_backfill_ai_event_linked_recording(camera_number, event_ids, now))
                         await asyncio.to_thread(_people_counting_state_save, camera_number, counter)
             else:
                 # Not (or no longer) entitled+configured -- drop any
@@ -58851,10 +58897,24 @@ async def build_manual_clip(
 
         camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
 
-
-
-
-
+        # 2026-09-22: the candidate-source lookback window below used to
+        # be a hardcoded 5 minutes -- correct only by coincidence, since
+        # that happens to match both RECORDING_SEGMENT_SECONDS (Continuous
+        # mode's own fixed 300s segments) AND local_recording_policy.py's
+        # own DEFAULT_MAX_EVENT_RECORDING_SECONDS (300s). A camera with an
+        # explicitly configured, LONGER local_recording_max_event_seconds
+        # (persist_event_recording()'s own merge-extension safety cap,
+        # real per-camera config since this session's own Event-mode
+        # work) could have a real, still-relevant Event-mode recording
+        # start MORE than 5 minutes before a customer's requested
+        # start_time, which this hardcoded window would silently exclude
+        # from build_manual_clip()'s own candidate list -- a real,
+        # customer-facing manual-clip gap, not just an automatic-linkage
+        # one. Widened to the larger of the two real per-camera/appliance
+        # segment-length sources, so this candidate search is never
+        # narrower than either mode's own actual maximum recording span.
+        lookback_seconds = max(RECORDING_SEGMENT_SECONDS, _local_recording_settings(camera_number)["max_event_seconds"])
+        lookback_window = timedelta(seconds=lookback_seconds)
 
 
 
@@ -58885,7 +58945,7 @@ async def build_manual_clip(
 
 
 
-            if source_start and source_start < end_time and source_start + timedelta(minutes=5) > start_time:
+            if source_start and source_start < end_time and source_start + lookback_window > start_time:
 
 
 
@@ -143743,7 +143803,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   async function fetchClipsMetadata(cameraId,params){{
     const query=new URLSearchParams(params||{{}});
     try{{
-      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}?${{query}}`);
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}?${{query}}`,{{cache:'no-store'}});
       if(!response.ok)return null;
       const data=await response.json();
       return Array.isArray(data.clips)?data.clips:null;
@@ -143755,7 +143815,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // === PAGINATION_FETCH_END ===
   async function fetchCameraEvents(cameraId){{
     try{{
-      const response=await fetch(`/api/customer/events/${{encodeURIComponent(cameraId)}}`);
+      const response=await fetch(`/api/customer/events/${{encodeURIComponent(cameraId)}}`,{{cache:'no-store'}});
       if(!response.ok)return [];
       const data=await response.json();
       return Array.isArray(data.events)?data.events:[];
@@ -144519,7 +144579,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   async function ensureDatesLoaded(cameraId){{
     if(datesLoaded.has(cameraId))return datesByCamera[cameraId]||[];
     try{{
-      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}/dates`);
+      const response=await fetch(`/api/customer/recordings/${{encodeURIComponent(cameraId)}}/dates`,{{cache:'no-store'}});
       const data=response.ok?await response.json():{{dates:[]}};
       datesByCamera[cameraId]=Array.isArray(data.dates)?data.dates:[];
     }}catch(error){{
@@ -145237,7 +145297,26 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
 
 @app.get("/playback", response_class=HTMLResponse)
-def playback(request: Request) -> str:
+def playback(request: Request, response: Response) -> str:
+    # Cache-Control (2026-09-22): this page had NO cache-related headers
+    # at all -- confirmed live on Ryzen (curl -D against the real
+    # deployed route). The customer branch below bakes a fresh snapshot
+    # of this camera's own recent recordings directly into the page's
+    # own inline <script> (recordingsByCamera=...) at render time --
+    # correct at the instant it's rendered, but with no explicit
+    # Cache-Control, a browser is free to resurrect an OLD rendering of
+    # this exact page from disk cache or back/forward cache (bfcache)
+    # on a later visit -- especially likely for this PWA-shell app on a
+    # phone, where "reopening the app" commonly restores a suspended
+    # tab's exact prior DOM/JS state rather than performing a genuine
+    # network navigation. That resurrected page's baked-in JSON is
+    # frozen at whatever moment it was first rendered and never
+    # updates itself -- indistinguishable, from the customer's side, from
+    # "Playback is stuck," even though every server-side query behind
+    # it (_customer_recording_rows()/_catalog_local_recordings_for_
+    # camera()) is already correct and current on every genuine
+    # request. This forces every visit to be a real network round trip.
+    response.headers["Cache-Control"] = "no-store"
 
 
 

@@ -180,3 +180,99 @@ def test_multiple_crossings_in_one_cycle_share_one_thumbnail_not_one_each(monkey
     day_folder = _people_counting_setup
     saved_files = list(day_folder.rglob("*.jpg"))
     assert len(saved_files) == 1, f"expected exactly one thumbnail file for one detection cycle, got {len(saved_files)}"
+
+
+# ---------------------------------------- 2026-09-22: linked_recording gap
+
+
+class _OneCrossingCounter:
+    in_count = 1
+    out_count = 0
+
+    @property
+    def occupancy(self):
+        return self.in_count - self.out_count
+
+    def update(self, centroids, debug=False):
+        class _Event:
+            direction = "in"
+            track_id = 1
+            frame_index = 1
+            x = 0.5
+            y = 0.5
+
+        return [_Event()]
+
+
+def test_a_crossing_on_an_event_mode_camera_schedules_persist_event_recording_and_backfill(monkeypatch, _people_counting_setup):
+    """Real, separate gap found live on Ryzen (2026-09-22): this worker
+    never called persist_event_recording() at all, for any camera, ever
+    -- unlike save_yolo_events(), which at least builds a clip that a
+    coincidentally-overlapping motion/AI detection might produce. A
+    camera whose ONLY active detector is People Counting had no path to
+    a real clip covering a crossing's own window, so linked_recording_
+    for() found nothing and nothing ever built the file it needed --
+    not just "too early", genuinely unresolvable. Proves both the new
+    persist_event_recording() scheduling and the companion backfill are
+    wired for an Event-mode camera."""
+    monkeypatch.setattr(main.people_counting, "PeopleCounter", lambda line: _OneCrossingCounter())
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+    monkeypatch.setattr(
+        main, "detect_objects_frame",
+        lambda camera_number: {
+            "ok": True, "frame": _fake_frame(), "error": None,
+            "detections": [{"class_name": "person", "x": 270, "y": 190, "width": 100, "height": 100}],
+        },
+    )
+    monkeypatch.setattr(main, "append_analytics_event", lambda event: None)
+
+    persisted = []
+
+    async def fake_persist_event_recording(camera_number, start, end, *, detector=None, trigger_id=None):
+        persisted.append((camera_number, detector, trigger_id))
+
+    monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
+
+    backfilled = []
+
+    async def fake_backfill(camera_number, event_ids, event_time):
+        backfilled.append((camera_number, event_ids))
+
+    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", fake_backfill)
+
+    asyncio.run(_run_one_cycle(3, monkeypatch))
+
+    assert len(persisted) == 1
+    assert persisted[0][0] == 3
+    assert persisted[0][1] == "people_counting"
+    assert persisted[0][2] is not None
+    assert len(backfilled) == 1
+    assert backfilled[0][0] == 3
+    assert len(backfilled[0][1]) == 1  # exactly the one crossing event from this cycle
+
+
+def test_a_crossing_on_a_continuous_mode_camera_schedules_neither(monkeypatch, _people_counting_setup):
+    """A Continuous-mode camera always has an already-existing segment
+    covering "now" -- linked_recording_for()'s own eager lookup is
+    already correct for it, so scheduling either a redundant
+    persist_event_recording() or a backfill would be pure waste."""
+    monkeypatch.setattr(main.people_counting, "PeopleCounter", lambda line: _OneCrossingCounter())
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "continuous"})
+    monkeypatch.setattr(
+        main, "detect_objects_frame",
+        lambda camera_number: {
+            "ok": True, "frame": _fake_frame(), "error": None,
+            "detections": [{"class_name": "person", "x": 270, "y": 190, "width": 100, "height": 100}],
+        },
+    )
+    monkeypatch.setattr(main, "append_analytics_event", lambda event: None)
+
+    persisted = []
+    backfilled = []
+    monkeypatch.setattr(main, "persist_event_recording", lambda *a, **k: persisted.append(a))
+    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", lambda *a, **k: backfilled.append(a))
+
+    asyncio.run(_run_one_cycle(4, monkeypatch))
+
+    assert persisted == []
+    assert backfilled == []

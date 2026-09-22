@@ -209,8 +209,40 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
                         if fired:
                             now = datetime.now()
                             thumbnail_url = save_rule_event_thumbnail(camera_number, frame, now, "analytics_rule")
-                            for event in fired:
-                                persist_rule_event(camera_number, event, now, thumbnail_url)
+                            # Event-mode recording + linked_recording backfill
+                            # (2026-09-22, same gap as people_counting_worker()'s
+                            # own): this worker never scheduled persist_event_
+                            # recording() at all -- on an Event-mode camera, no
+                            # local file ever covers "now" at the moment a rule
+                            # fires, so persist_rule_event()'s own eager
+                            # linked_recording_for() call below reliably finds
+                            # nothing, and with nothing else building the clip
+                            # for this exact window, it would stay null forever
+                            # once this feature is actually enabled (still
+                            # inert today -- see module docstring). Scheduled
+                            # once per cycle, mirroring save_yolo_events()'s
+                            # and people_counting_worker()'s own "one persist
+                            # call per scan" shape -- this coroutine already
+                            # runs on the main event loop (started via
+                            # asyncio.create_task() in main.py's own startup
+                            # wiring), so a plain asyncio.create_task() here is
+                            # correct, no cross-thread scheduling needed.
+                            from main import _local_recording_settings, persist_event_recording, _backfill_ai_event_linked_recording
+
+                            in_event_mode = _local_recording_settings(camera_number)["mode"] == "event"
+                            if in_event_mode:
+                                asyncio.create_task(
+                                    persist_event_recording(
+                                        camera_number, now, now,
+                                        detector="customer_analytics_rule", trigger_id=uuid.uuid4().hex[:12],
+                                    )
+                                )
+                            event_ids = [
+                                persist_rule_event(camera_number, event, now, thumbnail_url)["id"]
+                                for event in fired
+                            ]
+                            if in_event_mode and event_ids:
+                                asyncio.create_task(_backfill_ai_event_linked_recording(camera_number, event_ids, now))
         except asyncio.CancelledError:
             raise
         except Exception as error:
