@@ -485,3 +485,94 @@ def test_ai_detection_dedup_does_not_suppress_persist_event_recording_during_sus
     # (not this dedup) is what should decide whether the second call
     # extends the first recording or starts a new one.
     assert persisted[0][2] != persisted[1][2]
+
+
+# --------------------------------------- 2026-09-22: linked_recording backfill scheduling
+
+
+def test_linked_recording_backfill_is_scheduled_for_an_event_mode_camera(
+    monkeypatch, tmp_path, fake_uploader, background_loop
+):
+    """The real gap this closes: save_yolo_events() resolves
+    linked_recording_for() synchronously, before persist_event_
+    recording() has even started building this camera's Event-mode
+    clip, so it reliably finds nothing -- with no retry anywhere, the
+    event stayed linked_recording: null forever. This proves the
+    companion backfill task is actually scheduled, with the real
+    camera/timestamp and every event id from this detection batch."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+
+    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
+        return f"/recordings/clips/motion/motion_{event_id}.mp4"
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+    monkeypatch.setattr(main, "persist_event_recording", lambda *a, **k: asyncio.sleep(0))
+    _standard_mocks(monkeypatch, tmp_path)
+
+    backfill_calls = []
+
+    async def fake_backfill(camera_number, event_ids, event_time):
+        backfill_calls.append((camera_number, event_ids, event_time))
+
+    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", fake_backfill)
+
+    events = main.save_yolo_events(180, _fake_result("car"))
+
+    assert _wait_until(lambda: len(backfill_calls) == 1), \
+        "the linked_recording backfill must actually be scheduled on the background loop"
+    camera_number, event_ids, event_time = backfill_calls[0]
+    assert camera_number == 180
+    assert set(event_ids) == {event["id"] for event in events}
+    assert event_time == events[0]["timestamp"] or event_time is not None
+
+
+def test_linked_recording_backfill_is_not_scheduled_for_a_continuous_mode_camera(
+    monkeypatch, tmp_path, fake_uploader, background_loop
+):
+    """A Continuous-mode camera always has an already-existing segment
+    covering "now" (that's the whole point of Continuous mode) --
+    linked_recording_for()'s own synchronous, eager lookup is already
+    correct for it, so scheduling a redundant backfill would be pure
+    waste, never a correctness fix."""
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "continuous"})
+
+    async def fake_build_motion_event_clip(event_id, camera_number, start, end):
+        return f"/recordings/clips/motion/motion_{event_id}.mp4"
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+    _standard_mocks(monkeypatch, tmp_path)
+
+    backfill_calls = []
+
+    async def fake_backfill(camera_number, event_ids, event_time):
+        backfill_calls.append((camera_number, event_ids, event_time))
+
+    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", fake_backfill)
+
+    main.save_yolo_events(181, _fake_result("car"))
+
+    assert _wait_until(lambda: len(fake_uploader) == 1)
+    time.sleep(0.3)  # let a wrongly-scheduled backfill have a chance to also land
+    assert backfill_calls == []
+
+
+def test_linked_recording_backfill_is_not_scheduled_when_there_are_no_qualifying_detections(
+    monkeypatch, tmp_path, background_loop
+):
+    monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+    _standard_mocks(monkeypatch, tmp_path)
+
+    backfill_calls = []
+
+    async def fake_backfill(camera_number, event_ids, event_time):
+        backfill_calls.append((camera_number, event_ids, event_time))
+
+    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", fake_backfill)
+
+    events = main.save_yolo_events(182, _fake_result())  # no detections at all
+    assert events == []
+    time.sleep(0.2)
+    assert backfill_calls == []

@@ -32149,6 +32149,78 @@ def linked_recording_for(
     return None
 
 
+def _patch_analytics_events_linked_recording(event_ids: list[str], linked_recording: str) -> None:
+    """The one-time, locked backfill write _backfill_ai_event_linked_
+    recording() below uses -- same analytics_events_file_lock/
+    load_json_list/save_json_list shape append_analytics_event() itself
+    already uses for this exact file, so this write is never
+    interleaved with a concurrent append. Only ever sets
+    linked_recording on an event that still has none -- a value
+    already present by the time this runs (e.g. a merge-extended
+    recording whose earlier detection's own backfill already resolved
+    it) is left untouched, never overwritten with a second, possibly
+    different, guess."""
+    event_id_set = set(event_ids)
+    with analytics_events_file_lock:
+        events = load_json_list(ANALYTICS_EVENTS_FILE)
+        changed = False
+        for stored_event in events:
+            if stored_event.get("id") in event_id_set and not stored_event.get("linked_recording"):
+                stored_event["linked_recording"] = linked_recording
+                changed = True
+        if changed:
+            save_json_list(ANALYTICS_EVENTS_FILE, events)
+
+
+async def _backfill_ai_event_linked_recording(camera_number: int, event_ids: list[str], event_time: datetime) -> None:
+    """Companion to persist_event_recording(), scheduled alongside it
+    for the exact same trigger (an Event-mode camera's qualifying AI
+    detection) -- fixes a real gap confirmed live on Ryzen (2026-09-22):
+    save_yolo_events() resolves linked_recording_for() synchronously,
+    at the moment of detection, before persist_event_recording() (an
+    independent, separately-scheduled task) has even started building
+    the corresponding Event-mode clip, which requires waiting until the
+    post-roll window has actually elapsed in wall-clock time and then
+    running a real ffmpeg concat. For an Event-mode camera, no local
+    file ever covers "now" at the exact moment of detection --
+    linked_recording_for()'s own "does an already-existing file cover
+    this instant" check is only ever true by construction for
+    Continuous mode's always-recording segments -- so that first,
+    synchronous attempt reliably found nothing, and with no retry
+    anywhere the event's linked_recording stayed null forever even
+    once the real clip existed moments later.
+
+    Waits the same window persist_event_recording() itself waits past
+    (plus a real margin for that function's own ffmpeg concat to
+    finish), re-resolves linked_recording_for() -- now against a real,
+    completed clip -- and patches every one of THIS SAME detection
+    batch's already-saved events (by id) whose linked_recording is
+    still falsy. Never raises: a clip that still doesn't exist (a real
+    build failure, no buffered sources, or a camera never actually in
+    Event mode) simply leaves the event's original value unchanged,
+    exactly like today -- this only ever fills in an event that would
+    otherwise stay permanently null, never removes or overwrites an
+    already-real value."""
+    from event_clips import compute_clip_window
+
+    settings = _local_recording_settings(camera_number)
+    window = compute_clip_window(
+        event_time, event_time,
+        pre_roll_seconds=settings["pre_roll_seconds"], post_roll_seconds=settings["post_roll_seconds"],
+    )
+    # Same +3s persist_event_recording() itself waits past window.end,
+    # plus a real extra margin for that function's own ffmpeg concat
+    # (a real subprocess call, up to a 60s timeout in the worst case,
+    # normally a couple of seconds) to actually finish and replace the
+    # destination file before this looks for it.
+    wait_seconds = max(0.0, (window.end - datetime.now()).total_seconds()) + 3.0 + 10.0
+    await asyncio.sleep(wait_seconds)
+    linked_recording = linked_recording_for(camera_number, event_time, event_time)
+    if not linked_recording:
+        return
+    await asyncio.to_thread(_patch_analytics_events_linked_recording, event_ids, linked_recording)
+
+
 
 
 
@@ -34727,6 +34799,16 @@ async def store_motion_event(
     # stalled every concurrent HTTP handler -- /health, /playback,
     # /events, and the dashboard -- for the duration of each motion
     # event, confirmed live via a Samsung production audit.
+    #
+    # linked_recording (2026-09-22): this "minimal" mirror dict omitted
+    # it entirely -- confirmed live on Ryzen, every plain "motion" event
+    # in analytics_events.json carried linked_recording: null even
+    # though the correct value was already sitting right here on
+    # `event` (the same EventReviewModel field the correlated Smart
+    # Motion event a few lines below already copies successfully via
+    # `linked_recording=event.linked_recording`). Not a timing/race
+    # issue like the AI-detection path below -- this one was simply
+    # never included.
     await asyncio.to_thread(
         append_analytics_event,
         {
@@ -34737,6 +34819,7 @@ async def store_motion_event(
             "confidence": event.confidence,
             "object_count": 1,
             "detections": [],
+            "linked_recording": event.linked_recording,
         },
     )
 
@@ -38052,7 +38135,29 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 saved_events.append(plate_event)
         saved_events.append(event)
 
-
+    # linked_recording backfill (2026-09-22): the SAME trigger condition
+    # already used to schedule persist_event_recording() above -- this
+    # batch's events (person/car/vehicle/ppe/plate, every entry in
+    # saved_events) all currently carry the eagerly-resolved
+    # `linked_recording` snapshot taken before this camera's Event-mode
+    # clip existed (see _backfill_ai_event_linked_recording()'s own
+    # docstring for the full trace). Scheduled once per detection batch,
+    # after every event in it has been constructed, so it has every id
+    # that needs patching -- not per-class-name, which would schedule a
+    # redundant duplicate backfill per detected class in the same scan.
+    if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and saved_events:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _backfill_ai_event_linked_recording(
+                    camera_number, [saved["id"] for saved in saved_events], now,
+                ),
+                _ai_event_media_loop,
+            )
+        except RuntimeError as error:
+            print(
+                f"AI event {event_group_id}: could not schedule "
+                f"linked_recording backfill: {type(error).__name__}: {error}"
+            )
 
 
 

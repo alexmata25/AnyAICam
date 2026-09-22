@@ -283,3 +283,36 @@ def test_motion_alert_logic_is_unaffected(monkeypatch, fake_uploader):
     assert len(alert_calls) == 1
     assert alert_calls[0]["event_type"] == "motion"
     assert alert_calls[0]["camera"] == 10
+
+
+def test_analytics_events_mirror_now_includes_linked_recording(monkeypatch, fake_uploader):
+    """Real gap found live on Ryzen (2026-09-22), part of the broader
+    event-to-recording linkage investigation: the "minimal" analytics_
+    events.json mirror dict store_motion_event() writes omitted
+    linked_recording entirely, even though the correct value (`event.
+    linked_recording` -- the same optimistic future-clip-path both the
+    motion_events.jsonl record above and the correlated Smart Motion
+    event a few lines later in main.py both already use successfully)
+    was already computed and sitting right there. Every plain "motion"
+    event in Events/Investigate showed linked_recording: null forever
+    as a direct result -- not a timing race like the AI-detection
+    path's own gap, simply never included in this one dict."""
+    _standard_motion_mocks(monkeypatch)
+
+    captured_events = []
+    monkeypatch.setattr(main, "append_analytics_event", lambda event: captured_events.append(event))
+
+    async def fake_build_motion_event_clip(*a):
+        return None
+
+    monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
+
+    now = datetime.now()
+    asyncio.run(_store_and_drain(11, now, now))
+
+    motion_mirrors = [event for event in captured_events if event.get("event_type") == "motion"]
+    assert len(motion_mirrors) == 1
+    linked_recording = motion_mirrors[0].get("linked_recording")
+    assert linked_recording, "the analytics_events.json mirror must carry a real linked_recording, not None"
+    assert "/recordings/clips/motion/motion_" in linked_recording
+    assert linked_recording.endswith(".mp4")
