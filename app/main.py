@@ -2745,6 +2745,29 @@ AI_DETECTION_INTERVAL_SECONDS = max(2, int(os.environ.get("AI_DETECTION_INTERVAL
 # load out instead of serializing a burst of 5 every cycle.
 AI_DETECTOR_STARTUP_STAGGER_SECONDS = max(0, int(os.environ.get("AI_DETECTOR_STARTUP_STAGGER_SECONDS", "1")))
 
+# 2026-09-22 (real restart-loop root cause found live on Ryzen): unlike
+# ai_person_detector() above, process_supervisor() had NO startup stagger
+# at all -- lifespan()'s own startup loop creates one "live" and one
+# "recording" asyncio.create_task() per camera slot back-to-back, with no
+# gap, and process_supervisor()'s very first action on each is to spawn a
+# real FFmpeg subprocess. On a 5-camera appliance that's ~10 FFmpeg
+# processes launched in the same instant every time the container starts
+# -- confirmed live: load average briefly exceeded 20 on an 8-core box
+# immediately after every restart, long enough that even Docker's own
+# lightweight /health HEALTHCHECK probe (a static JSON response, no work
+# of its own) couldn't get scheduled within its 5s timeout, 3 checks in a
+# row, which a host-level watchdog (anyaicam-healthcheck-restart.timer)
+# then reacted to by restarting the container -- recreating the exact
+# same thundering herd and repeating indefinitely. Mirrors
+# AI_DETECTOR_STARTUP_STAGGER_SECONDS's own shape exactly: spreads each
+# supervisor's first FFmpeg spawn across a few seconds instead of forcing
+# every camera's cold start (RTSP handshake, initial encode setup -- the
+# genuinely CPU-heavy phase) into the same instant. Applied ONCE, before
+# process_supervisor()'s own reconnect loop begins -- a later real-world
+# reconnect (an RTSP hiccup hours into normal operation) is already
+# naturally desynchronized across cameras and needs no stagger.
+CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS = max(0, float(os.environ.get("CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS", "1")))
+
 
 
 
@@ -16818,6 +16841,16 @@ async def process_supervisor(camera_number: int, mode: str) -> None:
 
     """Keep one camera worker alive and retry when a camera is unavailable."""
 
+    # Startup stagger (2026-09-22) -- see CAMERA_SUPERVISOR_STARTUP_STAGGER_
+    # SECONDS's own comment for the real restart-loop this fixes. lifespan()
+    # creates one "live" and one "recording" task per camera slot back-to-
+    # back; distinguishing by mode as well as camera_number spreads out
+    # BOTH of a single camera's own two tasks, not just different cameras'
+    # tasks against each other -- 10 total launches on a 5-camera appliance,
+    # evenly spread instead of colliding in the same instant.
+    if CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS:
+        stagger_index = (camera_number - 1) * 2 + (0 if mode == "live" else 1)
+        await asyncio.sleep(stagger_index * CAMERA_SUPERVISOR_STARTUP_STAGGER_SECONDS)
 
 
 
