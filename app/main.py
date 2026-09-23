@@ -28705,6 +28705,43 @@ def cleanup_mobile_pairing_codes(codes: dict) -> dict:
 
 
 
+def _mobile_devices_identity(request: Request) -> dict:
+    """2026-09-23 fix: every mobile-devices route below (pairing-code
+    creation, the devices list, and revoke/notification-toggle) read
+    current_user(request) alone -- the legacy local-VMS session cookie
+    (anyaicam_session), never partner_identity()'s partner-portal cookie
+    (anyaicam_partner_session) that every real customer_owner/
+    customer_viewer session actually carries, the same auth-mismatch
+    class subscription_portal_page's own 2026-09-21 fix already
+    documents. Confirmed live: current_user() fell through to its
+    anonymous fallback ({"id": "anonymous", ...}) for a real customer
+    session, so mobile_device_owner_matches()'s device.get("user_id")==
+    user.get("id") check matched "anonymous"==\"anonymous\" for EVERY
+    real customer account on this deployment -- any customer could see,
+    rename, toggle notifications on, or revoke any other customer's
+    paired mobile devices, and any newly created pairing code was
+    stamped with that same shared anonymous identity rather than the
+    actual signed-in customer.
+
+    Returns a user-shaped dict namespaced as "customer:<customer_id>"
+    for a real customer session -- deliberately reusing the existing
+    user_id-keyed storage (mobile_devices.json) and
+    mobile_device_owner_matches() unchanged rather than adding a
+    parallel schema/field, since a legacy local/staff current_user().id
+    is never a "customer:" - prefixed string, so the two identity
+    spaces can never collide. Every other session kind (local/staff)
+    falls through to the exact original current_user(request) call,
+    completely unchanged -- this same JSON-file-backed feature also
+    serves the local single-tenant VMS's own device-pairing flow, which
+    this fix must not touch."""
+    from partner_portal import partner_identity
+
+    identity = partner_identity(request)
+    if identity and identity.get("role") in {"customer_owner", "customer_viewer"}:
+        return {"id": f"customer:{identity['customer_id']}", "email": identity.get("email") or "", "role": "viewer"}
+    return current_user(request)
+
+
 def create_mobile_pairing_code(user: dict, device_name: str) -> dict:
 
 
@@ -90932,12 +90969,7 @@ def mobile_devices_api(request: Request) -> dict:
 
 
 
-
-
-
-
-
-    user = current_user(request)
+    user = _mobile_devices_identity(request)
 
 
 
@@ -91072,7 +91104,7 @@ def create_mobile_pairing(
 
 
 
-    user = current_user(request)
+    user = _mobile_devices_identity(request)
 
 
 
@@ -91603,7 +91635,7 @@ def update_mobile_device(
 
 
 
-    user = current_user(request)
+    user = _mobile_devices_identity(request)
 
 
 
