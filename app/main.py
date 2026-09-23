@@ -48203,6 +48203,7 @@ from wireguard_remote import register_wireguard_remote_appliance_routes
 import talk_down_discovery
 import talk_audio_relay_client
 from facial_recognition_ui import register_facial_recognition_routes
+from aac_voice_call import register_aac_voice_call_routes
 
 
 
@@ -48354,6 +48355,7 @@ register_live_view_wireguard_routes(app)
 register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
 register_facial_recognition_routes(app, page_shell)
+register_aac_voice_call_routes(app, page_shell)
 register_door_access_routes(app)
 register_wireguard_remote_appliance_routes(app)
 
@@ -121994,9 +121996,22 @@ def _render_customer_alerts(request: Request) -> str:
         # by _customer_notifications()) were available -- the exact same
         # timestamp/event_id/has_event_clip shape _render_customer_events()
         # already passes correctly for the identical action-button helper.
-        actions_html = _customer_event_actions(
-            notification.get("camera_id"), raw_timestamp, notification.get("event_id"), notification.get("has_event_clip")
-        )
+        # AAC Voice Call (2026-09-23): "Answer" / "View camera" instead of
+        # the generic Playback/Snapshot action-links above -- this event_id
+        # is an aac_voice_call_events.id, not a detection_events.id, so
+        # _customer_event_actions()'s own event-clip lookup would find
+        # nothing for it (harmlessly, but uselessly). "Dismiss" for this
+        # first vertical slice is the existing "Mark read" action below;
+        # a dedicated dismiss action wired to aac_voice_call_events.
+        # mark_dismissed() is next-phase UI polish, not required for the
+        # notification to be genuinely actionable today.
+        if notification.get("event_type") == "aac_voice_call" and notification.get("event_id"):
+            voice_call_href = f'/aac/voice-call/{escape(str(notification["event_id"]), quote=True)}'
+            actions_html = f'<a class="action-button" href="{voice_call_href}">Answer</a> <a class="ghost-button" href="{voice_call_href}">View camera</a>'
+        else:
+            actions_html = _customer_event_actions(
+                notification.get("camera_id"), raw_timestamp, notification.get("event_id"), notification.get("has_event_clip")
+            )
         mark_read_html = (
             '' if is_read else
             f'<button class="ghost-button mark-alert-read" type="button" data-notification-id="{escape(str(notification["id"]), quote=True)}">Mark read</button>'

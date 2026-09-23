@@ -33,7 +33,13 @@ from partner_db import connection,row,rows
 # always called this "Face Access alert") could never have reached a
 # customer without it, regardless of what appliance_cloud.py's
 # analytics_event_available() route built for the message.
-SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition'}
+# 'aac_voice_call' added (2026-09-23): AAC Voice Call Phase 1 -- a
+# visitor-intent event at a configured entrance camera. Without it
+# here, aac_voice_call.py's own call to fanout_appliance_event() would
+# silently create zero notifications (the same class of gap 'ppe'/
+# 'storage_problem'/'facial_recognition' above were each added to fix),
+# even though the in-app notification is the entire point of Phase 3.
+SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call'}
 
 # Per-(user, camera, event_type) minimum spacing between EXTERNAL
 # (email/sms) delivery attempts -- "Prevent duplicate/spam notifications
