@@ -62,6 +62,19 @@ rather than door_access.py's Face-Access-specific manual-unlock flow,
 since that flow's own authorization model (can_unlock permission,
 automatic-unlock evaluation from a matched face) is a different
 product concept from a homeowner-authorized unlock mid-voice-call.
+
+UPDATE (2026-09-23): the paragraph above describes this module's own
+history, not its current state -- door unlock is now real (see
+aac_voice_call_door.py's own module docstring; request_door_unlock()
+just below remains superseded/uncalled, exactly as before). This same
+date also adds Phase 2's own "owed" piece: real proactive triggering.
+handle_person_detected() is what main.py's detection-loop hook now
+calls for a genuine appliance person-detection (see that hook's own
+comment in main.py), and record_visitor_utterance() is the listening-
+window's own real, natural-language-classified continue-vs-escalate
+step -- see both functions' own docstrings, and aac_voice_call_
+greeting.py's module docstring for the one honestly-still-not-real
+piece (actual text-to-speech synthesis and camera-speaker delivery).
 """
 from __future__ import annotations
 
@@ -74,10 +87,26 @@ from pydantic import BaseModel
 
 import aac_voice_call_door
 import aac_voice_call_events as store
-from aac_voice_call_intent import DeterministicVisitorIntentClassifier, VisitorIntentClassifier
+import aac_voice_call_greeting
+from aac_voice_call_intent import DeterministicVisitorIntentClassifier, NaturalLanguageVisitorIntentClassifier, VisitorIntentClassifier
 from notification_engine import fanout_appliance_event
 from partner_db import row, rows
 from partner_portal import partner_identity
+
+# 2026-09-23 proactive flow: how long one camera stays in its own
+# debounce/cooldown window after a real trigger before it is willing to
+# greet again -- long enough that one visitor standing at the door
+# doesn't hear/trigger a flood of repeated greetings and notifications,
+# short enough that a genuinely new visitor minutes later still gets
+# greeted. See aac_voice_call_events.check_and_stamp_cooldown() for the
+# atomic claim this gates.
+DEFAULT_GREETING_COOLDOWN_SECONDS = 300.0
+
+# How many of the visitor's own utterances the listening window accepts
+# before escalating to the homeowner even if intent never resolved
+# confidently -- a real conversation should not loop forever with
+# neither side reaching a resolution.
+MAX_UTTERANCES_BEFORE_ESCALATION = 3
 
 
 def _customer_identity(request: Request) -> dict:
@@ -96,6 +125,32 @@ def _authorized_camera(customer_id: str, camera_id: str) -> dict:
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found.")
     return camera
+
+
+def _authorized_site(customer_id: str, site_id: str) -> dict:
+    site = row("SELECT id,customer_id,name FROM sites WHERE id=? AND customer_id=?", (site_id, customer_id))
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found.")
+    return site
+
+
+def _camera_tenant_context(db, camera_number: int) -> dict | None:
+    """Resolves an appliance-local camera_number to this feature's own
+    tenant-scoped identity (id/customer_id/site_id/name) -- a small,
+    deliberately-local duplicate of facial_events.py's own private
+    _camera_tenant_context() rather than importing that module's
+    internal helper: each detection-hook module owns its own camera-
+    number resolution for its own use, matching this codebase's
+    existing convention of door_access.door_camera() and facial_events.
+    _camera_tenant_context() being separate, not-shared lookups despite
+    doing a similar thing. Returns None for an unknown camera_number --
+    never raises, since this is called from a non-request background
+    detection context (main.py's detection loop), not an HTTP route."""
+    record = db.execute(
+        "SELECT id,customer_id,site_id,name FROM cameras WHERE camera_number=?",
+        (camera_number,),
+    ).fetchone()
+    return dict(record) if record else None
 
 
 def _visitor_message(intent: str, camera_name: str) -> str:
@@ -184,6 +239,183 @@ def trigger_visitor_event(
     }
 
 
+def handle_person_detected(
+    *,
+    customer_id: str,
+    camera_id: str,
+    trigger_detection_event_id: str | None = None,
+    thumbnail_s3_key: str | None = None,
+    cooldown_seconds: float = DEFAULT_GREETING_COOLDOWN_SECONDS,
+    greeting_provider: object | None = None,
+    actor: dict | None = None,
+) -> dict:
+    """The real proactive trigger this phase adds: a person was detected
+    on a camera -- either a genuine appliance detection (see main.py's
+    detection-loop hook, which resolves camera_number to camera_id/
+    customer_id via _camera_tenant_context() above and calls this
+    function directly) or the customer-triggered simulate-person-
+    detected route below, mirroring trigger_visitor_event()/
+    simulate_trigger()'s own precedent for exactly this "real
+    orchestration, simulated upstream trigger source until the
+    appliance-side wiring is separately hardware-validated" pattern.
+
+    Never raises for "not configured" or "still cooling down" -- both
+    are normal, expected outcomes for a background detection hook that
+    must not crash the wider detection loop (see main.py's own PPE/
+    facial-recognition hooks for the same non-fatal posture) -- the
+    caller reads result["triggered"] and result.get("skipped_reason")
+    instead. Only "person detected -> greet -> notify -> open listening
+    window" happens here; door authorization is never touched by this
+    function or anything it calls (aac_voice_call_greeting.speak() has
+    no relay_control dependency at all)."""
+    if not store.is_entrance_camera(customer_id, camera_id):
+        return {"triggered": False, "skipped_reason": "not_entrance_camera"}
+    if not store.check_and_stamp_cooldown(customer_id=customer_id, camera_id=camera_id, cooldown_seconds=cooldown_seconds):
+        return {"triggered": False, "skipped_reason": "cooldown"}
+
+    camera = _authorized_camera(customer_id, camera_id)
+
+    event_id = store.create_voice_call_event(
+        customer_id=customer_id,
+        site_id=camera["site_id"],
+        camera_id=camera_id,
+        trigger_detection_event_id=trigger_detection_event_id,
+        thumbnail_s3_key=thumbnail_s3_key,
+        trigger_source="detection",
+        actor=actor,
+    )
+
+    greeting_text = store.resolve_greeting_text(customer_id=customer_id, camera_id=camera_id, site_id=camera["site_id"])
+    try:
+        provider = greeting_provider or aac_voice_call_greeting.get_provider()
+        provider.speak(aac_voice_call_greeting.GreetingRequest(
+            camera_id=camera_id, customer_id=customer_id, event_id=event_id, text=greeting_text,
+        ))
+        # Only stamped on a successful dispatch -- an exception here
+        # means the greeting was never actually sent anywhere, and
+        # greeted_at must stay honest about that (matches this
+        # codebase's own "never pretend the door opened" posture,
+        # applied to "never pretend the greeting was spoken"). A failed
+        # dispatch still never blocks the homeowner notification below,
+        # which is the more important real-world outcome of the two --
+        # same non-fatal posture as main.py's own PPE/facial-
+        # recognition/LPR detection hooks.
+        store.stamp_greeted(event_id=event_id, customer_id=customer_id, greeting_text_used=greeting_text, actor=actor)
+    except Exception as error:
+        print(f"AAC Voice Call greeting dispatch skipped (non-fatal) for camera {camera_id}: {error}")
+
+    appliance = {"customer_id": customer_id, "site_id": camera["site_id"]}
+    notify_event = {
+        "id": event_id,
+        "camera_id": camera_id,
+        "event_type": "aac_voice_call",
+        "timestamp": datetime.now().isoformat(),
+        "message": f"Someone is at {camera['name'] or 'your entrance camera'}.",
+        "severity": "info",
+    }
+    notifications_created = fanout_appliance_event(appliance, notify_event)
+
+    notification_id = None
+    if notifications_created:
+        created_row = row(
+            "SELECT id FROM notifications WHERE event_id=? AND event_type='aac_voice_call' ORDER BY created_at DESC LIMIT 1",
+            (event_id,),
+        )
+        notification_id = created_row["id"] if created_row else None
+        store.mark_notified(event_id=event_id, customer_id=customer_id, notification_id=notification_id or "", actor=actor)
+
+    store.open_listening_window(event_id=event_id, customer_id=customer_id, actor=actor)
+
+    return {
+        "triggered": True,
+        "event_id": event_id,
+        "greeting_text": greeting_text,
+        "notifications_created": notifications_created,
+        "notification_id": notification_id,
+    }
+
+
+def record_visitor_utterance(
+    *,
+    customer_id: str,
+    event_id: str,
+    transcript_text: str,
+    classifier: VisitorIntentClassifier | None = None,
+    actor: dict | None = None,
+) -> dict:
+    """Step 2 of the proactive flow: the visitor said something during
+    an open listening window. Classifies intent with
+    NaturalLanguageVisitorIntentClassifier (broad natural-phrasing
+    coverage, NOT a fixed phrase list -- see that class's own
+    docstring), records it, and decides continue-vs-escalate.
+
+    This function -- and everything it calls -- NEVER reads any door-
+    unlock/relay_control code path, and never will by construction:
+    escalation only ever creates a second, ordinary homeowner
+    notification through the exact same fanout_appliance_event() path
+    handle_person_detected() already used, the same real mechanism a
+    human then reviews and acts on through the existing, separately-
+    reviewed aac_voice_call_door.py two-step confirmed-unlock flow --
+    nothing a visitor says can ever unlock a door on its own, no matter
+    how it is classified or how urgent it sounds."""
+    event = store.get_voice_call_event(event_id=event_id, customer_id=customer_id)
+    if not event:
+        raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+    if not event.get("listening_opened_at") or event.get("listening_closed_at"):
+        raise HTTPException(status_code=409, detail="This call is not currently listening for a response.")
+    if event["state"] in ("ended", "dismissed"):
+        raise HTTPException(status_code=409, detail="This call has already ended.")
+
+    classifier = classifier or NaturalLanguageVisitorIntentClassifier()
+    intent_result = classifier.classify(transcript_text)
+    urgent = NaturalLanguageVisitorIntentClassifier.has_urgent_signal(transcript_text)
+
+    utterance_count = store.record_visitor_utterance(
+        event_id=event_id,
+        customer_id=customer_id,
+        transcript_text=transcript_text,
+        intent=intent_result.intent,
+        intent_confidence=intent_result.confidence,
+        actor=actor,
+    )
+
+    escalated = False
+    # Urgent always escalates immediately -- a distress/emergency signal
+    # is never held back to "give the visitor another chance". An
+    # unresolved (UNKNOWN) intent instead gets up to
+    # MAX_UTTERANCES_BEFORE_ESCALATION tries to clarify before
+    # escalating -- a single mumbled/unclear utterance should not by
+    # itself page the homeowner; several in a row without ever
+    # resolving should. A CONFIDENTLY recognized intent (delivery,
+    # maintenance, etc.) never escalates through this path at all --
+    # the homeowner already got the initial notification and can check
+    # in whenever they choose.
+    should_escalate = urgent or (intent_result.intent == "unknown" and utterance_count >= MAX_UTTERANCES_BEFORE_ESCALATION)
+    if should_escalate and not event.get("escalated_at"):
+        camera = _authorized_camera(customer_id, event["camera_id"])
+        store.mark_escalated(event_id=event_id, customer_id=customer_id, actor=actor)
+        store.close_listening_window(event_id=event_id, customer_id=customer_id, actor=actor)
+        appliance = {"customer_id": customer_id, "site_id": camera["site_id"]}
+        escalate_event = {
+            "id": event_id,
+            "camera_id": event["camera_id"],
+            "event_type": "aac_voice_call",
+            "timestamp": datetime.now().isoformat(),
+            "message": f"A visitor at {camera['name'] or 'your entrance camera'} needs your attention.",
+            "severity": "warning",
+        }
+        fanout_appliance_event(appliance, escalate_event)
+        escalated = True
+
+    return {
+        "event_id": event_id,
+        "intent": intent_result.intent,
+        "intent_confidence": intent_result.confidence,
+        "utterance_count": utterance_count,
+        "escalated": escalated,
+    }
+
+
 def request_door_unlock(*, customer_id: str, camera_id: str, event_id: str, requested_by: str) -> None:
     """SUPERSEDED (2026-09-23): Phase 5's real, owner-approved door-
     unlock flow is now implemented in aac_voice_call_door.py
@@ -205,6 +437,23 @@ class SimulateTriggerPayload(BaseModel):
     camera_id: str
     transcript_text: str = ""
     thumbnail_s3_key: str | None = None
+
+
+class SimulatePersonDetectedPayload(BaseModel):
+    camera_id: str
+    thumbnail_s3_key: str | None = None
+
+
+class VisitorUtterancePayload(BaseModel):
+    transcript_text: str
+
+
+class CameraGreetingPayload(BaseModel):
+    greeting_text: str | None = None
+
+
+class SiteGreetingPayload(BaseModel):
+    greeting_text: str
 
 
 class AnswerPayload(BaseModel):
@@ -233,6 +482,50 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         camera = _authorized_camera(identity["customer_id"], camera_id)
         store.set_entrance_camera(customer_id=identity["customer_id"], camera_id=camera["id"], enabled=enabled, configured_by=identity.get("email"))
         return {"message": f"{camera['name'] or camera_id} {'enabled' if enabled else 'disabled'} as an AAC Voice Call entrance camera.", "camera_id": camera_id, "enabled": enabled}
+
+    @app.post("/api/customer/aac/voice-call/entrance-cameras/{camera_id}/greeting")
+    def set_camera_greeting(request: Request, camera_id: str, payload: CameraGreetingPayload) -> dict:
+        """customer_owner-only, same convention as set_entrance_camera()
+        just above. greeting_text=null clears the per-camera override,
+        falling back to the site default (or the fixed fallback)."""
+        identity = _customer_identity(request)
+        if identity["role"] != "customer_owner":
+            raise HTTPException(status_code=403, detail="Only the account owner can configure entrance camera greetings.")
+        camera = _authorized_camera(identity["customer_id"], camera_id)
+        store.set_camera_greeting_text(customer_id=identity["customer_id"], camera_id=camera["id"], greeting_text=payload.greeting_text, configured_by=identity.get("email"))
+        return {"message": f"Greeting updated for {camera['name'] or camera_id}.", "camera_id": camera_id, "greeting_text": payload.greeting_text}
+
+    @app.post("/api/customer/aac/voice-call/sites/{site_id}/greeting")
+    def set_site_greeting(request: Request, site_id: str, payload: SiteGreetingPayload) -> dict:
+        """customer_owner-only. Sets the DEFAULT greeting every entrance
+        camera on this site uses unless it has its own per-camera
+        override (see set_camera_greeting() above)."""
+        identity = _customer_identity(request)
+        if identity["role"] != "customer_owner":
+            raise HTTPException(status_code=403, detail="Only the account owner can configure site greetings.")
+        site = _authorized_site(identity["customer_id"], site_id)
+        store.set_site_default_greeting(customer_id=identity["customer_id"], site_id=site["id"], greeting_text=payload.greeting_text, configured_by=identity.get("email"))
+        return {"message": f"Default greeting updated for {site['name'] or site_id}.", "site_id": site_id, "greeting_text": payload.greeting_text}
+
+    @app.post("/api/customer/aac/voice-call/simulate-person-detected")
+    def simulate_person_detected(request: Request, payload: SimulatePersonDetectedPayload) -> dict:
+        """The proactive flow's own honest simulate entrypoint --
+        exactly simulate_trigger()'s own precedent just below, applied
+        to the NEW "person detected" starting event instead of a
+        transcript-already-known trigger: real appliance-side person-
+        detection wiring is main.py's own detection-loop hook (see
+        handle_person_detected()'s own docstring), which calls the same
+        underlying function this route calls; only the upstream trigger
+        source differs, and every downstream step (cooldown, greeting
+        dispatch, notification fan-out, listening window) is real and
+        identical either way."""
+        identity = _customer_identity(request)
+        return handle_person_detected(
+            customer_id=identity["customer_id"],
+            camera_id=payload.camera_id,
+            thumbnail_s3_key=payload.thumbnail_s3_key,
+            actor=identity,
+        )
 
     @app.post("/api/customer/aac/voice-call/simulate-trigger")
     def simulate_trigger(request: Request, payload: SimulateTriggerPayload) -> dict:
@@ -298,6 +591,28 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
         store.mark_dismissed(event_id=event_id, customer_id=identity["customer_id"], actor=identity)
         return {"message": "Dismissed.", "event_id": event_id}
+
+    @app.post("/api/customer/aac/voice-call/events/{event_id}/simulate-visitor-utterance")
+    def simulate_visitor_utterance(request: Request, event_id: str, payload: VisitorUtterancePayload) -> dict:
+        """The listening window's own honest simulate entrypoint --
+        same precedent as simulate_trigger()/simulate_person_detected()
+        above: real appliance-side audio capture + speech-to-text from
+        the camera's own microphone does not exist anywhere in this
+        codebase yet (see aac_voice_call_greeting.py's own module
+        docstring for the identical gap on the OUTBOUND/greeting side).
+        This route proves the real, complete downstream orchestration
+        -- natural-language intent classification, transcript
+        accumulation, continue-vs-escalate, the second notification on
+        escalation -- end to end; only the upstream transcript source
+        (a real visitor's spoken words, transcribed) is not yet wired
+        to real hardware."""
+        identity = _customer_identity(request)
+        return record_visitor_utterance(
+            customer_id=identity["customer_id"],
+            event_id=event_id,
+            transcript_text=payload.transcript_text,
+            actor=identity,
+        )
 
     @app.post("/api/customer/aac/voice-call/events/{event_id}/door/unlock-request")
     def door_unlock_request(request: Request, event_id: str) -> dict:

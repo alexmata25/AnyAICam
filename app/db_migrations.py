@@ -1050,6 +1050,60 @@ CREATE TABLE IF NOT EXISTS aac_voice_call_unlock_confirmations(
 );
 CREATE INDEX IF NOT EXISTS idx_aac_voice_call_unlock_confirmations_event ON aac_voice_call_unlock_confirmations(event_id,created_at);
 '''),
+    # AAC Voice Call -- proactive visitor interaction (2026-09-23). A
+    # person detected on an entrance camera should be greeted, notified
+    # about, and listened to WITHOUT a customer having to simulate/
+    # trigger anything themselves (Phase 1's own "owed" appliance-side
+    # wiring, per aac_voice_call.py's own module docstring). This
+    # migration adds only additive columns/tables -- no existing column,
+    # state, or guard changes shape, so every Phase 1/PR-16 code path
+    # (trigger_visitor_event, mark_answered, mark_dismissed, end_call,
+    # the door-unlock flow) is untouched and keeps working exactly as
+    # before; the new proactive flow layers greeted_at/listening_*/
+    # escalated_at timestamps on top of the EXISTING triggered/notified/
+    # answered/dismissed/ended state machine rather than adding new
+    # states, to keep every already-reviewed state guard correct as-is.
+    #
+    # aac_voice_call_greeting_cooldowns is the debounce/cooldown table:
+    # one row per camera, claimed with the same atomic
+    # UPDATE...WHERE-rowcount discipline aac_voice_call_unlock_
+    # confirmations above already uses for its own single-use claim, so
+    # one person standing at the door cannot re-trigger a flood of
+    # repeated greetings/notifications.
+    #
+    # aac_voice_call_site_greetings holds the per-site DEFAULT greeting
+    # text an owner can configure; aac_voice_call_entrance_cameras'
+    # new greeting_text column is the per-CAMERA override that wins over
+    # the site default when set (see aac_voice_call_events.
+    # resolve_greeting_text()'s own precedence: camera > site > a fixed
+    # built-in fallback string -- never an unconfigured/blank greeting).
+    ('20260923_aac_voice_call_proactive_greeting','''
+ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_text TEXT;
+CREATE TABLE IF NOT EXISTS aac_voice_call_site_greetings(
+    customer_id TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    greeting_text TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT,
+    PRIMARY KEY(customer_id,site_id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(site_id) REFERENCES sites(id)
+);
+CREATE TABLE IF NOT EXISTS aac_voice_call_greeting_cooldowns(
+    camera_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    last_triggered_at TEXT NOT NULL,
+    FOREIGN KEY(camera_id) REFERENCES cameras(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+ALTER TABLE aac_voice_call_events ADD COLUMN greeted_at TEXT;
+ALTER TABLE aac_voice_call_events ADD COLUMN greeting_text_used TEXT;
+ALTER TABLE aac_voice_call_events ADD COLUMN listening_opened_at TEXT;
+ALTER TABLE aac_voice_call_events ADD COLUMN listening_closed_at TEXT;
+ALTER TABLE aac_voice_call_events ADD COLUMN escalated_at TEXT;
+ALTER TABLE aac_voice_call_events ADD COLUMN utterance_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE aac_voice_call_events ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'simulated';
+'''),
 ]
 
 

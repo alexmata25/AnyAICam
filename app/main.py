@@ -38228,6 +38228,35 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         facial_event_ids.append(aac_event["id"])
                 except Exception as error:
                     print(f"Camera {camera_number} AAC facial recognition skipped (non-fatal): {error}")
+        # AAC Voice Call -- proactive visitor interaction (2026-09-23).
+        # Same shape as the PPE/facial-recognition hooks directly above:
+        # gated on class_name=="person" and a per-camera enablement
+        # check, wrapped in a non-fatal try/except so this optional
+        # feature can never crash the wider detection loop. This is
+        # Phase 1's own documented "owed" piece (aac_voice_call.py's own
+        # module docstring: appliance-side person-detection wiring)
+        # filled in for real: handle_person_detected() itself decides
+        # whether to actually greet/notify (entrance-camera enablement,
+        # debounce/cooldown), so calling it once per qualifying person
+        # detection here is correct and safe -- never a second detection
+        # pipeline, never a bypass of the same real
+        # aac_voice_call_events.is_entrance_camera() gate every other
+        # trigger path (the simulate-person-detected route, and any
+        # future one) already goes through.
+        if class_name == "person":
+            try:
+                from database_backend import connect as aac_voice_call_connect
+
+                with aac_voice_call_connect() as vc_db:
+                    vc_context = aac_voice_call._camera_tenant_context(vc_db, camera_number)
+                if vc_context:
+                    aac_voice_call.handle_person_detected(
+                        customer_id=vc_context["customer_id"],
+                        camera_id=vc_context["id"],
+                        thumbnail_s3_key=thumbnail_url,
+                    )
+            except Exception as error:
+                print(f"Camera {camera_number} AAC Voice Call proactive greeting skipped (non-fatal): {error}")
         # 2026-09-16: same real per-camera RDM entitlement check as the
         # PPE hook above, for the same reason -- lpr.is_camera_enabled()
         # is deployment-pilot scope only, never entitlement-aware.
@@ -39916,6 +39945,7 @@ import facial_embedding_sync
 import facial_events
 import facial_recognition
 import relay_control
+import aac_voice_call
 
 
 @asynccontextmanager
