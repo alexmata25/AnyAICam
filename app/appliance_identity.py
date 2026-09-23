@@ -392,6 +392,61 @@ def has_global_administrator_grant(db, *, email: str) -> bool:
     return grant is not None
 
 
+def provision_platform_owner(db, *, email: str, granted_by: str) -> str | None:
+    """The one bootstrap step 'platform_owner' actually needs -- see
+    platform_owner.py's own module docstring for the full design. The
+    RBAC tier this codebase calls 'platform_owner' IS this same, already
+    fully-built identity_grants(role='administrator', scope_type='global')
+    mechanism cloud_administrator_bridge()/has_global_administrator_grant()
+    above already implement and test end to end (login routing to
+    /admin-portal, nav visibility, live re-verification, revocation) --
+    there is no new grant shape, no new role string, nothing else to
+    build for access itself. This function's only job is closing the
+    one real bootstrap gap: granting the FIRST real platform_owner,
+    since /api/operations/identity-grants (the existing, tested,
+    already-built self-service UI/API for this) itself requires an
+    existing global-scope administrator to call it -- a chicken-and-egg
+    problem for whichever real account is meant to be the very first
+    one. Every subsequent grant (to a second platform_owner/platform_
+    admin, or revoking this one) should go through that existing UI/API,
+    not this function -- this is bootstrap-only, exactly the same
+    division of responsibility as bootstrap_admin() (partner_db.py) has
+    with its own separate legacy account.
+
+    Idempotent and safe to call on every process start (see partner_db.
+    initialize_database()'s own call site): does nothing if `email`
+    already holds a live global administrator grant, does nothing if no
+    partner_users row exists yet for that email (never creates one --
+    same "a grant authorizes an existing identity, it doesn't create
+    one" rule create_identity_grant() already enforces), and is a no-op
+    entirely when `email` is empty (the default -- see ANYAICAM_
+    PLATFORM_OWNER_EMAIL in partner_db.py: this is fully opt-in per
+    deployment, never a hardcoded account). Returns the new grant id, or
+    None if nothing was done (already granted, or no such account yet)."""
+    email = (email or "").strip().lower()
+    if not email:
+        return None
+    if has_global_administrator_grant(db, email=email):
+        return None
+    user = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email,)).fetchone()
+    if not user:
+        return None
+    grant_id = create_grant(db, user_id=user["id"], role="administrator", scope_type="global", scope_id=None, granted_by=granted_by)
+    # Writes the audit row directly on the already-open `db` handle, NOT
+    # via partner_db.audit() -- this function runs from partner_db.
+    # initialize_database() itself (before the target is marked
+    # initialized), and audit() calls connection() -> ensure_database_
+    # initialized(), which would recurse right back into
+    # initialize_database() at that exact point. Same audit_logs shape
+    # audit() itself writes, just inline.
+    import json as _json
+    db.execute(
+        "INSERT INTO audit_logs(actor_email,actor_role,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
+        (granted_by, "system", "grant", "identity_grant", grant_id, _json.dumps({"email": email, "role": "administrator", "scope_type": "global"}), datetime.now().isoformat()),
+    )
+    return grant_id
+
+
 def create_grant(db, *, user_id: str, role: str, scope_type: str, scope_id: str | None, granted_by: str, now: str | None = None) -> str:
     if scope_type not in SCOPE_TYPES:
         raise ValueError(f"Unknown scope_type: {scope_type!r}")

@@ -41712,6 +41712,19 @@ PUBLIC_PATH_PREFIXES = (
 
     "/api/portal-login",
 
+    # platform_owner.py: both are reached mid-login, deliberately BEFORE
+    # any session cookie exists yet (mfa/verify completes a pending
+    # login started by POST /api/portal-login above; break-glass-recover
+    # is the one web-reachable half of the break-glass path, redeeming a
+    # token an operator created out-of-band). Every OTHER /api/platform-
+    # owner/* route (enroll, confirm, recovery-codes/regenerate) still
+    # requires an existing session -- see platform_owner.py's own
+    # _require_global_grant_session(), unaffected by this list; it is
+    # the one true gate for those, not this middleware.
+    "/api/platform-owner/mfa/verify",
+
+    "/api/platform-owner/break-glass-recover",
+
     # customer-login.html and partner.html both fetch this on every load,
     # before any identity exists, to populate their own top-nav Partner/
     # Customer Login links -- website_session() already has a graceful
@@ -45588,6 +45601,27 @@ def portal_login_submit(request: Request, payload: dict):
         )
         return response
 
+    # PLATFORM_OWNER_MFA_HOOK (2026-09-23): password (and, if delegated,
+    # cloud-assertion) verification above already fully decided this is
+    # a real, live scope_type='global' administrator login destined for
+    # /admin-portal -- see platform_owner.py's own module docstring for
+    # why this is the ONLY branch this hook can ever apply to. Every
+    # other login (every partner/technician/customer role, and every
+    # administrator login that ISN'T a global grant) is completely
+    # unaffected -- this whole block is skipped for them, exactly as
+    # before this hook existed.
+    if decision["system"] == "partner" and decision["destination"] == "/admin-portal" and partner_user and partner_user.get("id"):
+        from partner_db import connection as _pdb_connection
+        with _pdb_connection() as _mfa_db:
+            from platform_owner import mfa_is_confirmed
+            if mfa_is_confirmed(_mfa_db, user_id=partner_user["id"]):
+                from platform_owner import create_pending_mfa_login
+                pending_token = create_pending_mfa_login(
+                    _mfa_db, user_id=partner_user["id"], destination=decision["destination"], email=email,
+                    role=decision["role"], authorization_version_at_login=partner_authorization_version,
+                )
+                return {"status": "mfa_required", "mfa_pending_token": pending_token}
+
     from partner_portal import establish_partner_session
 
     return establish_partner_session(
@@ -48204,6 +48238,7 @@ import talk_down_discovery
 import talk_audio_relay_client
 from facial_recognition_ui import register_facial_recognition_routes
 from aac_voice_call import register_aac_voice_call_routes
+from platform_owner import register_platform_owner_routes
 
 
 
@@ -48356,6 +48391,7 @@ register_talk_session_routes(app)
 register_talk_audio_relay_routes(app)
 register_facial_recognition_routes(app, page_shell)
 register_aac_voice_call_routes(app, page_shell)
+register_platform_owner_routes(app, page_shell)
 register_door_access_routes(app)
 register_wireguard_remote_appliance_routes(app)
 

@@ -161,6 +161,18 @@ def initialize_database() -> None:
     bootstrap_admin()
     from db_migrations import apply_migrations
     apply_migrations()
+    # platform_owner.py (2026-09-23): opt-in, per-deployment bootstrap of
+    # the FIRST real platform_owner (identity_grants role='administrator'
+    # scope_type='global') -- see appliance_identity.provision_platform_
+    # owner()'s own docstring for why this is the only genuinely new
+    # provisioning step this RBAC tier needs. Unset by default (no email
+    # baked into source): a deployment opts in by setting this env var to
+    # an existing partner_users account's email, same idiom as ANYAICAM_
+    # ADMIN_EMAIL/bootstrap_admin() above. Idempotent -- safe on every
+    # container start.
+    with database_connect() as db:
+        from appliance_identity import provision_platform_owner
+        provision_platform_owner(db, email=os.getenv('ANYAICAM_PLATFORM_OWNER_EMAIL', ''), granted_by='platform_owner_bootstrap')
 
 
 def password_hash(password: str) -> str:

@@ -955,6 +955,58 @@ CREATE TABLE IF NOT EXISTS aac_voice_call_events(
 CREATE INDEX IF NOT EXISTS idx_aac_voice_call_events_customer ON aac_voice_call_events(customer_id,created_at);
 CREATE INDEX IF NOT EXISTS idx_aac_voice_call_events_camera ON aac_voice_call_events(camera_id,created_at);
 '''),
+    # platform_owner.py (2026-09-23): recovery infrastructure for the
+    # existing identity_grants(role='administrator', scope_type='global')
+    # tier -- see that module's own docstring for the full design. None of
+    # these three tables grant access on their own; they only ever let an
+    # already-provisioned global-grant holder AUTHENTICATE (prove it's
+    # really them) through a second factor, a backup code, or -- only via
+    # direct server/shell access, never a web request -- an audited
+    # break-glass token. Every one of them is fully inert for every other
+    # role in this system; a partner/customer account with no global grant
+    # gets nothing from any row existing here.
+    ('20260923_platform_owner_recovery','''
+CREATE TABLE IF NOT EXISTS platform_owner_mfa(
+    user_id TEXT PRIMARY KEY,
+    secret_base32 TEXT NOT NULL,
+    confirmed_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES partner_users(id)
+);
+CREATE TABLE IF NOT EXISTS platform_owner_recovery_codes(
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    used_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES partner_users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_platform_owner_recovery_codes_user ON platform_owner_recovery_codes(user_id);
+CREATE TABLE IF NOT EXISTS break_glass_tokens(
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    FOREIGN KEY(user_id) REFERENCES partner_users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_break_glass_tokens_user ON break_glass_tokens(user_id);
+CREATE TABLE IF NOT EXISTS pending_mfa_logins(
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    destination TEXT NOT NULL,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL,
+    authorization_version_at_login INTEGER,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    FOREIGN KEY(user_id) REFERENCES partner_users(id)
+);
+'''),
 ]
 
 
