@@ -74592,43 +74592,17 @@ def dashboard(request: Request) -> str:
 
 
 
-    recent_events = load_motion_events()
-
-
-
-
-
-
-
-
-    recent_events.sort(
-
-
-
-
-
-
-
-
-        key=lambda event: event.get("start_time", event.get("timestamp", "")),
-
-
-
-
-
-
-
-
-        reverse=True,
-
-
-
-
-
-
-
-
-    )
+    # 2026-09-23: was load_motion_events(), the legacy source -- never
+    # populated for any real customer whose activity flows through the
+    # modern detection_events pipeline (every other customer-facing
+    # surface already reads that pipeline instead). Always returned
+    # zero events for this account, so the initial paint showed "no
+    # motion yet" even with heavy real activity happening every few
+    # seconds -- the client-side poll below fetches the same real,
+    # tenant-scoped source for its own periodic refresh, for the same
+    # reason. Already newest-first (ORDER BY event_timestamp DESC), so
+    # the separate .sort() this replaces is no longer needed either.
+    recent_events = _customer_recent_events_bounded(request, 6) or []
 
 
 
@@ -76230,7 +76204,21 @@ function buildEventCard(event){
 
 
 
-async function updateRecentEvents(){const grid=document.getElementById('dashboard-event-grid'),status=document.getElementById('dashboard-event-refresh');try{const response=await fetch('/api/events?limit=6',{cache:'no-store'});const data=await response.json();grid.replaceChildren();if(!data.events.length){const empty=document.createElement('div');empty.className='empty dashboard-event-empty';empty.textContent='Recent events will appear here after motion is detected.';grid.appendChild(empty)}else{data.events.forEach(event=>grid.appendChild(buildEventCard(event)))}status.textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}`}catch(error){status.textContent='Event refresh unavailable'}}
+async function updateRecentEvents(){const grid=document.getElementById('dashboard-event-grid'),status=document.getElementById('dashboard-event-refresh');try{
+    // 2026-09-23: was fetching /api/events, the legacy load_motion_events()
+    // source -- never populated for any real customer whose activity
+    // flows through the modern detection_events pipeline (every other
+    // customer-facing surface: Events, Smart Alerts, Live's own Analytics
+    // panel, Playback's timeline). Always returned zero events here, so
+    // this widget showed the "no motion yet" empty state even with heavy
+    // real activity happening every few seconds. /api/customer/events/
+    // recent is the same real, tenant-scoped, already-correct source
+    // those other surfaces already use; its response shape (thumbnail,
+    // event_type, camera, confidence, timestamp, linked_recording) is
+    // identical to what buildEventCard() above already expects, so
+    // nothing else here changes. It has no ?limit= of its own (always
+    // returns its own bounded page), so the 6-card cap moves client-side.
+    const response=await fetch('/api/customer/events/recent',{cache:'no-store'});const data=await response.json();grid.replaceChildren();const events=(data.events||[]).slice(0,6);if(!events.length){const empty=document.createElement('div');empty.className='empty dashboard-event-empty';empty.textContent='Recent events will appear here after motion is detected.';grid.appendChild(empty)}else{events.forEach(event=>grid.appendChild(buildEventCard(event)))}status.textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}`}catch(error){status.textContent='Event refresh unavailable'}}
 
 
 
