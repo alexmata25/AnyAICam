@@ -182,8 +182,13 @@ def test_investigate_route_dispatches_to_customer_branch_for_customer_identity(m
 
 
 def _investigation_events(html):
-    match = re.search(r"const investigationEvents=(\[.*?\]);\n\s*const selectedEvidence", html, re.S)
-    assert match, "could not find embedded investigationEvents payload"
+    # 2026-09-23: the page now embeds only a small initial page (see
+    # _customer_investigate_search()) under `loadedEvents`, not the old
+    # `investigationEvents` name -- every test using this helper seeds
+    # well under INVESTIGATE_DEFAULT_EMBED_LIMIT events, so the initial
+    # embed still contains everything those tests seeded.
+    match = re.search(r"let loadedEvents=(\[.*?\]);\n\s*let currentTotal", html, re.S)
+    assert match, "could not find embedded loadedEvents payload"
     return json.loads(match.group(1))
 
 
@@ -292,6 +297,42 @@ def test_investigate_no_cameras_renders_honest_empty_state(monkeypatch, db_path)
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-1"))
         result = main.investigation_page(object())
     assert "No cameras are available for investigation" in result
+
+
+# =============================================================== Investigate: Bookmark button click handler (2026-09-23)
+#
+# Confirmed live on portal-staging: clicking "Bookmark" on an
+# Investigate card threw "TypeError: Cannot set properties of null
+# (setting 'textContent')" and the button/toast/counts never updated,
+# even though the PUT to /api/analytics/events/{id}/review had already
+# succeeded and persisted (bookmark count was 1 after a fresh page
+# reload). Root cause: the click handler is `async click=>{...}` and
+# referenced `click.currentTarget` *after* the handler's first
+# `await fetch(...)` -- per the DOM Event spec, currentTarget is reset
+# to null once the event's synchronous dispatch phase ends, which
+# happens at that first await, so the post-await assignment threw and
+# aborted the rest of the handler (render()/showToast() never ran).
+# Fixed by capturing the button reference into a plain variable before
+# the first await. This is a pure client-side rendering bug -- the
+# backend PUT/persistence was already correct and is covered by
+# test_review_route_allows_authorized_event_and_persists above.
+
+
+@pytest.mark.parametrize("camera_count", [2, 11])
+def test_investigate_bookmark_handler_captures_button_before_await(monkeypatch, db_path, camera_count):
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
+        _seed_fleet(conn, "cust-1", "site-1", "appl-1", "AIC-1", camera_count)
+        conn.commit()
+        monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-1"))
+        result = main.investigation_page(object())
+    assert "const button=click.currentTarget;" in result
+    # The broken pattern (reading click.currentTarget after the await,
+    # instead of the captured `button`) must be completely gone.
+    assert "click.currentTarget.textContent" not in result
+    assert "button.textContent='Bookmarked'" in result
 
 
 # =============================================================== "investigate" nav key reaches the customer portal

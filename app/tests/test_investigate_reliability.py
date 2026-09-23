@@ -327,21 +327,35 @@ def test_never_leaks_another_customers_smart_motion_or_ordinary_events(db_path, 
 # --------------------------------------------------------- page-level: the fix is actually wired in
 
 
-def test_render_customer_investigate_calls_the_new_bounded_function_not_the_unbounded_one(monkeypatch):
-    """Confirms _render_customer_investigate() was actually switched to
-    the fix, not just that the fix function itself works in isolation."""
-    called = {"new": False, "old": False}
+def test_render_customer_investigate_calls_the_paginated_search_not_the_bulk_fetch(monkeypatch):
+    """2026-09-23 superseding product decision: _render_customer_
+    investigate() must call the new query-driven, server-paginated
+    _customer_investigate_search() (bounded to a small initial page)
+    for its own initial embed, not _customer_investigate_events()'s
+    up-to-2500-row bulk fetch this file otherwise still thoroughly
+    covers and which remains correct (just no longer wired into the
+    live page) -- confirms the page was actually switched to the fix,
+    not just that the fix function itself works in isolation."""
+    called = {"paginated": False, "bulk": False, "detection_events": False}
 
-    def fake_new(request):
-        called["new"] = True
+    def fake_paginated(request, **kwargs):
+        called["paginated"] = True
+        assert kwargs.get("limit") == main.INVESTIGATE_DEFAULT_EMBED_LIMIT
+        assert kwargs.get("offset") == 0
+        return {"events": [], "total": 0, "has_more": False}
+
+    def fake_bulk(request):
+        called["bulk"] = True
         return []
 
-    def fake_old(request, **kwargs):
-        called["old"] = True
+    def fake_detection_events(request, **kwargs):
+        called["detection_events"] = True
         return []
 
-    monkeypatch.setattr(main, "_customer_investigate_events", fake_new)
-    monkeypatch.setattr(main, "_customer_detection_events", fake_old)
+    monkeypatch.setattr(main, "_customer_investigate_search", fake_paginated)
+    monkeypatch.setattr(main, "_customer_investigate_events", fake_bulk)
+    monkeypatch.setattr(main, "_customer_detection_events", fake_detection_events)
     main._render_customer_investigate([{"id": "cam-1", "name": "Front Door", "camera_number": 1}], _FakeRequest())
-    assert called["new"] is True
-    assert called["old"] is False
+    assert called["paginated"] is True
+    assert called["bulk"] is False
+    assert called["detection_events"] is False

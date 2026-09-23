@@ -54496,6 +54496,207 @@ def _customer_investigate_events(request: Request) -> list[dict] | None:
     return events
 
 
+# Investigate's initial page load (small, recent default) and its
+# search/pagination API both share these -- see _customer_investigate_
+# search()'s own docstring.
+INVESTIGATE_DEFAULT_EMBED_LIMIT = 50
+INVESTIGATE_SEARCH_PAGE_SIZE = 50
+
+
+def _customer_investigate_search(
+    request: Request,
+    *,
+    event_type: str | None = None,
+    camera_id: str | None = None,
+    query_text: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    limit: int = INVESTIGATE_SEARCH_PAGE_SIZE,
+    offset: int = 0,
+) -> dict | None:
+    """Investigate's query-driven, server-paginated event search
+    (2026-09-23 product decision).
+
+    Root cause this replaces as Investigate's own initial-load/browse
+    path: _customer_investigate_events() (above) is a correct, already-
+    fixed, SQL-bounded (<=2500) query -- but "bounded to 2500" and
+    "safe to hand a browser in a single response" are different bars.
+    Confirmed live on portal-staging: a real customer's Investigate
+    page embedded 2270 <article> cards in one page load (3.1MB of HTML,
+    34k+ DOM nodes just for that section), all client-side-filtered
+    thereafter. This function replaces that "embed nearly everything,
+    filter in JS" model with a real query: every filter (event type,
+    camera, free-text, date range) is applied in SQL, and only one
+    small page of matching rows is ever returned per call. Nothing
+    about the underlying detection_events data changes -- this only
+    changes what a single request queries, embeds, and returns.
+
+    Same tenant/camera-permission scoping as _customer_investigate_
+    events(): customer_owner sees their entire customer_id; customer_
+    viewer is additionally restricted to cameras they hold
+    customer_camera_permissions.can_playback=1 on. Same None-vs-dict
+    contract as every other customer-portal query function here: None
+    means "not a portal customer identity at all" (caller must fall
+    through to the legacy experience), never "no results."
+
+    event_type='vehicle' is the same UI-level grouping the client used
+    to compute in JS (isVehicle()) before this fix -- widened here to
+    IN (car,truck,bus,motorcycle,bicycle) so the existing "Vehicles"
+    filter option keeps working now that filtering happens in SQL.
+
+    Returns {"events": [...one page, newest first...], "total": <int,
+    every row matching the filters, not just this page>, "has_more":
+    <bool>}."""
+    try:
+        from partner_portal import partner_identity
+        identity = partner_identity(request)
+    except Exception:
+        identity = None
+    if not identity or identity.get("role") not in CUSTOMER_PORTAL_ROLES:
+        return None
+
+    from partner_db import connection
+
+    params: list = []
+    permission_join = ""
+    where = []
+    if identity.get("role") != "customer_owner":
+        with connection() as db:
+            user = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+        if not user:
+            return {"events": [], "total": 0, "has_more": False}
+        permission_join = 'JOIN customer_camera_permissions p ON p.camera_id = de.camera_id AND p.user_id = ? '
+        params.append(user["id"])
+        where.append("p.can_playback = 1")
+
+    where.append("de.customer_id = ?")
+    params.append(identity["customer_id"])
+
+    if event_type:
+        if event_type == "vehicle":
+            where.append("de.event_type IN ('car','truck','bus','motorcycle','bicycle')")
+        else:
+            where.append("de.event_type = ?")
+            params.append(event_type)
+    if camera_id:
+        where.append("de.camera_id = ?")
+        params.append(camera_id)
+    if from_ts:
+        where.append("de.event_timestamp >= ?")
+        params.append(from_ts)
+    if to_ts:
+        where.append("de.event_timestamp <= ?")
+        params.append(to_ts)
+    for token in (query_text or "").strip().split():
+        where.append("(de.event_type LIKE ? OR c.name LIKE ? OR s.name LIKE ?)")
+        like = f"%{token}%"
+        params.extend([like, like, like])
+
+    from_clause = (
+        'FROM detection_events de '
+        'JOIN cameras c ON c.id = de.camera_id '
+        'JOIN sites s ON s.id = de.site_id '
+        'LEFT JOIN detection_event_media dem ON dem.detection_event_id = de.id '
+        + permission_join
+        + 'WHERE ' + ' AND '.join(where)
+    )
+    with connection() as db:
+        total = db.execute(f'SELECT COUNT(*) AS n {from_clause}', params).fetchone()["n"]
+        rows = db.execute(
+            'SELECT de.id, de.event_type, de.confidence, de.event_timestamp, de.camera_id, '
+            'c.camera_number AS camera, c.name AS camera_display_name, s.name AS site_name, '
+            'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip, '
+            'dem.thumbnail_s3_key AS thumbnail_s3_key '
+            f'{from_clause} ORDER BY de.event_timestamp DESC, de.id DESC LIMIT ? OFFSET ?',
+            params + [limit, offset],
+        ).fetchall()
+
+    events = [
+        {
+            "id": row["id"],
+            "camera": row["camera"],
+            "camera_id": row["camera_id"],
+            "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
+            "site": row["site_name"],
+            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "event_type": row["event_type"],
+            "timestamp": row["event_timestamp"],
+            "confidence": row["confidence"],
+            "thumbnail": (
+                f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
+                if row["thumbnail_s3_key"] else None
+            ),
+            "has_event_clip": bool(row["has_event_clip"]),
+            "plate_number": None,
+            "vehicle_color": None,
+        }
+        for row in rows
+    ]
+    return {"events": events, "total": total, "has_more": offset + len(events) < total}
+
+
+def _customer_investigate_event_for_client(event: dict) -> dict:
+    """Shapes one _customer_investigate_search() event dict into exactly
+    what the Investigate page's JS card() renderer expects -- shared by
+    both the page's initial embed and GET /api/customer/investigate/
+    search so there is only ever one place that decides this shape."""
+    camera_id = event.get("camera_id")
+    timestamp = str(event.get("timestamp") or "")
+    return {
+        "id": event["id"],
+        "camera_id": camera_id,
+        "camera": event.get("camera_name") or f'Camera {event.get("camera")}',
+        "site": event.get("site") or "",
+        "timestamp": timestamp,
+        "event_type": str(event.get("event_type") or "motion").lower(),
+        "thumbnail": event.get("thumbnail") or "",
+        "recording": _customer_event_playback_href(camera_id, timestamp, event.get("id"), bool(event.get("has_event_clip"))),
+        "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
+        "confidence": event.get("confidence"),
+        "plate": event.get("plate_number") or "",
+        "color": event.get("vehicle_color") or "",
+        "rule": event.get("rule_name") or "",
+        "review": load_json_file(EVENT_REVIEWS_FILE, {}).get(event["id"], {}),
+    }
+
+
+@app.get("/api/customer/investigate/search")
+def customer_investigate_search_api(
+    request: Request,
+    event_type: str = "",
+    camera_id: str = "",
+    q: str = "",
+    from_ts: str = "",
+    to_ts: str = "",
+    offset: int = 0,
+):
+    """The paginated fetch Investigate's Search button and its "Load
+    more" button both call -- see _customer_investigate_search()'s own
+    docstring for why this replaced embedding everything up front."""
+    result = _customer_investigate_search(
+        request,
+        event_type=event_type or None,
+        camera_id=camera_id or None,
+        query_text=q or None,
+        from_ts=from_ts or None,
+        to_ts=to_ts or None,
+        limit=INVESTIGATE_SEARCH_PAGE_SIZE,
+        offset=max(0, offset),
+    )
+    if result is None:
+        raise HTTPException(status_code=403, detail="Not authorized for investigation search.")
+    return {
+        "events": [_customer_investigate_event_for_client(event) for event in result["events"]],
+        "total": result["total"],
+        "has_more": result["has_more"],
+        "offset": offset,
+        "limit": INVESTIGATE_SEARCH_PAGE_SIZE,
+    }
+
+
 def _customer_notifications(request: Request, *, camera_number: int | None = None, limit: int = 100) -> list[dict] | None:
     """This portal customer's own real notifications rows for the
     customer-facing Smart Alerts page, or None when the caller isn't a
@@ -81091,49 +81292,32 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     a pure client-side JSON download of the same already-authorized
     events -- neither call touches another customer's data.
 
-    events comes from _customer_investigate_events(), NOT the generic
-    _customer_detection_events() with no limit -- see that function's
-    own docstring for why: a plain most-recent-500-overall window
-    measurably starves out the large majority of a real customer's
-    smart_motion events once their total history grows past a few
-    hundred events, which is not a hypothetical edge case in this
-    system's real usage pattern."""
-    events = _customer_investigate_events(request) or []
+    events come from _customer_investigate_search() (2026-09-23 product
+    decision), NOT _customer_investigate_events()'s up-to-2500-row
+    fetch -- see that function's own docstring for the root cause this
+    replaces: confirmed live on portal-staging, a real customer's
+    Investigate page embedded 2270 <article> cards (3.1MB of HTML) into
+    a single response, all client-side-filtered thereafter. This page
+    now embeds only a small, recent default page (INVESTIGATE_DEFAULT_
+    EMBED_LIMIT); the Search button and "Load more" both pull further
+    pages from GET /api/customer/investigate/search, which applies
+    every filter in SQL and returns one bounded page at a time. Nothing
+    about which detection_events rows exist or how they're queried
+    beyond this page changes -- every event remains reachable through
+    search, exactly as it was reachable through the old page's
+    client-side filters, just never all embedded in the DOM at once."""
+    search_result = _customer_investigate_search(request, limit=INVESTIGATE_DEFAULT_EMBED_LIMIT, offset=0) or {
+        "events": [], "total": 0, "has_more": False,
+    }
+    normalized = [_customer_investigate_event_for_client(event) for event in search_result["events"]]
+    investigation_data = json.dumps(normalized, default=str)
+    initial_total = search_result["total"]
+    initial_has_more = search_result["has_more"]
 
     camera_options = "".join(
         f'<option value="{escape(camera["id"], quote=True)}">{escape(_camera_display_label(camera))}</option>'
         for camera in cameras
     )
-
-    normalized = []
-    for event in events:
-        camera_id = event.get("camera_id")
-        timestamp = str(event.get("timestamp") or "")
-        normalized.append({
-            "id": event["id"],
-            "camera_id": camera_id,
-            "camera": event.get("camera_name") or f'Camera {event.get("camera")}',
-            "site": event.get("site") or "",
-            "timestamp": timestamp,
-            "end_time": timestamp,
-            "event_type": str(event.get("event_type") or "motion").lower(),
-            "thumbnail": event.get("thumbnail") or "",
-            "recording": _customer_event_playback_href(camera_id, timestamp, event.get("id"), bool(event.get("has_event_clip"))),
-            "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
-            "confidence": event.get("confidence"),
-            "plate": event.get("plate_number") or "",
-            "color": event.get("vehicle_color") or "",
-            "rule": event.get("rule_name") or "",
-            "review": load_json_file(EVENT_REVIEWS_FILE, {}).get(event["id"], {}),
-        })
-    # id tie-break for the same reason _customer_investigate_events()
-    # already sorts this way: a correlated Motion+Smart Motion pair
-    # shares an identical timestamp, so a timestamp-only sort key does
-    # not guarantee the same relative order across repeated renders.
-    # Stable re-sort over an already-bounded (<= 2500) list -- no new
-    # truncation happens here, only the display order is fixed.
-    normalized.sort(key=lambda item: (item.get("timestamp", ""), item.get("id", "")), reverse=True)
-    investigation_data = json.dumps(normalized, default=str)
 
     if not cameras:
         content = (
@@ -81163,7 +81347,9 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
           <div class="stat"><span class="stat-label">Vehicles</span><span class="stat-value" id="investigation-vehicle-count">0</span></div>
           <div class="stat"><span class="stat-label">Bookmarked</span><span class="stat-value" id="investigation-bookmark-count">0</span></div>
         </section>
+        <p class="health-detail" id="investigation-shown-note"></p>
         <div class="investigation-grid" id="investigation-grid"></div>
+        <div class="investigation-actions"><button class="ghost-button" id="load-more-investigation" type="button" hidden>Load more</button></div>
         <section class="evidence-panel">
           <div class="panel-head"><div><h2>Evidence export</h2><div class="health-detail">Select results and export a JSON evidence manifest. Video export continues to use existing playback tools.</div></div></div>
           <div class="investigation-actions"><button id="select-visible-evidence" type="button">Select visible results</button><button id="clear-evidence-selection" type="button">Clear selection</button><button class="action-button" id="export-evidence" type="button">Export manifest</button></div>
@@ -81172,7 +81358,16 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     </section>"""
 
     scripts = f"""<script>
-    const investigationEvents={investigation_data};
+    // Query-driven, server-paginated search (2026-09-23 product
+    // decision): loadedEvents only ever holds the pages actually
+    // fetched so far (starting with this small initial default page),
+    // never a customer's entire matching history -- see
+    // _customer_investigate_search()'s own docstring for the root
+    // cause this replaces (2270 cards / 3.1MB embedded in one load,
+    // confirmed live on portal-staging).
+    let loadedEvents={investigation_data};
+    let currentTotal={json.dumps(initial_total)};
+    let currentHasMore={json.dumps(initial_has_more)};
     const selectedEvidence=new Set();
     const queryInput=document.getElementById('investigation-query');
     const typeInput=document.getElementById('investigation-type');
@@ -81182,26 +81377,36 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     const fromInput=document.getElementById('investigation-from');
     const toInput=document.getElementById('investigation-to');
     const grid=document.getElementById('investigation-grid');
+    const shownNote=document.getElementById('investigation-shown-note');
+    const loadMoreButton=document.getElementById('load-more-investigation');
     function isVehicle(type){{return ['car','truck','bus','motorcycle','bicycle','vehicle'].includes(type)}}
-    function naturalMatches(event,query){{
-      if(!query)return true;
-      const combined=[event.event_type,event.camera,event.site,event.color,event.plate,event.rule,event.timestamp,event.review?.notes,(event.review?.tags||[]).join(' ')].join(' ').toLowerCase();
-      return query.toLowerCase().split(/\\s+/).filter(Boolean).every(token=>combined.includes(token));
-    }}
-    function visibleEvents(){{
-      const from=fromInput.value?new Date(fromInput.value):null;
-      const to=toInput.value?new Date(toInput.value):null;
-      return investigationEvents.filter(event=>{{
-        const stamp=event.timestamp?new Date(event.timestamp):null;
-        const requested=typeInput.value;
-        return (!requested||event.event_type===requested||(requested==='vehicle'&&isVehicle(event.event_type)))
-          &&(!cameraInput.value||String(event.camera_id)===cameraInput.value)
-          &&(!colorInput.value||String(event.color||'').toLowerCase().includes(colorInput.value.toLowerCase()))
-          &&(!plateInput.value||String(event.plate||'').toLowerCase().includes(plateInput.value.toLowerCase()))
-          &&(!from||!stamp||stamp>=from)
-          &&(!to||!stamp||stamp<=to)
-          &&naturalMatches(event,queryInput.value.trim());
+    function isoOrEmpty(value){{return value?new Date(value).toISOString():''}}
+    async function fetchPage(offset){{
+      const params=new URLSearchParams({{
+        event_type:typeInput.value,camera_id:cameraInput.value,q:queryInput.value.trim(),
+        from_ts:isoOrEmpty(fromInput.value),to_ts:isoOrEmpty(toInput.value),offset:String(offset),
       }});
+      const response=await fetch(`/api/customer/investigate/search?${{params.toString()}}`);
+      if(!response.ok){{showToast('Search failed. Try again.');return null}}
+      return response.json();
+    }}
+    // Vehicle/clothing color and license plate are not yet populated
+    // on this account's real detection events (a separate LPR/color-
+    // recognition data source, not part of this fix) -- their filter
+    // inputs stay on the page but are intentionally not sent to the
+    // search API, matching their prior (already non-functional)
+    // client-side behavior rather than pretending they now filter.
+    async function runSearch(){{
+      const data=await fetchPage(0);
+      if(!data)return;
+      loadedEvents=data.events;currentTotal=data.total;currentHasMore=data.has_more;
+      render();
+    }}
+    async function loadMore(){{
+      const data=await fetchPage(loadedEvents.length);
+      if(!data)return;
+      loadedEvents=loadedEvents.concat(data.events);currentTotal=data.total;currentHasMore=data.has_more;
+      render();
     }}
     function card(event){{
       const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
@@ -81216,34 +81421,41 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
       </article>`;
     }}
     function render(){{
-      const results=visibleEvents();
-      grid.innerHTML=results.map(card).join('')||'<div class="investigation-empty">No events matched this investigation.</div>';
-      document.getElementById('investigation-result-count').textContent=results.length;
-      document.getElementById('investigation-people-count').textContent=results.filter(event=>event.event_type==='person').length;
-      document.getElementById('investigation-vehicle-count').textContent=results.filter(event=>isVehicle(event.event_type)).length;
-      document.getElementById('investigation-bookmark-count').textContent=results.filter(event=>event.review?.bookmarked).length;
+      grid.innerHTML=loadedEvents.map(card).join('')||'<div class="investigation-empty">No events matched this investigation.</div>';
+      document.getElementById('investigation-result-count').textContent=currentTotal;
+      document.getElementById('investigation-people-count').textContent=loadedEvents.filter(event=>event.event_type==='person').length;
+      document.getElementById('investigation-vehicle-count').textContent=loadedEvents.filter(event=>isVehicle(event.event_type)).length;
+      document.getElementById('investigation-bookmark-count').textContent=loadedEvents.filter(event=>event.review?.bookmarked).length;
+      shownNote.textContent=currentTotal?`Showing ${{loadedEvents.length}} of ${{currentTotal}} matching events.`:'';
+      loadMoreButton.hidden=!currentHasMore;
       grid.querySelectorAll('.investigation-card').forEach(cardElement=>{{
-        const event=investigationEvents.find(item=>item.id===cardElement.dataset.eventId);
+        const event=loadedEvents.find(item=>item.id===cardElement.dataset.eventId);
         cardElement.querySelector('.evidence-checkbox').addEventListener('change',change=>{{
           if(change.target.checked)selectedEvidence.add(event.id);else selectedEvidence.delete(event.id);
         }});
         cardElement.querySelector('.bookmark-investigation').addEventListener('click',async click=>{{
+          // event.currentTarget is reset to null by the browser once the
+          // synchronous dispatch phase ends (i.e. after the first await
+          // below) -- captured synchronously so the post-await UI update
+          // has a stable reference instead of throwing.
+          const button=click.currentTarget;
           const payload={{event_id:event.id,acknowledged:Boolean(event.review?.acknowledged),bookmarked:true,false_positive:Boolean(event.review?.false_positive),tags:event.review?.tags||[],notes:event.review?.notes||''}};
           const response=await fetch(`/api/analytics/events/${{event.id}}/review`,{{method:'PUT',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
           const result=await response.json();
           if(!response.ok||result.status!=='complete')return showToast(result.message||'Bookmark failed.');
-          event.review=result.review;click.currentTarget.textContent='Bookmarked';render();showToast('Event bookmarked.');
+          event.review=result.review;button.textContent='Bookmarked';render();showToast('Event bookmarked.');
         }});
       }});
     }}
-    function clearFilters(){{[queryInput,typeInput,cameraInput,colorInput,plateInput,fromInput,toInput].forEach(input=>input.value='');render()}}
-    document.getElementById('run-investigation').addEventListener('click',render);
+    function clearFilters(){{[queryInput,typeInput,cameraInput,colorInput,plateInput,fromInput,toInput].forEach(input=>input.value='');runSearch()}}
+    document.getElementById('run-investigation').addEventListener('click',runSearch);
     document.getElementById('clear-investigation').addEventListener('click',clearFilters);
-    queryInput.addEventListener('keydown',event=>{{if(event.key==='Enter')render()}});
-    document.getElementById('select-visible-evidence').addEventListener('click',()=>{{visibleEvents().forEach(event=>selectedEvidence.add(event.id));render()}});
+    queryInput.addEventListener('keydown',event=>{{if(event.key==='Enter')runSearch()}});
+    loadMoreButton.addEventListener('click',loadMore);
+    document.getElementById('select-visible-evidence').addEventListener('click',()=>{{loadedEvents.forEach(event=>selectedEvidence.add(event.id));render()}});
     document.getElementById('clear-evidence-selection').addEventListener('click',()=>{{selectedEvidence.clear();render()}});
     document.getElementById('export-evidence').addEventListener('click',()=>{{
-      const selected=investigationEvents.filter(event=>selectedEvidence.has(event.id));
+      const selected=loadedEvents.filter(event=>selectedEvidence.has(event.id));
       if(!selected.length)return showToast('Select at least one event first.');
       const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,color:colorInput.value,plate:plateInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
       const blob=new Blob([JSON.stringify(manifest,null,2)],{{type:'application/json'}});
