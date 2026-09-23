@@ -54,14 +54,22 @@ def record_door_access_event(
     matched_person_id: str | None = None,
     matched_person_name: str | None = None,
     facial_event_id: str | None = None,
+    aac_voice_call_event_id: str | None = None,
     error: str | None = None,
     now: datetime | None = None,
 ) -> str:
-    """The one place a door-access attempt -- manual button press or
-    automatic facial-recognition trigger -- becomes a durable audit
+    """The one place a door-access attempt -- manual button press,
+    automatic facial-recognition trigger, AACO voice command, or an
+    owner-approved AAC Voice Call unlock -- becomes a durable audit
     row. Always writes, even (especially) for a denied/failed attempt:
     the security requirement is "every attempt is auditable", not
     "every successful attempt".
+
+    aac_voice_call_event_id (2026-09-23): the specific visitor/call
+    event a trigger_type='aac_voice_call' attempt was approved from --
+    None for every other trigger_type, matching facial_event_id's own
+    "only set for the one trigger_type it applies to" convention just
+    above it.
 
     now accepts a real datetime OR a plain ISO string -- matching
     facial_events.create_match_event()'s own established `now.isoformat()
@@ -74,12 +82,12 @@ def record_door_access_event(
     db.execute(
         'INSERT INTO door_access_events(id,customer_id,camera_id,door_name,relay_channel,trigger_type,'
         'actor_user_id,actor_email,matched_person_id,matched_person_name,facial_event_id,'
-        'authorization_result,relay_result,success,error,created_at) '
-        'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'aac_voice_call_event_id,authorization_result,relay_result,success,error,created_at) '
+        'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (
             event_id, customer_id, camera_id, door_name, relay_channel, trigger_type,
             actor_user_id, actor_email, matched_person_id, matched_person_name, facial_event_id,
-            authorization_result, relay_result, 1 if success else 0, error, now_text,
+            aac_voice_call_event_id, authorization_result, relay_result, 1 if success else 0, error, now_text,
         ),
     )
     return event_id

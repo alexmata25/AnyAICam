@@ -72,6 +72,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+import aac_voice_call_door
 import aac_voice_call_events as store
 from aac_voice_call_intent import DeterministicVisitorIntentClassifier, VisitorIntentClassifier
 from notification_engine import fanout_appliance_event
@@ -184,19 +185,19 @@ def trigger_visitor_event(
 
 
 def request_door_unlock(*, customer_id: str, camera_id: str, event_id: str, requested_by: str) -> None:
-    """Phase 5 interface, prepared but NOT implemented or called from
-    anywhere in this module -- per the product spec, door unlocking is
-    explicitly not a blocker for this vertical slice. This function
-    exists so a later phase has a stable call shape to fill in (almost
-    certainly by constructing a relay_control.RelayRequest and calling
-    relay_control.get_provider().trigger(), the same real interface
-    door_access.py's manual-unlock route already uses, once a product
-    decision is made about how a mid-call unlock's own authorization
-    should differ from that route's can_unlock-permission model).
-    Actual Z-Wave hardware integration is out of scope for this
-    function and for this entire phase."""
+    """SUPERSEDED (2026-09-23): Phase 5's real, owner-approved door-
+    unlock flow is now implemented in aac_voice_call_door.py
+    (request_unlock()/confirm_unlock()), wired into this module's own
+    routes below -- never through this specific function, which remains
+    exactly as it was (unimplemented, uncalled) so nothing depends on
+    this particular signature. See aac_voice_call_door.py's own module
+    docstring for the real design: a server-enforced two-step
+    confirmation, re-authorization at both steps, and dispatch through
+    the same door_access.py/relay_control.py primitives the manual
+    Live-page Unlock Door button already uses -- never a second,
+    AAC-Voice-Call-only door-control mechanism."""
     raise NotImplementedError(
-        "AAC Voice Call door unlock is a prepared interface only (Phase 5) -- not implemented in this phase."
+        "This specific function is superseded -- see aac_voice_call_door.py's request_unlock()/confirm_unlock()."
     )
 
 
@@ -208,6 +209,10 @@ class SimulateTriggerPayload(BaseModel):
 
 class AnswerPayload(BaseModel):
     pass
+
+
+class UnlockConfirmPayload(BaseModel):
+    confirm_token: str
 
 
 def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
@@ -294,6 +299,27 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         store.mark_dismissed(event_id=event_id, customer_id=identity["customer_id"], actor=identity)
         return {"message": "Dismissed.", "event_id": event_id}
 
+    @app.post("/api/customer/aac/voice-call/events/{event_id}/door/unlock-request")
+    def door_unlock_request(request: Request, event_id: str) -> dict:
+        """Step 1 of the owner-approved door-access flow -- see
+        aac_voice_call_door.py's own module docstring for the full
+        design. Never dispatches anything; only validates and issues a
+        short-lived confirmation token."""
+        identity = _customer_identity(request)
+        return aac_voice_call_door.request_unlock(event_id=event_id, customer_id=identity["customer_id"], identity=identity)
+
+    @app.post("/api/customer/aac/voice-call/events/{event_id}/door/unlock-confirm")
+    def door_unlock_confirm(request: Request, event_id: str, payload: UnlockConfirmPayload) -> dict:
+        """Step 2 -- the actual real unlock, gated on the exact
+        confirmation token step 1 issued (single-use, short-lived,
+        server-enforced) plus a fresh re-check of the approving user's
+        live can_unlock permission. See aac_voice_call_door.py's
+        confirm_unlock() for the complete authorization/audit trail."""
+        identity = _customer_identity(request)
+        return aac_voice_call_door.confirm_unlock(
+            event_id=event_id, customer_id=identity["customer_id"], identity=identity, confirm_token=payload.confirm_token,
+        )
+
     @app.get("/aac/voice-call/{event_id}", response_class=HTMLResponse)
     def voice_call_screen(request: Request, event_id: str) -> str:
         """The AAC Voice Call "call screen" -- Phase 4's UI, kept to the
@@ -338,6 +364,18 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
             else "Two-way audio transport is not enabled on this deployment yet -- the microphone button below captures audio in your browser, but it is not confirmed to reach the camera's speaker."
         )
 
+        # Never rendered for a camera that isn't a configured,
+        # relay-assigned door, or for a viewer without a real can_unlock
+        # grant on it -- matching this codebase's established "no
+        # control that would only ever 403" convention (the live-tile
+        # Unlock button follows the same rule). request_unlock()/
+        # confirm_unlock() independently re-check this same
+        # authorization at the moment either route is actually called;
+        # this only decides whether the button exists at all.
+        show_unlock_button = event["state"] in ("triggered", "notified", "answered") and aac_voice_call_door.can_unlock_from_call(
+            customer_id=identity["customer_id"], camera_id=event["camera_id"], identity=identity,
+        )
+
         from html import escape as esc
 
         content = f'''<header class="topbar"><div><p class="eyebrow">AAC Voice Call</p><h1>Visitor at {esc(camera_name)}</h1></div>
@@ -354,7 +392,9 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
 <section class="panel dialog-actions">
   <button class="action-button" id="voice-call-answer" type="button">Answer</button>
   <button class="ghost-button" id="voice-call-end" type="button">End call</button>
-</section>'''
+  {'<button class="ghost-button" id="voice-call-unlock" type="button">Unlock Door</button>' if show_unlock_button else ''}
+</section>
+{'<p id="voice-call-unlock-status" class="health-detail"></p>' if show_unlock_button else ''}'''
         scripts = f'''<script>
 const eventId={event_id!r};
 document.getElementById('voice-call-answer').addEventListener('click', async () => {{
@@ -371,5 +411,29 @@ document.getElementById('voice-call-end').addEventListener('click', async () => 
   document.getElementById('voice-call-state').textContent = 'ended';
   showToast('Call ended.');
 }});
+{'''const unlockButton=document.getElementById('voice-call-unlock');
+const unlockStatus=document.getElementById('voice-call-unlock-status');
+unlockButton.addEventListener('click', async () => {
+  unlockButton.disabled=true;
+  let requestData;
+  try {
+    const requestResponse=await fetch(`/api/customer/aac/voice-call/events/${eventId}/door/unlock-request`, {method: 'POST'});
+    requestData=await requestResponse.json();
+    if (!requestResponse.ok) { showToast(requestData.detail||'Could not start door unlock.'); unlockButton.disabled=false; return; }
+  } catch (error) { showToast('Could not reach the server.'); unlockButton.disabled=false; return; }
+  const confirmed=window.confirm(`Unlock ${requestData.door_name}? This will physically unlock the door for a short time.`);
+  if (!confirmed) { unlockStatus.textContent='Unlock cancelled.'; unlockButton.disabled=false; return; }
+  try {
+    const confirmResponse=await fetch(`/api/customer/aac/voice-call/events/${eventId}/door/unlock-confirm`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({confirm_token: requestData.confirm_token}),
+    });
+    const confirmData=await confirmResponse.json();
+    if (!confirmResponse.ok) { unlockStatus.textContent=confirmData.detail||'The door could not be unlocked.'; showToast(unlockStatus.textContent); unlockButton.disabled=false; return; }
+    unlockStatus.textContent=confirmData.message||'Door unlocked.';
+    showToast(unlockStatus.textContent);
+  } catch (error) { unlockStatus.textContent='Could not reach the server.'; showToast(unlockStatus.textContent); }
+  unlockButton.disabled=false;
+});''' if show_unlock_button else ''}
 </script>'''
         return shell("AAC Voice Call", "aac-voice-call", content, scripts)
