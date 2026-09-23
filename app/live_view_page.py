@@ -1308,18 +1308,18 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<strong id="live-view-status">Starting live view…</strong>'
             f'<small>This can take a few seconds.</small></div></div>'
             f'<div class="camera-tools" style="justify-content:center">'
-            f'<button class="camera-tool" id="live-view-mute" title="Mute">♪</button>'
+            f'<button class="camera-tool" id="live-view-mute" title="Mute" aria-label="Mute">♪</button>'
             f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
             f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
             f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
-            f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot">◉</button>'
-            f'<button class="camera-tool" id="live-view-download" title="Download">⬇</button>'
-            f'<button class="camera-tool" id="live-view-share" title="Share">↗</button>'
-            f'<a class="camera-tool" href="/playback" title="Playback">◴</a>'
-            f'<button class="camera-tool" id="live-view-analytics" title="Analytics">⌕</button>'
-            f'<button class="camera-tool" id="live-view-bookmark" title="Bookmark">◈</button>'
-            f'<button class="camera-tool" id="live-view-stop" title="Stop">◼</button>'
-            f'<button class="camera-tool" id="live-view-retry" title="Retry" hidden>↻</button>'
+            f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot" aria-label="Snapshot">◉</button>'
+            f'<button class="camera-tool" id="live-view-download" title="Download" aria-label="Download">⬇</button>'
+            f'<button class="camera-tool" id="live-view-share" title="Share" aria-label="Share">↗</button>'
+            f'<a class="camera-tool" href="/playback" title="Playback" aria-label="Playback">◴</a>'
+            f'<button class="camera-tool" id="live-view-analytics" title="Analytics" aria-label="Analytics">⌕</button>'
+            f'<button class="camera-tool" id="live-view-bookmark" title="Bookmark" aria-label="Bookmark">◈</button>'
+            f'<button class="camera-tool" id="live-view-stop" title="Stop" aria-label="Stop">◼</button>'
+            f'<button class="camera-tool" id="live-view-retry" title="Retry" aria-label="Retry" hidden>↻</button>'
             f'{unlock_tool_button}'
             f'</div></section>'
             f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
@@ -1530,7 +1530,12 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       comingSoon('Snapshot is not available for this stream right now');
     }}
   }});
-  downloadButton.addEventListener('click',()=>comingSoon('Download applies to recorded clips in Playback'));
+  // Not a comingSoon() call: this isn't an unbuilt feature, it's a
+  // redirect to where download already works today (Playback) --
+  // comingSoon() always appends "is ready for a future update." to
+  // whatever label it's given, which turned this into a broken
+  // run-on sentence.
+  downloadButton.addEventListener('click',()=>showToast('Download applies to recorded clips in Playback.'));
   shareButton.addEventListener('click',()=>comingSoon('Share'));
   analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
   bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
