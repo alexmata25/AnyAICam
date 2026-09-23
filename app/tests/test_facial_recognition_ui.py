@@ -369,3 +369,111 @@ def test_people_page_renders_for_authenticated_viewer(client):
 def test_people_page_rejects_unauthenticated(client):
     response = client.get("/aac/people")
     assert response.status_code == 401
+
+
+# --------------------------------------------------------------- 2026-09-23:
+# real customers must never see/need a raw "Customer ID" field, and must
+# see an honest upsell (never the raw admin tool) when not entitled to
+# Face Access.
+
+
+def _grant_face_access(customer_id="cust-1"):
+    from analytics_entitlements import upsert_analytics_subscription
+
+    upsert_analytics_subscription(customer_id=customer_id, analytic_key="facial_recognition", status="active")
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/aac/people", "/aac/people/enroll", "/aac/watchlists", "/aac/events", "/aac/settings"],
+)
+def test_customer_without_face_access_sees_an_upsell_not_the_raw_tool(client, path):
+    response = client.get(path, cookies=_cookies(_customer_owner_cookie()))
+    assert response.status_code == 200
+    assert "Face Access" in response.text
+    assert "/subscription-portal" in response.text
+    assert 'id="aac-customer-id"' not in response.text
+    assert 'id="e-customer-id"' not in response.text
+    assert 'id="w-customer-id"' not in response.text
+    assert 'id="ev-customer-id"' not in response.text
+    assert 'id="s-customer-id"' not in response.text
+
+
+@pytest.mark.parametrize(
+    "path,field_id",
+    [
+        ("/aac/people", "aac-customer-id"),
+        ("/aac/people/enroll", "e-customer-id"),
+        ("/aac/watchlists", "w-customer-id"),
+        ("/aac/events", "ev-customer-id"),
+        ("/aac/settings", "s-customer-id"),
+    ],
+)
+def test_entitled_customer_never_sees_a_manual_customer_id_field(client, db_path, path, field_id):
+    with override_target(sqlite_path=str(db_path)):
+        _grant_face_access("cust-1")
+    response = client.get(path, cookies=_cookies(_customer_owner_cookie()))
+    assert response.status_code == 200
+    assert f'id="{field_id}"' not in response.text
+    assert "Face Access required" not in response.text
+    assert 'const FIXED_CUSTOMER_ID="cust-1";' in response.text
+
+
+def test_entitled_customer_viewer_also_gets_the_fixed_customer_id_not_the_field(client, db_path):
+    with override_target(sqlite_path=str(db_path)):
+        _grant_face_access("cust-1")
+    response = client.get("/aac/people", cookies=_cookies(_customer_viewer_cookie()))
+    assert response.status_code == 200
+    assert 'id="aac-customer-id"' not in response.text
+    assert 'const FIXED_CUSTOMER_ID="cust-1";' in response.text
+
+
+@pytest.mark.parametrize(
+    "path,field_id",
+    [
+        ("/aac/people", "aac-customer-id"),
+        ("/aac/people/enroll", "e-customer-id"),
+        ("/aac/watchlists", "w-customer-id"),
+        ("/aac/events", "ev-customer-id"),
+        ("/aac/settings", "s-customer-id"),
+    ],
+)
+def test_staff_sessions_keep_the_manual_multi_customer_tool_unchanged(client, db_path, path, field_id):
+    """Entitlement-gating and customer-id auto-fill are customer_owner/
+    customer_viewer-only -- an administrator (and every other staff
+    role) must keep the exact original manual, multi-tenant admin tool,
+    completely unaffected by whether ANY customer has purchased Face
+    Access."""
+    with override_target(sqlite_path=str(db_path)):
+        _grant_face_access("cust-1")
+    response = client.get(path, cookies=_cookies(_admin_cookie()))
+    assert response.status_code == 200
+    assert f'id="{field_id}"' in response.text
+    assert "Face Access required" not in response.text
+    assert "const FIXED_CUSTOMER_ID=null;" in response.text
+
+
+def test_entitled_customer_owner_can_actually_enroll_a_person_end_to_end(client, db_path):
+    """The whole point of the fix: an entitled real customer session can
+    use the feature at all, with zero manual customer-id entry anywhere
+    in the flow -- proven end-to-end against the real enroll API using
+    only the identity the session cookie itself carries."""
+    with override_target(sqlite_path=str(db_path)):
+        _grant_face_access("cust-1")
+    page = client.get("/aac/people/enroll", cookies=_cookies(_customer_owner_cookie()))
+    assert page.status_code == 200
+    assert 'const FIXED_CUSTOMER_ID="cust-1";' in page.text
+    created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Alice"}, cookies=_cookies(_customer_owner_cookie()))
+    assert created.status_code == 200
+
+
+def test_event_detail_page_falls_back_to_the_customers_own_id_with_no_query_param(client, db_path):
+    """A real customer following a bookmarked/typed /aac/events/{id} link
+    with no ?customer_id= must still resolve to their own account, not
+    silently fail -- proven via the embedded FIXED_CUSTOMER_ID fallback
+    the page's own script now carries."""
+    with override_target(sqlite_path=str(db_path)):
+        _grant_face_access("cust-1")
+    response = client.get("/aac/events/some-event-id", cookies=_cookies(_customer_owner_cookie()))
+    assert response.status_code == 200
+    assert 'const FIXED_CUSTOMER_ID="cust-1";' in response.text

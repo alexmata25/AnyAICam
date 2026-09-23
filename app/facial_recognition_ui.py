@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import binascii
 import html
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -103,6 +104,46 @@ def _require(request: Request, permission: str) -> dict:
     if not allowed(identity, permission):
         raise HTTPException(status_code=403, detail="You do not have permission for this action.")
     return identity
+
+
+def _customer_facial_context(identity: dict) -> dict | None:
+    """2026-09-23 fix: every /aac/* page below rendered the same raw,
+    role-unaware admin-tool UI -- a manual "Customer ID" text field the
+    visitor had to type into before anything would load. Confirmed live:
+    _resolve_customer_id() (above) already hard-pins a customer_owner/
+    customer_viewer session's requests to their OWN customer_id and
+    rejects any other value outright -- but a real customer has no way
+    to ever know that internal id (it's never shown anywhere in the
+    customer-facing UI), so this field permanently blocked the entire
+    feature for every real customer session, even one that had paid for
+    it.
+
+    Returns None for staff roles (administrator/partner_owner/
+    technician/salesperson) -- their manual, multi-customer tool is
+    correct and deliberate, unchanged by this fix. For a real
+    customer_owner/customer_viewer session, returns {"customer_id":
+    their own id, "entitled": bool}: entitled reflects whether Face
+    Access (analytics_entitlements' "facial_recognition" analytic_key,
+    the same add-on subscription_portal_page's own Add-ons list already
+    sells) is currently active for this account. Embedding customer_id
+    here grants nothing new -- _resolve_customer_id() already forces
+    every actual API call to this exact same value regardless; this
+    only removes an impossible manual-entry step for a role that could
+    never type in any other value anyway."""
+    if identity["role"] not in ("customer_owner", "customer_viewer"):
+        return None
+    from analytics_entitlements import get_active_analytics_for_customer
+
+    customer_id = identity.get("customer_id") or ""
+    active = set(get_active_analytics_for_customer(customer_id)) if customer_id else set()
+    return {"customer_id": customer_id, "entitled": "facial_recognition" in active}
+
+
+_FACE_ACCESS_UPSELL = '''<section class="panel">
+<h2>Face Access required</h2>
+<p class="health-detail">Facial recognition, watchlists, and match events are part of the Face Access add-on. Add it from My subscription to enroll people, manage watchlists, and review match events.</p>
+<a class="action-button" href="/subscription-portal">Go to My subscription</a>
+</section>'''
 
 
 def _decode_image(image_base64: str):
@@ -434,21 +475,25 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
 
     # --------------------------------------------------------------- pages
 
-    def _page(request: Request, title: str, content: str, scripts: str = "") -> str:
-        _require(request, "facial.view")
-        return shell(title, "aac", content, scripts)
-
     @app.get("/aac/people", response_class=HTMLResponse)
     def aac_people_page(request: Request):
-        content = '''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>People</h1></div>
+        identity = _require(request, "facial.view")
+        facial_ctx = _customer_facial_context(identity)
+        if facial_ctx and not facial_ctx["entitled"]:
+            return shell("AAC People", "aac", '<header class="topbar"><div><p class="eyebrow">AAC</p><h1>People</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="aac-customer-id" placeholder="cust-..."></label>\n'
+        empty_message = "Search or refresh to load your enrolled people." if facial_ctx else "Enter a customer id and refresh."
+        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
+        content = ('''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>People</h1></div>
 <a class="action-button" href="/aac/people/enroll">Enroll person</a></header>
-<section class="panel"><label>Customer ID<input id="aac-customer-id" placeholder="cust-..."></label>
-<label>Search<input id="aac-search"></label><button class="ghost-button" id="aac-refresh">Refresh</button></section>
-<section class="panel" id="aac-people-list"><p class="health-detail">Enter a customer id and refresh.</p></section>'''
+<section class="panel">''' + customer_id_field + '''<label>Search<input id="aac-search"></label><button class="ghost-button" id="aac-refresh">Refresh</button></section>
+<section class="panel" id="aac-people-list"><p class="health-detail">''' + empty_message + '''</p></section>''')
         scripts = '''<script>
+''' + fixed_customer_id_js + '''
+function aacGetCustomerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('aac-customer-id')?.value.trim()||'');}
 function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function aacLoadPeople(){
-  const customerId=document.getElementById('aac-customer-id').value.trim();
+  const customerId=aacGetCustomerId();
   const search=document.getElementById('aac-search').value.trim();
   if(!customerId)return;
   const params=new URLSearchParams({customer_id:customerId});
@@ -474,14 +519,19 @@ async function aacDeletePerson(personId,customerId){
 }
 document.getElementById('aac-refresh').addEventListener('click',aacLoadPeople);
 </script>'''
-        return _page(request, "AAC People", content, scripts)
+        return shell("AAC People", "aac", content, scripts)
 
     @app.get("/aac/people/enroll", response_class=HTMLResponse)
     def aac_enroll_page(request: Request):
-        content = '''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Enroll person</h1></div></header>
+        identity = _require(request, "facial.view")
+        facial_ctx = _customer_facial_context(identity)
+        if facial_ctx and not facial_ctx["entitled"]:
+            return shell("Enroll person", "aac", '<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Enroll person</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="e-customer-id" placeholder="cust-..."></label>\n'
+        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
+        content = ('''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Enroll person</h1></div></header>
 <section class="panel rule-form" style="max-width:640px">
-<label>Customer ID<input id="e-customer-id" placeholder="cust-..."></label>
-<label>Display name<input id="e-name" required></label>
+''' + customer_id_field + '''<label>Display name<input id="e-name" required></label>
 <label>Employee/customer reference<input id="e-reference"></label>
 <label>Notes<textarea id="e-notes"></textarea></label>
 <button class="action-button" id="e-create">Create person</button>
@@ -493,11 +543,13 @@ document.getElementById('aac-refresh').addEventListener('click',aacLoadPeople);
 <p class="health-detail">Only the detected face crop is stored -- the original photo is never saved.</p>
 <div id="e-image-list"></div>
 </div>
-</section>'''
+</section>''')
         scripts = '''<script>
+''' + fixed_customer_id_js + '''
+function eGetCustomerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('e-customer-id')?.value.trim()||'');}
 let currentPersonId=null;
 document.getElementById('e-create').addEventListener('click',async()=>{
-  const customerId=document.getElementById('e-customer-id').value.trim();
+  const customerId=eGetCustomerId();
   const response=await fetch('/api/aac/people',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({customer_id:customerId,display_name:document.getElementById('e-name').value,
     external_reference:document.getElementById('e-reference').value,notes:document.getElementById('e-notes').value})});
@@ -509,7 +561,7 @@ document.getElementById('e-create').addEventListener('click',async()=>{
 });
 document.getElementById('e-upload').addEventListener('click',async()=>{
   const file=document.getElementById('e-file').files[0];
-  const customerId=document.getElementById('e-customer-id').value.trim();
+  const customerId=eGetCustomerId();
   if(!file||!currentPersonId)return;
   const reader=new FileReader();
   reader.onload=async()=>{
@@ -521,20 +573,28 @@ document.getElementById('e-upload').addEventListener('click',async()=>{
   reader.readAsDataURL(file);
 });
 </script>'''
-        return _page(request, "Enroll person", content, scripts)
+        return shell("Enroll person", "aac", content, scripts)
 
     @app.get("/aac/watchlists", response_class=HTMLResponse)
     def aac_watchlists_page(request: Request):
-        content = '''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Watchlists</h1></div></header>
-<section class="panel rule-form"><label>Customer ID<input id="w-customer-id"></label>
-<label>New watchlist name<input id="w-name"></label>
+        identity = _require(request, "facial.view")
+        facial_ctx = _customer_facial_context(identity)
+        if facial_ctx and not facial_ctx["entitled"]:
+            return shell("AAC Watchlists", "aac", '<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Watchlists</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="w-customer-id"></label>\n'
+        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
+        auto_load_js = "wLoad();" if facial_ctx else ""
+        content = ('''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Watchlists</h1></div></header>
+<section class="panel rule-form">''' + customer_id_field + '''<label>New watchlist name<input id="w-name"></label>
 <label>Classification<select id="w-classification"><option value="alert">Alert</option><option value="allow">Allow (access rules)</option></select></label>
 <button class="action-button" id="w-create">Create watchlist</button></section>
-<section class="panel" id="w-list"></section>'''
+<section class="panel" id="w-list"></section>''')
         scripts = '''<script>
+''' + fixed_customer_id_js + '''
+function wGetCustomerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('w-customer-id')?.value.trim()||'');}
 function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function wLoad(){
-  const customerId=document.getElementById('w-customer-id').value.trim();
+  const customerId=wGetCustomerId();
   if(!customerId)return;
   const response=await fetch('/api/aac/watchlists?customer_id='+encodeURIComponent(customerId));
   const box=document.getElementById('w-list');
@@ -547,26 +607,34 @@ async function wLoad(){
 }
 async function wDelete(id,customerId){await fetch(`/api/aac/watchlists/${id}?customer_id=${customerId}`,{method:'DELETE'});wLoad();}
 document.getElementById('w-create').addEventListener('click',async()=>{
-  const customerId=document.getElementById('w-customer-id').value.trim();
+  const customerId=wGetCustomerId();
   await fetch('/api/aac/watchlists',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({customer_id:customerId,name:document.getElementById('w-name').value,classification:document.getElementById('w-classification').value})});
   wLoad();
 });
-document.getElementById('w-customer-id').addEventListener('change',wLoad);
+document.getElementById('w-customer-id')?.addEventListener('change',wLoad);
+''' + auto_load_js + '''
 </script>'''
-        return _page(request, "AAC Watchlists", content, scripts)
+        return shell("AAC Watchlists", "aac", content, scripts)
 
     @app.get("/aac/events", response_class=HTMLResponse)
     def aac_events_page(request: Request):
-        content = '''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Facial events</h1></div></header>
-<section class="panel"><label>Customer ID<input id="ev-customer-id"></label>
-<label>Match state<select id="ev-state"><option value="">All</option><option value="known">Known</option><option value="unknown">Unknown</option><option value="watchlist">Watchlist</option></select></label>
+        identity = _require(request, "facial.view")
+        facial_ctx = _customer_facial_context(identity)
+        if facial_ctx and not facial_ctx["entitled"]:
+            return shell("AAC Facial events", "aac", '<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Facial events</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="ev-customer-id"></label>\n'
+        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
+        content = ('''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Facial events</h1></div></header>
+<section class="panel">''' + customer_id_field + '''<label>Match state<select id="ev-state"><option value="">All</option><option value="known">Known</option><option value="unknown">Unknown</option><option value="watchlist">Watchlist</option></select></label>
 <button class="ghost-button" id="ev-refresh">Refresh</button></section>
-<section class="panel" id="ev-list"></section>'''
+<section class="panel" id="ev-list"></section>''')
         scripts = '''<script>
+''' + fixed_customer_id_js + '''
+function evGetCustomerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('ev-customer-id')?.value.trim()||'');}
 function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 document.getElementById('ev-refresh').addEventListener('click',async()=>{
-  const customerId=document.getElementById('ev-customer-id').value.trim();
+  const customerId=evGetCustomerId();
   if(!customerId)return;
   const params=new URLSearchParams({customer_id:customerId});
   const state=document.getElementById('ev-state').value;
@@ -582,7 +650,7 @@ document.getElementById('ev-refresh').addEventListener('click',async()=>{
     data.events.map(e=>`<tr><td><a href="/aac/events/${encodeURIComponent(e.id)}?customer_id=${encodeURIComponent(customerId)}">${aacEsc(e.event_timestamp)}</a></td><td>${aacEsc(e.camera_id)}</td><td>${aacEsc(e.match_state)}</td><td>${aacEsc(e.matched_person_name||'—')}</td><td>${aacEsc(e.confidence)}</td></tr>`).join('')+'</tbody></table>';
 });
 </script>'''
-        return _page(request, "AAC Facial events", content, scripts)
+        return shell("AAC Facial events", "aac", content, scripts)
 
     @app.get("/api/aac/events/{event_id}/thumbnail")
     def aac_event_thumbnail(request: Request, event_id: str, customer_id: str | None = None):
@@ -603,17 +671,23 @@ document.getElementById('ev-refresh').addEventListener('click',async()=>{
 
     @app.get("/aac/events/{event_id}", response_class=HTMLResponse)
     def aac_event_detail_page(request: Request, event_id: str):
+        identity = _require(request, "facial.view")
+        facial_ctx = _customer_facial_context(identity)
+        if facial_ctx and not facial_ctx["entitled"]:
+            return shell("AAC Match detail", "aac", '<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Match detail</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         # event_id is a raw URL path segment -- HTML-escaped here (server
         # side, before it ever reaches the response body) so a crafted
         # URL cannot break out of the data-event-id attribute.
-        content = f'''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Match detail</h1></div></header>
-<section class="panel" id="d-detail" data-event-id="{html.escape(event_id)}"></section>'''
+        content = ('''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Match detail</h1></div></header>
+<section class="panel" id="d-detail" data-event-id="''' + html.escape(event_id) + '''"></section>''')
         scripts = '''<script>
+''' + fixed_customer_id_js + '''
 function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 (async()=>{
   const box=document.getElementById('d-detail');
   const eventId=box.dataset.eventId;
-  const customerId=new URLSearchParams(location.search).get('customer_id')||'';
+  const customerId=new URLSearchParams(location.search).get('customer_id')||FIXED_CUSTOMER_ID||'';
   const response=await fetch(`/api/aac/events/${encodeURIComponent(eventId)}?customer_id=${encodeURIComponent(customerId)}`);
   if(!response.ok){box.innerHTML='<p class="health-detail">Event not found.</p>';return;}
   const e=await response.json();
@@ -632,14 +706,20 @@ function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&am
   <div class="health-row"><span>Engine</span><strong>${aacEsc(e.engine)}</strong></div>`;
 })();
 </script>'''
-        return _page(request, "AAC Match detail", content, scripts)
+        return shell("AAC Match detail", "aac", content, scripts)
 
     @app.get("/aac/settings", response_class=HTMLResponse)
     def aac_settings_page(request: Request):
-        content = '''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Settings</h1></div></header>
+        identity = _require(request, "facial.view")
+        facial_ctx = _customer_facial_context(identity)
+        if facial_ctx and not facial_ctx["entitled"]:
+            return shell("AAC Settings", "aac", '<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Settings</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="s-customer-id"></label>\n'
+        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
+        auto_load_js = "sLoad();" if facial_ctx else ""
+        content = ('''<header class="topbar"><div><p class="eyebrow">AAC</p><h1>Settings</h1></div></header>
 <section class="panel rule-form" style="max-width:520px">
-<label>Customer ID<input id="s-customer-id"></label>
-<button class="ghost-button" id="s-load">Load</button>
+''' + customer_id_field + '''<button class="ghost-button" id="s-load">Load</button>
 <label>Minimum confidence (0-1)<input id="s-confidence" type="number" min="0" max="1" step="0.01"></label>
 <label><input id="s-unknown" type="checkbox"> Create events for unknown faces</label>
 <label>Debounce seconds<input id="s-debounce" type="number" min="0"></label>
@@ -647,11 +727,13 @@ function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&am
 <p role="status" id="s-status"></p>
 <div class="health-row"><span>Active face engine</span><strong id="s-engine">&mdash;</strong></div>
 <p class="health-detail">The engine is a deployment-wide setting (ANYAICAM_FACE_ENGINE), shared by every customer/camera on this appliance -- shown here for information only, not editable per customer.</p>
-</section>'''
+</section>''')
         scripts = '''<script>
+''' + fixed_customer_id_js + '''
+function sGetCustomerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('s-customer-id')?.value.trim()||'');}
 function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function sLoad(){
-  const customerId=document.getElementById('s-customer-id').value.trim();
+  const customerId=sGetCustomerId();
   if(!customerId)return;
   const response=await fetch('/api/aac/settings?customer_id='+customerId);
   if(!response.ok)return;
@@ -663,12 +745,13 @@ async function sLoad(){
 }
 document.getElementById('s-load').addEventListener('click',sLoad);
 document.getElementById('s-save').addEventListener('click',async()=>{
-  const customerId=document.getElementById('s-customer-id').value.trim();
+  const customerId=sGetCustomerId();
   const response=await fetch('/api/aac/settings',{method:'PUT',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({customer_id:customerId,min_confidence:Number(document.getElementById('s-confidence').value),
     unknown_person_events_enabled:document.getElementById('s-unknown').checked,
     debounce_seconds:Number(document.getElementById('s-debounce').value)})});
   document.getElementById('s-status').textContent=response.ok?'Saved.':'Save failed.';
 });
+''' + auto_load_js + '''
 </script>'''
-        return _page(request, "AAC Settings", content, scripts)
+        return shell("AAC Settings", "aac", content, scripts)
