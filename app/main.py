@@ -132785,7 +132785,7 @@ def help_page() -> str:
 
 
 
-    content = """<header class="topbar"><div><p class="eyebrow">Support</p><h1>Help</h1></div></header><section class="feature-grid"><article class="feature-card"><div class="feature-icon">?</div><h2>Getting started</h2><p>Use Live view to monitor cameras and Playback to review completed five-minute recordings.</p></article><article class="feature-card"><div class="feature-icon">⌁</div><h2>Remote access</h2><p>Use the same page through your private Tailscale address while the home computer and VMS are running.</p></article><article class="feature-card"><div class="feature-icon">!</div><h2>Camera offline</h2><p>The interface remains available when cameras are unreachable and reconnects after the VMS restarts.</p></article></section>"""
+    content = """<header class="topbar"><div><p class="eyebrow">Support</p><h1>Help</h1></div></header><section class="feature-grid"><article class="feature-card"><div class="feature-icon">?</div><h2>Getting started</h2><p>Use Live to monitor camera feeds in real time, Playback to review recordings and event clips, and Dashboard for a quick overview of activity across every camera.</p></article><article class="feature-card"><div class="feature-icon">⌁</div><h2>Remote access</h2><p>Sign in from any browser on your phone, tablet, or computer using the same account -- see Phone access for connecting a mobile device.</p></article><article class="feature-card"><div class="feature-icon">!</div><h2>Camera offline</h2><p>Each camera's status is shown on Dashboard and Live. The portal stays available if a camera goes offline, and it reconnects automatically once the camera is back online.</p></article></section>"""
 
 
 
