@@ -371,3 +371,152 @@ def test_request_door_unlock_is_a_prepared_interface_not_an_implementation():
     (NotImplementedError), never silently pretend to unlock a door."""
     with pytest.raises(NotImplementedError):
         aac_voice_call.request_door_unlock(customer_id="cust-1", camera_id="cam-1", event_id="evt-1", requested_by="owner@example.test")
+
+
+# ------------------------------------------------ state-machine integrity
+#
+# 2026-09-23, found via independent review (no live incident): mark_
+# answered()/end_call() had no state precondition on their UPDATE at
+# all, so a stale/duplicate button press (two devices open on the same
+# account, a delayed retry, etc.) against an already-terminal call
+# silently re-stamped its timing fields and, for answer, even flipped
+# state back to 'answered' after the call had already ended or been
+# dismissed. Both are now guarded; these tests lock that in.
+
+
+def test_answering_an_already_ended_call_does_not_reopen_it(client, db_path):
+    info = _seed(db_path, "cust-1", 4)
+    entrance_camera_id = info["camera_ids"][0]
+    with override_target(sqlite_path=str(db_path)):
+        store.set_entrance_camera(customer_id="cust-1", camera_id=entrance_camera_id, enabled=True)
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+
+    trigger = client.post(
+        "/api/customer/aac/voice-call/simulate-trigger",
+        json={"camera_id": entrance_camera_id, "transcript_text": "hello"},
+        cookies=cookies,
+    )
+    event_id = trigger.json()["event_id"]
+    client.post(f"/api/customer/aac/voice-call/events/{event_id}/end", cookies=cookies)
+
+    with override_target(sqlite_path=str(db_path)):
+        ended_event = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")
+    assert ended_event["state"] == "ended"
+    ended_call_ended_at = ended_event["call_ended_at"]
+
+    # A stale "Answer" click after the call already ended must not
+    # reopen it.
+    response = client.post(f"/api/customer/aac/voice-call/events/{event_id}/answer", cookies=cookies)
+    assert response.status_code == 200  # the route itself still 200s (no error path wired) --
+
+    with override_target(sqlite_path=str(db_path)):
+        after = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")
+    assert after["state"] == "ended"
+    assert after["answered"] == 0
+    assert after["answered_at"] is None
+    assert after["call_started_at"] is None
+    assert after["call_ended_at"] == ended_call_ended_at
+
+
+def test_ending_an_already_ended_call_does_not_re_stamp_the_end_time(client, db_path):
+    info = _seed(db_path, "cust-1", 4)
+    entrance_camera_id = info["camera_ids"][0]
+    with override_target(sqlite_path=str(db_path)):
+        store.set_entrance_camera(customer_id="cust-1", camera_id=entrance_camera_id, enabled=True)
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+
+    trigger = client.post(
+        "/api/customer/aac/voice-call/simulate-trigger",
+        json={"camera_id": entrance_camera_id, "transcript_text": "hello"},
+        cookies=cookies,
+    )
+    event_id = trigger.json()["event_id"]
+    client.post(f"/api/customer/aac/voice-call/events/{event_id}/end", cookies=cookies)
+    with override_target(sqlite_path=str(db_path)):
+        first_end = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")["call_ended_at"]
+
+    # A second, stale "End call" click must not move call_ended_at.
+    client.post(f"/api/customer/aac/voice-call/events/{event_id}/end", cookies=cookies)
+    with override_target(sqlite_path=str(db_path)):
+        second_end = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")["call_ended_at"]
+    assert second_end == first_end
+
+
+def test_dismissing_then_ending_does_not_reopen_a_dismissed_call(client, db_path):
+    info = _seed(db_path, "cust-1", 4)
+    entrance_camera_id = info["camera_ids"][0]
+    with override_target(sqlite_path=str(db_path)):
+        store.set_entrance_camera(customer_id="cust-1", camera_id=entrance_camera_id, enabled=True)
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+
+    trigger = client.post(
+        "/api/customer/aac/voice-call/simulate-trigger",
+        json={"camera_id": entrance_camera_id, "transcript_text": "hello"},
+        cookies=cookies,
+    )
+    event_id = trigger.json()["event_id"]
+    client.post(f"/api/customer/aac/voice-call/events/{event_id}/dismiss", cookies=cookies)
+    with override_target(sqlite_path=str(db_path)):
+        dismissed = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")
+    assert dismissed["state"] == "dismissed"
+
+    client.post(f"/api/customer/aac/voice-call/events/{event_id}/end", cookies=cookies)
+    with override_target(sqlite_path=str(db_path)):
+        after = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")
+    assert after["state"] == "dismissed"
+    assert after["call_ended_at"] is None
+
+
+def test_ending_without_ever_answering_is_a_real_allowed_flow(client, db_path):
+    """The call screen's End call button is always available alongside
+    Answer -- ending a call the homeowner never answered (saw it was a
+    delivery, closed the screen) is intended, not a bug the state guard
+    should block."""
+    info = _seed(db_path, "cust-1", 4)
+    entrance_camera_id = info["camera_ids"][0]
+    with override_target(sqlite_path=str(db_path)):
+        store.set_entrance_camera(customer_id="cust-1", camera_id=entrance_camera_id, enabled=True)
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+
+    trigger = client.post(
+        "/api/customer/aac/voice-call/simulate-trigger",
+        json={"camera_id": entrance_camera_id, "transcript_text": "hello"},
+        cookies=cookies,
+    )
+    event_id = trigger.json()["event_id"]
+
+    response = client.post(f"/api/customer/aac/voice-call/events/{event_id}/end", cookies=cookies)
+    assert response.status_code == 200
+    with override_target(sqlite_path=str(db_path)):
+        after = store.get_voice_call_event(event_id=event_id, customer_id="cust-1")
+    assert after["state"] == "ended"
+    assert after["answered"] == 0
+    assert after["call_ended_at"] is not None
+
+
+# --------------------------------------------------- customer B cannot dismiss
+
+
+def test_customer_b_cannot_dismiss_customer_as_voice_call_event(client, db_path):
+    """The one cross-tenant mutation route the original 27 tests didn't
+    explicitly cover (trigger/read/answer/end were; dismiss shares the
+    exact same get_voice_call_event()-then-mutate pattern as answer/end,
+    but this locks the guarantee in explicitly rather than leaving it
+    merely implied)."""
+    info_a = _seed(db_path, "cust-a", 3)
+    _seed(db_path, "cust-b", 3)
+    with override_target(sqlite_path=str(db_path)):
+        store.set_entrance_camera(customer_id="cust-a", camera_id=info_a["camera_ids"][0], enabled=True)
+    cookies_a = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")}
+    cookies_b = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-b")}
+    trigger = client.post(
+        "/api/customer/aac/voice-call/simulate-trigger",
+        json={"camera_id": info_a["camera_ids"][0], "transcript_text": "hello"},
+        cookies=cookies_a,
+    )
+    event_id = trigger.json()["event_id"]
+
+    assert client.post(f"/api/customer/aac/voice-call/events/{event_id}/dismiss", cookies=cookies_b).status_code == 404
+    with override_target(sqlite_path=str(db_path)):
+        event = store.get_voice_call_event(event_id=event_id, customer_id="cust-a")
+    assert event["state"] != "dismissed"

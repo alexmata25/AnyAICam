@@ -119,11 +119,25 @@ def mark_notified(*, event_id: str, customer_id: str, notification_id: str, acto
 
 
 def mark_answered(*, event_id: str, customer_id: str, answered_by_user_id: str, actor: dict | None = None) -> None:
+    """2026-09-23 fix: the UPDATE below is now guarded to only fire from
+    'triggered'/'notified' -- without this, answering an already-ended
+    or already-dismissed call silently re-stamped answered_at/
+    call_started_at to "now" and flipped state back to 'answered',
+    resurrecting a call the homeowner (or the other party) had already
+    closed out, and double-answering an already-answered call reset its
+    timing fields with no record anything was amiss. Reached via
+    independent review, no live incident. Matches mark_dismissed()'s
+    own pre-existing state-guard precedent just below; silently no-ops
+    (same as that function) rather than raising, since the caller
+    (aac_voice_call.py) already 404s on a nonexistent/unowned event and
+    has no other error path wired for "wrong state" yet -- a stale
+    button press on an already-finished call is a normal, harmless race
+    (e.g. two devices open on the same account), not a caller bug."""
     now = datetime.now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET state='answered',answered=1,answered_at=?,answered_by_user_id=?,call_started_at=?,updated_at=? "
-            "WHERE id=? AND customer_id=?",
+            "WHERE id=? AND customer_id=? AND state IN ('triggered','notified')",
             (now, answered_by_user_id, now, now, event_id, customer_id),
         )
     audit(actor or {}, "aac_voice_call.answered", "aac_voice_call_event", event_id, {"answered_by_user_id": answered_by_user_id})
@@ -140,10 +154,22 @@ def mark_dismissed(*, event_id: str, customer_id: str, actor: dict | None = None
 
 
 def end_call(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
+    """2026-09-23 fix: guarded against re-ending an already-terminal
+    call (same defect class as mark_answered() just above -- an
+    unguarded UPDATE let a stale/duplicate "End call" press re-stamp
+    call_ended_at on a call already ended or already dismissed).
+    Deliberately NOT restricted to state='answered' only: the call
+    screen's own "End call" button is always available alongside
+    "Answer" (see aac_voice_call.py's voice_call_screen()), so ending
+    a call the homeowner never answered -- "saw it was a delivery,
+    closed the screen" -- is a real, intended flow, not a bug; only
+    re-processing an already-dismissed/already-ended call is guarded
+    against here."""
     now = datetime.now().isoformat()
     with connection() as db:
         db.execute(
-            "UPDATE aac_voice_call_events SET state='ended',call_ended_at=?,updated_at=? WHERE id=? AND customer_id=?",
+            "UPDATE aac_voice_call_events SET state='ended',call_ended_at=?,updated_at=? "
+            "WHERE id=? AND customer_id=? AND state NOT IN ('dismissed','ended')",
             (now, now, event_id, customer_id),
         )
     audit(actor or {}, "aac_voice_call.ended", "aac_voice_call_event", event_id, {})
