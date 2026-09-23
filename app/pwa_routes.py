@@ -78,7 +78,7 @@ self.addEventListener('notificationclick',event=>{
         current_user(request)
         content = '''
         <header class="topbar">
-          <div><p class="eyebrow">Phase 6D</p><h1>Install ANY AI CAM on your phone</h1></div>
+          <div><p class="eyebrow">Get the app</p><h1>Install ANY AI CAM on your phone</h1></div>
           <span class="pill">Android + iPhone</span>
         </header>
         <section class="panel">
