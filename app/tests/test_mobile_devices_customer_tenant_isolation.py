@@ -88,14 +88,18 @@ def _owner_cookie(customer_id, email="owner@example.test"):
     return partner_portal._token(email, "customer_owner", None, customer_id, None)
 
 
+def _admin_cookie():
+    return partner_portal._token("admin@example.test", "administrator")
+
+
 def _create_pairing(client, cookies, device_name="Test Phone"):
     response = client.post("/api/mobile/pairing", json={"device_name": device_name}, cookies=cookies)
     assert response.status_code == 200
     return response.json()["pairing"]
 
 
-def _claim(client, code, device_name="Test Phone"):
-    response = client.post("/api/mobile/pairing/claim", json={"code": code, "device_name": device_name})
+def _claim(client, code, cookies, device_name="Test Phone"):
+    response = client.post("/api/mobile/pairing/claim", json={"code": code, "device_name": device_name}, cookies=cookies)
     assert response.status_code == 200
     return response.json()["device"]
 
@@ -111,11 +115,20 @@ def test_pairing_code_created_by_a_real_customer_is_scoped_to_that_customer(http
     assert pairing["user_id"] != "anonymous"
 
 
-def test_anonymous_request_with_no_session_is_unaffected_by_the_fix(http_client, db_path):
-    """Pre-existing behavior for the legacy/no-session path must survive
-    unchanged -- proves the fix is additive, not a rewrite of
-    current_user()'s own fallback semantics."""
-    pairing = _create_pairing(http_client, cookies={})
+def test_non_customer_session_falls_through_to_current_user_unaffected(http_client, db_path):
+    """A staff/administrator partner-portal session (a real role, just
+    not customer_owner/customer_viewer) must still fall through to the
+    exact original current_user(request) call -- which itself checks a
+    different cookie (anyaicam_session) an administrator session doesn't
+    carry either, so this still resolves to current_user()'s own
+    anonymous fallback, unchanged. Proves the fix is additive to the
+    customer_owner/customer_viewer branch only, never a rewrite of
+    current_user()'s own fallback semantics for every other session
+    kind. (POST /api/mobile/pairing requires some authenticated partner-
+    portal session to reach the route body at all -- a separate,
+    pre-existing, unrelated middleware gate -- so a truly cookie-less
+    request can't reach this code path to begin with.)"""
+    pairing = _create_pairing(http_client, {partner_portal.SESSION_COOKIE: _admin_cookie()})
     assert pairing["user_id"] == "anonymous"
 
 
@@ -129,7 +142,7 @@ def test_two_customers_never_see_each_others_paired_devices(http_client, db_path
     cookie_b = {partner_portal.SESSION_COOKIE: _owner_cookie(customer_b)}
 
     pairing = _create_pairing(http_client, cookie_a, device_name="Customer A's Phone")
-    _claim(http_client, pairing["code"], device_name="Customer A's Phone")
+    _claim(http_client, pairing["code"], cookie_a, device_name="Customer A's Phone")
 
     devices_a = http_client.get("/api/mobile/devices", cookies=cookie_a).json()["devices"]
     devices_b = http_client.get("/api/mobile/devices", cookies=cookie_b).json()["devices"]
@@ -145,7 +158,7 @@ def test_a_customer_cannot_revoke_another_customers_device(http_client, db_path)
     cookie_b = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-b")}
 
     pairing = _create_pairing(http_client, cookie_a)
-    device = _claim(http_client, pairing["code"])
+    device = _claim(http_client, pairing["code"], cookie_a)
 
     response = http_client.put(f"/api/mobile/devices/{device['id']}", json={"revoked": True}, cookies=cookie_b)
     assert response.status_code == 403
@@ -156,7 +169,7 @@ def test_a_customer_can_manage_their_own_device(http_client, db_path):
     cookie_a = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")}
 
     pairing = _create_pairing(http_client, cookie_a)
-    device = _claim(http_client, pairing["code"])
+    device = _claim(http_client, pairing["code"], cookie_a)
 
     response = http_client.put(f"/api/mobile/devices/{device['id']}", json={"revoked": True}, cookies=cookie_a)
     assert response.status_code == 200
@@ -175,7 +188,7 @@ def test_a_customer_viewer_shares_the_owners_device_scope(http_client, db_path):
     viewer_cookie = {partner_portal.SESSION_COOKIE: partner_portal._token("viewer@example.test", "customer_viewer", None, "cust-a", None)}
 
     pairing = _create_pairing(http_client, owner_cookie, device_name="Owner's Phone")
-    _claim(http_client, pairing["code"], device_name="Owner's Phone")
+    _claim(http_client, pairing["code"], owner_cookie, device_name="Owner's Phone")
 
     devices = http_client.get("/api/mobile/devices", cookies=viewer_cookie).json()["devices"]
     assert any(d["device_name"] == "Owner's Phone" for d in devices)
