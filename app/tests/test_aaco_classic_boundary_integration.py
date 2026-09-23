@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import aaco
 import main
 from database_backend import override_target
 from partner_db import initialize_database
@@ -245,3 +246,130 @@ def test_a_second_tenants_camera_and_events_are_never_visible(db_path, monkeypat
             start=datetime(2026, 9, 16, 9, 0), end=datetime(2026, 9, 16, 11, 0),
         )
         assert result["events"] == [], "tenant A must never see tenant B's detection_events row"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-23: natural-language camera resolution. A customer's phrase for
+# "which camera" is often not that camera's exact display name -- these
+# prove _ClassicAacoBoundary's fuzzy fallback (main.py's
+# _aaco_fuzzy_camera_matches()/_resolve_camera()/_camera_ambiguity()) reaches
+# the one real, seeded camera ("Front Entrance") a phrase like "the
+# entrance"/"my front camera"/"outside the front" plausibly means, end to
+# end through the real aaco.parse()->aaco.execute() pipeline against a real
+# database -- not just the exact-name unit coverage above.
+# ---------------------------------------------------------------------------
+
+NOW = datetime(2026, 9, 16, 12, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("text", [
+    "Show me the front entrance.",
+    "Let me see the entrance.",
+    "What's happening at the entrance?",
+    "What does the front entrance look like right now?",
+    "Pull up my front camera.",
+    "I want to see out front.",
+    "Open the camera by the entrance.",
+])
+def test_many_natural_phrasings_resolve_to_the_one_real_seeded_camera(owner_seeded, text):
+    command = aaco.DeterministicLanguageAdapter().parse(text, now=NOW)
+    assert isinstance(command, aaco.AacoCommand), f"{text!r} did not parse to a command: {command!r}"
+    boundary = main._ClassicAacoBoundary(_request())
+    result = aaco.execute(command, identity=_owner_identity(), vms=boundary)
+    assert not isinstance(result, aaco.Clarification), f"{text!r} unexpectedly asked for clarification: {result!r}"
+    assert result["kind"] == "live"
+    # The real proof: whichever raw phrase parse() extracted, execute()
+    # must have resolved it, through the fuzzy fallback, to cam-1
+    # specifically ("Front Entrance", the one real seeded camera) --
+    # confirmed via the href, which always carries the resolved camera's
+    # own database id, never the raw pre-resolution token text.
+    assert "cam-1" in result["href"], f"{text!r} resolved to the wrong camera: {result!r}"
+
+
+def test_ambiguous_natural_phrase_asks_which_camera_never_guesses(db_path, monkeypatch):
+    """Two real cameras both plausibly match "front" -- must ask which
+    one, never silently pick the first/either."""
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed_base_tenant(conn)
+        _seed_camera(conn, "cam-1", "Front Door", 1)
+        _seed_camera(conn, "cam-2", "Front Gate", 2)
+        conn.commit()
+        import partner_portal
+        monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity())
+
+        boundary = main._ClassicAacoBoundary(_request())
+        command = aaco.DeterministicLanguageAdapter().parse("Show me the front.", now=NOW)
+        result = aaco.execute(command, identity=_owner_identity(), vms=boundary)
+        assert isinstance(result, aaco.Clarification)
+        assert "Front Door" in result.message and "Front Gate" in result.message
+
+
+def test_unambiguous_camera_among_several_still_resolves(db_path, monkeypatch):
+    """A phrase that's ambiguous in the two-camera test above must still
+    resolve cleanly once it's specific enough to pick exactly one --
+    proves the fuzzy matcher scores by best overlap, not "any overlap
+    at all count as ambiguous."""
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed_base_tenant(conn)
+        _seed_camera(conn, "cam-1", "Front Door", 1)
+        _seed_camera(conn, "cam-2", "Front Gate", 2)
+        conn.commit()
+        import partner_portal
+        monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity())
+
+        boundary = main._ClassicAacoBoundary(_request())
+        command = aaco.DeterministicLanguageAdapter().parse("Show me who's at the door.", now=NOW)
+        result = aaco.execute(command, identity=_owner_identity(), vms=boundary)
+        assert not isinstance(result, aaco.Clarification)
+        assert "cam-1" in result["href"]
+
+
+def test_natural_language_camera_reference_can_never_resolve_to_another_tenants_camera(db_path, monkeypatch):
+    """Tenant isolation, specifically for the new fuzzy path: tenant A
+    asking for "the front" must only ever be scored against tenant A's
+    own cameras, even though tenant B also owns a real camera whose name
+    would otherwise fuzzy-match the same phrase."""
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed_base_tenant(conn, customer_id="cust-1", partner_id="partner-1")
+        _seed_base_tenant(conn, customer_id="cust-2", partner_id="partner-1")
+        _seed_camera(conn, "cam-a", "Front Entrance", 1, customer_id="cust-1")
+        _seed_camera(conn, "cam-b", "Front Gate", 1, customer_id="cust-2")
+        conn.commit()
+        import partner_portal
+        monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-1"))
+
+        boundary = main._ClassicAacoBoundary(_request())
+        command = aaco.DeterministicLanguageAdapter().parse("Let me see out front.", now=NOW)
+        result = aaco.execute(command, identity=_owner_identity("cust-1"), vms=boundary)
+        assert not isinstance(result, aaco.Clarification)
+        assert result["kind"] == "live"
+        assert "cam-a" in result["href"]
+        assert "cam-b" not in result["href"]
+
+
+def test_talk_intent_is_recognized_and_resolved_but_honestly_not_connected(owner_seeded):
+    """The prepared-but-not-wired talk hook: parse() must correctly
+    recognize the intent and resolve the real, authorized camera through
+    the exact same path every other operation uses -- proving genuine
+    understanding, not a stub that only accepts a fixed phrase -- while
+    execute() must never fake a working call."""
+    command = aaco.DeterministicLanguageAdapter().parse("Talk to the front entrance.", now=NOW)
+    assert command == aaco.AacoCommand("talk", camera_id="camera-name:front entrance")
+    boundary = main._ClassicAacoBoundary(_request())
+    result = aaco.execute(command, identity=_owner_identity(), vms=boundary)
+    assert not isinstance(result, aaco.Clarification)
+    assert result["kind"] == "status"
+    assert "isn't connected yet" in result["message"]
+    assert "Front Entrance" in result["message"]
+
+
+def test_talk_still_enforces_the_same_authorization_as_every_other_operation(owner_seeded):
+    boundary = main._ClassicAacoBoundary(_request())
+    with pytest.raises(PermissionError):
+        aaco.execute(aaco.AacoCommand("talk", camera_id="camera-99"), identity=_owner_identity(), vms=boundary)
