@@ -74412,7 +74412,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            <video id="dashboard-video-{camera_number}" muted playsinline preload="metadata"></video>
+            <img id="dashboard-snapshot-{camera_number}" class="dashboard-camera-snapshot" alt="Camera {camera_number} snapshot" hidden>
 
 
 
@@ -75538,169 +75538,51 @@ def dashboard(request: Request) -> str:
 
 
 
-const dashboardPlayers = new Map();
-
-
-
-
-
-
-
-
-function attachDashboardStream(cameraNumber){
-
-
-
-
-
-
-
-
-    const video=document.getElementById(`dashboard-video-${cameraNumber}`);
-
-
-
-
-
-
-
-
+// Dashboard camera tiles (2026-09-23): previously tried to attach an
+// HLS player to /hls/camera{N}.m3u8, a local-appliance path that was
+// never served by this cloud portal at all (confirmed live: 404 on
+// every load, for every camera, every time) -- the real live-relay
+// session mechanism the dedicated Live page correctly uses was never
+// wired here. Every tile was permanently stuck on "Connecting to
+// Camera N" with no way to ever resolve.
+//
+// Starting a real live-relay session per tile on every dashboard load
+// (5 concurrent sessions just to render a summary view) was ruled out
+// on cost/entitlement grounds -- this account's own plan has no cloud-
+// relay entitlement at all. Deliberately reuses the most recent
+// Event-mode clip's own thumbnail instead (already captured by the
+// existing, already-working analytics pipeline -- see
+// _customer_camera_latest_thumbnail_s3_key()) via a small periodic
+// poll, refreshed every DASHBOARD_SNAPSHOT_REFRESH_MS: no new capture
+// pipeline, no appliance-side changes, no live-relay cost, and stays
+// close to current for any camera with regular activity, which this
+// account's cameras all have.
+//
+// Camera-count-agnostic: discovers every rendered tile from the DOM
+// (id^="dashboard-camera-") rather than a fixed camera-number range --
+// the previous 1..4 loop silently never even attempted Camera 5.
+const DASHBOARD_SNAPSHOT_REFRESH_MS=20000;
+function attachDashboardSnapshot(cameraNumber){
+    const card=document.getElementById(`dashboard-camera-${cameraNumber}`);
+    const img=document.getElementById(`dashboard-snapshot-${cameraNumber}`);
     const placeholder=document.getElementById(`dashboard-placeholder-${cameraNumber}`);
-
-
-
-
-
-
-
-
-    const source=`/hls/camera${cameraNumber}.m3u8`;
-
-
-
-
-
-
-
-
-    if(!video)return;
-
-
-
-
-
-
-
-
-    const showVideo=()=>{placeholder.hidden=true;video.classList.add('ready');video.play().catch(()=>{})};
-
-
-
-
-
-
-
-
-    const showPlaceholder=()=>{placeholder.hidden=false;video.classList.remove('ready')};
-
-
-
-
-
-
-
-
-    if(window.Hls&&Hls.isSupported()){
-
-
-
-
-
-
-
-
-        const existing=dashboardPlayers.get(cameraNumber);if(existing)existing.destroy();
-
-
-
-
-
-
-
-
-        const hls=new Hls({liveSyncDurationCount:2,maxBufferLength:8});
-
-
-
-
-
-
-
-
-        dashboardPlayers.set(cameraNumber,hls);hls.loadSource(source);hls.attachMedia(video);
-
-
-
-
-
-
-
-
-        hls.on(Hls.Events.MANIFEST_PARSED,showVideo);
-
-
-
-
-
-
-
-
-        hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)showPlaceholder()});
-
-
-
-
-
-
-
-
-    }else if(video.canPlayType('application/vnd.apple.mpegurl')){
-
-
-
-
-
-
-
-
-        video.src=source;video.addEventListener('loadedmetadata',showVideo,{once:true});video.addEventListener('error',showPlaceholder,{once:true});
-
-
-
-
-
-
-
-
+    if(!card||!img||!placeholder)return;
+    const href=card.getAttribute('href')||'';
+    const match=href.match(/\/cameras\/([^/]+)\//)||href.match(/[?&]camera=([^&]+)/);
+    const cameraId=match&&match[1];
+    if(!cameraId)return;
+    const url=`/api/customer/cameras/${encodeURIComponent(cameraId)}/latest-thumbnail`;
+    function refresh(){
+        const busted=`${url}?t=${Date.now()}`;
+        const probe=new Image();
+        probe.onload=()=>{img.src=busted;img.hidden=false;placeholder.hidden=true};
+        probe.onerror=()=>{img.hidden=true;placeholder.hidden=false};
+        probe.src=busted;
     }
-
-
-
-
-
-
-
-
+    refresh();
+    setInterval(refresh,DASHBOARD_SNAPSHOT_REFRESH_MS);
 }
-
-
-
-
-
-
-
-
-for(let cameraNumber=1;cameraNumber<=4;cameraNumber++)attachDashboardStream(cameraNumber);
+document.querySelectorAll('[id^="dashboard-camera-"]').forEach(card=>attachDashboardSnapshot(card.id.replace('dashboard-camera-','')));
 
 
 
@@ -76366,7 +76248,7 @@ updateDashboard();updateRecentEvents();setInterval(updateDashboard,10000);setInt
 
 
 
-setInterval(()=>{for(let cameraNumber=1;cameraNumber<=4;cameraNumber++){const video=document.getElementById(`dashboard-video-${cameraNumber}`);if(!video||video.readyState<2)attachDashboardStream(cameraNumber)}},15000);
+// Dead watchdog removed 2026-09-23: attachDashboardStream()/dashboard-video-N no longer exist (see attachDashboardSnapshot() above, which already re-polls itself).
 
 
 
@@ -142933,6 +142815,51 @@ def customer_event_thumbnail(camera_id: str, event_id: str, request: Request):
     response = _cacheable_presigned_redirect(key) if key else None
     if response is None:
         raise HTTPException(status_code=404, detail="Event thumbnail not available.")
+
+    return response
+
+
+def _customer_camera_latest_thumbnail_s3_key(camera_id: str) -> str | None:
+    """Resolves this camera's own most recent Event-mode clip's captured
+    thumbnail S3 key -- same DB shape as _customer_event_thumbnail_s3_key()
+    above, scoped by camera_id alone (no specific event_id) and ordered
+    to the newest one with real media, never a still-"Processing…" row.
+
+    Powers the customer Dashboard's per-camera preview tile (2026-09-23):
+    a genuine periodic-capture pipeline requiring new appliance-side code
+    was judged disproportionate for a summary-view preview, and starting
+    a full live-relay session per tile on every dashboard load was ruled
+    out on cost/entitlement grounds -- reusing the most recent thumbnail
+    the existing, already-working analytics pipeline already captured
+    needs neither. Never a substitute for genuine live video; the
+    dedicated Live page's own real session-based streaming is
+    unaffected and unchanged."""
+    from partner_db import connection
+
+    with connection() as db:
+        row = db.execute(
+            "SELECT dem.thumbnail_s3_key "
+            "FROM detection_event_media dem "
+            "JOIN detection_events de ON de.id=dem.detection_event_id "
+            "WHERE de.camera_id=? AND length(dem.thumbnail_s3_key)>0 "
+            "ORDER BY dem.started_at DESC LIMIT 1",
+            (camera_id,),
+        ).fetchone()
+
+    if not row or not row["thumbnail_s3_key"]:
+        return None
+    return row["thumbnail_s3_key"]
+
+
+@app.get("/api/customer/cameras/{camera_id}/latest-thumbnail")
+def customer_camera_latest_thumbnail(camera_id: str, request: Request):
+    if not _customer_authorized_camera_id(request, camera_id):
+        raise HTTPException(status_code=403, detail="Not authorized for this camera.")
+
+    key = _customer_camera_latest_thumbnail_s3_key(camera_id)
+    response = _cacheable_presigned_redirect(key) if key else None
+    if response is None:
+        raise HTTPException(status_code=404, detail="No recent snapshot available for this camera yet.")
 
     return response
 
