@@ -55,24 +55,115 @@ def _requested_time(now: datetime, hour_text: str, minute_text: str, ampm: str |
     return (now - timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
+# 2026-09-23: naturalness broadening. Every pattern below still resolves
+# to exactly the same, unchanged Operation set _execute() already
+# enforces -- this widens how many ways a customer can *ask* for an
+# existing action, never what actions exist. The unlock_door boundary
+# in particular is untouched below this point: broadening which
+# phrases route to it changes nothing about its own safety, since the
+# ambiguous-door Clarification and vms.unlock_door()'s own fail-closed
+# authorization (see execute()'s comment) both still run identically
+# regardless of which phrase got a customer there.
+#
+# _normalize() handles conversational *framing* only (a leading "AACO,"/
+# "hey AACO", polite wrappers like "can you please"/"I'd like to", a
+# trailing "?" or "please", and folding request-verb synonyms like
+# "pull up"/"bring up"/"let me see" onto the grammar's own canonical
+# "show") -- it never rewrites a camera/door *name* a customer actually
+# supplies, only the request framing around it. Every pattern after
+# normalization can therefore stay just as narrow and auditable as
+# before; the flexibility lives in one shared, testable place instead
+# of being duplicated (or, worse, inconsistently applied) into each
+# individual rule below.
+_LEADING_AACO_ADDRESS = re.compile(r"^(?:hey )?aaco[,]?\s+")
+_SHOW_SYNONYM_WANT_PATTERNS = (
+    re.compile(r"^i want to see\s+"),
+    re.compile(r"^i'd like to see\s+"),
+    re.compile(r"^i would like to see\s+"),
+    re.compile(r"^let me see\s+"),
+    re.compile(r"^can i see\s+"),
+    re.compile(r"^could i see\s+"),
+)
+_LEADING_FILLER_PATTERNS = (
+    re.compile(r"^(?:can|could|would) you (?:please )?"),
+    re.compile(r"^please\s+"),
+    re.compile(r"^i(?:'d| would) like to\s+"),
+    re.compile(r"^i want to\s+"),
+)
+_SHOW_SYNONYM_PLAIN_PATTERNS = (
+    re.compile(r"^show me\s+"),
+    re.compile(r"^pull up\s+"),
+    re.compile(r"^bring up\s+"),
+    re.compile(r"^display\s+"),
+    re.compile(r"^view\s+"),
+)
+
+
+def _normalize(text: str) -> str:
+    value = " ".join(text.lower().split())
+    value = re.sub(r"\?\s*$", "", value)
+    value = re.sub(r"\s+please\s*$", "", value)
+    value = _LEADING_AACO_ADDRESS.sub("", value, count=1)
+    for pattern in _SHOW_SYNONYM_WANT_PATTERNS:
+        new_value = pattern.sub("show ", value, count=1)
+        if new_value != value:
+            return new_value.strip()
+    changed = True
+    while changed:
+        changed = False
+        for pattern in _LEADING_FILLER_PATTERNS:
+            new_value = pattern.sub("", value, count=1)
+            if new_value != value:
+                value, changed = new_value, True
+    for pattern in _SHOW_SYNONYM_PLAIN_PATTERNS:
+        new_value = pattern.sub("show ", value, count=1)
+        if new_value != value:
+            value = new_value
+            break
+    return value.strip()
+
+
+_CAMERA_WORD = re.compile(r"\bcameras?\b")
+_CAMERA_STATUS_SIGNAL = re.compile(r"\b(?:offline|down|not working|unavailable|disconnected|status)\b")
+_RETURN_LIVE_PHRASES = {
+    "return to live", "return live", "go live", "go back to live",
+    "back to live", "switch to live", "resume live", "go to live view",
+    "return to live view", "go back to live view",
+}
+_PREVIOUS_EVENT_PHRASES = {
+    "show previous event", "previous event", "show the previous event",
+    "go to the previous event", "go to previous event", "last event",
+    "show the last event", "show last event", "go back to the previous event",
+}
+_LET_ME_IN_PHRASES = {"let me in", "can i come in"}
+
+
 class DeterministicLanguageAdapter:
-    """A small safe grammar; a future LLM may only emit ``AacoCommand``."""
+    """A small safe grammar; a future LLM may only emit ``AacoCommand``.
+
+    Deterministic does not mean rigid: _normalize() absorbs how a
+    customer actually phrases a request (politeness wrapping, a leading
+    "AACO,", verb synonyms) before any pattern below ever sees the
+    text, so many natural phrasings of the same request resolve to the
+    exact same AacoCommand -- see test_aaco.py's
+    test_many_natural_phrasings_resolve_to_the_same_action for the
+    proof this is meant to satisfy."""
 
     def parse(self, text: str, *, now: datetime, context: dict | None = None) -> AacoCommand | Clarification:
-        value = " ".join(text.lower().split())
-        if value in {"which cameras are offline?", "which cameras are offline"}:
+        value = _normalize(text)
+        if _CAMERA_WORD.search(value) and _CAMERA_STATUS_SIGNAL.search(value):
             return AacoCommand("camera_status")
-        if value in {"return to live", "return live", "go live"}:
+        if value in _RETURN_LIVE_PHRASES:
             if not context or not context.get("camera_id"):
                 return Clarification("Select an authorized camera before returning to live.")
             return AacoCommand("live_view", camera_id=context["camera_id"])
-        if value in {"show previous event", "previous event"}:
+        if value in _PREVIOUS_EVENT_PHRASES:
             if not context or not context.get("camera_id") or not context.get("event_at"):
                 return Clarification("Select an event before asking for the previous event.")
             return AacoCommand("event_navigation", camera_id=context["camera_id"], end=context["event_at"])
-        if value.startswith("go back "):
-            match = re.fullmatch(r"go back (\d+|ten|twenty|thirty) minutes?", value)
-            if not match or not context or not context.get("camera_id") or not context.get("playback_at"):
+        match = re.fullmatch(r"(?:go back|rewind|back up) (\d+|ten|twenty|thirty) minutes?", value)
+        if match:
+            if not context or not context.get("camera_id") or not context.get("playback_at"):
                 return Clarification("Select a camera and playback time before navigating.")
             minutes = {"ten": 10, "twenty": 20, "thirty": 30}.get(match.group(1))
             minutes = minutes if minutes is not None else int(match.group(1))
@@ -87,7 +178,12 @@ class DeterministicLanguageAdapter:
             "motion": "motion", "lpr": "lpr", "plate": "lpr", "license plate": "lpr",
             "people counting": "people_counting", "intrusion": "intrusion",
         }
-        match = re.fullmatch(r"show (person|vehicle|car|motion|lpr|plate|license plate|people counting|intrusion) events from the last (\d+) hours?", value)
+        match = re.fullmatch(
+            r"(?:show |any |were there any |display )?"
+            r"(person|vehicle|car|motion|lpr|plate|license plate|people counting|intrusion) events? "
+            r"(?:from |in )?(?:the )?(?:last|past) (\d+) hours?",
+            value,
+        )
         if match:
             return AacoCommand("event_search", event_type=event_words[match.group(1)], start=now - timedelta(hours=int(match.group(2))), end=now)
         # “yesterday at 3:15 PM” and “from 3:15 yesterday” are accepted.
@@ -106,12 +202,12 @@ class DeterministicLanguageAdapter:
             if match.group(1).strip() in {"camera", "cameras"}:
                 return Clarification("Tell me which authorized camera you want to see.")
             return AacoCommand("live_view", camera_id=_camera_token(match.group(1)))
-        match = re.fullmatch(r"(?:open|unlock) (?:the )?([a-z0-9][a-z0-9 &'_-]{0,80})", value)
-        if match:
-            name = match.group(1).strip()
-            if name in {"door", "doors"}:
+        door_match = re.fullmatch(r"(?:open|unlock) (?:the )?([a-z0-9][a-z0-9 &'_-]{0,80})", value)
+        door_name = "door" if value in _LET_ME_IN_PHRASES else (door_match.group(1).strip() if door_match else None)
+        if door_name is not None:
+            if door_name in {"door", "doors"}:
                 return Clarification("Tell me which authorized door you want to unlock.")
-            return AacoCommand("unlock_door", camera_id=_camera_token(name))
+            return AacoCommand("unlock_door", camera_id=_camera_token(door_name))
         return Clarification("I can show an authorized camera, playback, events, offline cameras, the previous event, unlock an authorized door, or navigate current playback.")
 
 
