@@ -198,13 +198,43 @@ def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, m
     assert 'data-addon-key="facial_recognition"' in html
 
 
-def test_an_unpriced_addon_is_not_offered_at_all(http_client, db_path):
+def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(http_client, db_path):
+    """2026-09-23 fix: this catalog entry (no Stripe Price ID env var
+    configured in this environment yet) used to be silently omitted from
+    the page entirely -- a customer had no way to know the SKU existed.
+    User-authorized product decision: show it honestly instead, matching
+    the codebase's own aaco_product_status() "sellable: false" precedent.
+    Never a buy button (clicking it would 404/fail -- there's no price
+    to check out with)."""
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
     conn.close()
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert "No analytics add-ons are configured for purchase yet." in response.text
+    html = response.text
+    assert "Advanced Analytics" in html
+    assert '<span>Advanced Analytics</span><span class="health-detail">Coming soon</span>' in html
+    assert 'data-addon-key="advanced_analytics"' not in html
+
+
+def test_an_addon_already_active_without_its_price_id_configured_still_shows_active(http_client, db_path):
+    """2026-09-23 fix, other half: an addon granted some way other than
+    this Stripe Price ID (e.g. a partner-provisioned entitlement) used to
+    vanish from the page entirely once its price env var was unset,
+    hiding a real active feature from the customer. It must still show
+    Active, never "Coming soon" and never a buy button, regardless of
+    whether the price env var happens to be configured."""
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-1")
+    conn.commit()
+    conn.close()
+    with override_target(sqlite_path=str(db_path)):
+        from analytics_entitlements import upsert_analytics_subscription
+        for key in ("smart_motion", "people_counting", "lpr", "ppe"):
+            upsert_analytics_subscription(customer_id="cust-1", analytic_key=key, status="active")
+    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
+    html = response.text
+    assert '<span>Advanced Analytics</span><span class="pill">Active</span>' in html
 
 
 # ------------------------------------------------------- customer_viewer role

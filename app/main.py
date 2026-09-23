@@ -103534,11 +103534,17 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     addon_rows = ""
     for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
         price_id = os.environ.get(env_var, "").strip()
-        if not price_id:
-            continue
         is_active = bool(analytic_keys) and all(key in active_analytics for key in analytic_keys)
         if is_active:
             status_html = '<span class="pill">Active</span>'
+        elif not price_id:
+            # Catalog defines this SKU but its Stripe Price ID env var
+            # isn't configured in this environment yet -- shown honestly
+            # rather than silently omitted (a customer with it already
+            # active via a non-Stripe grant still sees "Active" above;
+            # this branch is unreachable for them). Matches
+            # aaco_product_status()'s own "sellable: false" precedent.
+            status_html = '<span class="health-detail">Coming soon</span>'
         elif is_owner:
             status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
         else:
