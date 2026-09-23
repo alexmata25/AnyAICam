@@ -144107,10 +144107,22 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
     scripts = f'''<script>
 (function(){{
+  // recordingsByCamera/analyticsByCamera below are seeded once from the
+  // server-rendered snapshot (a fast first paint before the first live
+  // fetch completes) but are NOT a "loaded once, cached forever" store
+  // -- see ensureClipsLoaded()/ensureEventsLoaded() below, which always
+  // re-fetch and overwrite these entries on every call. A customer's
+  // Playback tab is routinely left open for hours -- caching "today"
+  // permanently at whatever it looked like when the tab was first
+  // opened silently froze the Recordings list and the timeline's own
+  // event markers at that moment forever, with no way to notice or
+  // recover short of a full page reload (2026-09-23, customer-
+  // reported: real recordings kept accumulating and were correctly
+  // visible from a fresh page load, but this same long-lived tab never
+  // saw any of them -- clicking Today, switching cameras back to this
+  // one, or simply waiting never re-fetched anything).
   const recordingsByCamera={json.dumps(recordings_by_camera)};
-  const recordingsLoaded=new Set([{json.dumps(first_camera_id)}]);
   const analyticsByCamera={json.dumps(analytics_by_camera)};
-  const analyticsLoaded=new Set([{json.dumps(first_camera_id)}]);
   const cameraTiles=[...document.querySelectorAll('.playback-camera-tile')];
   const video=document.getElementById('playback-video');
   const debugLine=document.getElementById('playback-debug');
@@ -145045,28 +145057,46 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // === PAGINATION_CORE_END ===
 
   // === PAGINATION_ENSURE_START ===
+  // 2026-09-23 fix: this used to short-circuit on a per-camera "loaded
+  // once" flag and never fetch again for the rest of the page's
+  // lifetime -- correct for genuinely static data, wrong for "today's
+  // most recent recordings" on a live system, where new footage keeps
+  // arriving. A customer's Playback tab is routinely left open for
+  // hours; the previous behavior silently froze the Recordings list at
+  // whatever it looked like the moment the tab was first opened, with
+  // no way to notice or recover short of a full page reload -- Today/
+  // camera-switch/waiting all appeared to do nothing. Always re-fetches
+  // now, on every call, and REPLACES (never merges/appends to)
+  // recordingsByCamera[cameraId] with the fresh result, so a repeated
+  // call can never leave a stale entry mixed in with a fresh one (the
+  // exact shape a duplicate-looking card would come from). Still "most
+  // recent N, no date filter" -- see this function's own callers for
+  // why that's still correct; only the "never called again" half of
+  // the old contract was ever wrong.
   async function ensureClipsLoaded(cameraId){{
-    if(recordingsLoaded.has(cameraId))return recordingsByCamera[cameraId]||[];
     const clips=await fetchClipsMetadata(cameraId,{{limit:{CUSTOMER_PLAYBACK_INITIAL_LIMIT}}});
     if(clips===null){{
-      // A genuine fetch failure, not a confirmed empty catalog --
-      // deliberately NOT marked as loaded, so the next time this
-      // camera is selected (or ensureClipsLoaded is otherwise called
-      // again) a fresh attempt is made instead of permanently treating
-      // a transient error as "this camera has zero recordings."
+      // A genuine fetch failure -- fall back to whatever was already
+      // showing (if anything) rather than blanking the view; the next
+      // call (next camera-tile click, next Today press) tries again,
+      // exactly as before.
       return recordingsByCamera[cameraId]||[];
     }}
     recordingsByCamera[cameraId]=clips;
-    recordingsLoaded.add(cameraId);
     return clips;
   }}
   // === PAGINATION_ENSURE_END ===
 
+  // Same 2026-09-23 fix as ensureClipsLoaded() immediately above, for
+  // the identical reason: the timeline's own event markers (motion/
+  // person/vehicle/etc dots) were just as permanently frozen at
+  // first-load time as the Recordings list was, on the same long-lived
+  // tab -- a customer seeing "today" on the timeline's date axis while
+  // its event dots (and the Recordings list below it) never advanced
+  // was this same bug in two places, not two different bugs.
   async function ensureEventsLoaded(cameraId){{
-    if(analyticsLoaded.has(cameraId))return analyticsByCamera[cameraId]||[];
     const events=await fetchCameraEvents(cameraId);
     analyticsByCamera[cameraId]=events;
-    analyticsLoaded.add(cameraId);
     return events;
   }}
 

@@ -265,16 +265,49 @@ test('a stale in-flight fetch still commits its result into the ORIGINAL camera\
   );
 });
 
-// --------------------------------------------------------- ensureClipsLoaded: initial load retry semantics
+// --------------------------------------------------------- ensureClipsLoaded: always-fresh semantics
 
-test('ensureClipsLoaded caches a successful initial load and never refetches it', async () => {
+// 2026-09-23 fix: this function used to cache a successful load forever
+// and never call fetch again for the rest of the page's lifetime --
+// this file's own OLDER version of this exact test asserted that as
+// correct. It is wrong for "today's most recent recordings" on a live
+// system: new footage keeps arriving, and a customer's Playback tab is
+// routinely left open for hours, so "loaded once" silently froze the
+// Recordings list (and, via the identical bug in ensureEventsLoaded(),
+// the timeline's own event markers) at whatever they looked like the
+// moment the tab was first opened -- Today/camera-switch/simply
+// waiting all appeared to do nothing, with no way to notice or recover
+// short of a full page reload.
+
+test('ensureClipsLoaded fetches fresh data on every call -- a second call is never served from a stale cache', async () => {
   const { api, queueFetchOk, fetchQueue } = buildSandbox();
   queueFetchOk([clip('a', '2026-08-30T00:00:00', '2026-08-30T00:05:00')]);
   const first = await api.ensureClipsLoaded('cam-1');
   assert.deepEqual(first.map(c => c.id), ['a']);
+
+  // A second call with a DIFFERENT queued response simulates real new
+  // footage having arrived since the first call -- the exact
+  // real-world case ("a customer's tab has been open for a while")
+  // this fix exists for.
+  queueFetchOk([
+    clip('a', '2026-08-30T00:00:00', '2026-08-30T00:05:00'),
+    clip('b', '2026-08-30T00:10:00', '2026-08-30T00:15:00'),
+  ]);
   const second = await api.ensureClipsLoaded('cam-1');
-  assert.deepEqual(second.map(c => c.id), ['a']);
-  assert.equal(fetchQueue.length, 0, 'the second call must be served from cache, not a second fetch');
+  assert.deepEqual(second.map(c => c.id), ['a', 'b'], 'the second call must reflect the newly-arrived recording, not a stale first-load snapshot');
+  assert.equal(fetchQueue.length, 0, 'both calls must have actually issued a real fetch');
+});
+
+test('ensureClipsLoaded REPLACES (never merges/appends to) recordingsByCamera on each call -- no duplicate-looking cards from a stale entry mixed with a fresh one', async () => {
+  const { api, state, queueFetchOk } = buildSandbox();
+  queueFetchOk([clip('a', '2026-08-30T00:00:00', '2026-08-30T00:05:00')]);
+  await api.ensureClipsLoaded('cam-1');
+
+  queueFetchOk([clip('a', '2026-08-30T00:00:00', '2026-08-30T00:05:00')]);
+  await api.ensureClipsLoaded('cam-1');
+
+  const ids = state.recordingsByCamera['cam-1'].map(c => c.id);
+  assert.deepEqual(ids, ['a'], 'a second call returning the same real recording must not duplicate it in the cache');
 });
 
 test('ensureClipsLoaded does not permanently cache a failed initial load, so a later retry can succeed', async () => {
