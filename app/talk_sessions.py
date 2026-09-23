@@ -125,7 +125,7 @@ def register_talk_session_routes(app: FastAPI) -> None:
         return {'session_id': session_id, 'status': 'requested', 'expires_at': expires.isoformat()}
 
     @app.post('/api/customer/talk/sessions/{session_id}/stop')
-    def stop_talk_session(request: Request, session_id: str) -> dict:
+    async def stop_talk_session(request: Request, session_id: str) -> dict:
         identity = _customer_identity(request)
         now = datetime.now()
         with connection() as db:
@@ -149,4 +149,17 @@ def register_talk_session_routes(app: FastAPI) -> None:
             )
 
         audit(identity, 'customer.talk_session_stopped', 'customer_talk_session', session_id, {'camera_id': session['camera_id']})
+
+        # 2026-09-23 fix: an explicit stop while a WebSocket was still
+        # actively relaying audio used to leave that relay running --
+        # audio kept reaching the camera speaker until it separately
+        # expired on its own timeout, up to MAX_RELAY_SECONDS later. A
+        # customer/AACO/AAC Voice Call "hang up" action must actually
+        # hang up. Local import: talk_audio_relay imports
+        # _authorized_talk_camera from this module, so a module-level
+        # import here would be circular. A no-op when no WebSocket for
+        # this session is currently open (the common case).
+        import talk_audio_relay
+        await talk_audio_relay.stop_active_relay_if_any(session_id)
+
         return {'session_id': session_id, 'status': 'stopped'}
