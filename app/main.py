@@ -143933,6 +143933,20 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.timeline-playhead{position:absolute;top:0;height:70px;width:2px;'
         'background:#1c6dd0;pointer-events:none;z-index:5}'
         '.timeline-playhead--gap{background:#9aa7b5}'
+        # Hover/scrub time readout (2026-09-23): a thin floating pill
+        # above the ruler showing the exact HH:MM:SS the cursor is over
+        # -- pointer-events:none for the identical reason the playhead
+        # itself is (never intercept the drag/click handlers meant for
+        # the lane underneath), translateX(-50%) centers it on the
+        # cursor's own fraction (its `left` is set in %, same convention
+        # positionPlayhead() already uses), and it starts [hidden] so a
+        # customer who has never touched the timeline sees nothing new
+        # until they actually hover or scrub it.
+        '.timeline-hover-tooltip{position:absolute;top:-28px;transform:translateX(-50%);'
+        'padding:2px 8px;border-radius:6px;background:#0b1018;color:#e8eef6;'
+        'font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;'
+        'pointer-events:none;z-index:6}'
+        '.timeline-hover-tooltip[hidden]{display:none}'
         '#playback-timeline-lane{cursor:grab;touch-action:none}'
         # 2026-09-04 lane fix (v2): the 2026-09-03 attempt above set
         # #playback-timeline-lane's height to a hand-picked 88px, WITHOUT
@@ -144209,6 +144223,18 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const playheadEl=document.createElement('div');
   playheadEl.className='timeline-playhead';
   playheadEl.hidden=true;
+  // Same single-persistent-element pattern as playheadEl immediately
+  // above (created once, re-appended after every timelineLane.innerHTML
+  // rebuild in renderTimeline() -- see that function's own comment) --
+  // never recreated per-render, so no listener/state is ever attached
+  // twice.
+  const timelineHoverTooltip=document.createElement('div');
+  timelineHoverTooltip.className='timeline-hover-tooltip';
+  timelineHoverTooltip.hidden=true;
+  function formatTimelineClockTime(ms){{
+    const d=new Date(ms);
+    return `${{String(d.getHours()).padStart(2,'0')}}:${{String(d.getMinutes()).padStart(2,'0')}}:${{String(d.getSeconds()).padStart(2,'0')}}`;
+  }}
   // Whichever clips array the timeline/clip-list are currently
   // showing -- the default (most-recent-page) view or a date-mode
   // view -- kept in sync at each renderTimeline() call site below,
@@ -144821,8 +144847,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // playheadEl is a single persistent element (see its own creation
     // comment above) -- re-appended here every render since the
     // innerHTML clear just above just discarded it along with the old
-    // segments/markers.
+    // segments/markers. timelineHoverTooltip is the identical pattern.
     timelineLane.appendChild(playheadEl);
+    timelineLane.appendChild(timelineHoverTooltip);
     const [dayY,dayM,dayD]=dayString.split('-').map(Number);
     const dayStartMs=new Date(dayY,dayM-1,dayD,0,0,0,0).getTime();
     const dayEndMs=dayStartMs+86400000;
@@ -145428,6 +145455,28 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     if(event.target!==timelineLane)return;
     seekToTimelineFraction(timelineFractionFromClientX(event.clientX),{{autoplay:true,announceGap:true}});
   }},{{capture:true}});
+
+  // Hover/scrub time readout (2026-09-23, customer-reported: the
+  // timeline had no way to see the exact hour/minute/second position
+  // being selected while hovering or dragging). One mousemove listener
+  // covers both cases deliberately -- it fires continuously while the
+  // mouse moves regardless of button state, so a plain hover and an
+  // active mouse-driven drag (the pointermove handler above) both keep
+  // this in sync with the cursor's own real position; the drag handler
+  // itself is left completely untouched. Mouse-specific (not pointer/
+  // touch): hover has no touch equivalent, so a touch-driven scrub
+  // intentionally does not show this -- the finger is already directly
+  // over the position being selected.
+  timelineLane.addEventListener('mousemove',(event)=>{{
+    const fraction=timelineFractionFromClientX(event.clientX);
+    const ms=timelineFractionToLocalMs(currentTimelineDayString(),fraction);
+    timelineHoverTooltip.textContent=formatTimelineClockTime(ms);
+    timelineHoverTooltip.style.left=(fraction*100)+'%';
+    timelineHoverTooltip.hidden=false;
+  }});
+  timelineLane.addEventListener('mouseleave',()=>{{
+    timelineHoverTooltip.hidden=true;
+  }});
 
   async function renderCamera(seekTimestamp){{
     debugLog(`[renderCamera] start cameraId=${{selectedCameraId}} seekTimestamp=${{seekTimestamp}}`);
