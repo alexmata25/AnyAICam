@@ -334,7 +334,7 @@ def test_no_audio_forwarded_after_relay_ended(db_path):
         initialize_database()
         talk_audio_relay._active_relays["evt-1"] = {"camera_id": "cam-1", "appliance_id": "appl-1", "customer_id": "cust-1", "created_at": time.monotonic()}
         import asyncio
-        asyncio.run(talk_audio_relay._end_relay("evt-1", notify_appliance=False))
+        asyncio.run(talk_audio_relay._end_relay("evt-1", notify_appliance=False, reason="test"))
     assert "evt-1" not in talk_audio_relay._active_relays
 
 
@@ -353,6 +353,118 @@ def test_appliance_channel_disconnect_ends_its_relays(client, db_path):
             import time as _t
             _t.sleep(0.3)
     assert _session_state(db_path, session_id) == "stopped"
+
+
+def test_relay_ended_by_appliance_disconnect_is_logged_and_audited_with_its_reason(client, db_path):
+    """2026-09-23 fix: _end_relay() used to be completely silent -- no
+    log line, no audit_logs row -- for every way a relay could end.
+    Reuses the exact scenario test_appliance_channel_disconnect_ends_
+    its_relays already proves the DB-state side of, and additionally
+    proves the audit trail now exists and correctly names *why*."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_tenant(db)
+            _seed_camera(db, "cam-1", talk_down_supported=1)
+            _seed_appliance_credential(db, "appl-1", "cred")
+
+    session_id = _start_session(client, "cam-1", {partner_portal.SESSION_COOKIE: _owner_cookie()})
+    with client.websocket_connect("/api/appliance/talk/channel", headers=_appliance_headers("appl-1", "cred")) as appliance_ws:
+        with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}):
+            appliance_ws.receive_json()
+            appliance_ws.close()
+            import time as _t
+            _t.sleep(0.3)
+
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            entry = db.execute(
+                "SELECT * FROM audit_logs WHERE action='customer.talk_session_ended' AND entity_id=?",
+                (session_id,),
+            ).fetchone()
+    assert entry is not None
+    import json
+    details = json.loads(entry["details_json"])
+    assert details["reason"] == "appliance_disconnected"
+    assert details["camera_id"] == "cam-1"
+
+
+def test_rest_stop_while_active_immediately_notifies_the_appliance_not_just_the_database(client, db_path):
+    """2026-09-23 fix: POST /api/customer/talk/sessions/{id}/stop --
+    the shared "hang up" interface AACO and AAC Voice Call are meant to
+    call, not just an artifact of Live's own press-and-hold release --
+    previously only updated the DB row. The live in-memory relay (and,
+    critically, the appliance -- the thing actually relaying real audio
+    to a real camera speaker) was never told, and kept running until it
+    separately expired on its own idle/max-duration timeout. This
+    proves the appliance now receives an immediate "stop" message
+    (not just an eventual timeout) and the relay is removed from
+    _active_relays at once."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_tenant(db)
+            _seed_camera(db, "cam-1", talk_down_supported=1)
+            _seed_appliance_credential(db, "appl-1", "cred")
+
+    session_id = _start_session(client, "cam-1", {partner_portal.SESSION_COOKIE: _owner_cookie()})
+    owner_cookies = {partner_portal.SESSION_COOKIE: _owner_cookie()}
+
+    with client.websocket_connect("/api/appliance/talk/channel", headers=_appliance_headers("appl-1", "cred")) as appliance_ws:
+        with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio", cookies=owner_cookies):
+            start_message = appliance_ws.receive_json()
+            assert start_message["type"] == "start"
+
+            assert session_id in talk_audio_relay._active_relays
+
+            stop_response = client.post(f"/api/customer/talk/sessions/{session_id}/stop", cookies=owner_cookies)
+            assert stop_response.status_code == 200
+            assert stop_response.json()["status"] == "stopped"
+
+            # The appliance must be told to stop relaying real audio to
+            # the camera speaker immediately -- not up to
+            # IDLE_TIMEOUT_SECONDS/MAX_RELAY_SECONDS later.
+            stop_message = appliance_ws.receive_json()
+            assert stop_message["type"] == "stop"
+            assert stop_message["session_id"] == session_id
+
+            assert session_id not in talk_audio_relay._active_relays
+
+    assert _session_state(db_path, session_id) == "stopped"
+
+
+def test_rest_stop_while_active_does_not_double_audit_the_relay_end(client, db_path):
+    """stop_talk_session()'s own audit() call already records "customer
+    asked to stop"; _end_relay()'s own audit() call (now reachable via
+    stop_active_relay_if_any()) must NOT also fire in this case -- the
+    DB row is already 'stopped' by the time _end_relay() runs, so its
+    own UPDATE affects zero rows and it must skip auditing a duplicate,
+    per its own rowcount-gated design."""
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            _seed_tenant(db)
+            _seed_camera(db, "cam-1", talk_down_supported=1)
+            _seed_appliance_credential(db, "appl-1", "cred")
+
+    session_id = _start_session(client, "cam-1", {partner_portal.SESSION_COOKIE: _owner_cookie()})
+    owner_cookies = {partner_portal.SESSION_COOKIE: _owner_cookie()}
+
+    with client.websocket_connect("/api/appliance/talk/channel", headers=_appliance_headers("appl-1", "cred")) as appliance_ws:
+        with client.websocket_connect(f"/api/customer/talk/sessions/{session_id}/audio", cookies=owner_cookies):
+            appliance_ws.receive_json()
+            client.post(f"/api/customer/talk/sessions/{session_id}/stop", cookies=owner_cookies)
+            appliance_ws.receive_json()
+
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            ended_entries = db.execute(
+                "SELECT * FROM audit_logs WHERE action='customer.talk_session_ended' AND entity_id=?",
+                (session_id,),
+            ).fetchall()
+            stopped_entries = db.execute(
+                "SELECT * FROM audit_logs WHERE action='customer.talk_session_stopped' AND entity_id=?",
+                (session_id,),
+            ).fetchall()
+    assert len(ended_entries) == 0
+    assert len(stopped_entries) == 1
 
 
 # --------------------------------------------------------------- structural

@@ -51,7 +51,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from appliance_cloud import authenticate_appliance
-from partner_db import connection
+from partner_db import audit, connection
 from partner_portal import partner_identity
 from talk_sessions import TALK_SESSION_DURATION_SECONDS, _authorized_talk_camera
 
@@ -108,7 +108,7 @@ def _customer_identity_ws(websocket: WebSocket) -> dict | None:
     return identity
 
 
-async def _end_relay(session_id: str, notify_appliance: bool) -> None:
+async def _end_relay(session_id: str, notify_appliance: bool, reason: str) -> None:
     """The single cleanup path for every way a relay can end -- explicit
     stop, idle timeout, max-duration timeout, appliance disconnect, or
     the customer socket simply dropping. Always removes the session
@@ -116,7 +116,26 @@ async def _end_relay(session_id: str, notify_appliance: bool) -> None:
     be forwarded again -- this is what makes "no audio sent after
     stop" true) and always marks the durable customer_talk_sessions row
     'stopped' if it was still 'requested'. Idempotent: calling this
-    twice for the same session_id is a harmless no-op the second time."""
+    twice for the same session_id is a harmless no-op the second time.
+
+    2026-09-23 fix: this function previously had no logging or audit
+    trail at all -- every relay ending here (which is EVERY relay: the
+    browser's own wireTalkMic() never calls the REST /stop route while
+    a WebSocket is open, only when a session is abandoned before the
+    socket ever connects) was completely silent, both operationally and
+    in audit_logs. `reason` is now always recorded via logger.info, and
+    audit()'d under the session's own original requester -- but only
+    when THIS call is the one that actually performs the 'requested' ->
+    'stopped' transition (checked via the UPDATE's own rowcount), so a
+    session already stopped by talk_sessions.py's own REST route (see
+    that module's stop_talk_session(), which now also calls this
+    function to make an explicit "hang up" while active actually notify
+    the appliance immediately rather than leaving the relay to expire
+    on its own idle/max-duration timeout) is never double-audited --
+    that route's own audit() call already covered the customer-facing
+    "why", this one adds the "what actually happened to the live relay
+    and when", which is a materially different fact worth its own
+    log line even when the audit entry is skipped as a duplicate."""
     relay = _active_relays.pop(session_id, None)
     if relay is None:
         return
@@ -129,10 +148,53 @@ async def _end_relay(session_id: str, notify_appliance: bool) -> None:
                 pass
     now = datetime.now().isoformat()
     with connection() as db:
-        db.execute(
+        cursor = db.execute(
             "UPDATE customer_talk_sessions SET state='stopped',ended_at=? WHERE id=? AND state='requested'",
             (now, session_id),
         )
+        updated = cursor.rowcount > 0
+        session_row = db.execute(
+            "SELECT customer_id,camera_id,requested_by,role FROM customer_talk_sessions WHERE id=?",
+            (session_id,),
+        ).fetchone() if updated else None
+
+    logger.info(
+        "talk_audio_relay.relay_ended session_id=%s reason=%s camera_id=%s customer_id=%s",
+        session_id, reason, relay.get("camera_id"), relay.get("customer_id"),
+    )
+    if updated and session_row:
+        audit(
+            {"email": session_row["requested_by"], "role": session_row["role"]},
+            "customer.talk_session_ended",
+            "customer_talk_session",
+            session_id,
+            {"camera_id": session_row["camera_id"], "reason": reason},
+        )
+
+
+async def stop_active_relay_if_any(session_id: str) -> None:
+    """2026-09-23 fix: talk_sessions.py's stop_talk_session() (the REST
+    "hang up" route -- the shared interface AACO/AAC Voice Call are
+    meant to call, not just Live's own press-and-hold button) previously
+    only updated customer_talk_sessions' DB row. It never touched
+    _active_relays at all, so an explicit stop WHILE a WebSocket was
+    still actively relaying audio left that relay running -- audio kept
+    reaching the camera speaker until it separately expired on its own
+    IDLE_TIMEOUT_SECONDS/MAX_RELAY_SECONDS, up to several seconds later.
+    For a customer/AACO/AAC Voice Call action that reads as "hang up
+    now", that's a real, user-visible correctness gap, not just a
+    missing log line.
+
+    Public (no leading underscore) specifically so talk_sessions.py can
+    import and call it -- a local import there, to avoid the circular
+    import this module already has the other direction (talk_sessions
+    -> _authorized_talk_camera). A no-op, by design, when no relay is
+    active for this session_id (the overwhelmingly common case: most
+    stop calls arrive for a session that either already ended or never
+    had its WebSocket open yet -- see _end_relay()'s own idempotent-pop
+    behavior)."""
+    if session_id in _active_relays:
+        await _end_relay(session_id, notify_appliance=True, reason="stopped_via_rest_while_active")
 
 
 
@@ -547,7 +609,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
             # for no reason.
             for session_id, relay in list(_active_relays.items()):
                 if relay["appliance_id"] == appliance["id"]:
-                    await _end_relay(session_id, notify_appliance=False)
+                    await _end_relay(session_id, notify_appliance=False, reason="appliance_disconnected")
 
     @app.websocket("/api/customer/talk/sessions/{session_id}/audio")
     async def customer_talk_audio(websocket: WebSocket, session_id: str):
@@ -644,6 +706,15 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                 })
             )
 
+        # 2026-09-23 fix: _end_relay() now records WHY a relay ended (see
+        # its own docstring) -- this default covers the loop's two
+        # relay-vanished-out-from-under-us breaks, which include the new
+        # "stopped explicitly via the REST route while this WebSocket
+        # was still active" case (talk_sessions.py's stop_talk_session()
+        # now calls _end_relay() directly, removing this session from
+        # _active_relays before this loop ever notices).
+        end_reason = "session_ended_externally"
+
         try:
             while True:
                 relay = _active_relays.get(session_id)
@@ -655,6 +726,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                     time.monotonic() - relay["created_at"]
                     > MAX_RELAY_SECONDS
                 ):
+                    end_reason = "max_duration_timeout"
                     break
 
                 try:
@@ -663,6 +735,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                         timeout=IDLE_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
+                    end_reason = "idle_timeout"
                     break
 
                 if local_relay is not None:
@@ -674,6 +747,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                 )
 
                 if channel is None:
+                    end_reason = "appliance_disconnected"
                     break
 
                 await channel.send_text(
@@ -685,7 +759,7 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                 )
 
         except WebSocketDisconnect:
-            pass
+            end_reason = "customer_disconnected"
 
         finally:
             if local_relay is not None:
@@ -694,4 +768,5 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
             await _end_relay(
                 session_id,
                 notify_appliance=(local_relay is None),
+                reason=end_reason,
             )
