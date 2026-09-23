@@ -874,6 +874,87 @@ CREATE TABLE IF NOT EXISTS customer_analytics_rules(
 CREATE INDEX IF NOT EXISTS idx_customer_analytics_rules_customer ON customer_analytics_rules(customer_id);
 CREATE INDEX IF NOT EXISTS idx_customer_analytics_rules_camera ON customer_analytics_rules(camera_id);
 '''),
+    # AAC Voice Call, Phase 1 foundation (2026-09-23): residential
+    # front-door voice/video interaction. Two tables, deliberately
+    # separate concerns:
+    #
+    # aac_voice_call_entrance_cameras is the explicit opt-in list --
+    # "only cameras explicitly configured as an AAC Voice Call entrance
+    # camera should participate" is the product requirement, so
+    # membership in this table (not a column bolted onto `cameras`,
+    # which every other camera-scoped feature already crowds) is the
+    # single source of truth a trigger checks before anything else
+    # happens. Same one-row-per-camera-per-concern convention as
+    # customer_camera_permissions/customer_analytics_rules -- never a
+    # hardcoded camera list, never inferred from camera_number/count.
+    #
+    # aac_voice_call_events is the event/call record itself -- one row
+    # per visitor interaction, covering every field the product spec
+    # asks for: the analytics trigger it came from (trigger_detection_
+    # event_id, nullable FK into the existing detection_events pipeline
+    # -- nullable because a simulated/manually-tested trigger has none),
+    # the interpreted visitor intent and its confidence, the transcript
+    # text if the audio pipeline provided one, a thumbnail reference
+    # (reusing detection_event_media's own s3_key convention rather
+    # than inventing a new media-reference shape), the notification
+    # this event fanned out into (notification_id, nullable until the
+    # notification step actually runs), and the full answered/call-
+    # timing lifecycle. `state` is a small enum tracked in application
+    # code (triggered -> notified -> answered|missed|dismissed ->
+    # ended), not a DB CHECK constraint, matching this codebase's own
+    # established convention (customer_talk_sessions.state,
+    # detection_event_media's own status column) of enforcing enum
+    # values in Python rather than at the schema layer.
+    #
+    # Audit/event history is deliberately NOT a third table here --
+    # partner_db.audit() (the audit_logs table) already exists
+    # precisely for "every state transition of a customer-scoped
+    # action, who did it, when, with what details" and is already used
+    # by door_access.py/facial_recognition_ui.py for exactly this kind
+    # of trail; aac_voice_call.py calls it at every transition instead
+    # of duplicating a parallel history table.
+    ('20260923_aac_voice_call','''
+CREATE TABLE IF NOT EXISTS aac_voice_call_entrance_cameras(
+    camera_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    configured_at TEXT NOT NULL,
+    configured_by TEXT,
+    FOREIGN KEY(camera_id) REFERENCES cameras(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_aac_voice_call_entrance_cameras_customer ON aac_voice_call_entrance_cameras(customer_id);
+
+CREATE TABLE IF NOT EXISTS aac_voice_call_events(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    site_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'triggered',
+    trigger_detection_event_id TEXT,
+    transcript_text TEXT,
+    intent TEXT,
+    intent_confidence REAL,
+    thumbnail_s3_key TEXT,
+    notification_id TEXT,
+    answered INTEGER NOT NULL DEFAULT 0,
+    answered_at TEXT,
+    answered_by_user_id TEXT,
+    call_started_at TEXT,
+    call_ended_at TEXT,
+    event_timestamp TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(site_id) REFERENCES sites(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id),
+    FOREIGN KEY(trigger_detection_event_id) REFERENCES detection_events(id),
+    FOREIGN KEY(notification_id) REFERENCES notifications(id),
+    FOREIGN KEY(answered_by_user_id) REFERENCES partner_users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_aac_voice_call_events_customer ON aac_voice_call_events(customer_id,created_at);
+CREATE INDEX IF NOT EXISTS idx_aac_voice_call_events_camera ON aac_voice_call_events(camera_id,created_at);
+'''),
 ]
 
 

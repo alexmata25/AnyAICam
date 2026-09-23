@@ -45,6 +45,9 @@ EVENT_TYPES: dict[str, str] = {
     # unlock); see appliance_cloud.py's analytics_event_available()
     # for where that distinction is actually made.
     "facial_recognition": "Face Access alert",
+    # AAC Voice Call (2026-09-23): a visitor-intent event at a
+    # configured entrance camera -- see aac_voice_call.py.
+    "aac_voice_call": "AAC Voice Call (visitor at the door)",
 }
 
 CAMERA_SCOPES = {"all", "selected"}
