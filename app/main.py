@@ -121932,7 +121932,18 @@ def _render_customer_alerts(request: Request) -> str:
   document.getElementById('alerts-grid')?.addEventListener('click',async event=>{
     const button=event.target.closest('.mark-alert-read');
     if(!button)return;
-    const card=button.closest('[data-notification-id]');
+    // The button itself also carries data-notification-id (so its id is
+    // readable without a card lookup) -- closest() checks the starting
+    // element first, so a bare '[data-notification-id]' selector matched
+    // the button itself, never its ancestor <article>. markCardRead()
+    // below silently updated/queried that wrong element (no data-read
+    // attribute, no .alert-unread class, no descendant .mark-alert-read
+    // to remove), so the POST succeeded server-side but the card's own
+    // read state, styling, and button never visibly changed. Scoping to
+    // the actual card element (not just any node with the attribute)
+    // fixes the ancestor lookup without touching the button's own
+    // attribute or the fetch below, which already read the correct id.
+    const card=button.closest('article[data-notification-id]');
     const id=card?.dataset.notificationId;
     if(!id)return;
     button.disabled=true;
