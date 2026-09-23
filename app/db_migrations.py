@@ -1007,6 +1007,49 @@ CREATE TABLE IF NOT EXISTS pending_mfa_logins(
     FOREIGN KEY(user_id) REFERENCES partner_users(id)
 );
 '''),
+    # AAC Voice Call -- owner-approved door access (2026-09-23). Fills in
+    # request_door_unlock()'s own prepared-but-unimplemented Phase 5
+    # interface with a real, explicitly human-confirmed unlock action --
+    # never a second door-control mechanism: authorization and dispatch
+    # both go through the exact same door_access._authorized_door_camera()/
+    # relay_control.get_provider().trigger() a manual Live-page unlock
+    # already uses (see aac_voice_call_door.py's own module docstring).
+    #
+    # aac_voice_call_unlock_confirmations is the server-enforced two-step
+    # confirmation gate the product spec requires ("require a clear
+    # confirmation before issuing the real unlock command") -- mirrors
+    # break_glass_tokens' own shape exactly (token_hash, expires_at,
+    # used_at), the same short-lived, single-use, hashed-at-rest pattern
+    # already independently reviewed earlier tonight, including its
+    # atomic UPDATE...WHERE used_at IS NULL claim discipline (the same
+    # review found and fixed a real TOCTOU race in that table's own
+    # sibling recovery-code/break-glass consumption -- this table's own
+    # consumption function is written with that same atomic claim from
+    # the start, not retrofitted after an incident). event_id/camera_id/
+    # requested_by_user_id are captured at REQUEST time and re-checked
+    # against the event's live state and the approving user's live
+    # can_unlock permission again at CONFIRM time -- a token proves "this
+    # specific request was made", never substitutes for re-verifying
+    # authorization.
+    ('20260923_aac_voice_call_door_unlock','''
+ALTER TABLE door_access_events ADD COLUMN aac_voice_call_event_id TEXT REFERENCES aac_voice_call_events(id);
+CREATE TABLE IF NOT EXISTS aac_voice_call_unlock_confirmations(
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    camera_id TEXT NOT NULL,
+    requested_by_user_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT,
+    FOREIGN KEY(event_id) REFERENCES aac_voice_call_events(id),
+    FOREIGN KEY(customer_id) REFERENCES customers(id),
+    FOREIGN KEY(camera_id) REFERENCES cameras(id),
+    FOREIGN KEY(requested_by_user_id) REFERENCES partner_users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_aac_voice_call_unlock_confirmations_event ON aac_voice_call_unlock_confirmations(event_id,created_at);
+'''),
 ]
 
 
