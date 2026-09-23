@@ -392,20 +392,29 @@ def record_visitor_utterance(
     # in whenever they choose.
     should_escalate = urgent or (intent_result.intent == "unknown" and utterance_count >= MAX_UTTERANCES_BEFORE_ESCALATION)
     if should_escalate and not event.get("escalated_at"):
-        camera = _authorized_camera(customer_id, event["camera_id"])
-        store.mark_escalated(event_id=event_id, customer_id=customer_id, actor=actor)
-        store.close_listening_window(event_id=event_id, customer_id=customer_id, actor=actor)
-        appliance = {"customer_id": customer_id, "site_id": camera["site_id"]}
-        escalate_event = {
-            "id": event_id,
-            "camera_id": event["camera_id"],
-            "event_type": "aac_voice_call",
-            "timestamp": datetime.now().isoformat(),
-            "message": f"A visitor at {camera['name'] or 'your entrance camera'} needs your attention.",
-            "severity": "warning",
-        }
-        fanout_appliance_event(appliance, escalate_event)
-        escalated = True
+        # store.mark_escalated()'s own return value -- not the
+        # `not event.get("escalated_at")` check just above, which reads
+        # a snapshot taken before this call and cannot see a concurrent
+        # winner -- is the real, atomic claim. Two near-simultaneous
+        # record_visitor_utterance() calls for the same event (a
+        # duplicate/replayed request, two open tabs) can both reach
+        # this line; at most one ever gets True back, so the second,
+        # real homeowner notification below can never fire twice for
+        # the same escalation.
+        if store.mark_escalated(event_id=event_id, customer_id=customer_id, actor=actor):
+            store.close_listening_window(event_id=event_id, customer_id=customer_id, actor=actor)
+            camera = _authorized_camera(customer_id, event["camera_id"])
+            appliance = {"customer_id": customer_id, "site_id": camera["site_id"]}
+            escalate_event = {
+                "id": event_id,
+                "camera_id": event["camera_id"],
+                "event_type": "aac_voice_call",
+                "timestamp": datetime.now().isoformat(),
+                "message": f"A visitor at {camera['name'] or 'your entrance camera'} needs your attention.",
+                "severity": "warning",
+            }
+            fanout_appliance_event(appliance, escalate_event)
+            escalated = True
 
     return {
         "event_id": event_id,

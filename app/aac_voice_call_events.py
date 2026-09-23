@@ -205,14 +205,28 @@ def record_visitor_utterance(
     return new_count
 
 
-def mark_escalated(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
+def mark_escalated(*, event_id: str, customer_id: str, actor: dict | None = None) -> bool:
+    """Returns True only for the caller that actually transitioned
+    escalated_at from NULL -- the UPDATE...WHERE's own rowcount is the
+    single source of truth, the same atomic-claim discipline
+    aac_voice_call_door.py's confirm_unlock() and check_and_stamp_
+    cooldown() above already established. Two near-simultaneous
+    record_visitor_utterance() calls for the same event (a duplicate/
+    replayed request, two open tabs) can both reach the caller's own
+    `not event.get("escalated_at")` check with the same stale snapshot,
+    but at most one of them ever gets True back here -- the caller
+    gates the second, real homeowner notification on this return value
+    specifically so a race can never send it twice."""
     now = datetime.now().isoformat()
     with connection() as db:
-        db.execute(
+        claim = db.execute(
             "UPDATE aac_voice_call_events SET escalated_at=?,updated_at=? WHERE id=? AND customer_id=? AND escalated_at IS NULL",
             (now, now, event_id, customer_id),
         )
-    audit(actor or {}, "aac_voice_call.escalated", "aac_voice_call_event", event_id, {})
+        claimed = bool(claim.rowcount)
+    if claimed:
+        audit(actor or {}, "aac_voice_call.escalated", "aac_voice_call_event", event_id, {})
+    return claimed
 
 
 def create_voice_call_event(

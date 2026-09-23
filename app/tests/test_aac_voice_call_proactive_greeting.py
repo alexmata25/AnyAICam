@@ -330,6 +330,27 @@ def test_utterance_after_the_listening_window_closed_is_rejected(client, db_path
             aac_voice_call.record_visitor_utterance(customer_id="cust-1", event_id=trigger["event_id"], transcript_text="hello again")
 
 
+def test_mark_escalated_atomic_claim_prevents_duplicate_escalation_notifications(db_path, _isolated_greeting):
+    """Regression test for a race found in independent review:
+    record_visitor_utterance()'s own `not event.get("escalated_at")`
+    guard reads a snapshot taken before the real claim -- two
+    concurrent utterance-recording calls for the same event (a
+    duplicate/replayed request, two open tabs) could both pass that
+    stale check. store.mark_escalated()'s own atomic UPDATE...WHERE-
+    rowcount claim (mirroring aac_voice_call_door.py's confirm_unlock()
+    token claim) is the real gate the caller uses to decide whether to
+    actually send the second, real homeowner notification -- this
+    proves only the first of two claim attempts for the same event
+    ever succeeds."""
+    _seed_tenant(db_path, "cust-1")
+    with override_target(sqlite_path=str(db_path)):
+        trigger = aac_voice_call.handle_person_detected(customer_id="cust-1", camera_id="cam-1")
+        first = store.mark_escalated(event_id=trigger["event_id"], customer_id="cust-1")
+        second = store.mark_escalated(event_id=trigger["event_id"], customer_id="cust-1")
+    assert first is True
+    assert second is False
+
+
 # ------------------------------------------------- visitor speech never unlocks
 
 
