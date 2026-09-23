@@ -373,3 +373,37 @@ def test_talk_still_enforces_the_same_authorization_as_every_other_operation(own
     boundary = main._ClassicAacoBoundary(_request())
     with pytest.raises(PermissionError):
         aaco.execute(aaco.AacoCommand("talk", camera_id="camera-99"), identity=_owner_identity(), vms=boundary)
+
+
+def test_ambiguous_clarification_never_names_another_tenants_lexically_similar_camera(db_path, monkeypatch):
+    """Security-sweep addition (2026-09-23): a stricter version of the
+    existing cross-tenant test above. Here tenant A's own two cameras
+    are ALREADY ambiguous with each other ("Front Door"/"Front Gate"),
+    while tenant B separately owns a THIRD camera ("Front Yard") whose
+    name is lexically closer to the phrase than either of tenant A's own
+    cameras. Confirms two things at once: (1) the Clarification's
+    candidate list is still exactly tenant A's own two cameras -- tenant
+    B's camera can never leak into the message even when it would have
+    scored as a strong or better match had it been visible -- and (2)
+    this holds because _aaco_fuzzy_camera_matches() is only ever handed
+    an already-tenant-scoped list to begin with, so a lexically-similar
+    other-tenant camera is structurally invisible to the scorer, not
+    merely absent from this one phrasing's output by chance."""
+    with override_target(sqlite_path=db_path):
+        initialize_database()
+        conn = sqlite3.connect(db_path)
+        _seed_base_tenant(conn, customer_id="cust-a", partner_id="partner-1")
+        _seed_base_tenant(conn, customer_id="cust-b", partner_id="partner-1")
+        _seed_camera(conn, "cam-a1", "Front Door", 1, customer_id="cust-a")
+        _seed_camera(conn, "cam-a2", "Front Gate", 2, customer_id="cust-a")
+        _seed_camera(conn, "cam-b1", "Front Yard", 1, customer_id="cust-b")
+        conn.commit()
+        import partner_portal
+        monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity("cust-a"))
+
+        boundary = main._ClassicAacoBoundary(_request())
+        command = aaco.DeterministicLanguageAdapter().parse("Show me the front.", now=NOW)
+        result = aaco.execute(command, identity=_owner_identity("cust-a"), vms=boundary)
+        assert isinstance(result, aaco.Clarification)
+        assert "Front Door" in result.message and "Front Gate" in result.message
+        assert "Front Yard" not in result.message
