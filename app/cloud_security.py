@@ -58,6 +58,29 @@ def _connect_src_csp() -> str:
     return "connect-src " + " ".join(sources)
 
 
+def _frame_ancestors_csp(request: Request) -> str:
+    """'none' (never framable, by anyone, anywhere) for every page
+    except the customer single-camera Live view -- confirmed live
+    (2026-09-23, found via independent review of AAC Voice Call Phase
+    1): that page's own AAC Voice Call call screen (main.py's
+    aac_voice_call.py, GET /aac/voice-call/{event_id}) embeds it via
+    <iframe> as its camera video, exactly matching the product spec's
+    own "reuse the existing Live camera... instead of creating a
+    completely separate streaming system" instruction -- but the
+    blanket frame-ancestors 'none'/X-Frame-Options: DENY below applied
+    unconditionally to every route including this one, so the browser
+    silently refused to render the iframe at all ("refused to
+    connect"), even though the embedding page is this SAME application,
+    already carrying the same authenticated session. 'self' here means
+    same-origin framing only -- an attacker's site still cannot frame
+    this page from anywhere else; only this application can frame its
+    own already-authenticated page, and only for this one route."""
+    path = request.url.path
+    if path.startswith("/customer/cameras/") and path.endswith("/live"):
+        return "self"
+    return "none"
+
+
 _MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
 
 # Provisioning Phase 4: Stripe's real webhook POST carries a
@@ -187,8 +210,9 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if isinstance(token,str): token=self._unquote_double_submit_value(token)
             if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
-        response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
-        response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp()+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        frame_ancestors=_frame_ancestors_csp(request)
+        response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY' if frame_ancestors=='none' else 'SAMEORIGIN'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
+        response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp()+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors '"+frame_ancestors+"'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'
