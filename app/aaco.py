@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import re
 from typing import Literal, Protocol
 
-Operation = Literal["live_view", "playback", "event_search", "camera_status", "playback_navigation", "event_navigation", "unlock_door"]
+Operation = Literal["live_view", "playback", "event_search", "camera_status", "playback_navigation", "event_navigation", "unlock_door", "talk"]
 
 
 @dataclass(frozen=True)
@@ -30,13 +30,25 @@ class RecordingResolver(Protocol):
 
 
 class VmsBoundary(Protocol):
-    def authorized_camera(self, identity: dict, camera_id: str) -> dict | None: ...
+    def authorized_camera(self, identity: dict, camera_id: str) -> object: ...
     def live_view(self, identity: dict, camera_id: str) -> object: ...
     def playback(self, identity: dict, camera_id: str, start: datetime, end: datetime) -> object: ...
     def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> object: ...
     def previous_event(self, identity: dict, camera_id: str, before: datetime) -> object: ...
     def camera_status(self, identity: dict) -> object: ...
     def unlock_door(self, identity: dict, door_id: str) -> object: ...
+    def talk(self, identity: dict, camera_id: str) -> object:
+        """Recognized intent, not yet a wired capability: a shared two-
+        way-talk service (unifying Live's own talk control and AAC
+        Voice Call) is being built separately. This method is the
+        prepared hook that work is expected to implement -- AACO's own
+        job stops at correctly recognizing "talk to/talk down to/speak
+        to <camera>" as a talk intent and resolving <camera> through
+        the exact same authorized, tenant-scoped resolution every other
+        camera-taking operation already uses; it never fakes a
+        connected call itself. See _ClassicAacoBoundary.talk() in
+        main.py for the current honest "not connected yet" response."""
+        ...
 
 
 def _camera_token(value: str) -> str:
@@ -101,7 +113,7 @@ _SHOW_SYNONYM_PLAIN_PATTERNS = (
 
 def _normalize(text: str) -> str:
     value = " ".join(text.lower().split())
-    value = re.sub(r"\?\s*$", "", value)
+    value = re.sub(r"[.?!]+\s*$", "", value)
     value = re.sub(r"\s+please\s*$", "", value)
     value = _LEADING_AACO_ADDRESS.sub("", value, count=1)
     for pattern in _SHOW_SYNONYM_WANT_PATTERNS:
@@ -136,6 +148,34 @@ _PREVIOUS_EVENT_PHRASES = {
     "show the last event", "show last event", "go back to the previous event",
 }
 _LET_ME_IN_PHRASES = {"let me in", "can i come in"}
+
+# Additional view-intent sentence frames beyond the canonical "show
+# (the) <phrase>" one (itself already reached from many verb synonyms
+# via _normalize() above) -- these are common natural ways to ask "what
+# does this camera look like" that don't reduce to a "show" verb at
+# all: a question about what's happening, a question about what a
+# place looks like, and "open" when its direct object is the camera
+# itself ("open the camera by/at/near the front door") rather than a
+# bare name ("open front door"), which stays the unlock_door frame
+# below unchanged. Each captures a raw <phrase> handed to
+# _camera_token() exactly like the canonical frame does -- resolving
+# that phrase (including any location synonym, like "entrance" for
+# "door", or a partial name like "front") to one specific, authorized
+# camera happens once, downstream, at the VMS boundary
+# (main.py's _ClassicAacoBoundary._resolve_camera()), the only place
+# that actually holds this customer's real camera list -- never here.
+_VIEW_FRAME_PATTERNS = (
+    re.compile(r"^what'?s happening (?:at|near|by) (?:the |my |our )?(?P<phrase>[a-z0-9][a-z0-9 &'_-]{0,80})$"),
+    re.compile(r"^what does (?:the |my |our )?(?P<phrase>[a-z0-9][a-z0-9 &'_-]{0,80}) look like(?: right now)?$"),
+    re.compile(r"^open (?:the |a )?camera(?: (?:by|at|near|outside|in) (?:the |my |our )?(?P<phrase>[a-z0-9][a-z0-9 &'_-]{0,80}))?$"),
+)
+
+# Talk is recognized as a genuine intent -- resolved to an authorized,
+# tenant-scoped camera through the exact same path every other
+# camera-taking operation uses -- but not yet a wired capability. See
+# VmsBoundary.talk()'s own docstring for why, and the prepared (not
+# faked) response _ClassicAacoBoundary.talk() returns today.
+_TALK_FRAME = re.compile(r"^(?:talk to|talk down to|talk down at|speak to|say something to) (?:the |my |our )?(?P<phrase>[a-z0-9][a-z0-9 &'_-]{0,80})$")
 
 
 class DeterministicLanguageAdapter:
@@ -202,6 +242,24 @@ class DeterministicLanguageAdapter:
             if match.group(1).strip() in {"camera", "cameras"}:
                 return Clarification("Tell me which authorized camera you want to see.")
             return AacoCommand("live_view", camera_id=_camera_token(match.group(1)))
+        for pattern in _VIEW_FRAME_PATTERNS:
+            match = pattern.fullmatch(value)
+            if match:
+                phrase = (match.group("phrase") or "").strip()
+                if not phrase:
+                    return Clarification("Tell me which authorized camera you want to see.")
+                return AacoCommand("live_view", camera_id=_camera_token(phrase))
+        match = _TALK_FRAME.fullmatch(value)
+        if match:
+            phrase = match.group("phrase").strip()
+            if phrase in {"door", "doors"}:
+                return Clarification("Tell me which authorized camera you'd like to talk through.")
+            return AacoCommand("talk", camera_id=_camera_token(phrase))
+        # "open"/"unlock" reaching this point never had a "camera" direct
+        # object (the _VIEW_FRAME_PATTERNS "open (the) camera ..." frame
+        # above already claimed every phrasing of that shape) -- so a
+        # bare "open <name>"/"unlock <name>" here always means the
+        # unlock_door intent, exactly as it always has.
         door_match = re.fullmatch(r"(?:open|unlock) (?:the )?([a-z0-9][a-z0-9 &'_-]{0,80})", value)
         door_name = "door" if value in _LET_ME_IN_PHRASES else (door_match.group(1).strip() if door_match else None)
         if door_name is not None:
@@ -230,10 +288,31 @@ def execute(command: AacoCommand, *, identity: dict, vms: VmsBoundary) -> object
         if not command.camera_id:
             raise ValueError("Door required.")
         return vms.unlock_door(identity, command.camera_id)
-    if not command.camera_id or not vms.authorized_camera(identity, command.camera_id):
+    if not command.camera_id:
+        raise PermissionError("Camera is unavailable.")
+    # authorized_camera() now has three possible outcomes, not two: a
+    # dict (a single, confidently authorized camera -- proceed), a
+    # Clarification (the phrase matched more than one of this
+    # customer's own cameras equally well and AACO must ask which one
+    # rather than guess -- the exact same escape hatch already used for
+    # an ambiguous door name, extended here to every camera-taking
+    # operation), or a falsy value (no match at all -- fail closed,
+    # unchanged). isinstance() is checked before the truthy check
+    # specifically because a Clarification is itself truthy -- `not
+    # vms.authorized_camera(...)` alone would silently treat "found
+    # more than one match" the same as "found none" and proceed to
+    # raise a generic PermissionError instead of asking the customer,
+    # which is exactly the silent-guess failure mode this whole change
+    # exists to prevent.
+    authorized = vms.authorized_camera(identity, command.camera_id)
+    if isinstance(authorized, Clarification):
+        return authorized
+    if not authorized:
         raise PermissionError("Camera is unavailable.")
     if command.operation == "live_view":
         return vms.live_view(identity, command.camera_id)
+    if command.operation == "talk":
+        return vms.talk(identity, command.camera_id)
     if command.operation == "event_navigation":
         if not command.end:
             raise ValueError("Event context required.")

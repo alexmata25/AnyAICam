@@ -154825,6 +154825,59 @@ def _aaco_event_category(raw_event_type: object) -> str | None:
     return None
 
 
+# 2026-09-23: natural-language camera resolution. A customer's phrase
+# for "which camera" often isn't that camera's exact display name --
+# "the entrance"/"outside the front"/"my front camera" should all still
+# reach a camera literally named "Front Door" if that's the one real
+# camera those phrases plausibly mean. _aaco_fuzzy_camera_matches()
+# below is the one place that happens: a small content-word-overlap
+# scorer, with a handful of common location synonyms folded together
+# first, run only as a FALLBACK after an exact name match fails (so any
+# customer whose spoken name already matches exactly sees zero behavior
+# change), and ALWAYS scored only against whatever tenant-scoped
+# `cameras`/`doors` list its caller already fetched -- see every call
+# site below (_customer_playback_cameras(), _customer_live_cameras(),
+# door_access.customer_door_cameras(), all already filtered to one
+# customer) -- so broadening the matching can only ever change WHICH of
+# THIS customer's own cameras a phrase resolves to, never whose cameras
+# are searched; a natural-language reference can no more reach another
+# tenant's camera than an exact-name one already could.
+_AACO_CAMERA_PHRASE_STOPWORDS = {
+    "the", "a", "an", "my", "our", "camera", "cameras", "outside", "out",
+    "who's", "whos", "at", "by", "near", "of", "in", "on", "right", "now",
+    "please", "there", "is", "see",
+}
+_AACO_CAMERA_LOCATION_SYNONYMS = {
+    "entrance": "door", "entry": "door", "doorway": "door", "porch": "door",
+}
+
+
+def _aaco_camera_phrase_tokens(text: str) -> set:
+    tokens = set(re.findall(r"[a-z0-9']+", text.lower()))
+    tokens -= _AACO_CAMERA_PHRASE_STOPWORDS
+    return {_AACO_CAMERA_LOCATION_SYNONYMS.get(token, token) for token in tokens}
+
+
+def _aaco_fuzzy_camera_matches(cameras: list[dict], requested: str) -> list[dict]:
+    """Every camera tied at the best nonzero content-word-overlap score
+    with `requested` -- exactly one result is a confident match, two or
+    more means the phrase genuinely doesn't distinguish between them
+    and the caller must ask which one, never silently guess."""
+    requested_tokens = _aaco_camera_phrase_tokens(requested)
+    if not requested_tokens:
+        return []
+    scored = []
+    for camera in cameras:
+        name_tokens = _aaco_camera_phrase_tokens(str(camera.get("name") or ""))
+        overlap = len(requested_tokens & name_tokens)
+        if overlap:
+            scored.append((overlap, camera))
+    if not scored:
+        return []
+    best = max(score for score, _ in scored)
+    return [camera for score, camera in scored if score == best]
+
+
 class _ClassicAacoBoundary:
     """Adapter from AACO's strict command schema to existing Classic VMS.
 
@@ -154841,7 +154894,7 @@ class _ClassicAacoBoundary:
         # camera-<number>.  Resolve that display token through Classic's
         # customer-scoped camera list, never a request-supplied database id.
         cameras = _customer_playback_cameras(self.request) or []
-        return self._find_camera(cameras, camera_token)
+        return self._resolve_camera(cameras, camera_token)
 
     @staticmethod
     def _find_camera(cameras: list[dict], camera_token: str) -> dict | None:
@@ -154854,6 +154907,12 @@ class _ClassicAacoBoundary:
         # camera named "Front Entrance"; the pre-existing 32 AACO unit
         # tests never caught this because they inject an independent
         # fake VmsBoundary that never calls this method at all.
+        #
+        # Exact match only, deliberately unchanged -- see
+        # _resolve_camera() below for the fuzzy fallback layered on top
+        # of this, and _camera_ambiguity() for why this method (not the
+        # fuzzy layer) is what decides whether an exact match already
+        # exists before any fuzzy matching is even attempted.
         if camera_token.startswith("camera-name:"):
             requested = " ".join(camera_token.removeprefix("camera-name:").lower().split())
             return next((camera for camera in cameras if " ".join(str(camera.get("name") or "").lower().split()) == requested), None)
@@ -154865,6 +154924,45 @@ class _ClassicAacoBoundary:
             return next((camera for camera in cameras if camera.get("camera_number") == number), None)
         return None
 
+    @classmethod
+    def _resolve_camera(cls, cameras: list[dict], camera_token: str) -> dict | None:
+        """Exact match first (_find_camera(), unchanged) -- a token-
+        overlap fuzzy match only as a fallback, and only when it
+        resolves to exactly one camera. An ambiguous fuzzy match (2+
+        tied) intentionally returns None here, same as no match at all:
+        _camera_ambiguity() below is the one place that distinguishes
+        "no match" from "ambiguous match" and turns the latter into a
+        Clarification, checked by authorized_camera() before any
+        operation method (this one included) ever runs -- so a real
+        command can never reach this method with an ambiguous phrase in
+        the first place; execute() already returned the Clarification
+        by then."""
+        exact = cls._find_camera(cameras, camera_token)
+        if exact or not camera_token.startswith("camera-name:"):
+            return exact
+        matches = _aaco_fuzzy_camera_matches(cameras, camera_token.removeprefix("camera-name:"))
+        return matches[0] if len(matches) == 1 else None
+
+    @classmethod
+    def _camera_ambiguity(cls, cameras: list[dict], camera_token: str):
+        """The one place fuzzy-match ambiguity becomes a customer-facing
+        question instead of a silent guess or a generic "unavailable"
+        error. Only ever consulted from authorized_camera() -- the
+        single gate execute() checks before any operation-specific
+        method, which all call _resolve_camera()/_camera()/
+        _live_camera() again and independently arrive at the exact same
+        unambiguous answer (or never run at all, because this already
+        returned a Clarification)."""
+        from aaco import Clarification
+
+        if not camera_token.startswith("camera-name:") or cls._find_camera(cameras, camera_token):
+            return None
+        matches = _aaco_fuzzy_camera_matches(cameras, camera_token.removeprefix("camera-name:"))
+        if len(matches) > 1:
+            names = ", ".join(_camera_display_label(camera) for camera in matches)
+            return Clarification(f"More than one authorized camera matches that -- did you mean {names}?")
+        return None
+
     def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
         # Reuse the established Live authorization helper, including its
         # customer_viewer can_live permission, instead of inferring Live
@@ -154873,14 +154971,28 @@ class _ClassicAacoBoundary:
         from partner_db import connection
         with connection() as db:
             cameras = _customer_live_cameras(db, identity, "")
-        return self._find_camera(cameras, camera_token)
+        return self._resolve_camera(cameras, camera_token)
 
-    def authorized_camera(self, identity: dict, camera_id: str) -> dict | None:
+    def authorized_camera(self, identity: dict, camera_id: str):
         # This common Phase-1 gate establishes that the camera belongs to
         # this identity through at least one existing customer VMS surface.
         # The operation methods below then apply their stricter, operation-
         # specific Classic access rule (can_live versus can_playback).
-        return self._camera(camera_id) or self._live_camera(identity, camera_id)
+        #
+        # Ambiguity is checked first, across both surfaces, before any
+        # resolution is attempted -- a phrase that's ambiguous within
+        # either the playback or the live camera list must ask for
+        # clarification, never silently fall through to whichever
+        # surface happens to resolve it first.
+        playback_cameras = _customer_playback_cameras(self.request) or []
+        from live_view_page import _customer_live_cameras
+        from partner_db import connection
+        with connection() as db:
+            live_cameras = _customer_live_cameras(db, identity, "")
+        ambiguity = self._camera_ambiguity(playback_cameras, camera_id) or self._camera_ambiguity(live_cameras, camera_id)
+        if ambiguity:
+            return ambiguity
+        return self._resolve_camera(playback_cameras, camera_id) or self._resolve_camera(live_cameras, camera_id)
 
     def live_view(self, identity: dict, camera_id: str) -> dict:
         camera = self._live_camera(identity, camera_id)
@@ -154973,6 +155085,28 @@ class _ClassicAacoBoundary:
             "context": context,
         }
 
+    def talk(self, identity: dict, camera_id: str) -> dict:
+        """Recognized intent, not yet a wired capability -- see
+        VmsBoundary.talk()'s own docstring in aaco.py. A shared two-way-
+        talk service (unifying Live's own talk control and AAC Voice
+        Call) is being built separately, in its own isolated branch;
+        this deliberately returns an honest "not connected yet" status
+        (kind="status", the same already-allowed AACO response kind
+        camera_status() below returns) rather than faking a live call
+        or silently doing nothing. By the time execute() calls this,
+        the camera has already been resolved and authorized exactly
+        like every other operation here -- that other service's own
+        eventual implementation only needs to replace this method's
+        body, never re-derive authorization."""
+        camera = self._live_camera(identity, camera_id)
+        if not camera:
+            raise PermissionError("Camera is unavailable.")
+        return {
+            "kind": "status",
+            "message": f"Two-way talk for {_camera_display_label(camera)} isn't connected yet. Open Live view for current audio options.",
+            "context": {"camera_id": camera_id},
+        }
+
     def camera_status(self, identity: dict) -> dict:
         # Reuses the real, already customer-scoped /api/cameras/status
         # route function (camera_status(request) at module scope -- not
@@ -155002,6 +155136,21 @@ class _ClassicAacoBoundary:
         # which one, so this returns every match and lets unlock_door()
         # decide.
         if door_token.startswith("camera-name:"):
+            # Deliberately EXACT match only, never the fuzzy token-
+            # overlap fallback _resolve_camera() uses for view/
+            # navigation actions above. A generic shared word like
+            # "door" appears in nearly every door camera's own name, so
+            # fuzzy matching here would let a garbled, mistyped, or
+            # cross-tenant phrase opportunistically resolve to some
+            # unrelated real door instead of failing closed -- confirmed
+            # by a real regression: fuzzy-matching a wrong-tenant token
+            # like "tenant b door" against this identity's OWN doors
+            # matched on the shared word "door" and would have unlocked
+            # an unrelated door in the caller's own tenant rather than
+            # raising PermissionError. Broadening which PHRASES route to
+            # unlock_door (aaco.py's parse()) is safe and already done;
+            # broadening how a door NAME is matched, for the one
+            # destructive action here, is not.
             requested = " ".join(door_token.removeprefix("camera-name:").lower().split())
             return [door for door in doors if " ".join(str(door.get("name") or "").lower().split()) == requested]
         if door_token.startswith("camera-"):
