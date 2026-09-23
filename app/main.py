@@ -132085,7 +132085,22 @@ def phone_connect(request: Request) -> str:
 
 
 
-    base_url = PHONE_ACCESS_URL or str(request.base_url).rstrip("/")
+    # 2026-09-23 fix: request.base_url reflects the scheme uvicorn itself
+    # saw (plain HTTP -- Caddy terminates TLS and proxies over the
+    # internal docker network, and uvicorn's --proxy-headers only trusts
+    # X-Forwarded-Proto from 127.0.0.1 by default, which Caddy's
+    # container isn't). Confirmed live: this showed customers
+    # "http://portal-staging.anyaicam.com" to type into their phone, on
+    # a domain that is HTTPS-only end-to-end (ANYAICAM_HTTPS_ONLY,
+    # ANYAICAM_SECURE_COOKIES). PUBLIC_BASE_URL (ANYAICAM_PUBLIC_URL) is
+    # the same already-configured, already-validated-elsewhere
+    # (see the "Public HTTPS URL" health check) canonical address for
+    # exactly this kind of case, so it's preferred whenever set. A pure
+    # local/self-hosted deployment with neither env var configured is
+    # unaffected -- it still falls back to request.base_url, and the
+    # existing localhost warning below still covers that address being
+    # unreachable from a phone.
+    base_url = PHONE_ACCESS_URL or PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
 
 
 
@@ -132310,7 +132325,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Camera stream</span><strong>/static/hls</strong></div>
+          <div class="phone-status-row"><span>Camera stream</span><strong>Live relay session</strong></div>
 
 
 
