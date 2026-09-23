@@ -135613,21 +135613,24 @@ def partner_quote_builder_page(request: Request) -> Response:
 
     customers = load_partner_customers()
 
+    # 2026-09-23 fix: quotes carried no partner_id at all before this
+    # session's create_partner_quote() fix, and this list rendered every
+    # quote in PARTNER_QUOTES_FILE to any authenticated partner with no
+    # ownership check whatsoever -- a real cross-partner data leak
+    # (wholesale pricing, commissions, customer names) the moment any
+    # quote existed. Filtered the same way every other tenant-scoped
+    # list in this codebase is: tenant_owns_partner() against the
+    # quote's own stamped partner_id, with the existing global-
+    # administrator bypass. A quote saved before this fix (no
+    # partner_id field) has none to match and is excluded for everyone
+    # except a genuine global administrator -- fail closed, never fail
+    # open, matching authorize_customer_tenant()'s own established
+    # convention elsewhere in this codebase.
+    from partner_db import connection, tenant_owns_partner
 
-
-
-
-
-
-
-    quotes = load_partner_quotes()
-
-
-
-
-
-
-
+    identity = require_partner_access(request)
+    with connection() as db:
+        quotes = [item for item in load_partner_quotes() if tenant_owns_partner(db, identity, item.get("partner_id"))]
 
     customer_map = {str(item.get("id")): item for item in customers}
 
@@ -137583,42 +137586,30 @@ def partner_customer_quote_page(quote_id: str, request: Request) -> Response:
 
 
 def create_partner_quote(request: Request, payload: PartnerQuoteCreateModel) -> dict:
+    # 2026-09-23 fix: this route validated payload.customer_id against
+    # load_partner_customers() -- a legacy, flat JSON file
+    # (PARTNER_CUSTOMERS_FILE) with no partner_id field on any record at
+    # all, completely separate from the real, tenant-scoped SQL
+    # `customers` table every real customer actually lives in (see
+    # partner_workspace.py's own authorize_customer_tenant()-based
+    # remediation for that table). Two live bugs from the same root
+    # cause: (1) since that legacy file is empty in every real
+    # deployment (nothing writes to it), this check rejected every real
+    # customer_id, making quote creation completely non-functional; (2)
+    # had that file ever been populated, ANY authenticated partner could
+    # reference ANY OTHER partner's real customer_id here with no
+    # ownership check at all -- an IDOR. Fixed by resolving customer_id
+    # against the real customers table through authorize_customer_tenant(),
+    # the same already-audited primitive partner_workspace.py's own
+    # 2026-09-14 remediation established, and stamping the quote with
+    # the caller's own partner_id so it can be correctly scoped when
+    # listed (see partner_quote_builder_page()'s matching fix).
+    from partner_db import authorize_customer_tenant, connection
 
-
-
-
-
-
-
-
-    require_partner_access(request)
-
-
-
-
-
-
-
-
-    customers = load_partner_customers()
-
-
-
-
-
-
-
-
-    if not any(item.get("id") == payload.customer_id for item in customers):
-
-
-
-
-
-
-
-
-        return {"status": "error", "message": "Partner customer not found."}
+    identity = require_partner_access(request)
+    with connection() as db:
+        if not authorize_customer_tenant(db, identity, payload.customer_id):
+            return {"status": "error", "message": "Partner customer not found."}
 
 
 
@@ -137682,19 +137673,8 @@ def create_partner_quote(request: Request, payload: PartnerQuoteCreateModel) -> 
 
 
         "updated_at": datetime.now().isoformat(),
-
-
-
-
-
-
-
-
+        "partner_id": identity.get("partner_id") or "anyaicam-primary",
     }
-
-
-
-
 
 
 

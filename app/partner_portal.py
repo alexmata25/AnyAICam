@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from pricing_config import calculate_partner_quote, load_pricing, public_pricing, save_pricing
-from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash
+from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash, tenant_owns_partner
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
@@ -275,7 +275,14 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         try:
             result = calculate_partner_quote(payload)
             if payload.get('save_quote'):
-                quotes = _read_quotes(); quotes.append({'id': secrets.token_hex(5), 'customer': payload.get('customer',''), 'site': payload.get('site',''), 'created_at': int(time.time()), **result}); _save_quotes(quotes)
+                # 2026-09-23 fix: saved quotes carried no partner_id at all,
+                # and partner_revenue() below read every saved quote with no
+                # ownership check whatsoever -- any authenticated partner
+                # could see every other partner's confidential quotes,
+                # commissions, and recurring-revenue totals the moment any
+                # quote was ever saved. Stamped with the caller's own
+                # partner_id so partner_revenue() can filter correctly.
+                quotes = _read_quotes(); quotes.append({'id': secrets.token_hex(5), 'customer': payload.get('customer',''), 'site': payload.get('site',''), 'created_at': int(time.time()), 'partner_id': identity.get('partner_id') or 'anyaicam-primary', **result}); _save_quotes(quotes)
             return result
         except ValueError as error: raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -349,7 +356,18 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         if not identity: return RedirectResponse('/partner-login',status_code=303)
         _require(request)
         if not allowed(identity,'pricing.view'): raise HTTPException(status_code=403,detail='Pricing permission required.')
-        quotes=_read_quotes(); monthly=sum(float(q.get('monthly_recurring_profit',0)) for q in quotes); first_year=sum(float(q.get('first_year_profit',0)) for q in quotes)
+        # 2026-09-23 fix: every saved quote was summed here with no
+        # ownership check at all -- a real cross-partner leak of
+        # confidential recurring-revenue and commission totals. Filtered
+        # via tenant_owns_partner(), the same already-audited primitive
+        # partner_workspace.py's own 2026-09-14 remediation established
+        # elsewhere in this codebase; a global administrator still sees
+        # every partner's totals unchanged, and a quote saved before this
+        # fix (no partner_id field) is excluded for everyone else --
+        # fail closed, never fail open.
+        with connection() as db:
+            quotes=[q for q in _read_quotes() if tenant_owns_partner(db,identity,q.get('partner_id'))]
+        monthly=sum(float(q.get('monthly_recurring_profit',0)) for q in quotes); first_year=sum(float(q.get('first_year_profit',0)) for q in quotes)
         content=f'''<header class="topbar"><div><p class="eyebrow">Protected partner tools</p><h1>Commissions and recurring revenue</h1></div></header><section class="summary"><div class="stat"><span class="stat-label">Active estimates</span><span class="stat-value">{len(quotes)}</span></div><div class="stat"><span class="stat-label">Estimated monthly recurring profit</span><span class="stat-value">${monthly:,.2f}</span></div><div class="stat"><span class="stat-label">Estimated first-year profit</span><span class="stat-value">${first_year:,.2f}</span></div></section><div class="empty">Revenue appears after partner quotes are saved and approved.</div>'''
         return shell('Partner revenue','partner-revenue',content)
 
