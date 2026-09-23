@@ -223,14 +223,29 @@ def consume_recovery_code(db, *, user_id: str, code: str) -> bool:
     false otherwise, including for an already-used code. Every unused
     row is checked (hashes are salted per-row, there's no shortcut
     lookup by value) -- the recovery-code population is always small
-    (10 by default), so this is not a performance concern."""
+    (10 by default), so this is not a performance concern.
+
+    2026-09-23 review fix: finding the match (by hash) and claiming it
+    are necessarily two steps -- there's no shortcut lookup by value --
+    but claiming it must still be one atomic statement, the same
+    UPDATE-with-rowcount-check idiom cloud_security.py's own
+    consume_password_reset() already established for exactly this
+    problem. The prior version's plain `UPDATE ... WHERE id=?` (no
+    `AND used_at IS NULL`, no rowcount check) let two concurrent
+    redemptions of the same code both read "unused" before either
+    wrote, so both could succeed -- a real, if narrow, single-use
+    violation this codebase already had the right pattern for
+    elsewhere and this function didn't use."""
     rows = db.execute(
         "SELECT id,code_hash FROM platform_owner_recovery_codes WHERE user_id=? AND used_at IS NULL", (user_id,)
     ).fetchall()
     for row in rows:
         if _verify_code(code, row["code_hash"]):
-            db.execute("UPDATE platform_owner_recovery_codes SET used_at=? WHERE id=?", (datetime.now().isoformat(), row["id"]))
-            return True
+            claimed = db.execute(
+                "UPDATE platform_owner_recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL",
+                (datetime.now().isoformat(), row["id"]),
+            )
+            return bool(claimed.rowcount)
     return False
 
 
@@ -318,6 +333,16 @@ def create_break_glass_token(db, *, email: str, reason: str, created_by: str, tt
 
 
 def _redeem_break_glass_token(db, *, email: str, token: str) -> dict | None:
+    """2026-09-23 review fix: same atomic-claim pattern as
+    consume_recovery_code() above, for the same reason -- the token
+    must be hash-matched among candidates before its specific row id is
+    known, but claiming that identified row must be one atomic
+    UPDATE-with-rowcount-check statement (cloud_security.py's
+    consume_password_reset() idiom), not a separate UPDATE with no
+    check. The prior version's bare `UPDATE ... WHERE id=?` let two
+    concurrent redemptions of the same break-glass token both read
+    "unused" before either wrote -- for the single most sensitive
+    credential in this whole module, this must be airtight."""
     email = (email or "").strip().lower()
     user = db.execute("SELECT id FROM partner_users WHERE lower(email)=?", (email,)).fetchone()
     if not user:
@@ -329,8 +354,13 @@ def _redeem_break_glass_token(db, *, email: str, token: str) -> dict | None:
     ).fetchall()
     for row in rows:
         if _verify_code(token, row["token_hash"]):
-            db.execute("UPDATE break_glass_tokens SET used_at=? WHERE id=?", (now_iso, row["id"]))
-            return {"user_id": user["id"]}
+            claimed = db.execute(
+                "UPDATE break_glass_tokens SET used_at=? WHERE id=? AND used_at IS NULL",
+                (now_iso, row["id"]),
+            )
+            if claimed.rowcount:
+                return {"user_id": user["id"]}
+            return None
     return None
 
 
@@ -350,15 +380,25 @@ def create_pending_mfa_login(db, *, user_id: str, destination: str, email: str, 
 
 
 def _consume_pending_mfa_login(db, *, token: str) -> dict | None:
+    """2026-09-23 review fix: `token` is itself the row's primary key
+    here (unlike the recovery-code/break-glass cases, which must first
+    find a hash match among several candidates) -- so the claim can be
+    the FIRST and only statement, no separate lookup needed, closing
+    the same class of race the prior SELECT-then-UPDATE (no rowcount
+    check) version had: two concurrent completions of the same pending
+    login could otherwise both read "unused" before either wrote."""
     now_iso = datetime.now().isoformat()
-    row = db.execute(
-        "SELECT id,user_id,destination,email,role,authorization_version_at_login FROM pending_mfa_logins WHERE id=? AND used_at IS NULL AND expires_at>?",
-        (token, now_iso),
-    ).fetchone()
-    if not row:
+    claimed = db.execute(
+        "UPDATE pending_mfa_logins SET used_at=? WHERE id=? AND used_at IS NULL AND expires_at>?",
+        (now_iso, token, now_iso),
+    )
+    if not claimed.rowcount:
         return None
-    db.execute("UPDATE pending_mfa_logins SET used_at=? WHERE id=?", (now_iso, row["id"]))
-    return dict(row)
+    row = db.execute(
+        "SELECT id,user_id,destination,email,role,authorization_version_at_login FROM pending_mfa_logins WHERE id=?",
+        (token,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 # ------------------------------------------------------------------- routes

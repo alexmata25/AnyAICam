@@ -220,6 +220,53 @@ def test_recovery_code_for_one_user_does_not_work_for_another(http_client):
         assert not platform_owner.consume_recovery_code(db, user_id=user_b, code=codes_a[0])
 
 
+def _concurrent_claims(db_path, n, claim_fn):
+    """Run `claim_fn` (taking one open `db` connection) from `n` real OS
+    threads at nearly the same instant (a Barrier holds every thread at
+    the starting line until all have arrived), each on its own fresh
+    connection scoped to `db_path` via its own override_target() --
+    threading does not propagate contextvars into new threads, so each
+    thread must re-enter the override itself, not rely on the caller's
+    already-active context. Returns the list of per-thread results."""
+    import threading
+
+    barrier = threading.Barrier(n)
+    results = [None] * n
+
+    def worker(index):
+        with override_target(sqlite_path=str(db_path)):
+            with connection() as db:
+                barrier.wait()
+                results[index] = claim_fn(db)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def test_recovery_code_single_use_holds_under_real_concurrent_redemption(http_client):
+    """2026-09-23 review finding: the pre-fix consume_recovery_code() did
+    a plain SELECT-then-UPDATE with no atomic claim -- two threads could
+    both read "unused" before either wrote "used", double-spending one
+    code. Fires two real OS threads at the same code at (as close to)
+    the same instant as a Barrier can arrange; exactly one must
+    succeed, never both, never neither."""
+    _client, db_path = http_client
+    user_id = _seed_operator(db_path)
+    with connection() as db:
+        codes = platform_owner.generate_recovery_codes(db, user_id=user_id)
+    code = codes[0]
+
+    results = _concurrent_claims(db_path, 2, lambda db: platform_owner.consume_recovery_code(db, user_id=user_id, code=code))
+    assert sorted(results) == [False, True]
+
+    with connection() as db:
+        assert not platform_owner.consume_recovery_code(db, user_id=user_id, code=code)
+
+
 # --------------------------------------------------------------- MFA enrollment
 
 
@@ -388,6 +435,23 @@ def test_mfa_pending_token_is_single_use(http_client):
     assert replay.status_code == 400
 
 
+def test_pending_mfa_login_single_use_holds_under_real_concurrent_completion(http_client):
+    """Same review finding, same fix, applied here: _consume_pending_mfa_
+    login()'s prior SELECT-then-UPDATE (no rowcount check) let two
+    concurrent completions of one pending login both read "unused"
+    before either wrote."""
+    _client, db_path = http_client
+    user_id = _seed_operator(db_path)
+    with connection() as db:
+        token = platform_owner.create_pending_mfa_login(
+            db, user_id=user_id, destination="/admin-portal", email="amata@anyaicam.com", role="administrator", authorization_version_at_login=1,
+        )
+
+    results = _concurrent_claims(db_path, 2, lambda db: platform_owner._consume_pending_mfa_login(db, token=token))
+    outcomes = [bool(r) for r in results]
+    assert sorted(outcomes) == [False, True]
+
+
 def test_mfa_gate_never_applies_to_a_partner_scoped_administrator(http_client):
     """The hook's own scoping condition: destination must be exactly
     /admin-portal (a live global grant) -- a partner-scoped
@@ -444,6 +508,24 @@ def test_break_glass_token_is_single_use(http_client):
     client.post("/api/platform-owner/break-glass-recover", json={"email": "amata@anyaicam.com", "token": token}, follow_redirects=False)
     replay = client.post("/api/platform-owner/break-glass-recover", json={"email": "amata@anyaicam.com", "token": token}, follow_redirects=False)
     assert replay.status_code == 400
+
+
+def test_break_glass_token_single_use_holds_under_real_concurrent_redemption(http_client):
+    """Same review finding, same fix, applied to the single most
+    sensitive credential in this module: _redeem_break_glass_token()'s
+    prior SELECT-then-UPDATE (no rowcount check) let two concurrent
+    redemptions of one break-glass token both read "unused" before
+    either wrote."""
+    _client, db_path = http_client
+    _seed_operator(db_path)
+    admin_token = _admin_session()
+    _grant_global(db_path, admin_token, _client, email="amata@anyaicam.com")
+    with connection() as db:
+        token = platform_owner.create_break_glass_token(db, email="amata@anyaicam.com", reason="test", created_by="ops@anyaicam.com")
+
+    results = _concurrent_claims(db_path, 2, lambda db: platform_owner._redeem_break_glass_token(db, email="amata@anyaicam.com", token=token))
+    outcomes = [bool(r) for r in results]
+    assert sorted(outcomes) == [False, True]
 
 
 def test_break_glass_recovery_does_not_bypass_a_since_revoked_grant(http_client):
