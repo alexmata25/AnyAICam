@@ -1073,7 +1073,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         return {'status':'accepted','event_id':event_id}
 
     @app.get('/api/appliance/facial-directory')
-    def facial_directory(request: Request) -> dict:
+    def facial_directory(request: Request, if_version: str = '') -> dict:
         # AAC (facial recognition), Phase 2: the cloud side of
         # facial_embedding_sync.py's edge-pull worker -- closes the
         # largest of the three split-topology gaps from the Phase 1
@@ -1089,31 +1089,44 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         customer_id=appliance['customer_id']
         with connection() as db:
             people=[dict(item) for item in db.execute(
-                'SELECT id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by FROM facial_people WHERE customer_id=? AND status=?',
+                'SELECT id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by FROM facial_people WHERE customer_id=? AND status=? ORDER BY id',
                 (customer_id,'active'),
             ).fetchall()]
             embeddings=[dict(item) for item in db.execute(
                 'SELECT fe.id,fe.person_id,fe.engine,fe.engine_version,fe.embedding_json,fe.quality,fe.created_at '
                 'FROM facial_embeddings fe JOIN facial_people fp ON fp.id=fe.person_id '
-                'WHERE fe.customer_id=? AND fp.status=?',
+                'WHERE fe.customer_id=? AND fp.status=? ORDER BY fe.id',
                 (customer_id,'active'),
             ).fetchall()]
             watchlists=[dict(item) for item in db.execute(
-                'SELECT id,site_id,name,classification,description,created_at,updated_at,created_by FROM facial_watchlists WHERE customer_id=?',
+                'SELECT id,site_id,name,classification,description,created_at,updated_at,created_by FROM facial_watchlists WHERE customer_id=? ORDER BY id',
                 (customer_id,),
             ).fetchall()]
             watchlist_members=[dict(item) for item in db.execute(
                 'SELECT fwm.watchlist_id,fwm.person_id,fwm.added_at,fwm.added_by FROM facial_watchlist_members fwm '
-                'JOIN facial_watchlists fw ON fw.id=fwm.watchlist_id WHERE fw.customer_id=?',
+                'JOIN facial_watchlists fw ON fw.id=fwm.watchlist_id WHERE fw.customer_id=? ORDER BY fwm.watchlist_id,fwm.person_id',
                 (customer_id,),
             ).fetchall()]
-        return {
-            'customer_id': customer_id,
+        directory={
             'people': people,
             'embeddings': embeddings,
             'watchlists': watchlists,
             'watchlist_members': watchlist_members,
         }
+        # Conditional sync (2026-09-24): the edge used to receive the FULL
+        # directory -- ~28.5 KB of JSON per stored face embedding -- every
+        # 5 minutes whether or not anything changed. directory_version is
+        # a content hash of exactly this customer's snapshot (ordered
+        # queries above make it deterministic); an appliance that sends
+        # back the version it already applied gets a tiny "unchanged"
+        # reply instead. Tenant isolation is unaffected: the hash is only
+        # ever computed over, and compared against, the authenticated
+        # appliance's own customer's data.
+        import hashlib
+        directory_version=hashlib.sha256(json.dumps(directory,sort_keys=True,separators=(',',':'),default=str).encode()).hexdigest()
+        if if_version and if_version==directory_version:
+            return {'customer_id': customer_id, 'directory_version': directory_version, 'unchanged': True}
+        return {'customer_id': customer_id, 'directory_version': directory_version, **directory}
 
     @app.post('/api/appliance/facial-events/{detection_event_id}/thumbnail')
     def facial_event_thumbnail_available(request: Request,detection_event_id: str,payload: dict) -> dict:
