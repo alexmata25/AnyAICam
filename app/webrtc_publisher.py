@@ -173,6 +173,15 @@ LONG_POLL_SECONDS = max(0.0, min(25.0, float(os.environ.get("ANYAICAM_LIVE_P2P_L
 # The HTTP read timeout must outlast the held request.
 LONG_POLL_HTTP_TIMEOUT_SECONDS = LONG_POLL_SECONDS + 15.0
 CONFIG_REFRESH_SECONDS = max(30.0, float(os.environ.get("ANYAICAM_LIVE_P2P_CONFIG_REFRESH_SECONDS", "60.0")))
+# P2P stream choice (2026-09-24, confirmed live on Ryzen): P2P used the
+# camera's full-bitrate MAIN stream, which over a real home uplink gave one
+# camera 1.7 fps at 72% packet loss. "auto" (default) sends a verified
+# substream over P2P when the camera's stream URL follows a known substream
+# convention, else the main stream; "main" always sends the main stream.
+# Recording and the capped live HLS encode never use this -- they keep
+# calling camera_url() for the untouched main stream.
+P2P_STREAM_PREFERENCE = os.environ.get("ANYAICAM_LIVE_P2P_STREAM", "auto").strip().lower()
+P2P_SUBSTREAM_PROBE_TIMEOUT_SECONDS = max(3.0, float(os.environ.get("ANYAICAM_LIVE_P2P_SUBSTREAM_PROBE_SECONDS", "10")))
 MEDIAMTX_RESTART_BACKOFF_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_RESTART_BACKOFF_SECONDS", "5.0")))
 MEDIAMTX_STARTUP_GRACE_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_STARTUP_GRACE_SECONDS", "3.0")))
 
@@ -409,6 +418,63 @@ def _config_request(method: str, path: str, payload: dict | None = None) -> tupl
         return 0, str(error)
 
 
+def substream_candidates(main_url: str) -> list[str]:
+    """Lower-bitrate sibling URLs for a camera's main RTSP stream, derived
+    only from widely used, vendor-neutral URL conventions -- never from a
+    camera number or a hardcoded camera:
+      .../Channels/<n>01 (+ profile=Profile_1)  ->  .../Channels/<n>02 (+ profile=Profile_2)
+      ...subtype=0                              ->  ...subtype=1
+    An unrecognized URL yields no candidate (the main stream is used)."""
+    import re
+    candidates = []
+    hik = re.sub(r"(/[Cc]hannels/)(\d*)01(?=[/?]|$)", r"\g<1>\g<2>02", main_url, count=1)
+    if hik != main_url:
+        hik = re.sub(r"([?&]profile=)Profile_1(?![0-9])", r"\g<1>Profile_2", hik)
+        candidates.append(hik)
+    dahua = re.sub(r"([?&]subtype=)0(?![0-9])", r"\g<1>1", main_url, count=1)
+    if dahua != main_url:
+        candidates.append(dahua)
+    return candidates
+
+
+def _probe_video_stream(url: str) -> bool:
+    """True when the URL answers with a real video stream. Never logs or
+    returns the (credentialed) URL."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type,width,height", "-of", "json", url],
+            capture_output=True, text=True, timeout=P2P_SUBSTREAM_PROBE_TIMEOUT_SECONDS, check=False,
+        )
+        streams = json.loads(result.stdout or "{}").get("streams") or []
+        return result.returncode == 0 and any(s.get("codec_type") == "video" and (s.get("width") or 0) > 0 for s in streams)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+# camera_id -> (main_url, chosen P2P source). Re-decided only when the
+# camera's main URL changes, so a substream is probed once, not every sync.
+_p2p_source_choice: dict = {}
+
+
+def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
+    """(source URL for MediaMTX, "substream"|"main"). Runs ffprobe, so it
+    must only be called off the event loop (sync_camera_paths() already is)."""
+    cached = _p2p_source_choice.get(camera_id)
+    if cached and cached[0] == main_url:
+        return cached[1], ("main" if cached[1] == main_url else "substream")
+    chosen = main_url
+    if P2P_STREAM_PREFERENCE != "main":
+        for candidate in substream_candidates(main_url):
+            if _probe_video_stream(candidate):
+                chosen = candidate
+                break
+    _p2p_source_choice[camera_id] = (main_url, chosen)
+    kind = "main" if chosen == main_url else "substream"
+    logger.info("webrtc_publisher.p2p_source camera_id=%s stream=%s", camera_id, kind)
+    return chosen, kind
+
+
 def sync_camera_paths(camera_url_fn) -> None:
     """Reconciles MediaMTX's configured paths against the current known-
     camera set -- adds a path for every camera not yet configured, removes
@@ -448,6 +514,7 @@ def sync_camera_paths(camera_url_fn) -> None:
         except Exception as error:
             logger.warning("webrtc_publisher.camera_url_unavailable camera_id=%s error=%s", camera_id, error)
             continue
+        source, _stream_kind = p2p_source_for(camera_id, source)
         path_config = {"source": source, "sourceOnDemand": True}
         status, _ = _config_request("POST", f"/v3/config/paths/add/{camera_id}", path_config)
         if status not in (200, 201):

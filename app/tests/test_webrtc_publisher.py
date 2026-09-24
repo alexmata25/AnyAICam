@@ -591,3 +591,70 @@ def test_a_path_that_really_cannot_be_configured_stays_unconfigured(fake_mediamt
     fake_mediamtx.fail_config = True
     wp.sync_camera_paths(lambda n: "rtsp://u:p@h:554/x")
     assert wp._known_paths == set()
+
+
+# ------------------------------------------------ P2P substream selection
+# 2026-09-24, confirmed live on Ryzen: P2P sent the full-bitrate main
+# stream (one camera: 1.7 fps at 72% packet loss). P2P now uses a verified
+# substream when the URL follows a known convention; recording and the
+# live HLS encode keep the untouched main stream.
+
+MAIN = "rtsp://u:p@10.0.0.9:554/Streaming/Channels/101?transportmode=unicast&profile=Profile_1"
+SUB = "rtsp://u:p@10.0.0.9:554/Streaming/Channels/102?transportmode=unicast&profile=Profile_2"
+
+
+def test_substream_candidates_follow_generic_conventions_only():
+    assert wp.substream_candidates(MAIN) == [SUB]
+    assert wp.substream_candidates("rtsp://u:p@h/Streaming/Channels/201") == ["rtsp://u:p@h/Streaming/Channels/202"]
+    assert wp.substream_candidates("rtsp://u:p@h/cam/realmonitor?channel=1&subtype=0") == ["rtsp://u:p@h/cam/realmonitor?channel=1&subtype=1"]
+    assert wp.substream_candidates("rtsp://u:p@h/live/main") == []
+    assert wp.substream_candidates("rtsp://u:p@h/cam?subtype=01") == []
+
+
+@pytest.fixture()
+def fresh_choice(monkeypatch):
+    monkeypatch.setattr(wp, "_p2p_source_choice", {})
+    monkeypatch.setattr(wp, "P2P_STREAM_PREFERENCE", "auto")
+    probes = []
+    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: probes.append(url) or url == SUB)
+    return probes
+
+
+def test_a_verified_substream_is_what_p2p_sends(fake_mediamtx, monkeypatch, fresh_choice):
+    monkeypatch.setattr(wp, "_camera_map", {"cam-x": 7})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    handed_to_recording = []
+    wp.sync_camera_paths(lambda n: handed_to_recording.append(MAIN) or MAIN)
+    added = [c for c in fake_mediamtx.calls if c[1] == "/v3/config/paths/add/cam-x"]
+    assert json.loads(added[0][2])["source"] == SUB
+    assert handed_to_recording == [MAIN]  # camera_url() itself (recording/HLS) is untouched
+
+
+def test_no_working_substream_keeps_the_main_stream(fake_mediamtx, monkeypatch, fresh_choice):
+    monkeypatch.setattr(wp, "_camera_map", {"cam-x": 7})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: False)
+    wp.sync_camera_paths(lambda n: MAIN)
+    added = [c for c in fake_mediamtx.calls if c[1] == "/v3/config/paths/add/cam-x"]
+    assert json.loads(added[0][2])["source"] == MAIN
+
+
+def test_main_preference_never_probes_a_substream(monkeypatch, fresh_choice):
+    monkeypatch.setattr(wp, "P2P_STREAM_PREFERENCE", "main")
+    assert wp.p2p_source_for("cam-x", MAIN) == (MAIN, "main")
+    assert fresh_choice == []
+
+
+def test_the_choice_is_probed_once_and_redecided_when_the_camera_url_changes(monkeypatch, fresh_choice):
+    assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "substream")
+    assert wp.p2p_source_for("cam-x", MAIN) == (SUB, "substream")
+    assert fresh_choice == [SUB]
+    other = MAIN.replace("10.0.0.9", "10.0.0.10")  # camera re-provisioned at a new address
+    assert wp.p2p_source_for("cam-x", other) == (other, "main")  # the fake probe rejects this host's substream
+    assert fresh_choice == [SUB, SUB.replace("10.0.0.9", "10.0.0.10")]  # probed again, not served from cache
+
+
+def test_recording_and_live_hls_still_use_the_main_stream_only():
+    import main
+    source = open(main.__file__, encoding="utf-8").read()
+    assert "p2p_source_for" not in source and "substream_candidates" not in source

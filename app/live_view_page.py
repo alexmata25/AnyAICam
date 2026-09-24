@@ -75,17 +75,22 @@ _P2P_JS = """
   // (2026-09-24): over a congested uplink P2P "connected" in 1.5s while
   // heavy packet loss kept every frame from ever assembling, and the tile
   // sat on an empty stream with the relay already torn down.
-  async function videoFramesDecoded(pc){
+  async function videoInboundStats(pc){
+    const totals = {frames: 0, received: 0, lost: 0};
     try {
       const report = await pc.getStats();
-      let frames = 0;
       report.forEach((stat) => {
         if (stat.type === 'inbound-rtp' && (stat.kind || stat.mediaType) === 'video') {
-          frames = Math.max(frames, stat.framesDecoded || 0);
+          totals.frames = Math.max(totals.frames, stat.framesDecoded || 0);
+          totals.received += stat.packetsReceived || 0;
+          totals.lost += Math.max(0, stat.packetsLost || 0);
         }
       });
-      return frames;
-    } catch (e) { return 0; }
+    } catch (e) {}
+    return totals;
+  }
+  async function videoFramesDecoded(pc){
+    return (await videoInboundStats(pc)).frames;
   }
   window.liveP2PFramesDecoded = videoFramesDecoded;
   async function getP2PConfig(){
@@ -222,19 +227,43 @@ _P2P_JS = """
   // window.liveP2PFrozenMs (default 8s) as lost -- a frozen picture on a
   // still-"connected" path falls back to the relay the same way a failed
   // connection does.
+  // Poor quality (2026-09-24, confirmed live on Ryzen): a P2P stream that
+  // keeps decoding a trickle of frames (1.7 fps at 72% packet loss) is
+  // never "frozen", but it is unusable. Measured over rolling windows of
+  // liveP2PQualityWindowMs (default 5s): two consecutive windows below
+  // liveP2PMinFps (default 3) or above liveP2PMaxLoss (default 0.3) are
+  // treated as lost, so the viewer falls back to the relay.
   window.watchLiveP2P = function(pc, onLost){
-    let lost = false, timer = null, frozenPoll = null;
+    let lost = false, timer = null, frozenPoll = null, qualityPoll = null;
     const frozenMs = window.liveP2PFrozenMs || 8000;
+    const qualityWindowMs = window.liveP2PQualityWindowMs || 5000;
+    const minFps = window.liveP2PMinFps ?? 3;
+    const maxLoss = window.liveP2PMaxLoss ?? 0.3;
     let lastFrames = -1, lastProgressAt = Date.now();
+    let windowStart = null, badWindows = 0;
     const state = () => pc.connectionState || pc.iceConnectionState;
     const lose = () => {
       if (lost) return;
       lost = true;
       if (timer) { clearTimeout(timer); timer = null; }
       if (frozenPoll) { clearInterval(frozenPoll); frozenPoll = null; }
+      if (qualityPoll) { clearInterval(qualityPoll); qualityPoll = null; }
       try { pc.close(); } catch (e) {}
       onLost();
     };
+    qualityPoll = setInterval(async () => {
+      if (lost) return;
+      const now = Date.now(), stats = await videoInboundStats(pc);
+      if (windowStart) {
+        const seconds = (now - windowStart.at) / 1000;
+        const fps = (stats.frames - windowStart.frames) / seconds;
+        const received = stats.received - windowStart.received, dropped = stats.lost - windowStart.lost;
+        const loss = received + dropped > 0 ? dropped / (received + dropped) : 0;
+        badWindows = (fps < minFps || loss > maxLoss) ? badWindows + 1 : 0;
+        if (badWindows >= 2) { lose(); return; }
+      }
+      windowStart = {at: now, ...stats};
+    }, qualityWindowMs);
     frozenPoll = setInterval(async () => {
       if (lost) return;
       const frames = await videoFramesDecoded(pc);
@@ -254,7 +283,7 @@ _P2P_JS = """
     };
     pc.addEventListener('connectionstatechange', check);
     pc.addEventListener('iceconnectionstatechange', check);
-    return () => { lost = true; if (timer) { clearTimeout(timer); timer = null; } if (frozenPoll) { clearInterval(frozenPoll); frozenPoll = null; } };
+    return () => { lost = true; if (timer) { clearTimeout(timer); timer = null; } if (frozenPoll) { clearInterval(frozenPoll); frozenPoll = null; } if (qualityPoll) { clearInterval(qualityPoll); qualityPoll = null; } };
   };
 
   window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
