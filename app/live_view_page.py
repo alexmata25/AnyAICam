@@ -68,6 +68,26 @@ POLL_TIMEOUT_MS = 45000
 _P2P_JS = """
 (function(){
   let cachedConfig = null;
+
+  // Decoded video frames on this connection so far (0 until the first one
+  // is actually decoded). A connected ICE path and an arrived track do NOT
+  // mean the viewer is seeing anything -- confirmed live on the Ryzen
+  // (2026-09-24): over a congested uplink P2P "connected" in 1.5s while
+  // heavy packet loss kept every frame from ever assembling, and the tile
+  // sat on an empty stream with the relay already torn down.
+  async function videoFramesDecoded(pc){
+    try {
+      const report = await pc.getStats();
+      let frames = 0;
+      report.forEach((stat) => {
+        if (stat.type === 'inbound-rtp' && (stat.kind || stat.mediaType) === 'video') {
+          frames = Math.max(frames, stat.framesDecoded || 0);
+        }
+      });
+      return frames;
+    } catch (e) { return 0; }
+  }
+  window.liveP2PFramesDecoded = videoFramesDecoded;
   async function getP2PConfig(){
     if (cachedConfig) return cachedConfig;
     try {
@@ -92,15 +112,31 @@ _P2P_JS = """
     if (!config.enabled) throw new Error('p2p_disabled');
 
     const pc = new RTCPeerConnection({iceServers: config.ice_servers || []});
-    let settled = false;
+    let settled = false, trackArrived = false;
     const timeoutMs = config.timeout_ms || 15000;
     const failClosed = () => { try { pc.close(); } catch (e) {} };
 
     const resultPromise = new Promise((resolve, reject) => {
+      // P2P only "wins" once a frame is actually decoded -- until then the
+      // relay keeps playing (the caller claims the tile only on resolve).
+      // A track that never produces a frame before timeoutMs rejects as
+      // 'no_frames', so the viewer simply stays on the relay.
       pc.ontrack = (event) => {
-        if (settled) return;
-        settled = true;
-        resolve({stream: event.streams[0], pc, connect_ms: Date.now() - startedAt});
+        if (settled || trackArrived) return;
+        trackArrived = true;
+        const stream = event.streams[0];
+        const waitForFrame = async () => {
+          while (!settled) {
+            if (await videoFramesDecoded(pc) > 0) {
+              if (settled) return;
+              settled = true;
+              resolve({stream, pc, connect_ms: Date.now() - startedAt});
+              return;
+            }
+            await new Promise((r) => setTimeout(r, 250));
+          }
+        };
+        waitForFrame();
       };
       pc.oniceconnectionstatechange = () => {
         if (settled) return;
@@ -112,7 +148,7 @@ _P2P_JS = """
       setTimeout(() => {
         if (settled) return;
         settled = true; failClosed();
-        reject(new Error('timeout'));
+        reject(new Error(trackArrived ? 'no_frames' : 'timeout'));
       }, timeoutMs);
     });
 
@@ -182,16 +218,29 @@ _P2P_JS = """
   // recovers from a brief 'disconnected' by itself) -- the page then falls
   // back to the relay, so a P2P viewer is never left on a frozen frame.
   // Returns a function that stops watching.
+  // Also treats a P2P stream whose decoded-frame count stops advancing for
+  // window.liveP2PFrozenMs (default 8s) as lost -- a frozen picture on a
+  // still-"connected" path falls back to the relay the same way a failed
+  // connection does.
   window.watchLiveP2P = function(pc, onLost){
-    let lost = false, timer = null;
+    let lost = false, timer = null, frozenPoll = null;
+    const frozenMs = window.liveP2PFrozenMs || 8000;
+    let lastFrames = -1, lastProgressAt = Date.now();
     const state = () => pc.connectionState || pc.iceConnectionState;
     const lose = () => {
       if (lost) return;
       lost = true;
       if (timer) { clearTimeout(timer); timer = null; }
+      if (frozenPoll) { clearInterval(frozenPoll); frozenPoll = null; }
       try { pc.close(); } catch (e) {}
       onLost();
     };
+    frozenPoll = setInterval(async () => {
+      if (lost) return;
+      const frames = await videoFramesDecoded(pc);
+      if (frames > lastFrames) { lastFrames = frames; lastProgressAt = Date.now(); return; }
+      if (Date.now() - lastProgressAt >= frozenMs) lose();
+    }, Math.min(2000, Math.max(250, Math.floor(frozenMs / 4))));
     const check = () => {
       if (lost) return;
       const current = state();
@@ -205,7 +254,7 @@ _P2P_JS = """
     };
     pc.addEventListener('connectionstatechange', check);
     pc.addEventListener('iceconnectionstatechange', check);
-    return () => { lost = true; if (timer) { clearTimeout(timer); timer = null; } };
+    return () => { lost = true; if (timer) { clearTimeout(timer); timer = null; } if (frozenPoll) { clearInterval(frozenPoll); frozenPoll = null; } };
   };
 
   window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
