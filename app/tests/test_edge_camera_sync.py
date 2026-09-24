@@ -114,7 +114,7 @@ def test_cloud_camera_is_upserted_into_the_local_cameras_table(db_path, monkeypa
          "resolution": "2mp", "recording_mode": "motion", "people_counting_enabled": 0},
     ])
     result = edge_camera_sync.sync_provisioned_cameras()
-    assert result == {"status": "ok", "synced": 1, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None}
+    assert result == {"status": "ok", "synced": 1, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None, "aac_voice_call_synced": None}
     cameras = _local_cameras(db_path)
     assert set(cameras) == {"cam-1"}
     assert cameras["cam-1"]["camera_number"] == 1
@@ -189,8 +189,8 @@ def test_restart_safe_a_fresh_process_re_running_sync_reaches_the_same_state(db_
     first = edge_camera_sync.sync_provisioned_cameras()
     edge_camera_sync.sync_state.clear()  # simulate a fresh process
     second = edge_camera_sync.sync_provisioned_cameras()
-    assert first == {"status": "ok", "synced": 1, "credentials_moved": 1, "product_mode_restart_required": False, "rules_synced": None}
-    assert second == {"status": "ok", "synced": 1, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None}
+    assert first == {"status": "ok", "synced": 1, "credentials_moved": 1, "product_mode_restart_required": False, "rules_synced": None, "aac_voice_call_synced": None}
+    assert second == {"status": "ok", "synced": 1, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None, "aac_voice_call_synced": None}
     assert len(_local_credentials(db_path)) == 1
 
 
@@ -206,7 +206,7 @@ def test_pending_credential_is_moved_into_camera_credentials_once_camera_id_is_k
          "recording_mode": None, "people_counting_enabled": 0},
     ])
     result = edge_camera_sync.sync_provisioned_cameras()
-    assert result == {"status": "ok", "synced": 1, "credentials_moved": 1, "product_mode_restart_required": False, "rules_synced": None}
+    assert result == {"status": "ok", "synced": 1, "credentials_moved": 1, "product_mode_restart_required": False, "rules_synced": None, "aac_voice_call_synced": None}
     assert _pending(db_path) == []
     creds = _local_credentials(db_path)
     assert set(creds) == {"cam-1"}
@@ -235,7 +235,7 @@ def test_no_matching_pending_credential_leaves_camera_without_one(db_path, monke
          "recording_mode": None, "people_counting_enabled": 0},
     ])
     result = edge_camera_sync.sync_provisioned_cameras()
-    assert result == {"status": "ok", "synced": 1, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None}
+    assert result == {"status": "ok", "synced": 1, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None, "aac_voice_call_synced": None}
     assert _local_credentials(db_path) == {}
 
 
@@ -281,7 +281,7 @@ def test_a_camera_no_longer_reported_by_the_cloud_is_left_untouched_locally(db_p
 
     _mock_cloud_config(monkeypatch, [])  # cloud now reports zero cameras for this appliance
     result = edge_camera_sync.sync_provisioned_cameras()
-    assert result == {"status": "ok", "synced": 0, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None}
+    assert result == {"status": "ok", "synced": 0, "credentials_moved": 0, "product_mode_restart_required": False, "rules_synced": None, "aac_voice_call_synced": None}
     assert set(_local_cameras(db_path)) == {"cam-1"}  # still present, untouched
 
 

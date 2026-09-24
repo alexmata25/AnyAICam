@@ -183,6 +183,69 @@ def _reconcile_analytics_rules(db, appliance_id: str, cloud_rules: list, now: st
     return len(cloud_ids)
 
 
+def _reconcile_aac_voice_call(db, appliance_id: str, cloud_config: dict, now: str) -> dict:
+    """Mirrors the cloud-owned AAC Voice Call configuration for THIS
+    appliance's own cameras into the local aac_voice_call_entrance_
+    cameras / aac_voice_call_site_greetings tables (2026-09-24) -- the
+    config-down half of the Voice Call cloud/edge split. The edge's
+    detection hook (aac_voice_call.handle_edge_person_detected()) reads
+    only these local copies, so the entrance-camera check and the
+    greeting keep working through a cloud/internet outage.
+
+    Same full-replace policy as _reconcile_analytics_rules() above:
+    appliance_configuration() only reports ENABLED entrance cameras, so
+    absence means "no longer an entrance camera" and the local row is
+    removed -- a camera the customer turned off must stop greeting
+    visitors. Scoped to cameras whose local appliance_id is this
+    appliance; rows for any other appliance's cameras, and any camera the
+    cloud names that isn't this appliance's, are never touched."""
+    local_cameras = {
+        item["id"]: dict(item)
+        for item in db.execute("SELECT id,customer_id,site_id FROM cameras WHERE appliance_id=?", (appliance_id,)).fetchall()
+    }
+    wanted_cameras: set[str] = set()
+    entrance_items = cloud_config.get("entrance_cameras")
+    for item in entrance_items if isinstance(entrance_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        camera_id = str(item.get("camera_id") or "").strip()
+        camera = local_cameras.get(camera_id)
+        if not camera:
+            continue
+        greeting_text = str(item.get("greeting_text") or "").strip() or None
+        wanted_cameras.add(camera_id)
+        db.execute(
+            "INSERT INTO aac_voice_call_entrance_cameras(camera_id,customer_id,enabled,configured_at,configured_by,greeting_text) "
+            "VALUES(?,?,1,?,?,?) "
+            "ON CONFLICT(camera_id) DO UPDATE SET customer_id=excluded.customer_id,enabled=1,greeting_text=excluded.greeting_text",
+            (camera_id, camera["customer_id"], now, "cloud-sync", greeting_text),
+        )
+    for camera_id in local_cameras:
+        if camera_id not in wanted_cameras:
+            db.execute("DELETE FROM aac_voice_call_entrance_cameras WHERE camera_id=?", (camera_id,))
+
+    site_customers = {camera["site_id"]: camera["customer_id"] for camera in local_cameras.values() if camera.get("site_id")}
+    wanted_sites: set[str] = set()
+    greeting_items = cloud_config.get("site_greetings")
+    for item in greeting_items if isinstance(greeting_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        site_id = str(item.get("site_id") or "").strip()
+        greeting_text = str(item.get("greeting_text") or "").strip()
+        if site_id not in site_customers or not greeting_text:
+            continue
+        wanted_sites.add(site_id)
+        db.execute(
+            "INSERT INTO aac_voice_call_site_greetings(customer_id,site_id,greeting_text,updated_at,updated_by) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(customer_id,site_id) DO UPDATE SET greeting_text=excluded.greeting_text",
+            (site_customers[site_id], site_id, greeting_text, now, "cloud-sync"),
+        )
+    for site_id, customer_id in site_customers.items():
+        if site_id not in wanted_sites:
+            db.execute("DELETE FROM aac_voice_call_site_greetings WHERE customer_id=? AND site_id=?", (customer_id, site_id))
+    return {"entrance_cameras": len(wanted_cameras), "site_greetings": len(wanted_sites)}
+
+
 def sync_provisioned_cameras() -> dict:
     """One reconciliation pass. Safe to call repeatedly (idempotent) and
     safe to call after any restart (reads only durable local/cloud
@@ -211,6 +274,12 @@ def sync_provisioned_cameras() -> dict:
     # than aborting the whole cycle's camera sync over it.
     cloud_rules = response.get("analytics_rules")
     cloud_rules = cloud_rules if isinstance(cloud_rules, list) else None
+    # aac_voice_call (2026-09-24): same "missing/malformed means skip,
+    # leave local state untouched" posture as analytics_rules -- an older
+    # control plane that doesn't send this field can never wipe the
+    # edge's local entrance-camera configuration.
+    cloud_aac_voice_call = response.get("aac_voice_call")
+    cloud_aac_voice_call = cloud_aac_voice_call if isinstance(cloud_aac_voice_call, dict) else None
 
     # product_mode (2026-09-21): this appliance's real, entitlement-
     # derived Local/Hybrid mode, from the same already-polled response --
@@ -378,8 +447,18 @@ def sync_provisioned_cameras() -> dict:
         # here belongs to a camera that was in this exact same
         # cloud_cameras list moments ago.
         rules_synced = _reconcile_analytics_rules(db, identity["appliance_id"], cloud_rules, now) if cloud_rules is not None else None
+        # Same transaction, same ordering reason as the rules above: the
+        # entrance-camera rows reference cameras upserted just above.
+        aac_voice_call_synced = (
+            _reconcile_aac_voice_call(db, identity["appliance_id"], cloud_aac_voice_call, now)
+            if cloud_aac_voice_call is not None else None
+        )
 
-    result = {"status": "ok", "synced": synced, "credentials_moved": credentials_moved, "product_mode_restart_required": restart_required, "rules_synced": rules_synced}
+    result = {
+        "status": "ok", "synced": synced, "credentials_moved": credentials_moved,
+        "product_mode_restart_required": restart_required, "rules_synced": rules_synced,
+        "aac_voice_call_synced": aac_voice_call_synced,
+    }
     sync_state["last_run_at"] = now
     sync_state["last_error"] = None
     sync_state["last_synced_count"] = synced

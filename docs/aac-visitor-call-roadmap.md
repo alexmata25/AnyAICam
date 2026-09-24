@@ -122,3 +122,54 @@ design, not just scale:
   generic "someone is at the door" alert with the raw camera/live link
   and no invented intent, mirroring AACO's own fail-closed
   `Clarification` behavior for commands it can't safely parse.
+
+## Cloud/edge split — implemented 2026-09-24
+
+Architecture rule (applies to Voice Call, access control, facial
+recognition, talkdown and live video): the cloud owns coordination —
+identity, permissions, the homeowner-facing session, notifications,
+audit/history and command routing; the edge appliance owns cameras,
+analytics, recording, the real-time media endpoint, local AI decisions
+and physical hardware. A cloud/internet outage must never stop local
+recording, analytics, facial recognition, locally authorized access
+control or local relay/Z-Wave operation.
+
+What is now implemented for Voice Call (branch
+`feature/aac-voicecall-cloud-edge-split-20260924`):
+
+- **Config down:** `GET /api/appliance/configuration` carries
+  `aac_voice_call.entrance_cameras` / `site_greetings` for the calling
+  appliance's own cameras; `edge_camera_sync` mirrors them into the
+  edge's local tables (full replace; untouched if the field is absent).
+- **Edge:** `aac_voice_call.handle_edge_person_detected()` — local
+  entrance-camera check, local cooldown, local greeting, then the
+  trigger is queued as an `aac_voice_call` analytics event. No local
+  session, notification or listening window. Works offline; the event
+  is delivered (and retried) by `analytics_sync` once connectivity
+  returns, and `request_prompt_scan()` sends it immediately when online.
+- **Cloud:** the analytics-event route calls
+  `aac_voice_call.ingest_edge_visitor_event()`, which creates the one
+  authoritative session (idempotent on the detection id), notifies the
+  homeowner once, and opens the listening window. A trigger that arrives
+  more than 5 minutes late is recorded as a missed visitor.
+- Combined-role processes and Local-mode edges (no cloud sync) keep
+  running the full flow locally via `handle_person_detected()` — there
+  the local process is itself the coordinator.
+
+## Architecture follow-ups (not yet implemented)
+
+1. **Remote unlock must be routed to the appliance.** Voice Call unlock
+   (`aac_voice_call_door.confirm_unlock()`) and the manual Unlock Door
+   route (`door_access.py`) currently call
+   `relay_control.get_provider().trigger()` inside whichever process
+   serves the request — in a split deployment, the cloud. The cloud must
+   instead authenticate, authorize, audit, and route an authorized
+   command to the correct appliance; the appliance performs the local
+   Z-Wave/dry-contact action and reports success/failure back for audit.
+   The cloud must never drive a physical lock or relay. (Today only the
+   mock relay provider exists, so no hardware is affected yet.)
+2. **Live video and talkdown should prefer a direct path.** The cloud
+   should coordinate authentication, permissions and session setup, with
+   media carried over WireGuard/direct/P2P whenever possible and the
+   S3/CloudFront relay used only as a fallback when no direct path can
+   be established.

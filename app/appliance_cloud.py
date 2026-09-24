@@ -480,6 +480,27 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             'WHERE c.appliance_id=? AND r.enabled=1 ORDER BY r.camera_id,r.id',
             (appliance['id'],),
         )
+        # aac_voice_call (2026-09-24): the cloud-owned AAC Voice Call
+        # configuration this appliance needs to act locally -- which of
+        # ITS OWN cameras are enabled entrance cameras (with any per-
+        # camera greeting), plus the per-site default greetings for the
+        # sites those cameras are on. Same `c.appliance_id=?` ownership
+        # boundary and the same "only enabled rows; absent means off"
+        # convention as analytics_rules above; edge_camera_sync.py
+        # mirrors it into the edge's local tables so detection, the
+        # entrance-camera check, and the greeting keep working offline.
+        aac_voice_call_config={
+            'entrance_cameras':rows(
+                'SELECT e.camera_id,e.greeting_text FROM aac_voice_call_entrance_cameras e JOIN cameras c ON c.id=e.camera_id '
+                'WHERE c.appliance_id=? AND e.customer_id=c.customer_id AND e.enabled=1 ORDER BY e.camera_id',
+                (appliance['id'],),
+            ),
+            'site_greetings':rows(
+                'SELECT g.site_id,g.greeting_text FROM aac_voice_call_site_greetings g '
+                'WHERE g.customer_id=? AND g.site_id IN (SELECT site_id FROM cameras WHERE appliance_id=? AND customer_id=?) ORDER BY g.site_id',
+                (appliance['customer_id'],appliance['id'],appliance['customer_id']),
+            ),
+        }
         for rule_item in analytics_rule_items:
             raw_geometry=rule_item.pop('geometry_json',None)
             try:
@@ -582,7 +603,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # docstring for the "database is locked" this avoids).
         if product_mode_audit:
             audit(product_mode_audit['actor'],product_mode_audit['action'],product_mode_audit['entity_type'],product_mode_audit['entity_id'],product_mode_audit['details'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'analytics_rules':analytics_rule_items}
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -891,6 +912,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # from the later .../media/shared request itself.
         parent_local_event_id=str(safe.get('parent_local_event_id') or '').strip() or None
         event_id=secrets.token_hex(12); now=datetime.now().isoformat()
+        # AAC Voice Call (2026-09-24): set when this is a replay of an
+        # already-recorded aac_voice_call detection -- see the Voice Call
+        # ingestion step after this block for why a replay still gets one
+        # more (idempotent) ingestion attempt instead of returning early.
+        aac_voice_call_duplicate_of=None
         with connection() as db:
             parent_detection_event_id=(
                 _resolve_parent_motion_event(db,camera_id,appliance['id'],parent_local_event_id)
@@ -928,7 +954,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                         db.execute('UPDATE detection_events SET parent_detection_event_id=? WHERE id=?',(parent_detection_event_id,existing['id']))
                     elif existing['parent_detection_event_id']!=parent_detection_event_id:
                         raise HTTPException(status_code=409,detail='This event is already correlated with a different Motion event.')
-                return {'status':'duplicate','event_id':existing['id']}
+                if event_type!='aac_voice_call':
+                    return {'status':'duplicate','event_id':existing['id']}
+                aac_voice_call_duplicate_of=existing['id']
             # AAC (facial recognition), Phase 2: closes the second of the
             # three split-topology gaps from the Phase 1 Codex review --
             # this generic route already stored the detection_events row
@@ -1005,7 +1033,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # has nothing for a customer to act on). Every other event_type
         # is completely unaffected -- this skip is scoped to event_
         # type=='facial_recognition' alone.
-        if event_type!='facial_recognition' or facial_notify_message:
+        # aac_voice_call is excluded here too: its homeowner notification
+        # is sent by the Voice Call ingestion below, through the session
+        # it belongs to -- a generic fan-out here would be a duplicate.
+        if event_type!='aac_voice_call' and (event_type!='facial_recognition' or facial_notify_message):
             try:
                 fanout_appliance_event(
                     {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
@@ -1013,6 +1044,32 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 )
             except Exception:
                 logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
+        # AAC Voice Call cloud/edge split (2026-09-24): the edge greeted the
+        # visitor locally and sent this trigger; the cloud now creates the
+        # ONE authoritative Voice Call session for it (aac_voice_call.
+        # ingest_edge_visitor_event() -- idempotent on the detection id).
+        # Runs after the block above has committed the detection_events
+        # row it references. Unlike the best-effort fan-out above, a
+        # failure here is returned to the edge as a retryable error, and a
+        # replay (aac_voice_call_duplicate_of) re-attempts ingestion: the
+        # edge keeps the event pending and re-sends it, so a transient
+        # cloud failure delays the session instead of silently losing it.
+        if event_type=='aac_voice_call':
+            detection_event_id=aac_voice_call_duplicate_of or event_id
+            greeting=detections[0] if isinstance(detections,list) and detections and isinstance(detections[0],dict) else {}
+            try:
+                from aac_voice_call import ingest_edge_visitor_event
+                ingest_edge_visitor_event(
+                    customer_id=camera['customer_id'],camera_id=camera_id,detection_event_id=detection_event_id,
+                    event_timestamp=event_timestamp,
+                    greeting_text_used=(str(greeting.get('greeting_text_used') or '').strip() or None),
+                    greeting_delivered=bool(greeting.get('greeting_delivered')),
+                )
+            except Exception as error:
+                logger.exception('analytics_event.aac_voice_call_ingest_failed detection_event_id=%s camera_id=%s',detection_event_id,camera_id)
+                raise HTTPException(status_code=503,detail='Voice Call event could not be recorded yet; retry.') from error
+            if aac_voice_call_duplicate_of:
+                return {'status':'duplicate','event_id':aac_voice_call_duplicate_of}
         return {'status':'accepted','event_id':event_id}
 
     @app.get('/api/appliance/facial-directory')
