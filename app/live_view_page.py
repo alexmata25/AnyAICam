@@ -1234,8 +1234,11 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             rows = db.execute(
                 f'SELECT event_type, confidence, object_count, detections_json, event_timestamp '
                 f'FROM detection_events WHERE camera_id=? AND customer_id=? AND event_type IN ({placeholders}) '
-                f'ORDER BY event_timestamp DESC LIMIT 20',
-                (camera_id, identity['customer_id'], *event_types),
+                f'ORDER BY event_timestamp DESC LIMIT ?',
+                # People Counting derives entries/exits/occupancy from one
+                # row per line crossing, so it needs a wider window than
+                # the other analytics' "latest few results".
+                (camera_id, identity['customer_id'], *event_types, 200 if analytic_key == 'people_counting' else 20),
             ).fetchall()
         return summarize(analytic_key, [dict(row) for row in rows])
 
@@ -1741,16 +1744,31 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     document.getElementById(`upgrade-learn-${{key}}`).addEventListener('click',()=>comingSoon(analyticsByKey[key].label+': '+info.description));
   }}
 
+  // Every value below comes from stored event data (appliance-reported
+  // event types, OCR'd plate text, names) -- always HTML-escaped before it
+  // is placed in innerHTML (2026-09-24).
+  function esc(value){{
+    return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
+  }}
+  function row(name,detail){{return `<div class="health-row"><span class="health-name">${{esc(name)}}</span><span class="health-detail">${{esc(detail)}}</span></div>`}}
   function renderAnalyticsSummary(key,data){{
+    const recent=Array.isArray(data.recent)?data.recent:[];
     if(key==='lpr'){{
-      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest plate</span><span class="health-detail">${{data.latest_plate||'No plates read yet'}}</span></div><div class="health-row"><span class="health-name">Confidence</span><span class="health-detail">${{data.latest_confidence!=null?data.latest_confidence+'%':'—'}}</span></div><div class="health-row"><span class="health-name">Recent</span><span class="health-detail">${{data.recent.length}} recent detection(s)</span></div>`;
+      // Plate text is read and kept on the appliance; the cloud receives
+      // the detection itself (time/confidence), not the plate number.
+      const plate=data.latest_plate||(recent.length?'Plate text is kept on the appliance':'No plates read yet');
+      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?Math.round(data.latest_confidence*100)+'%':'—')+row('Recent',`${{recent.length}} recent detection(s)`);
     }}else if(key==='people_counting'){{
-      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest count</span><span class="health-detail">${{data.latest_count!=null?data.latest_count:'No counts yet'}}</span></div><div class="health-row"><span class="health-name">Entries / exits</span><span class="health-detail">${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}</span></div>`;
+      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`);
     }}else if(key==='ppe'){{
-      analyticsPanel.innerHTML=`<div class="health-row"><span class="health-name">Latest status</span><span class="health-detail">${{data.latest_status||'No PPE events yet'}}</span></div><div class="health-row"><span class="health-name">As of</span><span class="health-detail">${{data.latest_timestamp||'—'}}</span></div>`;
+      const status=data.latest_status==='compliant'?'Compliant':data.latest_status==='violation'?'Violation':(data.latest_status||'No PPE events yet');
+      analyticsPanel.innerHTML=row('Latest status',status)+row('As of',data.latest_timestamp||'—');
+    }}else if(key==='facial_recognition'){{
+      const rows=recent.map(item=>row(item.person||(item.state==='unknown'?'Unknown person':(item.state||'Face')),item.timestamp||'')).join('');
+      analyticsPanel.innerHTML=rows||row('','No face matches yet');
     }}else{{
-      const rows=data.recent.map(item=>`<div class="health-row"><span class="health-name">${{item.event_type||'motion'}}</span><span class="health-detail">${{item.timestamp||''}}</span></div>`).join('')||'<div class="health-row"><span class="health-detail">No motion/person/vehicle events yet</span></div>';
-      analyticsPanel.innerHTML=rows;
+      const rows=recent.map(item=>row(item.event_type||'motion',item.timestamp||'')).join('');
+      analyticsPanel.innerHTML=rows||row('','No motion/person/vehicle events yet');
     }}
   }}
 

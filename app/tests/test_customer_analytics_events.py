@@ -288,6 +288,12 @@ def test_summary_totals_type_and_camera_for_the_real_tenant(monkeypatch, db_path
         conn = sqlite3.connect(db_path)
         conn.execute("PRAGMA foreign_keys=ON")
         _seed_real_proof_event(conn)
+        # The summary's type/camera breakdown covers the last 7 days of
+        # REAL time; move the seeded event into that window so this test
+        # doesn't silently expire as the calendar moves on (2026-09-24).
+        from datetime import datetime, timedelta
+        conn.execute("UPDATE detection_events SET event_timestamp=?", ((datetime.now() - timedelta(hours=1)).isoformat(),))
+        conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity())
         summary = main.analytics_summary_api(object())
     assert summary["mock_data"] is False

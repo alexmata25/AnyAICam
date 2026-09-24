@@ -36,9 +36,16 @@ from typing import Any
 # not just raw pixel-difference motion (see punch-list item 5's note on
 # analytics-vs-motion triggers).
 ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "smart_motion": ("Smart Motion", ("motion", "person", "vehicle")),
-    "people_counting": ("People Counting", ("people_counting",)),
-    "lpr": ("LPR", ("lpr",)),
+    # Event types are the values actually STORED in detection_events
+    # (2026-09-24 fix): the edge stores the specific vehicle class YOLO
+    # produced (car/truck/bus/...), Smart Motion's own "smart_motion"
+    # events, one "people_counting_in"/"people_counting_out" row per line
+    # crossing, and LPR reads as "plate" -- the previous generic values
+    # ("vehicle", "people_counting", "lpr") are only notification-side
+    # aliases, so these summaries were always empty for real data.
+    "smart_motion": ("Smart Motion", ("motion", "smart_motion", "person", "vehicle", "car", "truck", "bus", "motorcycle", "bicycle")),
+    "people_counting": ("People Counting", ("people_counting", "people_counting_in", "people_counting_out")),
+    "lpr": ("LPR", ("lpr", "plate")),
     "ppe": ("PPE", ("ppe",)),
     # AAC (facial recognition / access-control), Phase 1: gated per-camera
     # through this exact same camera_analytics_entitlements mechanism as
@@ -266,15 +273,22 @@ def event_types_for_analytic(analytic_key: str) -> tuple[str, ...]:
 
 
 def _parse_detections(raw: Any) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw:
+    """detections_json as a dict. The cloud stores the synced payload's
+    `detections` LIST (e.g. PPE's [{hard_hat_present, safety_vest_present}]
+    or facial recognition's [{match_state, matched_person_name, ...}]);
+    its first dict entry is the one summary-relevant record. Anything
+    else unparseable is an empty dict, never an error."""
+    parsed = raw
+    if isinstance(raw, str):
+        if not raw:
+            return {}
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
-    return {}
+    if isinstance(parsed, list):
+        parsed = next((item for item in parsed if isinstance(item, dict)), {})
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def summarize_lpr(events: list[dict]) -> dict:
@@ -314,10 +328,24 @@ def summarize_people_counting(events: list[dict]) -> dict:
         }
         for item in events[:10]
     ]
+    # Line-crossing events are one row per crossing, direction in the
+    # event_type (people_counting_in/_out). Entries/exits are counted over
+    # the rows the caller fetched (the most recent crossings), and the
+    # estimated occupancy is entries - exits over that same window, never
+    # negative. A legacy aggregate row that carries its own entries/exits
+    # in detections_json still wins, unchanged.
+    crossings_in = sum(1 for item in events if item.get("event_type") == "people_counting_in")
+    crossings_out = sum(1 for item in events if item.get("event_type") == "people_counting_out")
+    if crossings_in or crossings_out:
+        entries, exits = crossings_in, crossings_out
+        latest_count = max(entries - exits, 0)
+    else:
+        entries, exits = latest_detections.get("entries"), latest_detections.get("exits")
+        latest_count = latest.get("object_count")
     return {
-        "latest_count": latest.get("object_count"),
-        "entries": latest_detections.get("entries"),
-        "exits": latest_detections.get("exits"),
+        "latest_count": latest_count,
+        "entries": entries,
+        "exits": exits,
         "latest_timestamp": latest.get("event_timestamp"),
         "recent": recent,
     }
@@ -330,16 +358,30 @@ def summarize_ppe(events: list[dict]) -> dict:
     latest_detections = _parse_detections(latest.get("detections_json"))
     recent = [
         {
-            "status": _parse_detections(item.get("detections_json")).get("status", item.get("event_type")),
+            "status": _ppe_status(_parse_detections(item.get("detections_json"))),
             "timestamp": item.get("event_timestamp"),
         }
         for item in events[:10]
     ]
     return {
-        "latest_status": latest_detections.get("status", "violation" if latest.get("event_type") == "ppe" else None),
+        "latest_status": _ppe_status(latest_detections),
         "latest_timestamp": latest.get("event_timestamp"),
         "recent": recent,
     }
+
+
+def _ppe_status(detections: dict) -> str | None:
+    """'compliant' / 'violation' from the edge's own decision fields
+    (hard_hat_present / safety_vest_present -- see analytics_sync.py's PPE
+    special case), an explicit 'status' if a record carries one, else
+    None. Previously a record without 'status' was always reported as a
+    violation, including compliant ones."""
+    if detections.get("status"):
+        return str(detections["status"])
+    if "hard_hat_present" in detections or "safety_vest_present" in detections:
+        compliant = bool(detections.get("hard_hat_present")) and bool(detections.get("safety_vest_present"))
+        return "compliant" if compliant else "violation"
+    return None
 
 
 def summarize_smart_motion(events: list[dict]) -> dict:
