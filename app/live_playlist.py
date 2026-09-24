@@ -20,6 +20,7 @@ until then, by construction.
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,6 +32,7 @@ from appliance_cloud import live_manifest_store
 from appliance_protocol import live_relay_s3_prefix
 from camera_mapping import resolve_camera_number
 from live_cdn_signing import get_configured_signer, sign_segment_url
+from live_relay_idle_sweep import record_relay_viewer_activity
 from partner_db import connection
 from partner_portal import partner_identity
 
@@ -194,6 +196,22 @@ def register_live_playlist_routes(app: FastAPI, *, hls_folder=None, local_identi
             camera,camera_number=local_context(request,camera_id)
             return Response(local_playlist(hls_folder,camera_number,camera_id,STALE_MANIFEST_SECONDS),
                             media_type='application/vnd.apple.mpegurl',headers={'Cache-Control':'no-store'})
+
+        # Relay viewer demand (2026-09-24): this fetch IS the "someone is
+        # watching relay video" signal -- HLS players re-fetch the live
+        # playlist every segment. Refreshes this viewer's session heartbeat
+        # and, if the relay was idle-stopped while they were away, queues
+        # it to start again (see live_relay_idle_sweep.py). Never allowed
+        # to fail the playlist response itself.
+        try:
+            viewer = partner_identity(request) or {}
+            with connection() as db:
+                record_relay_viewer_activity(
+                    db, camera_id=camera_id, customer_id=camera['customer_id'],
+                    requested_by=str(viewer.get('email') or ''), now=datetime.now(),
+                )
+        except Exception:
+            logger.exception('live_playlist.relay_viewer_activity_failed camera_id=%s', camera_id)
 
         expected_prefix = live_relay_s3_prefix(camera['customer_id'], camera['site_id'], camera['appliance_id'], camera_id)
         manifest = live_manifest_store.manifest_for(camera_id)

@@ -54,3 +54,11 @@ class LiveManifestStore:
         with self._lock:
             self._ensure_loaded()
             return dict(self._state.get(camera_id, {"segments": [], "updated_at": None}))
+
+    def last_segment_times(self) -> dict:
+        """camera_id -> epoch seconds of the most recent segment received
+        (None if never). Read-only -- live_relay_idle_sweep.py uses it to
+        notice a camera still uploading with no viewer."""
+        with self._lock:
+            self._ensure_loaded()
+            return {camera_id: entry.get("updated_at") for camera_id, entry in self._state.items() if isinstance(entry, dict)}
