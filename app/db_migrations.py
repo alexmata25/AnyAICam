@@ -1115,6 +1115,15 @@ ALTER TABLE aac_voice_call_events ADD COLUMN trigger_source TEXT NOT NULL DEFAUL
     ('20260924_aac_voice_call_edge_trigger','''
 CREATE UNIQUE INDEX IF NOT EXISTS idx_aac_voice_call_events_trigger_detection ON aac_voice_call_events(trigger_detection_event_id) WHERE trigger_detection_event_id IS NOT NULL;
 '''),
+    # Live relay viewer demand (2026-09-24): last_seen_at is the relay
+    # viewer's heartbeat -- refreshed (throttled) by every relay playlist
+    # fetch in live_playlist.py. live_relay_idle_sweep.py treats a camera
+    # as still wanting relay upload only while a live session was either
+    # just started or has fetched the relay playlist recently, so a
+    # crashed/closed/P2P-connected viewer no longer holds the relay open.
+    ('20260924_live_view_session_relay_heartbeat','''
+ALTER TABLE live_view_sessions ADD COLUMN last_seen_at TEXT;
+'''),
 ]
 
 
