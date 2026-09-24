@@ -110,31 +110,31 @@ def _enabled(monkeypatch):
 def test_returns_empty_when_facial_recognition_disabled(db, monkeypatch):
     monkeypatch.setattr(fr, "FACIAL_RECOGNITION_ENABLED", False)
     _entitle(db)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events == []
 
 
 def test_returns_empty_when_camera_not_entitled(db):
     # No camera_analytics_entitlements row inserted for cam-1.
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events == []
 
 
 def test_returns_empty_when_camera_number_unmapped(db):
-    events = facial_events.record_facial_events(db, camera_number=999, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=999, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events == []
 
 
 def test_returns_empty_when_no_face_detected(db):
     _entitle(db)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0), faces=0))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0), faces=0))
     assert events == []
 
 
 def test_respects_per_camera_scoping(db, monkeypatch):
     monkeypatch.setattr(fr, "FACIAL_CAMERAS", frozenset({2}))
     _entitle(db)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events == []
 
 
@@ -145,7 +145,7 @@ def test_known_person_match_creates_known_event(db):
     _entitle(db)
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert len(events) == 1
     assert events[0]["match_state"] == "known"
     assert events[0]["matched_person_id"] == person_id
@@ -157,7 +157,7 @@ def test_unmatched_face_is_unknown_by_default(db):
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     # Orthogonal vector -> similarity 0.0, far below default threshold.
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
     assert len(events) == 1
     assert events[0]["match_state"] == "unknown"
     assert events[0]["matched_person_id"] is None
@@ -166,7 +166,7 @@ def test_unmatched_face_is_unknown_by_default(db):
 def test_unknown_events_can_be_disabled_via_settings(db):
     _entitle(db)
     facial_people.update_settings(db, customer_id="cust-1", unknown_person_events_enabled=False, now=NOW)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
     assert events == []
 
 
@@ -176,7 +176,7 @@ def test_watchlist_member_match_creates_watchlist_event(db):
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     watchlist_id = facial_people.create_watchlist(db, customer_id="cust-1", name="Banned", now=NOW)
     facial_people.add_watchlist_member(db, customer_id="cust-1", watchlist_id=watchlist_id, person_id=person_id, now=NOW)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events[0]["match_state"] == "watchlist"
     assert events[0]["matched_watchlist_id"] == watchlist_id
     assert events[0]["matched_watchlist_name"] == "Banned"
@@ -191,7 +191,7 @@ def test_confidence_just_below_configured_threshold_is_unknown(db):
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     vector = _unit_vector_at_similarity(0.89)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine(vector))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine(vector))
     assert events[0]["match_state"] == "unknown"
     assert events[0]["matched_person_id"] is None
 
@@ -202,7 +202,7 @@ def test_confidence_at_exactly_configured_threshold_is_known(db):
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     vector = _unit_vector_at_similarity(0.9)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine(vector))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine(vector))
     assert events[0]["match_state"] == "known"
     assert events[0]["matched_person_id"] == person_id
 
@@ -212,7 +212,7 @@ def test_confidence_at_exactly_configured_threshold_is_known(db):
 
 def test_multiple_faces_in_one_frame_each_produce_an_event(db):
     _entitle(db)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0), faces=3))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0), faces=3))
     assert len(events) == 3
 
 
@@ -221,8 +221,8 @@ def test_duplicate_sighting_within_debounce_window_is_suppressed(db):
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     engine = _FixedVectorEngine((1.0, 0.0))
-    first = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=engine)
-    second = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=engine)
+    first = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=engine)
+    second = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=engine)
     assert len(first) == 1
     assert len(second) == 0  # same person, same camera, within the debounce window
 
@@ -231,8 +231,8 @@ def test_different_cameras_do_not_share_debounce_state(db):
     _entitle(db, camera_id="cam-1")
     _entitle(db, camera_id="cam-2")
     engine = _FixedVectorEngine((0.0, 1.0))
-    first = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=engine)
-    second = facial_events.record_facial_events(db, camera_number=2, person_crop_bgr=_frame(), now=NOW, engine=engine)
+    first = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=engine)
+    second = facial_events.record_facial_events(db, camera_number=2, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=engine)
     assert len(first) == 1
     assert len(second) == 1
 
@@ -256,7 +256,7 @@ def test_events_are_scoped_to_the_cameras_own_customer(db):
     _entitle(db, camera_id="cam-1")
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
-    events = facial_events.record_facial_events(db, camera_number=3, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=3, appliance_id="appl-2", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert events[0]["match_state"] == "unknown"  # cust-1's Alice must not leak into cust-2's camera
 
 
@@ -265,7 +265,7 @@ def test_events_are_scoped_to_the_cameras_own_customer(db):
 
 def test_list_events_filters_by_match_state(db):
     _entitle(db)
-    facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
     events = facial_events.list_events(db, customer_id="cust-1", match_state="unknown")
     assert len(events) == 1
     assert facial_events.list_events(db, customer_id="cust-1", match_state="known") == []
@@ -282,16 +282,87 @@ def test_list_events_never_returns_another_customers_rows(db):
             ("cam-3", "facial_recognition", "active", NOW, NOW),
         )
     _entitle(db, camera_id="cam-1")
-    facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
-    facial_events.record_facial_events(db, camera_number=3, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    facial_events.record_facial_events(db, camera_number=3, appliance_id="appl-2", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
     cust1_events = facial_events.list_events(db, customer_id="cust-1")
     assert all(event["customer_id"] == "cust-1" for event in cust1_events)
     assert len(cust1_events) == 1
 
 
+# --------------------------------------------------------------- appliance-scoped camera_number
+
+
+def _seed_second_appliance_with_camera_number_1(db):
+    """A second appliance (different customer) whose own Camera 1 shares
+    camera_number=1 with appl-1's cam-1 -- camera_number is only unique
+    per appliance, never globally."""
+    with connection() as second_db:
+        second_db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-2','p1','C2','c2@example.test','active','real',?)", (NOW,))
+        second_db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-2','cust-2','Site 2',?)", (NOW,))
+        second_db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-2','cust-2','site-2','AIC-TEST0002',?)", (NOW,))
+        second_db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,camera_number) VALUES('cam-9','cust-2','site-2','appl-2','Other Camera 1','active',?,1)", (NOW,))
+    _entitle(db, camera_id="cam-1")
+    _entitle(db, camera_id="cam-9")
+
+
+def test_same_camera_number_on_two_appliances_resolves_only_to_each_appliances_own_camera(db):
+    _seed_second_appliance_with_camera_number_1(db)
+    first = facial_events._camera_tenant_context(db, 1, "appl-1")
+    second = facial_events._camera_tenant_context(db, 1, "appl-2")
+    assert (first["id"], first["customer_id"], first["appliance_id"]) == ("cam-1", "cust-1", "appl-1")
+    assert (second["id"], second["customer_id"], second["appliance_id"]) == ("cam-9", "cust-2", "appl-2")
+
+
+def test_record_facial_events_attributes_a_detection_to_the_detecting_appliances_camera(db):
+    _seed_second_appliance_with_camera_number_1(db)
+    on_appl_1 = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    on_appl_2 = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-2", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    assert [(e["camera_id"], e["customer_id"]) for e in on_appl_1] == [("cam-1", "cust-1")]
+    assert [(e["camera_id"], e["customer_id"]) for e in on_appl_2] == [("cam-9", "cust-2")]
+
+
+def test_missing_appliance_identity_resolves_no_camera_and_records_nothing(db):
+    _entitle(db)
+    assert facial_events._camera_tenant_context(db, 1, None) is None
+    assert facial_events._camera_tenant_context(db, 1, "") is None
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id=None, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    assert events == []
+    assert db.execute("SELECT COUNT(*) FROM facial_events").fetchone()[0] == 0
+
+
+def test_unknown_appliance_resolves_no_camera(db):
+    _entitle(db)
+    assert facial_events._camera_tenant_context(db, 1, "appl-does-not-exist") is None
+
+
+def test_ambiguous_camera_number_on_one_appliance_is_logged_and_resolves_no_camera(db, caplog):
+    # idx_cameras_appliance_camera_number normally makes this state
+    # impossible; dropped here to simulate a database that never got it,
+    # which is exactly the case the lookup's own guard exists for.
+    db.execute("DROP INDEX idx_cameras_appliance_camera_number")
+    db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at,camera_number) VALUES('cam-dup','cust-1','site-1','appl-1','Duplicate 1','active',?,1)", (NOW,))
+    _entitle(db)
+    with caplog.at_level("WARNING", logger="anyaicam.facial_events"):
+        assert facial_events._camera_tenant_context(db, 1, "appl-1") is None
+        events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    assert events == []
+    assert "ambiguous_camera_number" in caplog.text
+
+
+def test_main_detection_hook_scopes_facial_events_to_the_persisted_appliance_identity():
+    """main.py's one live call site must pass this appliance's own
+    persisted identity -- never omit it or pass a hardcoded id."""
+    from pathlib import Path
+
+    main_source = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+    start = main_source.index("facial_events.record_facial_events(")
+    call_site = " ".join(main_source[start:start + 500].split())
+    assert "appliance_id=active_appliance_id()" in call_site
+
+
 def test_get_event_detail_returns_none_for_wrong_customer(db):
     _entitle(db)
-    created = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
+    created = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)))
     event_id = created[0]["id"]
     assert facial_events.get_event_detail(db, customer_id="cust-2", event_id=event_id) is None
     assert facial_events.get_event_detail(db, customer_id="cust-1", event_id=event_id) is not None
@@ -305,7 +376,7 @@ def test_event_survives_person_deletion_with_denormalized_name(db):
     _entitle(db)
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
-    created = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    created = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     facial_people.delete_person(db, customer_id="cust-1", person_id=person_id)
     detail = facial_events.get_event_detail(db, customer_id="cust-1", event_id=created[0]["id"])
     assert detail is not None
@@ -322,7 +393,7 @@ def test_relay_not_evaluated_when_no_provider_given(db):
     _entitle(db)
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     assert "relay_outcomes" not in events[0]
 
 
@@ -336,7 +407,7 @@ def test_relay_rule_triggers_mock_channel_1_on_known_match(db):
         (NOW, NOW),
     )
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     assert events[0]["relay_outcomes"][0]["channel"] == 1
     assert events[0]["relay_outcomes"][0]["activated"] is True
     assert provider.calls[0].dry_run is False
@@ -352,7 +423,7 @@ def test_relay_rule_in_dry_run_never_activates(db):
         (NOW, NOW),
     )
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     assert events[0]["relay_outcomes"][0]["channel"] == 2
     assert events[0]["relay_outcomes"][0]["activated"] is False
     assert events[0]["relay_outcomes"][0]["dry_run"] is True
@@ -366,7 +437,7 @@ def test_relay_rule_never_triggers_for_unknown_faces(db):
         (NOW, NOW),
     )
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((0.0, 1.0)), relay_provider=provider)
     assert events[0]["match_state"] == "unknown"
     assert provider.calls == []  # relay is never even consulted for an unknown face
 
@@ -387,7 +458,7 @@ def test_access_outcomes_are_persisted_on_the_facial_events_row(db):
         (NOW, NOW),
     )
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     row = db.execute("SELECT access_outcomes_json FROM facial_events WHERE id=?", (events[0]["id"],)).fetchone()
     import json
     stored = json.loads(row["access_outcomes_json"])
@@ -402,7 +473,7 @@ def test_access_outcomes_column_stays_null_when_no_provider_is_given(db):
     _entitle(db)
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)))
     row = db.execute("SELECT access_outcomes_json FROM facial_events WHERE id=?", (events[0]["id"],)).fetchone()
     assert row["access_outcomes_json"] is None
 
@@ -441,7 +512,7 @@ def test_mode1_authorized_auto_unlock_has_no_notify_message_and_audits_success(d
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     _door_rule(db, dry_run=0)
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     assert "door_notify_message" not in events[0]
     audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
     assert audit is not None
@@ -460,7 +531,7 @@ def test_mode2_recognized_without_authorization_notifies_and_never_unlocks(db):
     person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Bob", now=NOW)
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     assert provider.calls == []
     assert events[0]["door_notify_message"] == "Bob is at Camera 1."
     audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
@@ -479,7 +550,7 @@ def test_mode2_a_dry_run_rule_matching_still_notifies_and_never_unlocks(db):
     facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
     _door_rule(db, dry_run=1)
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     assert events[0]["door_notify_message"] == "Carol is at Camera 1."
     audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
     assert audit["authorization_result"] == "authorized"
@@ -490,7 +561,7 @@ def test_mode2_a_dry_run_rule_matching_still_notifies_and_never_unlocks(db):
 def test_mode3_unknown_person_at_door_camera_notifies_and_never_unlocks(db):
     _entitle(db)
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((9.0, 9.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((9.0, 9.0)), relay_provider=provider)
     assert provider.calls == []
     assert events[0]["door_notify_message"] == "Unknown person at Camera 1."
     audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
@@ -511,7 +582,7 @@ def test_non_door_camera_never_evaluates_rules_or_notifies_even_with_a_provider(
     )
     _door_rule(db, dry_run=0)
     provider = MockRelayProvider()
-    events = facial_events.record_facial_events(db, camera_number=2, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    events = facial_events.record_facial_events(db, camera_number=2, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
     assert provider.calls == []
     assert "door_notify_message" not in events[0]
     assert db.execute("SELECT COUNT(*) c FROM door_access_events").fetchone()["c"] == 0
@@ -523,7 +594,7 @@ def test_door_access_events_written_even_without_a_relay_provider(db):
     auditing must still work in that default configuration; only the
     ACTUAL relay evaluation (evaluate_access_rules()) is skipped."""
     _entitle(db)
-    events = facial_events.record_facial_events(db, camera_number=1, person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((9.0, 9.0)))
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((9.0, 9.0)))
     assert events[0]["door_notify_message"] == "Unknown person at Camera 1."
     audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
     assert audit["authorization_result"] == "unknown_person"

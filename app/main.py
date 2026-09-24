@@ -38196,12 +38196,14 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         person_detection["height"],
                     )
                     person_crop_for_aac = frame[fy : fy + fh, fx : fx + fw]
+                    from appliance_activation import active_appliance_id
                     from database_backend import connect as aac_connect
 
                     with aac_connect() as aac_db:
                         aac_events_created = facial_events.record_facial_events(
                             aac_db, camera_number=camera_number, person_crop_bgr=person_crop_for_aac, now=now,
                             relay_provider=relay_control.get_provider() if relay_control.FACIAL_ACCESS_CONTROL_ENABLED else None,
+                            appliance_id=active_appliance_id(),
                         )
                     for aac_event in aac_events_created:
                         append_analytics_event(
@@ -38245,10 +38247,11 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # future one) already goes through.
         if class_name == "person":
             try:
+                from appliance_activation import active_appliance_id
                 from database_backend import connect as aac_voice_call_connect
 
                 with aac_voice_call_connect() as vc_db:
-                    vc_context = aac_voice_call._camera_tenant_context(vc_db, camera_number)
+                    vc_context = aac_voice_call._camera_tenant_context(vc_db, camera_number, active_appliance_id())
                 if vc_context:
                     aac_voice_call.handle_person_detected(
                         customer_id=vc_context["customer_id"],

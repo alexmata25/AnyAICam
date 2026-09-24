@@ -39,6 +39,7 @@ camera.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import threading
@@ -50,6 +51,8 @@ import facial_people
 import facial_recognition
 import relay_control
 from database_backend import backend
+
+logger = logging.getLogger("anyaicam.facial_events")
 
 AAC_THUMBNAIL_FOLDER = Path(os.environ.get("ANYAICAM_AAC_THUMBNAIL_FOLDER", "/app/recordings/aac_faces/events"))
 
@@ -136,13 +139,27 @@ def reset_state() -> None:
     _debounce.reset()
 
 
-def _camera_tenant_context(db, camera_number: int) -> dict | None:
-    row = db.execute(
+def _camera_tenant_context(db, camera_number: int, appliance_id: str | None) -> dict | None:
+    """camera_number is only unique per appliance, so the lookup is
+    scoped to this appliance's own cameras (appliance_activation.
+    active_appliance_id()). Fails closed: no appliance identity, no
+    match, or an ambiguous match (more than one row for the same
+    appliance + camera_number) all resolve no camera rather than
+    guessing which tenant a detection belongs to."""
+    if not appliance_id:
+        return None
+    matches = db.execute(
         "SELECT id,customer_id,site_id,appliance_id,name,door_access_enabled,door_relay_channel,door_relay_pulse_ms "
-        "FROM cameras WHERE camera_number=?",
-        (camera_number,),
-    ).fetchone()
-    return dict(row) if row else None
+        "FROM cameras WHERE camera_number=? AND appliance_id=?",
+        (camera_number, appliance_id),
+    ).fetchall()
+    if len(matches) > 1:
+        logger.warning(
+            "facial_events.ambiguous_camera_number appliance_id=%s camera_number=%s matches=%s -- resolving no camera",
+            appliance_id, camera_number, len(matches),
+        )
+        return None
+    return dict(matches[0]) if matches else None
 
 
 def _is_entitled(db, *, camera_id: str) -> bool:
@@ -323,6 +340,7 @@ def record_facial_events(
     db,
     *,
     camera_number: int,
+    appliance_id: str | None,
     person_crop_bgr,
     now,
     relay_provider: "relay_control.RelayProvider | None" = None,
@@ -346,7 +364,7 @@ def record_facial_events(
         return []
     if not facial_recognition.is_camera_enabled(camera_number):
         return []
-    context = _camera_tenant_context(db, camera_number)
+    context = _camera_tenant_context(db, camera_number, appliance_id)
     if context is None:
         return []
     if not _is_entitled(db, camera_id=context["id"]):

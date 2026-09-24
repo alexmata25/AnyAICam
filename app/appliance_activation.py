@@ -132,6 +132,23 @@ def load_persisted_identity() -> dict | None:
     return data
 
 
+def active_appliance_id() -> str | None:
+    """This appliance's own authenticated appliance_id -- the same
+    persisted identity edge_camera_sync.sync_provisioned_cameras()
+    already authenticates its cloud sync with -- or None when this
+    appliance is not (or no longer) activated. The detection-loop hooks
+    (facial_events.record_facial_events(), aac_voice_call's person-
+    detected hook) use this to scope an appliance-local camera_number
+    to THIS appliance's own cameras only: the local cameras table can
+    legitimately hold rows from another appliance identity (edge sync
+    never deletes, see edge_camera_sync.py's own docstring), and
+    camera_number is only unique per appliance. None must be treated as
+    "resolve no camera", never as "match any appliance"."""
+    identity = load_persisted_identity()
+    appliance_id = str((identity or {}).get("appliance_id") or "").strip()
+    return appliance_id or None
+
+
 def persist_activation(*, appliance_id: str, cloud_id: str, credential: str, customer_id: str, site_id: str, partner_id: str | None, allow_overwrite: bool = False) -> dict:
     """Idempotent for the SAME cloud_id (a legitimate credential refresh
     -- re-running activation with a freshly issued token updates the
