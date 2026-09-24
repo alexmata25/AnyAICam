@@ -34,9 +34,11 @@ change to this one list -- no signaling/session/instrumentation code needs
 to change, which is the whole point of shipping STUN-only first.
 """
 
+import asyncio
 import json
 import os
 import secrets
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
@@ -56,6 +58,92 @@ LIVE_P2P_ENABLED = os.environ.get("ANYAICAM_LIVE_P2P_ENABLED", "false").strip().
 P2P_NEGOTIATION_TIMEOUT_MS = int(os.environ.get("ANYAICAM_LIVE_P2P_TIMEOUT_MS", "4000"))
 
 _DEFAULT_STUN_SERVERS = "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478"
+
+# Appliance pending-signal LONG-POLL (2026-09-24). The appliance used to
+# poll GET /api/appliance/live/p2p/pending every ~1s, 24/7 -- measured on
+# staging at ~60,800 requests/day for ONE appliance, each paying a full
+# appliance authentication (PBKDF2 credential check + replay-nonce write)
+# to ask "is anyone trying to connect?", almost always answered "no".
+# With ?wait=N the request is held open up to N seconds (capped here) and
+# returns as soon as a browser submits an offer/ICE candidate for one of
+# this appliance's cameras: submit_offer()/submit_client_ice() wake the
+# waiting request in-process, and the waiter also re-checks the database
+# every PENDING_RECHECK_SECONDS so a signal written by a different worker
+# process (uvicorn --workers>1) is still delivered promptly. wait=0 (the
+# default, and what an older appliance sends) keeps the original
+# immediate-return behavior exactly.
+MAX_PENDING_WAIT_SECONDS = 25.0
+PENDING_RECHECK_SECONDS = 2.0
+
+
+class _PendingSignalNotifier:
+    """In-process wake-ups for long-polling appliances, keyed by
+    appliance_id. notify() may be called from any thread (the customer
+    signaling routes are sync, i.e. run in the threadpool); each waiter's
+    asyncio.Event is set on its own event loop via call_soon_threadsafe."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._waiters: dict[str, set] = {}
+
+    def register(self, appliance_id: str):
+        waiter = (asyncio.get_running_loop(), asyncio.Event())
+        with self._lock:
+            self._waiters.setdefault(appliance_id, set()).add(waiter)
+        return waiter
+
+    def unregister(self, appliance_id: str, waiter) -> None:
+        with self._lock:
+            waiters = self._waiters.get(appliance_id)
+            if waiters is not None:
+                waiters.discard(waiter)
+                if not waiters:
+                    self._waiters.pop(appliance_id, None)
+
+    def notify(self, appliance_id: str | None) -> None:
+        if not appliance_id:
+            return
+        with self._lock:
+            waiters = list(self._waiters.get(appliance_id, ()))
+        for loop, event in waiters:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass  # that waiter's loop already closed
+
+    def waiter_count(self, appliance_id: str) -> int:
+        with self._lock:
+            return len(self._waiters.get(appliance_id, ()))
+
+
+pending_signal_notifier = _PendingSignalNotifier()
+
+
+def _session_appliance_id(db, session_id: str) -> str | None:
+    row = db.execute(
+        "SELECT c.appliance_id FROM live_view_sessions s JOIN cameras c ON c.id=s.camera_id WHERE s.id=?",
+        (session_id,),
+    ).fetchone()
+    return row['appliance_id'] if row else None
+
+
+def _collect_pending(appliance_id: str) -> list[dict]:
+    """This appliance's own not-yet-delivered offers/client-ICE (scoped via
+    live_view_sessions.camera_id -> cameras.appliance_id, never another
+    appliance's signaling traffic), marked consumed as they are returned."""
+    now = datetime.now()
+    with connection() as db:
+        candidate_sessions = db.execute(
+            "SELECT s.id AS session_id, s.camera_id FROM live_view_sessions s "
+            "JOIN cameras c ON c.id=s.camera_id WHERE c.appliance_id=? AND s.state='requested'",
+            (appliance_id,),
+        ).fetchall()
+        pending = []
+        for item in candidate_sessions:
+            signals = _drain_signals(db, session_id=item['session_id'], kinds=('offer', 'ice_client'), now=now)
+            for signal in signals:
+                pending.append({'session_id': item['session_id'], 'camera_id': item['camera_id'], 'kind': signal['kind'], 'payload': signal['payload']})
+    return pending
 
 
 def ice_servers() -> list[dict]:
@@ -134,6 +222,9 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
                 raise HTTPException(status_code=409, detail='Live view session is not active.')
             db.execute('UPDATE live_view_sessions SET p2p_attempted=1 WHERE id=?', (session_id,))
             _insert_signal(db, session_id=session_id, kind='offer', payload={'sdp': sdp}, now=now)
+            appliance_id = _session_appliance_id(db, session_id)
+        # After the commit above, so the woken long-poll finds the signal.
+        pending_signal_notifier.notify(appliance_id)
         return {'status': 'accepted'}
 
     @app.post('/api/customer/live/sessions/{session_id}/p2p/ice')
@@ -148,6 +239,8 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
             if session['state'] != 'requested':
                 raise HTTPException(status_code=409, detail='Live view session is not active.')
             _insert_signal(db, session_id=session_id, kind='ice_client', payload=candidate, now=now)
+            appliance_id = _session_appliance_id(db, session_id)
+        pending_signal_notifier.notify(appliance_id)
         return {'status': 'accepted'}
 
     @app.get('/api/customer/live/sessions/{session_id}/p2p/answer')
@@ -199,26 +292,46 @@ def register_live_view_p2p_customer_routes(app: FastAPI) -> None:
 
 def register_live_view_p2p_appliance_routes(app: FastAPI) -> None:
     @app.get('/api/appliance/live/p2p/pending')
-    def poll_pending_offers(request: Request) -> dict:
+    async def poll_pending_offers(request: Request, wait: float = 0.0) -> dict:
         """Appliance-side poll, same shape as the existing GET
         /api/appliance/commands -- returns this appliance's own not-yet-
         answered offers/client-ICE only (scoped via live_view_sessions.
         site_id/camera_id -> cameras.appliance_id, never another
-        appliance's signaling traffic)."""
-        appliance = authenticate_appliance(request)
-        now = datetime.now()
-        with connection() as db:
-            candidate_sessions = db.execute(
-                "SELECT s.id AS session_id, s.camera_id FROM live_view_sessions s "
-                "JOIN cameras c ON c.id=s.camera_id WHERE c.appliance_id=? AND s.state='requested'",
-                (appliance['id'],),
-            ).fetchall()
-            pending = []
-            for item in candidate_sessions:
-                signals = _drain_signals(db, session_id=item['session_id'], kinds=('offer', 'ice_client'), now=now)
-                for signal in signals:
-                    pending.append({'session_id': item['session_id'], 'camera_id': item['camera_id'], 'kind': signal['kind'], 'payload': signal['payload']})
-        return {'pending': pending}
+        appliance's signaling traffic).
+
+        wait>0 makes it a long-poll (see MAX_PENDING_WAIT_SECONDS above):
+        returns immediately if anything is pending, otherwise holds the
+        request until a signal arrives or `wait` seconds pass. async, with
+        every blocking step (authentication, DB) run in a worker thread,
+        so a held request never occupies a threadpool thread while idle.
+        The response echoes long_poll_seconds so the appliance knows this
+        cloud honored the wait and can re-poll immediately."""
+        appliance = await asyncio.to_thread(authenticate_appliance, request)
+        wait_seconds = max(0.0, min(float(wait or 0.0), MAX_PENDING_WAIT_SECONDS))
+        # Registered BEFORE the first check, so a signal committed between
+        # the check and the wait still wakes this request.
+        waiter = pending_signal_notifier.register(appliance['id']) if wait_seconds > 0 else None
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + wait_seconds
+            while True:
+                pending = await asyncio.to_thread(_collect_pending, appliance['id'])
+                remaining = deadline - loop.time()
+                if pending or waiter is None or remaining <= 0:
+                    break
+                event = waiter[1]
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=min(remaining, PENDING_RECHECK_SECONDS))
+                except asyncio.TimeoutError:
+                    pass
+                event.clear()
+        finally:
+            if waiter is not None:
+                pending_signal_notifier.unregister(appliance['id'], waiter)
+        response = {'pending': pending}
+        if wait_seconds > 0:
+            response['long_poll_seconds'] = wait_seconds
+        return response
 
     @app.post('/api/appliance/live/{camera_id}/p2p/answer')
     def submit_answer(request: Request, camera_id: str, payload: dict) -> dict:

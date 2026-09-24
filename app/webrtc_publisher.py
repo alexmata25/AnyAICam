@@ -160,6 +160,17 @@ TURN_USERNAME = os.environ.get("ANYAICAM_LIVE_TURN_USERNAME", "").strip()
 TURN_CREDENTIAL = os.environ.get("ANYAICAM_LIVE_TURN_CREDENTIAL", "").strip()
 
 SCAN_SECONDS = max(0.5, float(os.environ.get("ANYAICAM_LIVE_P2P_SCAN_SECONDS", "1.0")))
+# Long-poll the cloud's pending-signal route (2026-09-24): the request is
+# held up to this long and returns the moment a browser offer/ICE arrives
+# (see live_view_p2p.py), so an idle appliance makes ~3 requests/minute
+# instead of ~60, and offers are delivered faster than a 1s poll. 0
+# disables it (plain SCAN_SECONDS polling). A cloud that doesn't support
+# it answers immediately without echoing long_poll_seconds, and this
+# worker then falls back to sleeping SCAN_SECONDS between polls, exactly
+# as before -- never a tight loop.
+LONG_POLL_SECONDS = max(0.0, min(25.0, float(os.environ.get("ANYAICAM_LIVE_P2P_LONG_POLL_SECONDS", "20"))))
+# The HTTP read timeout must outlast the held request.
+LONG_POLL_HTTP_TIMEOUT_SECONDS = LONG_POLL_SECONDS + 15.0
 CONFIG_REFRESH_SECONDS = max(30.0, float(os.environ.get("ANYAICAM_LIVE_P2P_CONFIG_REFRESH_SECONDS", "60.0")))
 MEDIAMTX_RESTART_BACKOFF_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_RESTART_BACKOFF_SECONDS", "5.0")))
 MEDIAMTX_STARTUP_GRACE_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_STARTUP_GRACE_SECONDS", "3.0")))
@@ -203,14 +214,14 @@ def _control_plane_headers(appliance_id: str, credential: str) -> dict:
     }
 
 
-def _control_plane_get(path: str) -> dict | None:
+def _control_plane_get(path: str, timeout: float = 10) -> dict | None:
     identity = _load_appliance_identity()
     if not identity or not CLOUD_URL:
         return None
     appliance_id, credential = identity
     request = urllib.request.Request(CLOUD_URL + path, headers=_control_plane_headers(appliance_id, credential), method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode() or "{}")
     except urllib.error.HTTPError as error:
         logger.warning("webrtc_publisher.control_plane_http_error path=%s status=%s", path, error.code)
@@ -560,7 +571,22 @@ def _handle_pending_signal(camera_url_fn, item: dict) -> None:
         # best-effort contract.
 
 
-async def _bridge_tick(camera_url_fn) -> None:
+def _pending_poll_request() -> tuple[str, float]:
+    """(path, HTTP timeout) for one pending-signal poll -- a long-poll when
+    LONG_POLL_SECONDS > 0 (see its comment), else the original plain poll."""
+    if LONG_POLL_SECONDS > 0:
+        return f"/api/appliance/live/p2p/pending?wait={LONG_POLL_SECONDS:g}", LONG_POLL_HTTP_TIMEOUT_SECONDS
+    return "/api/appliance/live/p2p/pending", 10.0
+
+
+def _delay_after_poll(long_poll_honored: bool) -> float:
+    """Seconds to wait before the next poll: none after a poll the cloud
+    actually held open (it already waited), SCAN_SECONDS otherwise -- a
+    failed/unreachable poll, or an older cloud that ignores ?wait=."""
+    return 0.0 if long_poll_honored else SCAN_SECONDS
+
+
+async def _bridge_tick(camera_url_fn) -> bool:
     """Every blocking call in here (the control-plane poll itself, and
     each pending signal's own MediaMTX HTTP round trip) runs via
     asyncio.to_thread() -- confirmed live against the real MediaMTX
@@ -568,16 +594,22 @@ async def _bridge_tick(camera_url_fn) -> None:
     up to MediaMTX's own ~10s sourceOnDemandStartTimeout before failing
     (see module docstring), and this worker's event loop is shared with
     every other background task in this process; a single stuck signal
-    must never stall the rest of them."""
-    response = await asyncio.to_thread(_control_plane_get, "/api/appliance/live/p2p/pending")
+    must never stall the rest of them.
+
+    Returns True when the cloud honored a long-poll (echoed
+    long_poll_seconds), so the worker can re-poll without sleeping."""
+    path, timeout = _pending_poll_request()
+    response = await asyncio.to_thread(_control_plane_get, path, timeout)
     if not isinstance(response, dict):
-        return
+        return False
+    long_poll_honored = LONG_POLL_SECONDS > 0 and bool(response.get("long_poll_seconds"))
     pending = response.get("pending")
     if not isinstance(pending, list):
-        return
+        return long_poll_honored
     for item in pending:
         if isinstance(item, dict):
             await asyncio.to_thread(_handle_pending_signal, camera_url_fn, item)
+    return long_poll_honored
 
 
 async def webrtc_publisher_worker(camera_url_fn) -> None:
@@ -598,6 +630,7 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
     last_config_refresh = 0.0
     try:
         while True:
+            long_poll_honored = False
             try:
                 _ensure_mediamtx_running()
                 now = time.monotonic()
@@ -605,7 +638,7 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
                     await asyncio.to_thread(_refresh_camera_map)
                     await asyncio.to_thread(sync_camera_paths, camera_url_fn)
                     last_config_refresh = now
-                await _bridge_tick(camera_url_fn)
+                long_poll_honored = bool(await _bridge_tick(camera_url_fn))
                 webrtc_publisher_state["last_scan_at"] = time.time()
                 webrtc_publisher_state["last_error"] = None
             except asyncio.CancelledError:
@@ -613,6 +646,8 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
             except Exception as error:
                 webrtc_publisher_state["last_error"] = str(error)
                 logger.warning("webrtc_publisher.worker_iteration_failed error=%s", error)
-            await asyncio.sleep(SCAN_SECONDS)
+            # A long-poll that the cloud actually held open already waited;
+            # yield to the loop and poll again straight away.
+            await asyncio.sleep(_delay_after_poll(long_poll_honored))
     finally:
         stop_mediamtx()
