@@ -65,13 +65,13 @@ class FakePC extends EventTarget {
     super();
     this.connectionState = 'new'; this.iceConnectionState = 'new';
     this.ontrack = null; this.oniceconnectionstatechange = null; this.onicecandidate = null;
-    this.localDescription = null; this.closed = false; this.framesDecoded = 0;
+    this.localDescription = null; this.closed = false; this.framesDecoded = 0; this.packetsReceived = 0; this.packetsLost = 0;
     window.__log.pcs.push(this);
   }
   // Decoded frames advance every 100ms once connected -- unless the test
   // sets window.__p2pNoFrames (never any) or window.__p2pFreeze (stop now).
   async getStats() {
-    return new Map([['inbound-video', {type: 'inbound-rtp', kind: 'video', framesDecoded: this.framesDecoded}]]);
+    return new Map([['inbound-video', {type: 'inbound-rtp', kind: 'video', framesDecoded: this.framesDecoded, packetsReceived: this.packetsReceived, packetsLost: this.packetsLost}]]);
   }
   addTransceiver() {}
   async createOffer() { return {type: 'offer', sdp: 'v=0 fake-offer'}; }
@@ -80,8 +80,17 @@ class FakePC extends EventTarget {
     setTimeout(() => {
       if (this.closed) return;
       this._set('connected');
+      // window.__p2pPoor: ~1 fps at 75% packet loss (the live Ryzen shape).
+      this._tick = 0;
       this._frames = setInterval(() => {
-        if (!this.closed && !window.__p2pNoFrames && !window.__p2pFreeze) this.framesDecoded += 1;
+        if (this.closed || window.__p2pNoFrames || window.__p2pFreeze) return;
+        this._tick += 1;
+        if (window.__p2pPoor) {
+          this.packetsReceived += 10; this.packetsLost += 30;
+          if (this._tick % 10 === 0) this.framesDecoded += 1;
+        } else {
+          this.packetsReceived += 10; this.framesDecoded += 1;
+        }
       }, 100);
       if (this.ontrack) this.ontrack({streams: [window.__makeFakeStream()]});
     }, window.__p2pDelayMs);
@@ -304,5 +313,42 @@ def test_p2p_that_freezes_mid_session_falls_back_to_the_relay(playwright_instanc
         page.evaluate("() => { window.__p2pFreeze = true; }")  # still 'connected', frames stop
         assert harness.wait_for(lambda: harness.log()["hlsLoads"] > loads_before), "frozen P2P must fall back to the relay"
         assert harness.outcomes[-1] == "relay"
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS, ids=[b[0] for b in BROWSERS])
+@pytest.mark.parametrize("kind", ["grid", "single"])
+def test_poor_quality_p2p_falls_back_to_the_relay(playwright_instance, pages, engine, channel, kind):
+    """The live Ryzen shape (2026-09-24): P2P connected and kept decoding a
+    trickle (1.7 fps at 72% loss) -- never frozen, but unusable."""
+    browser = _launch(playwright_instance, engine, channel)
+    try:
+        page = browser.new_page()
+        harness = Harness(page, pages[kind])
+        page.add_init_script("window.__p2pDelayMs = 300; window.liveP2PQualityWindowMs = 1000;")
+        page.goto(f"{ORIGIN}/page")
+        assert harness.wait_for(lambda: "p2p" in harness.outcomes), f"p2p never won: {harness.outcomes}"
+        loads_before = harness.log()["hlsLoads"]
+        page.evaluate("() => { window.__p2pPoor = true; }")
+        assert harness.wait_for(lambda: harness.log()["hlsLoads"] > loads_before, timeout=12.0), "poor P2P must fall back to the relay"
+        assert harness.outcomes[-1] == "relay"
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS, ids=[b[0] for b in BROWSERS])
+@pytest.mark.parametrize("kind", ["grid", "single"])
+def test_good_quality_p2p_stays_on_p2p(playwright_instance, pages, engine, channel, kind):
+    browser = _launch(playwright_instance, engine, channel)
+    try:
+        page = browser.new_page()
+        harness = Harness(page, pages[kind], playlist_has_segments=False)
+        page.add_init_script("window.__p2pDelayMs = 300; window.liveP2PQualityWindowMs = 1000;")
+        page.goto(f"{ORIGIN}/page")
+        assert harness.wait_for(lambda: "p2p" in harness.outcomes), f"p2p never won: {harness.outcomes}"
+        page.wait_for_timeout(5000)  # several quality windows at ~10 fps, 0% loss
+        assert harness.outcomes[-1] == "p2p" and "relay" not in harness.outcomes
+        assert harness.log()["hlsLoads"] == 0
     finally:
         browser.close()
