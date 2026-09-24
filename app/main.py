@@ -16617,7 +16617,10 @@ async def persist_event_recording(
             )
             if result.returncode == 0 and temp_output.exists():
                 temp_output.replace(destination)
-                duration = _probe_recording_duration_seconds(destination)
+                # Off the event loop -- same reason as
+                # _backfill_ai_event_linked_recording()'s own call: a real
+                # ffprobe waiting on the appliance-wide _ffprobe_semaphore.
+                duration = await asyncio.to_thread(_probe_recording_duration_seconds, destination)
                 log.info(
                     "event_recording.persisted camera=%s detector=%s trigger_id=%s "
                     "path=%s duration_seconds=%s",
@@ -32207,6 +32210,12 @@ def get_alert_rule(camera_number: int) -> AlertRuleModel:
 
 
 
+# No recording segment is longer than this (Continuous mode writes 5-minute
+# segments; Event mode caps a clip at its max_event_seconds safety cap), so a
+# file that starts earlier than this before an event can never cover it.
+LINKED_RECORDING_MAX_LOOKBACK_SECONDS = max(300, int(os.environ.get("ANYAICAM_LINKED_RECORDING_MAX_LOOKBACK_SECONDS", "3600")))
+
+
 def linked_recording_for(
     camera_number: int, event_time: datetime, event_end_time: datetime | None = None
 ) -> str | None:
@@ -32229,10 +32238,26 @@ def linked_recording_for(
 
     window = compute_clip_window(event_time, event_end_time or event_time)
     camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+    # Bounded scan (2026-09-24, real restart loop confirmed live on Ryzen):
+    # this loop used to ffprobe EVERY recording on the camera, newest
+    # first, until one covered event_time. When none does -- routine on an
+    # Event-mode camera, whose clip is only written after the detection --
+    # that was the camera's whole history (2,500-4,700 files, ~0.8s per
+    # probe on a loaded appliance, serialized by the single appliance-wide
+    # _ffprobe_semaphore), i.e. tens of minutes after any restart emptied
+    # the in-memory duration cache. Only a file that starts at or before
+    # event_time, and no more than LINKED_RECORDING_MAX_LOOKBACK_SECONDS
+    # before it, can cover the event, so everything else is decided from
+    # the filename timestamp alone, without a probe.
+    lookback_start = event_time - timedelta(seconds=LINKED_RECORDING_MAX_LOOKBACK_SECONDS)
     for source in sorted(camera_folder.glob("*.mkv"), reverse=True):
         source_start = recording_start(source, camera_number)
         if not source_start:
             continue
+        if source_start > event_time:
+            continue
+        if source_start < lookback_start:
+            break
         # Real ffprobe duration, not an assumed 5 minutes -- confirmed
         # live on Ryzen (2026-09-20): Event mode's own recordings
         # (persist_event_recording()'s output, 8s/18s/23s/etc., never a
@@ -32321,7 +32346,13 @@ async def _backfill_ai_event_linked_recording(camera_number: int, event_ids: lis
     # destination file before this looks for it.
     wait_seconds = max(0.0, (window.end - datetime.now()).total_seconds()) + 3.0 + 10.0
     await asyncio.sleep(wait_seconds)
-    linked_recording = linked_recording_for(camera_number, event_time, event_time)
+    # Off the event loop (2026-09-24): linked_recording_for() runs real
+    # ffprobe subprocesses behind the single appliance-wide
+    # _ffprobe_semaphore -- called directly here it froze the whole web
+    # server (every /health, API and async worker) for as long as the scan
+    # and any queue for that permit took, which is what tripped the Docker
+    # health check and the restart loop.
+    linked_recording = await asyncio.to_thread(linked_recording_for, camera_number, event_time, event_time)
     if not linked_recording:
         return
     await asyncio.to_thread(_patch_analytics_events_linked_recording, event_ids, linked_recording)
@@ -38707,6 +38738,15 @@ async def people_counting_worker(camera_number: int) -> None:
                                     detector="people_counting", trigger_id=uuid.uuid4().hex[:12],
                                 )
                             )
+                        # Resolved once per batch and off the event loop
+                        # (2026-09-24): linked_recording_for() runs real
+                        # ffprobe subprocesses -- called here, on the event
+                        # loop, for every line crossing, it froze the whole
+                        # VMS web server on a busy counting camera (the live
+                        # Ryzen restart loop).
+                        people_counting_link = (
+                            await asyncio.to_thread(linked_recording_for, camera_number, now) if events else None
+                        )
                         for event in events:
                             record = AnalyticsEventModel(
                                 camera=camera_number,
@@ -38716,7 +38756,7 @@ async def people_counting_worker(camera_number: int) -> None:
                                 direction=event.direction,
                                 confidence=1.0,  # a deterministic geometric crossing, not a probabilistic detection score
                                 thumbnail=thumbnail_url,
-                                linked_recording=linked_recording_for(camera_number, now),
+                                linked_recording=people_counting_link,
                                 mock=False,
                             ).model_dump(mode="json")
                             record["occupancy"] = counter.occupancy
