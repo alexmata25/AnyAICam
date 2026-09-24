@@ -520,6 +520,11 @@ async def test_worker_ticks_when_enabled_on_edge_role(monkeypatch):
     monkeypatch.setattr(wp, "CONFIG_REFRESH_SECONDS", 9999)
     ticks = {"value": 0}
     monkeypatch.setattr(wp, "_ensure_mediamtx_running", lambda: None)
+    # CONFIG_REFRESH_SECONDS alone does not skip the first refresh: the
+    # worker compares against time.monotonic() (time since boot), so
+    # stub the refresh itself -- no network/MediaMTX call in this test.
+    monkeypatch.setattr(wp, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(wp, "sync_camera_paths", lambda camera_url_fn: None)
 
     async def fake_bridge_tick(camera_url_fn):
         ticks["value"] += 1

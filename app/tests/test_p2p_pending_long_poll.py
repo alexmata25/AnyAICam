@@ -239,6 +239,11 @@ def _run_worker_for(seconds, monkeypatch, *, honored):
     monkeypatch.setattr(wp, "CONFIG_REFRESH_SECONDS", 9999)
     monkeypatch.setattr(wp, "_ensure_mediamtx_running", lambda: None)
     monkeypatch.setattr(wp, "stop_mediamtx", lambda: None)
+    # CONFIG_REFRESH_SECONDS alone does not skip the first refresh: the
+    # worker compares against time.monotonic() (time since boot), so
+    # stub the refresh itself -- no network/MediaMTX call in this test.
+    monkeypatch.setattr(wp, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(wp, "sync_camera_paths", lambda camera_url_fn: None)
     ticks = {"n": 0}
 
     async def fake_bridge_tick(camera_url_fn):

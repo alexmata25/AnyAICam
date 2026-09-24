@@ -49,6 +49,7 @@ already established in the other direction by live_relay_commands.json
 
 import json
 import logging
+import appliance_config_cache
 import os
 import secrets
 import shutil
@@ -163,7 +164,7 @@ def _control_plane_post(path: str, payload: dict) -> dict | None:
 
 
 def _refresh_camera_map() -> None:
-    response = _control_plane_get("/api/appliance/configuration")
+    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
     if not isinstance(response, dict):
         return
     cameras = response.get("cameras")
@@ -203,7 +204,7 @@ def _local_storage_policy() -> dict:
     cloud copy (if any) is kept."""
     from local_storage_policy import DEFAULT_RESERVED_FREE_PERCENT, DEFAULT_WARNING_FREE_PERCENT, DEFAULT_LOCAL_RETENTION_DAYS
 
-    response = _control_plane_get("/api/appliance/configuration")
+    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
     policy = response.get("storage_policy") if isinstance(response, dict) else None
     if not isinstance(policy, dict):
         return {

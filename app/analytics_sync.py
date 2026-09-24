@@ -54,6 +54,7 @@ marked synced, retried next scan).
 import asyncio
 import json
 import logging
+import appliance_config_cache
 import os
 import secrets
 import threading
@@ -301,7 +302,7 @@ def _refresh_camera_map() -> None:
     failed/unreachable poll just leaves the previous mapping in place,
     so a transient network blip never stops already-known cameras'
     events from continuing to sync."""
-    response = _control_plane_get("/api/appliance/configuration")
+    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
     if not isinstance(response, dict):
         return
     cameras = response.get("cameras")
