@@ -114463,91 +114463,49 @@ async def stripe_webhook(request: Request) -> dict:
     # on the first delivery had no real trigger that could ever retry it,
     # since Stripe only redelivers an event it has already seen, and that
     # redelivery hit this exact gate every time.
+    # Retry safety (2026-09-24). Previously the event was recorded as
+    # processed BEFORE the provisioning steps ran, each step's exception was
+    # logged and swallowed, and 200 was always returned -- so a transient
+    # failure (e.g. the entitlement sync) was never retried by Stripe and
+    # the customer's purchase was silently never provisioned. Now each step
+    # is tracked per event in stripe_webhook_steps: only steps not yet
+    # 'completed' run, and any failure (or a step still running in another
+    # worker) returns a retryable 503 so Stripe redelivers; the retry runs
+    # only what is left. The legacy JSON event log is still written.
+    event_id = str(event.get("id") or "")
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Webhook event has no id.")
     is_new_event = record_stripe_webhook_event(event)
+    if not is_new_event and not _stripe_webhook_has_step_rows(event_id):
+        # Recorded by the handler that predates per-step tracking, which
+        # always ran every step on first delivery -- keep treating a
+        # redelivery (e.g. a manual resend) as already processed.
+        return {"status": "complete", "duplicate": True}
 
-    if is_new_event:
-        process_stripe_webhook_event(event)
-
-        # Provisioning Phase 2: additive authoritative-entitlement sync,
-        # on its own DB-backed idempotency (provisioning_webhook_events) --
-        # never the legacy record_stripe_webhook_event()/billing_accounts.
-        # json path above, which is untouched. Wrapped so a failure here
-        # can never break the 200 response Stripe needs to stop retrying,
-        # nor prevent the legacy processing above from having already run.
-        # Only ever runs for a genuinely NEW event id -- see is_new_event
-        # above -- so a redelivered event can never re-process/duplicate
-        # an entitlement.
+    outcomes: dict[str, str] = {}
+    for step_name, run_step in _stripe_webhook_steps():
+        claim = _claim_stripe_webhook_step(event_id, step_name)
+        if claim != "claimed":
+            outcomes[step_name] = claim
+            continue
         try:
-            from customer_entitlements import sync_entitlement_from_stripe_event
-            sync_entitlement_from_stripe_event(event)
-        except Exception:
+            run_step(event)
+        except Exception as error:
+            _finish_stripe_webhook_step(event_id, step_name, "failed", error=str(error)[:500])
+            outcomes[step_name] = "failed"
             structured_log(
-                "provisioning.entitlement_sync_failed",
+                "provisioning.webhook_step_failed",
                 level="error",
-                event_id=event.get("id"),
+                event_id=event_id,
                 event_type=event.get("type"),
+                step=step_name,
             )
+            continue
+        _finish_stripe_webhook_step(event_id, step_name, "completed")
+        outcomes[step_name] = "completed"
 
-        # Provisioning Phase 5: additive one-time HARDWARE order sync, fully
-        # independent of the entitlement sync directly above -- see hardware_
-        # orders.py's module docstring for the fail-closed separation
-        # contract (a hardware Price ID is never in PRICE_ID_CAMERA_SLOT_MAP,
-        # a camera-slot Price ID is never in HARDWARE_PRICE_MAP, so neither
-        # sync can ever act on the other's event). Wrapped the same way, for
-        # the same reason: never break the 200 response Stripe needs, never
-        # block the entitlement sync above from having already run. Also
-        # only ever runs for a genuinely new event id, for the same reason --
-        # a redelivered event can never create a duplicate hardware order.
-        try:
-            from hardware_orders import sync_hardware_order_from_stripe_event
-            sync_hardware_order_from_stripe_event(event)
-        except Exception:
-            structured_log(
-                "provisioning.hardware_order_sync_failed",
-                level="error",
-                event_id=event.get("id"),
-                event_type=event.get("type"),
-            )
-
-        # Stripe TEST analytics wiring: additive analytics-add-on sync,
-        # fully independent of both syncs above -- see analytics_
-        # entitlements.py's module docstring for the fail-closed
-        # separation (an analytics Price ID is never in PRICE_ID_CAMERA_
-        # SLOT_MAP or HARDWARE_PRICE_MAP, and a camera-slot/hardware Price
-        # ID is never in ANALYTICS_PRICE_MAP, so none of the three syncs
-        # can ever act on another's event). Wrapped the same way, for the
-        # same reason: never break the 200 response Stripe needs, never
-        # block the syncs above from having already run. Also only ever
-        # runs for a genuinely new event id -- a redelivered event can
-        # never double-grant or double-revoke an analytics entitlement.
-        try:
-            from analytics_entitlements import sync_analytics_from_stripe_event
-            sync_analytics_from_stripe_event(event)
-        except Exception:
-            structured_log(
-                "provisioning.analytics_sync_failed",
-                level="error",
-                event_id=event.get("id"),
-                event_type=event.get("type"),
-            )
-
-    # Provisioning Phase 6/7: customer-facing post-purchase email. Runs on
-    # EVERY delivery of this event -- fresh (is_new_event True) or a
-    # genuine Stripe redelivery (is_new_event False) -- never gated behind
-    # is_new_event, unlike the entitlement/hardware syncs above. This is
-    # deliberate and safe, not a weakening of Stripe-event idempotency:
-    # notify_from_stripe_event() is independently idempotent per (event_
-    # id, notification_type) via its own provisioning_notifications table
-    # (see purchase_notifications.py's module docstring) -- a notification
-    # already marked 'sent' is skipped every time, so a fresh event and
-    # every later redelivery of it converge on sending at most one email.
-    # What redelivery now enables that it couldn't before this fix: a
-    # notification still marked 'failed' from an earlier delivery gets a
-    # real retry, because this call is no longer unreachable behind the
-    # duplicate-event gate. An email failure here still can never roll
-    # back or block the entitlement/order commit above (which, on a
-    # redelivery, already happened during a PRIOR delivery -- nothing to
-    # roll back on this one), nor the 200 response Stripe needs.
+    # Best-effort and already idempotent per (event, notification type) --
+    # never the reason Stripe retries.
     try:
         from purchase_notifications import notify_from_stripe_event
         notify_from_stripe_event(event)
@@ -114555,138 +114513,96 @@ async def stripe_webhook(request: Request) -> dict:
         structured_log(
             "provisioning.purchase_notification_failed",
             level="error",
-            event_id=event.get("id"),
+            event_id=event_id,
             event_type=event.get("type"),
         )
 
-    if not is_new_event:
-        return {
-            "status": "complete",
-            "duplicate": True,
-        }
-
-
-
-
-
-
-
-
+    incomplete = sorted(name for name, outcome in outcomes.items() if outcome in {"failed", "busy"})
+    if incomplete:
+        raise HTTPException(
+            status_code=503,
+            detail="Provisioning is not complete yet (" + ", ".join(incomplete) + "); Stripe will retry this event.",
+        )
+    if all(outcome == "already_completed" for outcome in outcomes.values()):
+        return {"status": "complete", "duplicate": True}
     structured_log(
-
-
-
-
-
-
-
-
         "stripe.webhook_processed",
-
-
-
-
-
-
-
-
-        event_id=event.get("id"),
-
-
-
-
-
-
-
-
+        event_id=event_id,
         event_type=event.get("type"),
-
-
-
-
-
-
-
-
         livemode=bool(event.get("livemode")),
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
     return {
-
-
-
-
-
-
-
-
         "status": "complete",
-
-
-
-
-
-
-
-
-        "event_id": event.get("id"),
-
-
-
-
-
-
-
-
+        "event_id": event_id,
         "event_type": event.get("type"),
-
-
-
-
-
-
-
-
     }
 
 
+# A step left 'running' longer than this (its worker crashed or was
+# restarted mid-step) may be claimed again by a redelivery.
+STRIPE_WEBHOOK_STEP_STALE_SECONDS = 300
 
 
+def _stripe_webhook_steps() -> list:
+    """(name, callable) for every provisioning step a Stripe event drives,
+    in order. Each callable is resolved at call time (tests patch them)."""
+    def entitlements(event):
+        from customer_entitlements import sync_entitlement_from_stripe_event
+        sync_entitlement_from_stripe_event(event)
+
+    def hardware(event):
+        from hardware_orders import sync_hardware_order_from_stripe_event
+        sync_hardware_order_from_stripe_event(event)
+
+    def analytics(event):
+        from analytics_entitlements import sync_analytics_from_stripe_event
+        sync_analytics_from_stripe_event(event)
+
+    return [
+        ("legacy_billing", process_stripe_webhook_event),
+        ("camera_slot_entitlements", entitlements),
+        ("hardware_orders", hardware),
+        ("analytics_entitlements", analytics),
+    ]
 
 
+def _stripe_webhook_has_step_rows(event_id: str) -> bool:
+    from partner_db import connection
+    with connection() as db:
+        return db.execute("SELECT 1 FROM stripe_webhook_steps WHERE event_id=? LIMIT 1", (event_id,)).fetchone() is not None
 
 
+def _claim_stripe_webhook_step(event_id: str, step: str) -> str:
+    """'claimed' -- this delivery runs the step (new, previously failed, or
+    stale); 'already_completed'; or 'busy' -- another delivery is running
+    it right now. Atomic via the (event_id, step) primary key."""
+    from partner_db import connection
+    now = datetime.now()
+    stale_before = (now - timedelta(seconds=STRIPE_WEBHOOK_STEP_STALE_SECONDS)).isoformat()
+    with connection() as db:
+        claimed = db.execute(
+            "INSERT INTO stripe_webhook_steps(event_id,step,status,attempts,updated_at) VALUES(?,?,'running',1,?) "
+            "ON CONFLICT(event_id,step) DO UPDATE SET status='running',attempts=stripe_webhook_steps.attempts+1,"
+            "last_error=NULL,updated_at=excluded.updated_at "
+            "WHERE stripe_webhook_steps.status='failed' "
+            "OR (stripe_webhook_steps.status='running' AND stripe_webhook_steps.updated_at<?)",
+            (event_id, step, now.isoformat(), stale_before),
+        ).rowcount
+        if claimed:
+            return "claimed"
+        existing = db.execute(
+            "SELECT status FROM stripe_webhook_steps WHERE event_id=? AND step=?", (event_id, step),
+        ).fetchone()
+    return "already_completed" if existing and existing["status"] == "completed" else "busy"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def _finish_stripe_webhook_step(event_id: str, step: str, status: str, *, error: str | None = None) -> None:
+    from partner_db import connection
+    with connection() as db:
+        db.execute(
+            "UPDATE stripe_webhook_steps SET status=?,last_error=?,updated_at=? WHERE event_id=? AND step=?",
+            (status, error, datetime.now().isoformat(), event_id, step),
+        )
 
 
 @app.get("/payment-setup", response_class=HTMLResponse)
