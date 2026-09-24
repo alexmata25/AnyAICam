@@ -427,15 +427,110 @@ def test_camera_tenant_context_resolves_by_appliance_camera_number(db_path):
     _seed_tenant(db_path, "cust-1", camera_id="cam-1", camera_number=7)
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            context = aac_voice_call._camera_tenant_context(db, 7)
+            context = aac_voice_call._camera_tenant_context(db, 7, "app-cust-1")
     assert context is not None
     assert context["id"] == "cam-1"
     assert context["customer_id"] == "cust-1"
 
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
-            missing = aac_voice_call._camera_tenant_context(db, 999)
+            missing = aac_voice_call._camera_tenant_context(db, 999, "app-cust-1")
     assert missing is None
+
+
+def test_same_camera_number_on_two_appliances_resolves_only_to_each_appliances_own_camera(db_path):
+    """camera_number is only unique per appliance: Camera 1 on one
+    appliance must never resolve to Camera 1 on another."""
+    _seed_tenant(db_path, "cust-1", camera_id="cam-1", camera_number=1)
+    _seed_tenant(db_path, "cust-2", camera_id="cam-2", camera_number=1)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            first = aac_voice_call._camera_tenant_context(db, 1, "app-cust-1")
+            second = aac_voice_call._camera_tenant_context(db, 1, "app-cust-2")
+    assert (first["id"], first["customer_id"]) == ("cam-1", "cust-1")
+    assert (second["id"], second["customer_id"]) == ("cam-2", "cust-2")
+
+
+def test_camera_tenant_context_without_appliance_identity_resolves_no_camera(db_path):
+    _seed_tenant(db_path, "cust-1", camera_id="cam-1", camera_number=1)
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            assert aac_voice_call._camera_tenant_context(db, 1, None) is None
+            assert aac_voice_call._camera_tenant_context(db, 1, "") is None
+            assert aac_voice_call._camera_tenant_context(db, 1, "app-unknown") is None
+
+
+def test_ambiguous_camera_number_on_one_appliance_is_logged_and_resolves_no_camera(db_path, caplog):
+    _seed_tenant(db_path, "cust-1", camera_id="cam-1", camera_number=1)
+    # idx_cameras_appliance_camera_number normally makes this state
+    # impossible; dropped here to simulate a database that never got it,
+    # which is exactly the case the lookup's own guard exists for.
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP INDEX idx_cameras_appliance_camera_number")
+    conn.execute(
+        "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,camera_number,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        ("cam-dup", "cust-1", "site-cust-1", "app-cust-1", "Duplicate", "configured", 1, NOW),
+    )
+    conn.commit()
+    conn.close()
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            with caplog.at_level("WARNING", logger="anyaicam.aac_voice_call"):
+                context = aac_voice_call._camera_tenant_context(db, 1, "app-cust-1")
+    assert context is None
+    assert "ambiguous_camera_number" in caplog.text
+
+
+def _persist_identity(monkeypatch, tmp_path, appliance_id, customer_id):
+    import json
+
+    import appliance_activation
+
+    identity_file = tmp_path / "appliance_identity.json"
+    identity_file.write_text(json.dumps({
+        "appliance_id": appliance_id, "cloud_id": f"cloud-{customer_id}", "credential": "test-credential",
+        "customer_id": customer_id, "site_id": f"site-{customer_id}", "partner_id": "partner-1",
+        "activated_at": NOW, "activation_version": 1,
+    }), encoding="utf-8")
+    monkeypatch.setattr(appliance_activation, "ACTIVATION_IDENTITY_FILE", identity_file)
+
+
+def test_detection_path_greets_only_the_detecting_appliances_own_camera(db_path, tmp_path, monkeypatch, _isolated_greeting):
+    """The main.py hook's own resolution chain -- persisted appliance
+    identity -> appliance-scoped camera_number -> handle_person_detected()
+    -- with another appliance's entrance camera sharing the same
+    camera_number in the same local database."""
+    from appliance_activation import active_appliance_id
+
+    _seed_tenant(db_path, "cust-1", camera_id="cam-1", camera_number=1)
+    _seed_tenant(db_path, "cust-2", camera_id="cam-2", camera_number=1, owner_email="owner2@example.test")
+    _persist_identity(monkeypatch, tmp_path, "app-cust-2", "cust-2")
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            context = aac_voice_call._camera_tenant_context(db, 1, active_appliance_id())
+        result = aac_voice_call.handle_person_detected(customer_id=context["customer_id"], camera_id=context["id"])
+        events = sqlite3.connect(db_path).execute("SELECT customer_id,camera_id FROM aac_voice_call_events").fetchall()
+    assert result["triggered"] is True
+    assert events == [("cust-2", "cam-2")]
+    assert [call.camera_id for call in _isolated_greeting.calls] == ["cam-2"]
+
+
+def test_detection_path_without_persisted_identity_resolves_no_camera(db_path, tmp_path, monkeypatch):
+    import appliance_activation
+
+    _seed_tenant(db_path, "cust-1", camera_id="cam-1", camera_number=1)
+    monkeypatch.setattr(appliance_activation, "ACTIVATION_IDENTITY_FILE", tmp_path / "missing_identity.json")
+    assert appliance_activation.active_appliance_id() is None
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            assert aac_voice_call._camera_tenant_context(db, 1, appliance_activation.active_appliance_id()) is None
+
+
+def test_main_detection_hook_scopes_voice_call_to_the_persisted_appliance_identity():
+    from pathlib import Path
+
+    main_source = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+    assert "aac_voice_call._camera_tenant_context(vc_db, camera_number, active_appliance_id())" in main_source
 
 
 # --------------------------------------------------------- existing flows still work

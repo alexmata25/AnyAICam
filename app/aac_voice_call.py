@@ -78,6 +78,7 @@ piece (actual text-to-speech synthesis and camera-speaker delivery).
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Callable
 
@@ -92,6 +93,8 @@ from aac_voice_call_intent import DeterministicVisitorIntentClassifier, NaturalL
 from notification_engine import fanout_appliance_event
 from partner_db import row, rows
 from partner_portal import partner_identity
+
+logger = logging.getLogger("anyaicam.aac_voice_call")
 
 # 2026-09-23 proactive flow: how long one camera stays in its own
 # debounce/cooldown window after a real trigger before it is willing to
@@ -134,7 +137,7 @@ def _authorized_site(customer_id: str, site_id: str) -> dict:
     return site
 
 
-def _camera_tenant_context(db, camera_number: int) -> dict | None:
+def _camera_tenant_context(db, camera_number: int, appliance_id: str | None) -> dict | None:
     """Resolves an appliance-local camera_number to this feature's own
     tenant-scoped identity (id/customer_id/site_id/name) -- a small,
     deliberately-local duplicate of facial_events.py's own private
@@ -145,12 +148,27 @@ def _camera_tenant_context(db, camera_number: int) -> dict | None:
     _camera_tenant_context() being separate, not-shared lookups despite
     doing a similar thing. Returns None for an unknown camera_number --
     never raises, since this is called from a non-request background
-    detection context (main.py's detection loop), not an HTTP route."""
-    record = db.execute(
-        "SELECT id,customer_id,site_id,name FROM cameras WHERE camera_number=?",
-        (camera_number,),
-    ).fetchone()
-    return dict(record) if record else None
+    detection context (main.py's detection loop), not an HTTP route.
+
+    camera_number is only unique per appliance, so the lookup is scoped
+    to this appliance's own cameras (appliance_activation.active_
+    appliance_id()). No appliance identity, or more than one row for
+    the same appliance + camera_number, resolves no camera (logged for
+    the ambiguous case) rather than greeting/notifying an arbitrary
+    tenant's camera."""
+    if not appliance_id:
+        return None
+    matches = db.execute(
+        "SELECT id,customer_id,site_id,name FROM cameras WHERE camera_number=? AND appliance_id=?",
+        (camera_number, appliance_id),
+    ).fetchall()
+    if len(matches) > 1:
+        logger.warning(
+            "aac_voice_call.ambiguous_camera_number appliance_id=%s camera_number=%s matches=%s -- resolving no camera",
+            appliance_id, camera_number, len(matches),
+        )
+        return None
+    return dict(matches[0]) if matches else None
 
 
 def _visitor_message(intent: str, camera_name: str) -> str:
