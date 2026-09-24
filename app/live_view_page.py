@@ -93,7 +93,7 @@ _P2P_JS = """
 
     const pc = new RTCPeerConnection({iceServers: config.ice_servers || []});
     let settled = false;
-    const timeoutMs = config.timeout_ms || 4000;
+    const timeoutMs = config.timeout_ms || 15000;
     const failClosed = () => { try { pc.close(); } catch (e) {} };
 
     const resultPromise = new Promise((resolve, reject) => {
@@ -174,6 +174,38 @@ _P2P_JS = """
     } finally {
       clearInterval(pollTimer);
     }
+  };
+
+  // Watches an ESTABLISHED P2P connection (attemptLiveP2P() above only
+  // watches negotiation). Calls onLost() once if the connection fails or
+  // closes, or stays 'disconnected' for more than 5s (ICE frequently
+  // recovers from a brief 'disconnected' by itself) -- the page then falls
+  // back to the relay, so a P2P viewer is never left on a frozen frame.
+  // Returns a function that stops watching.
+  window.watchLiveP2P = function(pc, onLost){
+    let lost = false, timer = null;
+    const state = () => pc.connectionState || pc.iceConnectionState;
+    const lose = () => {
+      if (lost) return;
+      lost = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      try { pc.close(); } catch (e) {}
+      onLost();
+    };
+    const check = () => {
+      if (lost) return;
+      const current = state();
+      if (current === 'failed' || current === 'closed') { lose(); return; }
+      if (current === 'disconnected') {
+        if (!timer) timer = setTimeout(() => {
+          timer = null;
+          if (['disconnected', 'failed', 'closed'].includes(state())) lose();
+        }, 5000);
+      } else if (timer) { clearTimeout(timer); timer = null; }
+    };
+    pc.addEventListener('connectionstatechange', check);
+    pc.addEventListener('iceconnectionstatechange', check);
+    return () => { lost = true; if (timer) { clearTimeout(timer); timer = null; } };
   };
 
   window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
@@ -861,10 +893,20 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   // itself down, never displace the winner). See live_view_p2p.py's
   // module docstring for why the relay path must never be delayed or
   // displaced once it has already won.
+  // P2P UPGRADE (2026-09-24): relay (or the WireGuard gateway) usually
+  // wins the first-frame race because the appliance's WebRTC answer takes
+  // ~2-7s; a P2P connection that completes afterwards used to be thrown
+  // away. Now P2P may take over a tile relay/WireGuard already claimed
+  // ('upgrade'): the HLS player is torn down, so the relay playlist stops
+  // being fetched and the cloud stops the relay upload shortly after (see
+  // live_relay_idle_sweep.py). Nothing else ever displaces a winner.
   function claimTransport(id,transport){{
     const tile=tiles[id];
     if(tile.transport===transport)return'already';
-    if(tile.transport)return'blocked';
+    if(tile.transport){{
+      if(transport==='p2p'&&(tile.transport==='relay'||tile.transport==='wireguard')){{tile.transport='p2p';return'upgrade'}}
+      return'blocked';
+    }}
     tile.transport=transport;
     return'claimed';
   }}
@@ -969,11 +1011,29 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       const claim=claimTransport(id,'p2p');
       if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
       stopPolling(id);
+      if(claim==='upgrade'){{
+        // Stop the relay player (hls.js) or native HLS source so the relay
+        // playlist is no longer fetched, then switch this tile to P2P.
+        destroyHls(id);
+        tile.video.removeAttribute('src');
+        try{{tile.video.load()}}catch(e){{}}
+      }}
       tile.video.addEventListener('playing',()=>{{tile.placeholder.hidden=true}},{{once:true}});
       tile.video.srcObject=result.stream;
       tile.p2pConnection=result.pc;
       tile.video.play().catch(()=>{{}});
-      if(claim==='claimed')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
+      if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(tile.sessionId,'p2p',result.connect_ms,null);
+      window.watchLiveP2P(result.pc,()=>{{
+        // P2P dropped mid-view: fall back to the relay (the playlist fetch
+        // itself asks the cloud to resume the relay if it was stopped).
+        if(tile.stopped||tile.p2pConnection!==result.pc)return;
+        tile.p2pConnection=null;
+        tile.video.srcObject=null;
+        tile.transport=null;
+        tile.placeholder.hidden=false;
+        setStatus(id,'Reconnecting…');
+        pollPlaylist(id,Date.now()+pollTimeoutMs);
+      }});
     }}).catch(()=>{{
       // Disabled/timed out/ICE failed -- the relay poll is already running
       // in parallel and unaffected; this tile simply resolves via relay
@@ -1361,9 +1421,14 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   // module docstring): 'claimed' the first time a transport wins (report
   // once), 'already' on that transport's own later reconnect, 'blocked'
   // for the transport that lost the race.
+  // P2P UPGRADE: same rule as the grid page's claimTransport() -- P2P may
+  // take over from relay/WireGuard; nothing else displaces a winner.
   function claimTransport(t){{
     if(transport===t)return'already';
-    if(transport)return'blocked';
+    if(transport){{
+      if(t==='p2p'&&(transport==='relay'||transport==='wireguard')){{transport='p2p';return'upgrade'}}
+      return'blocked';
+    }}
     transport=t;
     return'claimed';
   }}
@@ -1472,11 +1537,25 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       const claim=claimTransport('p2p');
       if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
       stopPolling();
+      if(claim==='upgrade'){{
+        destroyHls();
+        video.removeAttribute('src');
+        try{{video.load()}}catch(e){{}}
+      }}
       video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
       video.srcObject=result.stream;
       p2pConnection=result.pc;
       video.play().catch(()=>{{}});
-      if(claim==='claimed')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
+      if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
+      window.watchLiveP2P(result.pc,()=>{{
+        if(stopped||p2pConnection!==result.pc)return;
+        p2pConnection=null;
+        video.srcObject=null;
+        transport=null;
+        placeholder.hidden=false;
+        setStatus('Reconnecting…');
+        pollPlaylist(Date.now()+pollTimeoutMs);
+      }});
     }}).catch(()=>{{
       // Disabled/timed out/ICE failed -- the relay poll already running in
       // parallel is unaffected; resolves via relay or showUnavailable().

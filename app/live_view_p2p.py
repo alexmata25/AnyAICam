@@ -50,12 +50,14 @@ from partner_portal import partner_identity
 LIVE_P2P_ENABLED = os.environ.get("ANYAICAM_LIVE_P2P_ENABLED", "false").strip().lower() == "true"
 
 # Bounded, browser-side negotiation window (see live_view_page.py's
-# wireP2PAttempt()) -- how long a viewer waits for a direct connection
-# before falling back to the relay. Kept short: the relay path already
-# starts its own playlist polling in parallel, so a long P2P timeout would
-# only ever delay first video for viewers who were going to fall back
-# anyway.
-P2P_NEGOTIATION_TIMEOUT_MS = int(os.environ.get("ANYAICAM_LIVE_P2P_TIMEOUT_MS", "4000"))
+# attemptLiveP2P()) -- how long the browser keeps trying to establish a
+# direct connection. 15s (was 4s, 2026-09-24): the relay starts in
+# parallel and usually shows video first, and the page now UPGRADES a
+# relay-playing tile to P2P when P2P connects (see claimTransport()), so a
+# longer window never delays first video -- it only gives P2P time to win.
+# Measured on staging: median offer->answer 2.4s, p90 7.1s, i.e. most P2P
+# attempts that were abandoned at 4s would have connected.
+P2P_NEGOTIATION_TIMEOUT_MS = int(os.environ.get("ANYAICAM_LIVE_P2P_TIMEOUT_MS", "15000"))
 
 _DEFAULT_STUN_SERVERS = "stun:stun.l.google.com:19302,stun:stun.cloudflare.com:3478"
 

@@ -16037,6 +16037,24 @@ def camera_url(camera_number: int) -> str:
 
 
 
+# Live-view bitrate cap (2026-09-24). This encode had no rate limit (CRF
+# 23 only), so busy scenes produced 6-18 Mbps segments -- measured on
+# Ryzen at 1.5-3.5 MB per 2s segment on average, up to ~8 MB -- and every
+# relayed byte is CloudFront/S3 cost plus customer upload bandwidth.
+# A VBV cap (-maxrate/-bufsize) keeps CRF quality whenever the scene fits
+# under it and only limits bursts; resolution is deliberately NOT changed,
+# because the motion detector, motion thumbnails and AI detection
+# (facial recognition, LPR, PPE crops) read frames from these same HLS
+# segments. 0 disables the cap (the previous behavior).
+LIVE_MAX_BITRATE_KBPS = max(0, int(os.environ.get("ANYAICAM_LIVE_MAX_BITRATE_KBPS", "4000") or 0))
+
+
+def live_bitrate_cap_args() -> list[str]:
+    if LIVE_MAX_BITRATE_KBPS <= 0:
+        return []
+    return ["-maxrate", f"{LIVE_MAX_BITRATE_KBPS}k", "-bufsize", f"{LIVE_MAX_BITRATE_KBPS * 2}k"]
+
+
 def start_live_stream(camera_number: int) -> subprocess.Popen:
 
 
@@ -16084,6 +16102,7 @@ def start_live_stream(camera_number: int) -> subprocess.Popen:
 
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
         "-g", "56", "-keyint_min", "28", "-sc_threshold", "0",
+        *live_bitrate_cap_args(),
         "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "48000",
         "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
