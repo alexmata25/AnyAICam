@@ -65,4 +65,63 @@ def test_malformed_detections_are_ignored():
 def test_the_ai_detector_skips_stationary_repeats_and_remembers_what_it_reported():
     source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
     assert "and not stationary_repeat" in source
-    assert "ai_last_reported_signature[camera_number] = detection_signature" in source
+    assert "ai_stationary_memory.remember(camera_number, detection_signature, now_monotonic)" in source
+    assert "ai_stationary_memory.is_repeat(" in source
+
+
+def _frame(*boxes):
+    return so.signature([{"class_name": c, "x": x, "y": y, "width": w, "height": h} for c, x, y, w, h in boxes])
+
+
+# Camera 3, 20:45:37 -> 20:49:11 UTC on the live Ryzen after the first fix:
+# the same parked cars every time, plus low-confidence boxes flickering in
+# and out (the truck at ~1560,61 and a small car at ~2110,248). Comparing
+# against only the last reported frame fired an event at every one of these.
+CAM3 = [
+    _frame(("car", 1185, 344, 1072, 608), ("car", 2116, 223, 442, 206), ("car", 596, 62, 127, 96), ("car", 2380, 143, 178, 96), ("truck", 1109, 37, 319, 153)),
+    _frame(("car", 1184, 345, 1068, 607), ("car", 2117, 223, 441, 205), ("car", 592, 55, 130, 102), ("truck", 1107, 40, 318, 148), ("truck", 1562, 61, 267, 148)),
+    _frame(("car", 1185, 343, 1071, 611), ("car", 2120, 223, 438, 207), ("car", 598, 65, 128, 94), ("car", 2110, 248, 149, 109), ("truck", 1108, 40, 321, 149)),
+    _frame(("car", 1185, 344, 1069, 610), ("car", 2114, 222, 444, 208), ("car", 595, 62, 128, 95), ("truck", 1108, 40, 323, 150), ("truck", 1560, 64, 275, 144)),
+    _frame(("car", 1185, 344, 1072, 608), ("car", 2116, 223, 442, 206), ("car", 2380, 143, 178, 96), ("truck", 1109, 37, 319, 153)),
+]
+
+
+def _replay(memory, frames, start=0.0, step=70.0):
+    reported = []
+    for i, frame in enumerate(frames):
+        now = start + i * step
+        if not memory.is_repeat(3, frame, now):
+            memory.remember(3, frame, now)
+            reported.append(i)
+    return reported
+
+
+def test_flickering_boxes_around_parked_cars_stop_re_firing():
+    reported = _replay(so.StationaryMemory(rearm_seconds=1800), CAM3)
+    # frame 0 (first sight), frame 1 (the 1560,61 truck first appears) and
+    # frame 2 (the 2110,248 car first appears); frames 3-4 only contain
+    # boxes already seen -> no more events.
+    assert reported == [0, 1, 2]
+
+
+def test_the_memory_still_reports_a_genuinely_new_arrival():
+    memory = so.StationaryMemory(rearm_seconds=1800)
+    _replay(memory, CAM3)
+    arrival = CAM3[0] + _frame(("car", 300, 700, 400, 250))
+    assert not memory.is_repeat(3, arrival, 400.0)
+
+
+def test_memory_entries_rearm_after_the_window_and_zero_disables():
+    memory = so.StationaryMemory(rearm_seconds=100)
+    memory.remember(3, CAM3[0], 0.0)
+    assert memory.is_repeat(3, CAM3[0], 50.0)
+    assert not memory.is_repeat(3, CAM3[0], 150.0)
+    off = so.StationaryMemory(rearm_seconds=0)
+    off.remember(3, CAM3[0], 0.0)
+    assert not off.is_repeat(3, CAM3[0], 1.0)
+
+
+def test_memory_is_per_camera():
+    memory = so.StationaryMemory(rearm_seconds=1800)
+    memory.remember(3, CAM3[0], 0.0)
+    assert not memory.is_repeat(2, CAM3[0], 10.0)
