@@ -38245,6 +38245,17 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # aac_voice_call_events.is_entrance_camera() gate every other
         # trigger path (the simulate-person-detected route, and any
         # future one) already goes through.
+        #
+        # Cloud/edge split (2026-09-24): when this edge's Voice Call
+        # sessions are owned by the cloud (Hybrid edge), only the local
+        # half runs here -- greet locally, then queue the trigger as an
+        # analytics event that analytics_sync.py delivers (and retries
+        # through an outage) to the cloud, which creates the one
+        # authoritative session. request_prompt_scan() just wakes that
+        # worker early so the homeowner isn't waiting a full scan
+        # interval. Otherwise (combined role, or Local mode with no
+        # cloud) this process is itself the coordinator and runs the
+        # full flow locally, unchanged.
         if class_name == "person":
             try:
                 from appliance_activation import active_appliance_id
@@ -38252,7 +38263,20 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
                 with aac_voice_call_connect() as vc_db:
                     vc_context = aac_voice_call._camera_tenant_context(vc_db, camera_number, active_appliance_id())
-                if vc_context:
+                if vc_context and aac_voice_call.cloud_coordinates_voice_calls():
+
+                    def _queue_voice_call_for_cloud(voice_call_event: dict) -> None:
+                        append_analytics_event(voice_call_event)
+                        analytics_sync.request_prompt_scan()
+
+                    aac_voice_call.handle_edge_person_detected(
+                        customer_id=vc_context["customer_id"],
+                        camera_id=vc_context["id"],
+                        camera_number=camera_number,
+                        confidence=max((float(item.get("confidence") or 0.0) for item in class_detections), default=None),
+                        forward_event=_queue_voice_call_for_cloud,
+                    )
+                elif vc_context:
                     aac_voice_call.handle_person_detected(
                         customer_id=vc_context["customer_id"],
                         camera_id=vc_context["id"],

@@ -75,11 +75,25 @@ window's own real, natural-language-classified continue-vs-escalate
 step -- see both functions' own docstrings, and aac_voice_call_
 greeting.py's module docstring for the one honestly-still-not-real
 piece (actual text-to-speech synthesis and camera-speaker delivery).
+
+CLOUD/EDGE SPLIT (2026-09-24): in a split deployment the cloud owns the
+one authoritative, homeowner-facing Voice Call session, and the edge
+only does what must happen locally. handle_edge_person_detected() is
+the edge half: entrance-camera check (config synced down from the cloud
+by edge_camera_sync.py), local cooldown, local greeting, then the
+trigger is queued to the cloud through the existing analytics-sync
+channel (durable, retried after an outage) -- it never creates a local
+aac_voice_call_events row, notification, or listening window.
+ingest_edge_visitor_event() is the cloud half, called by appliance_
+cloud.py's analytics-event route. handle_person_detected() remains the
+path for a process that is itself the coordinator (combined role, or an
+edge with no cloud sync, i.e. Local mode) and for the simulate route.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -110,6 +124,20 @@ DEFAULT_GREETING_COOLDOWN_SECONDS = 300.0
 # confidently -- a real conversation should not loop forever with
 # neither side reaching a resolution.
 MAX_UTTERANCES_BEFORE_ESCALATION = 3
+
+# The analytics-event type an edge Voice Call trigger travels to the
+# cloud as (analytics_sync.py -> POST /api/appliance/analytics/{camera_id}
+# /events -> ingest_edge_visitor_event()).
+EDGE_EVENT_TYPE = "aac_voice_call"
+
+# An edge trigger that reaches the cloud later than this (the edge was
+# offline and its queued event was only delivered once connectivity came
+# back) is recorded as a missed visitor: the homeowner still learns
+# someone came by, but is never told "someone is at your door" about a
+# visitor who left long ago, and no listening window is opened for a
+# conversation that can no longer happen. Same length as the greeting
+# cooldown, i.e. roughly one visit.
+STALE_EDGE_TRIGGER_SECONDS = 300.0
 
 
 def _customer_identity(request: Request) -> dict:
@@ -348,6 +376,192 @@ def handle_person_detected(
         "triggered": True,
         "event_id": event_id,
         "greeting_text": greeting_text,
+        "notifications_created": notifications_created,
+        "notification_id": notification_id,
+    }
+
+
+def cloud_coordinates_voice_calls() -> bool:
+    """True when this process is an edge appliance whose Voice Call
+    sessions are owned by the cloud: RUNTIME_ROLE=edge with analytics
+    sync to the cloud enabled (Hybrid). False for a combined process (it
+    is its own cloud) and for an edge with no cloud sync (Local mode),
+    where this process's own local portal is the coordinator and
+    handle_person_detected() runs the whole flow locally."""
+    import analytics_sync
+
+    return analytics_sync.RUNTIME_ROLE == "edge" and bool(analytics_sync.ANALYTICS_SYNC_ENABLED)
+
+
+def handle_edge_person_detected(
+    *,
+    customer_id: str,
+    camera_id: str,
+    camera_number: int,
+    forward_event: Callable[[dict], None],
+    confidence: float | None = None,
+    cooldown_seconds: float = DEFAULT_GREETING_COOLDOWN_SECONDS,
+    greeting_provider: object | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Edge half of the cloud/edge split (see this module's docstring):
+    everything that must happen locally for a person at an entrance
+    camera, and nothing that belongs to the cloud's session.
+
+    Uses only locally synced state -- entrance-camera enablement and
+    greeting text arrive from the cloud via edge_camera_sync.py -- so the
+    greeting keeps working through a cloud/internet outage. The trigger
+    is handed to forward_event (main.py passes append_analytics_event(),
+    the durable local record analytics_sync.py forwards and retries), so
+    an outage delays the cloud's event instead of losing it. Never
+    creates a local aac_voice_call_events row, notification, or
+    listening window: the cloud creates the one authoritative session
+    when the event arrives (ingest_edge_visitor_event()). Never touches
+    door/relay code. Never raises for "not configured"/"cooling down"."""
+    if not store.is_entrance_camera(customer_id, camera_id):
+        return {"triggered": False, "skipped_reason": "not_entrance_camera"}
+    camera = row("SELECT id,site_id FROM cameras WHERE id=? AND customer_id=?", (camera_id, customer_id))
+    if not camera:
+        return {"triggered": False, "skipped_reason": "camera_not_found"}
+    if not store.check_and_stamp_cooldown(customer_id=customer_id, camera_id=camera_id, cooldown_seconds=cooldown_seconds):
+        return {"triggered": False, "skipped_reason": "cooldown"}
+
+    now = now or datetime.now()
+    local_event_id = f"aacvc-{uuid.uuid4().hex}"
+    greeting_text = store.resolve_greeting_text(customer_id=customer_id, camera_id=camera_id, site_id=camera["site_id"])
+    greeting_delivered = False
+    try:
+        provider = greeting_provider or aac_voice_call_greeting.get_provider()
+        result = provider.speak(aac_voice_call_greeting.GreetingRequest(
+            camera_id=camera_id, customer_id=customer_id, event_id=local_event_id, text=greeting_text,
+        ))
+        greeting_delivered = bool(getattr(result, "delivered", False))
+    except Exception as error:
+        # A failed greeting never blocks the homeowner being told a
+        # visitor is at the door -- the trigger is still forwarded, just
+        # honestly marked as not greeted.
+        print(f"AAC Voice Call greeting dispatch skipped (non-fatal) for camera {camera_id}: {error}")
+
+    forward_event({
+        "id": local_event_id,
+        "camera": camera_number,
+        "event_type": EDGE_EVENT_TYPE,
+        "timestamp": now.isoformat(),
+        "confidence": confidence,
+        "object_count": 1,
+        "greeting_text_used": greeting_text,
+        "greeting_delivered": greeting_delivered,
+        "mock": False,
+    })
+    return {
+        "triggered": True,
+        "local_event_id": local_event_id,
+        "greeting_text": greeting_text,
+        "greeting_delivered": greeting_delivered,
+    }
+
+
+def _edge_trigger_is_stale(event_timestamp: str, now: datetime) -> bool:
+    """An unparseable timestamp, or one in the future (clock skew), is
+    treated as fresh -- the homeowner is never denied a live alert over
+    a formatting or clock difference."""
+    try:
+        occurred = datetime.fromisoformat(str(event_timestamp))
+    except (TypeError, ValueError):
+        return False
+    if occurred.tzinfo is not None:
+        occurred = occurred.astimezone(timezone.utc).replace(tzinfo=None)
+        now = now.astimezone(timezone.utc).replace(tzinfo=None) if now.tzinfo else now
+    return (now - occurred).total_seconds() > STALE_EDGE_TRIGGER_SECONDS
+
+
+def ingest_edge_visitor_event(
+    *,
+    customer_id: str,
+    camera_id: str,
+    detection_event_id: str,
+    event_timestamp: str,
+    greeting_text_used: str | None = None,
+    greeting_delivered: bool = False,
+    now: datetime | None = None,
+) -> dict:
+    """Cloud half of the cloud/edge split: turns one edge Voice Call
+    trigger (already stored as detection_events row detection_event_id by
+    appliance_cloud.py's analytics-event route, which resolved customer_
+    id/camera_id from the authenticated appliance) into the ONE
+    authoritative aac_voice_call_events session -- then notifies the
+    homeowner and opens the listening window, exactly like
+    handle_person_detected() does for a coordinator-local trigger.
+
+    Idempotent on detection_event_id (lookup first, plus the partial
+    UNIQUE index from migration 20260924_aac_voice_call_edge_trigger as
+    the race backstop), so a retried/replayed delivery never creates a
+    second session or a second notification. The cloud's own entrance-
+    camera config is authoritative: a camera the customer disabled after
+    the edge last synced is recorded as a detection only, with no call.
+    A trigger delivered later than STALE_EDGE_TRIGGER_SECONDS becomes a
+    missed-visitor record instead of a live call."""
+    existing = store.get_event_by_trigger_detection(customer_id=customer_id, detection_event_id=detection_event_id)
+    if existing:
+        return {"status": "duplicate", "event_id": existing["id"]}
+    if not store.is_entrance_camera(customer_id, camera_id):
+        return {"status": "skipped", "skipped_reason": "not_entrance_camera"}
+    camera = row("SELECT id,site_id,name FROM cameras WHERE id=? AND customer_id=?", (camera_id, customer_id))
+    if not camera:
+        return {"status": "skipped", "skipped_reason": "camera_not_found"}
+
+    stale = _edge_trigger_is_stale(event_timestamp, now or datetime.now())
+    try:
+        event_id = store.create_voice_call_event(
+            customer_id=customer_id,
+            site_id=camera["site_id"],
+            camera_id=camera_id,
+            trigger_detection_event_id=detection_event_id,
+            event_timestamp=event_timestamp,
+            trigger_source="detection",
+        )
+    except Exception:
+        # Lost a race with a concurrent delivery of the same detection --
+        # the UNIQUE index rejected the second insert; the winner's
+        # session is the authoritative one.
+        existing = store.get_event_by_trigger_detection(customer_id=customer_id, detection_event_id=detection_event_id)
+        if existing:
+            return {"status": "duplicate", "event_id": existing["id"]}
+        raise
+
+    if greeting_delivered and greeting_text_used:
+        store.stamp_greeted(event_id=event_id, customer_id=customer_id, greeting_text_used=greeting_text_used)
+
+    camera_name = camera["name"] or "your entrance camera"
+    notifications_created = fanout_appliance_event(
+        {"customer_id": customer_id, "site_id": camera["site_id"]},
+        {
+            "id": event_id,
+            "camera_id": camera_id,
+            "event_type": EDGE_EVENT_TYPE,
+            "timestamp": event_timestamp,
+            "message": f"You missed a visitor at {camera_name}." if stale else f"Someone is at {camera_name}.",
+            "severity": "info",
+        },
+    )
+    notification_id = None
+    if notifications_created:
+        created_row = row(
+            "SELECT id FROM notifications WHERE event_id=? AND event_type='aac_voice_call' ORDER BY created_at DESC LIMIT 1",
+            (event_id,),
+        )
+        notification_id = created_row["id"] if created_row else None
+        store.mark_notified(event_id=event_id, customer_id=customer_id, notification_id=notification_id or "")
+
+    if stale:
+        store.mark_missed(event_id=event_id, customer_id=customer_id)
+    else:
+        store.open_listening_window(event_id=event_id, customer_id=customer_id)
+
+    return {
+        "status": "accepted",
+        "event_id": event_id,
+        "stale": stale,
         "notifications_created": notifications_created,
         "notification_id": notification_id,
     }

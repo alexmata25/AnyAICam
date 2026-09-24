@@ -450,6 +450,16 @@ def _build_payload(event: dict) -> dict:
     actual authorization decision this field ultimately enables."""
     detections = event.get("detections")
     payload_detections = detections if isinstance(detections, list) else None
+    # AAC Voice Call cloud/edge split (2026-09-24): the edge's own local
+    # greeting outcome -- the only Voice Call facts the edge owns. The
+    # cloud (aac_voice_call.ingest_edge_visitor_event()) creates the
+    # authoritative session from this and stamps greeted_at only when the
+    # edge actually delivered the greeting.
+    if str(event.get("event_type") or "").strip() == "aac_voice_call" and payload_detections is None:
+        payload_detections = [{
+            "greeting_text_used": event.get("greeting_text_used"),
+            "greeting_delivered": bool(event.get("greeting_delivered")),
+        }]
     # PPE's hard_hat_present/safety_vest_present booleans are set as
     # loose extra keys on the local event dict by main.py's PPE hook in
     # save_yolo_events() (ppe.py's own summarize_ppe() output) -- not
@@ -598,6 +608,11 @@ def _forward_notification(event: dict, camera_id: str) -> None:
     ANALYTICS_SYNC_NOTIFY_ENABLED is explicitly true."""
     if str(event.get("event_type") or "") == "plate" and not LPR_NOTIFY_ENABLED:
         return
+    # The cloud's analytics-event route already notifies the homeowner
+    # for an AAC Voice Call trigger (through the authoritative session it
+    # creates) -- forwarding it here too would send a second, generic one.
+    if str(event.get("event_type") or "") == "aac_voice_call":
+        return
     payload = _build_notification_payload(event, camera_id)
     if not payload["id"] or not payload["event_type"] or not payload["timestamp"]:
         logger.warning("analytics_sync.notification_payload_malformed event_id=%r", event.get("id"))
@@ -652,12 +667,46 @@ def _sync_pending_events() -> dict:
     }
 
 
+# Prompt-scan wake-up (2026-09-24): a time-sensitive local event (an AAC
+# Voice Call visitor trigger -- the homeowner should hear about it in
+# seconds, not after up to a full SCAN_SECONDS) can ask the worker to
+# scan now instead of finishing its sleep. Only shortens the wait; every
+# scan still goes through the same bounded, idempotent, retrying
+# _sync_pending_events(). Callable from any thread (save_yolo_events()
+# runs via asyncio.to_thread); a no-op when the worker isn't running.
+_wake_event: asyncio.Event | None = None
+_wake_loop: asyncio.AbstractEventLoop | None = None
+
+
+def request_prompt_scan() -> None:
+    loop, event = _wake_loop, _wake_event
+    if loop is None or event is None or loop.is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(event.set)
+    except RuntimeError:
+        pass
+
+
+async def _sleep_or_wake(seconds: float) -> None:
+    if _wake_event is None:
+        await asyncio.sleep(seconds)
+        return
+    try:
+        await asyncio.wait_for(_wake_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+    _wake_event.clear()
+
+
 async def analytics_sync_worker() -> None:
-    global _consecutive_scan_failures
+    global _consecutive_scan_failures, _wake_event, _wake_loop
     if RUNTIME_ROLE not in {"edge", "combined"} or not ANALYTICS_SYNC_ENABLED:
         analytics_sync_state["worker_status"] = "disabled"
         while True:
             await asyncio.sleep(3600)
+    _wake_event = asyncio.Event()
+    _wake_loop = asyncio.get_running_loop()
     analytics_sync_state["worker_status"] = "running"
     logger.info("analytics_sync.worker_started")
     last_config_refresh = 0.0
@@ -684,7 +733,7 @@ async def analytics_sync_worker() -> None:
                 analytics_sync_state["connectivity"] = "syncing" if summary.get("catchup_mode") else "connected"
             analytics_sync_state["consecutive_failures"] = _consecutive_scan_failures
             backoff_multiplier = min(BACKOFF_MAX_MULTIPLIER, 2 ** _consecutive_scan_failures) if _consecutive_scan_failures else 1
-            await asyncio.sleep(SCAN_SECONDS * backoff_multiplier)
+            await _sleep_or_wake(SCAN_SECONDS * backoff_multiplier)
         except asyncio.CancelledError:
             raise
         except Exception as error:

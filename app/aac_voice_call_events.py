@@ -354,6 +354,30 @@ def end_call(*, event_id: str, customer_id: str, actor: dict | None = None) -> N
     audit(actor or {}, "aac_voice_call.ended", "aac_voice_call_event", event_id, {})
 
 
+def mark_missed(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
+    """A visitor event that reached the cloud too late for anyone to
+    answer (the edge was offline and queued it -- see aac_voice_call.
+    ingest_edge_visitor_event()). Same state guard as mark_dismissed():
+    only ever moves a call that nobody has acted on yet."""
+    now = datetime.now().isoformat()
+    with connection() as db:
+        db.execute(
+            "UPDATE aac_voice_call_events SET state='missed',updated_at=? WHERE id=? AND customer_id=? AND state IN ('triggered','notified')",
+            (now, event_id, customer_id),
+        )
+    audit(actor or {}, "aac_voice_call.missed", "aac_voice_call_event", event_id, {})
+
+
+def get_event_by_trigger_detection(*, customer_id: str, detection_event_id: str) -> dict | None:
+    """The cloud's authoritative Voice Call event for one edge detection
+    (detection_events.id), if it was already ingested -- tenant-scoped
+    like every other lookup here."""
+    return row(
+        "SELECT * FROM aac_voice_call_events WHERE trigger_detection_event_id=? AND customer_id=?",
+        (detection_event_id, customer_id),
+    )
+
+
 def get_voice_call_event(*, event_id: str, customer_id: str) -> dict | None:
     """Tenant-scoped single-row lookup -- customer_id is part of the
     WHERE clause, not just checked after the fact, so a mismatched id

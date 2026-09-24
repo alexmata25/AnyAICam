@@ -1104,6 +1104,17 @@ ALTER TABLE aac_voice_call_events ADD COLUMN escalated_at TEXT;
 ALTER TABLE aac_voice_call_events ADD COLUMN utterance_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE aac_voice_call_events ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'simulated';
 '''),
+    # AAC Voice Call cloud/edge split (2026-09-24): an edge person
+    # detection reaches the cloud as a detection_events row (the existing
+    # analytics-sync channel), and the cloud creates the ONE authoritative
+    # aac_voice_call_events row for it (aac_voice_call.ingest_edge_visitor_
+    # event()). This index is what makes that ingestion idempotent under
+    # retries/replays: one detection can never become two Voice Call
+    # events. Partial (NOT NULL only), so simulated/customer-triggered
+    # events -- which carry no trigger_detection_event_id -- are unaffected.
+    ('20260924_aac_voice_call_edge_trigger','''
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aac_voice_call_events_trigger_detection ON aac_voice_call_events(trigger_detection_event_id) WHERE trigger_detection_event_id IS NOT NULL;
+'''),
 ]
 
 
