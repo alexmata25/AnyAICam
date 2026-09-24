@@ -50,6 +50,7 @@ import secrets
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,13 @@ STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
 
 SYNC_INTERVAL_SECONDS = max(60.0, float(os.environ.get("ANYAICAM_FACIAL_EMBEDDING_SYNC_INTERVAL_SECONDS", "300.0")))
+# Conditional sync (2026-09-24): the cloud returns a directory_version
+# (content hash) with every directory; sending back the version this
+# appliance already applied gets a tiny "unchanged" reply instead of every
+# embedding again (~28.5 KB each), and skips the local delete-and-reinsert
+# too. A full, unconditional sync still happens at least this often as a
+# safety net, and after every process start.
+FULL_RESYNC_SECONDS = max(SYNC_INTERVAL_SECONDS, float(os.environ.get("ANYAICAM_FACIAL_EMBEDDING_FULL_RESYNC_SECONDS", "21600")))
 
 facial_embedding_sync_state: dict = {
     "worker_status": "disabled",
@@ -83,6 +91,14 @@ facial_embedding_sync_state: dict = {
 }
 
 _state_lock = threading.Lock()
+# What this process last applied locally -- see FULL_RESYNC_SECONDS.
+_applied_directory: dict = {"customer_id": None, "version": None, "applied_at": None}
+
+
+def reset_sync_state() -> None:
+    """Forget the applied version so the next sync is a full one."""
+    with _state_lock:
+        _applied_directory.update(customer_id=None, version=None, applied_at=None)
 
 
 def _load_appliance_identity() -> tuple[str, str] | None:
@@ -196,13 +212,36 @@ def sync_facial_directory() -> dict:
     identity = _load_appliance_identity()
     if identity is None:
         return {"status": "no_identity"}
-    response = _control_plane_get("/api/appliance/facial-directory")
+    with _state_lock:
+        applied = dict(_applied_directory)
+    conditional = bool(
+        applied["version"] and applied["applied_at"] is not None
+        and time.monotonic() - applied["applied_at"] < FULL_RESYNC_SECONDS
+    )
+    path = "/api/appliance/facial-directory"
+    if conditional:
+        path += "?if_version=" + urllib.parse.quote(str(applied["version"]), safe="")
+    response = _control_plane_get(path)
     if not isinstance(response, dict) or "customer_id" not in response:
         return {"status": "fetch_failed"}
     customer_id = str(response.get("customer_id") or "").strip()
     if not customer_id:
         return {"status": "fetch_failed"}
+    if response.get("unchanged") is True:
+        if conditional and customer_id == applied["customer_id"] and response.get("directory_version") == applied["version"]:
+            # Local tables already hold exactly this snapshot -- no data
+            # transferred, nothing rewritten, recognition keeps running.
+            return {"status": "unchanged"}
+        # An "unchanged" reply that doesn't match what this process applied
+        # (e.g. the appliance was re-assigned to a different customer)
+        # can't be trusted -- drop the version so the next sync is full.
+        reset_sync_state()
+        return {"status": "fetch_failed"}
     summary = _replace_local_directory(customer_id, response)
+    version = str(response.get("directory_version") or "").strip() or None
+    with _state_lock:
+        # An older cloud sends no directory_version: stay unconditional.
+        _applied_directory.update(customer_id=customer_id, version=version, applied_at=time.monotonic() if version else None)
     summary["status"] = "synced"
     return summary
 
