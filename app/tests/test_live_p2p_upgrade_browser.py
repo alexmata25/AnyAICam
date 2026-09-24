@@ -65,8 +65,13 @@ class FakePC extends EventTarget {
     super();
     this.connectionState = 'new'; this.iceConnectionState = 'new';
     this.ontrack = null; this.oniceconnectionstatechange = null; this.onicecandidate = null;
-    this.localDescription = null; this.closed = false;
+    this.localDescription = null; this.closed = false; this.framesDecoded = 0;
     window.__log.pcs.push(this);
+  }
+  // Decoded frames advance every 100ms once connected -- unless the test
+  // sets window.__p2pNoFrames (never any) or window.__p2pFreeze (stop now).
+  async getStats() {
+    return new Map([['inbound-video', {type: 'inbound-rtp', kind: 'video', framesDecoded: this.framesDecoded}]]);
   }
   addTransceiver() {}
   async createOffer() { return {type: 'offer', sdp: 'v=0 fake-offer'}; }
@@ -75,11 +80,14 @@ class FakePC extends EventTarget {
     setTimeout(() => {
       if (this.closed) return;
       this._set('connected');
+      this._frames = setInterval(() => {
+        if (!this.closed && !window.__p2pNoFrames && !window.__p2pFreeze) this.framesDecoded += 1;
+      }, 100);
       if (this.ontrack) this.ontrack({streams: [window.__makeFakeStream()]});
     }, window.__p2pDelayMs);
   }
   async addIceCandidate() {}
-  close() { this.closed = true; this.connectionState = 'closed'; this.iceConnectionState = 'closed'; }
+  close() { this.closed = true; clearInterval(this._frames); this.connectionState = 'closed'; this.iceConnectionState = 'closed'; }
   _set(state) {
     this.connectionState = state; this.iceConnectionState = state;
     this.dispatchEvent(new Event('connectionstatechange'));
@@ -163,6 +171,7 @@ class Harness:
         self.playlist_has_segments = playlist_has_segments
         self.playlist_requests = 0
         self.outcomes = []
+        self.p2p_timeout_ms = 15000
         page.add_init_script(FAKES_JS)
         page.route("**/*", lambda route: self._handle(route, html))
 
@@ -185,7 +194,7 @@ class Harness:
             body = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\nseg-1.ts\n" if self.playlist_has_segments else "#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
             return route.fulfill(status=200, content_type="application/vnd.apple.mpegurl", body=body)
         if "/live/p2p/config" in url:
-            return self._json(route, {"enabled": True, "ice_servers": [], "timeout_ms": 15000})
+            return self._json(route, {"enabled": True, "ice_servers": [], "timeout_ms": self.p2p_timeout_ms})
         if "/p2p/answer" in url:
             return self._json(route, {"answer": {"sdp": "v=0 fake-answer"}, "candidates": []})
         if "/transport-outcome" in url:
@@ -255,5 +264,45 @@ def test_p2p_first_keeps_the_relay_player_off(playwright_instance, pages, engine
         page.wait_for_timeout(1000)
         assert harness.log()["hlsLoads"] == 0
         assert "relay" not in harness.outcomes
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS, ids=[b[0] for b in BROWSERS])
+@pytest.mark.parametrize("kind", ["grid", "single"])
+def test_p2p_that_connects_but_never_decodes_a_frame_never_replaces_the_relay(playwright_instance, pages, engine, channel, kind):
+    """The live Ryzen failure (2026-09-24): P2P ICE connected and a track
+    arrived, but packet loss meant no frame ever decoded -- and the tile
+    switched to that empty stream anyway, tearing the relay down."""
+    browser = _launch(playwright_instance, engine, channel)
+    try:
+        page = browser.new_page()
+        harness = Harness(page, pages[kind])
+        harness.p2p_timeout_ms = 3000
+        page.add_init_script("window.__p2pDelayMs = 300; window.__p2pNoFrames = true;")
+        page.goto(f"{ORIGIN}/page")
+        assert harness.wait_for(lambda: "relay" in harness.outcomes), f"relay never attached: {harness.outcomes}"
+        page.wait_for_timeout(4000)  # past the P2P attempt's own timeout
+        assert "p2p" not in harness.outcomes, f"a frameless P2P stream must never win: {harness.outcomes}"
+        assert harness.log()["hlsDestroyed"] == 0, "the relay player must keep playing"
+        assert page.evaluate(f"() => !document.getElementById('{VIDEO_ID[kind]}').srcObject")
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS, ids=[b[0] for b in BROWSERS])
+@pytest.mark.parametrize("kind", ["grid", "single"])
+def test_p2p_that_freezes_mid_session_falls_back_to_the_relay(playwright_instance, pages, engine, channel, kind):
+    browser = _launch(playwright_instance, engine, channel)
+    try:
+        page = browser.new_page()
+        harness = Harness(page, pages[kind])
+        page.add_init_script("window.__p2pDelayMs = 300; window.liveP2PFrozenMs = 1500;")
+        page.goto(f"{ORIGIN}/page")
+        assert harness.wait_for(lambda: "p2p" in harness.outcomes), f"p2p never won: {harness.outcomes}"
+        loads_before = harness.log()["hlsLoads"]
+        page.evaluate("() => { window.__p2pFreeze = true; }")  # still 'connected', frames stop
+        assert harness.wait_for(lambda: harness.log()["hlsLoads"] > loads_before), "frozen P2P must fall back to the relay"
+        assert harness.outcomes[-1] == "relay"
     finally:
         browser.close()
