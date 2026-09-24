@@ -448,7 +448,16 @@ def sync_camera_paths(camera_url_fn) -> None:
         except Exception as error:
             logger.warning("webrtc_publisher.camera_url_unavailable camera_id=%s error=%s", camera_id, error)
             continue
-        status, _ = _config_request("POST", f"/v3/config/paths/add/{camera_id}", {"source": source, "sourceOnDemand": True})
+        path_config = {"source": source, "sourceOnDemand": True}
+        status, _ = _config_request("POST", f"/v3/config/paths/add/{camera_id}", path_config)
+        if status not in (200, 201):
+            # 2026-09-24, confirmed live on Ryzen: under startup load an add
+            # can time out HERE after MediaMTX has already created the path,
+            # and every later add then fails 400 ("already exists") -- the
+            # camera stayed out of _known_paths, so every P2P offer for it
+            # was refused as unconfigured until the next restart. replace
+            # sets the same config whether or not the path already exists.
+            status, _ = _config_request("POST", f"/v3/config/paths/replace/{camera_id}", path_config)
         if status in (200, 201):
             _known_paths.add(camera_id)
         else:

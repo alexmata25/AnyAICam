@@ -78,6 +78,7 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
     calls: list = []
     fail_whep = False
     fail_config = False
+    existing: set = set()
 
     def log_message(self, *a):
         pass
@@ -92,11 +93,13 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = self._body()
         self.__class__.calls.append((self.command, self.path, body, self._headers_lower()))
-        if self.path.startswith("/v3/config/paths/add/"):
-            if self.__class__.fail_config:
+        if self.path.startswith("/v3/config/paths/add/") or self.path.startswith("/v3/config/paths/replace/"):
+            name = self.path.rsplit("/", 1)[-1]
+            if self.__class__.fail_config or (self.path.startswith("/v3/config/paths/add/") and name in self.__class__.existing):
                 self.send_response(400)
                 self.end_headers()
                 return
+            self.__class__.existing.add(name)
             self.send_response(200)
             self.end_headers()
             return
@@ -148,6 +151,7 @@ def fake_mediamtx(monkeypatch):
     _FakeMediaMTX.calls = []
     _FakeMediaMTX.fail_whep = False
     _FakeMediaMTX.fail_config = False
+    _FakeMediaMTX.existing = set()
     server = http.server.HTTPServer(("127.0.0.1", 0), _FakeMediaMTX)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -546,3 +550,44 @@ async def test_worker_ticks_when_enabled_on_edge_role(monkeypatch):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+def test_a_path_mediamtx_already_has_is_adopted_not_left_unconfigured(fake_mediamtx, monkeypatch):
+    """Confirmed live on Ryzen (2026-09-24): an add that timed out on our
+    side had in fact created the path, so every later add returned 400 and
+    the camera's P2P offers were refused as unconfigured until a restart."""
+    monkeypatch.setattr(wp, "_camera_map", {"cam-a": 1, "cam-b": 2})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    fake_mediamtx.existing = {"cam-b"}
+    wp.sync_camera_paths(lambda n: f"rtsp://u:p@10.0.0.{n}:554/x")
+    assert wp._known_paths == {"cam-a", "cam-b"}
+    replaced = [c for c in fake_mediamtx.calls if c[1] == "/v3/config/paths/replace/cam-b"]
+    assert len(replaced) == 1 and json.loads(replaced[0][2])["sourceOnDemand"] is True
+    assert not [c for c in fake_mediamtx.calls if c[1] == "/v3/config/paths/replace/cam-a"]
+
+
+def test_an_add_that_timed_out_is_recovered_on_the_next_sync(fake_mediamtx, monkeypatch):
+    monkeypatch.setattr(wp, "_camera_map", {"cam-a": 1})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    real_request = wp._config_request
+    outcome = {"first": True}
+
+    def timing_out_once(method, path, payload=None):
+        if outcome["first"] and path.startswith("/v3/config/paths/"):
+            outcome["first"] = False
+            real_request(method, path.replace("/replace/", "/add/"), payload)  # MediaMTX did create it...
+            return 0, ""  # ...but our request timed out
+        return real_request(method, path, payload)
+
+    monkeypatch.setattr(wp, "_config_request", timing_out_once)
+    wp.sync_camera_paths(lambda n: "rtsp://u:p@h:554/x")
+    wp.sync_camera_paths(lambda n: "rtsp://u:p@h:554/x")
+    assert wp._known_paths == {"cam-a"}
+
+
+def test_a_path_that_really_cannot_be_configured_stays_unconfigured(fake_mediamtx, monkeypatch):
+    monkeypatch.setattr(wp, "_camera_map", {"cam-a": 1})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    fake_mediamtx.fail_config = True
+    wp.sync_camera_paths(lambda n: "rtsp://u:p@h:554/x")
+    assert wp._known_paths == set()

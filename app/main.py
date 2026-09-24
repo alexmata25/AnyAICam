@@ -3148,8 +3148,7 @@ ai_person_last_event = {
 import stationary_objects
 # Last *reported* AI detection frame per camera (see stationary_objects.py):
 # a later frame showing only the same, unmoved objects is not a new event.
-ai_last_reported_signature: dict[int, list] = {}
-ai_last_reported_at: dict[int, float] = {}
+ai_stationary_memory = stationary_objects.StationaryMemory()
 yolo_model = None
 
 
@@ -39095,10 +39094,8 @@ async def ai_person_detector(camera_number: int) -> None:
             # new event with a new clip uploaded to S3 (~190 clips/hour, ~3.8
             # Mbps of uplink on the Ryzen). New or moved objects still fire.
             detection_signature = stationary_objects.signature(detections)
-            stationary_repeat = bool(detections) and stationary_objects.is_stationary_repeat(
-                ai_last_reported_signature.get(camera_number),
-                detection_signature,
-                now_monotonic - ai_last_reported_at.get(camera_number, float("-inf")),
+            stationary_repeat = bool(detections) and ai_stationary_memory.is_repeat(
+                camera_number, detection_signature, now_monotonic,
             )
             if stationary_repeat and now_monotonic - ai_person_last_event[camera_number] >= AI_PERSON_COOLDOWN_SECONDS:
                 state["stationary_suppressed"] = int(state.get("stationary_suppressed") or 0) + 1
@@ -39211,8 +39208,7 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
                     ai_person_last_event[camera_number] = now_monotonic
-                    ai_last_reported_signature[camera_number] = detection_signature
-                    ai_last_reported_at[camera_number] = now_monotonic
+                    ai_stationary_memory.remember(camera_number, detection_signature, now_monotonic)
 
 
 

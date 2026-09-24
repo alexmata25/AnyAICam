@@ -8,14 +8,21 @@ exact same bounding boxes each time (e.g. camera 3's car at x=623 y=164
 uplink, and a timeline full of the same parked car.
 
 A detection frame is a repeat when every object in it matches (same class,
-IoU >= threshold) an object in the camera's last *reported* frame. Anything
-new -- another object, a different class, or a real move -- is never a
-repeat, so arrivals and movement still create events immediately. A still
-object is re-reported after `rearm_seconds` so it is never silent forever.
+IoU >= threshold) an object the camera has already reported. Anything new --
+another object, a different class, or a real move -- is never a repeat, so
+arrivals and movement still create events immediately. A still object is
+re-reported after `rearm_seconds` so it is never silent forever.
+
+StationaryMemory (second live pass, same day): comparing against only the
+LAST reported frame still let a stationary scene re-fire every ~60s,
+because low-confidence detections flicker in and out between frames (a
+0.39 "car" or 0.38 "truck" at the same spot, present in one frame and not
+the next) -- each reappearance looked "new". The memory keeps every box
+reported in the last rearm window, per camera.
 """
 import os
 
-STATIONARY_IOU_THRESHOLD = min(1.0, max(0.1, float(os.environ.get("ANYAICAM_AI_STATIONARY_IOU_THRESHOLD", "0.85"))))
+STATIONARY_IOU_THRESHOLD = min(1.0, max(0.1, float(os.environ.get("ANYAICAM_AI_STATIONARY_IOU_THRESHOLD", "0.7"))))
 # 0 disables suppression entirely (every cooldown expiry reports again).
 STATIONARY_REARM_SECONDS = max(0, int(os.environ.get("ANYAICAM_AI_STATIONARY_REARM_SECONDS", "1800")))
 
@@ -58,3 +65,39 @@ def is_stationary_repeat(previous, current, seconds_since_previous: float, *,
                    for prev_label, *prev_box in previous):
             return False
     return True
+
+
+class StationaryMemory:
+    """Per-camera memory of reported boxes: (label, box, first_reported_at).
+    An entry expires rearm_seconds after it was FIRST reported, so an object
+    that never moves is re-reported once per rearm window, not never."""
+
+    MAX_ENTRIES_PER_CAMERA = 64
+
+    def __init__(self, *, iou_threshold: float = STATIONARY_IOU_THRESHOLD, rearm_seconds: int = STATIONARY_REARM_SECONDS):
+        self.iou_threshold = iou_threshold
+        self.rearm_seconds = rearm_seconds
+        self._entries: dict = {}
+
+    def _live(self, camera, now: float) -> list:
+        entries = [e for e in self._entries.get(camera, []) if now - e[2] < self.rearm_seconds]
+        self._entries[camera] = entries
+        return entries
+
+    def _known(self, entries, label, box) -> bool:
+        return any(label == known_label and iou(box, known_box) >= self.iou_threshold for known_label, known_box, _ in entries)
+
+    def is_repeat(self, camera, current, now: float) -> bool:
+        if self.rearm_seconds <= 0 or not current:
+            return False
+        entries = self._live(camera, now)
+        return bool(entries) and all(self._known(entries, label, tuple(box)) for label, *box in current)
+
+    def remember(self, camera, reported, now: float) -> None:
+        if self.rearm_seconds <= 0:
+            return
+        entries = self._live(camera, now)
+        for label, *box in reported:
+            if not self._known(entries, label, tuple(box)):
+                entries.append((label, tuple(box), now))
+        self._entries[camera] = entries[-self.MAX_ENTRIES_PER_CAMERA:]
