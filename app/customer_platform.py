@@ -262,6 +262,10 @@ def register_customer_platform_routes(
             </label>'''
             for key, item in ANALYTICS_CATALOG.items()
         )
+        no_cameras_notice = "" if cameras else (
+            '<div class="health-detail" id="no-cameras-notice" style="margin-top:8px">'
+            'No cameras are set up on your account yet. Once a camera is added, its analytics and alerts can be configured here.</div>'
+        )
         content = f'''
         <header class="topbar">
           <div><p class="eyebrow">Mobile app settings</p><h1>Camera analytics and alerts</h1></div>
@@ -270,7 +274,7 @@ def register_customer_platform_routes(
         </header>
         <section class="panel">
           <div class="panel-head"><div><h2>Choose a camera</h2><div class="health-detail">Paid analytics are enabled individually per camera.</div></div></div>
-          <label style="display:grid;gap:7px;max-width:360px">Camera<select id="camera-select">{camera_options}</select></label>
+          <label style="display:grid;gap:7px;max-width:360px">Camera<select id="camera-select">{camera_options}</select></label>{no_cameras_notice}
         </section>
         <section class="panel" style="margin-top:16px">
           <div class="panel-head"><div><h2>Camera name</h2><div class="health-detail">Give this camera a name your household or team will recognize, like "Front Door" or "Driveway Right." This changes the display name only -- the camera's stream, recording, and analytics are unaffected. Leave blank to use the default "Camera N" label.</div></div></div>
@@ -289,7 +293,7 @@ def register_customer_platform_routes(
             <div class="panel-head"><div><h2>Notifications</h2><div class="health-detail">Program alerts for this camera.</div></div></div>
             <form class="notification-form" id="alert-form">
               <label><span><input id="alerts-enabled" type="checkbox" checked> Enable alerts for this camera</span></label>
-              <label>Recipient email<input id="recipient-email" type="email" value="{user.get("email","")}"></label>
+              <label>Recipient email<input id="recipient-email" type="email" value="{escape(user.get("email") or "")}"></label>
               <label><span><input id="email-enabled" type="checkbox" checked> Email notifications</span></label>
               <label><span><input id="push-enabled" type="checkbox" checked> Mobile push notifications</span></label>
               <div class="event-check-grid">
@@ -324,7 +328,12 @@ def register_customer_platform_routes(
           cameraNameInput.placeholder=`Camera ${cameraId}`;
         }
 
+        // A new account can have no cameras yet: nothing camera-specific can
+        // be loaded or saved until one exists.
+        const noCamera=()=>{if(cameraSelect.value)return false;showToast('Add a camera first.');return true};
+
         document.getElementById('save-camera-name').onclick=async()=>{
+          if(noCamera())return;
           const cameraId=cameraSelect.value;
           const name=cameraNameInput.value.trim();
           const response=await fetch(`/api/customer/cameras/${cameraId}/name`,{
@@ -341,8 +350,16 @@ def register_customer_platform_routes(
 
         async function loadCameraSettings(){
           const cameraId=cameraSelect.value;
+          if(!cameraId){
+            catalog.forEach(name=>{
+              document.getElementById(`feature-${name}`).disabled=true;
+              document.getElementById(`entitlement-${name}`).textContent='No camera yet';
+            });
+            return;
+          }
           const response=await fetch(`/api/customer/cameras/${cameraId}/app-settings`);
-          const data=await response.json();
+          const data=await response.json().catch(()=>({}));
+          if(!response.ok||!data.features){showToast(data.detail||'Could not load settings for this camera.');return}
           const entitlements=new Set(data.features.entitlements||[]);
           const enabled=data.features.analytics_enabled||{};
           catalog.forEach(name=>{
@@ -368,6 +385,7 @@ def register_customer_platform_routes(
         }
 
         document.getElementById('save-features').onclick=async()=>{
+          if(noCamera())return;
           const analytics_enabled={};
           catalog.forEach(name=>analytics_enabled[name]=document.getElementById(`feature-${name}`).checked);
           const response=await fetch(`/api/customer/cameras/${cameraSelect.value}/features`,{
@@ -381,6 +399,7 @@ def register_customer_platform_routes(
 
         document.getElementById('alert-form').onsubmit=async event=>{
           event.preventDefault();
+          if(noCamera())return;
           const payload={
             enabled:document.getElementById('alerts-enabled').checked,
             recipient_email:document.getElementById('recipient-email').value,

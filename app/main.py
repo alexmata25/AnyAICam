@@ -72268,7 +72268,7 @@ function toggleAnalytics(n){
 
 
 
-function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}for(let n=1;n<=4;n++)connectCamera(n);
+function connectCamera(n){const video=document.getElementById(`camera${n}`),source=`/static/hls/camera${n}.m3u8`;video.addEventListener('playing',()=>{setState(n,'Streaming',true);const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Pause';if(button)button.classList.remove('active')});video.addEventListener('pause',()=>{const label=document.getElementById(`pause-label${n}`);const button=document.getElementById(`pause${n}`);if(label)label.textContent='Resume';if(button)button.classList.add('active')});video.addEventListener('waiting',()=>setState(n,'Reconnecting…'));if(window.Hls&&Hls.isSupported()){const hls=new Hls({liveSyncDurationCount:2,liveMaxLatencyDurationCount:5});hls.loadSource(source);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>setState(n,'Click play to start'))});hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal)setState(n,'Waiting for camera')})}else if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=source}else{setState(n,'Browser not supported')}}document.querySelectorAll('video[id^="camera"]').forEach(v=>{const n=Number(v.id.slice(6));if(n)connectCamera(n)});
 
 
 
@@ -121542,10 +121542,10 @@ def _render_customer_events(request: Request) -> str:
 <div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
-<input class="picker-search" id="events-search" type="search" placeholder="Search"><div id="events-camera-filters">{camera_options}</div></aside>
-<section class="work-area"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
-<table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
-<tbody>{event_body}</tbody></table></section></div>"""
+<input class="picker-search" id="events-search" type="search" placeholder="Search" aria-label="Search cameras"><div id="events-camera-filters">{camera_options}</div></aside>
+<section class="work-area" style="min-width:0"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
+<div style="overflow-x:auto;max-width:100%"><table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
+<tbody>{event_body}</tbody></table></div></section></div>"""
 
     scripts = """<script>
 (function(){
