@@ -265,6 +265,11 @@ def sync_provisioned_cameras() -> dict:
     cloud_cameras = response.get("cameras")
     if not isinstance(cloud_cameras, list):
         return {"status": "malformed_response"}
+    # Share this well-formed response with every other edge worker in this
+    # process (appliance_config_cache.py) so they stop fetching the same
+    # configuration independently. This worker always fetches fresh itself.
+    import appliance_config_cache
+    appliance_config_cache.publish(response)
     # analytics_rules (2026-09-21): a missing/malformed field here is
     # treated as "this control-plane response didn't carry rule data
     # this cycle" -- local rule state is simply left untouched (None

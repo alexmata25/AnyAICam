@@ -77,6 +77,7 @@ removes.
 import asyncio
 import json
 import logging
+import appliance_config_cache
 import os
 import re
 import secrets
@@ -345,7 +346,7 @@ def _refresh_camera_map() -> None:
     no test coverage on this exact map. lpr.is_camera_enabled() and
     ppe.is_camera_enabled() now consult the same 3 new keys the same
     way."""
-    response = _control_plane_get("/api/appliance/configuration")
+    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
     if not isinstance(response, dict):
         return
     cameras = response.get("cameras")

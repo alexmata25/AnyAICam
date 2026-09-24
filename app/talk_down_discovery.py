@@ -56,6 +56,7 @@ import base64
 import hashlib
 import json
 import logging
+import appliance_config_cache
 import os
 import re
 import secrets
@@ -163,7 +164,7 @@ def _refresh_camera_map() -> None:
     """Same GET /api/appliance/configuration this appliance already
     polls for its other workers -- never writes anything, and a
     failed/unreachable poll just leaves the previous mapping in place."""
-    response = _control_plane_get("/api/appliance/configuration")
+    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
     if not isinstance(response, dict):
         return
     cameras = response.get("cameras")

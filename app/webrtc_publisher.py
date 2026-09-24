@@ -97,6 +97,7 @@ rejected with a real 400) this surfaced and fixed."""
 
 import json
 import logging
+import appliance_config_cache
 import os
 import asyncio
 import secrets
@@ -254,7 +255,7 @@ def _refresh_camera_map() -> None:
     never-clobber-on-failure behavior as recording_uploader.py's own
     _refresh_camera_map() -- a transient control-plane outage leaves the
     previous mapping in place rather than dropping every known camera."""
-    response = _control_plane_get("/api/appliance/configuration")
+    response = appliance_config_cache.get_or_fetch(lambda: _control_plane_get("/api/appliance/configuration"))
     if not isinstance(response, dict):
         return
     cameras = response.get("cameras")
