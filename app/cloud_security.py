@@ -257,9 +257,36 @@ def clear_login_failures(email: str):
 
 
 def create_password_reset(user_id: str,email: str):
-    raw=secrets.token_urlsafe(32); token_hash=password_hash(raw); now=datetime.now()
-    with connection() as db: db.execute('INSERT INTO password_reset_tokens(id,user_id,email,token_hash,expires_at,used_at,created_at) VALUES(?,?,?,?,?,?,?)',(secrets.token_hex(8),user_id,email,token_hash,(now+timedelta(hours=1)).isoformat(),None,now.isoformat()))
-    return raw
+    """Single-use, one-hour reset token. The emailed value is
+    "<row id>.<secret>" (2026-09-24): the id lets consume_password_reset()
+    verify exactly ONE stored hash instead of hashing the submitted value
+    against every outstanding token in the system (310k-iteration PBKDF2
+    each -- an unauthenticated CPU amplification on /api/password-reset/
+    complete). Only the secret part is hashed and stored; the id is not a
+    secret and grants nothing on its own."""
+    token_id=secrets.token_hex(8); secret=secrets.token_urlsafe(32); now=datetime.now()
+    with connection() as db: db.execute('INSERT INTO password_reset_tokens(id,user_id,email,token_hash,expires_at,used_at,created_at) VALUES(?,?,?,?,?,?,?)',(token_id,user_id,email,password_hash(secret),(now+timedelta(hours=1)).isoformat(),None,now.isoformat()))
+    return f'{token_id}.{secret}'
+
+
+# Reset links issued before the "<id>.<secret>" format (a bare secret) stay
+# valid for the rest of their one-hour life; they are matched by scanning,
+# bounded to this many of the newest outstanding tokens.
+LEGACY_RESET_TOKEN_SCAN_LIMIT = 25
+
+
+def _matching_reset_token(raw: str):
+    now=datetime.now().isoformat()
+    token_id,separator,secret=raw.partition('.')
+    with connection() as db:
+        if separator and token_id and secret:
+            record=db.execute('SELECT * FROM password_reset_tokens WHERE id=? AND used_at IS NULL AND expires_at>?',(token_id,now)).fetchone()
+            return dict(record) if record and verify_password(secret,record['token_hash']) else None
+        records=[dict(item) for item in db.execute(
+            'SELECT * FROM password_reset_tokens WHERE used_at IS NULL AND expires_at>? ORDER BY created_at DESC LIMIT ?',
+            (now,LEGACY_RESET_TOKEN_SCAN_LIMIT),
+        ).fetchall()]
+    return next((item for item in records if verify_password(raw,item['token_hash'])),None)
 
 
 def consume_password_reset(raw: str,new_password: str):
@@ -283,9 +310,7 @@ def consume_password_reset(raw: str,new_password: str):
     improvement -- must_change_password exists for a partner-issued
     temporary password the recipient has never chosen themselves, which
     this is no longer true of the moment this function runs."""
-    records=[]
-    with connection() as db: records=[dict(item) for item in db.execute('SELECT * FROM password_reset_tokens WHERE used_at IS NULL AND expires_at>?',(datetime.now().isoformat(),)).fetchall()]
-    match=next((item for item in records if verify_password(raw,item['token_hash'])),None)
+    match=_matching_reset_token(str(raw or ''))
     if not match: return None
     with connection() as db:
         now=datetime.now().isoformat()

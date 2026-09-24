@@ -1663,6 +1663,18 @@ BACKUP_INCLUDE_HLS = os.environ.get(
 SMTP_HOST = os.environ.get("ANYAICAM_SMTP_HOST", "").strip()
 
 
+def _password_reset_email_ready() -> bool:
+    """Can email_service.py actually deliver password-reset mail? (See the
+    readiness snapshot's password_reset_email_ready.)"""
+    from cloud_config import settings as email_settings
+
+    return bool(
+        email_settings.email_backend == "smtp" and email_settings.smtp_host
+        and email_settings.email_from and not email_settings.email_from.endswith("@localhost")
+    )
+
+
+
 
 
 
@@ -12923,6 +12935,11 @@ def cloud_configuration_snapshot() -> dict:
 
 
         "ses_configured": bool(SES_SENDER or (SMTP_HOST and SMTP_FROM)),
+        # Informational only (never part of cloud_foundation_ready): can the
+        # customer/partner Forgot Password flow actually deliver email? The
+        # 'preview' backend (the default) only writes reset links to local
+        # JSON files -- fine for development, never for real customers.
+        "password_reset_email_ready": _password_reset_email_ready(),
 
 
 

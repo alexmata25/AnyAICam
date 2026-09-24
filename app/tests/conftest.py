@@ -35,3 +35,19 @@ def _reset_facial_directory_sync_state():
     facial_embedding_sync.reset_sync_state()
     yield
     facial_embedding_sync.reset_sync_state()
+
+
+@pytest.fixture(autouse=True)
+def _reset_password_reset_completion_limiter():
+    """cloud_features' per-IP limit on /api/password-reset/complete is
+    process-wide by design; every TestClient request comes from the same
+    client address, so without a reset the suite's many reset completions
+    would start hitting 429 partway through. Only touched if the module
+    is already imported (never imports main/cloud_features on its own)."""
+    import sys
+
+    module = sys.modules.get("cloud_features")
+    limiter = getattr(module, "_password_reset_complete_ip_limiter", None) if module else None
+    if limiter is not None:
+        limiter.events.clear()
+    yield
