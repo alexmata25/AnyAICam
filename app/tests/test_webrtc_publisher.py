@@ -351,7 +351,7 @@ async def test_bridge_tick_never_blocks_the_event_loop_on_a_slow_signal(monkeypa
     asyncio task still gets to run well before it finishes."""
     import time
 
-    monkeypatch.setattr(wp, "_control_plane_get", lambda path: {"pending": [{"session_id": "s", "camera_id": "c", "kind": "offer", "payload": {}}]})
+    monkeypatch.setattr(wp, "_control_plane_get", lambda path, timeout=10: {"pending": [{"session_id": "s", "camera_id": "c", "kind": "offer", "payload": {}}]})
 
     def slow_handle(camera_url_fn, item):
         time.sleep(0.3)
