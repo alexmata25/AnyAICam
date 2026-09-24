@@ -160,22 +160,37 @@ def test_checkout_before_registration_creates_a_pending_link_not_a_duplicate_cus
     assert pending == ("pending", 16)
 
 
-def test_entitlement_sync_failure_never_breaks_the_webhook_response(client, db_path, monkeypatch):
-    """The legacy 200 response Stripe needs to stop retrying must survive
-    even if the new entitlement bridge throws."""
+def test_an_entitlement_sync_failure_is_retried_without_rerunning_legacy_billing(client, db_path, monkeypatch):
+    """2026-09-24 (retry safety): a failing entitlement sync used to be
+    swallowed with a 200, so Stripe never retried and the purchase was
+    never provisioned. Now the webhook answers 503 (Stripe redelivers),
+    the legacy billing step that already succeeded is NOT run again on the
+    retry, and the retry completes the entitlement."""
     test_client, main = client
+    import customer_entitlements
+
+    real_sync = customer_entitlements.sync_entitlement_from_stripe_event
+    legacy_runs = []
+    real_legacy = main.process_stripe_webhook_event
+    monkeypatch.setattr(main, "process_stripe_webhook_event", lambda event: legacy_runs.append(event["id"]) or real_legacy(event))
 
     def _boom(event):
         raise RuntimeError("simulated entitlement sync failure")
 
-    with override_target(sqlite_path=str(db_path)):
-        import customer_entitlements
-        monkeypatch.setattr(customer_entitlements, "sync_entitlement_from_stripe_event", _boom)
-        # main.py imports the function by name inside the route handler
-        # (a deferred import), so patching the module attribute above is
-        # what the route actually calls.
-    response = _post_webhook(test_client, _checkout_completed_event(event_id="evt_boom"))
-    assert response.status_code == 200
+    # main.py imports the function by name at call time, so patching the
+    # module attribute is what the webhook actually calls.
+    monkeypatch.setattr(customer_entitlements, "sync_entitlement_from_stripe_event", _boom)
+    first = _post_webhook(test_client, _checkout_completed_event(event_id="evt_boom"))
+    assert first.status_code == 503
+    assert "camera_slot_entitlements" in first.json()["detail"]
+
+    monkeypatch.setattr(customer_entitlements, "sync_entitlement_from_stripe_event", real_sync)
+    retry = _post_webhook(test_client, _checkout_completed_event(event_id="evt_boom"))
+    assert retry.status_code == 200
+    assert legacy_runs == ["evt_boom"]  # legacy billing ran exactly once
+
+    again = _post_webhook(test_client, _checkout_completed_event(event_id="evt_boom"))
+    assert again.status_code == 200 and again.json()["duplicate"] is True
 
 
 def test_legacy_processing_still_runs_unchanged_alongside_the_new_sync(client, db_path):

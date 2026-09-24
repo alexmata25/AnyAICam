@@ -1123,6 +1123,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_aac_voice_call_events_trigger_detection ON
     # crashed/closed/P2P-connected viewer no longer holds the relay open.
     ('20260924_live_view_session_relay_heartbeat','''
 ALTER TABLE live_view_sessions ADD COLUMN last_seen_at TEXT;
+'''),    # Stripe webhook retry safety (2026-09-24): per-(event, step) progress
+    # for the provisioning steps a checkout/subscription webhook drives
+    # (legacy billing, camera-slot entitlements, hardware orders, analytics
+    # entitlements). A step that fails leaves the webhook returning a
+    # retryable error so Stripe redelivers it, and only steps not yet
+    # 'completed' run again. The PRIMARY KEY makes the claim atomic across
+    # uvicorn workers. See main.stripe_webhook().
+    ('20260924_stripe_webhook_steps','''
+CREATE TABLE IF NOT EXISTS stripe_webhook_steps(
+    event_id TEXT NOT NULL,
+    step TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(event_id, step)
+);
 '''),
 ]
 
