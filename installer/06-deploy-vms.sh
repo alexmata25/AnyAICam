@@ -142,6 +142,18 @@ ensure_vms_env() {
     chmod 0640 "$VMS_ENV_FILE"
 }
 
+# The installed VMS software tree must be root-owned: the container
+# bind-mounts $VMS_INSTALL_ROOT/app over /app, so whoever can write it
+# controls the code the VMS runs. The paths the mirror excludes (legacy
+# persistent state, and the separately-installed MediaMTX binary) are
+# left exactly as they are.
+normalize_vms_install_ownership() {
+    local owner="${VMS_INSTALL_OWNER:-root:root}"
+    find "$VMS_INSTALL_ROOT" \( -path "$VMS_INSTALL_ROOT/recordings" -o -path "$VMS_INSTALL_ROOT/data/config" \
+        -o -path "$VMS_INSTALL_ROOT/.env" -o -path "$VMS_INSTALL_ROOT/mediamtx" \) -prune \
+        -o -exec chown -h "$owner" {} +
+}
+
 deploy_vms() {
     local state="$1"
 
@@ -174,9 +186,19 @@ deploy_vms() {
     # under a P2P-enabled appliance the moment any unrelated VMS-only
     # repair (e.g. this session's own LPR/PPE fix) ran, breaking P2P
     # live view with no error anywhere in the install output.
-    rsync -a --delete \
+    #
+    # --no-owner/--no-group (2026-09-24, real defect confirmed live on
+    # Ryzen): plain -a copied the PAYLOAD's own owner/group, and the
+    # payload is unpacked by whichever login user extracted the release
+    # tarball (uid 1000) -- so a root-run repair left /opt/anyaicam and
+    # every VMS source file owned by that user, writable without sudo.
+    # normalize_vms_install_ownership() also repairs files an earlier
+    # install already left with the wrong owner (rsync skips unchanged
+    # files, so --no-owner alone would never fix those).
+    rsync -a --no-owner --no-group --delete \
         --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
         "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/"
+    normalize_vms_install_ownership
 
     ensure_vms_env
 

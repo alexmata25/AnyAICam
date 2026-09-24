@@ -1115,5 +1115,70 @@ assert_exit "run_validate() itself calls the new anyaicam-agent.service is-activ
     grep -q 'check "anyaicam-agent.service is active" systemctl is-active --quiet anyaicam-agent.service' "$INSTALLER_DIR/validate.sh"
 
 echo
+echo "== VMS install ownership (06-deploy-vms.sh) =="
+# 2026-09-24, real defect confirmed live on Ryzen: `rsync -a` copied the
+# payload's own owner (the login user who unpacked the release tarball)
+# onto /opt/anyaicam, leaving the VMS source tree -- bind-mounted over the
+# container's /app -- writable without sudo. find -exec runs the real
+# chown binary, so it is shadowed with a logging stub on PATH, not a shell
+# function; nothing is actually chowned.
+reset_fixture
+make_fake_vms_payload
+mkdir -p "$MEDIAMTX_INSTALL_DIR"
+printf 'real previously-installed mediamtx binary' > "$MEDIAMTX_BINARY_PATH"
+mkdir -p "$VMS_INSTALL_ROOT/app"
+printf 'left user-owned by an earlier install' > "$VMS_INSTALL_ROOT/app/unchanged_module.py"
+cp "$VMS_INSTALL_ROOT/app/unchanged_module.py" "$VMS_PAYLOAD_DIR/app/unchanged_module.py"
+CHOWN_STUB_DIR="$FIXTURE_ROOT/stub-bin"; CHOWN_LOG="$FIXTURE_ROOT/chown.log"
+mkdir -p "$CHOWN_STUB_DIR"
+printf '#!/usr/bin/env bash\nfor arg in "$@"; do printf "%%s\\n" "$arg"; done >> "%s"\n' "$CHOWN_LOG" > "$CHOWN_STUB_DIR/chown"
+chmod +x "$CHOWN_STUB_DIR/chown"
+PATH="$CHOWN_STUB_DIR:$PATH" deploy_vms repair >/dev/null 2>&1
+assert_eq "the installed VMS tree is chowned to root:root" "1" "$(grep -cx 'root:root' "$CHOWN_LOG" 2>/dev/null | awk '{print ($1>0)}')"
+assert_eq "the install root itself is included in the ownership repair" "1" "$(grep -cx "$VMS_INSTALL_ROOT" "$CHOWN_LOG" 2>/dev/null)"
+assert_eq "an unchanged file an earlier install left user-owned is repaired too" "1" "$(grep -cx "$VMS_INSTALL_ROOT/app/unchanged_module.py" "$CHOWN_LOG" 2>/dev/null)"
+assert_eq "the separately-installed MediaMTX binary is never re-owned" "0" "$(grep -c "$VMS_INSTALL_ROOT/mediamtx" "$CHOWN_LOG" 2>/dev/null)"
+assert_exit "the mirror rsync no longer copies the payload's owner/group" 0 \
+    grep -q 'rsync -a --no-owner --no-group --delete' "$INSTALLER_DIR/06-deploy-vms.sh"
+
+echo
+echo "== validate.sh startup wait (VMS still starting) =="
+# 2026-09-24, confirmed live on Ryzen: install.sh restarts the VMS and
+# validate.sh ran immediately, so /health, /ready and /version each got a
+# single attempt while uvicorn was still starting and all three failed on
+# a healthy install.
+CURL_ATTEMPTS_FILE="$FIXTURE_ROOT/curl-attempts"
+curl() {
+    local attempts; attempts=$(( $(cat "$CURL_ATTEMPTS_FILE" 2>/dev/null || echo 0) + 1 ))
+    echo "$attempts" > "$CURL_ATTEMPTS_FILE"
+    (( attempts > CURL_FAILS_BEFORE_UP )) || return 7
+    printf '%s' '{"ready":true,"self_test":{"ok":true,"checks":[]},"build_id":"'"$VMS_RELEASE_COMMIT"'"}'
+}
+reset_fixture
+VMS_RELEASE_COMMIT="2222222222222222222222222222222222222b"
+rm -f "$CURL_ATTEMPTS_FILE"; CURL_FAILS_BEFORE_UP=3
+VMS_STARTUP_DEADLINE=""; VMS_STARTUP_WAIT_SECONDS=30; VMS_STARTUP_POLL_SECONDS=0
+assert_exit "/health that answers after 3 refused connections passes (waits for startup)" 0 retry_until_vms_started vms_health_ok
+assert_eq "it kept polling until the VMS answered" "4" "$(cat "$CURL_ATTEMPTS_FILE")"
+rm -f "$CURL_ATTEMPTS_FILE"; CURL_FAILS_BEFORE_UP=2
+VMS_STARTUP_DEADLINE=""
+assert_exit "/ready self-test is also retried through startup" 0 retry_until_vms_started ready_endpoint_self_test_ok
+rm -f "$CURL_ATTEMPTS_FILE"; CURL_FAILS_BEFORE_UP=2
+VMS_STARTUP_DEADLINE=""
+assert_exit "/version is also retried through startup" 0 retry_until_vms_started version_reports_release
+rm -f "$CURL_ATTEMPTS_FILE"; CURL_FAILS_BEFORE_UP=1000000
+VMS_STARTUP_DEADLINE=""; VMS_STARTUP_WAIT_SECONDS=1; VMS_STARTUP_POLL_SECONDS=0.2
+started=$(date +%s)
+assert_exit "a VMS that never comes up still FAILS once the startup deadline passes" 1 retry_until_vms_started vms_health_ok
+assert_eq "the wait is bounded by VMS_STARTUP_WAIT_SECONDS" "1" "$(( $(date +%s) - started <= 5 ))"
+unset -f curl
+assert_exit "run_validate() wraps the /health check in the startup wait" 0 \
+    grep -q 'check "VMS local health endpoint responds" retry_until_vms_started vms_health_ok' "$INSTALLER_DIR/validate.sh"
+assert_exit "run_validate() wraps the /ready check in the startup wait" 0 \
+    grep -q 'retry_until_vms_started ready_endpoint_self_test_ok' "$INSTALLER_DIR/validate.sh"
+assert_exit "run_validate() wraps the /version check in the startup wait" 0 \
+    grep -q 'check "VMS /version reports exact approved commit" retry_until_vms_started version_reports_release' "$INSTALLER_DIR/validate.sh"
+
+echo
 echo "== summary: $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

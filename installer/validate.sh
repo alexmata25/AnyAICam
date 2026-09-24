@@ -21,6 +21,33 @@ version_reports_release() {
     curl -fsS -m 5 http://127.0.0.1:8000/version | grep -Fq "$VMS_RELEASE_COMMIT"
 }
 
+vms_health_ok() {
+    curl -fsS -m 5 -o /dev/null http://127.0.0.1:8000/health
+}
+
+# Startup race (2026-09-24, confirmed live on Ryzen): install.sh restarts
+# the VMS as its last step and validate.sh runs straight after, but the
+# VMS needs several seconds (YOLO/model imports) before uvicorn is
+# listening -- so the three local HTTP checks each got exactly one
+# attempt against a process that was still starting, and all failed on a
+# healthy install. Each HTTP check now retries until it passes or the
+# shared startup deadline (VMS_STARTUP_WAIT_SECONDS, default 120s,
+# measured from the first HTTP check) runs out; a VMS that genuinely never
+# comes up still fails every one of them.
+VMS_STARTUP_WAIT_SECONDS="${VMS_STARTUP_WAIT_SECONDS:-120}"
+VMS_STARTUP_POLL_SECONDS="${VMS_STARTUP_POLL_SECONDS:-2}"
+VMS_STARTUP_DEADLINE=""
+
+retry_until_vms_started() {
+    if [[ -z "$VMS_STARTUP_DEADLINE" ]]; then
+        VMS_STARTUP_DEADLINE=$(( $(date +%s) + VMS_STARTUP_WAIT_SECONDS ))
+    fi
+    until "$@"; do
+        (( $(date +%s) < VMS_STARTUP_DEADLINE )) || return 1
+        sleep "$VMS_STARTUP_POLL_SECONDS"
+    done
+}
+
 suspend_targets_masked() {
     # `systemctl is-enabled` exits non-zero for a masked unit (it isn't
     # "enabled"), so check() can't wrap it directly -- confirm the actual
@@ -147,9 +174,10 @@ run_validate() {
     check "anyaicam-vms.service is enabled" systemctl is-enabled --quiet anyaicam-vms.service
     check "anyaicam-vms.service is active" systemctl is-active --quiet anyaicam-vms.service
     check "system suspend/hibernate is disabled (appliance must stay online 24/7)" suspend_targets_masked
-    check "VMS local health endpoint responds" curl -fsS -m 5 -o /dev/null http://127.0.0.1:8000/health
-    check "VMS local ready endpoint is reachable and self-test passes (business readiness -- e.g. a camera actually recording -- is intentionally not required at install time)" ready_endpoint_self_test_ok
-    check "VMS /version reports exact approved commit" version_reports_release
+    log "Waiting up to ${VMS_STARTUP_WAIT_SECONDS}s for the VMS to finish starting before its HTTP checks..."
+    check "VMS local health endpoint responds" retry_until_vms_started vms_health_ok
+    check "VMS local ready endpoint is reachable and self-test passes (business readiness -- e.g. a camera actually recording -- is intentionally not required at install time)" retry_until_vms_started ready_endpoint_self_test_ok
+    check "VMS /version reports exact approved commit" retry_until_vms_started version_reports_release
     check "MediaMTX is present, executable, and checksum-verified when P2P live view is enabled" mediamtx_required_and_usable
 
     if [[ "$FAILURES" -eq 0 ]]; then
