@@ -372,8 +372,10 @@ def test_csrf_helper_correctly_extracts_a_legacy_quoted_padded_cookie_value():
 def test_forgot_password_pages_surface_the_real_error_instead_of_fake_success():
     app_dir = Path(__file__).resolve().parents[1]
     source = (app_dir / "cloud_features.py").read_text(encoding="utf-8")
-    assert "showToast(response.ok?r.message:(r.detail||'Request failed.'))" in source
-    assert "box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed.')" in source
+    # 2026-09-24: a non-JSON error body no longer throws (r falls back to
+    # {}), and the fallbacks read clearly -- still never a fake success.
+    assert "r=await response.json().catch(()=>({}));showToast(response.ok?(r.message||'If the account exists, a password-reset message has been prepared.'):(r.detail||'Request failed. Please try again.'))" in source
+    assert "box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed. Please try again.')" in source
 
 
 def test_forgot_password_request_shows_the_real_csrf_failure_not_generic_success(db_path, monkeypatch):

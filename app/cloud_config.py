@@ -54,6 +54,17 @@ _DEFAULT_TRUSTED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
 STAGING_SECONDARY_PUBLIC_HOST = "app.anyaicam.com"
 
 
+def default_email_from() -> str:
+    """ANYAICAM_EMAIL_FROM, else the older ANYAICAM_SMTP_FROM (the variable
+    main.py's legacy SMTP notifier and older env files use), else the
+    development placeholder -- read when Settings() is created."""
+    return (
+        os.getenv("ANYAICAM_EMAIL_FROM", "").strip()
+        or os.getenv("ANYAICAM_SMTP_FROM", "").strip()
+        or "no-reply@localhost"
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str = os.getenv("ANYAICAM_ENV", "development").lower()
@@ -173,7 +184,11 @@ class Settings:
     smtp_port: int = _int("ANYAICAM_SMTP_PORT", 587)
     smtp_username: str = os.getenv("ANYAICAM_SMTP_USERNAME", "")
     smtp_password: str = os.getenv("ANYAICAM_SMTP_PASSWORD", "")
-    email_from: str = os.getenv("ANYAICAM_EMAIL_FROM", "no-reply@localhost")
+    # ANYAICAM_SMTP_FROM is the older sender variable main.py's own legacy
+    # SMTP notifier reads (and the one aws.env/older env files set); honor
+    # it here too so a deployment that only sets it doesn't send password-
+    # reset mail as no-reply@localhost, which SES and most relays reject.
+    email_from: str = field(default_factory=lambda: default_email_from())
     # Notifications settings page (Email + SMS channels) -- sms_backend
     # mirrors email_backend's own "preview" default exactly (never a
     # live send until explicitly configured). Every credential here is

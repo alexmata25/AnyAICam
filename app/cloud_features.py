@@ -23,6 +23,30 @@ from partner_portal import partner_identity,require_partner_access
 # leaving the lockout policy itself unchanged.
 _password_reset_email_limiter = RateLimiter(limit=3, window_seconds=900)
 _password_reset_ip_limiter = RateLimiter(limit=30, window_seconds=900)
+# Completing a reset is unauthenticated and costs a PBKDF2 verification;
+# bounded per client IP (2026-09-24). Generous enough for a real user
+# retrying a mistyped password several times.
+_password_reset_complete_ip_limiter = RateLimiter(limit=20, window_seconds=900)
+
+CUSTOMER_RESET_ROLES = ('customer_owner', 'customer_viewer')
+
+
+def customer_reset_url() -> str:
+    """The customer-branded reset page on the configured public portal.
+    ANYAICAM_PASSWORD_RESET_URL points at the partner/admin reset page
+    (/reset-password, rendered in the Admin/Partner portal chrome); a
+    customer must stay in the customer experience, so their links use
+    /customer-reset-password on the same origin (2026-09-24 -- previously
+    only the edge_production path did this)."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(settings.password_reset_url)
+    path = parts.path
+    if path.endswith('/reset-password'):
+        path = path[: -len('/reset-password')] + '/customer-reset-password'
+    else:
+        path = '/customer-reset-password'
+    return urlunsplit((parts.scheme, parts.netloc, path, '', ''))
 
 
 def deployment_status():
@@ -99,7 +123,8 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
                 reset_path='/customer-reset-password' if user['role'] in ('customer_owner','customer_viewer') else '/reset-password'
                 link=f'{scheme}://{host}{reset_path}?token={raw}'
             else:
-                link=settings.password_reset_url+'?token='+raw
+                base=customer_reset_url() if user['role'] in CUSTOMER_RESET_ROLES else settings.password_reset_url
+                link=base+'?token='+raw
             message=get_email_service().send('password_reset',email,'Reset your AnyAiCam password',f'Use this one-hour password reset link:\n{link}',metadata={'expires_minutes':60})
             with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',email,message['status'],settings.email_backend,json.dumps({'expires_minutes':60}),datetime.now().isoformat()))
             audit({'email':email,'role':'account'},'password_reset.requested','partner_user',user['id'],{'provider':settings.email_backend})
@@ -156,7 +181,8 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
             host=request.headers.get('host') or request.url.netloc
             link=f'{scheme}://{host}/customer-reset-password?token={raw}'
         else:
-            link=settings.password_reset_url+'?token='+raw
+            # Always a customer account here (see the role filter above).
+            link=customer_reset_url()+'?token='+raw
         message=get_email_service().send('password_reset',user['email'],'Reset your AnyAiCam password',f'An administrator started a password reset for your account. Use this one-hour link to set a new password:\n{link}',metadata={'expires_minutes':60,'initiated_by':'admin'})
         with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',user['email'],message['status'],settings.email_backend,json.dumps({'expires_minutes':60,'initiated_by':'admin'}),datetime.now().isoformat()))
         audit(identity,'customer_account.password_reset_initiated','partner_user',user_id,{'customer_id':customer_id,'provider':settings.email_backend})
@@ -234,10 +260,13 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
 
     @app.get('/forgot-password',response_class=HTMLResponse)
     def forgot_password_page():
-        content='''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Forgot password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="forgot-form" class="rule-form"><label>Account email<input id="forgot-email" type="email" required></label><button class="action-button">Prepare reset message</button></form><p class="health-detail">Local development writes the reset message to the email-preview folder. Production uses the configured email provider.</p></section>'''; scripts='''<script>const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v};document.getElementById('forgot-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/request',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({email:document.getElementById('forgot-email').value})}),r=await response.json();showToast(response.ok?r.message:(r.detail||'Request failed.'))})</script>'''; return shell('Forgot password','users',content,scripts)
+        content='''<header class="topbar"><div><p class="eyebrow">Account security</p><h1>Forgot password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="forgot-form" class="rule-form"><label>Account email<input id="forgot-email" type="email" required></label><button class="action-button">Prepare reset message</button></form><p class="health-detail">Local development writes the reset message to the email-preview folder. Production uses the configured email provider.</p></section>'''; scripts='''<script>const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v};document.getElementById('forgot-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/request',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({email:document.getElementById('forgot-email').value})}),r=await response.json().catch(()=>({}));showToast(response.ok?(r.message||'If the account exists, a password-reset message has been prepared.'):(r.detail||'Request failed. Please try again.'))})</script>'''; return shell('Forgot password','users',content,scripts)
 
     @app.post('/api/password-reset/complete')
-    def password_reset_complete(payload: dict):
+    def password_reset_complete(payload: dict,request: Request):
+        client_ip=(request.client.host if request.client else 'unknown')
+        if not _password_reset_complete_ip_limiter.allow(client_ip):
+            raise HTTPException(status_code=429,detail='Too many password reset attempts. Please wait a few minutes and try again.')
         password=str(payload.get('password',''))
         if len(password)<12: raise HTTPException(status_code=400,detail='Password must contain at least 12 characters.')
         role=consume_password_reset(str(payload.get('token','')),password)
@@ -284,7 +313,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         # logged is affected. Defaults masked (type="password") on load.
         # This page has one password field today (no separate confirm
         # field to mirror it onto).
-        content=f'''<style>.password-wrap{{position:relative}}.password-wrap input{{padding-right:5rem}}.show-password{{position:absolute;right:.4rem;top:.4rem;border:0;background:#edf1fa;border-radius:8px;padding:.48rem;cursor:pointer}}</style><header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<div class="password-wrap"><input id="reset-password" type="password" minlength="12" autocomplete="new-password" required><button id="show-password" class="show-password" type="button">Show</button></div></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v};document.getElementById('show-password').onclick=()=>{const input=document.getElementById('reset-password'),button=document.getElementById('show-password');input.type=input.type==='password'?'text':'password';button.textContent=input.type==='password'?'Show':'Hide'};document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json();showToast(r.message||r.detail);if(response.ok)setTimeout(()=>location.href=r.destination||'/partner.html',800)})</script>'''; return shell('Reset password','users',content,scripts)
+        content=f'''<style>.password-wrap{{position:relative}}.password-wrap input{{padding-right:5rem}}.show-password{{position:absolute;right:.4rem;top:.4rem;border:0;background:#edf1fa;border-radius:8px;padding:.48rem;cursor:pointer}}</style><header class="topbar"><div><p class="eyebrow">Account security</p><h1>Reset password</h1></div></header><section class="panel" style="max-width:520px;margin:auto"><form id="reset-form" class="rule-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<div class="password-wrap"><input id="reset-password" type="password" minlength="12" autocomplete="new-password" required><button id="show-password" class="show-password" type="button">Show</button></div></label><button class="action-button">Update password</button></form></section>'''; scripts='''<script>const csrf=()=>{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v};document.getElementById('show-password').onclick=()=>{const input=document.getElementById('reset-password'),button=document.getElementById('show-password');input.type=input.type==='password'?'text':'password';button.textContent=input.type==='password'?'Show':'Hide'};document.getElementById('reset-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/complete',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value})}),r=await response.json().catch(()=>({}));showToast(r.message||r.detail||'Password reset failed. Please try again.');if(response.ok)setTimeout(()=>location.href=r.destination||'/partner.html',800)})</script>'''; return shell('Reset password','users',content,scripts)
 
     # /forgot-password and /reset-password above render inside shell() --
     # the same dark Admin/Partner Portal chrome every /partner.html-side
@@ -307,7 +336,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Forgot password | ANY AI CAM</title><style>{_CUSTOMER_AUTH_STYLE}</style></head><body>
 <header class="head"><a class="brand" href="/customer-login.html"><img src="/static/brand-icon.png" alt="AnyAiCam">ANY AI CAM</a></header>
 <main class="auth-wrap"><section class="card"><h2>Forgot your password?</h2><p>Enter the email on your customer account and we'll prepare a reset link.</p><form id="forgot-form"><label>Email<input id="forgot-email" type="email" autocomplete="username" required></label><div id="message" class="message"></div><button class="submit">Send reset link</button></form><a class="back-link" href="/customer-login.html">Back to customer sign in</a></section></main>
-<script>const csrf=()=>{{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v}};document.getElementById('forgot-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/request',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':csrf()}},body:JSON.stringify({{email:document.getElementById('forgot-email').value}})}}),r=await response.json(),box=document.getElementById('message');box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed.');box.style.display='block'}});</script>
+<script>const csrf=()=>{{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v}};document.getElementById('forgot-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/request',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':csrf()}},body:JSON.stringify({{email:document.getElementById('forgot-email').value}})}}),r=await response.json().catch(()=>({{}})),box=document.getElementById('message');box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed. Please try again.');box.style.display='block'}});</script>
 </body></html>''')
 
     @app.get('/customer-reset-password',response_class=HTMLResponse)
@@ -316,7 +345,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reset password | ANY AI CAM</title><style>{_CUSTOMER_AUTH_STYLE}</style></head><body>
 <header class="head"><a class="brand" href="/customer-login.html"><img src="/static/brand-icon.png" alt="AnyAiCam">ANY AI CAM</a></header>
 <main class="auth-wrap"><section class="card"><h2>Reset your password</h2><form id="reset-form"><input id="reset-token" type="hidden" value="{safe_token}"><label>New password<input id="reset-password" type="password" minlength="12" autocomplete="new-password" required></label><div id="message" class="message"></div><button class="submit">Update password</button></form><a class="back-link" href="/customer-login.html">Back to customer sign in</a></section></main>
-<script>const csrf=()=>{{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v}};document.getElementById('reset-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/complete',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':csrf()}},body:JSON.stringify({{token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value}})}}),r=await response.json(),box=document.getElementById('message');box.textContent=r.message||r.detail;box.style.display='block';if(response.ok)setTimeout(()=>location.href='/customer-login.html',900)}});</script>
+<script>const csrf=()=>{{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v}};document.getElementById('reset-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/complete',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':csrf()}},body:JSON.stringify({{token:document.getElementById('reset-token').value,password:document.getElementById('reset-password').value}})}}),r=await response.json().catch(()=>({{}})),box=document.getElementById('message');box.textContent=r.message||r.detail||'Password reset failed. Please try again.';box.style.display='block';if(response.ok)setTimeout(()=>location.href='/customer-login.html',900)}});</script>
 </body></html>''')
 
     @app.get('/api/admin/audit-export')
