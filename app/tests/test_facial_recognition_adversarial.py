@@ -175,10 +175,12 @@ def test_no_known_field_is_interpolated_into_innerhtml_unescaped(raw_pattern):
 
 def test_event_id_path_param_is_html_escaped_before_use_in_attribute():
     text = _UI_SOURCE.read_text(encoding="utf-8")
-    assert 'data-event-id="{html.escape(event_id)}"' in text
+    # The attribute is built by concatenation now, not an f-string
+    # (2026-09-24 test update -- the escaping itself is unchanged).
+    assert 'data-event-id="' + "'''" + " + html.escape(event_id) + " + "'''" in text
 
 
-def test_reflected_event_id_in_match_detail_page_is_escaped(client):
+def test_reflected_event_id_in_match_detail_page_is_escaped(client, monkeypatch):
     """event_id is a raw URL path segment. A value containing HTML-
     meaningful characters must never appear unescaped in the response
     body's data-event-id attribute.
@@ -194,6 +196,10 @@ def test_reflected_event_id_in_match_detail_page_is_escaped(client):
     from urllib.parse import quote
 
     payload = '"><img src=x onerror=alert(1)>'
+    # Entitled to Face Access, so the match detail page (the code under
+    # test) renders instead of the subscription upsell -- without this the
+    # reflected event id never reaches the page at all (2026-09-24).
+    monkeypatch.setattr("analytics_entitlements.get_active_analytics_for_customer", lambda customer_id: ["facial_recognition"])
     response = client.get(f"/aac/events/{quote(payload, safe='')}", cookies=_cookies(_customer_viewer_cookie()))
     assert response.status_code == 200
     assert "<img src=x onerror=alert(1)>" not in response.text

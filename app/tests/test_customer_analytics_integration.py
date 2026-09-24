@@ -187,109 +187,112 @@ def test_camera_with_no_analytics_enabled_gets_the_simple_view(client):
     assert "display:none!important" not in response.text  # sidebar not hidden
 
 
-def test_camera_with_enabled_analytics_gets_the_panel_and_hides_the_sidebar(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion", "people_counting"])
-    with sqlite3.connect(db_path) as conn:
-        _seed_detection_event(conn, "evt-1", "cam-1", "smart_motion", 0.8, "2026-08-23T10:00:00")
+# The server-rendered "camera-analytics-panel" (file-based entitlements,
+# "Recent activity" rows) was replaced by the Focused Live View's
+# client-loaded analytics section (live-analytics-section), backed by
+# GET /api/customer/cameras/{id}/analytics and .../analytics/{key}/summary
+# and the database camera_analytics_entitlements table. These tests cover
+# that current design with the shapes the cloud actually stores
+# (2026-09-24: detections_json is the synced LIST, LPR rows are "plate",
+# People Counting is one people_counting_in/_out row per crossing, and
+# vehicles are stored as their specific class).
 
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+
+def _grant_db_entitlements(conn, camera_id, keys):
+    for key in keys:
+        conn.execute(
+            "INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) VALUES(?,?,'active','2026-01-01','2026-01-01')",
+            (camera_id, key),
+        )
+    conn.commit()
+
+
+def _seed_event(conn, event_id, camera_id, event_type, timestamp, detections=None, confidence=0.8, customer_id="cust-1"):
+    conn.execute(
+        "INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,"
+        "event_type,confidence,object_count,detections_json,event_timestamp,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, customer_id, "site-1", "appl-1", camera_id, event_id, event_type, confidence, 1,
+         json.dumps(detections) if detections is not None else None, timestamp, timestamp),
+    )
+    conn.commit()
+
+
+def _summary(client, key, camera_id="cam-1", customer_id="cust-1"):
+    return client.get(f"/api/customer/cameras/{camera_id}/analytics/{key}/summary", cookies={partner_portal.SESSION_COOKIE: _owner_cookie(customer_id)})
+
+
+def test_live_analytics_row_lists_every_analytic_and_flags_the_enabled_ones(client, db_path):
+    with sqlite3.connect(db_path) as conn:
+        _grant_db_entitlements(conn, "cam-1", ["smart_motion", "people_counting"])
+    response = client.get("/api/customer/cameras/cam-1/analytics", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert 'id="camera-analytics-panel"' in response.text
-    assert "display:none!important" in response.text  # sidebar hidden
-    assert "Smart Motion" in response.text
-    assert "People Counting" in response.text
+    rows = {item["key"]: item["enabled"] for item in response.json()["analytics"]}
+    assert rows["smart_motion"] is True and rows["people_counting"] is True
+    assert rows["lpr"] is False and rows["ppe"] is False and rows["facial_recognition"] is False
 
 
-def test_lpr_panel_omitted_entirely_when_no_plate_events_exist(client, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["lpr"])
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "License Plate Recognition" not in response.text
-
-
-def test_lpr_panel_shown_once_a_real_plate_event_exists(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["lpr"])
+def test_lpr_summary_counts_real_plate_events_without_claiming_plate_text(client, db_path):
     with sqlite3.connect(db_path) as conn:
-        _seed_detection_event(conn, "evt-plate", "cam-1", "plate", 0.6, "2026-08-23T10:00:00")
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "License Plate Recognition" in response.text
+        _seed_event(conn, "p1", "cam-1", "plate", "2026-08-23T10:00:00", confidence=0.87)
+        _seed_event(conn, "p2", "cam-1", "plate", "2026-08-23T09:00:00")
+    body = _summary(client, "lpr").json()
+    assert len(body["recent"]) == 2
+    assert body["latest_confidence"] == 0.87
+    assert body["latest_plate"] is None  # plate text stays on the appliance
 
 
-def test_ppe_panel_shows_violation_from_real_forwarded_detections(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["ppe_detection"])
+@pytest.mark.parametrize(("hard_hat", "vest", "expected"), [(False, True, "violation"), (True, True, "compliant")])
+def test_ppe_summary_reads_the_edges_own_decision(client, db_path, hard_hat, vest, expected):
     with sqlite3.connect(db_path) as conn:
-        _seed_ppe_event(conn, "evt-ppe", "cam-1", "2026-08-23T10:00:00", hard_hat=False, vest=False)
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "Violation" in response.text
+        _seed_ppe_event(conn, "ppe-1", "cam-1", "2026-08-23T10:00:00", hard_hat, vest)
+    body = _summary(client, "ppe").json()
+    assert body["latest_status"] == expected
+    assert body["recent"][0]["status"] == expected
 
 
-def test_ppe_panel_shows_compliant_from_real_forwarded_detections(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["ppe_detection"])
+def test_people_counting_summary_is_a_real_aggregate_of_crossings(client, db_path):
     with sqlite3.connect(db_path) as conn:
-        _seed_ppe_event(conn, "evt-ppe", "cam-1", "2026-08-23T10:00:00", hard_hat=True, vest=True)
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "Compliant" in response.text
+        _seed_event(conn, "pc-1", "cam-1", "people_counting_in", "2026-08-23T10:00:00")
+        _seed_event(conn, "pc-2", "cam-1", "people_counting_in", "2026-08-23T10:01:00")
+        _seed_event(conn, "pc-3", "cam-1", "people_counting_out", "2026-08-23T10:02:00")
+    body = _summary(client, "people_counting").json()
+    assert (body["entries"], body["exits"], body["latest_count"]) == (2, 1, 1)
 
 
-def test_people_counting_occupancy_is_a_real_aggregate_not_fake(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["people_counting"])
+def test_smart_motion_summary_includes_real_vehicle_classes_and_smart_motion_events(client, db_path):
     with sqlite3.connect(db_path) as conn:
-        import datetime as dt
-        today = dt.datetime.now().strftime("%Y-%m-%dT12:00:00")
-        _seed_detection_event(conn, "evt-in-1", "cam-1", "people_counting_in", 0.9, today, "in-1")
-        _seed_detection_event(conn, "evt-in-2", "cam-1", "people_counting_in", 0.9, today, "in-2")
-        _seed_detection_event(conn, "evt-out-1", "cam-1", "people_counting_out", 0.9, today, "out-1")
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "In 2 · Out 1 · Currently inside 1" in response.text
+        _seed_event(conn, "sm-1", "cam-1", "car", "2026-08-23T10:02:00")
+        _seed_event(conn, "sm-2", "cam-1", "smart_motion", "2026-08-23T10:01:00")
+        _seed_event(conn, "sm-3", "cam-1", "person", "2026-08-23T10:00:00")
+        _seed_event(conn, "sm-4", "cam-1", "ppe", "2026-08-23T09:00:00")  # a different analytic
+    types = [item["event_type"] for item in _summary(client, "smart_motion").json()["recent"]]
+    assert types == ["car", "smart_motion", "person"]
 
 
-def test_smart_alerts_panel_shows_real_notifications_for_this_camera(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
+def test_facial_summary_reads_the_synced_match_fields(client, db_path):
     with sqlite3.connect(db_path) as conn:
-        _seed_notification(conn, "notif-1", "cam-1", "smart_motion", "Smart Motion", "Smart Motion: person detected", "2026-08-23T10:00:00")
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "Smart Alerts" in response.text
-    assert "Smart Motion (" in response.text or "Smart Motion" in response.text
+        _seed_event(conn, "f-1", "cam-1", "facial_recognition", "2026-08-23T10:00:00",
+                    detections=[{"match_state": "known", "matched_person_name": "Alice"}])
+    body = _summary(client, "facial_recognition").json()
+    assert body["latest_state"] == "known"
+    assert body["recent"][0]["person"] == "Alice"
 
 
-def test_recent_activity_is_not_limited_to_the_last_hour(client, db_path, tmp_path, monkeypatch):
-    # Recent activity shows real history newest-first, not just the
-    # last hour -- a camera that's been quiet for a while should still
-    # show its real recent past instead of an empty section.
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
+def test_summaries_are_tenant_scoped(client, db_path):
     with sqlite3.connect(db_path) as conn:
-        import datetime as dt
-        old = (dt.datetime.now() - dt.timedelta(hours=5)).isoformat()
-        _seed_detection_event(conn, "evt-old", "cam-1", "person", 0.9, old)
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "Recent activity" in response.text
-    assert "No activity recorded yet" not in response.text
+        conn.execute("INSERT OR IGNORE INTO customers(id,partner_id,name,email,status,created_at) VALUES('cust-2','partner-1','Other','other@example.com','active','2026-01-01')")
+        conn.execute("INSERT OR IGNORE INTO partner_users(id,email,role,customer_id,password_hash,created_at) VALUES('user-2','owner-cust-2@example.test','customer_owner','cust-2','x','2026-01-01')")
+        conn.commit()
+        _seed_event(conn, "x-1", "cam-1", "person", "2026-08-23T10:00:00", customer_id="cust-2")
+    assert _summary(client, "smart_motion").json()["recent"] == []  # another customer's row on this camera id
+    assert _summary(client, "smart_motion", customer_id="cust-2").status_code == 404  # not their camera
 
 
-def test_recent_activity_honest_empty_state_with_no_events(client, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "No activity recorded yet for this camera" in response.text
-
-
-def test_recent_activity_rows_deep_link_to_playback_for_this_camera_and_time(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["smart_motion"])
-    with sqlite3.connect(db_path) as conn:
-        _seed_detection_event(conn, "evt-1", "cam-1", "person", 0.9, "2026-08-23T10:00:00")
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    # & is HTML-escaped to &amp; inside the href attribute (standard,
-    # correct HTML -- browsers decode it back to & on navigation).
-    assert "/playback?camera=cam-1&amp;t=2026-08-23T10%3A00%3A00" in response.text
-
-
-def test_ppe_and_lpr_summary_lines_are_also_clickable_playback_links(client, db_path, tmp_path, monkeypatch):
-    _grant_entitlements(monkeypatch, tmp_path, 1, ["ppe_detection", "lpr"])
-    with sqlite3.connect(db_path) as conn:
-        _seed_ppe_event(conn, "evt-ppe", "cam-1", "2026-08-23T10:00:00", hard_hat=True, vest=True)
-        _seed_detection_event(conn, "evt-plate", "cam-1", "plate", 0.6, "2026-08-23T11:00:00")
-    response = client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    # Two distinct deep links: one per real event, each to its own moment.
-    assert "t=2026-08-23T10%3A00%3A00" in response.text
-    assert "t=2026-08-23T11%3A00%3A00" in response.text
+def test_the_live_page_escapes_analytics_values_and_labels_every_analytic():
+    source = open(live_view_page.__file__, encoding="utf-8").read()
+    assert "function esc(value)" in source
+    assert "key==='facial_recognition'" in source
+    assert "${{data.latest_plate||" not in source  # never raw into innerHTML
 
 
 # --------------------------------------------------------- Playback deep-linking
@@ -301,7 +304,7 @@ def test_playback_preselects_the_camera_from_the_query_param(client, db_path):
     response = client.get("/playback?camera=cam-5&t=2026-08-23T10:00:00", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     assert 'class="playback-camera-tile active" data-camera-id="cam-5"' in response.text
-    assert 'const initialTimestamp="2026-08-23T10:00:00";' in response.text
+    assert 'const initialTimestampRaw="2026-08-23T10:00:00";' in response.text
 
 
 def test_playback_falls_back_to_first_camera_for_an_unknown_camera_param(client):
@@ -314,7 +317,7 @@ def test_playback_without_query_params_behaves_exactly_as_before(client):
     response = client.get("/playback", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     assert 'class="playback-camera-tile active" data-camera-id="cam-1"' in response.text
-    assert "const initialTimestamp=null;" in response.text
+    assert "const initialTimestampRaw=null;" in response.text
 
 
 def test_camera_5_naturally_falls_into_the_no_analytics_case(client):
