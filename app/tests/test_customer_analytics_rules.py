@@ -18,6 +18,7 @@ matters -- TrustedHostMiddleware) and partner_portal._token() cookie
 helper.
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -343,7 +344,8 @@ def test_the_analytics_rules_page_renders_for_an_authorized_owner(http_client, d
     response = http_client.get("/customer/cameras/cam-1/analytics-rules", cookies=cookies)
     assert response.status_code == 200
     assert "Driveway" in response.text
-    assert "edge worker" in response.text  # the explicit no-execution-yet disclosure
+    assert "checked there" in response.text and "does not yet trigger" not in response.text  # rules are evaluated now (2026-09-25)
+    assert 'value="people_counting"' in response.text
 
 
 def test_the_analytics_rules_page_redirects_a_non_customer_role(http_client, db_path):
@@ -461,3 +463,83 @@ def test_the_real_execution_path_now_exists_exactly_where_expected(monkeypatch):
     assert "customer_analytics_rules" in inspect.getsource(appliance_cloud)
     assert "customer_analytics_rules" in inspect.getsource(edge_camera_sync._reconcile_analytics_rules)
     assert "customer_analytics_rules" in inspect.getsource(customer_analytics_rule_worker.load_rules_for_camera)
+
+
+# ------------------------------------------------------------- People Counting line (2026-09-25)
+
+COUNT_LINE = {"rule_type": "people_counting", "name": "Front door count", "direction": "both",
+              "geometry": [{"x": 0.5, "y": 0.1}, {"x": 0.5, "y": 0.9}]}
+
+
+def _owner_with_camera(db_path, camera_id="cam-1", customer_id="cust-1", camera_number=1):
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, customer_id)
+    _seed_camera(conn, camera_id, customer_id=customer_id, camera_number=camera_number)
+    conn.commit()
+    conn.close()
+    return {partner_portal.SESSION_COOKIE: _owner_cookie(customer_id)}
+
+
+def test_owner_can_place_a_people_counting_line(http_client, db_path):
+    cookies = _owner_with_camera(db_path)
+    response = http_client.post(_rules_url("cam-1"), json=dict(COUNT_LINE, direction="inbound"), cookies=cookies)
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["rule_type"], body["direction"], len(body["geometry"])) == ("people_counting", "inbound", 2)
+
+
+def test_a_camera_has_one_people_counting_line_which_is_edited_not_duplicated(http_client, db_path):
+    cookies = _owner_with_camera(db_path)
+    rule_id = http_client.post(_rules_url("cam-1"), json=COUNT_LINE, cookies=cookies).json()["id"]
+    second = http_client.post(_rules_url("cam-1"), json=dict(COUNT_LINE, name="Another"), cookies=cookies)
+    assert second.status_code == 409 and "already has a people counting line" in second.json()["detail"]
+    moved = http_client.put(_rules_url("cam-1", rule_id), json={"geometry": [{"x": 0.2, "y": 0.5}, {"x": 0.8, "y": 0.5}]}, cookies=cookies)
+    assert moved.status_code == 200 and moved.json()["geometry"][0] == {"x": 0.2, "y": 0.5}
+    assert http_client.post(_rules_url("cam-1"), json=dict(LINE, name="alert line"), cookies=cookies).status_code == 200  # alert lines are separate
+
+
+@pytest.mark.parametrize("geometry,fragment", [
+    ([{"x": 0.5, "y": 0.1}], "exactly 2 points"),
+    ([{"x": 0.5, "y": 0.5}, {"x": 0.5, "y": 0.5}], "2 different points"),
+])
+def test_a_people_counting_line_needs_two_distinct_points(http_client, db_path, geometry, fragment):
+    cookies = _owner_with_camera(db_path)
+    response = http_client.post(_rules_url("cam-1"), json=dict(COUNT_LINE, geometry=geometry), cookies=cookies)
+    assert response.status_code == 400 and fragment in response.json()["detail"]
+
+
+def _seed_count_line(db_path, camera_id, *, rule_id="pc-1", enabled=1, direction="outbound", geometry=None):
+    geometry = geometry or [{"x": 0.3, "y": 0.2}, {"x": 0.3, "y": 0.8}]
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at,created_by) "
+        "VALUES(?,?,?,?,?,'people_counting','Door',?,?,?,'2026-09-25T00:00:00','2026-09-25T00:00:00',NULL)",
+        (rule_id, "cust-1", "site-1", "appl-1", camera_id, direction, json.dumps(geometry), enabled),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_people_counting_uses_the_customer_line_first_and_the_legacy_file_as_fallback(http_client, db_path, monkeypatch, tmp_path):
+    import recording_uploader
+    legacy = tmp_path / "analytics_rules.json"
+    legacy.write_text(json.dumps([{"id": "legacy-1", "analytic_type": "line_crossing", "camera": 7, "enabled": True,
+                                   "direction": "both", "geometry": [{"x": 0.1, "y": 0.5}, {"x": 0.9, "y": 0.5}]}]))
+    monkeypatch.setattr(main, "ANALYTICS_RULES_FILE", legacy)
+    identities = {7: {"camera_id": "cam-7"}, 8: {"camera_id": "cam-8"}}
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda n: identities.get(n))
+    assert main._load_people_counting_rule(7)["id"] == "legacy-1"  # no customer line yet: existing line keeps counting
+    _seed_count_line(db_path, "cam-7")
+    rule = main._load_people_counting_rule(7)
+    assert (rule["id"], rule["direction"], rule["source"]) == ("pc-1", "outbound", "customer")
+    assert main._load_people_counting_rule(8) is None  # another camera's line is never borrowed
+
+
+def test_a_disabled_customer_counting_line_falls_back_and_never_crashes(http_client, db_path, monkeypatch, tmp_path):
+    import recording_uploader
+    monkeypatch.setattr(main, "ANALYTICS_RULES_FILE", tmp_path / "missing.json")
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda n: {"camera_id": "cam-9"})
+    _seed_count_line(db_path, "cam-9", enabled=0)
+    assert main._load_people_counting_rule(9) is None
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda n: None)
+    assert main._load_people_counting_rule(9) is None  # unknown camera: no line, no guess

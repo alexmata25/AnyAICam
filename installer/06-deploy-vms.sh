@@ -93,6 +93,22 @@ ensure_vms_env() {
     grep -q '^ANYAICAM_LIVE_RELAY_ENABLED=' "$VMS_ENV_FILE" 2>/dev/null || \
         printf '%s\n' 'ANYAICAM_LIVE_RELAY_ENABLED=false' >> "$VMS_ENV_FILE"
 
+    # On-device analytics workers whose code default is off (2026-09-25).
+    # Advanced Analytics grants People Counting and LPR per camera from the
+    # cloud (cameras.<analytic>_enabled), but these appliance-wide switches
+    # defaulted to false and nothing set them, so a fresh appliance never
+    # ran either analytic even for a paying customer. Each worker still
+    # does nothing for a camera without that camera's entitlement (and,
+    # for People Counting / zones / alert lines, a customer-drawn line or
+    # zone). Add-if-missing, like every default here: an explicit value,
+    # true or false, is never changed. Facial recognition stays an
+    # explicit opt-in (biometric processing), not an installer default.
+    local analytics_flag
+    for analytics_flag in ANYAICAM_LPR_ENABLED PEOPLE_COUNTING_ENABLED CUSTOMER_ANALYTICS_RULES_ENABLED; do
+        grep -q "^${analytics_flag}=" "$VMS_ENV_FILE" 2>/dev/null || \
+            printf '%s=true\n' "$analytics_flag" >> "$VMS_ENV_FILE"
+    done
+
     # Generated once, per appliance, the first time this file has no
     # value yet -- and, like ANYAICAM_ENV/ANYAICAM_RUNTIME_ROLE above
     # (never like the always-refreshed build-identity keys below), NEVER

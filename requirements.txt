@@ -10,6 +10,9 @@ python-multipart==0.0.20
 itsdangerous==2.2.0
 ultralytics==8.3.40
 opencv-python==4.10.0.84
+# Face Access production engine (facial_engine_onnx.py); imported only when
+# ANYAICAM_FACE_ENGINE selects an ONNX engine. Verified with numpy 1.26.4.
+onnxruntime==1.19.2
 numpy==1.26.4
 pywebpush==2.0.3
 pytesseract==0.3.13

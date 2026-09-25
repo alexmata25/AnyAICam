@@ -243,7 +243,39 @@ def sync_facial_directory() -> dict:
         # An older cloud sends no directory_version: stay unconditional.
         _applied_directory.update(customer_id=customer_id, version=version, applied_at=time.monotonic() if version else None)
     summary["status"] = "synced"
+    summary.update(engine_compatibility(response.get("embeddings")))
     return summary
+
+
+def _active_engine_key() -> tuple[str, str]:
+    import facial_recognition
+    engine = facial_recognition.get_engine()
+    return str(getattr(engine, "name", "unknown")), str(getattr(engine, "version", "0"))
+
+
+def engine_compatibility(embeddings, active: tuple[str, str] | None = None) -> dict:
+    """How many synced enrollment embeddings this appliance's active face
+    engine can actually match against. Matching only ever compares
+    embeddings from the same engine and version, so enrollments made on a
+    cloud running a different engine (e.g. Haar there, ArcFace here, or
+    the reverse after switching ANYAICAM_FACE_ENGINE on one side only)
+    sync fine but can never produce a known match -- previously with no
+    sign of it anywhere. Read-only; never changes or deletes enrollments."""
+    items = [item for item in embeddings or [] if isinstance(item, dict)]
+    if not items:
+        return {"embeddings_for_active_engine": 0}
+    active = active or _active_engine_key()
+    matching = sum(1 for item in items if (str(item.get("engine") or ""), str(item.get("engine_version") or "")) == active)
+    result = {"active_engine": f"{active[0]}/{active[1]}", "embeddings_for_active_engine": matching}
+    if matching == 0:
+        enrolled_with = sorted({f"{item.get('engine')}/{item.get('engine_version') or ''}" for item in items})
+        result.update(engine_mismatch=True, enrolled_engines=enrolled_with)
+        logger.warning(
+            "facial_embedding_sync.no_enrollments_for_active_engine active=%s enrolled_with=%s -- "
+            "known people cannot be recognized until they are enrolled with the active engine",
+            result["active_engine"], ",".join(enrolled_with),
+        )
+    return result
 
 
 async def facial_embedding_sync_worker() -> None:

@@ -62,6 +62,17 @@ class CountingLine:
         p1, p2 = geometry[0], geometry[1]
         return cls(x1=float(p1["x"]), y1=float(p1["y"]), x2=float(p2["x"]), y2=float(p2["y"]), direction=direction)
 
+    def counts(self, crossing: str) -> bool:
+        """Whether this line's direction filter counts a crossing ('in' or
+        'out'). The stored rule vocabulary is 'inbound'/'outbound', while
+        a crossing is 'in'/'out' -- comparing the two directly meant an
+        inbound-only or outbound-only line never counted anything."""
+        wanted = _DIRECTION_FILTER.get(self.direction, self.direction)
+        return wanted == "both" or wanted == crossing
+
+
+_DIRECTION_FILTER = {"inbound": "in", "outbound": "out", "both": "both", "": "both", None: "both"}
+
 
 def _line_cross_value(line: CountingLine, x: float, y: float) -> float:
     """Raw signed cross-product distance of (x, y) from the line -- the
@@ -475,7 +486,7 @@ class PeopleCounter:
                         crossing_reason = "side_changed_but_recross_cooldown_active"
                     else:
                         direction = "in" if new_side < 0 else "out"
-                        if self.line.direction in ("both", direction):
+                        if self.line.counts(direction):
                             events.append(CrossingEvent(track_id=tid, direction=direction, frame_index=self.frame_index, x=cross_x, y=cross_y))
                             if direction == "in":
                                 self.in_count += 1
