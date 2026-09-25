@@ -128,6 +128,10 @@ LIVE_P2P_ENABLED = product_mode.resolve_cloud_flag("ANYAICAM_LIVE_P2P_ENABLED")
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR = Path(os.environ.get("ANYAICAM_STATE_DIR", "/var/lib/anyaicam"))
 CREDENTIAL_FILE = STATE_DIR / "credential.json"
+# Host LAN addresses written by the appliance agent (lan_addresses.py) --
+# advertised to browsers as extra ICE candidates so a viewer on the same
+# LAN reaches MediaMTX directly instead of falling back to the relay.
+LAN_ADDRESSES_FILE = STATE_DIR / "lan_addresses.json"
 
 MEDIAMTX_BINARY = os.environ.get("ANYAICAM_MEDIAMTX_BINARY", "/opt/anyaicam/mediamtx/mediamtx").strip()
 # NOT under STATE_DIR (/var/lib/anyaicam) -- confirmed live on Ryzen that
@@ -325,6 +329,9 @@ def render_mediamtx_config() -> str:
         "webrtcAddress: 127.0.0.1:8889",
         "webrtcLocalUDPAddress: :8189",
     ]
+    hosts = advertised_hosts()
+    if hosts:
+        lines.append("webrtcAdditionalHosts: [" + ", ".join(_yaml_quote(h) for h in hosts) + "]")
     ice_servers = _ice_server_entries()
     if ice_servers:
         lines.append("webrtcICEServers2:")
@@ -339,9 +346,53 @@ def render_mediamtx_config() -> str:
     return "\n".join(lines) + "\n"
 
 
+def advertised_hosts() -> list[str]:
+    """The agent's host LAN addresses, re-validated here: only RFC1918
+    IPv4 or Tailscale (100.64.0.0/10) addresses, at most 8. A
+    missing/invalid file means none -- behaviour is then exactly as before
+    (STUN candidates only)."""
+    import ipaddress
+    try:
+        raw = json.loads(LAN_ADDRESSES_FILE.read_text(encoding="utf-8")).get("addresses") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+    allowed = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+    hosts = []
+    for value in raw if isinstance(raw, list) else []:
+        try:
+            address = ipaddress.ip_address(str(value))
+        except ValueError:
+            continue
+        if address.version == 4 and any(address in net for net in allowed):
+            hosts.append(str(address))
+    return list(dict.fromkeys(hosts))[:8]
+
+
+# What the running MediaMTX currently advertises; [] (none) until a file
+# with real addresses appears, so a missing file never triggers an API call.
+_applied_hosts: list[str] | None = []
+
+
+def sync_additional_hosts() -> None:
+    """Applies a changed host-address list to the running MediaMTX through
+    its loopback config API -- no restart, so no live session is dropped."""
+    global _applied_hosts
+    hosts = advertised_hosts()
+    if hosts == _applied_hosts:
+        return
+    status, _ = _config_request("PATCH", "/v3/config/global/patch", {"webrtcAdditionalHosts": hosts})
+    if status in (200, 204):
+        _applied_hosts = hosts
+        logger.info("webrtc_publisher.additional_hosts_applied count=%s", len(hosts))
+    else:
+        logger.warning("webrtc_publisher.additional_hosts_patch_failed status=%s", status)
+
+
 def _write_mediamtx_config() -> None:
+    global _applied_hosts
     MEDIAMTX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     MEDIAMTX_CONFIG_PATH.write_text(render_mediamtx_config(), encoding="utf-8")
+    _applied_hosts = advertised_hosts()  # a fresh MediaMTX starts with exactly these
 
 
 def _mediamtx_alive() -> bool:
@@ -755,6 +806,7 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
                 if now - last_config_refresh >= CONFIG_REFRESH_SECONDS:
                     await asyncio.to_thread(_refresh_camera_map)
                     await asyncio.to_thread(sync_camera_paths, camera_url_fn)
+                    await asyncio.to_thread(sync_additional_hosts)
                     last_config_refresh = now
                 long_poll_honored = bool(await _bridge_tick(camera_url_fn))
                 webrtc_publisher_state["last_scan_at"] = time.time()

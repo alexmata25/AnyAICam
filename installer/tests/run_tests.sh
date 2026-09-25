@@ -1180,5 +1180,45 @@ assert_exit "run_validate() wraps the /version check in the startup wait" 0 \
     grep -q 'check "VMS /version reports exact approved commit" retry_until_vms_started version_reports_release' "$INSTALLER_DIR/validate.sh"
 
 echo
+echo "== WebRTC media port restriction (runtime/anyaicam-webrtc-firewall) =="
+# 2026-09-25: UDP 8189 is published for LAN WebRTC viewers. Docker-published
+# ports bypass UFW, so the restriction lives in Docker's DOCKER-USER chain.
+# A stub iptables records every call and remembers appended/inserted rules
+# so -C (check) behaves like the real thing; nothing touches real netfilter.
+FW="$INSTALLER_DIR/runtime/anyaicam-webrtc-firewall"
+IPT_STATE="$FIXTURE_ROOT/ipt-rules"; IPT_STUB="$FIXTURE_ROOT/stub-iptables"
+cat > "$IPT_STUB" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == "-w" ]] && shift
+state="$IPT_STATE"; touch "$state"
+op="$1"; shift
+case "$op" in
+  -N) grep -qx "chain $1" "$state" && exit 1; echo "chain $1" >> "$state" ;;
+  -F) grep -v "^rule $1 " "$state" > "$state.tmp" || true; mv "$state.tmp" "$state" ;;
+  -A|-I) chain="$1"; shift; [[ "$op" == "-I" && "$1" =~ ^[0-9]+$ ]] && shift; echo "rule $chain $*" >> "$state" ;;
+  -C) chain="$1"; shift; grep -qxF "rule $chain $*" "$state" ;;
+  *) exit 2 ;;
+esac
+STUB
+chmod +x "$IPT_STUB"
+export IPT_STATE
+rm -f "$IPT_STATE"
+assert_exit "check FAILS before any rule exists" 1 env ANYAICAM_IPTABLES="$IPT_STUB" bash "$FW" check
+assert_exit "apply succeeds" 0 env ANYAICAM_IPTABLES="$IPT_STUB" bash "$FW" apply
+assert_exit "apply is idempotent (second run)" 0 env ANYAICAM_IPTABLES="$IPT_STUB" bash "$FW" apply
+assert_exit "check passes after apply" 0 env ANYAICAM_IPTABLES="$IPT_STUB" bash "$FW" check
+assert_eq "the DOCKER-USER jump for udp/8189 exists exactly once" "1" "$(grep -c '^rule DOCKER-USER -p udp -m conntrack --ctorigdstport 8189 --ctdir ORIGINAL -j ANYAICAM-WEBRTC$' "$IPT_STATE")"
+assert_eq "chain order: wg drop, 4 private/Tailscale allows, final drop"   "-i wg+ -j DROP|-s 10.0.0.0/8 -j RETURN|-s 172.16.0.0/12 -j RETURN|-s 192.168.0.0/16 -j RETURN|-s 100.64.0.0/10 -j RETURN|-j DROP"   "$(grep '^rule ANYAICAM-WEBRTC ' "$IPT_STATE" | sed 's/^rule ANYAICAM-WEBRTC //' | paste -sd'|')"
+assert_eq "no public range is ever allowed" "0" "$(grep -c -- '-s 0.0.0.0/0' "$IPT_STATE")"
+assert_exit "compose publishes the WebRTC port on IPv4, UDP only" 0 grep -q '^    - 0.0.0.0:8189:8189/udp$' "$INSTALLER_DIR/../docker-compose.yml"
+assert_eq "compose publishes nothing else new (8000/tcp + 8189/udp only)" "2" "$(grep -cE '^    - (0\.0\.0\.0:)?[0-9]+:[0-9]+' "$INSTALLER_DIR/../docker-compose.yml")"
+assert_exit "firewall unit runs Before=docker.service (no boot-time exposure window)" 0 grep -q '^Before=docker.service anyaicam-vms.service$' "$INSTALLER_DIR/runtime/anyaicam-webrtc-firewall.service"
+assert_exit "VMS unit wants and orders after the firewall unit" 0 grep -q '^Wants=network-online.target anyaicam-webrtc-firewall.service$' "$INSTALLER_DIR/runtime/anyaicam-vms.service"
+assert_exit "install.sh applies the restriction before (re)starting the VMS" 0   bash -c "grep -n 'install_webrtc_firewall\|^    systemd_setup' '$INSTALLER_DIR/install.sh' | tail -2 | head -1 | grep -q install_webrtc_firewall"
+assert_exit "the installer refuses to continue if the restriction does not verify" 0 grep -q 'refusing to publish UDP 8189' "$INSTALLER_DIR/11-webrtc-firewall.sh"
+assert_exit "validate.sh checks the restriction" 0 grep -q 'WebRTC media port (UDP 8189) is restricted to private/Tailscale sources' "$INSTALLER_DIR/validate.sh"
+assert_exit "the release builder packages the firewall step" 0 grep -q '"11-webrtc-firewall.sh",' "$INSTALLER_DIR/build_release_installer.py"
+
+echo
 echo "== summary: $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]
