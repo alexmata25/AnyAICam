@@ -22,7 +22,7 @@ from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 
-from customer_analytics_panel import ANALYTIC_LABELS, _parse_detections, _ppe_status, epoch_ms
+from customer_analytics_panel import ANALYTIC_LABELS, _parse_detections, _ppe_status, epoch_ms, real_confidence
 from partner_db import connection
 
 TABS = ("smart_motion", "people_counting", "lpr", "ppe", "facial_recognition")
@@ -72,12 +72,12 @@ def _row_details(key: str, row: dict) -> dict:
     return {"object_count": row.get("object_count")}
 
 
-def _confidence(key: str, value):
-    # PPE rows carry a placeholder 0.0, and people-counting crossings have
-    # no meaningful score -- showing either would be misleading.
-    if key in ("ppe", "people_counting") or value is None:
+def _confidence(key: str, event_type: str, value):
+    # PPE rows carry a placeholder 0.0 and people-counting crossings no
+    # meaningful score; motion rows a raw motion score, not a probability.
+    if key in ("ppe", "people_counting"):
         return None
-    return value
+    return real_confidence(event_type, value)
 
 
 def _result_clause(key: str, result: str) -> tuple[str, list]:
@@ -132,7 +132,7 @@ def query_events(*, customer_id: str, camera_ids: list[str], key: str, start_ms:
     events = []
     for row in rows:
         item = {"event_id": row["id"], "camera_id": row["camera_id"], "event_type": row["event_type"],
-                "timestamp_ms": epoch_ms(row["event_timestamp"]), "confidence": _confidence(key, row["confidence"]),
+                "timestamp_ms": epoch_ms(row["event_timestamp"]), "confidence": _confidence(key, row["event_type"], row["confidence"]),
                 "has_clip": bool(row["has_clip"]), "has_thumbnail": bool(row["has_thumbnail"]),
                 "details": _row_details(key, row)}
         if _post_filter(key, result, item):
@@ -243,6 +243,7 @@ def render_page(request: Request, cameras: list[dict], page_shell: Callable) -> 
 .analytics-tabs{{margin:0 0 14px}}
 .analytics-filters{{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin-bottom:14px}}
 .analytics-filter{{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}}
+.analytics-filter[hidden]{{display:none}}
 .analytics-filter select,.analytics-filter input{{min-height:38px;padding:7px 10px;border:1px solid rgba(170,196,207,.3);border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:14px}}
 .analytics-stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}}
 .analytics-stat{{padding:14px 16px;border:1px solid rgba(170,196,207,.18);border-radius:12px;background:rgba(24,33,50,.94)}}

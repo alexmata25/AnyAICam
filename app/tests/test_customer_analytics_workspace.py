@@ -56,7 +56,7 @@ def client(db_path):
         conn.execute("INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) VALUES('cam-a','smart_motion','active','x','x')")
         _event(conn, "sm-1", "cust-1", "cam-a", "person", "2026-09-25T10:00:00", 0.54, clip=True, thumb=True)
         _event(conn, "sm-2", "cust-1", "cam-b", "car", "2026-09-25T11:00:00", 0.9)
-        _event(conn, "sm-3", "cust-1", "cam-a", "motion", "2026-09-25T12:00:00", None)
+        _event(conn, "sm-3", "cust-1", "cam-a", "motion", "2026-09-25T12:00:00", 25.4)  # raw motion score, not a probability
         _event(conn, "sm-old", "cust-1", "cam-a", "person", "2026-09-20T12:00:00", 0.7)
         _event(conn, "sm-other", "cust-2", "cam-x", "person", "2026-09-25T10:30:00", 0.99)
         _event(conn, "pc-1", "cust-1", "cam-a", "people_counting_in", "2026-09-25T09:10:00", 0.0)
@@ -170,3 +170,15 @@ def test_workspace_script_is_valid_javascript(client, tmp_path):
     path.write_text(script, encoding="utf-8")
     result = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_motion_scores_and_placeholders_are_never_shown_as_confidence(client):
+    events = {e["event_id"]: e for e in _get(client, "smart_motion").json()["events"]}
+    assert events["sm-3"]["confidence"] is None  # stored 25.4 would render as "2540%"
+    assert events["sm-2"]["confidence"] == 0.9
+
+
+def test_hidden_filters_stay_hidden(client):
+    html = client.get("/analytics", cookies=_cookie()).text
+    assert ".analytics-filter[hidden]{display:none}" in html
+    assert 'id="analytics-from-wrap" hidden' in html and 'id="analytics-to-wrap" hidden' in html

@@ -107,3 +107,11 @@ def test_zero_license_message_directly(db_path, client):
         from partner_db import connection
         with connection() as db, pytest.raises(cap.LicenseLimitExceeded, match="not part of your plan for this site yet"):
             cap.assign_entitlement(db, "cam-cust-1", "lpr", now="2026-09-25T00:00:00")
+
+
+def test_real_confidence_rejects_scores_and_placeholders():
+    assert cap.real_confidence("person", 0.54) == 0.54
+    assert cap.real_confidence("motion", 0.5) is None
+    assert cap.real_confidence("car", 25.4) is None
+    assert cap.real_confidence("ppe", 0.0) is None
+    assert cap.summarize("smart_motion", [{"id": "m", "event_type": "motion", "confidence": 18.5, "event_timestamp": T}])["recent"][0]["confidence"] is None

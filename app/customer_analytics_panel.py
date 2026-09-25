@@ -315,6 +315,23 @@ def epoch_ms(raw_timestamp) -> int | None:
     return int(dt.timestamp() * 1000)
 
 
+MOTION_EVENT_TYPES = frozenset({"motion", "smart_motion"})
+
+
+def real_confidence(event_type, value):
+    """A detection confidence only when it is one: a 0-1 probability from an
+    object/face/plate model. Motion rows store a raw motion score (e.g.
+    25.4) and PPE/people-counting rows a placeholder 0.0 -- neither may be
+    shown to a customer as a percentage."""
+    if value is None or str(event_type or "").lower() in MOTION_EVENT_TYPES:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0 < number <= 1 else None
+
+
 def event_ref(item: dict) -> dict:
     """What the Live analytics panel needs to link a result to its event
     (2026-09-25): the stored detection_events id, a viewer-local-ready
@@ -401,7 +418,7 @@ def summarize_ppe(events: list[dict]) -> dict:
         {
             "status": _ppe_status(_parse_detections(item.get("detections_json"))),
             "timestamp": item.get("event_timestamp"),
-            "confidence": item.get("confidence"),
+            "confidence": None,  # PPE rows carry a placeholder 0.0
             **event_ref(item),
         }
         for item in events[:10]
@@ -432,7 +449,7 @@ def summarize_smart_motion(events: list[dict]) -> dict:
         {
             "event_type": item.get("event_type"),
             "timestamp": item.get("event_timestamp"),
-            "confidence": item.get("confidence"),
+            "confidence": real_confidence(item.get("event_type"), item.get("confidence")),
             "thumbnail": _parse_detections(item.get("detections_json")).get("thumbnail"),
             **event_ref(item),
         }
