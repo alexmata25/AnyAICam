@@ -59,3 +59,38 @@ preflight_checks() {
     fi
     log "Preflight OK: Ubuntu $os_version, $arch, ${vcpu} vCPU, $((mem_kib / 1024 / 1024)) GiB RAM"
 }
+
+# WebRTC media port (2026-09-25): the VMS publishes UDP 8189 for same-LAN
+# WebRTC viewers (MediaMTX). If another program on the host already holds
+# that port, `docker compose up` would fail AFTER the VMS was stopped for
+# the update -- so a conflict is refused here, before anything changes.
+# Our own publish is not a conflict: on a repair of an appliance already
+# publishing it, the only listener is Docker's docker-proxy for the
+# anyaicam-vms container.
+WEBRTC_UDP_PORT="${WEBRTC_UDP_PORT:-8189}"
+
+webrtc_udp_listeners() {
+    ss -H -u -l -n -p "sport = :$WEBRTC_UDP_PORT" 2>/dev/null
+}
+
+webrtc_port_published_by_vms() {
+    docker port anyaicam-vms "$WEBRTC_UDP_PORT/udp" 2>/dev/null | grep -q ":$WEBRTC_UDP_PORT\$"
+}
+
+webrtc_port_preflight() {
+    local listeners foreign
+    listeners="$(webrtc_udp_listeners)"
+    if [[ -z "$listeners" ]]; then
+        log "Preflight OK: UDP $WEBRTC_UDP_PORT (WebRTC media) is free"
+        return 0
+    fi
+    foreign="$(grep -v '"docker-proxy"' <<< "$listeners" || true)"
+    if [[ -z "$foreign" ]] && webrtc_port_published_by_vms; then
+        log "Preflight OK: UDP $WEBRTC_UDP_PORT is already published by this appliance's own VMS container"
+        return 0
+    fi
+    echo "[ERROR] UDP port $WEBRTC_UDP_PORT (WebRTC media for same-LAN live view) is already in use on this host:" >&2
+    echo "$listeners" >&2
+    echo "Stop or reconfigure the program using it, then re-run the installer. Nothing has been changed." >&2
+    return 1
+}
