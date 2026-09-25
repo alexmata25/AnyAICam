@@ -1220,5 +1220,42 @@ assert_exit "validate.sh checks the restriction" 0 grep -q 'WebRTC media port (U
 assert_exit "the release builder packages the firewall step" 0 grep -q '"11-webrtc-firewall.sh",' "$INSTALLER_DIR/build_release_installer.py"
 
 echo
+echo "== UDP 8189 port-conflict preflight (01-preflight.sh) and validation =="
+# `ss` and `docker port` are shadowed; SS_MOCK is the listener list (one
+# line per socket, as `ss -H -u -l -n -p` prints it) and VMS_PUBLISHES_8189
+# says whether the anyaicam-vms container publishes udp/8189.
+ss() { printf '%s' "${SS_MOCK:-}"; }
+docker() {
+    if [[ "$1" == "port" && "$2" == "anyaicam-vms" ]]; then
+        [[ "${VMS_PUBLISHES_8189:-no}" == "yes" ]] && { echo "0.0.0.0:8189"; return 0; }
+        return 1
+    fi
+    return 0
+}
+PROXY='UNCONN 0 0 0.0.0.0:8189 0.0.0.0:* users:(("docker-proxy",pid=4242,fd=4))'
+FOREIGN='UNCONN 0 0 0.0.0.0:8189 0.0.0.0:* users:(("some-other-app",pid=777,fd=9))'
+SS_MOCK=""; VMS_PUBLISHES_8189=no
+assert_exit "a free UDP 8189 passes the preflight (clean install)" 0 webrtc_port_preflight
+SS_MOCK="$FOREIGN"; VMS_PUBLISHES_8189=no
+assert_exit "another program holding UDP 8189 FAILS the preflight" 1 webrtc_port_preflight
+assert_eq "the conflict message names the port and the holder" "1" "$( (webrtc_port_preflight 2>&1 >/dev/null) | grep -c 'some-other-app' )"
+SS_MOCK="$PROXY"; VMS_PUBLISHES_8189=yes
+assert_exit "the appliance's own VMS publish passes (repair of an already-updated appliance)" 0 webrtc_port_preflight
+SS_MOCK="$PROXY"; VMS_PUBLISHES_8189=no
+assert_exit "a docker-proxy that is NOT the VMS container's publish FAILS" 1 webrtc_port_preflight
+SS_MOCK="$PROXY"$'\n'"$FOREIGN"; VMS_PUBLISHES_8189=yes
+assert_exit "our docker-proxy plus a foreign listener FAILS" 1 webrtc_port_preflight
+SS_MOCK="$PROXY"; VMS_PUBLISHES_8189=yes
+assert_exit "validate: VMS publishes 8189 and nothing else holds it -> PASS" 0 webrtc_port_owned_by_vms
+SS_MOCK=""; VMS_PUBLISHES_8189=no
+assert_exit "validate: the VMS container does not publish 8189 -> FAIL" 1 webrtc_port_owned_by_vms
+SS_MOCK="$PROXY"$'\n'"$FOREIGN"; VMS_PUBLISHES_8189=yes
+assert_exit "validate: something besides the VMS holds 8189 -> FAIL" 1 webrtc_port_owned_by_vms
+unset -f ss docker
+assert_exit "install.sh runs the port preflight right after preflight_checks, before anything is changed" 0 \
+  bash -c "grep -A1 '^    preflight_checks\$' '$INSTALLER_DIR/install.sh' | grep -q '^    webrtc_port_preflight\$' && [ \$(grep -n '^    webrtc_port_preflight\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) -lt \$(grep -n '^    docker_setup\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) ]"
+assert_exit "validate.sh runs the port-ownership check" 0 grep -q 'check "WebRTC media port (UDP 8189) is published by the VMS container and by nothing else" webrtc_port_owned_by_vms' "$INSTALLER_DIR/validate.sh"
+
+echo
 echo "== summary: $PASS passed, $FAIL failed =="
 [[ "$FAIL" -eq 0 ]]

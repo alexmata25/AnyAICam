@@ -133,6 +133,7 @@ run_install() {
     load_release_metadata
     log "AnyAiCam appliance installer v$INSTALLER_VERSION starting (requested mode=$mode, VMS=$VMS_RELEASE_COMMIT)"
     preflight_checks
+    webrtc_port_preflight
     detect_install_state
     if [[ "$mode" == "install" && "$INSTALL_STATE" == "partial" ]]; then
         log "Partial installation detected -- treating as repair, never silently as clean."

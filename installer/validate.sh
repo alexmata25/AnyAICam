@@ -17,6 +17,13 @@ check() {
     fi
 }
 
+# UDP 8189 must be the VMS container's own publish, with no other program
+# on the host holding the port (see 01-preflight.sh's webrtc_port_preflight).
+webrtc_port_owned_by_vms() {
+    webrtc_port_published_by_vms || return 1
+    ! webrtc_udp_listeners | grep -v '"docker-proxy"' | grep -q .
+}
+
 version_reports_release() {
     curl -fsS -m 5 http://127.0.0.1:8000/version | grep -Fq "$VMS_RELEASE_COMMIT"
 }
@@ -179,6 +186,7 @@ run_validate() {
     check "VMS local ready endpoint is reachable and self-test passes (business readiness -- e.g. a camera actually recording -- is intentionally not required at install time)" retry_until_vms_started ready_endpoint_self_test_ok
     check "VMS /version reports exact approved commit" retry_until_vms_started version_reports_release
     check "MediaMTX is present, executable, and checksum-verified when P2P live view is enabled" mediamtx_required_and_usable
+    check "WebRTC media port (UDP 8189) is published by the VMS container and by nothing else" webrtc_port_owned_by_vms
     check "WebRTC media port (UDP 8189) is restricted to private/Tailscale sources" "${WEBRTC_FIREWALL_SCRIPT:-/usr/local/sbin/anyaicam-webrtc-firewall}" check
     check "anyaicam-webrtc-firewall.service is enabled" systemctl is-enabled --quiet anyaicam-webrtc-firewall.service
 
