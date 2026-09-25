@@ -267,6 +267,7 @@ def test_door_fields_are_really_hidden_while_face_access_is_off(client):
     the [hidden] attribute's default display:none -- so the relay and
     duration fields showed even with Face Access unchecked (2026-09-25)."""
     response = client.get("/customer/cameras/cam-plain/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert 'id="door-access-fields" style="display:grid;gap:14px;max-width:360px;margin-top:12px" hidden' in response.text
-    assert "#door-access-fields[hidden]{display:none!important}" in response.text
+    assert '<div id="door-access-fields" hidden>' in response.text
+    # Layout lives in a rule (not an inline style that would beat [hidden]).
+    assert "#door-access-fields{display:grid;" in response.text and "#door-access-fields[hidden]{display:none}" in response.text
 

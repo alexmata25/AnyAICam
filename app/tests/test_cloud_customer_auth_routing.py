@@ -336,8 +336,17 @@ def test_runtime_role_reads_cloud_from_environment(monkeypatch):
 def test_cloud_customer_nav_path_prefixes_defined_and_matches_the_customer_nav():
     assert set(main.CLOUD_CUSTOMER_NAV_PATH_PREFIXES) == {
         "/dashboard", "/playback", "/events", "/alerts",
-        "/investigate", "/subscription-portal", "/aaco",
+        "/investigate", "/analytics", "/subscription-portal", "/aaco",
     }
+
+
+def test_analytics_unauthenticated_cloud_browser_visit_lands_on_customer_login(http_client, monkeypatch):
+    """/analytics became a customer page (Analytics workspace, 2026-09-25),
+    reached from the Dashboard's links -- same shape as /events."""
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    response = http_client.get("/analytics")
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/customer-login.html?next="), response.headers["location"]
 
 
 # =============================================================== /aaco: the same bug found again, live, 2026-09-19

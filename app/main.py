@@ -54640,7 +54640,7 @@ def _customer_detection_events(request: Request, *, limit: int | None = None) ->
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "direction": None,
             "timestamp": row["event_timestamp"],
@@ -54777,7 +54777,7 @@ def _customer_investigate_events(request: Request) -> list[dict] | None:
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "direction": None,
             "timestamp": row["event_timestamp"],
@@ -54930,7 +54930,7 @@ def _customer_investigate_search(
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "timestamp": row["event_timestamp"],
             "confidence": row["confidence"],
@@ -54964,7 +54964,12 @@ def _customer_investigate_event_for_client(event: dict) -> dict:
         "thumbnail": event.get("thumbnail") or "",
         "recording": _customer_event_playback_href(camera_id, timestamp, event.get("id"), bool(event.get("has_event_clip"))),
         "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
-        "confidence": event.get("confidence"),
+        # 2026-09-25: customer-ready fields -- a friendly type label, an
+        # epoch-ms time (the browser shows it in the viewer's timezone; the
+        # stored value is naive UTC) and a confidence only when it is one.
+        "type_label": _customer_event_type_label(event.get("event_type")),
+        "timestamp_ms": _naive_utc_timestamp_to_epoch_ms(timestamp) if timestamp else None,
+        "confidence": _customer_real_confidence(event.get("event_type"), event.get("confidence")),
         "plate": event.get("plate_number") or "",
         "color": event.get("vehicle_color") or "",
         "rule": event.get("rule_name") or "",
@@ -75148,7 +75153,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        event_type = escape(str(event.get("event_type", "motion")).replace("_", " ").title())
+        event_type = escape(_customer_event_type_label(event.get("event_type", "motion")))
 
 
 
@@ -81634,8 +81639,6 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
         <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
         <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select></label>
         <label>Camera<select id="investigation-camera"><option value="">All cameras</option>{camera_options}</select></label>
-        <label>Vehicle or clothing color<input id="investigation-color" placeholder="red, blue, silver"></label>
-        <label>License plate<input id="investigation-plate" placeholder="Plate text"></label>
         <label>From<input id="investigation-from" type="datetime-local"></label>
         <label>To<input id="investigation-to" type="datetime-local"></label>
         <div class="investigation-actions"><button class="action-button" id="run-investigation" type="button">Search</button><button class="ghost-button" id="clear-investigation" type="button">Clear</button></div>
@@ -81672,8 +81675,6 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     const queryInput=document.getElementById('investigation-query');
     const typeInput=document.getElementById('investigation-type');
     const cameraInput=document.getElementById('investigation-camera');
-    const colorInput=document.getElementById('investigation-color');
-    const plateInput=document.getElementById('investigation-plate');
     const fromInput=document.getElementById('investigation-from');
     const toInput=document.getElementById('investigation-to');
     const grid=document.getElementById('investigation-grid');
@@ -81708,15 +81709,26 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
       loadedEvents=loadedEvents.concat(data.events);currentTotal=data.total;currentHasMore=data.has_more;
       render();
     }}
+    // Stored values are escaped before they reach innerHTML, the time is
+    // shown in the viewer's timezone, and confidence only when one was
+    // stored (2026-09-25).
+    function esc(value){{return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch])}}
+    function localTime(event){{
+      const date=typeof event.timestamp_ms==='number'?new Date(event.timestamp_ms):null;
+      if(!date||isNaN(date.getTime()))return '';
+      return date.toLocaleString([],{{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit'}});
+    }}
     function card(event){{
-      const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
-      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
-      return `<article class="investigation-card" data-event-id="${{event.id}}">
-        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{event.event_type.replaceAll('_',' ')}}</span></div>
+      const label=event.type_label||event.event_type;
+      const confidence=event.confidence==null?'':` · ${{Math.round(Number(event.confidence)*100)}}% confidence`;
+      const thumb=event.thumbnail?`<img src="${{esc(event.thumbnail)}}" alt="${{esc(label)}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      return `<article class="investigation-card" data-event-id="${{esc(event.id)}}">
+        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{esc(label)}}</span></div>
         <div class="investigation-body">
-          <div class="investigation-title"><h3>${{event.event_type.replaceAll('_',' ')}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
-          <div class="investigation-meta">${{event.camera}} · ${{String(event.timestamp||'').replace('T',' ').slice(0,19)}}<br>Confidence ${{confidence}}${{event.color?` · ${{event.color}}`:''}}${{event.plate?` · ${{event.plate}}`:''}}</div>
-          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.live?`<a href="${{event.live}}">Live camera</a>`:''}}</div>
+          <div class="investigation-title"><h3>${{esc(label)}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
+          <div class="investigation-meta">${{esc(event.camera)}} · ${{esc(localTime(event))}}${{esc(confidence)}}${{event.color?` · ${{esc(event.color)}}`:''}}${{event.plate?` · ${{esc(event.plate)}}`:''}}</div>
+          <div class="investigation-card-actions"><a class="primary" href="${{esc(event.recording||'/playback')}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.live?`<a href="${{esc(event.live)}}">Live camera</a>`:''}}</div>
+
         </div>
       </article>`;
     }}
@@ -81747,7 +81759,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
         }});
       }});
     }}
-    function clearFilters(){{[queryInput,typeInput,cameraInput,colorInput,plateInput,fromInput,toInput].forEach(input=>input.value='');runSearch()}}
+    function clearFilters(){{[queryInput,typeInput,cameraInput,fromInput,toInput].forEach(input=>input.value='');runSearch()}}
     document.getElementById('run-investigation').addEventListener('click',runSearch);
     document.getElementById('clear-investigation').addEventListener('click',clearFilters);
     queryInput.addEventListener('keydown',event=>{{if(event.key==='Enter')runSearch()}});
@@ -81757,7 +81769,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     document.getElementById('export-evidence').addEventListener('click',()=>{{
       const selected=loadedEvents.filter(event=>selectedEvidence.has(event.id));
       if(!selected.length)return showToast('Select at least one event first.');
-      const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,color:colorInput.value,plate:plateInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
+      const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
       const blob=new Blob([JSON.stringify(manifest,null,2)],{{type:'application/json'}});
       const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='anyaicam_evidence_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(link.href);
     }});
@@ -121388,6 +121400,18 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
+def _customer_event_type_label(event_type) -> str:
+    from customer_analytics_panel import event_type_label
+    return event_type_label(event_type)
+
+
+def _customer_real_confidence(event_type, confidence):
+    # Motion rows store a raw motion score and PPE a placeholder 0.0 --
+    # neither is a confidence (customer_analytics_panel.real_confidence).
+    from customer_analytics_panel import real_confidence
+    return real_confidence(event_type, confidence)
+
+
 def _event_confidence_percent(confidence) -> str:
     """Same defensive 0-1-vs-0-100 handling the customer analytics
     search results view (renderResults()'s own JS) already uses --
@@ -121626,7 +121650,7 @@ def _render_customer_events(request: Request) -> str:
             )
         else:
             action_html = _customer_event_actions(camera_id_val, raw_timestamp, event_id_val, event.get("has_event_clip"))
-        type_label = str(event.get("event_type") or "event").replace("_", " ").title()
+        type_label = _customer_event_type_label(event.get("event_type"))
         camera_number = event.get("camera")
         event_id_attr = escape(str(event_id_val or ""), quote=True)
         # P0 #5 remediation round 2 (2026-09-05, Codex second review):
@@ -121652,7 +121676,7 @@ def _render_customer_events(request: Request) -> str:
             f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
             f'<td class="event-thumbnail-cell">{thumbnail}</td>'
             f'<td><span class="pill">{escape(type_label)}</span></td>'
-            f'<td>{_event_confidence_percent(event.get("confidence"))}</td>'
+            f'<td>{_event_confidence_percent(_customer_real_confidence(event.get("event_type"), event.get("confidence")))}</td>'
             f'<td class="event-action-cell">{action_html}</td></tr>'
         )
     event_body = "".join(rows) or (
@@ -143785,7 +143809,7 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "direction": None,
             "timestamp": row["event_timestamp"],

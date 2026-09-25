@@ -342,4 +342,5 @@ def test_api_route_shapes_events_for_the_client_and_reports_pagination_fields(mo
     assert payload["limit"] == main.INVESTIGATE_SEARCH_PAGE_SIZE
     assert len(payload["events"]) == 6
     first = payload["events"][0]
-    assert set(first) == {"id", "camera_id", "camera", "site", "timestamp", "event_type", "thumbnail", "recording", "live", "confidence", "plate", "color", "rule", "review"}
+    assert set(first) == {"id", "camera_id", "camera", "site", "timestamp", "event_type", "thumbnail", "recording", "live", "confidence", "plate", "color", "rule", "review",
+                         "type_label", "timestamp_ms"}  # customer-ready label and viewer-local time (2026-09-25)

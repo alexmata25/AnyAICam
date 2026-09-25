@@ -315,6 +315,21 @@ def epoch_ms(raw_timestamp) -> int | None:
     return int(dt.timestamp() * 1000)
 
 
+EVENT_TYPE_LABELS = {
+    "motion": "Motion", "smart_motion": "Motion", "ppe": "PPE", "plate": "License plate", "lpr": "License plate",
+    "people_counting": "People count", "people_counting_in": "Entry", "people_counting_out": "Exit",
+    "facial_recognition": "Face", "aac_voice_call": "Voice call", "line_crossing": "Line crossing",
+}
+
+
+def event_type_label(event_type) -> str:
+    """Customer-facing short name for a stored event type (2026-09-25):
+    'PPE' not 'Ppe', 'Entry' not 'People Counting In'. Unknown types fall
+    back to the previous title-casing."""
+    key = str(event_type or "").strip().lower()
+    return EVENT_TYPE_LABELS.get(key) or (key.replace("_", " ").title() if key else "Event")
+
+
 MOTION_EVENT_TYPES = frozenset({"motion", "smart_motion"})
 
 

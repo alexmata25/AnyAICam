@@ -736,8 +736,8 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         f'<style>.face-access-field{{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:13px}}'
         f'.face-access-field select,.face-access-field input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);'
         f'border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}'
-        f'#door-access-fields[hidden]{{display:none!important}}</style>'  # its inline display:grid beat [hidden]
-        f'<div id="door-access-fields" style="display:grid;gap:14px;max-width:360px;margin-top:12px" {"" if door_enabled else "hidden"}>'
+        f'#door-access-fields{{display:grid;gap:14px;max-width:360px;margin-top:12px}}#door-access-fields[hidden]{{display:none}}</style>'
+        f'<div id="door-access-fields" {"" if door_enabled else "hidden"}>'  # layout in the rule above, so [hidden] wins
         f'<label class="face-access-field">Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
         f'<label class="face-access-field">Unlock duration (seconds)<input id="door-relay-pulse-seconds" type="number" min="0.5" max="60" step="0.5" '
         f'inputmode="decimal" value="{pulse_seconds}"></label>'
@@ -849,7 +849,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                     aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
                     {'' if camera['enabled'] else 'disabled'}>🎤</button>
                   <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
-                    title="Camera tools (mute, snapshot, download, share, analytics, bookmark, stop)"
+                    title="Camera tools (mute, snapshot, fullscreen, playback, analytics, stop)"
                     aria-label="Open camera tools">⚙</a>
                   {unlock_button}
                 </div>
