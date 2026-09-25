@@ -1310,9 +1310,15 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             camera = _authorized_camera(db, camera_id, identity)
             placeholders = ','.join('?' for _ in event_types)
             rows = db.execute(
-                f'SELECT event_type, confidence, object_count, detections_json, event_timestamp '
-                f'FROM detection_events WHERE camera_id=? AND customer_id=? AND event_type IN ({placeholders}) '
-                f'ORDER BY event_timestamp DESC LIMIT ?',
+                # id + detection_event_media flags (2026-09-25): lets the panel
+                # show the event's thumbnail and open it in Playback -- the
+                # same media join the Events page and Dashboard already use.
+                f'SELECT de.id, de.event_type, de.confidence, de.object_count, de.detections_json, de.event_timestamp, '
+                f'CASE WHEN dem.id IS NULL THEN 0 ELSE 1 END AS has_clip, '
+                "CASE WHEN length(COALESCE(dem.thumbnail_s3_key, ''))>0 THEN 1 ELSE 0 END AS has_thumbnail "
+                f'FROM detection_events de LEFT JOIN detection_event_media dem ON dem.detection_event_id=de.id '
+                f'WHERE de.camera_id=? AND de.customer_id=? AND de.event_type IN ({placeholders}) '
+                f'ORDER BY de.event_timestamp DESC LIMIT ?',
                 # People Counting derives entries/exits/occupancy from one
                 # row per line crossing, so it needs a wider window than
                 # the other analytics' "latest few results".
@@ -1463,6 +1469,14 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<button class="camera-tool" id="live-view-retry" title="Retry" aria-label="Retry" hidden>↻</button>'
             f'{unlock_tool_button}'
             f'</div></section>'
+            f'<style>.analytics-event-row{{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;border-radius:8px}}'
+            f'a.analytics-event-row:hover,a.analytics-event-row:focus-visible{{background:rgba(67,209,204,.07);outline:none}}'
+            f'a.analytics-event-row:focus-visible{{box-shadow:0 0 0 2px var(--brand,#47d7ac)}}'
+            f'.analytics-thumb{{flex:0 0 auto;width:96px;height:54px;border-radius:6px;object-fit:cover;background:#0b1018}}'
+            f'.analytics-thumb--empty{{display:grid;place-items:center;color:var(--muted);font-size:18px}}'
+            f'.analytics-row-text{{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}}'
+            f'.analytics-row-action{{flex:0 0 auto;color:#8df0ea;font-size:12px;font-weight:700;white-space:nowrap}}'
+            f'@media(max-width:560px){{.analytics-thumb{{width:72px;height:40px}}.analytics-row-action{{font-size:0}}.analytics-row-action span{{font-size:16px}}}}</style>'
             f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
             f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
             f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
@@ -1474,6 +1488,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraId={json.dumps(camera_id)};
+  const isOwner={json.dumps(identity.get('role') == 'customer_owner')};
   const startUrl={json.dumps(start_url)};
   const playlistUrl={json.dumps(playlist_url)};
   const pollIntervalMs={POLL_INTERVAL_MS};
@@ -1815,11 +1830,32 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   function renderUpgradeCard(key){{
     const info=analyticsByKey[key].upgrade;
-    const benefits=info.benefits.map(item=>`<li>${{item}}</li>`).join('');
-    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{info.description}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><button class="action-button" id="upgrade-request-${{key}}">Request Upgrade</button><button class="ghost-button" id="upgrade-add-${{key}}">Add to This Camera</button><button class="ghost-button" id="upgrade-learn-${{key}}">Learn More</button></div></div>`;
-    document.getElementById(`upgrade-request-${{key}}`).addEventListener('click',()=>comingSoon('Upgrade requests are coming soon -- contact your partner for now.'));
-    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',()=>comingSoon('Adding analytics directly from Live View is coming soon.'));
-    document.getElementById(`upgrade-learn-${{key}}`).addEventListener('click',()=>comingSoon(analyticsByKey[key].label+': '+info.description));
+    const benefits=info.benefits.map(item=>`<li>${{esc(item)}}</li>`).join('');
+    // Real actions only (2026-09-25): "View plans" opens My subscription;
+    // "Add to This Camera" (owners) calls the existing license-capped
+    // assignment route. No placeholder "coming soon" buttons.
+    const addButton=isOwner?`<button class="ghost-button" id="upgrade-add-${{key}}" type="button">Add to This Camera</button>`:'';
+    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{esc(info.description)}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><a class="action-button" href="/subscription-portal">View plans</a>${{addButton}}</div><p class="health-detail" id="upgrade-result-${{key}}" role="status" aria-live="polite"></p></div>`;
+    if(!isOwner)return;
+    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',async(event)=>{{
+      const button=event.currentTarget;
+      const result=document.getElementById(`upgrade-result-${{key}}`);
+      button.disabled=true;
+      result.textContent='Adding…';
+      try{{
+        const response=await fetch(`/api/customer/cameras/${{encodeURIComponent(cameraId)}}/analytics/${{encodeURIComponent(key)}}`,{{method:'POST',credentials:'same-origin'}});
+        const body=await response.json().catch(()=>({{}}));
+        if(!response.ok)throw new Error(typeof body.detail==='string'?body.detail:'This analytic could not be added to this camera.');
+        analyticsByKey[key].enabled=true;
+        const pill=[...analyticsPills.children].find(item=>item.dataset.key===key);
+        const badge=pill&&pill.querySelector('.pill');
+        if(badge)badge.remove();
+        selectAnalytic(key);
+      }}catch(error){{
+        result.textContent=error.message;
+        button.disabled=false;
+      }}
+    }});
   }}
 
   // Every value below comes from stored event data (appliance-reported
@@ -1829,24 +1865,74 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
   }}
   function row(name,detail){{return `<div class="health-row"><span class="health-name">${{esc(name)}}</span><span class="health-detail">${{esc(detail)}}</span></div>`}}
+  // Customer-facing presentation of stored results (2026-09-25): friendly
+  // labels, viewer-local times, the event's own thumbnail and a link into
+  // Playback -- all from data the summary route already returns.
+  const EVENT_LABELS={{motion:'Motion detected',smart_motion:'Motion detected',person:'Person detected',vehicle:'Vehicle detected',car:'Car detected',truck:'Truck detected',bus:'Bus detected',motorcycle:'Motorcycle detected',bicycle:'Bicycle detected',intrusion:'Zone intrusion',line_crossing:'Line crossed',people_counting_in:'Person entered',people_counting_out:'Person left',people_counting:'People count updated',plate:'License plate read',lpr:'License plate read'}};
+  function eventLabel(type){{
+    const key=String(type||'').toLowerCase();
+    if(EVENT_LABELS[key])return EVENT_LABELS[key];
+    return key?key.replace(/_/g,' ').replace(/^./,ch=>ch.toUpperCase())+' detected':'Activity detected';
+  }}
+  function friendlyTime(ms,raw){{
+    let date=null;
+    if(typeof ms==='number')date=new Date(ms);
+    else if(raw){{const text=String(raw);date=new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(text)?text:text+'Z')}}
+    if(!date||isNaN(date.getTime()))return '';
+    const now=new Date();
+    const yesterday=new Date(now.getFullYear(),now.getMonth(),now.getDate()-1);
+    const time=date.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit',second:'2-digit'}});
+    if(date.toDateString()===now.toDateString())return `Today, ${{time}}`;
+    if(date.toDateString()===yesterday.toDateString())return `Yesterday, ${{time}}`;
+    const day=date.toLocaleDateString([],date.getFullYear()===now.getFullYear()?{{month:'short',day:'numeric'}}:{{month:'short',day:'numeric',year:'numeric'}});
+    return `${{day}}, ${{time}}`;
+  }}
+  function percent(value){{
+    if(value==null||value==='')return null;
+    const number=Number(value);
+    return Number.isFinite(number)?Math.round(number*100)+'%':null;
+  }}
+  function playbackHref(item){{
+    const camera=encodeURIComponent(cameraId);
+    if(item.event_id&&item.has_clip)return `/playback?camera=${{camera}}&event=${{encodeURIComponent(item.event_id)}}&autoplay=event`;
+    if(typeof item.timestamp_ms==='number')return `/playback?camera=${{camera}}&t=${{item.timestamp_ms}}&autoplay=event`;
+    return null;
+  }}
+  function eventRow(item,title,extra){{
+    item=item||{{}};
+    const href=playbackHref(item);
+    const thumb=item.has_thumbnail&&item.event_id
+      ? `<img class="analytics-thumb" src="/api/customer/events/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(item.event_id)}}/thumbnail" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`
+      : '<span class="analytics-thumb analytics-thumb--empty" aria-hidden="true">◴</span>';
+    const detail=[friendlyTime(item.timestamp_ms,item.timestamp),...(extra||[])].filter(Boolean).map(esc).join(' · ');
+    const action=href?`<span class="analytics-row-action">${{item.has_clip?'Play clip':'Open in Playback'}} <span aria-hidden="true">→</span></span>`:'';
+    const inner=`${{thumb}}<span class="analytics-row-text"><span class="health-name">${{esc(title)}}</span><span class="health-detail">${{detail}}</span></span>${{action}}`;
+    return href?`<a class="health-row analytics-event-row" href="${{esc(href)}}">${{inner}}</a>`:`<div class="health-row analytics-event-row">${{inner}}</div>`;
+  }}
+  function confidenceNote(item){{const value=percent(item&&item.confidence);return value?`${{value}} confidence`:null}}
   function renderAnalyticsSummary(key,data){{
     const recent=Array.isArray(data.recent)?data.recent:[];
+    const asOf=friendlyTime(data.latest_timestamp_ms,data.latest_timestamp)||'—';
     if(key==='lpr'){{
       // Plate text is read and kept on the appliance; the cloud receives
       // the detection itself (time/confidence), not the plate number.
       const plate=data.latest_plate||(recent.length?'Plate text is kept on the appliance':'No plates read yet');
-      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?Math.round(data.latest_confidence*100)+'%':'—')+row('Recent',`${{recent.length}} recent detection(s)`);
+      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?percent(data.latest_confidence):'—')
+        +recent.map(item=>eventRow(item,'License plate read',[item&&item.plate?`Plate ${{item.plate}}`:null,confidenceNote(item)])).join('');
     }}else if(key==='people_counting'){{
-      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`);
+      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`)
+        +(data.latest_timestamp?row('Last activity',asOf):'')
+        +recent.slice(0,5).map(item=>eventRow(item,eventLabel(item&&item.event_type))).join('');
     }}else if(key==='ppe'){{
       const status=data.latest_status==='compliant'?'Compliant':data.latest_status==='violation'?'Violation':(data.latest_status||'No PPE events yet');
-      analyticsPanel.innerHTML=row('Latest status',status)+row('As of',data.latest_timestamp||'—');
+      analyticsPanel.innerHTML=row('Latest status',status)+(data.latest_timestamp?row('As of',asOf):'')
+        +recent.map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check',[confidenceNote(item)])).join('');
     }}else if(key==='facial_recognition'){{
-      const rows=recent.map(item=>row(item.person||(item.state==='unknown'?'Unknown person':(item.state||'Face')),item.timestamp||'')).join('');
+      const rows=recent.map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[confidenceNote(item)])).join('');
       analyticsPanel.innerHTML=rows||row('','No face matches yet');
     }}else{{
-      const rows=recent.map(item=>row(item.event_type||'motion',item.timestamp||'')).join('');
-      analyticsPanel.innerHTML=rows||row('','No motion/person/vehicle events yet');
+      const rows=recent.map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');
+      analyticsPanel.innerHTML=rows||row('','No motion, person or vehicle events yet');
     }}
   }}
 
