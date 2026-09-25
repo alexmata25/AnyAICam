@@ -21453,6 +21453,23 @@ def process_stripe_webhook_event(event: dict) -> None:
 
 
 
+    elif event_type in {"checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed"}:
+        # Delayed-payment outcome (2026-09-25): keep this session's record
+        # truthful for the admin payments view. Record-keeping only -- the
+        # grant/no-grant decision is made by the entitlement, analytics and
+        # hardware steps (stripe_checkout_payment.py), never here.
+        session_id = str(data_object.get("id") or "")
+        if session_id:
+            sessions = load_payment_sessions()
+            record = sessions.get(session_id, {})
+            succeeded = event_type.endswith("succeeded")
+            record.update({
+                "payment_status": data_object.get("payment_status") or ("paid" if succeeded else "unpaid"),
+                "async_payment": "succeeded" if succeeded else "failed",
+                "async_payment_at": datetime.now().isoformat(),
+            })
+            sessions[session_id] = record
+            save_payment_sessions(sessions)
     elif event_type in {
 
 
