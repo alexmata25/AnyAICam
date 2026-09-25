@@ -81,6 +81,12 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
     api_down = False
     fail_list = False
     existing: set = set()
+    # path name -> how many more add/replace requests for it are held past
+    # the client's timeout (Ryzen 2026-09-25: MediaMTX accepted the
+    # connection, then answered nothing for >5s right after a restart).
+    stall: dict = {}
+    stall_seconds = 0.0
+    stall_then_applies = False  # the held request still takes effect, just late
 
     def log_message(self, *a):
         pass
@@ -97,6 +103,12 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
         self.__class__.calls.append((self.command, self.path, body, self._headers_lower()))
         if self.path.startswith("/v3/config/paths/add/") or self.path.startswith("/v3/config/paths/replace/"):
             name = self.path.rsplit("/", 1)[-1]
+            if self.__class__.stall.get(name, 0) > 0:
+                self.__class__.stall[name] -= 1
+                time.sleep(self.__class__.stall_seconds)
+                if self.__class__.stall_then_applies:
+                    self.__class__.existing.add(name)
+                return  # the client has already given up; no response
             if self.__class__.fail_config or (self.path.startswith("/v3/config/paths/add/") and name in self.__class__.existing):
                 self.send_response(400)
                 self.end_headers()
@@ -187,7 +199,12 @@ def fake_mediamtx(monkeypatch):
     _FakeMediaMTX.api_down = False
     _FakeMediaMTX.fail_list = False
     _FakeMediaMTX.existing = set()
-    server = http.server.HTTPServer(("127.0.0.1", 0), _FakeMediaMTX)
+    _FakeMediaMTX.stall = {}
+    _FakeMediaMTX.stall_seconds = 0.0
+    _FakeMediaMTX.stall_then_applies = False
+    # Threaded like the real MediaMTX: a stalled request never queues the next one.
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeMediaMTX)
+    server.daemon_threads = True
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -211,6 +228,7 @@ def _no_real_capability_discovery(monkeypatch):
     monkeypatch.setattr(wp, "_onvif_soap_call", lambda: None)
     monkeypatch.setattr(wp, "_probe_video_stream", lambda url: False)
     monkeypatch.setattr(wp, "_paths_resync_pending", False)
+    monkeypatch.setattr(wp, "_path_add_retries", {})
     monkeypatch.setattr(wp, "_whep_sessions", {})
     monkeypatch.setattr(wp, "_applied_hosts", [])  # a MediaMTX (re)start sets it; never leak it to other tests
 
@@ -897,3 +915,135 @@ async def test_the_worker_resyncs_right_after_a_restart_not_at_the_next_refresh(
     except asyncio.CancelledError:
         pass
     assert resyncs == [False, True]  # re-synced within one loop; the refresh is still not due
+
+
+# ------------------------------------- unanswered path adds during restart recovery
+# 2026-09-25, confirmed live on Ryzen: right after a MediaMTX restart its API
+# answered the readiness GET, then one camera's add AND replace each hit the
+# 5s timeout (status 0) -> path_add_failed, and that camera waited for the
+# next 60s refresh. These drive a real socket timeout against the fake.
+
+def _stall_adds(fake, monkeypatch, camera_id, times, applies=False):
+    monkeypatch.setattr(wp, "MEDIAMTX_API_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(wp, "PATH_ADD_RETRY_BASE_SECONDS", 0.0)  # due at once; backoff is tested below
+    fake.stall = {camera_id: times}
+    fake.stall_seconds = 0.6
+    fake.stall_then_applies = applies
+
+
+def _posts_for(fake, camera_id):
+    return [c[1].split("/")[4] for c in fake.calls
+            if c[0] == "POST" and c[1].rsplit("/", 1)[-1] == camera_id and c[1].startswith("/v3/config/paths/")]
+
+
+def test_an_unanswered_add_during_restart_recovery_is_retried_until_the_path_is_added(configured, tmp_path, monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="anyaicam.webrtc_publisher")
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    _stall_adds(configured, monkeypatch, "cam-3", times=2)
+    wp.reconcile_camera_paths(_url)  # the post-restart resync: cam-3's add times out
+    assert wp._known_paths == set(CAMERAS) - {"cam-3"}
+    assert wp._path_add_retry_due()  # the worker comes back for it, not the 60s refresh
+    wp.reconcile_camera_paths(_url)  # MediaMTX still not answering
+    assert "cam-3" not in wp._known_paths
+    wp.reconcile_camera_paths(_url)
+    assert configured.existing == set(CAMERAS) == wp._known_paths
+    assert _posts_for(configured, "cam-3") == ["add", "add", "add"]  # no replace stacked on a timeout
+    assert all(_posts_for(configured, c) == ["add"] for c in CAMERAS if c != "cam-3")
+    assert wp._path_add_retries == {} and not wp._path_add_retry_due()
+    assert "path_add_failed" not in caplog.text
+    assert "mediamtx_api_unreachable path=/v3/config/paths/add/cam-3 error=timed out" in caplog.text  # not hidden
+
+
+def test_an_add_applied_after_the_timeout_is_adopted_without_another_post(configured, tmp_path, monkeypatch, caplog):
+    """What the Ryzen most likely saw: MediaMTX applied the add late, so
+    the path was there although our request had timed out."""
+    import logging
+    caplog.set_level(logging.INFO, logger="anyaicam.webrtc_publisher")
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    _stall_adds(configured, monkeypatch, "cam-3", times=1, applies=True)
+    wp.reconcile_camera_paths(_url)
+    assert "cam-3" not in wp._known_paths
+    deadline = time.monotonic() + 5
+    while "cam-3" not in configured.existing and time.monotonic() < deadline:
+        time.sleep(0.05)  # MediaMTX applies the timed-out add late
+    assert "cam-3" in configured.existing
+    wp.reconcile_camera_paths(_url)  # the retry reads MediaMTX's path list first
+    assert wp._known_paths == set(CAMERAS) and wp._path_add_retries == {}
+    assert _posts_for(configured, "cam-3") == ["add"]  # adopted: no duplicate add/replace
+    assert "path_add_confirmed camera_id=cam-3" in caplog.text and "path_add_failed" not in caplog.text
+
+
+def test_an_add_mediamtx_never_answers_is_bounded_then_reported_once(configured, tmp_path, monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="anyaicam.webrtc_publisher")
+    monkeypatch.setattr(wp, "PATH_ADD_MAX_ATTEMPTS", 3)
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    _stall_adds(configured, monkeypatch, "cam-3", times=99)
+    for _ in range(3):
+        wp.reconcile_camera_paths(_url)
+    assert _posts_for(configured, "cam-3") == ["add", "add", "add"]
+    assert caplog.text.count("path_add_failed camera_id=cam-3 status=0") == 1
+    assert "cam-3" not in wp._known_paths and wp._path_add_retries == {}
+    assert not wp._path_add_retry_due()  # back to the normal refresh, as before this fix
+
+
+def test_path_add_retries_back_off_and_are_bounded(monkeypatch):
+    monkeypatch.setattr(wp, "PATH_ADD_MAX_ATTEMPTS", 6)
+    monkeypatch.setattr(wp, "PATH_ADD_RETRY_BASE_SECONDS", 1.0)
+    delays = []
+    while True:
+        before = time.monotonic()
+        if not wp._defer_path_add("cam-a"):
+            break
+        delays.append(round(wp._path_add_retries["cam-a"][1] - before))
+        assert not wp._path_add_retry_due()  # nothing re-posted before its backoff
+    assert delays == [1, 2, 4, 8, 8] and wp._path_add_retries == {}
+
+
+def test_a_mediamtx_restart_drops_pending_path_add_retries(tmp_path, monkeypatch):
+    wp._path_add_retries["cam-a"] = (2, 0.0)
+    monkeypatch.setattr(wp, "MEDIAMTX_CONFIG_PATH", tmp_path / "mediamtx.yml")
+    monkeypatch.setattr(wp.subprocess, "Popen", lambda *a, **k: _FakeProcess(returncode=None))
+    monkeypatch.setattr(wp, "_mediamtx_process", _FakeProcess(returncode=1))
+    wp._ensure_mediamtx_running()
+    assert wp._path_add_retries == {} and wp._paths_resync_pending is True  # the full resync covers it
+
+
+@pytest.mark.anyio
+async def test_the_worker_retries_a_due_path_add_without_waiting_for_the_refresh(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(wp, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(wp, "LIVE_P2P_ENABLED", True)
+    monkeypatch.setattr(wp, "SCAN_SECONDS", 0.5)
+    monkeypatch.setattr(wp, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(wp, "_ensure_mediamtx_running", lambda: None)
+    monkeypatch.setattr(wp, "stop_mediamtx", lambda: None)
+    monkeypatch.setattr(wp, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(wp, "sync_additional_hosts", lambda: None)
+    reconciles = []
+
+    def fake_reconcile(camera_url_fn):
+        reconciles.append(dict(wp._path_add_retries))
+        wp._path_add_retries.clear()
+
+    monkeypatch.setattr(wp, "reconcile_camera_paths", fake_reconcile)
+
+    async def fake_bridge_tick(camera_url_fn):
+        await asyncio.sleep(0.01)
+        return False
+
+    monkeypatch.setattr(wp, "_bridge_tick", fake_bridge_tick)
+    task = asyncio.ensure_future(wp.webrtc_publisher_worker(lambda n: "rtsp://u:p@h:554/x"))
+    await asyncio.sleep(0.2)
+    wp._path_add_retries["cam-later"] = (1, time.monotonic() + 3600)  # backing off: not yet
+    await asyncio.sleep(0.8)
+    assert len(reconciles) == 1  # only the first (due) refresh
+    wp._path_add_retries["cam-now"] = (1, 0.0)  # due
+    await asyncio.sleep(0.8)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert len(reconciles) == 2 and "cam-now" in reconciles[1]
