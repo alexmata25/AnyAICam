@@ -92,6 +92,7 @@ from datetime import datetime
 from typing import Optional
 
 from partner_db import connection, row, rows
+from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment, awaiting_payment_result
 
 
 def normalize_email(email: str) -> str:
@@ -333,10 +334,15 @@ def sync_hardware_order_from_stripe_event(event: dict) -> dict:
     checkout.session.completed sessions in mode=payment are considered --
     a hardware purchase is one-time, never a subscription event."""
     event_type = str(event.get("type") or "")
-    if event_type != "checkout.session.completed":
+    if event_type not in CHECKOUT_GRANT_EVENT_TYPES:
         return {"status": "ignored", "reason": f"unhandled event type {event_type!r}"}
 
     session_obj = (event.get("data") or {}).get("object") or {}
+    if awaiting_payment(session_obj):
+        # Not ordered yet: an order is created with fulfillment_status
+        # "paid" and would enter the fulfillment queue before the money
+        # settles. async_payment_succeeded (same session) creates it.
+        return awaiting_payment_result(session_obj)
     if str(session_obj.get("mode") or "") not in ("payment", ""):
         # An explicit non-"payment" mode (e.g. "subscription") is never a
         # hardware purchase -- ignore rather than guess. Missing/empty
