@@ -34,6 +34,20 @@ def _viewer_session():
     return main.create_session("viewer-1")
 
 
+def _seed_second_global_admin(db_path):
+    """Another live platform administrator, so revoking the grant under
+    test is not revoking the last one (which the revoke route refuses --
+    see test_admin_access_lockout.py)."""
+    from appliance_identity import create_grant
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            now = "2026-08-27T00:00:00"
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-backup", "Backup", "approved", "real", now))
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       ("u-backup-admin", "partner-backup", "backup-admin@anyaicam.test", "Backup", "administrator", password_hash("backup-password-123"), 1, now))
+            create_grant(db, user_id="u-backup-admin", role="administrator", scope_type="global", scope_id=None, granted_by="test", now=now)
+
+
 def _seed_operator(db_path, email="amata@anyaicam.com"):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -161,6 +175,7 @@ def test_grant_revocation_is_audited(http_client, tmp_path, monkeypatch):
     client, db_path = http_client
     monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit_log.jsonl")
     _seed_operator(db_path)
+    _seed_second_global_admin(db_path)
     token = _admin_session()
     grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token}).json()["grant_id"]
 
@@ -205,6 +220,7 @@ def test_grant_management_page_renders_current_grants(http_client):
 def test_admin_can_revoke_a_grant(http_client):
     client, db_path = http_client
     _seed_operator(db_path)
+    _seed_second_global_admin(db_path)
     token = _admin_session()
     grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token}).json()["grant_id"]
 
@@ -221,6 +237,7 @@ def test_admin_can_revoke_a_grant(http_client):
 def test_revoking_bumps_authorization_version_again(http_client):
     client, db_path = http_client
     _seed_operator(db_path)
+    _seed_second_global_admin(db_path)
     token = _admin_session()
     grant_id = client.post("/api/operations/identity-grants", json={"email": "amata@anyaicam.com", "role": "administrator", "scope_type": "global"}, cookies={main.SESSION_COOKIE_NAME: token}).json()["grant_id"]
 

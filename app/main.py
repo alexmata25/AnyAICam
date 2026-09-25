@@ -51962,6 +51962,21 @@ def revoke_identity_grant(request: Request, grant_id: str) -> dict:
             raise HTTPException(status_code=404, detail="Grant not found.")
         if existing["revoked_at"]:
             return {"status": "already_revoked"}
+        if existing["role"] == "administrator" and existing["scope_type"] == "global" and not db.execute(
+            "SELECT 1 FROM identity_grants g JOIN partner_users u ON u.id=g.user_id "
+            "WHERE g.role='administrator' AND g.scope_type='global' AND g.revoked_at IS NULL AND g.id<>? "
+            "AND u.approved=1 AND COALESCE(u.account_status,'active') NOT IN ('suspended','revoked') LIMIT 1",
+            (grant_id,),
+        ).fetchone():
+            # The last live platform administrator: revoking it leaves nobody
+            # able to reach the Admin Portal, and break-glass recovery
+            # (platform_owner.create_break_glass_token) deliberately only
+            # restores an EXISTING global grant -- so this would be a
+            # lockout only direct database surgery could undo.
+            raise HTTPException(
+                status_code=409,
+                detail="This is the last active platform administrator. Grant another account global administrator access before revoking this one.",
+            )
         revoke_grant(db, grant_id=grant_id)
     record_audit(request, "revoke", "identity_grant", f"Revoked {existing['role']} ({existing['scope_type']}) grant {grant_id}.")
     return {"status": "revoked"}
@@ -125243,6 +125258,34 @@ def create_user(request: Request, new_user: UserCreateModel) -> dict:
 
 
 
+LAST_USER_MANAGER_MESSAGE = (
+    "At least one enabled administrator must remain. Add or enable another administrator first."
+)
+
+
+def removes_last_user_manager(users: list[dict], target: dict | None, changes: dict) -> bool:
+    """True when applying `changes` (a role change and/or enabled=False)
+    to `target` would leave no enabled local user able to manage users --
+    nobody could then re-enable, re-role or reset anyone, a lockout only
+    root access to users.json could undo. The roles counted are exactly
+    those ROLE_PERMISSIONS grants manage_users to, never a hardcoded list.
+    local-admin is also protected by its own dedicated checks."""
+    if not target:
+        return False
+    managers = {role for role, permissions in ROLE_PERMISSIONS.items() if "manage_users" in permissions}
+
+    def is_manager(user: dict) -> bool:
+        return bool(user.get("enabled", True)) and user.get("role") in managers
+
+    if not is_manager(target):
+        return False
+    after = dict(target)
+    after.update({key: value for key, value in changes.items() if key in ("role", "enabled") and value is not None})
+    if is_manager(after):
+        return False
+    return not any(is_manager(user) for user in users if user.get("id") != target.get("id"))
+
+
 @app.put("/api/users/{user_id}")
 
 
@@ -125370,6 +125413,8 @@ def update_user(request: Request, user_id: str, update: UserUpdateModel) -> dict
 
 
         return {"status": "error", "message": "The bootstrap administrator cannot be disabled."}
+    if removes_last_user_manager(users, target, changes):
+        return {"status": "error", "message": LAST_USER_MANAGER_MESSAGE}
 
 
 
@@ -125909,6 +125954,8 @@ def delete_user(request: Request, user_id: str) -> dict:
 
 
 
+    if removes_last_user_manager(users, next((item for item in users if item.get("id") == user_id), None), {"enabled": False}):
+        return {"status": "error", "message": LAST_USER_MANAGER_MESSAGE}
     remaining = [item for item in users if item.get("id") != user_id]
 
 
