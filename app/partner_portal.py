@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from pricing_config import calculate_partner_quote, load_pricing, public_pricing, save_pricing
-from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash, tenant_owns_partner
+from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash, tenant_owns_partner, verify_password
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
 from customer_policy import role_destination
@@ -240,8 +240,13 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         identity=_identity(request)
         if not identity: return RedirectResponse('/partner.html',status_code=303)
         terms='<label><input id="accept-terms" type="checkbox" required> I accept the current AnyAiCam Partner Terms</label>' if identity['role'] in PARTNER_ROLES else '<input id="accept-terms" type="hidden" value="true">'
-        content=f'''<header class="topbar"><div><p class="eyebrow">Account activation</p><h1>Create your permanent password</h1></div></header><section class="panel" style="max-width:560px;margin:auto"><form id="activation-password" class="rule-form"><label>New password<input id="new-password" type="password" minlength="12" required></label>{terms}<button class="action-button">Activate account</button></form></section>'''
-        scripts='''<script>document.getElementById('activation-password').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/partner/activate-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('new-password').value,accept_terms:document.getElementById('accept-terms').checked})}),result=await response.json();if(!response.ok)return showToast(result.detail);showToast(result.message);setTimeout(()=>location.href=result.destination,500)})</script>'''
+        with connection() as db:
+            record=db.execute('SELECT must_change_password FROM partner_users WHERE lower(email)=?',(identity['email'].lower(),)).fetchone()
+        forced=bool(record and record['must_change_password'])
+        current='' if forced else '<label>Current password<input id="current-password" type="password" autocomplete="current-password" required></label>'
+        heading='Create your permanent password' if forced else 'Change your password'
+        content=f'''<header class="topbar"><div><p class="eyebrow">Account activation</p><h1>{heading}</h1></div></header><section class="panel" style="max-width:560px;margin:auto"><form id="activation-password" class="rule-form">{current}<label>New password<input id="new-password" type="password" minlength="12" autocomplete="new-password" required></label>{terms}<button class="action-button">{'Activate account' if forced else 'Change password'}</button></form></section>'''
+        scripts='''<script>document.getElementById('activation-password').addEventListener('submit',async e=>{e.preventDefault();const currentField=document.getElementById('current-password');const response=await fetch('/api/partner/activate-account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('new-password').value,current_password:currentField?currentField.value:undefined,accept_terms:document.getElementById('accept-terms').checked})}),result=await response.json();if(!response.ok)return showToast(result.detail);showToast(result.message);setTimeout(()=>location.href=result.destination,500)})</script>'''
         return shell('Activate partner account','partner-login',content,scripts)
 
     @app.post('/api/partner/activate-account')
@@ -253,8 +258,17 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         if identity['role'] in PARTNER_ROLES and not payload.get('accept_terms'): raise HTTPException(status_code=400,detail='Partner Terms must be accepted before activation.')
         now=datetime.now().isoformat(); user_id=''
         with connection() as db:
-            user=db.execute('SELECT id FROM partner_users WHERE lower(email)=?',(identity['email'].lower(),)).fetchone()
+            user=db.execute('SELECT id,password_hash,must_change_password FROM partner_users WHERE lower(email)=?',(identity['email'].lower(),)).fetchone()
             if not user: raise HTTPException(status_code=404,detail='Partner user was not found.')
+            # Only a forced first-password change (a partner-issued temporary
+            # password, must_change_password=1) may skip the current
+            # password. Otherwise a signed-in session alone -- e.g. a stolen
+            # cookie -- could replace the password and take the account over.
+            # A user who has lost their password recovers through the reset
+            # link (or, for a platform owner, break-glass), not this route.
+            if not user['must_change_password'] and not verify_password(str(payload.get('current_password') or ''),user['password_hash'] or ''):
+                audit(identity,'password.change_denied','partner_user',user['id'],{'reason':'current_password_mismatch'})
+                raise HTTPException(status_code=403,detail='Your current password is incorrect.')
             user_id=user['id']; db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0,terms_accepted_at=? WHERE id=?',(password_hash(password),now,user_id))
             db.execute("UPDATE invitations SET status='accepted' WHERE lower(email)=? AND status='pending'",(identity['email'].lower(),))
             if identity['role'] in PARTNER_ROLES: db.execute('INSERT INTO partner_terms_acceptances(id,user_id,terms_version,accepted_at,ip_address) VALUES(?,?,?,?,?)',(secrets.token_hex(8),user_id,'2026-08-01',now,request.client.host if request.client else None))

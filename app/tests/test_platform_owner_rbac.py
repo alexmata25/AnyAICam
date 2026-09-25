@@ -58,6 +58,20 @@ def http_client(tmp_path, monkeypatch):
     appliance_identity.reset_cloud_identity_backend_for_tests()
 
 
+def _seed_second_global_admin(db_path):
+    """Another live platform administrator, so revoking the grant under
+    test is not revoking the last one (which the revoke route refuses --
+    see test_admin_access_lockout.py)."""
+    from appliance_identity import create_grant
+    with override_target(sqlite_path=str(db_path)):
+        with connection() as db:
+            now = "2026-08-27T00:00:00"
+            db.execute("INSERT OR IGNORE INTO partners(id,name,approval_status,source,created_at) VALUES(?,?,?,?,?)", ("partner-backup", "Backup", "approved", "real", now))
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                       ("u-backup-admin", "partner-backup", "backup-admin@anyaicam.test", "Backup", "administrator", password_hash("backup-password-123"), 1, now))
+            create_grant(db, user_id="u-backup-admin", role="administrator", scope_type="global", scope_id=None, granted_by="test", now=now)
+
+
 def _seed_operator(db_path, email="amata@anyaicam.com", partner_id="partner-1"):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
@@ -537,6 +551,7 @@ def test_break_glass_recovery_does_not_bypass_a_since_revoked_grant(http_client)
     own live re-check)."""
     client, db_path = http_client
     _seed_operator(db_path)
+    _seed_second_global_admin(db_path)
     admin_token = _admin_session()
     grant_id = _grant_global(db_path, admin_token, client, email="amata@anyaicam.com")
 
