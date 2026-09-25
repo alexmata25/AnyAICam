@@ -133,7 +133,15 @@ from pathlib import Path
 
 from facial_recognition import FaceDetection, FaceEngine
 
-MODEL_CACHE_DIR = Path(os.environ.get("ANYAICAM_AAC_MODEL_DIR", "/app/models/aac"))
+# The image bakes the three pinned models into BAKED_MODEL_DIR at build
+# time (Dockerfile / Dockerfile.production, 2026-09-25), outside /app: on
+# a real appliance /app is the bind-mounted source tree (docker-compose's
+# ./app:/app), so anything the image put under /app is hidden, and a
+# lazy download there would write model files into /opt/anyaicam/app on
+# the host. The /app path remains the fallback for a dev run without the
+# baked directory.
+BAKED_MODEL_DIR = Path("/opt/anyaicam-aac-models")
+MODEL_CACHE_DIR = Path(os.environ.get("ANYAICAM_AAC_MODEL_DIR") or (BAKED_MODEL_DIR if BAKED_MODEL_DIR.is_dir() else "/app/models/aac"))
 
 # Pinned provenance: URL, filename, and the exact SHA-256 of the file at
 # that URL as verified during development (see this module's own

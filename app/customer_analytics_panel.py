@@ -43,7 +43,12 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     # crossing, and LPR reads as "plate" -- the previous generic values
     # ("vehicle", "people_counting", "lpr") are only notification-side
     # aliases, so these summaries were always empty for real data.
-    "smart_motion": ("Smart Motion", ("motion", "smart_motion", "person", "vehicle", "car", "truck", "bus", "motorcycle", "bicycle")),
+    # Customer-drawn intrusion zones / alert lines run on Smart Motion's
+    # person/vehicle detections and require its entitlement
+    # (customer_analytics_rule_worker.camera_rules_entitled), so their
+    # events belong to its summary.
+    "smart_motion": ("Smart Motion", ("motion", "smart_motion", "person", "vehicle", "car", "truck", "bus", "motorcycle", "bicycle",
+                                      "intrusion", "line_crossing")),
     "people_counting": ("People Counting", ("people_counting", "people_counting_in", "people_counting_out")),
     "lpr": ("LPR", ("lpr", "plate")),
     "ppe": ("PPE", ("ppe",)),

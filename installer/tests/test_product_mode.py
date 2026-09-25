@@ -93,6 +93,34 @@ grep -qx ANYAICAM_RECORDING_UPLOAD_ENABLED=true "$VMS_ENV_FILE"
 grep -qx ANYAICAM_ANALYTICS_SYNC_ENABLED=false "$VMS_ENV_FILE"
 ''')
 
+    def test_fresh_install_enables_the_entitlement_gated_analytics_workers(self):
+        """Advanced Analytics grants People Counting and LPR per camera,
+        but a fresh appliance never ran them: their appliance switches
+        defaulted to off and nothing set them. Facial recognition stays
+        an explicit opt-in."""
+        self.run_policy('''
+ANYAICAM_PRODUCT_MODE=hybrid
+select_product_mode
+ensure_vms_env
+grep -qx ANYAICAM_LPR_ENABLED=true "$VMS_ENV_FILE"
+grep -qx PEOPLE_COUNTING_ENABLED=true "$VMS_ENV_FILE"
+grep -qx CUSTOMER_ANALYTICS_RULES_ENABLED=true "$VMS_ENV_FILE"
+! grep -q '^ANYAICAM_FACIAL_RECOGNITION_ENABLED=' "$VMS_ENV_FILE"
+''')
+
+    def test_an_explicit_analytics_flag_is_never_changed_or_duplicated(self):
+        self.run_policy('''
+printf '%s\\n' PEOPLE_COUNTING_ENABLED=false ANYAICAM_LPR_ENABLED=true > "$VMS_ENV_FILE"
+ANYAICAM_PRODUCT_MODE=local
+select_product_mode
+ensure_vms_env
+ensure_vms_env
+grep -qx PEOPLE_COUNTING_ENABLED=false "$VMS_ENV_FILE"
+test "$(grep -c '^PEOPLE_COUNTING_ENABLED=' "$VMS_ENV_FILE")" = 1
+test "$(grep -c '^ANYAICAM_LPR_ENABLED=' "$VMS_ENV_FILE")" = 1
+test "$(grep -c '^CUSTOMER_ANALYTICS_RULES_ENABLED=true' "$VMS_ENV_FILE")" = 1
+''')
+
     def test_invalid_and_blank_requests_fail(self):
         for value in ("", "LOCAL", "cloud", " hybrid "):
             with self.subTest(value=value):

@@ -70,6 +70,10 @@ def _seed_rule(camera_id="cam-1", *, rule_id="rule-1", rule_type="line_crossing"
         )
 
 
+# Intrusion/line-crossing rules are evaluated only for Smart Motion-entitled cameras.
+ENTITLED_CAM_1 = {"camera_id": "cam-1", "smart_motion_enabled": True}
+
+
 def _fake_frame() -> np.ndarray:
     return np.zeros((480, 640, 3), dtype=np.uint8)
 
@@ -227,7 +231,7 @@ def test_worker_idles_harmlessly_with_no_camera_id_resolved(monkeypatch, db_path
 
 
 def test_worker_idles_harmlessly_with_no_rules_for_this_camera(monkeypatch, db_path):
-    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: {"camera_id": "cam-1"})
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: ENTITLED_CAM_1)
     called = {"n": 0}
 
     def fake_detect(camera_number):
@@ -245,7 +249,7 @@ def test_full_cycle_a_real_line_crossing_produces_a_thumbnailed_event(monkeypatc
     with a real thumbnail file on disk -- the complete chain this
     session's runtime-path trace previously documented as absent."""
     _seed_rule("cam-1", geometry=[{"x": 0.0, "y": 0.5}, {"x": 1.0, "y": 0.5}], direction="both")
-    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: {"camera_id": "cam-1"})
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: ENTITLED_CAM_1)
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
     monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
     monkeypatch.setattr(worker, "CUSTOMER_ANALYTICS_RULE_INTERVAL_SECONDS", 0.01)
@@ -301,7 +305,7 @@ def test_a_lingering_person_inside_an_intrusion_zone_does_not_fire_before_the_re
     fire immediately."""
     import analytics_rules_engine
     _seed_rule("cam-1", rule_type="intrusion", direction=None, geometry=[{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 0.0}, {"x": 1.0, "y": 1.0}, {"x": 0.0, "y": 1.0}])
-    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: {"camera_id": "cam-1"})
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: ENTITLED_CAM_1)
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
     monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
     monkeypatch.setattr(main, "detect_objects_frame", lambda camera_number: {
@@ -325,3 +329,33 @@ def test_a_lingering_person_inside_an_intrusion_zone_does_not_fire_before_the_re
     asyncio.run(driver())
 
     assert recorded == [], "an intrusion event fired before the real dwell threshold was reached"
+
+
+# ------------------------------------------------------- entitlement + rule types (2026-09-25)
+
+
+def test_rules_are_not_evaluated_for_a_camera_without_smart_motion(monkeypatch, db_path):
+    _seed_rule("cam-1")
+    monkeypatch.setattr(recording_uploader, "_camera_identity", lambda camera_number: {"camera_id": "cam-1", "smart_motion_enabled": False})
+    called = {"n": 0}
+
+    def fake_detect(camera_number):
+        called["n"] += 1
+        return {"ok": False}
+
+    monkeypatch.setattr(main, "detect_objects_frame", fake_detect)
+    asyncio.run(_run_one_cycle(1, monkeypatch))
+    assert called["n"] == 0  # no AI inference, no events: the zone is stored, not a free analytic
+
+
+def test_entitlement_gate_follows_the_synced_smart_motion_flag():
+    assert worker.camera_rules_entitled({"camera_id": "c", "smart_motion_enabled": True}) is True
+    assert worker.camera_rules_entitled({"camera_id": "c", "smart_motion_enabled": False}) is False
+    assert worker.camera_rules_entitled({"camera_id": "c"}) is False
+    assert worker.camera_rules_entitled(None) is False
+
+
+def test_a_people_counting_line_is_never_evaluated_as_an_alert_rule(db_path):
+    _seed_rule("cam-1", rule_id="count-line", rule_type="people_counting")
+    _seed_rule("cam-1", rule_id="alert-line", rule_type="line_crossing")
+    assert [rule["id"] for rule in worker.load_rules_for_camera("cam-1")] == ["alert-line"]

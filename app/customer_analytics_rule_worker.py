@@ -69,6 +69,21 @@ CUSTOMER_ANALYTICS_RULES_ENABLED = os.environ.get("CUSTOMER_ANALYTICS_RULES_ENAB
 CUSTOMER_ANALYTICS_RULE_INTERVAL_SECONDS = max(0.5, float(os.environ.get("CUSTOMER_ANALYTICS_RULE_INTERVAL_SECONDS", "1.5")))
 
 
+# The rule types this worker evaluates. The same table also stores People
+# Counting's own counting line ("people_counting"), which only
+# people_counting_worker() (main.py) reads.
+EVALUATED_RULE_TYPES = frozenset({"intrusion", "line_crossing"})
+
+
+def camera_rules_entitled(identity: dict | None) -> bool:
+    """Intrusion/line-crossing events are built on the same person/vehicle
+    detections Smart Motion is sold as, so a camera needs the Smart Motion
+    entitlement (cameras.smart_motion_enabled, synced from the cloud) for
+    its rules to be evaluated -- otherwise a customer could get paid
+    analytics, and the AI inference behind them, by drawing a zone."""
+    return bool(identity and identity.get("smart_motion_enabled"))
+
+
 def load_rules_for_camera(camera_id: str) -> list[dict]:
     """Loads this camera's enabled rules from the LOCAL mirror table,
     translated into analytics_rules_engine's own AnalyticsRuleModel-
@@ -88,8 +103,8 @@ def load_rules_for_camera(camera_id: str) -> list[dict]:
         ).fetchall()
     rules = []
     for row in raw_rules:
-        if not row["enabled"]:
-            continue
+        if not row["enabled"] or row["rule_type"] not in EVALUATED_RULE_TYPES:
+            continue  # e.g. a "people_counting" line belongs to people_counting_worker()
         try:
             geometry = json.loads(row["geometry_json"])
         except (TypeError, ValueError):
@@ -193,7 +208,7 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
         try:
             identity = recording_uploader._camera_identity(camera_number)
             camera_id = identity.get("camera_id") if identity else None
-            rules = load_rules_for_camera(camera_id) if camera_id else []
+            rules = load_rules_for_camera(camera_id) if camera_id and camera_rules_entitled(identity) else []
             if rules:
                 async with ai_inference_semaphore:
                     result = await asyncio.to_thread(detect_objects_frame, camera_number)

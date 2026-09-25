@@ -128,6 +128,23 @@ def test_direction_filter_inbound_only_ignores_outbound_crossings():
     assert counter.in_count == 0
 
 
+def test_direction_filter_inbound_only_still_counts_inbound_crossings():
+    """The stored rule vocabulary is inbound/outbound; a crossing is in/out.
+    Comparing them directly made a one-direction line count nothing at all
+    (the two filter tests around this one only ever checked the zero case)."""
+    counter = PeopleCounter(vertical_line(direction="inbound"))
+    for x in WALK_IN:
+        counter.update([det(x)])
+    assert (counter.in_count, counter.out_count) == (1, 0)
+
+
+def test_direction_filter_outbound_only_still_counts_outbound_crossings():
+    counter = PeopleCounter(vertical_line(direction="outbound"))
+    for x in WALK_OUT:
+        counter.update([det(x)])
+    assert (counter.in_count, counter.out_count) == (0, 1)
+
+
 def test_direction_filter_outbound_only_ignores_inbound_crossings():
     counter = PeopleCounter(vertical_line(direction="outbound"))
     for x in WALK_IN:  # a pure left-to-right (in) walk

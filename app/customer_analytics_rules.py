@@ -10,18 +10,15 @@ that legacy file is not tenant-safe (no customer_id/site_id/appliance_id,
 keyed only by a bare integer camera_number unique per appliance, not
 per customer) and is therefore never read from or written to here.
 
-IMPORTANT -- what this module does NOT do: it does not evaluate any rule
-against live or recorded video. `app/analytics_rules_engine.py` (the real
-IoU tracker + geometry + per-rule state machine) exists only on the
-divergent, unmerged `analytics-rules-foundation-20260821` branch and is not
-wired to anything on this branch; on this branch, line-crossing execution
-today happens only inside People Counting's own worker
-(`people_counting_worker()`), using People Counting's own line, never a rule
-saved through this module. A rule saved here is authorized, validated,
-tenant-scoped, and durably stored -- and nothing more -- until a real edge
-worker is built to read `customer_analytics_rules` and evaluate it. Do not
-add any UI copy implying otherwise; the customer-facing page this module
-renders says so explicitly.
+Evaluation (2026-09-25): this module only stores rules; the edge
+evaluates them. edge_camera_sync.py mirrors every rule onto the camera's
+appliance, where customer_analytics_rule_worker.py evaluates "intrusion"
+and "line_crossing" rules (for cameras entitled to Smart Motion, whose
+person/vehicle detections they build on), and main.py's
+people_counting_worker() uses a camera's "people_counting" line (for
+cameras entitled to People Counting). A "people_counting" line is a
+counting line, not an alert rule -- the rule worker never evaluates it,
+and a camera has at most one.
 
 Permission model (mirrors door_access.py's own can_unlock-gated write /
 open read split): a customer_owner has implicit full-fleet read+write,
@@ -46,7 +43,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from partner_db import audit, connection
 from partner_portal import partner_identity
 
-RULE_TYPES = ("intrusion", "line_crossing")
+RULE_TYPES = ("intrusion", "line_crossing", "people_counting")
+# Two-point line rules; "people_counting" is People Counting's counting
+# line (at most one per camera), "line_crossing" an alert rule.
+LINE_RULE_TYPES = ("line_crossing", "people_counting")
 LINE_CROSSING_DIRECTIONS = ("both", "inbound", "outbound")
 MIN_POLYGON_POINTS = 3
 MAX_POLYGON_POINTS = 20
@@ -133,11 +133,13 @@ def _validate_geometry(rule_type: str, geometry, direction):
     if not isinstance(geometry, list):
         raise HTTPException(status_code=400, detail='geometry must be a list of points.')
     points = [_validate_point(point) for point in geometry]
-    if rule_type == 'line_crossing':
+    if rule_type in LINE_RULE_TYPES:
         if len(points) != 2:
-            raise HTTPException(status_code=400, detail='A line-crossing rule needs exactly 2 points.')
+            raise HTTPException(status_code=400, detail='A line needs exactly 2 points.')
+        if points[0] == points[1]:
+            raise HTTPException(status_code=400, detail='A line needs 2 different points.')
         if direction not in LINE_CROSSING_DIRECTIONS:
-            raise HTTPException(status_code=400, detail=f'direction must be one of {list(LINE_CROSSING_DIRECTIONS)} for a line-crossing rule.')
+            raise HTTPException(status_code=400, detail=f'direction must be one of {list(LINE_CROSSING_DIRECTIONS)} for a line.')
         return points, direction
     if len(points) < MIN_POLYGON_POINTS:
         raise HTTPException(status_code=400, detail=f'An intrusion zone needs at least {MIN_POLYGON_POINTS} points.')
@@ -211,6 +213,11 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         with connection() as db:
             camera, can_edit = _authorized_camera_for_rules(db, camera_id, identity)
             _require_edit(can_edit)
+            if rule_type == 'people_counting' and db.execute(
+                "SELECT 1 FROM customer_analytics_rules WHERE camera_id=? AND customer_id=? AND rule_type='people_counting'",
+                (camera_id, identity['customer_id']),
+            ).fetchone():
+                raise HTTPException(status_code=409, detail='This camera already has a people counting line. Edit it instead.')
             rule_id = uuid.uuid4().hex[:12]
             db.execute(
                 'INSERT INTO customer_analytics_rules'
@@ -276,7 +283,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
 
         content = f'''
         <header class="topbar">
-          <div><p class="eyebrow">Detection rules</p><h1>Line crossing &amp; intrusion &middot; {camera_name}</h1></div>
+          <div><p class="eyebrow">Detection rules</p><h1>Lines, zones &amp; people counting &middot; {camera_name}</h1></div>
           <a class="ghost-button" href="/customer/cameras/{camera_id}/live">Back to live view</a>
         </header>
         <section class="panel">
@@ -303,6 +310,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                 <select id="rule-type" {"disabled" if not can_edit else ""}>
                   <option value="line_crossing">Line crossing</option>
                   <option value="intrusion">Intrusion zone</option>
+                  <option value="people_counting">People counting line</option>
                 </select>
               </label>
               <label style="display:grid;gap:6px" id="direction-field">Direction
@@ -330,10 +338,12 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         <section class="panel" style="margin-top:16px">
           <div class="panel-head"><div><h2>What this does today</h2></div></div>
           <p class="health-detail">
-            Saving a rule stores exactly where you drew it for this camera --
-            it does not yet trigger detection or alerts. Real-time evaluation
-            against saved rules requires an edge worker that has not been
-            built yet. Nothing here will notify you until that exists.
+            Saved rules are sent to this camera's appliance and checked there.
+            A line crossing or an entry into an intrusion zone creates an event
+            (and an alert, if you have alerts turned on) on cameras with Smart
+            Motion. A people counting line counts people walking across it in
+            each direction on cameras with People Counting; each camera has one
+            counting line. Changes take effect within a few minutes.
           </p>
         </section>
         '''
@@ -347,6 +357,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   const canvas=document.getElementById('rule-canvas');
   const ctx=canvas.getContext('2d');
   const ruleType=document.getElementById('rule-type');
+  const isLine=t=>t==='line_crossing'||t==='people_counting';
+  const typeLabels={line_crossing:'Line crossing',intrusion:'Intrusion zone',people_counting:'People counting line'};
   const directionField=document.getElementById('direction-field');
   const bgCanvas=document.createElement('canvas');
   let hasFrame=false, points=[], editingRuleId=null, sessionId=null, hls=null, pollTimer=null, stopped=false;
@@ -387,7 +399,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   }
 
   function toggleDirectionField(){
-    directionField.style.display=ruleType.value==='line_crossing'?'':'none';
+    directionField.style.display=isLine(ruleType.value)?'':'none';
   }
   toggleDirectionField();
   ruleType.addEventListener('change',()=>{toggleDirectionField();points=[];redraw();});
@@ -408,9 +420,9 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
       const rect=canvas.getBoundingClientRect();
       const x=(e.clientX-rect.left)/rect.width;
       const y=(e.clientY-rect.top)/rect.height;
-      const cap=ruleType.value==='line_crossing'?2:''' + str(MAX_POLYGON_POINTS) + ''';
+      const cap=isLine(ruleType.value)?2:''' + str(MAX_POLYGON_POINTS) + ''';
       if(points.length>=cap){
-        if(ruleType.value==='line_crossing')points=[{x:x,y:y}];
+        if(isLine(ruleType.value))points=[{x:x,y:y}];
         else return;
       }else{
         points.push({x:x,y:y});
@@ -426,12 +438,12 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     const name=document.getElementById('rule-name').value.trim();
     if(!name){alert('Name is required.');return;}
     const type=ruleType.value;
-    if(type==='line_crossing'&&points.length!==2){alert('Draw exactly 2 points for a line-crossing rule.');return;}
+    if(isLine(type)&&points.length!==2){alert('Draw exactly 2 points for a line.');return;}
     if(type==='intrusion'&&points.length<''' + str(MIN_POLYGON_POINTS) + '''){alert('Draw at least ''' + str(MIN_POLYGON_POINTS) + ''' points for an intrusion zone.');return;}
     const payload={
       rule_type:type,
       name:name,
-      direction:type==='line_crossing'?document.getElementById('rule-direction').value:null,
+      direction:isLine(type)?document.getElementById('rule-direction').value:null,
       geometry:points,
       enabled:document.getElementById('rule-enabled').checked,
     };
@@ -463,7 +475,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     }catch(e){list.textContent='Could not load rules.';return;}
     if(!body.rules.length){list.textContent='No rules yet.';return;}
     list.innerHTML=body.rules.map(rule=>{
-      const typeLabel=rule.rule_type==='line_crossing'?'Line crossing':'Intrusion zone';
+      const typeLabel=typeLabels[rule.rule_type]||'Rule';
       const directionLabel=rule.direction?' &middot; '+escapeHtml(rule.direction):'';
       const stateLabel=rule.enabled?'Enabled':'Disabled';
       const actions=canEdit?(

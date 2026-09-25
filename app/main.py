@@ -38478,13 +38478,50 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
+def _customer_people_counting_rule(camera_number: int) -> dict | None:
+    """This camera's enabled customer-drawn counting line, in the same
+    rule-dict shape the legacy file stores (id/geometry/direction), or
+    None. Resolved by camera_id -- never by camera_number alone -- through
+    the same identity map the worker already reads for its entitlement."""
+    identity = recording_uploader._camera_identity(camera_number)
+    camera_id = identity.get("camera_id") if identity else None
+    if not camera_id:
+        return None
+    try:
+        from partner_db import connection
+        with connection() as db:
+            row = db.execute(
+                "SELECT id,name,direction,geometry_json FROM customer_analytics_rules "
+                "WHERE camera_id=? AND rule_type='people_counting' AND enabled=1 ORDER BY updated_at DESC LIMIT 1",
+                (camera_id,),
+            ).fetchone()
+        if not row:
+            return None
+        geometry = json.loads(row["geometry_json"])
+    except Exception:
+        return None
+    if not isinstance(geometry, list) or len(geometry) < 2:
+        return None
+    return {"id": row["id"], "name": row["name"], "analytic_type": "line_crossing", "camera": camera_number,
+            "direction": row["direction"] or "both", "geometry": geometry, "enabled": True, "source": "customer"}
+
+
 def _load_people_counting_rule(camera_number: int) -> dict | None:
     """Reuses the EXISTING line_crossing rule-builder/storage (analytics_
     rules.json) rather than a second, incompatible configuration system,
     per explicit instruction. Returns the first enabled line_crossing
     rule for this camera, or None if none exists -- an entitled camera
     with no configured line simply doesn't run People Counting yet
-    (fail-safe: no crash, no guess at where a line should go)."""
+    (fail-safe: no crash, no guess at where a line should go).
+
+    2026-09-25: a customer-drawn "people_counting" line (the tenant-safe
+    customer_analytics_rules table, mirrored onto this appliance by
+    edge_camera_sync.py) takes priority -- until then the only way to
+    place a counting line was this appliance's local admin rule API. The
+    legacy file stays the fallback so an existing line keeps counting."""
+    customer_rule = _customer_people_counting_rule(camera_number)
+    if customer_rule:
+        return customer_rule
     rules = load_json_list(ANALYTICS_RULES_FILE)
     for rule in rules:
         if not isinstance(rule, dict):
