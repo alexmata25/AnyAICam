@@ -166,6 +166,17 @@ def fake_mediamtx(monkeypatch):
         thread.join(timeout=5)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_capability_discovery(monkeypatch):
+    """Path-sync tests must never touch a real DB or a real camera's ONVIF
+    service; each test starts with no stored capabilities or cached choice."""
+    monkeypatch.setattr(wp, "_p2p_source_choice", {})
+    monkeypatch.setattr(wp, "_load_capabilities", lambda camera_id: None)
+    monkeypatch.setattr(wp, "_save_capabilities", lambda camera_id, record: None)
+    monkeypatch.setattr(wp, "_onvif_soap_call", lambda: None)
+    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: False)
+
+
 # --------------------------------------------------------------- path sync
 
 
@@ -615,6 +626,11 @@ def test_substream_candidates_follow_generic_conventions_only():
 def fresh_choice(monkeypatch):
     monkeypatch.setattr(wp, "_p2p_source_choice", {})
     monkeypatch.setattr(wp, "P2P_STREAM_PREFERENCE", "auto")
+    # No real DB or camera: no stored capabilities and no ONVIF service, so
+    # the capability layer falls back to its URL-convention adapter.
+    monkeypatch.setattr(wp, "_load_capabilities", lambda camera_id: None)
+    monkeypatch.setattr(wp, "_save_capabilities", lambda camera_id, record: None)
+    monkeypatch.setattr(wp, "_onvif_soap_call", lambda: None)
     probes = []
     monkeypatch.setattr(wp, "_probe_video_stream", lambda url: probes.append(url) or url == SUB)
     return probes

@@ -1141,6 +1141,18 @@ CREATE TABLE IF NOT EXISTS stripe_webhook_steps(
     PRIMARY KEY(event_id, step)
 );
 '''),
+    # Capability-driven camera integration (2026-09-24): one discovered,
+    # credential-free capability record per camera (streams with codec/
+    # resolution/fps/bitrate, audio, PTZ, snapshot) -- see
+    # camera_capabilities.py. Subsystems select streams from this instead
+    # of camera numbers, brands or URL shapes.
+    ('20260925_camera_capabilities','''
+CREATE TABLE IF NOT EXISTS camera_capabilities(
+    camera_id TEXT PRIMARY KEY,
+    capabilities_json TEXT NOT NULL,
+    probed_at TEXT NOT NULL
+);
+'''),
 ]
 
 

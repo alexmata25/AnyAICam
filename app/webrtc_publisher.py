@@ -98,6 +98,7 @@ rejected with a real 400) this surfaced and fixed."""
 import json
 import logging
 import appliance_config_cache
+import camera_capabilities
 import os
 import asyncio
 import secrets
@@ -457,18 +458,58 @@ def _probe_video_stream(url: str) -> bool:
 _p2p_source_choice: dict = {}
 
 
+def _onvif_soap_call():
+    """The existing ONVIF SOAP client (talk_down_discovery) -- imported
+    lazily so this module stays import-safe."""
+    try:
+        import talk_down_discovery
+        return talk_down_discovery._soap_call
+    except Exception:
+        return None
+
+
+def _load_capabilities(camera_id: str):
+    try:
+        from partner_db import connection
+        with connection() as db:
+            return camera_capabilities.load(db, camera_id)
+    except Exception:
+        return None
+
+
+def _save_capabilities(camera_id: str, record: dict) -> None:
+    try:
+        from partner_db import connection
+        with connection() as db:
+            camera_capabilities.save(db, camera_id, record)
+    except Exception as error:
+        logger.warning("webrtc_publisher.capabilities_save_failed camera_id=%s error=%s", camera_id, error)
+
+
 def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
-    """(source URL for MediaMTX, "substream"|"main"). Runs ffprobe, so it
-    must only be called off the event loop (sync_camera_paths() already is)."""
+    """(source URL for MediaMTX, "substream"|"main"), chosen from the
+    camera's discovered capabilities (camera_capabilities.py: ONVIF media
+    profiles first, the URL-convention guess only as a fallback), and
+    verified with a real probe before use. Runs network calls, so it must
+    only be called off the event loop (sync_camera_paths() already is)."""
     cached = _p2p_source_choice.get(camera_id)
     if cached and cached[0] == main_url:
         return cached[1], ("main" if cached[1] == main_url else "substream")
     chosen = main_url
     if P2P_STREAM_PREFERENCE != "main":
-        for candidate in substream_candidates(main_url):
-            if _probe_video_stream(candidate):
+        _clean, username, password = camera_capabilities.split_credentials(main_url)
+        record = _load_capabilities(camera_id)
+        if camera_capabilities.needs_reprobe(record, main_url):
+            record = camera_capabilities.discover(main_url, soap_call=_onvif_soap_call(), url_candidates=substream_candidates)
+        for stream in camera_capabilities.select_streams(record, "live_p2p"):
+            if stream.get("role") == "main":
+                break
+            candidate = camera_capabilities.with_credentials(stream["uri"], username, password)
+            stream["verified"] = _probe_video_stream(candidate)
+            if stream["verified"]:
                 chosen = candidate
                 break
+        _save_capabilities(camera_id, record)
     _p2p_source_choice[camera_id] = (main_url, chosen)
     kind = "main" if chosen == main_url else "substream"
     logger.info("webrtc_publisher.p2p_source camera_id=%s stream=%s", camera_id, kind)
