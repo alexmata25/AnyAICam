@@ -170,6 +170,102 @@ normalize_vms_install_ownership() {
         -o -exec chown -h "$owner" {} +
 }
 
+# ---------------------------------------------------------------- rollback point
+# (2026-09-25) A repair/upgrade rebuilds anyaicam-vms:latest in place and
+# rsync --delete replaces the code, so before this the previous release
+# survived only if someone tagged/archived it by hand first. Every
+# non-clean install now leaves, BEFORE touching anything:
+#   - the previous image tagged anyaicam-vms:rollback-<previous commit>
+#   - the previous code tree (no recordings/config/.env/secrets) archived
+#   - an online, integrity-checked copy of the VMS database
+#   - a manifest (ROLLBACK_DIR/rollback-*.env, latest.env) that rollback.sh
+#     restores from.
+# Nothing here deletes or rewrites existing data; old rollback points are
+# kept (pruning them is left to the operator).
+ROLLBACK_DIR="${ANYAICAM_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}"
+VMS_IMAGE="${ANYAICAM_VMS_IMAGE:-anyaicam-vms}"
+VMS_CONTAINER="${ANYAICAM_VMS_CONTAINER:-anyaicam-vms}"
+VMS_DATABASE_NAME="partner_portal.db"
+
+previous_vms_commit() {
+    sed -n 's/^ANYAICAM_VMS_COMMIT=//p' "$VMS_ENV_FILE" 2>/dev/null | tail -n 1
+}
+
+# Prints the backup's path ("none" when there is no database yet). Online
+# and consistent via sqlite3's backup API inside the running container
+# (the same method used for every manual Ryzen backup), integrity-checked;
+# a plain copy (with its WAL) only when the VMS is not running.
+backup_vms_database() {
+    local dest_name="$1" db="$VMS_RECORDINGS_DIR/$VMS_DATABASE_NAME"
+    if [[ ! -f "$db" ]]; then
+        echo "none"
+        return 0
+    fi
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$VMS_CONTAINER" 2>/dev/null)" == "true" ]]; then
+        docker exec "$VMS_CONTAINER" python3 -c '
+import sqlite3, sys
+name = sys.argv[1]
+src = sqlite3.connect("file:/app/recordings/'"$VMS_DATABASE_NAME"'?mode=ro", uri=True)
+out = sqlite3.connect("/app/recordings/" + name)
+src.backup(out); out.close(); src.close()
+check = sqlite3.connect("file:/app/recordings/" + name + "?mode=ro", uri=True)
+sys.exit(0 if check.execute("PRAGMA integrity_check").fetchone()[0] == "ok" else 3)
+' "$dest_name" >&2 || return 1
+    else
+        cp -p "$db" "$VMS_RECORDINGS_DIR/$dest_name" || return 1
+        if [[ -f "$db-wal" ]]; then
+            cp -p "$db-wal" "$VMS_RECORDINGS_DIR/$dest_name-wal" || return 1
+        fi
+    fi
+    [[ -s "$VMS_RECORDINGS_DIR/$dest_name" ]] || return 1
+    echo "$VMS_RECORDINGS_DIR/$dest_name"
+}
+
+create_rollback_point() {
+    local previous short stamp image_tag="" archive db_backup manifest root_parent root_name
+    previous="$(previous_vms_commit)"
+    [[ -n "$previous" ]] || previous="unknown"
+    short="${previous:0:12}"
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$ROLLBACK_DIR" && chmod 0750 "$ROLLBACK_DIR" || return 1
+    if [[ "$(id -u)" == "0" ]]; then chown root:root "$ROLLBACK_DIR"; fi
+
+    if docker image inspect "$VMS_IMAGE:latest" >/dev/null 2>&1; then
+        image_tag="$VMS_IMAGE:rollback-$short"
+        docker tag "$VMS_IMAGE:latest" "$image_tag" || return 1
+    fi
+
+    root_parent="$(dirname "$VMS_INSTALL_ROOT")"
+    root_name="$(basename "$VMS_INSTALL_ROOT")"
+    archive="$ROLLBACK_DIR/vms-code-$short-$stamp.tar.gz"
+    if [[ -d "$VMS_INSTALL_ROOT" ]]; then
+        tar -czf "$archive" -C "$root_parent" \
+            --exclude="$root_name/recordings" --exclude="$root_name/data/config" --exclude="$root_name/.env" \
+            --exclude="$root_name/mediamtx" --exclude="$root_name/app/static/hls" --exclude="$root_name/app/recordings" \
+            --exclude="$root_name/app/auto.key" --exclude="$root_name/app/auto.crt" --exclude='__pycache__' \
+            "$root_name" || return 1
+        gzip -t "$archive" || return 1
+        chmod 0640 "$archive"
+    else
+        archive="none"
+    fi
+
+    db_backup="$(backup_vms_database "partner_portal-pre-${VMS_RELEASE_COMMIT:0:12}-$stamp.db")" || return 1
+
+    manifest="$ROLLBACK_DIR/rollback-$short-$stamp.env"
+    {
+        printf 'ROLLBACK_COMMIT=%s\n' "$previous"
+        printf 'ROLLBACK_IMAGE=%s\n' "${image_tag:-none}"
+        printf 'ROLLBACK_CODE_ARCHIVE=%s\n' "$archive"
+        printf 'ROLLBACK_DATABASE_BACKUP=%s\n' "$db_backup"
+        printf 'ROLLBACK_CREATED_AT=%s\n' "$stamp"
+        printf 'UPGRADE_TO_COMMIT=%s\n' "$VMS_RELEASE_COMMIT"
+    } > "$manifest"
+    chmod 0640 "$manifest"
+    cp -f "$manifest" "$ROLLBACK_DIR/latest.env"
+    log "Rollback point for $previous: image ${image_tag:-none}, code $archive, database $db_backup (manifest $manifest)."
+}
+
 deploy_vms() {
     local state="$1"
 
@@ -181,6 +277,15 @@ deploy_vms() {
     migrate_legacy_persistent_data "$VMS_INSTALL_ROOT/recordings" "$VMS_RECORDINGS_DIR" "VMS recordings/application state"
     migrate_legacy_persistent_data "$VMS_INSTALL_ROOT/data/config" "$VMS_DATA_CONFIG_DIR" "VMS data/config"
     migrate_legacy_persistent_file "$VMS_INSTALL_ROOT/.env" "$VMS_ENV_FILE" "VMS environment config"
+
+    if [[ "$state" != "clean" ]]; then
+        if [[ "${ANYAICAM_SKIP_ROLLBACK_POINT:-}" == "1" ]]; then
+            log "WARNING: ANYAICAM_SKIP_ROLLBACK_POINT=1 -- replacing the installed VMS WITHOUT a rollback point."
+        elif ! create_rollback_point; then
+            echo "[ERROR] Could not create a rollback point for the installed VMS; nothing was changed. Fix the error above, or set ANYAICAM_SKIP_ROLLBACK_POINT=1 to replace it without one." >&2
+            return 1
+        fi
+    fi
 
     install -d -m 0755 -o root -g root "$VMS_INSTALL_ROOT"
 
