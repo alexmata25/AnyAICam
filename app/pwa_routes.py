@@ -84,9 +84,9 @@ self.addEventListener('notificationclick',event=>{
         <section class="panel">
           <div class="panel-head"><div><h2>Installable mobile web app</h2><div class="health-detail">The app opens directly to your secure portal and uses the same approved account.</div></div></div>
           <div class="feature-grid">
-            <article class="feature-card"><div class="feature-icon">A</div><h2>Android</h2><p>Open app.anyaicam.com in Chrome, then choose Install app or Add to Home screen.</p><button class="action-button" id="install-app" type="button">Install on this device</button></article>
+            <article class="feature-card"><div class="feature-icon">A</div><h2>Android</h2><p>Open __PORTAL_HOST__ in Chrome, then choose Install app or Add to Home screen.</p><button class="action-button" id="install-app" type="button">Install on this device</button></article>
             <article class="feature-card"><div class="feature-icon"></div><h2>iPhone and iPad</h2><p>Open in Safari, tap Share, choose Add to Home Screen, and enable Open as Web App.</p><button class="compact-button" id="ios-help" type="button">Show iPhone instructions</button></article>
-            <article class="feature-card"><div class="feature-icon">✦</div><h2>Push alerts</h2><p>After installation, open Camera apps & alerts and allow notifications.</p><a class="download" href="/customer-app-settings">Program alerts</a></article>
+            <article class="feature-card"><div class="feature-icon">✦</div><h2>Push alerts</h2><p>After installing, pair the phone under Mobile devices and choose your alerts in Notification settings.</p><a class="download" href="/mobile-devices">Mobile devices</a> · <a class="download" href="/settings/notifications">Notification settings</a></article>
           </div>
           <div id="install-message" class="launch-note" style="margin-top:16px">Your browser will show the install option when the public HTTPS portal and PWA requirements are ready.</div>
         </section>
@@ -111,4 +111,7 @@ self.addEventListener('notificationclick',event=>{
         window.addEventListener('appinstalled',()=>{message.textContent='ANY AI CAM is installed on this device.'});
         </script>
         '''
+        # The portal's own address (was a hard-coded app.anyaicam.com), 2026-09-25.
+        from html import escape as _escape
+        content = content.replace("__PORTAL_HOST__", _escape(request.headers.get("host") or request.url.netloc or "this portal's address"))
         return page_shell("Install mobile app", "mobile-app", content, scripts)

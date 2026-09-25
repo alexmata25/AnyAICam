@@ -92746,6 +92746,8 @@ def mobile_devices_page(request: Request) -> str:
 
 
 
+    // Stored naive UTC (container time) -> the viewer's local time (2026-09-25).
+    function mobileLocalTime(value){if(!value)return 'Never';const text=String(value);const date=new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(text)?text:text+'Z');return isNaN(date.getTime())?text.replace('T',' ').slice(0,19):date.toLocaleString([],{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'})}
     function escMobile(value){return String(value??'').replace(/[&<>\"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char]))}
 
 
@@ -92782,7 +92784,7 @@ def mobile_devices_page(request: Request) -> str:
 
 
 
-        <div class="mobile-device-head"><div><h3>${escMobile(device.device_name)}</h3><div class="mobile-device-meta">${escMobile(device.platform)} · ${escMobile(device.user_email||'')}<br>Last seen: ${escMobile((device.last_seen_at||'Never').replace('T',' ').slice(0,19))}</div></div><span class="mobile-badge">${device.revoked?'revoked':'active'}</span></div>
+        <div class="mobile-device-head"><div><h3>${escMobile(device.device_name)}</h3><div class="mobile-device-meta">${escMobile(device.platform)} · ${escMobile(device.user_email||'')}<br>Last seen: ${escMobile(mobileLocalTime(device.last_seen_at))}</div></div><span class="mobile-badge">${device.revoked?'revoked':'active'}</span></div>
 
 
 
@@ -132741,7 +132743,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-        "This address uses localhost. A phone cannot reach localhost on the Samsung laptop. "
+        "This address uses localhost. A phone cannot reach localhost on this computer. "
 
 
 
@@ -132858,7 +132860,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-check"><strong>1</strong><span>Connect the phone and Samsung laptop to the same Wi-Fi, or connect both devices to Tailscale.</span></div>
+          <div class="phone-check"><strong>1</strong><span>{"Make sure the phone has an internet connection." if RUNTIME_ROLE == "cloud" else "Connect the phone to the same network as this AnyAiCam appliance, or use Tailscale for remote access."}</span></div>
 
 
 
@@ -132885,7 +132887,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-check"><strong>4</strong><span>Open Notifications and enable push alerts after VAPID keys are configured.</span></div>
+          <div class="phone-check"><strong>4</strong><span>Pair the phone under <a class="download" href="/mobile-devices">Mobile devices</a>, then choose which alerts you get in <a class="download" href="/settings/notifications">Notification settings</a>.</span></div>
 
 
 
@@ -132966,7 +132968,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Push server</span><strong>{'Configured' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Needs VAPID keys'}</strong></div>
+          <div class="phone-status-row"><span>Push server</span><strong>{'Ready' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Not set up yet'}</strong></div>
 
 
 
