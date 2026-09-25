@@ -16,3 +16,6 @@ onnxruntime==1.19.2
 numpy==1.26.4
 pywebpush==2.0.3
 pytesseract==0.3.13
+# Access control: dry-contact USB relay modules (access_adapters.NumatoUsbRelayDriver);
+# imported only when a relay door is configured.
+pyserial==3.5

@@ -1152,6 +1152,60 @@ CREATE TABLE IF NOT EXISTS camera_capabilities(
     capabilities_json TEXT NOT NULL,
     probed_at TEXT NOT NULL
 );
+'''),    # Access-control hardware (2026-09-25, access_control.py): doors as
+    # their own records (Z-Wave lock, relay strike/maglock, simulator), the
+    # persisted relock state that restart recovery reads, a hardware-level
+    # command log and door events (forced, held open, REX, offline).
+    # door_access_events stays the authorization-level audit.
+    ('20260925_access_control','''
+CREATE TABLE IF NOT EXISTS access_doors(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    camera_id TEXT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    unlock_seconds INTEGER NOT NULL DEFAULT 5,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_doors_customer ON access_doors(customer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_doors_camera ON access_doors(camera_id) WHERE camera_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS access_door_state(
+    door_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    relock_due_at REAL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS access_door_commands(
+    id TEXT PRIMARY KEY,
+    door_id TEXT NOT NULL,
+    customer_id TEXT,
+    camera_id TEXT,
+    command TEXT NOT NULL,
+    trigger_type TEXT,
+    actor TEXT,
+    reason TEXT,
+    person_id TEXT,
+    facial_event_id TEXT,
+    result TEXT NOT NULL,
+    detail TEXT,
+    duration_seconds INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_door_commands_door_created ON access_door_commands(door_id,created_at);
+CREATE TABLE IF NOT EXISTS access_door_events(
+    id TEXT PRIMARY KEY,
+    door_id TEXT NOT NULL,
+    customer_id TEXT,
+    camera_id TEXT,
+    event_type TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_door_events_door_created ON access_door_events(door_id,created_at);
 '''),
 ]
 
