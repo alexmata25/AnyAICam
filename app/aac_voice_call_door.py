@@ -205,15 +205,10 @@ def confirm_unlock(*, event_id: str, customer_id: str, identity: dict, confirm_t
             )
         raise door_access.HTTPException(status_code=409, detail="This confirmation has expired or was already used -- request a new unlock confirmation.")
 
-    request_obj = relay_control.RelayRequest(
-        channel=camera["door_relay_channel"],
-        pulse_ms=camera["door_relay_pulse_ms"] or relay_control.DEFAULT_PULSE_MS,
-        reason=f"aac_voice_call_unlock:{camera['id']}",
-        dry_run=False,
-        requested_by=identity.get("email"),
-    )
     try:
-        result = relay_control.get_provider().trigger(request_obj)
+        result = door_access.trigger_door(camera, reason=f"aac_voice_call_unlock:{camera['id']}",
+                                          actor=identity.get("email") or "", trigger_type="aac_voice_call",
+                                          pulse_ms=camera["door_relay_pulse_ms"])
     except Exception as error:
         with connection() as audit_db:
             door_access.record_door_access_event(
