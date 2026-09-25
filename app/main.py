@@ -132356,23 +132356,12 @@ IMPLEMENTED_SETTINGS_CATEGORIES = {"Events & alerts"}
 
 
 @app.get("/settings", response_class=HTMLResponse)
-
-
-
-
-
-
-
-
 def settings(request: Request) -> str:
-
-
-
-
-
-
-
-
+    # Portal customers have their own settings page; "All settings" links
+    # (e.g. from Notification settings) used to dead-end here on
+    # "role does not include manage_settings" (2026-09-25).
+    if _customer_playback_cameras(request) is not None:
+        return RedirectResponse("/customer-app-settings", status_code=303)
     user = current_user(request)
 
 

@@ -78,3 +78,10 @@ def test_settings_script_is_valid_javascript(client, tmp_path):
     path.write_text(script, encoding="utf-8")
     result = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_all_settings_link_takes_customers_to_their_settings(client):
+    """'All settings' (Notification settings) linked to /settings, which
+    showed customers 'role does not include manage_settings'."""
+    response = client.get("/settings", cookies=_cookie())
+    assert response.status_code == 303 and response.headers["location"] == "/customer-app-settings"
