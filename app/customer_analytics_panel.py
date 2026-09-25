@@ -59,7 +59,7 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     # which refuses to run at all for a camera without an active
     # 'facial_recognition' row here, and facial_people.py/facial_recognition_ui.py
     # for enrollment/watchlist management.
-    "facial_recognition": ("AAC Facial Recognition", ("facial_recognition",)),
+    "facial_recognition": ("Facial Recognition", ("facial_recognition",)),
 }
 
 # Never show an empty bar: this pin exists so ANALYTIC_LABELS additions

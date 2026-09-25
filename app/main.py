@@ -104161,12 +104161,17 @@ def _customer_subscription_portal_page(identity: dict) -> str:
             # active via a non-Stripe grant still sees "Active" above;
             # this branch is unreachable for them). Matches
             # aaco_product_status()'s own "sellable: false" precedent.
-            status_html = '<span class="health-detail">Coming soon</span>'
+            status_html = '<span class="pending-badge" aria-disabled="true" title="Not available to purchase yet">Not available yet</span>'
         elif is_owner:
             status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
         else:
             status_html = '<span class="health-detail">Not purchased</span>'
-        addon_rows += f'<div class="health-row"><span>{escape(label)}</span>{status_html}</div>'
+        # What the add-on turns on, from the catalog's own analytic mapping
+        # (only analytics customers see in the portal; no invented detail).
+        from customer_analytics_panel import ANALYTIC_LABELS as _PORTAL_ANALYTICS
+        included = [_PORTAL_ANALYTICS[key][0] for key in analytic_keys if key in _PORTAL_ANALYTICS]
+        includes_html = f'<br><span class="health-detail">Includes: {escape(", ".join(included))}</span>' if included else ''
+        addon_rows += f'<div class="health-row"><span>{escape(label)}{includes_html}</span>{status_html}</div>'
     if not addon_rows:
         addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
 
