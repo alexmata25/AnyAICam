@@ -135,3 +135,66 @@ def test_the_webhook_endpoint_runs_the_async_success_event_through_every_step(mo
                                headers={"stripe-signature": f"t={stamp},v1={signature}", "Content-Type": "application/json"})
     assert response.status_code == 200, response.text
     assert ce.total_camera_slots("cust-1") == 8
+
+
+# ------------------------------------------------ through the real webhook route, every step (2026-09-25)
+
+def _webhook_poster(monkeypatch, tmp_path):
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    from fastapi.testclient import TestClient
+
+    import main
+    monkeypatch.setattr(main, "STRIPE_WEBHOOK_SECRET", "whsec_test_delayed")
+    for name in ("PAYMENT_WEBHOOK_EVENTS_FILE", "PAYMENT_SESSIONS_FILE", "BILLING_ACCOUNTS_FILE"):
+        monkeypatch.setattr(main, name, tmp_path / f"{name.lower()}.json")
+    client = TestClient(main.app)
+
+    def post(event):
+        body = json.dumps(event).encode()
+        stamp = str(int(time.time()))
+        signature = hmac.new(b"whsec_test_delayed", f"{stamp}.".encode() + body, hashlib.sha256).hexdigest()
+        response = client.post("/api/payments/stripe/webhook", content=body,
+                               headers={"stripe-signature": f"t={stamp},v1={signature}", "Content-Type": "application/json"})
+        assert response.status_code == 200, response.text
+        return response.json()
+    return post, main
+
+
+def test_a_card_payment_still_grants_and_orders_immediately(monkeypatch, tmp_path):
+    post, _main = _webhook_poster(monkeypatch, tmp_path)
+    post(_session_event("evt_card_slots", "checkout.session.completed", SLOT_PRICE, payment_status="paid", session_id="cs_card_1"))
+    post(_session_event("evt_card_hw", "checkout.session.completed", HARDWARE_PRICE, payment_status="paid", session_id="cs_card_2"))
+    assert ce.total_camera_slots("cust-1") == 8
+    orders = ho.get_orders_for_customer("cust-1")
+    assert [(o["status"], o["fulfillment_status"]) for o in orders] == [("paid", "paid")]
+
+
+def test_a_delayed_payment_through_the_webhook_waits_then_grants_and_orders(monkeypatch, tmp_path):
+    post, main = _webhook_poster(monkeypatch, tmp_path)
+    for price, session in ((SLOT_PRICE, "cs_late_1"), (ANALYTICS_PRICE, "cs_late_2"), (HARDWARE_PRICE, "cs_late_3")):
+        post(_session_event(f"evt_done_{session}", "checkout.session.completed", price, payment_status="unpaid", session_id=session))
+    assert ce.total_camera_slots("cust-1") == 0
+    assert ae.get_active_analytics_for_customer("cust-1") == []
+    assert ho.get_orders_for_customer("cust-1") == []  # nothing in the fulfillment queue
+    for price, session in ((SLOT_PRICE, "cs_late_1"), (ANALYTICS_PRICE, "cs_late_2"), (HARDWARE_PRICE, "cs_late_3")):
+        post(_session_event(f"evt_ok_{session}", "checkout.session.async_payment_succeeded", price, payment_status="paid", session_id=session))
+    assert ce.total_camera_slots("cust-1") == 8
+    assert ae.get_active_analytics_for_customer("cust-1") == ["lpr", "people_counting", "ppe", "smart_motion"]
+    assert [o["status"] for o in ho.get_orders_for_customer("cust-1")] == ["paid"]
+    assert main.load_payment_sessions()["cs_late_1"]["async_payment"] == "succeeded"
+
+
+def test_a_failed_delayed_payment_through_the_webhook_grants_nothing_and_is_recorded(monkeypatch, tmp_path):
+    post, main = _webhook_poster(monkeypatch, tmp_path)
+    for price, session in ((SLOT_PRICE, "cs_fail_1"), (ANALYTICS_PRICE, "cs_fail_2"), (HARDWARE_PRICE, "cs_fail_3")):
+        post(_session_event(f"evt_done_{session}", "checkout.session.completed", price, payment_status="unpaid", session_id=session))
+        post(_session_event(f"evt_fail_{session}", "checkout.session.async_payment_failed", price, payment_status="unpaid", session_id=session))
+    assert ce.total_camera_slots("cust-1") == 0
+    assert ae.get_active_analytics_for_customer("cust-1") == []
+    assert ho.get_orders_for_customer("cust-1") == []
+    record = main.load_payment_sessions()["cs_fail_1"]
+    assert (record["async_payment"], record["payment_status"]) == ("failed", "unpaid")
