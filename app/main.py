@@ -72477,6 +72477,86 @@ const grid=document.getElementById('camera-grid');const savedLayout=localStorage
 
 
 
+@app.get("/api/customer/dashboard/intelligence")
+def customer_dashboard_intelligence_api(request: Request, start_ms: int, end_ms: int) -> dict:
+    """The portal customer's own Dashboard numbers for the viewer's local
+    day (2026-09-25), in the same shape /api/dashboard/intelligence has.
+    That route reads appliance-local legacy files (motion_events,
+    in_app_alerts.jsonl) with no tenant scoping at all -- on the cloud
+    portal every customer saw the same '0 events' and stray 'Motion
+    detected on Camera 1' alerts linking to the legacy /camera/1 page.
+    This one reads only this customer's detection_events (their permitted
+    cameras) and their own notifications."""
+    cameras = _customer_playback_cameras(request)
+    if cameras is None:
+        raise HTTPException(status_code=403, detail="Customer portal sign-in required.")
+    if end_ms <= start_ms or end_ms - start_ms > 2 * 86400000:
+        raise HTTPException(status_code=400, detail="Provide one local day (start_ms/end_ms).")
+    from partner_portal import partner_identity
+    identity = partner_identity(request) or {}
+    from customer_analytics_panel import event_type_label
+    names = {camera["id"]: _camera_display_label(camera) for camera in cameras}
+    camera_ids = list(names)
+    start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    end_iso = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    hourly = [0] * 24
+    by_type: dict[str, int] = {}
+    per_camera: dict[str, int] = {}
+    if camera_ids:
+        placeholders = ",".join("?" for _ in camera_ids)
+        from partner_db import connection
+        with connection() as db:
+            for item in db.execute(
+                "SELECT camera_id, event_type, substr(event_timestamp,1,13) AS hour, COUNT(*) AS n FROM detection_events "
+                f"WHERE customer_id=? AND camera_id IN ({placeholders}) AND event_timestamp>=? AND event_timestamp<? "
+                "GROUP BY camera_id, event_type, substr(event_timestamp,1,13)",
+                (identity.get("customer_id"), *camera_ids, start_iso, end_iso),
+            ).fetchall():
+                count = item["n"]
+                by_type[item["event_type"]] = by_type.get(item["event_type"], 0) + count
+                per_camera[item["camera_id"]] = per_camera.get(item["camera_id"], 0) + count
+                hour_ms = _naive_utc_timestamp_to_epoch_ms(f'{item["hour"]}:00:00')
+                if hour_ms is not None:
+                    index = int((hour_ms - start_ms) // 3600000)
+                    if 0 <= index < 24:
+                        hourly[index] += count
+    vehicle_types = ("vehicle", "car", "truck", "bus", "motorcycle", "bicycle")
+    notifications = _customer_notifications(request) or []
+    unread = [item for item in notifications if not item.get("read")]
+    alerts = []
+    for item in unread[:6]:
+        title, message = _customer_alert_text(item)
+        stamp = _naive_utc_timestamp_to_epoch_ms(item.get("timestamp"))
+        alerts.append({
+            "message": f'{message} · {item.get("camera_name")}' if item.get("camera_name") else message,
+            "severity": "warning",
+            "type": title,
+            "timestamp": datetime.fromtimestamp(stamp / 1000, tz=timezone.utc).isoformat() if stamp is not None else None,
+            "href": (_customer_event_playback_href(item.get("camera_id"), item.get("timestamp"), item.get("event_id"),
+                                                   item.get("has_event_clip")) if item.get("event_id") else "/alerts"),
+            "category": "event",
+        })
+    busiest = max(per_camera, key=per_camera.get) if per_camera else None
+    return {
+        "events_today": sum(by_type.values()),
+        "analytics": {
+            "person": by_type.get("person", 0),
+            "vehicle": sum(by_type.get(kind, 0) for kind in vehicle_types),
+            "plate": by_type.get("plate", 0),
+            "intrusion": by_type.get("intrusion", 0) + by_type.get("line_crossing", 0),
+        },
+        "analytics_mock": False,
+        "unread_alert_count": len(unread),
+        "active_issue_count": 0,
+        "alerts": alerts,
+        "hourly_activity": hourly,
+        "most_active_camera": busiest,
+        "most_active_camera_label": names.get(busiest) if busiest else None,
+        "most_active_camera_events": per_camera.get(busiest, 0) if busiest else 0,
+        "event_types": {event_type_label(key): value for key, value in by_type.items()},
+    }
+
+
 @app.get("/api/dashboard/intelligence")
 
 
@@ -74673,10 +74753,17 @@ def dashboard(request: Request) -> str:
             for number, ids in _dashboard_camera_ids_seen.items()
             if len(ids) == 1
         }
+        # The customer's own camera names ("Living Room"), not "Camera N"
+        # (2026-09-25) -- same label every other customer page shows.
+        _dashboard_camera_names_by_number = {
+            camera["camera_number"]: _camera_display_label(camera)
+            for camera in _customer_dashboard_cameras if camera.get("camera_number") is not None
+        }
     else:
         _dashboard_camera_numbers = list(get_camera_numbers())
         _dashboard_live_view_href = "/"
         _dashboard_camera_ids_by_number = {}
+        _dashboard_camera_names_by_number = {}
     from partner_portal import partner_identity
     _dashboard_identity = partner_identity(request) if _customer_dashboard_cameras is not None else None
     # Permission-mismatch fix (2026-09-21): _customer_dashboard_cameras
@@ -74927,7 +75014,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            <img id="dashboard-snapshot-{camera_number}" class="dashboard-camera-snapshot" alt="Camera {camera_number} snapshot" hidden>
+            <img id="dashboard-snapshot-{camera_number}" class="dashboard-camera-snapshot" alt="{escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')} snapshot" hidden>
 
 
 
@@ -74954,7 +75041,7 @@ def dashboard(request: Request) -> str:
 
 
 
-                <strong>Connecting to Camera {camera_number}</strong>
+                <strong>Connecting to {escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')}</strong>
 
 
 
@@ -75026,7 +75113,7 @@ def dashboard(request: Request) -> str:
 
 
 
-                <div class="dashboard-camera-name">Camera {camera_number}{' <span class=\"pill\">Playback only</span>' if camera_number in _dashboard_camera_playback_only else ''}</div>
+                <div class="dashboard-camera-name">{escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')}{' <span class=\"pill\">Playback only</span>' if camera_number in _dashboard_camera_playback_only else ''}</div>
 
 
 
@@ -76080,6 +76167,15 @@ document.querySelectorAll('[id^="dashboard-camera-"]').forEach(card=>attachDashb
 
 
 
+// Portal customers get their own tenant-scoped numbers for their local day
+// (2026-09-25); everything else keeps the appliance intelligence route.
+function dashboardIntelligenceUrl(){
+    if(!window.__anyaicamCustomerDashboard)return '/api/dashboard/intelligence';
+    const now=new Date();
+    const start=new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime();
+    const end=new Date(now.getFullYear(),now.getMonth(),now.getDate()+1).getTime();
+    return `/api/customer/dashboard/intelligence?start_ms=${start}&end_ms=${end}`;
+}
 async function updateDashboard(){
 
 
@@ -76125,7 +76221,7 @@ async function updateDashboard(){
 
 
 
-            fetch('/api/dashboard/intelligence',{cache:'no-store'})
+            fetch(dashboardIntelligenceUrl(),{cache:'no-store'})
 
 
 
@@ -76512,7 +76608,7 @@ function renderIntelligence(data){
 
 
 
-    active.textContent=data.most_active_camera?`Camera ${data.most_active_camera}`:'—';
+    active.textContent=data.most_active_camera?(data.most_active_camera_label||`Camera ${data.most_active_camera}`):'—';
 
 
 
@@ -76611,7 +76707,7 @@ function eventTimestamp(event){return event.start_time||event.timestamp||''}
 
 
 
-function relativeTime(value){const parsed=new Date(value);if(Number.isNaN(parsed.getTime()))return 'Time unavailable';const seconds=Math.max(0,Math.floor((Date.now()-parsed.getTime())/1000));if(seconds<60)return `${seconds}s ago`;const minutes=Math.floor(seconds/60);if(minutes<60)return `${minutes}m ago`;const hours=Math.floor(minutes/60);if(hours<24)return `${hours}h ago`;return `${Math.floor(hours/24)}d ago`}
+function relativeTime(value){const parsed=typeof value==='number'?new Date(value):new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(String(value))?String(value):String(value)+'Z');if(Number.isNaN(parsed.getTime()))return 'Time unavailable';const seconds=Math.max(0,Math.floor((Date.now()-parsed.getTime())/1000));if(seconds<60)return `${seconds}s ago`;const minutes=Math.floor(seconds/60);if(minutes<60)return `${minutes}m ago`;const hours=Math.floor(minutes/60);if(hours<24)return `${hours}h ago`;return `${Math.floor(hours/24)}d ago`}
 
 
 
@@ -76683,7 +76779,7 @@ function buildEventCard(event){
 
 
 
-    const title=document.createElement('div');title.className='dashboard-event-title';title.textContent=`${(event.event_type||'Motion').replaceAll('_',' ')} detected`;body.appendChild(title);
+    const title=document.createElement('div');title.className='dashboard-event-title';title.textContent=`${event.type_label||(event.event_type||'Motion').replaceAll('_',' ')} detected`;body.appendChild(title);
 
 
 
@@ -76692,7 +76788,7 @@ function buildEventCard(event){
 
 
 
-    const meta=document.createElement('div');meta.className='dashboard-event-meta';const confidence=document.createElement('span');confidence.textContent=event.confidence!=null?`${event.confidence}% confidence`:'Event detected';const time=document.createElement('time');time.dateTime=eventTimestamp(event);time.textContent=relativeTime(eventTimestamp(event));meta.append(confidence,time);body.appendChild(meta);
+    const meta=document.createElement('div');meta.className='dashboard-event-meta';const confidence=document.createElement('span');confidence.textContent=event.display_confidence!=null?`${Math.round(Number(event.display_confidence)*100)}% confidence`:(event.type_label?'':'Event detected');const time=document.createElement('time');time.dateTime=eventTimestamp(event);time.textContent=relativeTime(typeof event.timestamp_ms==='number'?event.timestamp_ms:eventTimestamp(event));meta.append(confidence,time);body.appendChild(meta);
 
 
 
@@ -76701,7 +76797,7 @@ function buildEventCard(event){
 
 
 
-    const actions=document.createElement('div');actions.className='dashboard-event-actions';const play=document.createElement('a');play.className='dashboard-event-action primary';play.href=event.linked_recording||'/playback';play.textContent='Play recording';actions.appendChild(play);if(event.thumbnail){const snapshot=document.createElement('a');snapshot.className='dashboard-event-action';snapshot.href=event.thumbnail;snapshot.target='_blank';snapshot.rel='noopener';snapshot.textContent='Snapshot';actions.appendChild(snapshot)}else{const missing=document.createElement('span');missing.className='dashboard-event-action';missing.textContent='No snapshot';actions.appendChild(missing)}body.appendChild(actions);card.append(imageWrap,body);return card
+    const actions=document.createElement('div');actions.className='dashboard-event-actions';const play=document.createElement('a');play.className='dashboard-event-action primary';play.href=event.playback_href||event.linked_recording||'/playback';play.textContent=event.has_event_clip?'Play clip':'Play recording';actions.appendChild(play);if(event.thumbnail){const snapshot=document.createElement('a');snapshot.className='dashboard-event-action';snapshot.href=event.thumbnail;snapshot.target='_blank';snapshot.rel='noopener';snapshot.textContent='Snapshot';actions.appendChild(snapshot)}else{const missing=document.createElement('span');missing.className='dashboard-event-action';missing.textContent='No snapshot';actions.appendChild(missing)}body.appendChild(actions);card.append(imageWrap,body);return card
 
 
 
@@ -76769,6 +76865,8 @@ updateDashboard();updateRecentEvents();setInterval(updateDashboard,10000);setInt
 
 
 
+    if _customer_dashboard_cameras is not None:
+        scripts = '<script>window.__anyaicamCustomerDashboard=true;</script>' + scripts
     return page_shell("Dashboard", "dashboard", content, scripts)
 
 
@@ -143839,6 +143937,14 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
             "linked_recording": None,
             "has_event_clip": bool(row["has_event_clip"]),
             "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            # Additive, customer-ready fields (2026-09-25) for the Dashboard:
+            # friendly type, epoch-ms time (the stored value is naive UTC,
+            # which browsers parse as local time), a real confidence only,
+            # and the event's own Playback deep link.
+            "type_label": _customer_event_type_label(row["event_type"]),
+            "timestamp_ms": _naive_utc_timestamp_to_epoch_ms(row["event_timestamp"]),
+            "display_confidence": _customer_real_confidence(row["event_type"], row["confidence"]),
+            "playback_href": _customer_event_playback_href(row["camera_id"], row["event_timestamp"], row["id"], bool(row["has_event_clip"])),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
