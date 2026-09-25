@@ -62,22 +62,28 @@ def _render(monkeypatch, recordings=None, events=None):
 
 def test_selecting_a_historical_date_via_the_date_input(monkeypatch):
     html = _render(monkeypatch)
-    assert '<input id="playback-date-input" type="date">' in html
+    assert '<input id="playback-date-input" type="date" autocomplete="off">' in html  # 2026-09-25: no browser-restored stale date
     assert "dateInput.addEventListener('change',()=>{" in html
-    assert "loadRecordingsForDate(selectedCameraId,dateInput.value)" in html
+    # 2026-09-25: a pick goes through the day controller (desktop keeps it;
+    # mobile has no picker), which loads it via loadRecordingsForDate().
+    assert "dayController.selectDate(dateInput.value);" in html
 
 
 # ---------------------------------------------------------------------------
 # 2. Today -- unchanged: returns to the default/most-recent view.
 # ---------------------------------------------------------------------------
 
-def test_today_button_unchanged(monkeypatch):
+def test_today_button_goes_to_todays_date(monkeypatch):
+    """Changed deliberately 2026-09-25: Today used to switch to the undated
+    "most recent recordings" view, which on a quiet day or an Event-mode
+    camera showed (and preselected) an older day. It now loads today's
+    recordings in the viewer's local timezone."""
     html = _render(monkeypatch)
     assert '<button id="playback-date-today" type="button" class="ghost-button">Today</button>' in html
     idx = html.index("dateTodayButton.addEventListener('click',()=>{")
-    block = html[idx: idx + 300]
-    assert "viewingDate=null;" in block
-    assert "renderCamera().catch" in block
+    block = html[idx: idx + 120]
+    assert "dayController.goToday();" in block
+    assert "viewingDate=null;" not in block
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +99,7 @@ def test_previous_and_next_day_buttons_exist_and_are_wired(monkeypatch):
     assert "dateNextButton.addEventListener('click',()=>navigateByOneDay(1));" in html
     idx = html.index("function navigateByOneDay(deltaDays){")
     block = html[idx: idx + 500]
-    assert "loadRecordingsForDate(selectedCameraId,target)" in block
+    assert "dayController.selectDate(target);" in block
     assert "viewingDate||localDateStringOf(new Date())" in block, "must default to today's local date when no date is selected yet"
     assert "target>dateInput.max" in block, "must not navigate into the future, matching the date input's own existing max="
 
@@ -126,8 +132,9 @@ def test_camera_switch_preserves_selected_date(monkeypatch):
     html = _render(monkeypatch)
     idx = html.index("cameraTiles.forEach(tile=>{")
     block = html[idx:html.index("let lastTap=0;", idx)]
-    assert "if(viewingDate){" in block
-    assert "loadRecordingsForDate(selectedCameraId,viewingDate)" in block
+    # 2026-09-25: desktop keeps the viewed date; mobile always stays on today.
+    assert "if(viewingDate||isPlaybackMobile()){" in block
+    assert "loadRecordingsForDate(selectedCameraId,isPlaybackMobile()?localDateStringOf(new Date()):viewingDate)" in block
     assert "}else{" in block
     assert "await renderCamera();" in block, "the original default-view behavior must still run when no date is selected"
     # The old unconditional reset must be gone.

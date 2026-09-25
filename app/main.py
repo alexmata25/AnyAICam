@@ -21453,6 +21453,23 @@ def process_stripe_webhook_event(event: dict) -> None:
 
 
 
+    elif event_type in {"checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed"}:
+        # Delayed-payment outcome (2026-09-25): keep this session's record
+        # truthful for the admin payments view. Record-keeping only -- the
+        # grant/no-grant decision is made by the entitlement, analytics and
+        # hardware steps (stripe_checkout_payment.py), never here.
+        session_id = str(data_object.get("id") or "")
+        if session_id:
+            sessions = load_payment_sessions()
+            record = sessions.get(session_id, {})
+            succeeded = event_type.endswith("succeeded")
+            record.update({
+                "payment_status": data_object.get("payment_status") or ("paid" if succeeded else "unpaid"),
+                "async_payment": "succeeded" if succeeded else "failed",
+                "async_payment_at": datetime.now().isoformat(),
+            })
+            sessions[session_id] = record
+            save_payment_sessions(sessions)
     elif event_type in {
 
 
@@ -40476,6 +40493,14 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # Orphaned live-HLS segments left by every FFmpeg restart (see
+    # hls_segment_sweeper.py): wherever cameras stream locally.
+    import hls_segment_sweeper
+    hls_segment_sweeper_task = (
+        asyncio.create_task(hls_segment_sweeper.hls_segment_sweeper_worker(HLS_FOLDER))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # camera_url is main.py's own credentialed-RTSP-URL builder -- injected
     # rather than imported by webrtc_publisher.py, which this module
     # imports to wire this task, exactly the same circular-import
@@ -40736,6 +40761,8 @@ async def lifespan(app: FastAPI):
             live_relay_task.cancel()
         if live_relay_idle_sweep_task:
             live_relay_idle_sweep_task.cancel()
+        if hls_segment_sweeper_task:
+            hls_segment_sweeper_task.cancel()
         if webrtc_publisher_task:
             webrtc_publisher_task.cancel()
         if local_storage_manager_task:
@@ -40850,6 +40877,8 @@ async def lifespan(app: FastAPI):
             pending.append(live_relay_task)
         if live_relay_idle_sweep_task:
             pending.append(live_relay_idle_sweep_task)
+        if hls_segment_sweeper_task:
+            pending.append(hls_segment_sweeper_task)
         if webrtc_publisher_task:
             pending.append(webrtc_publisher_task)
         if local_storage_manager_task:
@@ -144145,6 +144174,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</div>'
         '</div>'
         '</section>'
+        '<style>@media (max-width:900px){#playback-date-bar,#playback-available-dates{display:none!important}}</style>'
         '<style>@media (max-width:900px){.monitor-timeline{display:none!important}.mobile-recent-events{display:block!important}}@media (min-width:901px){.mobile-recent-events{display:none!important}.monitor-timeline{display:block}}</style>'
         # 2026-09-04: video-first mobile cards -- the section's own
         # container (.mobile-recent-events) is already hidden above
@@ -144185,7 +144215,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</div>'
         '<div class="monitor-toolbar-group" id="playback-date-bar" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">'
         '<label for="playback-date-input" class="health-detail">Date</label>'
-        '<input id="playback-date-input" type="date">'
+        '<input id="playback-date-input" type="date" autocomplete="off">'
         '<button id="playback-date-prev" type="button" class="ghost-button" aria-label="Previous day">\u2190 Previous Day</button>'
         '<button id="playback-date-today" type="button" class="ghost-button">Today</button>'
         '<button id="playback-date-next" type="button" class="ghost-button" aria-label="Next day">Next Day \u2192</button>'
@@ -144377,6 +144407,95 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // A YYYY-MM-DD string means the customer explicitly picked a
   // calendar date -- see loadRecordingsForDate()/dateTodayButton below.
   let viewingDate=null;
+  // Set at boot (see PLAYBACK_TODAY_CORE below); decides the viewed day.
+  let dayController=null;
+  const playbackMobileMedia=window.matchMedia('(max-width:900px)');
+  function isPlaybackMobile(){{return playbackMobileMedia.matches}}
+  // === PLAYBACK_TODAY_CORE_START ===
+  // Which calendar day Playback shows, and the mobile "latest recordings"
+  // refresh (2026-09-25). DOM-free so it runs as-is under Node in
+  // test_playback_today_core.mjs. The day is always the VIEWER's local
+  // calendar day (the browser's own timezone), never the server's.
+  //   - First open (desktop and mobile): today.
+  //   - Desktop: a date the user picks stays picked -- nothing here ever
+  //     moves it back to today.
+  //   - Mobile: always today; every PLAYBACK_MOBILE_REFRESH_MS the day's
+  //     list is re-fetched and handed to onClips only when it changed, and
+  //     at local midnight the view moves to the new day by itself. The
+  //     refresh path (refreshDay/onClips) never loads, pauses or seeks the
+  //     player -- only loadDay (open / Today / a desktop pick) does.
+  const PLAYBACK_MOBILE_REFRESH_MS=5000;
+  function playbackLocalDay(value){{
+    const d=(value instanceof Date)?value:new Date(value);
+    return `${{d.getFullYear()}}-${{String(d.getMonth()+1).padStart(2,'0')}}-${{String(d.getDate()).padStart(2,'0')}}`;
+  }}
+  function playbackClipsSignature(clips){{
+    return (clips||[]).map(clip=>`${{clip.id}}|${{clip.end||''}}`).join(',');
+  }}
+  function createPlaybackDayController(deps){{
+    const state={{viewingDate:null,manual:false,timer:null,inFlight:false,lastSignature:null}};
+    function today(){{return playbackLocalDay(deps.now())}}
+    function schedule(){{
+      if(state.timer!==null)deps.clearTimer(state.timer);
+      state.timer=deps.setTimer(tick,PLAYBACK_MOBILE_REFRESH_MS);
+    }}
+    function open(options){{
+      state.manual=false;
+      state.viewingDate=today();
+      if(!(options&&options.skipLoad))deps.loadDay(state.viewingDate,{{reason:'open'}});
+      schedule();
+      return state.viewingDate;
+    }}
+    function selectDate(date){{
+      if(deps.isMobile())return state.viewingDate;  // mobile is a "latest recordings" view: always today
+      state.manual=date!==today();
+      state.viewingDate=date;
+      deps.loadDay(date,{{reason:'manual'}});
+      return date;
+    }}
+    function goToday(){{
+      state.manual=false;
+      state.viewingDate=today();
+      deps.loadDay(state.viewingDate,{{reason:'today'}});
+      return state.viewingDate;
+    }}
+    function noteLoaded(date,clips){{
+      state.viewingDate=date;
+      state.lastSignature=playbackClipsSignature(clips);
+    }}
+    async function tick(){{
+      state.timer=null;
+      try{{
+        if(!deps.isMobile()||deps.isHidden())return;
+        const day=today();
+        if(day!==state.viewingDate){{  // local midnight, or a stale/restored day
+          state.viewingDate=day;
+          state.manual=false;
+          state.lastSignature=null;
+          if(deps.onDayChanged)deps.onDayChanged(day);
+        }}
+        if(state.inFlight)return;
+        state.inFlight=true;
+        const requested=state.viewingDate;
+        try{{
+          const clips=await deps.refreshDay(requested);
+          if(Array.isArray(clips)&&requested===state.viewingDate){{
+            const signature=playbackClipsSignature(clips);
+            if(signature!==state.lastSignature){{
+              state.lastSignature=signature;
+              deps.onClips(requested,clips);
+            }}
+          }}
+        }}finally{{state.inFlight=false}}
+      }}finally{{schedule()}}
+    }}
+    function wake(){{  // tab visible again, bfcache restore, rotation into the mobile layout
+      if(state.timer!==null){{deps.clearTimer(state.timer);state.timer=null}}
+      return tick();
+    }}
+    return {{state,today,open,selectDate,goToday,noteLoaded,tick,wake}};
+  }}
+  // === PLAYBACK_TODAY_CORE_END ===
   let selectedCameraId={json.dumps(first_camera_id)};
   const eventPlayer=AnyAiCamEventMedia.player({{video,status,isCurrent:cameraId=>cameraId===selectedCameraId,onReady:()=>{{
     // playheadEl.hidden: an event clip is a different media identity
@@ -144483,13 +144602,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       stopMobileEventPoll();
       clipPanel.hidden=true;
       renderAvailableDates(selectedCameraId).catch(()=>{{}});
-      if(viewingDate){{
+      if(viewingDate||isPlaybackMobile()){{
         // Preserve the selected date across a camera switch "when
         // possible" -- i.e. whenever a date was actually active.
         // loadRecordingsForDate() already handles the no-recordings-
         // for-this-date case honestly (status text below), so nothing
         // extra is needed here for that.
-        await loadRecordingsForDate(selectedCameraId,viewingDate).catch(error=>{{
+        await loadRecordingsForDate(selectedCameraId,isPlaybackMobile()?localDateStringOf(new Date()):viewingDate).catch(error=>{{
           debugLog(`loadRecordingsForDate (camera switch) failed: ${{error && error.message}}`);
         }});
       }}else{{
@@ -144749,6 +144868,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }}
     const state=mobileEventPollState;
     state.events=events;
+    state.clips=clips;
     if(state.timer||state.inFlight)return;
     const interval=events.some(isMobileEventPending)?MOBILE_EVENT_POLL_INTERVAL_MS:15000;
     state.timer=setTimeout(async()=>{{
@@ -144773,7 +144893,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         clearTimeout(timeout);state.inFlight=false;
         if(mobileEventPollState===state&&cameraId===selectedCameraId){{
           // Re-render on failed requests as well: elapsed time still expires.
-          renderMobileRecentEvents(cameraId,clips,state.events);
+          renderMobileRecentEvents(cameraId,state.clips||clips,viewingDate?eventsForLocalDate(state.events,viewingDate):state.events);
         }}
       }}
     }},interval);
@@ -145357,24 +145477,19 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       ?`${{clips.length}} recording(s) found for ${{date}}. Select one, or a point on the timeline, to play.`
       :`No recordings are available for ${{date}}.`;
     renderAvailableDates(cameraId).catch(()=>{{}});
+    if(dayController)dayController.noteLoaded(date,clips);
   }}
 
   dateInput.addEventListener('change',()=>{{
     if(!dateInput.value)return;
-    loadRecordingsForDate(selectedCameraId,dateInput.value).catch(error=>{{
-      debugLog(`loadRecordingsForDate failed: ${{error && error.message}}`);
-    }});
+    dayController.selectDate(dateInput.value);
   }});
 
+  // Today = today's recordings in the viewer's local timezone (it used to
+  // switch to an undated "most recent" list, which on a quiet day or an
+  // Event-mode camera showed -- and preselected -- an older day).
   dateTodayButton.addEventListener('click',()=>{{
-    viewingDate=null;
-    dateInput.value='';
-    selectedDateLabel.textContent='';
-    visibleRecordingCount=6;
-    loadOlderButton.hidden=false;
-    renderCamera().catch(error=>{{
-      debugLog(`renderCamera (today) failed: ${{error && error.message}}`);
-    }});
+    dayController.goToday();
   }});
 
   // Previous/Next Day: shift by exactly one LOCAL calendar day from
@@ -145408,9 +145523,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     const base=viewingDate||localDateStringOf(new Date());
     const target=shiftedDateString(base,deltaDays);
     if(target>dateInput.max)return;  // never navigate into the future, matching the date input's own existing max=
-    loadRecordingsForDate(selectedCameraId,target).catch(error=>{{
-      debugLog(`loadRecordingsForDate (${{deltaDays>0?'next':'previous'}} day) failed: ${{error && error.message}}`);
-    }});
+    dayController.selectDate(target);
   }}
 
   datePrevButton.addEventListener('click',()=>navigateByOneDay(-1));
@@ -145985,15 +146098,69 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }});
   }});
 
+  dateInput.value='';  // never a date the browser restored from an earlier visit
   dateInput.max=localDateStringOf(new Date());
+  // Mobile refresh: list-only. Never pauses, reloads or seeks the player;
+  // keeps the reader's place when the list above them grows.
+  function applyRefreshedClips(date,clips){{
+    if(!dayController||date!==dayController.state.viewingDate)return;
+    const mobileList=document.getElementById('mobile-recent-events-list');
+    const scrollY=window.scrollY;
+    const listTop=mobileList?mobileList.getBoundingClientRect().top+scrollY:0;
+    const heightBefore=mobileList?mobileList.offsetHeight:0;
+    viewingDate=date;
+    currentClips=clips;
+    visibleRecordingCount=clips.length||6;
+    renderClipList(selectedCameraId,clips);
+    renderTimeline(selectedCameraId,clips,eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],date),date);
+    if(mobileList&&scrollY>listTop){{
+      const grew=mobileList.offsetHeight-heightBefore;
+      if(grew)window.scrollTo(0,scrollY+grew);
+    }}
+    if(video.paused&&!video.currentSrc)status.textContent=clips.length?`${{clips.length}} recording(s) today. Select one to play.`:'No recordings yet today.';
+  }}
+  dayController=createPlaybackDayController({{
+    now:()=>new Date(),
+    isMobile:isPlaybackMobile,
+    isHidden:()=>document.visibilityState==='hidden',
+    loadDay:date=>loadRecordingsForDate(selectedCameraId,date).catch(error=>{{
+      debugLog(`loadRecordingsForDate (${{date}}) failed: ${{error && error.message}}`);
+    }}),
+    refreshDay:async date=>{{
+      const cameraId=selectedCameraId;
+      const [day_start_utc,day_end_utc]=localDayBoundsToUtcNaiveIso(date);
+      const clips=await fetchClipsMetadata(cameraId,{{date,day_start_utc,day_end_utc}});
+      return cameraId===selectedCameraId?clips:null;
+    }},
+    onClips:applyRefreshedClips,
+    onDayChanged:date=>{{
+      viewingDate=date;
+      dateInput.max=date;
+      dateInput.value=date;
+      selectedDateLabel.textContent=`Showing recordings for ${{date}}`;
+    }},
+    setTimer:(fn,ms)=>setTimeout(fn,ms),
+    clearTimer:handle=>clearTimeout(handle),
+  }});
+  document.addEventListener('visibilitychange',()=>{{if(document.visibilityState==='visible')dayController.wake()}});
+  window.addEventListener('pageshow',event=>{{if(event.persisted)dayController.wake()}});
+  playbackMobileMedia.addEventListener('change',()=>dayController.wake());
+  // Desktop: keep "Next day" usable after midnight without changing the viewed date.
+  setInterval(()=>{{dateInput.max=localDateStringOf(new Date())}},60000);
   renderAvailableDates(selectedCameraId).catch(error=>{{
     debugLog(`available dates fetch failed: ${{error && error.message}}`);
   }});
-
-  debugLog(`[boot] calling renderCamera(initialTimestamp=${{initialTimestamp}})`);
-  renderCamera(initialTimestamp).catch(error=>{{
-    debugLog(`[fatal] renderCamera() threw/rejected: ${{error && error.message ? error.message : error}}`);
-  }});
+  if(initialEventId||initialTimestamp){{
+    // Event deep links keep opening their own event and time.
+    debugLog(`[boot] calling renderCamera(initialTimestamp=${{initialTimestamp}})`);
+    renderCamera(initialTimestamp).catch(error=>{{
+      debugLog(`[fatal] renderCamera() threw/rejected: ${{error && error.message ? error.message : error}}`);
+    }});
+    dayController.open({{skipLoad:true}});
+  }}else{{
+    debugLog('[boot] opening on today (viewer local time)');
+    dayController.open();
+  }}
 }})();
 </script>'''
 
