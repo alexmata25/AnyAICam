@@ -197,6 +197,10 @@ _camera_map: dict[str, int] = {}       # camera_id -> camera_number, refreshed p
 _known_paths: set[str] = set()         # camera_ids currently configured as MediaMTX paths (mirrors what MediaMTX itself thinks exists)
 _whep_sessions: dict[str, str] = {}    # session_id -> WHEP session Location URL, for best-effort ICE trickle forwarding
 _mediamtx_process: "subprocess.Popen | None" = None
+# Set when a new MediaMTX process is spawned: it starts with none of the
+# runtime paths (they are added through its API, never its config file), so
+# every camera path must be re-added once its API answers.
+_paths_resync_pending = False
 
 
 # --------------------------------------------------------------- appliance identity / control plane
@@ -422,6 +426,21 @@ def _start_mediamtx() -> None:
         _mediamtx_process = None
         return
     webrtc_publisher_state["mediamtx_status"] = "starting"
+    _forget_runtime_paths()
+
+
+def _forget_runtime_paths() -> None:
+    """A freshly spawned MediaMTX has no camera paths and none of the old
+    process's WHEP sessions. Without this, _known_paths still listed every
+    camera after a MediaMTX crash/restart, so sync_camera_paths() never
+    re-added them and every P2P offer went to a path the new process did
+    not have -- relay-only until the whole VMS restarted. The per-camera
+    stream choice (_p2p_source_choice) is kept, so no camera is re-probed."""
+    global _paths_resync_pending
+    with _lock:
+        _known_paths.clear()
+    _whep_sessions.clear()
+    _paths_resync_pending = True
 
 
 def _ensure_mediamtx_running() -> None:
@@ -468,6 +487,71 @@ def _config_request(method: str, path: str, payload: dict | None = None) -> tupl
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         logger.warning("webrtc_publisher.mediamtx_api_unreachable path=%s error=%s", path, error)
         return 0, str(error)
+
+
+def _wait_for_mediamtx_api(timeout_seconds: float) -> bool:
+    """True once MediaMTX's config API answers (a new process needs a
+    moment before it accepts path adds); False after timeout_seconds."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status, _ = _config_request("GET", "/v3/config/global/get")
+        if status == 200:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _mediamtx_path_names() -> set[str] | None:
+    """Every path MediaMTX currently has configured (GET
+    /v3/config/paths/list, paginated), or None when it cannot be read."""
+    names: set[str] = set()
+    page = 0
+    while True:
+        status, body = _config_request("GET", f"/v3/config/paths/list?itemsPerPage=1000&page={page}")
+        if status != 200:
+            return None
+        try:
+            data = json.loads(body)
+            names.update(str(item.get("name")) for item in data.get("items") or [] if isinstance(item, dict))
+            page_count = int(data.get("pageCount") or 1)
+        except (ValueError, TypeError, AttributeError):
+            return None
+        page += 1
+        if page >= page_count or page >= 100:
+            return names
+
+
+def _forget_paths_mediamtx_lost() -> None:
+    """Drops from _known_paths any camera MediaMTX no longer actually has
+    (a restart this process did not observe, a config reload), so the next
+    sync re-adds just those. One read-only GET per config refresh; while
+    the two agree nothing is re-added, and an unreadable list changes
+    nothing."""
+    actual = _mediamtx_path_names()
+    if actual is None:
+        return
+    with _lock:
+        lost = _known_paths - actual
+        _known_paths.difference_update(lost)
+    if lost:
+        logger.warning("webrtc_publisher.paths_missing_in_mediamtx count=%s", len(lost))
+
+
+def reconcile_camera_paths(camera_url_fn) -> None:
+    """sync_camera_paths() against what MediaMTX really has. After a
+    MediaMTX (re)start it waits for the new process's API, then re-adds
+    every camera; a still-starting MediaMTX leaves the resync pending for
+    the worker's next iteration."""
+    global _paths_resync_pending
+    if _paths_resync_pending:
+        if not _wait_for_mediamtx_api(MEDIAMTX_STARTUP_GRACE_SECONDS):
+            return
+        _paths_resync_pending = False
+        logger.info("webrtc_publisher.paths_resync_after_mediamtx_start")
+    else:
+        _forget_paths_mediamtx_lost()
+    sync_camera_paths(camera_url_fn)
 
 
 def substream_candidates(main_url: str) -> list[str]:
@@ -805,9 +889,13 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
                 now = time.monotonic()
                 if now - last_config_refresh >= CONFIG_REFRESH_SECONDS:
                     await asyncio.to_thread(_refresh_camera_map)
-                    await asyncio.to_thread(sync_camera_paths, camera_url_fn)
+                    await asyncio.to_thread(reconcile_camera_paths, camera_url_fn)
                     await asyncio.to_thread(sync_additional_hosts)
                     last_config_refresh = now
+                elif _paths_resync_pending:
+                    # MediaMTX was just restarted: re-add its paths now,
+                    # not at the next CONFIG_REFRESH_SECONDS.
+                    await asyncio.to_thread(reconcile_camera_paths, camera_url_fn)
                 long_poll_honored = bool(await _bridge_tick(camera_url_fn))
                 webrtc_publisher_state["last_scan_at"] = time.time()
                 webrtc_publisher_state["last_error"] = None
