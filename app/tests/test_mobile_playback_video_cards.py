@@ -146,7 +146,8 @@ def test_hydratepreview_lazy_lookup_is_removed(monkeypatch):
 def test_recording_card_still_calls_the_existing_unmodified_playclip(monkeypatch):
     html = _render(monkeypatch)
     body = _mobile_function_body(html)
-    assert "row.addEventListener('click',()=>playClip(cameraId,clip));" in body
+    # 2026-09-25: a recording card plays inline, right where it was tapped.
+    assert "const openInline=()=>inlinePlayer.open(row,cameraId,inlineItem);" in body
 
 
 def test_event_card_still_uses_the_existing_unmodified_event_media_url_and_reveal_panel(monkeypatch):

@@ -144054,6 +144054,123 @@ def _customer_camera_recordings(camera_id: str) -> list[dict]:
     return recordings
 
 
+# Playback's inline recording player (2026-09-25) -- see the comment at the
+# top of the script. Kept as plain constants (single braces) and injected
+# into the page's f-string template.
+_PLAYBACK_INLINE_PLAYER_JS = '''  // Inline recording player (2026-09-25): a recording chosen from the list
+  // plays right where it was tapped, in a Live-style card, instead of in the
+  // top player -- which stays the timeline/scrub/date player. One at a time
+  // (opening another replaces it; tapping the open one again closes it). The
+  // list re-renders on refresh, so the card is re-attached after its row in
+  // the same task (a media element re-inserted synchronously keeps playing),
+  // and nothing here ever scrolls the page to the top.
+  function createPlaybackInlinePlayer(opts){
+    let current=null;
+    function shareUrl(cameraId,item){
+      const cam=encodeURIComponent(cameraId);
+      if(item.kind==='event')return `${location.origin}/playback?camera=${cam}&event=${encodeURIComponent(item.id)}&autoplay=event`;
+      const ms=opts.dateOf(item.start).getTime();
+      return `${location.origin}/playback?camera=${cam}${Number.isFinite(ms)?`&t=${ms}`:''}&autoplay=event`;
+    }
+    function close(){
+      if(!current)return;
+      const closing=current;current=null;
+      try{if(closing.player)closing.player.cancel();}catch(error){}
+      closing.video.pause();closing.video.removeAttribute('src');closing.video.load();
+      closing.card.remove();
+      if(closing.row)closing.row.setAttribute('aria-expanded','false');
+    }
+    function open(row,cameraId,item){
+      const key=`${item.kind}:${item.id}`;
+      if(current&&current.key===key){close();return;}
+      close();
+      if(opts.topVideo&&!opts.topVideo.paused)opts.topVideo.pause();
+      const card=document.createElement('div');
+      card.className='inline-media-card';
+      card.dataset.inlineFor=key;
+      card.setAttribute('role','region');
+      card.setAttribute('aria-label',`Playing ${item.title||'recording'}`);
+      card.innerHTML=`<div class="camera-view inline-media-view"><video playsinline preload="auto"></video></div>
+        <p class="inline-media-status health-detail" role="status" aria-live="polite">Loading…</p>
+        <div class="camera-tools inline-media-tools" role="toolbar" aria-label="Recording controls">
+          <button class="camera-tool" type="button" data-act="play" title="Pause" aria-label="Pause">⏸</button>
+          <button class="camera-tool" type="button" data-act="mute" title="Mute" aria-label="Mute">♪</button>
+          <button class="camera-tool" type="button" data-act="fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>
+          <a class="camera-tool" data-act="download" title="Download" aria-label="Download" target="_blank" rel="noopener" download hidden>⬇</a>
+          <button class="camera-tool" type="button" data-act="share" title="Share link" aria-label="Share link">↗</button>
+          <button class="camera-tool" type="button" data-act="close" title="Close player" aria-label="Close player">✕</button>
+        </div>`;
+      row.after(card);
+      row.setAttribute('aria-expanded','true');
+      const clipVideo=card.querySelector('video');
+      const statusEl=card.querySelector('.inline-media-status');
+      const download=card.querySelector('[data-act="download"]');
+      const playButton=card.querySelector('[data-act="play"]');
+      const muteButton=card.querySelector('[data-act="mute"]');
+      const view=card.querySelector('.inline-media-view');
+      current={key,card,video:clipVideo,row,list:row.parentElement,player:null};
+      const syncPlay=()=>{const label=clipVideo.paused?'Play':'Pause';playButton.textContent=clipVideo.paused?'▶':'⏸';playButton.title=label;playButton.setAttribute('aria-label',label)};
+      const syncMute=()=>{const label=clipVideo.muted?'Unmute':'Mute';muteButton.textContent=clipVideo.muted?'🔇':'♪';muteButton.title=label;muteButton.setAttribute('aria-label',label)};
+      clipVideo.addEventListener('play',()=>{syncPlay();statusEl.textContent=''});
+      clipVideo.addEventListener('pause',syncPlay);
+      clipVideo.addEventListener('volumechange',syncMute);
+      clipVideo.addEventListener('error',()=>{if(clipVideo.getAttribute('src'))statusEl.textContent='This recording could not be played.'});
+      const start=()=>Promise.resolve(clipVideo.play()).catch(()=>{clipVideo.muted=true;return clipVideo.play()}).catch(()=>{statusEl.textContent='Press play to start.'});
+      if(item.kind==='event'){
+        const mine=current;
+        current.player=AnyAiCamEventMedia.player({video:clipVideo,status:statusEl,isCurrent:()=>current===mine,onReady:()=>{
+          const src=clipVideo.getAttribute('src')||clipVideo.currentSrc;
+          if(src){download.href=src;download.hidden=false;}
+        }});
+        current.player.start(cameraId,item.id,true);
+      }else{
+        const url=opts.mediaUrl(cameraId,item.id);
+        clipVideo.src=url;download.href=url;download.hidden=false;
+        start();
+      }
+      if(!view.requestFullscreen&&!clipVideo.webkitEnterFullscreen)card.querySelector('[data-act="fullscreen"]').hidden=true;
+      card.addEventListener('click',event=>{
+        const control=event.target.closest('[data-act]');
+        if(!control)return;
+        const act=control.dataset.act;
+        if(act==='play'){if(clipVideo.paused)start();else clipVideo.pause();}
+        else if(act==='mute'){clipVideo.muted=!clipVideo.muted;}
+        else if(act==='fullscreen'){
+          if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});
+          else if(view.requestFullscreen)view.requestFullscreen().catch(()=>{});
+          else if(clipVideo.webkitEnterFullscreen)clipVideo.webkitEnterFullscreen();
+        }
+        else if(act==='share'){
+          const url=shareUrl(cameraId,item);
+          if(navigator.share){navigator.share({title:item.title||'AnyAiCam recording',url}).catch(()=>{});}
+          else if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(url).then(()=>{statusEl.textContent='Link copied -- it opens this recording for people on your account.'}).catch(()=>{statusEl.textContent=url});}
+          else{statusEl.textContent=url;}
+        }
+        else if(act==='close'){const openedFrom=current&&current.row;close();if(openedFrom&&openedFrom.focus)openedFrom.focus({preventScroll:true});}
+      });
+      syncPlay();syncMute();
+      card.scrollIntoView({block:'nearest',behavior:'smooth'});
+    }
+    function reattach(container){
+      // Only the list it was opened from (the desktop and mobile lists
+      // share keys, and the hidden one re-renders too).
+      if(!current||container!==current.list)return;
+      const row=container.querySelector(`[data-inline-key="${CSS.escape(current.key)}"]`);
+      if(!row){if(!current.card.isConnected)close();return;}
+      current.row=row;
+      row.setAttribute('aria-expanded','true');
+      if(row.nextElementSibling!==current.card)row.after(current.card);
+    }
+    // The top (timeline) player taking over pauses an inline recording.
+    if(opts.topVideo)opts.topVideo.addEventListener('play',()=>{if(current&&!current.video.paused)current.video.pause()});
+    return {open,close,reattach,isOpen:()=>Boolean(current)};
+  }
+  const inlinePlayer=createPlaybackInlinePlayer({topVideo:video,mediaUrl:recordingMediaUrl,dateOf:playbackDate});
+  function openFromKeyboard(event,action){if(event.key==='Enter'||event.key===' '){event.preventDefault();action()}}
+'''
+_PLAYBACK_INLINE_PLAYER_CSS = '.inline-media-card{grid-column:1/-1;justify-self:center;width:100%;max-width:960px;margin:6px 0 12px;padding:8px;border-radius:14px;background:rgba(24,33,50,.94)}.inline-media-card .inline-media-view{width:100%;border-radius:10px}.inline-media-card .inline-media-tools{justify-content:center;flex-wrap:wrap}.inline-media-card .camera-tool[hidden]{display:none}.inline-media-card .camera-tool:focus-visible{outline:2px solid var(--brand,#47d7ac);outline-offset:1px}.inline-media-status{margin:6px 4px 0}.inline-media-status:empty{display:none}@media(max-width:900px){.inline-media-card .camera-tool{width:44px;height:40px;font-size:17px}}'
+
+
 def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     """Renders the customer Playback page for an already-scoped camera
     list (see _customer_playback_cameras()). Never shows live video --
@@ -144359,6 +144476,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.mobile-media-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:0 12px;background:#141b26}'
         '.mobile-media-fallback--pending{color:#e8b93f}'
         '.mobile-media-fallback--expired{color:#8f9baa;font-style:italic}'
+        + _PLAYBACK_INLINE_PLAYER_CSS +
         '</style>'
         '<section class="panel mobile-recent-events" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
@@ -144748,6 +144866,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   function recordingMediaUrl(cameraId,recordingId){{
     return `/api/customer/recordings/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(recordingId)}}/media`;
   }}
+{_PLAYBACK_INLINE_PLAYER_JS}
 
   cameraTiles.forEach(tile=>{{
     tile.addEventListener('click',async()=>{{
@@ -145100,7 +145219,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       const durationMin=Math.max(1,Math.round((playbackDate(clip.end)-playbackDate(clip.start))/60000));
       const timeLabel=playbackDate(clip.start).toLocaleTimeString([],{{hour:'numeric',minute:'2-digit'}});
       return `<div class="mobile-media-card" data-mobile-clip role="button" tabindex="0">
-        <img class="mobile-media-thumb" src="/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">
+        <img class="mobile-media-thumb" src="${{clip.kind==='event_clip'?`/api/customer/events/${{cameraId}}/${{clip.id}}/thumbnail`:`/api/customer/recordings/${{cameraId}}/${{clip.id}}/thumbnail`}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">
         <span class="mobile-media-time">${{timeLabel}} · ${{durationMin}} min</span>
         <span class="mobile-media-menu" aria-hidden="true">⋮</span>
       </div>`;
@@ -145159,7 +145278,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 
     [...clips].reverse().slice(0,15).forEach((clip,index)=>{{
       const row=mobileList.querySelectorAll('[data-mobile-clip]')[index];
-      if(row)row.addEventListener('click',()=>playClip(cameraId,clip));
+      if(!row)return;
+      const inlineItem={{kind:clip.kind==='event_clip'?'event':'recording',id:clip.id,start:clip.start,title:playbackDate(clip.start).toLocaleString()}};
+      row.dataset.inlineKey=`${{inlineItem.kind}}:${{clip.id}}`;
+      row.setAttribute('aria-expanded','false');
+      const openInline=()=>inlinePlayer.open(row,cameraId,inlineItem);
+      row.addEventListener('click',openInline);
+      row.addEventListener('keydown',event=>openFromKeyboard(event,openInline));
     }});
 
     // P0 #5: keep polling the existing, self-authorizing recent-events
@@ -145183,16 +145308,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       // are deliberately not presented as playable controls.
       if(row.dataset.mobileEventClip!=='1'||!row.dataset.mobileEventId)return;
 
-      const openEvent=()=>playEventClipDeepLink(cameraId,row.dataset.mobileEventId,true);
+      const eventItem={{kind:'event',id:row.dataset.mobileEventId,start:row.dataset.mobileEvent,title:'event clip'}};
+      row.dataset.inlineKey=`event:${{eventItem.id}}`;
+      row.setAttribute('aria-expanded','false');
+      const openEvent=()=>inlinePlayer.open(row,cameraId,eventItem);
 
       row.addEventListener('click',openEvent);
-      row.addEventListener('keydown',event=>{{
-        if(event.key==='Enter'||event.key===' '){{
-          event.preventDefault();
-          openEvent();
-        }}
-      }});
+      row.addEventListener('keydown',event=>openFromKeyboard(event,openEvent));
     }});
+    inlinePlayer.reattach(mobileList);
   }}
 
   // === LANE_CORE_START ===
@@ -145371,9 +145495,15 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         <span style="white-space:nowrap">Play →</span>
       </div>`;
 
-      row.addEventListener('click',()=>playClip(cameraId,clip));
+      // Plays inline, right under this row (2026-09-25); the top player
+      // stays the timeline/scrub player.
+      const inlineItem={{kind:isEventClip?'event':'recording',id:clip.id,start:clip.start,title:playbackDate(clip.start).toLocaleString()}};
+      row.dataset.inlineKey=`${{inlineItem.kind}}:${{clip.id}}`;
+      row.setAttribute('aria-expanded','false');
+      row.addEventListener('click',()=>inlinePlayer.open(row,cameraId,inlineItem));
       clipList.appendChild(row);
     }});
+    inlinePlayer.reattach(clipList);
 
     loadOlderButton.hidden=clips.length===0;
   }}
