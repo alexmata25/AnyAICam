@@ -114,6 +114,7 @@ from datetime import datetime
 from typing import Optional
 
 from partner_db import connection, row, rows
+from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment, awaiting_payment_result
 
 
 def normalize_email(email: str) -> str:
@@ -474,7 +475,7 @@ def sync_entitlement_from_stripe_event(event: dict) -> dict:
     if is_event_processed(event_id):
         return {"status": "already_processed", "event_id": event_id}
 
-    if event_type == "checkout.session.completed":
+    if event_type in CHECKOUT_GRANT_EVENT_TYPES:
         result = _sync_checkout_completed(event)
     elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
         result = _sync_subscription_change(event, cancelled=event_type.endswith("deleted"))
@@ -500,6 +501,8 @@ def _extract_checkout_fields(session_obj: dict) -> dict:
 
 def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
+    if awaiting_payment(session_obj):
+        return awaiting_payment_result(session_obj)  # granted on async_payment_succeeded
     fields = _extract_checkout_fields(session_obj)
 
     # Fixed-tier lookup is server-side and Price-ID-keyed only -- never a

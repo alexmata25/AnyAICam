@@ -591,7 +591,7 @@ def _notify_from_stripe_event(event: dict) -> dict:
     # Not a camera-slot outcome -- check whether this event produced a
     # hardware order instead (mutually exclusive by construction, see
     # module docstring).
-    if event_type == "checkout.session.completed":
+    if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
         session_id = str(session_or_sub.get("id") or "")
         hardware_order = _find_hardware_order_for_session(session_id)
         if hardware_order:

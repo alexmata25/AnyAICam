@@ -75,6 +75,7 @@ from datetime import datetime
 from typing import Optional
 
 from partner_db import connection, row, rows
+from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment, awaiting_payment_result
 
 # addon_key (the customer-billed SKU), display label, the tuple of
 # internal analytic_key feature flags this SKU grants when purchased
@@ -288,6 +289,8 @@ def _extract_checkout_fields(session_obj: dict) -> dict:
 
 def _sync_checkout_completed(event: dict) -> dict:
     session_obj = (event.get("data") or {}).get("object") or {}
+    if awaiting_payment(session_obj):
+        return awaiting_payment_result(session_obj)  # granted on async_payment_succeeded
     fields = _extract_checkout_fields(session_obj)
 
     addon = resolve_addon(fields["price_id"])
@@ -406,7 +409,7 @@ def sync_analytics_from_stripe_event(event: dict) -> dict:
     event already grants on first purchase, so acting on the companion
     subscription.created event would be redundant, not additive."""
     event_type = str(event.get("type") or "")
-    if event_type == "checkout.session.completed":
+    if event_type in CHECKOUT_GRANT_EVENT_TYPES:
         return _sync_checkout_completed(event)
     elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
         return _sync_subscription_change(event, cancelled=event_type.endswith("deleted"))
