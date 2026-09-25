@@ -141,4 +141,6 @@ def test_other_connection_check_rows_are_unaffected(http_client, db_path, monkey
     response = http_client.get("/phone-connect", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "<span>Session cookie</span><strong>Secure</strong>" in html
-    assert "<span>Push server</span><strong>Needs VAPID keys</strong>" in html
+    # Customer wording since 2026-09-25 (was "Needs VAPID keys").
+    assert "<span>Push server</span><strong>Not set up yet</strong>" in html
+    assert "VAPID" not in html and "Samsung laptop" not in html

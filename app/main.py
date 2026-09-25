@@ -41861,6 +41861,7 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     "/events",
     "/alerts",
     "/investigate",
+    "/analytics",
     "/subscription-portal",
     # /aaco (app/aaco_web.py) is the same shape bug as every other entry
     # above: a bare, cloud-only, customer-facing nav path that
@@ -47009,7 +47010,7 @@ NAV_ITEMS = [
 
 
 
-    ("analytics", "/analytics", "⌕", "Analytics"),
+    ("analytics", "/analytics", "▥", "Analytics"),
 
 
 
@@ -47606,7 +47607,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "investigate", "dashboard", "aac",
+            "live", "events", "alerts", "playback", "analytics", "investigate", "dashboard", "aac",
 
 
 
@@ -48596,6 +48597,9 @@ register_provisioning_api_routes(app)
 register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
+from customer_analytics_workspace import register_customer_analytics_routes
+from partner_portal import partner_identity as _analytics_partner_identity
+register_customer_analytics_routes(app, lambda request: _customer_playback_cameras(request), _analytics_partner_identity)
 from customer_analytics_rules import register_customer_analytics_rules_routes
 register_customer_analytics_rules_routes(app, page_shell)
 register_live_view_p2p_customer_routes(app)
@@ -54636,7 +54640,7 @@ def _customer_detection_events(request: Request, *, limit: int | None = None) ->
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "direction": None,
             "timestamp": row["event_timestamp"],
@@ -54773,7 +54777,7 @@ def _customer_investigate_events(request: Request) -> list[dict] | None:
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "direction": None,
             "timestamp": row["event_timestamp"],
@@ -54926,7 +54930,7 @@ def _customer_investigate_search(
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "timestamp": row["event_timestamp"],
             "confidence": row["confidence"],
@@ -54960,7 +54964,12 @@ def _customer_investigate_event_for_client(event: dict) -> dict:
         "thumbnail": event.get("thumbnail") or "",
         "recording": _customer_event_playback_href(camera_id, timestamp, event.get("id"), bool(event.get("has_event_clip"))),
         "live": f"/customer/cameras/{quote(str(camera_id))}/live" if camera_id else "",
-        "confidence": event.get("confidence"),
+        # 2026-09-25: customer-ready fields -- a friendly type label, an
+        # epoch-ms time (the browser shows it in the viewer's timezone; the
+        # stored value is naive UTC) and a confidence only when it is one.
+        "type_label": _customer_event_type_label(event.get("event_type")),
+        "timestamp_ms": _naive_utc_timestamp_to_epoch_ms(timestamp) if timestamp else None,
+        "confidence": _customer_real_confidence(event.get("event_type"), event.get("confidence")),
         "plate": event.get("plate_number") or "",
         "color": event.get("vehicle_color") or "",
         "rule": event.get("rule_name") or "",
@@ -72468,6 +72477,86 @@ const grid=document.getElementById('camera-grid');const savedLayout=localStorage
 
 
 
+@app.get("/api/customer/dashboard/intelligence")
+def customer_dashboard_intelligence_api(request: Request, start_ms: int, end_ms: int) -> dict:
+    """The portal customer's own Dashboard numbers for the viewer's local
+    day (2026-09-25), in the same shape /api/dashboard/intelligence has.
+    That route reads appliance-local legacy files (motion_events,
+    in_app_alerts.jsonl) with no tenant scoping at all -- on the cloud
+    portal every customer saw the same '0 events' and stray 'Motion
+    detected on Camera 1' alerts linking to the legacy /camera/1 page.
+    This one reads only this customer's detection_events (their permitted
+    cameras) and their own notifications."""
+    cameras = _customer_playback_cameras(request)
+    if cameras is None:
+        raise HTTPException(status_code=403, detail="Customer portal sign-in required.")
+    if end_ms <= start_ms or end_ms - start_ms > 2 * 86400000:
+        raise HTTPException(status_code=400, detail="Provide one local day (start_ms/end_ms).")
+    from partner_portal import partner_identity
+    identity = partner_identity(request) or {}
+    from customer_analytics_panel import event_type_label
+    names = {camera["id"]: _camera_display_label(camera) for camera in cameras}
+    camera_ids = list(names)
+    start_iso = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    end_iso = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    hourly = [0] * 24
+    by_type: dict[str, int] = {}
+    per_camera: dict[str, int] = {}
+    if camera_ids:
+        placeholders = ",".join("?" for _ in camera_ids)
+        from partner_db import connection
+        with connection() as db:
+            for item in db.execute(
+                "SELECT camera_id, event_type, substr(event_timestamp,1,13) AS hour, COUNT(*) AS n FROM detection_events "
+                f"WHERE customer_id=? AND camera_id IN ({placeholders}) AND event_timestamp>=? AND event_timestamp<? "
+                "GROUP BY camera_id, event_type, substr(event_timestamp,1,13)",
+                (identity.get("customer_id"), *camera_ids, start_iso, end_iso),
+            ).fetchall():
+                count = item["n"]
+                by_type[item["event_type"]] = by_type.get(item["event_type"], 0) + count
+                per_camera[item["camera_id"]] = per_camera.get(item["camera_id"], 0) + count
+                hour_ms = _naive_utc_timestamp_to_epoch_ms(f'{item["hour"]}:00:00')
+                if hour_ms is not None:
+                    index = int((hour_ms - start_ms) // 3600000)
+                    if 0 <= index < 24:
+                        hourly[index] += count
+    vehicle_types = ("vehicle", "car", "truck", "bus", "motorcycle", "bicycle")
+    notifications = _customer_notifications(request) or []
+    unread = [item for item in notifications if not item.get("read")]
+    alerts = []
+    for item in unread[:6]:
+        title, message = _customer_alert_text(item)
+        stamp = _naive_utc_timestamp_to_epoch_ms(item.get("timestamp"))
+        alerts.append({
+            "message": f'{message} · {item.get("camera_name")}' if item.get("camera_name") else message,
+            "severity": "warning",
+            "type": title,
+            "timestamp": datetime.fromtimestamp(stamp / 1000, tz=timezone.utc).isoformat() if stamp is not None else None,
+            "href": (_customer_event_playback_href(item.get("camera_id"), item.get("timestamp"), item.get("event_id"),
+                                                   item.get("has_event_clip")) if item.get("event_id") else "/alerts"),
+            "category": "event",
+        })
+    busiest = max(per_camera, key=per_camera.get) if per_camera else None
+    return {
+        "events_today": sum(by_type.values()),
+        "analytics": {
+            "person": by_type.get("person", 0),
+            "vehicle": sum(by_type.get(kind, 0) for kind in vehicle_types),
+            "plate": by_type.get("plate", 0),
+            "intrusion": by_type.get("intrusion", 0) + by_type.get("line_crossing", 0),
+        },
+        "analytics_mock": False,
+        "unread_alert_count": len(unread),
+        "active_issue_count": 0,
+        "alerts": alerts,
+        "hourly_activity": hourly,
+        "most_active_camera": busiest,
+        "most_active_camera_label": names.get(busiest) if busiest else None,
+        "most_active_camera_events": per_camera.get(busiest, 0) if busiest else 0,
+        "event_types": {event_type_label(key): value for key, value in by_type.items()},
+    }
+
+
 @app.get("/api/dashboard/intelligence")
 
 
@@ -74664,10 +74753,17 @@ def dashboard(request: Request) -> str:
             for number, ids in _dashboard_camera_ids_seen.items()
             if len(ids) == 1
         }
+        # The customer's own camera names ("Living Room"), not "Camera N"
+        # (2026-09-25) -- same label every other customer page shows.
+        _dashboard_camera_names_by_number = {
+            camera["camera_number"]: _camera_display_label(camera)
+            for camera in _customer_dashboard_cameras if camera.get("camera_number") is not None
+        }
     else:
         _dashboard_camera_numbers = list(get_camera_numbers())
         _dashboard_live_view_href = "/"
         _dashboard_camera_ids_by_number = {}
+        _dashboard_camera_names_by_number = {}
     from partner_portal import partner_identity
     _dashboard_identity = partner_identity(request) if _customer_dashboard_cameras is not None else None
     # Permission-mismatch fix (2026-09-21): _customer_dashboard_cameras
@@ -74918,7 +75014,7 @@ def dashboard(request: Request) -> str:
 
 
 
-            <img id="dashboard-snapshot-{camera_number}" class="dashboard-camera-snapshot" alt="Camera {camera_number} snapshot" hidden>
+            <img id="dashboard-snapshot-{camera_number}" class="dashboard-camera-snapshot" alt="{escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')} snapshot" hidden>
 
 
 
@@ -74945,7 +75041,7 @@ def dashboard(request: Request) -> str:
 
 
 
-                <strong>Connecting to Camera {camera_number}</strong>
+                <strong>Connecting to {escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')}</strong>
 
 
 
@@ -75017,7 +75113,7 @@ def dashboard(request: Request) -> str:
 
 
 
-                <div class="dashboard-camera-name">Camera {camera_number}{' <span class=\"pill\">Playback only</span>' if camera_number in _dashboard_camera_playback_only else ''}</div>
+                <div class="dashboard-camera-name">{escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')}{' <span class=\"pill\">Playback only</span>' if camera_number in _dashboard_camera_playback_only else ''}</div>
 
 
 
@@ -75144,7 +75240,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        event_type = escape(str(event.get("event_type", "motion")).replace("_", " ").title())
+        event_type = escape(_customer_event_type_label(event.get("event_type", "motion")))
 
 
 
@@ -76071,6 +76167,15 @@ document.querySelectorAll('[id^="dashboard-camera-"]').forEach(card=>attachDashb
 
 
 
+// Portal customers get their own tenant-scoped numbers for their local day
+// (2026-09-25); everything else keeps the appliance intelligence route.
+function dashboardIntelligenceUrl(){
+    if(!window.__anyaicamCustomerDashboard)return '/api/dashboard/intelligence';
+    const now=new Date();
+    const start=new Date(now.getFullYear(),now.getMonth(),now.getDate()).getTime();
+    const end=new Date(now.getFullYear(),now.getMonth(),now.getDate()+1).getTime();
+    return `/api/customer/dashboard/intelligence?start_ms=${start}&end_ms=${end}`;
+}
 async function updateDashboard(){
 
 
@@ -76116,7 +76221,7 @@ async function updateDashboard(){
 
 
 
-            fetch('/api/dashboard/intelligence',{cache:'no-store'})
+            fetch(dashboardIntelligenceUrl(),{cache:'no-store'})
 
 
 
@@ -76503,7 +76608,7 @@ function renderIntelligence(data){
 
 
 
-    active.textContent=data.most_active_camera?`Camera ${data.most_active_camera}`:'—';
+    active.textContent=data.most_active_camera?(data.most_active_camera_label||`Camera ${data.most_active_camera}`):'—';
 
 
 
@@ -76602,7 +76707,7 @@ function eventTimestamp(event){return event.start_time||event.timestamp||''}
 
 
 
-function relativeTime(value){const parsed=new Date(value);if(Number.isNaN(parsed.getTime()))return 'Time unavailable';const seconds=Math.max(0,Math.floor((Date.now()-parsed.getTime())/1000));if(seconds<60)return `${seconds}s ago`;const minutes=Math.floor(seconds/60);if(minutes<60)return `${minutes}m ago`;const hours=Math.floor(minutes/60);if(hours<24)return `${hours}h ago`;return `${Math.floor(hours/24)}d ago`}
+function relativeTime(value){const parsed=typeof value==='number'?new Date(value):new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(String(value))?String(value):String(value)+'Z');if(Number.isNaN(parsed.getTime()))return 'Time unavailable';const seconds=Math.max(0,Math.floor((Date.now()-parsed.getTime())/1000));if(seconds<60)return `${seconds}s ago`;const minutes=Math.floor(seconds/60);if(minutes<60)return `${minutes}m ago`;const hours=Math.floor(minutes/60);if(hours<24)return `${hours}h ago`;return `${Math.floor(hours/24)}d ago`}
 
 
 
@@ -76638,7 +76743,7 @@ function buildEventCard(event){
 
 
 
-    if(event.thumbnail){const image=document.createElement('img');image.src=event.thumbnail;image.alt=`${event.event_type||'Motion'} on Camera ${event.camera||'?'}`;image.loading='lazy';imageWrap.appendChild(image)}else{const fallback=document.createElement('div');fallback.className='dashboard-event-fallback';fallback.innerHTML='<strong>No thumbnail</strong><span>Preview unavailable</span>';imageWrap.appendChild(fallback)}
+    if(event.thumbnail){const image=document.createElement('img');image.loading='lazy';image.decoding='async';image.src=event.thumbnail;image.alt=`${event.type_label||event.event_type||'Motion'} on ${event.camera_name||('Camera '+(event.camera||''))}`;image.loading='lazy';imageWrap.appendChild(image)}else{const fallback=document.createElement('div');fallback.className='dashboard-event-fallback';fallback.innerHTML='<strong>No thumbnail</strong><span>Preview unavailable</span>';imageWrap.appendChild(fallback)}
 
 
 
@@ -76656,7 +76761,7 @@ function buildEventCard(event){
 
 
 
-    const camera=document.createElement('span');camera.className='dashboard-event-camera';camera.textContent=`Camera ${event.camera||'?'}`;imageWrap.appendChild(camera);
+    const camera=document.createElement('span');camera.className='dashboard-event-camera';camera.textContent=event.camera_name||(event.camera?`Camera ${event.camera}`:'');camera.hidden=!camera.textContent;imageWrap.appendChild(camera);
 
 
 
@@ -76674,7 +76779,7 @@ function buildEventCard(event){
 
 
 
-    const title=document.createElement('div');title.className='dashboard-event-title';title.textContent=`${(event.event_type||'Motion').replaceAll('_',' ')} detected`;body.appendChild(title);
+    const title=document.createElement('div');title.className='dashboard-event-title';title.textContent=`${event.type_label||(event.event_type||'Motion').replaceAll('_',' ')} detected`;body.appendChild(title);
 
 
 
@@ -76683,7 +76788,7 @@ function buildEventCard(event){
 
 
 
-    const meta=document.createElement('div');meta.className='dashboard-event-meta';const confidence=document.createElement('span');confidence.textContent=event.confidence!=null?`${event.confidence}% confidence`:'Event detected';const time=document.createElement('time');time.dateTime=eventTimestamp(event);time.textContent=relativeTime(eventTimestamp(event));meta.append(confidence,time);body.appendChild(meta);
+    const meta=document.createElement('div');meta.className='dashboard-event-meta';const confidence=document.createElement('span');confidence.textContent=event.display_confidence!=null?`${Math.round(Number(event.display_confidence)*100)}% confidence`:(event.type_label?'':'Event detected');const time=document.createElement('time');time.dateTime=eventTimestamp(event);time.textContent=relativeTime(typeof event.timestamp_ms==='number'?event.timestamp_ms:eventTimestamp(event));meta.append(confidence,time);body.appendChild(meta);
 
 
 
@@ -76692,7 +76797,7 @@ function buildEventCard(event){
 
 
 
-    const actions=document.createElement('div');actions.className='dashboard-event-actions';const play=document.createElement('a');play.className='dashboard-event-action primary';play.href=event.linked_recording||'/playback';play.textContent='Play recording';actions.appendChild(play);if(event.thumbnail){const snapshot=document.createElement('a');snapshot.className='dashboard-event-action';snapshot.href=event.thumbnail;snapshot.target='_blank';snapshot.rel='noopener';snapshot.textContent='Snapshot';actions.appendChild(snapshot)}else{const missing=document.createElement('span');missing.className='dashboard-event-action';missing.textContent='No snapshot';actions.appendChild(missing)}body.appendChild(actions);card.append(imageWrap,body);return card
+    const actions=document.createElement('div');actions.className='dashboard-event-actions';const play=document.createElement('a');play.className='dashboard-event-action primary';play.href=event.playback_href||event.linked_recording||'/playback';play.textContent=event.has_event_clip?'Play clip':'Play recording';actions.appendChild(play);if(event.thumbnail){const snapshot=document.createElement('a');snapshot.className='dashboard-event-action';snapshot.href=event.thumbnail;snapshot.target='_blank';snapshot.rel='noopener';snapshot.textContent='Snapshot';actions.appendChild(snapshot)}else{const missing=document.createElement('span');missing.className='dashboard-event-action';missing.textContent='No snapshot';actions.appendChild(missing)}body.appendChild(actions);card.append(imageWrap,body);return card
 
 
 
@@ -76760,6 +76865,8 @@ updateDashboard();updateRecentEvents();setInterval(updateDashboard,10000);setInt
 
 
 
+    if _customer_dashboard_cameras is not None:
+        scripts = '<script>window.__anyaicamCustomerDashboard=true;</script>' + scripts
     return page_shell("Dashboard", "dashboard", content, scripts)
 
 
@@ -78246,23 +78353,14 @@ def sales_training_resource_file(item_id: str, request: Request) -> Response:
 
 
 @app.get("/analytics", response_class=HTMLResponse)
-
-
-
-
-
-
-
-
 def analytics(request: Request) -> str:
-
-
-
-
-
-
-
-
+    # Portal customers get their own Analytics workspace (2026-09-25),
+    # the same branch /events and /playback use; everyone else keeps the
+    # existing page unchanged.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        import customer_analytics_workspace
+        return customer_analytics_workspace.render_page(request, customer_cameras, page_shell)
     user = current_user(request)
 
 
@@ -81639,8 +81737,6 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
         <label>Natural-language search<input id="investigation-query" placeholder="Example: red truck on camera 2 yesterday"></label>
         <label>Event type<select id="investigation-type"><option value="">All event types</option><option value="motion">Motion</option><option value="person">Person</option><option value="vehicle">Vehicle</option><option value="car">Car</option><option value="truck">Truck</option><option value="plate">License plate</option><option value="line_crossing">Line crossing</option><option value="intrusion">Intrusion</option></select></label>
         <label>Camera<select id="investigation-camera"><option value="">All cameras</option>{camera_options}</select></label>
-        <label>Vehicle or clothing color<input id="investigation-color" placeholder="red, blue, silver"></label>
-        <label>License plate<input id="investigation-plate" placeholder="Plate text"></label>
         <label>From<input id="investigation-from" type="datetime-local"></label>
         <label>To<input id="investigation-to" type="datetime-local"></label>
         <div class="investigation-actions"><button class="action-button" id="run-investigation" type="button">Search</button><button class="ghost-button" id="clear-investigation" type="button">Clear</button></div>
@@ -81677,8 +81773,6 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     const queryInput=document.getElementById('investigation-query');
     const typeInput=document.getElementById('investigation-type');
     const cameraInput=document.getElementById('investigation-camera');
-    const colorInput=document.getElementById('investigation-color');
-    const plateInput=document.getElementById('investigation-plate');
     const fromInput=document.getElementById('investigation-from');
     const toInput=document.getElementById('investigation-to');
     const grid=document.getElementById('investigation-grid');
@@ -81713,15 +81807,26 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
       loadedEvents=loadedEvents.concat(data.events);currentTotal=data.total;currentHasMore=data.has_more;
       render();
     }}
+    // Stored values are escaped before they reach innerHTML, the time is
+    // shown in the viewer's timezone, and confidence only when one was
+    // stored (2026-09-25).
+    function esc(value){{return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch])}}
+    function localTime(event){{
+      const date=typeof event.timestamp_ms==='number'?new Date(event.timestamp_ms):null;
+      if(!date||isNaN(date.getTime()))return '';
+      return date.toLocaleString([],{{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit'}});
+    }}
     function card(event){{
-      const confidence=event.confidence==null?'—':Math.round(Number(event.confidence)*(Number(event.confidence)<=1?100:1))+'%';
-      const thumb=event.thumbnail?`<img src="${{event.thumbnail}}" alt="${{event.event_type}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
-      return `<article class="investigation-card" data-event-id="${{event.id}}">
-        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{event.event_type.replaceAll('_',' ')}}</span></div>
+      const label=event.type_label||event.event_type;
+      const confidence=event.confidence==null?'':` · ${{Math.round(Number(event.confidence)*100)}}% confidence`;
+      const thumb=event.thumbnail?`<img src="${{esc(event.thumbnail)}}" alt="${{esc(label)}} event" loading="lazy">`:'<div class="investigation-placeholder">No thumbnail</div>';
+      return `<article class="investigation-card" data-event-id="${{esc(event.id)}}">
+        <div class="investigation-thumb">${{thumb}}<span class="investigation-badge">${{esc(label)}}</span></div>
         <div class="investigation-body">
-          <div class="investigation-title"><h3>${{event.event_type.replaceAll('_',' ')}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
-          <div class="investigation-meta">${{event.camera}} · ${{String(event.timestamp||'').replace('T',' ').slice(0,19)}}<br>Confidence ${{confidence}}${{event.color?` · ${{event.color}}`:''}}${{event.plate?` · ${{event.plate}}`:''}}</div>
-          <div class="investigation-card-actions"><a class="primary" href="${{event.recording||'/playback'}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.live?`<a href="${{event.live}}">Live camera</a>`:''}}</div>
+          <div class="investigation-title"><h3>${{esc(label)}}</h3><label><input class="evidence-checkbox" type="checkbox" ${{selectedEvidence.has(event.id)?'checked':''}}> Evidence</label></div>
+          <div class="investigation-meta">${{esc(event.camera)}} · ${{esc(localTime(event))}}${{esc(confidence)}}${{event.color?` · ${{esc(event.color)}}`:''}}${{event.plate?` · ${{esc(event.plate)}}`:''}}</div>
+          <div class="investigation-card-actions"><a class="primary" href="${{esc(event.recording||'/playback')}}">Playback</a><button class="bookmark-investigation" type="button">${{event.review?.bookmarked?'Bookmarked':'Bookmark'}}</button>${{event.live?`<a href="${{esc(event.live)}}">Live camera</a>`:''}}</div>
+
         </div>
       </article>`;
     }}
@@ -81752,7 +81857,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
         }});
       }});
     }}
-    function clearFilters(){{[queryInput,typeInput,cameraInput,colorInput,plateInput,fromInput,toInput].forEach(input=>input.value='');runSearch()}}
+    function clearFilters(){{[queryInput,typeInput,cameraInput,fromInput,toInput].forEach(input=>input.value='');runSearch()}}
     document.getElementById('run-investigation').addEventListener('click',runSearch);
     document.getElementById('clear-investigation').addEventListener('click',clearFilters);
     queryInput.addEventListener('keydown',event=>{{if(event.key==='Enter')runSearch()}});
@@ -81762,7 +81867,7 @@ def _render_customer_investigate(cameras: list[dict], request: Request) -> str:
     document.getElementById('export-evidence').addEventListener('click',()=>{{
       const selected=loadedEvents.filter(event=>selectedEvidence.has(event.id));
       if(!selected.length)return showToast('Select at least one event first.');
-      const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,color:colorInput.value,plate:plateInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
+      const manifest={{product:'AnyAiCam VMS',exported_at:new Date().toISOString(),query:queryInput.value.trim(),filters:{{event_type:typeInput.value,camera:cameraInput.value,from:fromInput.value,to:toInput.value}},events:selected}};
       const blob=new Blob([JSON.stringify(manifest,null,2)],{{type:'application/json'}});
       const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download='anyaicam_evidence_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';document.body.appendChild(link);link.click();link.remove();URL.revokeObjectURL(link.href);
     }});
@@ -92641,6 +92746,8 @@ def mobile_devices_page(request: Request) -> str:
 
 
 
+    // Stored naive UTC (container time) -> the viewer's local time (2026-09-25).
+    function mobileLocalTime(value){if(!value)return 'Never';const text=String(value);const date=new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(text)?text:text+'Z');return isNaN(date.getTime())?text.replace('T',' ').slice(0,19):date.toLocaleString([],{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'})}
     function escMobile(value){return String(value??'').replace(/[&<>\"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char]))}
 
 
@@ -92677,7 +92784,7 @@ def mobile_devices_page(request: Request) -> str:
 
 
 
-        <div class="mobile-device-head"><div><h3>${escMobile(device.device_name)}</h3><div class="mobile-device-meta">${escMobile(device.platform)} · ${escMobile(device.user_email||'')}<br>Last seen: ${escMobile((device.last_seen_at||'Never').replace('T',' ').slice(0,19))}</div></div><span class="mobile-badge">${device.revoked?'revoked':'active'}</span></div>
+        <div class="mobile-device-head"><div><h3>${escMobile(device.device_name)}</h3><div class="mobile-device-meta">${escMobile(device.platform)} · ${escMobile(device.user_email||'')}<br>Last seen: ${escMobile(mobileLocalTime(device.last_seen_at))}</div></div><span class="mobile-badge">${device.revoked?'revoked':'active'}</span></div>
 
 
 
@@ -104056,12 +104163,17 @@ def _customer_subscription_portal_page(identity: dict) -> str:
             # active via a non-Stripe grant still sees "Active" above;
             # this branch is unreachable for them). Matches
             # aaco_product_status()'s own "sellable: false" precedent.
-            status_html = '<span class="health-detail">Coming soon</span>'
+            status_html = '<span class="pending-badge" aria-disabled="true" title="Not available to purchase yet">Not available yet</span>'
         elif is_owner:
             status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
         else:
             status_html = '<span class="health-detail">Not purchased</span>'
-        addon_rows += f'<div class="health-row"><span>{escape(label)}</span>{status_html}</div>'
+        # What the add-on turns on, from the catalog's own analytic mapping
+        # (only analytics customers see in the portal; no invented detail).
+        from customer_analytics_panel import ANALYTIC_LABELS as _PORTAL_ANALYTICS
+        included = [_PORTAL_ANALYTICS[key][0] for key in analytic_keys if key in _PORTAL_ANALYTICS]
+        includes_html = f'<br><span class="health-detail">Includes: {escape(", ".join(included))}</span>' if included else ''
+        addon_rows += f'<div class="health-row"><span>{escape(label)}{includes_html}</span>{status_html}</div>'
     if not addon_rows:
         addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
 
@@ -121393,6 +121505,18 @@ def analytics_detail(analytics_slug: str) -> str:
 
 
 
+def _customer_event_type_label(event_type) -> str:
+    from customer_analytics_panel import event_type_label
+    return event_type_label(event_type)
+
+
+def _customer_real_confidence(event_type, confidence):
+    # Motion rows store a raw motion score and PPE a placeholder 0.0 --
+    # neither is a confidence (customer_analytics_panel.real_confidence).
+    from customer_analytics_panel import real_confidence
+    return real_confidence(event_type, confidence)
+
+
 def _event_confidence_percent(confidence) -> str:
     """Same defensive 0-1-vs-0-100 handling the customer analytics
     search results view (renderResults()'s own JS) already uses --
@@ -121507,8 +121631,12 @@ def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_
     )
     if event_id and not has_event_clip:
         state=customer_event_media_state(False,timestamp)
-        label='Processing…' if state=='processing' else 'Not ready yet'
-        return f'{live_link}<span class="event-action-pending" aria-disabled="true">{label}</span>'
+        if state == 'processing':
+            return f'{live_link}<span class="event-action-pending" aria-disabled="true">Processing…</span>'
+        # An event past the processing window without a clip never gets
+        # one (analytics-only detection) -- 'Not ready yet' implied it would.
+        return (f'{live_link}<span class="event-action-pending" aria-disabled="true" '
+                f'title="Analytics-only detection: no video clip was recorded for this event">No clip</span>')
     playback_href = _customer_event_playback_href(camera_id, timestamp, event_id, has_event_clip)
     return f'{live_link}<a class="download" href="{playback_href}">Playback</a>'
 
@@ -121575,7 +121703,9 @@ def _render_customer_events(request: Request) -> str:
             # many requests at once" shape and changes no visible
             # behavior for a normal-sized event list.
             f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" loading="lazy" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">'
-            if event.get("thumbnail") else "—"
+            if event.get("thumbnail") else
+            # 2026-09-25: says what it means instead of a bare em dash.
+            '<span class="event-thumb-none" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>'
         )
         # Inline event-clip player (2026-09-02): a same-page thumbnail
         # click is a genuine, synchronous user gesture -- browsers give
@@ -121631,7 +121761,7 @@ def _render_customer_events(request: Request) -> str:
             )
         else:
             action_html = _customer_event_actions(camera_id_val, raw_timestamp, event_id_val, event.get("has_event_clip"))
-        type_label = str(event.get("event_type") or "event").replace("_", " ").title()
+        type_label = _customer_event_type_label(event.get("event_type"))
         camera_number = event.get("camera")
         event_id_attr = escape(str(event_id_val or ""), quote=True)
         # P0 #5 remediation round 2 (2026-09-05, Codex second review):
@@ -121657,7 +121787,7 @@ def _render_customer_events(request: Request) -> str:
             f'<td>{escape(event.get("camera_name") or (f"Camera {camera_number}" if camera_number else "—"))}</td>'
             f'<td class="event-thumbnail-cell">{thumbnail}</td>'
             f'<td><span class="pill">{escape(type_label)}</span></td>'
-            f'<td>{_event_confidence_percent(event.get("confidence"))}</td>'
+            f'<td>{_event_confidence_percent(_customer_real_confidence(event.get("event_type"), event.get("confidence")))}</td>'
             f'<td class="event-action-cell">{action_html}</td></tr>'
         )
     event_body = "".join(rows) or (
@@ -121674,6 +121804,7 @@ def _render_customer_events(request: Request) -> str:
 .event-thumb-loading{{width:96px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
 .event-thumb-pending{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:#e8b93f;font-size:11px;background:#0b1018;border-radius:4px;text-align:center;padding:0 6px}}
 .event-action-pending{{opacity:.55;cursor:default;pointer-events:none}}
+.event-thumb-none{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
 </style>
 <header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
 <div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
@@ -121883,22 +122014,25 @@ def _render_customer_events(request: Request) -> str:
 
   function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,mediaState){
     const liveLink=cameraId?`<a class="download" href="/customer/cameras/${encodeURIComponent(cameraId)}/live">Live view</a> `:'';
-    if(mediaState!=='ready'){
+    if(mediaState==='processing'){
       return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Playback</span>`;
+    }
+    if(mediaState!=='ready'){
+      return `${liveLink}<span class="event-action-pending" aria-disabled="true" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>`;
     }
     return `${liveLink}<a class="download" href="${eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip)}">Playback</a>`;
   }
 
   function eventThumbnailCellHtml(event,mediaState){
     if(event.thumbnail||event.has_event_clip){
-      const img=event.thumbnail?`<img src="${AnyAiCamEventMedia.escape(event.thumbnail)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`:'<span>Event clip</span>';
+      const img=event.thumbnail?`<img src="${AnyAiCamEventMedia.escape(event.thumbnail)}" alt="Event thumbnail" loading="lazy" decoding="async" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`:'<span>Event clip</span>';
       if(event.has_event_clip&&event.camera_id&&event.id){
         const escapedImg=img.replace(/"/g,'&quot;');
         return `<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" data-camera-id="${AnyAiCamEventMedia.escape(event.camera_id)}" data-event-id="${AnyAiCamEventMedia.escape(event.id)}" data-thumb-html="${escapedImg}">${img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span></div>`;
       }
       return img;
     }
-    return mediaState==='processing'?'<span class="event-thumb-pending">Processing…</span>':'—';
+    return mediaState==='processing'?'<span class="event-thumb-pending">Processing…</span>':'<span class="event-thumb-none" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>';
   }
 
   // Round 2 fix: updates both server-rendered "N event(s)" pill
@@ -121979,9 +122113,9 @@ def _render_customer_events(request: Request) -> str:
       if(ageMs<EVENT_PENDING_WINDOW_MS)return;
       row.dataset.mediaState='unavailable';
       const pendingLabel=row.querySelector('.event-thumbnail-cell .event-thumb-pending');
-      if(pendingLabel)pendingLabel.textContent='Not ready yet';
+      if(pendingLabel){pendingLabel.textContent='No clip';pendingLabel.className='event-thumb-none';pendingLabel.title='Analytics-only detection: no video clip was recorded for this event';}
       const actionPending=row.querySelector('.event-action-cell .event-action-pending');
-      if(actionPending)actionPending.title='Still processing -- check back soon';
+      if(actionPending){actionPending.textContent='No clip';actionPending.classList.remove('download');actionPending.title='Analytics-only detection: no video clip was recorded for this event';}
     });
   }
 
@@ -122121,6 +122255,23 @@ def _render_customer_events(request: Request) -> str:
     return page_shell("Events", "events", content, '<script src="/static/event_media.js"></script>' + scripts)
 
 
+def _customer_alert_text(notification: dict) -> tuple[str, str]:
+    """Title/message for an alert card. Rows stored before 2026-09-25 carry
+    the raw title-cased type ('Ppe', 'Ppe detected', 'Aac Voice Call');
+    those generated defaults are replaced by the customer names, while any
+    custom title/message (e.g. 'Someone is at Front Door.') is kept."""
+    from customer_analytics_panel import event_type_label, event_type_message
+    event_type = str(notification.get("event_type") or "")
+    raw_default = event_type.replace("_", " ").title()
+    title = str(notification.get("title") or "Alert")
+    message = str(notification.get("message") or "")
+    if event_type and title == raw_default:
+        title = event_type_label(event_type)
+    if event_type and message == f"{raw_default} detected":
+        message = event_type_message(event_type)
+    return title, message
+
+
 def _render_customer_alerts(request: Request) -> str:
     """Real, tenant-scoped Smart Alerts page. Reuses _customer_notifications()
     (real notifications rows, written by notification_engine.fanout_
@@ -122194,14 +122345,15 @@ def _render_customer_alerts(request: Request) -> str:
             actions_html = _customer_event_actions(
                 notification.get("camera_id"), raw_timestamp, notification.get("event_id"), notification.get("has_event_clip")
             )
+        alert_title, alert_message = _customer_alert_text(notification)
         mark_read_html = (
             '' if is_read else
             f'<button class="ghost-button mark-alert-read" type="button" data-notification-id="{escape(str(notification["id"]), quote=True)}">Mark read</button>'
         )
         cards.append(
             f'<article class="feature-card{"" if is_read else " alert-unread"}" data-alert-camera="{escape(str(camera_number or ""), quote=True)}" data-notification-id="{escape(str(notification["id"]), quote=True)}" data-read="{"1" if is_read else "0"}">{thumbnail}'
-            f'<h2>{escape(str(notification.get("title") or "Alert"))} · {escape(camera_label)}</h2>'
-            f'<p>{escape(str(notification.get("message") or ""))}</p>'
+            f'<h2>{escape(alert_title)} · {escape(camera_label)}</h2>'
+            f'<p>{escape(alert_message)}</p>'
             f'<p class="health-detail">{escape(timestamp_label)}</p>'
             f'<div class="dashboard-event-actions">{actions_html}{mark_read_html}</div></article>'
         )
@@ -122210,7 +122362,7 @@ def _render_customer_alerts(request: Request) -> str:
     )
 
     content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div>
-<div><button class="ghost-button" id="mark-all-alerts-read" type="button"{" hidden" if not unread_count else ""}>Mark all read</button> <button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header>
+<div><button class="ghost-button" id="mark-all-alerts-read" type="button"{" hidden" if not unread_count else ""}>Mark all read</button> <a class="action-button" href="/settings/notifications" title="Choose which events alert you, on which cameras, and how">＋ New alert</a></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
 <div id="alerts-camera-filters">{camera_options}</div></aside>
@@ -132204,23 +132356,12 @@ IMPLEMENTED_SETTINGS_CATEGORIES = {"Events & alerts"}
 
 
 @app.get("/settings", response_class=HTMLResponse)
-
-
-
-
-
-
-
-
 def settings(request: Request) -> str:
-
-
-
-
-
-
-
-
+    # Portal customers have their own settings page; "All settings" links
+    # (e.g. from Notification settings) used to dead-end here on
+    # "role does not include manage_settings" (2026-09-25).
+    if _customer_playback_cameras(request) is not None:
+        return RedirectResponse("/customer-app-settings", status_code=303)
     user = current_user(request)
 
 
@@ -132591,7 +132732,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-        "This address uses localhost. A phone cannot reach localhost on the Samsung laptop. "
+        "This address uses localhost. A phone cannot reach localhost on this computer. "
 
 
 
@@ -132708,7 +132849,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-check"><strong>1</strong><span>Connect the phone and Samsung laptop to the same Wi-Fi, or connect both devices to Tailscale.</span></div>
+          <div class="phone-check"><strong>1</strong><span>{"Make sure the phone has an internet connection." if RUNTIME_ROLE == "cloud" else "Connect the phone to the same network as this AnyAiCam appliance, or use Tailscale for remote access."}</span></div>
 
 
 
@@ -132735,7 +132876,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-check"><strong>4</strong><span>Open Notifications and enable push alerts after VAPID keys are configured.</span></div>
+          <div class="phone-check"><strong>4</strong><span>Pair the phone under <a class="download" href="/mobile-devices">Mobile devices</a>, then choose which alerts you get in <a class="download" href="/settings/notifications">Notification settings</a>.</span></div>
 
 
 
@@ -132816,7 +132957,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Push server</span><strong>{'Configured' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Needs VAPID keys'}</strong></div>
+          <div class="phone-status-row"><span>Push server</span><strong>{'Ready' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Not set up yet'}</strong></div>
 
 
 
@@ -143790,7 +143931,7 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
             "camera_id": row["camera_id"],
             "camera_name": (row["camera_display_name"] or "").strip() or f'Camera {row["camera"]}',
             "site": row["site_name"],
-            "rule_name": f'{str(row["event_type"]).replace("_", " ").title()} detection',
+            "rule_name": f'{_customer_event_type_label(row["event_type"])} detection',
             "event_type": row["event_type"],
             "direction": None,
             "timestamp": row["event_timestamp"],
@@ -143802,6 +143943,14 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
             "linked_recording": None,
             "has_event_clip": bool(row["has_event_clip"]),
             "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"]),
+            # Additive, customer-ready fields (2026-09-25) for the Dashboard:
+            # friendly type, epoch-ms time (the stored value is naive UTC,
+            # which browsers parse as local time), a real confidence only,
+            # and the event's own Playback deep link.
+            "type_label": _customer_event_type_label(row["event_type"]),
+            "timestamp_ms": _naive_utc_timestamp_to_epoch_ms(row["event_timestamp"]),
+            "display_confidence": _customer_real_confidence(row["event_type"], row["confidence"]),
+            "playback_href": _customer_event_playback_href(row["camera_id"], row["event_timestamp"], row["id"], bool(row["has_event_clip"])),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
@@ -144058,7 +144207,20 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # untouched. Saves real, no-tradeoff space rather than shrinking
         # the video itself (the one thing this whole feature exists to
         # keep usable) to force-fit the remainder.
-        '.playback-workspace-solo .panel{display:flex;justify-content:center;padding:6px}'
+        # Live-style media card (2026-09-25 camera-tile consistency pass):
+        # the panel is now the camera card itself -- hugging the video at
+        # the same width budget as the .camera-view rule above, with the
+        # recording's own actions (download/share/bookmark) in the shared
+        # .camera-tools strip directly beneath the video, inside the card,
+        # exactly like the Live detail page. Timeline, dates and clip
+        # navigation stay outside the card.
+        '.playback-workspace-solo .panel.playback-media-card{display:block;padding:10px;margin:0 auto;'
+        'width:min(calc(34vh * 16 / 9 + 22px),calc(340px * 16 / 9 + 22px),100%)}'
+        '.playback-media-card .camera-view{width:100%;max-height:none;margin:0}'
+        '.playback-media-card .camera-tools{justify-content:center}'
+        '@media(max-width:900px){.playback-media-card .camera-tool{width:44px;height:40px;font-size:17px}}'
+        '.playback-media-card .camera-tool:disabled{opacity:.4;cursor:default}'
+        '.playback-media-card .camera-tool:focus-visible{outline:2px solid var(--brand,#47d7ac);outline-offset:1px}'
         # The .event-* classes were already used by this legend (and by
         # the /analytics search results legend) but never actually had
         # a background color defined anywhere -- every dot rendered
@@ -144168,9 +144330,14 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:6px">'
-        '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
+        '<div class="panel playback-media-card"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
+        '</div>'
+        '<div class="camera-tools" id="playback-media-tools" role="toolbar" aria-label="Recording actions">'
+        '<button id="download-selected" type="button" disabled class="camera-tool" title="Download" aria-label="Download">⬇</button>'
+        '<button id="share-selected" type="button" disabled class="camera-tool" title="Share" aria-label="Share">↗</button>'
+        '<button id="bookmark-selected" type="button" disabled class="camera-tool" title="Bookmarking from Playback is not available yet." aria-label="Bookmark">◈</button>'
         '</div>'
         '</div>'
         '</section>'
@@ -144206,10 +144373,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<button id="skip-forward" type="button" disabled title="Forward 10 seconds" aria-label="Forward 10 seconds">⏩</button>'
         '</div>'
         '<div class="monitor-toolbar-group">'
-        '<button id="download-selected" type="button" disabled title="Download" aria-label="Download">⬇</button>'
-        '<button id="share-selected" type="button" disabled title="Share" aria-label="Share">⤴</button>'
         '<button id="create-clip" type="button" disabled>Create clip</button>'
-        '<button id="bookmark-selected" type="button" disabled title="Bookmarking from Playback is not available yet." aria-label="Bookmark">☆</button>'
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
@@ -144977,10 +145141,10 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       const media=event.thumbnail
         ? `<img class="mobile-media-thumb" src="${{AnyAiCamEventMedia.escape(event.thumbnail)}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
         : gaveUp
-          ? `<div class="mobile-media-fallback mobile-media-fallback--expired">${{label}} · Not ready yet</div>`
+          ? `<div class="mobile-media-fallback mobile-media-fallback--expired" title="Analytics-only detection: no video clip was recorded for this event">${{label}} · No clip</div>`
           : pending
             ? `<div class="mobile-media-fallback mobile-media-fallback--pending">${{label}} · Processing…</div>`
-            : `<div class="mobile-media-fallback">${{label}} · ${{playable?'Event clip':'Not ready yet'}}</div>`;
+            : `<div class="mobile-media-fallback">${{label}} · ${{playable?'Event clip':'No clip'}}</div>`;
 
       return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{AnyAiCamEventMedia.escape(event.timestamp)}}" data-mobile-event-id="${{AnyAiCamEventMedia.escape(event.id||'')}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
         ${{media}}

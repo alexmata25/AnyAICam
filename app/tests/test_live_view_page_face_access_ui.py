@@ -170,8 +170,11 @@ def test_camera_settings_section_prefills_the_cameras_own_current_configuration(
     # Relay 2 is the seeded channel -- its <option> must carry `selected`.
     assert '<option value="2" selected>Relay 2</option>' in response.text
     assert '<option value="1">Relay 1</option>' in response.text
-    # The seeded pulse duration (4500ms) is pre-filled, not the default.
-    assert 'id="door-relay-pulse-ms" type="number" min="1" step="1" value="4500"' in response.text
+    # The seeded pulse duration (4500ms) is pre-filled, not the default --
+    # shown to the customer in seconds since 2026-09-25, posted back in ms.
+    assert 'id="door-relay-pulse-seconds" type="number" min="0.5" max="60" step="0.5" inputmode="decimal" value="4.5"' in response.text
+    assert "payload.door_relay_pulse_ms=Math.round(seconds*1000);" in response.text
+    assert "Unlock duration (milliseconds)" not in response.text
 
 
 def test_camera_settings_section_for_a_not_yet_configured_camera_defaults_unchecked(client):
@@ -257,3 +260,14 @@ def test_viewer_access_section_posts_to_the_real_unlock_access_route(client):
     response = client.get("/customer/cameras/cam-door/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
     assert "/api/customer/cameras/${cameraId}/door-config/unlock-access" in response.text
+
+
+def test_door_fields_are_really_hidden_while_face_access_is_off(client):
+    """The fields' container carries an inline display:grid, which beats
+    the [hidden] attribute's default display:none -- so the relay and
+    duration fields showed even with Face Access unchecked (2026-09-25)."""
+    response = client.get("/customer/cameras/cam-plain/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
+    assert '<div id="door-access-fields" hidden>' in response.text
+    # Layout lives in a rule (not an inline style that would beat [hidden]).
+    assert "#door-access-fields{display:grid;" in response.text and "#door-access-fields[hidden]{display:none}" in response.text
+

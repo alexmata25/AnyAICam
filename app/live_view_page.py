@@ -696,6 +696,8 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         for channel in relay_control.VALID_CHANNELS
     )
     pulse_value = camera.get('door_relay_pulse_ms') or relay_control.DEFAULT_PULSE_MS
+    # Shown in seconds (2026-09-25); stored and posted in milliseconds.
+    pulse_seconds = f'{pulse_value / 1000:g}'
     door_enabled = bool(camera.get('door_access_enabled'))
 
     if not door_enabled:
@@ -731,9 +733,14 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         f'(e.g. "Front Door") so alerts and the live tile are easy to recognize.</div></div></div>'
         f'<label><span><input id="door-access-enabled" type="checkbox" {"checked" if door_enabled else ""}> '
         f'Enable Face Access for this camera</span></label>'
-        f'<div id="door-access-fields" style="display:grid;gap:14px;max-width:360px;margin-top:12px" {"" if door_enabled else "hidden"}>'
-        f'<label>Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
-        f'<label>Unlock duration (milliseconds)<input id="door-relay-pulse-ms" type="number" min="1" step="1" value="{pulse_value}"></label>'
+        f'<style>.face-access-field{{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:13px}}'
+        f'.face-access-field select,.face-access-field input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);'
+        f'border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}'
+        f'#door-access-fields{{display:grid;gap:14px;max-width:360px;margin-top:12px}}#door-access-fields[hidden]{{display:none}}</style>'
+        f'<div id="door-access-fields" {"" if door_enabled else "hidden"}>'  # layout in the rule above, so [hidden] wins
+        f'<label class="face-access-field">Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
+        f'<label class="face-access-field">Unlock duration (seconds)<input id="door-relay-pulse-seconds" type="number" min="0.5" max="60" step="0.5" '
+        f'inputmode="decimal" value="{pulse_seconds}"></label>'
         f'</div>'
         f'<button class="action-button" id="save-door-access" type="button" style="margin-top:12px">Save Face Access settings</button>'
         f'{viewer_access_section}'
@@ -842,7 +849,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                     aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
                     {'' if camera['enabled'] else 'disabled'}>🎤</button>
                   <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
-                    title="Camera tools (mute, snapshot, download, share, analytics, bookmark, stop)"
+                    title="Camera tools (mute, snapshot, fullscreen, playback, analytics, stop)"
                     aria-label="Open camera tools">⚙</a>
                   {unlock_button}
                 </div>
@@ -1310,9 +1317,15 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             camera = _authorized_camera(db, camera_id, identity)
             placeholders = ','.join('?' for _ in event_types)
             rows = db.execute(
-                f'SELECT event_type, confidence, object_count, detections_json, event_timestamp '
-                f'FROM detection_events WHERE camera_id=? AND customer_id=? AND event_type IN ({placeholders}) '
-                f'ORDER BY event_timestamp DESC LIMIT ?',
+                # id + detection_event_media flags (2026-09-25): lets the panel
+                # show the event's thumbnail and open it in Playback -- the
+                # same media join the Events page and Dashboard already use.
+                f'SELECT de.id, de.event_type, de.confidence, de.object_count, de.detections_json, de.event_timestamp, '
+                f'CASE WHEN dem.id IS NULL THEN 0 ELSE 1 END AS has_clip, '
+                "CASE WHEN length(COALESCE(dem.thumbnail_s3_key, ''))>0 THEN 1 ELSE 0 END AS has_thumbnail "
+                f'FROM detection_events de LEFT JOIN detection_event_media dem ON dem.detection_event_id=de.id '
+                f'WHERE de.camera_id=? AND de.customer_id=? AND de.event_type IN ({placeholders}) '
+                f'ORDER BY de.event_timestamp DESC LIMIT ?',
                 # People Counting derives entries/exits/occupancy from one
                 # row per line crossing, so it needs a wider window than
                 # the other analytics' "latest few results".
@@ -1454,15 +1467,26 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
             f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
             f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot" aria-label="Snapshot">◉</button>'
-            f'<button class="camera-tool" id="live-view-download" title="Download" aria-label="Download">⬇</button>'
-            f'<button class="camera-tool" id="live-view-share" title="Share" aria-label="Share">↗</button>'
-            f'<a class="camera-tool" href="/playback" title="Playback" aria-label="Playback">◴</a>'
+            # 2026-09-25: only controls that work. Download/Share/Bookmark were
+            # placeholders ("coming soon" / "use Playback") and are gone;
+            # Playback opens this camera's own recordings; Fullscreen exposes
+            # the fullscreen the frame already supported by double-click.
+            f'<button class="camera-tool" id="live-view-fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>'
+            f'<a class="camera-tool" href="/playback?camera={quote(camera_id)}" title="Playback" aria-label="Playback">◴</a>'
             f'<button class="camera-tool" id="live-view-analytics" title="Analytics" aria-label="Analytics">⌕</button>'
-            f'<button class="camera-tool" id="live-view-bookmark" title="Bookmark" aria-label="Bookmark">◈</button>'
             f'<button class="camera-tool" id="live-view-stop" title="Stop" aria-label="Stop">◼</button>'
             f'<button class="camera-tool" id="live-view-retry" title="Retry" aria-label="Retry" hidden>↻</button>'
             f'{unlock_tool_button}'
             f'</div></section>'
+            f'<style>.analytics-event-row{{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;border-radius:8px}}'
+            f'a.analytics-event-row:hover,a.analytics-event-row:focus-visible{{background:rgba(67,209,204,.07);outline:none}}'
+            f'a.analytics-event-row:focus-visible{{box-shadow:0 0 0 2px var(--brand,#47d7ac)}}'
+            f'.analytics-thumb{{flex:0 0 auto;width:96px;height:54px;border-radius:6px;object-fit:cover;background:#0b1018}}'
+            f'.analytics-thumb--empty{{display:grid;place-items:center;color:var(--muted);font-size:18px}}'
+            f'.analytics-row-text{{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}}'
+            f'.analytics-row-action{{flex:0 0 auto;color:#8df0ea;font-size:12px;font-weight:700;white-space:nowrap}}'
+            f'.analytics-view-all{{display:inline-block;margin-top:12px}}'
+            f'@media(max-width:560px){{.analytics-thumb{{width:72px;height:40px}}.analytics-row-action{{font-size:0}}.analytics-row-action span{{font-size:16px}}}}</style>'
             f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
             f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
             f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
@@ -1474,6 +1498,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
 (function(){{
   const cameraId={json.dumps(camera_id)};
+  const isOwner={json.dumps(identity.get('role') == 'customer_owner')};
   const startUrl={json.dumps(start_url)};
   const playlistUrl={json.dumps(playlist_url)};
   const pollIntervalMs={POLL_INTERVAL_MS};
@@ -1484,10 +1509,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const statusLabel=document.getElementById('live-view-status');
   const muteButton=document.getElementById('live-view-mute');
   const snapshotButton=document.getElementById('live-view-snapshot');
-  const downloadButton=document.getElementById('live-view-download');
-  const shareButton=document.getElementById('live-view-share');
+  const fullscreenButton=document.getElementById('live-view-fullscreen');
   const analyticsButton=document.getElementById('live-view-analytics');
-  const bookmarkButton=document.getElementById('live-view-bookmark');
   const stopButton=document.getElementById('live-view-stop');
   const retryButton=document.getElementById('live-view-retry');
   let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
@@ -1690,15 +1713,15 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       comingSoon('Snapshot is not available for this stream right now');
     }}
   }});
-  // Not a comingSoon() call: this isn't an unbuilt feature, it's a
-  // redirect to where download already works today (Playback) --
-  // comingSoon() always appends "is ready for a future update." to
-  // whatever label it's given, which turned this into a broken
-  // run-on sentence.
-  downloadButton.addEventListener('click',()=>showToast('Download applies to recorded clips in Playback.'));
-  shareButton.addEventListener('click',()=>comingSoon('Share'));
+  // Frame fullscreen where the browser supports it; iPhone Safari only
+  // supports it on the <video> itself. Hidden when neither exists.
+  if(!cameraView.requestFullscreen&&!video.webkitEnterFullscreen)fullscreenButton.hidden=true;
+  fullscreenButton.addEventListener('click',()=>{{
+    if(document.fullscreenElement){{document.exitFullscreen().catch(()=>{{}});return}}
+    if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
+    else if(video.webkitEnterFullscreen)video.webkitEnterFullscreen();
+  }});
   analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
-  bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
   stopButton.addEventListener('click',()=>{{stopPolling();destroyHls();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
 
@@ -1740,7 +1763,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const doorEnabledCheckbox=document.getElementById('door-access-enabled');
   const doorFields=document.getElementById('door-access-fields');
   const doorRelayChannel=document.getElementById('door-relay-channel');
-  const doorRelayPulseMs=document.getElementById('door-relay-pulse-ms');
+  const doorRelayPulseSeconds=document.getElementById('door-relay-pulse-seconds');
   const saveDoorAccessButton=document.getElementById('save-door-access');
   if(doorEnabledCheckbox){{
     doorEnabledCheckbox.addEventListener('change',()=>{{
@@ -1753,8 +1776,10 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       const payload={{door_access_enabled:enabled}};
       if(enabled){{
         payload.door_relay_channel=parseInt(doorRelayChannel.value,10);
-        const pulseRaw=doorRelayPulseMs.value.trim();
-        payload.door_relay_pulse_ms=pulseRaw?parseInt(pulseRaw,10):{relay_control.DEFAULT_PULSE_MS};
+        const secondsRaw=doorRelayPulseSeconds.value.trim();
+        const seconds=secondsRaw?Number(secondsRaw):{relay_control.DEFAULT_PULSE_MS}/1000;
+        if(!Number.isFinite(seconds)||seconds<=0||seconds>60){{showToast('Enter an unlock duration between 0.5 and 60 seconds.');return}}
+        payload.door_relay_pulse_ms=Math.round(seconds*1000);
       }}
       saveDoorAccessButton.disabled=true;
       let response,data;
@@ -1815,11 +1840,32 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   function renderUpgradeCard(key){{
     const info=analyticsByKey[key].upgrade;
-    const benefits=info.benefits.map(item=>`<li>${{item}}</li>`).join('');
-    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{info.description}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><button class="action-button" id="upgrade-request-${{key}}">Request Upgrade</button><button class="ghost-button" id="upgrade-add-${{key}}">Add to This Camera</button><button class="ghost-button" id="upgrade-learn-${{key}}">Learn More</button></div></div>`;
-    document.getElementById(`upgrade-request-${{key}}`).addEventListener('click',()=>comingSoon('Upgrade requests are coming soon -- contact your partner for now.'));
-    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',()=>comingSoon('Adding analytics directly from Live View is coming soon.'));
-    document.getElementById(`upgrade-learn-${{key}}`).addEventListener('click',()=>comingSoon(analyticsByKey[key].label+': '+info.description));
+    const benefits=info.benefits.map(item=>`<li>${{esc(item)}}</li>`).join('');
+    // Real actions only (2026-09-25): "View plans" opens My subscription;
+    // "Add to This Camera" (owners) calls the existing license-capped
+    // assignment route. No placeholder "coming soon" buttons.
+    const addButton=isOwner?`<button class="ghost-button" id="upgrade-add-${{key}}" type="button">Add to This Camera</button>`:'';
+    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{esc(info.description)}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><a class="action-button" href="/subscription-portal">View plans</a>${{addButton}}</div><p class="health-detail" id="upgrade-result-${{key}}" role="status" aria-live="polite"></p></div>`;
+    if(!isOwner)return;
+    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',async(event)=>{{
+      const button=event.currentTarget;
+      const result=document.getElementById(`upgrade-result-${{key}}`);
+      button.disabled=true;
+      result.textContent='Adding…';
+      try{{
+        const response=await fetch(`/api/customer/cameras/${{encodeURIComponent(cameraId)}}/analytics/${{encodeURIComponent(key)}}`,{{method:'POST',credentials:'same-origin'}});
+        const body=await response.json().catch(()=>({{}}));
+        if(!response.ok)throw new Error(typeof body.detail==='string'?body.detail:'This analytic could not be added to this camera.');
+        analyticsByKey[key].enabled=true;
+        const pill=[...analyticsPills.children].find(item=>item.dataset.key===key);
+        const badge=pill&&pill.querySelector('.pill');
+        if(badge)badge.remove();
+        selectAnalytic(key);
+      }}catch(error){{
+        result.textContent=error.message;
+        button.disabled=false;
+      }}
+    }});
   }}
 
   // Every value below comes from stored event data (appliance-reported
@@ -1829,25 +1875,78 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
   }}
   function row(name,detail){{return `<div class="health-row"><span class="health-name">${{esc(name)}}</span><span class="health-detail">${{esc(detail)}}</span></div>`}}
+  // Customer-facing presentation of stored results (2026-09-25): friendly
+  // labels, viewer-local times, the event's own thumbnail and a link into
+  // Playback -- all from data the summary route already returns.
+  const EVENT_LABELS={{motion:'Motion detected',smart_motion:'Motion detected',person:'Person detected',vehicle:'Vehicle detected',car:'Car detected',truck:'Truck detected',bus:'Bus detected',motorcycle:'Motorcycle detected',bicycle:'Bicycle detected',intrusion:'Zone intrusion',line_crossing:'Line crossed',people_counting_in:'Person entered',people_counting_out:'Person left',people_counting:'People count updated',plate:'License plate read',lpr:'License plate read'}};
+  function eventLabel(type){{
+    const key=String(type||'').toLowerCase();
+    if(EVENT_LABELS[key])return EVENT_LABELS[key];
+    return key?key.replace(/_/g,' ').replace(/^./,ch=>ch.toUpperCase())+' detected':'Activity detected';
+  }}
+  function friendlyTime(ms,raw){{
+    let date=null;
+    if(typeof ms==='number')date=new Date(ms);
+    else if(raw){{const text=String(raw);date=new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(text)?text:text+'Z')}}
+    if(!date||isNaN(date.getTime()))return '';
+    const now=new Date();
+    const yesterday=new Date(now.getFullYear(),now.getMonth(),now.getDate()-1);
+    const time=date.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit',second:'2-digit'}});
+    if(date.toDateString()===now.toDateString())return `Today, ${{time}}`;
+    if(date.toDateString()===yesterday.toDateString())return `Yesterday, ${{time}}`;
+    const day=date.toLocaleDateString([],date.getFullYear()===now.getFullYear()?{{month:'short',day:'numeric'}}:{{month:'short',day:'numeric',year:'numeric'}});
+    return `${{day}}, ${{time}}`;
+  }}
+  function percent(value){{
+    if(value==null||value==='')return null;
+    const number=Number(value);
+    return Number.isFinite(number)?Math.round(number*100)+'%':null;
+  }}
+  function playbackHref(item){{
+    const camera=encodeURIComponent(cameraId);
+    if(item.event_id&&item.has_clip)return `/playback?camera=${{camera}}&event=${{encodeURIComponent(item.event_id)}}&autoplay=event`;
+    if(typeof item.timestamp_ms==='number')return `/playback?camera=${{camera}}&t=${{item.timestamp_ms}}&autoplay=event`;
+    return null;
+  }}
+  function eventRow(item,title,extra){{
+    item=item||{{}};
+    const href=playbackHref(item);
+    const thumb=item.has_thumbnail&&item.event_id
+      ? `<img class="analytics-thumb" src="/api/customer/events/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(item.event_id)}}/thumbnail" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`
+      : '<span class="analytics-thumb analytics-thumb--empty" aria-hidden="true">◴</span>';
+    const detail=[friendlyTime(item.timestamp_ms,item.timestamp),...(extra||[])].filter(Boolean).map(esc).join(' · ');
+    const action=href?`<span class="analytics-row-action">${{item.has_clip?'Play clip':'Open in Playback'}} <span aria-hidden="true">→</span></span>`:'';
+    const inner=`${{thumb}}<span class="analytics-row-text"><span class="health-name">${{esc(title)}}</span><span class="health-detail">${{detail}}</span></span>${{action}}`;
+    return href?`<a class="health-row analytics-event-row" href="${{esc(href)}}">${{inner}}</a>`:`<div class="health-row analytics-event-row">${{inner}}</div>`;
+  }}
+  function confidenceNote(item){{const value=percent(item&&item.confidence);return value?`${{value}} confidence`:null}}
   function renderAnalyticsSummary(key,data){{
     const recent=Array.isArray(data.recent)?data.recent:[];
+    const asOf=friendlyTime(data.latest_timestamp_ms,data.latest_timestamp)||'—';
     if(key==='lpr'){{
       // Plate text is read and kept on the appliance; the cloud receives
       // the detection itself (time/confidence), not the plate number.
       const plate=data.latest_plate||(recent.length?'Plate text is kept on the appliance':'No plates read yet');
-      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?Math.round(data.latest_confidence*100)+'%':'—')+row('Recent',`${{recent.length}} recent detection(s)`);
+      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?percent(data.latest_confidence):'—')
+        +recent.slice(0,3).map(item=>eventRow(item,'License plate read',[item&&item.plate?`Plate ${{item.plate}}`:null,confidenceNote(item)])).join('');
     }}else if(key==='people_counting'){{
-      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`);
+      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`)
+        +(data.latest_timestamp?row('Last activity',asOf):'')
+        +recent.slice(0,3).map(item=>eventRow(item,eventLabel(item&&item.event_type))).join('');
     }}else if(key==='ppe'){{
       const status=data.latest_status==='compliant'?'Compliant':data.latest_status==='violation'?'Violation':(data.latest_status||'No PPE events yet');
-      analyticsPanel.innerHTML=row('Latest status',status)+row('As of',data.latest_timestamp||'—');
+      analyticsPanel.innerHTML=row('Latest status',status)+(data.latest_timestamp?row('As of',asOf):'')
+        +recent.slice(0,3).map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check')).join('');  // PPE stores no real confidence (0.0)
     }}else if(key==='facial_recognition'){{
-      const rows=recent.map(item=>row(item.person||(item.state==='unknown'?'Unknown person':(item.state||'Face')),item.timestamp||'')).join('');
+      const rows=recent.slice(0,3).map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[item.state==='known'&&percent(item.confidence)?`${{percent(item.confidence)}} match`:null])).join('');
       analyticsPanel.innerHTML=rows||row('','No face matches yet');
     }}else{{
-      const rows=recent.map(item=>row(item.event_type||'motion',item.timestamp||'')).join('');
-      analyticsPanel.innerHTML=rows||row('','No motion/person/vehicle events yet');
+      const rows=recent.slice(0,3).map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');
+      analyticsPanel.innerHTML=rows||row('','No motion, person or vehicle events yet');
     }}
+    // The full, filterable history lives in the Analytics workspace;
+    // this camera page keeps a concise summary (2026-09-25).
+    analyticsPanel.insertAdjacentHTML('beforeend',`<a class="download analytics-view-all" href="/analytics?type=${{encodeURIComponent(key)}}&camera=${{encodeURIComponent(cameraId)}}">View Analytics for this camera <span aria-hidden="true">→</span></a>`);
   }}
 
   async function selectAnalytic(key){{

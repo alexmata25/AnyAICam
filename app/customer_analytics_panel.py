@@ -26,6 +26,7 @@ routes call:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 # analytic_key (as stored in analytics_subscriptions, matching the exact
@@ -58,7 +59,7 @@ ANALYTIC_LABELS: dict[str, tuple[str, tuple[str, ...]]] = {
     # which refuses to run at all for a camera without an active
     # 'facial_recognition' row here, and facial_people.py/facial_recognition_ui.py
     # for enrollment/watchlist management.
-    "facial_recognition": ("AAC Facial Recognition", ("facial_recognition",)),
+    "facial_recognition": ("Facial Recognition", ("facial_recognition",)),
 }
 
 # Never show an empty bar: this pin exists so ANALYTIC_LABELS additions
@@ -191,6 +192,11 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
         currently_entitled_count=currently_entitled_count,
         already_entitled=already_entitled,
     ):
+        if not licensed_quantity:
+            raise LicenseLimitExceeded(
+                f"{ANALYTIC_LABELS[analytic_key][0]} is not part of your plan for this site yet. "
+                f"Add it from My subscription, then assign it to this camera."
+            )
         raise LicenseLimitExceeded(
             f"{ANALYTIC_LABELS[analytic_key][0]} is licensed for {licensed_quantity} camera(s) at this site; "
             f"that limit is already in use."
@@ -296,6 +302,78 @@ def _parse_detections(raw: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def epoch_ms(raw_timestamp) -> int | None:
+    """Naive-UTC event timestamp -> epoch milliseconds (same conversion as
+    main._naive_utc_timestamp_to_epoch_ms), so the browser formats it in
+    the viewer's own timezone instead of showing a raw ISO string."""
+    try:
+        dt = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+EVENT_TYPE_LABELS = {
+    "motion": "Motion", "smart_motion": "Smart Motion", "ppe": "PPE", "plate": "License plate", "lpr": "License plate",
+    "people_counting": "People count", "people_counting_in": "Entry", "people_counting_out": "Exit",
+    "facial_recognition": "Face", "aac_voice_call": "Voice call", "line_crossing": "Line crossing",
+}
+
+
+EVENT_TYPE_MESSAGES = {
+    "people_counting_in": "Person entered", "people_counting_out": "Person left",
+    "plate": "License plate read", "lpr": "License plate read",
+}
+
+
+def event_type_message(event_type) -> str:
+    """Default one-line alert message for an event type ('PPE detected',
+    'Person entered')."""
+    key = str(event_type or "").strip().lower()
+    return EVENT_TYPE_MESSAGES.get(key) or f"{event_type_label(key)} detected"
+
+
+def event_type_label(event_type) -> str:
+    """Customer-facing short name for a stored event type (2026-09-25):
+    'PPE' not 'Ppe', 'Entry' not 'People Counting In'. Unknown types fall
+    back to the previous title-casing."""
+    key = str(event_type or "").strip().lower()
+    return EVENT_TYPE_LABELS.get(key) or (key.replace("_", " ").title() if key else "Event")
+
+
+MOTION_EVENT_TYPES = frozenset({"motion", "smart_motion"})
+
+
+def real_confidence(event_type, value):
+    """A detection confidence only when it is one: a 0-1 probability from an
+    object/face/plate model. Motion rows store a raw motion score (e.g.
+    25.4) and PPE/people-counting rows a placeholder 0.0 -- neither may be
+    shown to a customer as a percentage."""
+    if value is None or str(event_type or "").lower() in MOTION_EVENT_TYPES:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0 < number <= 1 else None
+
+
+def event_ref(item: dict) -> dict:
+    """What the Live analytics panel needs to link a result to its event
+    (2026-09-25): the stored detection_events id, a viewer-local-ready
+    time, and whether the event already has a clip / thumbnail
+    (detection_event_media, joined by the summary route). Existing data
+    only -- nothing new is stored."""
+    return {
+        "event_id": item.get("id"),
+        "timestamp_ms": epoch_ms(item.get("event_timestamp")),
+        "has_clip": bool(item.get("has_clip")),
+        "has_thumbnail": bool(item.get("has_thumbnail")),
+    }
+
+
 def summarize_lpr(events: list[dict]) -> dict:
     """events: detection_events rows for event_type='lpr', most recent
     first. Never assumes a specific detections_json shape beyond
@@ -310,6 +388,7 @@ def summarize_lpr(events: list[dict]) -> dict:
             "plate": _parse_detections(item.get("detections_json")).get("plate"),
             "timestamp": item.get("event_timestamp"),
             "confidence": item.get("confidence"),
+            **event_ref(item),
         }
         for item in events[:10]
     ]
@@ -330,6 +409,8 @@ def summarize_people_counting(events: list[dict]) -> dict:
         {
             "count": item.get("object_count"),
             "timestamp": item.get("event_timestamp"),
+            "event_type": item.get("event_type"),
+            **event_ref(item),
         }
         for item in events[:10]
     ]
@@ -365,6 +446,8 @@ def summarize_ppe(events: list[dict]) -> dict:
         {
             "status": _ppe_status(_parse_detections(item.get("detections_json"))),
             "timestamp": item.get("event_timestamp"),
+            "confidence": None,  # PPE rows carry a placeholder 0.0
+            **event_ref(item),
         }
         for item in events[:10]
     ]
@@ -394,8 +477,9 @@ def summarize_smart_motion(events: list[dict]) -> dict:
         {
             "event_type": item.get("event_type"),
             "timestamp": item.get("event_timestamp"),
-            "confidence": item.get("confidence"),
+            "confidence": real_confidence(item.get("event_type"), item.get("confidence")),
             "thumbnail": _parse_detections(item.get("detections_json")).get("thumbnail"),
+            **event_ref(item),
         }
         for item in events[:10]
     ]
@@ -423,6 +507,7 @@ def summarize_facial_recognition(events: list[dict]) -> dict:
             "person": _parse_detections(item.get("detections_json")).get("matched_person_name"),
             "timestamp": item.get("event_timestamp"),
             "confidence": item.get("confidence"),
+            **event_ref(item),
         }
         for item in events[:10]
     ]
@@ -446,4 +531,6 @@ def summarize(analytic_key: str, events: list[dict]) -> dict:
     summarizer = SUMMARIZERS.get(analytic_key)
     if not summarizer:
         raise ValueError(f"Unknown analytic_key: {analytic_key!r}")
-    return summarizer(events)
+    result = summarizer(events)
+    result["latest_timestamp_ms"] = epoch_ms(result.get("latest_timestamp")) if result.get("latest_timestamp") else None
+    return result

@@ -76,7 +76,9 @@ def test_video_container_is_centered_within_its_panel(monkeypatch):
     # the timeline stopped clipping its own real content -- trimmed
     # here, scoped to this one video panel only, in favor of shrinking
     # the video itself.
-    assert ".playback-workspace-solo .panel{display:flex;justify-content:center;padding:6px}" in html
+    # 2026-09-25: the panel became the Live-style media card (video +
+    # integrated action strip), still centered and still tightly padded.
+    assert ".playback-workspace-solo .panel.playback-media-card{display:block;padding:10px;margin:0 auto;" in html
 
 
 def test_video_element_itself_still_fills_its_now_correctly_sized_container(monkeypatch):
@@ -100,7 +102,7 @@ def test_primary_toolbar_buttons_are_compact_icons_with_accessible_names(monkeyp
         "timeline-play": ("▶", "Play"),
         "skip-forward": ("⏩", "Forward 10 seconds"),
         "download-selected": ("⬇", "Download"),
-        "share-selected": ("⤴", "Share"),
+        "share-selected": ("↗", "Share"),  # Live's share glyph since 2026-09-25
     }
     for button_id, (glyph, label) in expected.items():
         assert f'id="{button_id}"' in html
@@ -113,7 +115,7 @@ def test_bookmark_button_keeps_its_existing_not_available_yet_tooltip(monkeypatc
     tooltip that was already there for a real, known limitation."""
     html = _render(monkeypatch)
     assert 'title="Bookmarking from Playback is not available yet."' in html
-    assert 'aria-label="Bookmark">☆<' in html
+    assert 'aria-label="Bookmark">◈<' in html  # Live's bookmark glyph since 2026-09-25
 
 
 def test_every_toolbar_button_is_still_a_real_disabled_until_selected_button(monkeypatch):

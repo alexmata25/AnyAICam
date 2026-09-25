@@ -20,6 +20,7 @@ legacy session must keep seeing the exact original page, untouched.
 Reuses test_dashboard_camera_tenant_scoping.py's own established harness.
 """
 
+import re
 import sqlite3
 
 import pytest
@@ -183,7 +184,7 @@ def test_an_active_addon_shows_an_active_pill_not_a_buy_button(http_client, db_p
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Advanced Analytics" in html
-    assert '<span>Advanced Analytics</span><span class="pill">Active</span>' in html
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">Includes: [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, monkeypatch):
@@ -213,7 +214,10 @@ def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(ht
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Advanced Analytics" in html
-    assert '<span>Advanced Analytics</span><span class="health-detail">Coming soon</span>' in html
+    # 2026-09-25: shown as clearly unavailable (not an active-looking
+    # "Coming soon"), with what it includes from the catalog mapping.
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">Includes: Smart Motion, People Counting, [^<]+</span></span>'
+                     r'<span class="pending-badge" aria-disabled="true"[^>]*>Not available yet</span>', html)
     assert 'data-addon-key="advanced_analytics"' not in html
 
 
@@ -234,7 +238,7 @@ def test_an_addon_already_active_without_its_price_id_configured_still_shows_act
             upsert_analytics_subscription(customer_id="cust-1", analytic_key=key, status="active")
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert '<span>Advanced Analytics</span><span class="pill">Active</span>' in html
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">Includes: [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 # ------------------------------------------------------- customer_viewer role

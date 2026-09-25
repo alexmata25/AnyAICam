@@ -4,6 +4,8 @@ from datetime import datetime
 
 from notification_service import CHANNELS
 from partner_db import connection,row,rows
+# Customer-facing names for stored event types ('PPE', not 'Ppe'), 2026-09-25.
+from customer_analytics_panel import event_type_label,event_type_message
 
 # 'ppe' added (2026-09-16): confirmed a real, previously-silent gap --
 # analytics_sync.py's _notification_event_type() already passes 'ppe'
@@ -171,7 +173,7 @@ def fanout_appliance_event(appliance: dict,event: dict):
                 if camera_id not in {item['camera_id'] for item in permissions if item['can_alerts']}: continue
             elif (user['camera_access_mode'] or 'selected')!='all':
                 continue
-        notification_id=secrets.token_hex(16); timestamp=str(event.get('timestamp') or now.isoformat()); title=event_type.replace('_',' ').title(); message=str(event.get('message') or f'{title} detected')[:1000]
+        notification_id=secrets.token_hex(16); timestamp=str(event.get('timestamp') or now.isoformat()); title=event_type_label(event_type); message=str(event.get('message') or event_type_message(event_type))[:1000]
         notification={'id':notification_id,'title':title,'message':message}
         with connection() as db:
             db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity','info'),title,message,timestamp,event.get('thumbnail'),now.isoformat()))
