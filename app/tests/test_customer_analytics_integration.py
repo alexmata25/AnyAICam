@@ -156,6 +156,10 @@ def test_alerts_page_shows_real_notifications_with_friendly_names(client, db_pat
 def test_alerts_page_new_alert_button_preserved(client):
     response = client.get("/alerts", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert "New alert" in response.text
+    # 2026-09-25: it opens the real per-camera alert program (Settings),
+    # not a "ready for a future update" toast; the empty Setup guide is gone.
+    assert 'href="/settings/notifications"' in response.text
+    assert "comingSoon('New alert rule')" not in response.text and "comingSoon('Setup guide')" not in response.text
 
 
 def test_alerts_page_honest_empty_state(client):

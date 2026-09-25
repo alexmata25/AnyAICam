@@ -117,9 +117,13 @@ def test_app_settings_escapes_the_account_email_and_explains_the_empty_state(mon
     import customer_platform
 
     source = open(customer_platform.__file__, encoding="utf-8").read()
-    assert 'value="{escape(user.get("email") or "")}"' in source
+    # 2026-09-25: the per-camera alert form (and its recipient-email field)
+    # wrote to a store the notification engine never read; alerts are set in
+    # Notification settings, so no account email is rendered here any more.
+    assert 'id="recipient-email"' not in source and 'href="/settings/notifications"' in source
     assert 'id="no-cameras-notice"' in source
-    assert "if(!response.ok||!data.features)" in source
+    assert "if(!response.ok||!Array.isArray(data.analytics))" in source
+    assert "${esc(item.label)}" in source  # stored labels escaped
 
 
 def test_live_view_no_longer_hard_codes_cameras_one_to_four():

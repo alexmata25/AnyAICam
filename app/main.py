@@ -122247,7 +122247,7 @@ def _render_customer_alerts(request: Request) -> str:
     )
 
     content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div>
-<div><button class="ghost-button" id="mark-all-alerts-read" type="button"{" hidden" if not unread_count else ""}>Mark all read</button> <button class="ghost-button" onclick="comingSoon('Setup guide')">Setup guide</button> <button class="action-button" onclick="comingSoon('New alert rule')">＋ New alert</button></div></header>
+<div><button class="ghost-button" id="mark-all-alerts-read" type="button"{" hidden" if not unread_count else ""}>Mark all read</button> <a class="action-button" href="/settings/notifications" title="Choose which events alert you, on which cameras, and how">＋ New alert</a></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
 <div id="alerts-camera-filters">{camera_options}</div></aside>

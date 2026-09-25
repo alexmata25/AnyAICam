@@ -75,6 +75,31 @@ def _alerts() -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _portal_camera_analytics(user: dict) -> dict[int, dict]:
+    """camera_number -> {"id": cameras.id, "analytics": [{key,label,enabled,
+    description}]} from the REAL per-camera entitlements
+    (camera_analytics_entitlements -- what the camera page, the Analytics
+    workspace and the license-capped assignment route use). 2026-09-25:
+    this page previously read customer_camera_features.json, a legacy
+    store nothing that runs analytics reads, so it showed "Upgrade
+    required" for analytics that were actually on."""
+    from customer_analytics_panel import UPGRADE_CARD_CONTENT, analytics_row_state, camera_entitlement_rows
+    customer_id = user.get("customer_id")
+    if not customer_id:
+        return {}
+    out: dict[int, dict] = {}
+    with connection() as db:
+        for camera in db.execute(
+            "SELECT id, camera_number FROM cameras WHERE customer_id=? AND camera_number IS NOT NULL ORDER BY camera_number",
+            (customer_id,),
+        ).fetchall():
+            analytics = analytics_row_state(camera_entitlement_rows(db, camera["id"]))
+            for item in analytics:
+                item["description"] = (UPGRADE_CARD_CONTENT.get(item["key"]) or {}).get("description", "")
+            out[int(camera["camera_number"])] = {"id": camera["id"], "analytics": analytics}
+    return out
+
+
 def _camera_key(user_id: str, camera_id: int) -> str:
     return f"{user_id}:{camera_id}"
 
@@ -182,32 +207,25 @@ def register_customer_platform_routes(
 
         cameras = _portal_customer_camera_ids(user)
         camera_names = _portal_customer_camera_names(user)
-        feature_state = _features()
+        real = _portal_camera_analytics(user)
         enabled_total = 0
-        entitled_total = 0
+        cameras_with_analytics = 0
         cards = []
 
         for camera_id in cameras:
-            state = feature_state.get(_camera_key(user["id"], camera_id), {})
-            entitlements = set(state.get("entitlements") or [])
-            enabled = {
-                key for key, value in (state.get("analytics_enabled") or {}).items()
-                if value and key in entitlements
-            }
-            enabled_total += len(enabled)
-            entitled_total += len(entitlements)
+            info = real.get(camera_id) or {"id": None, "analytics": []}
+            enabled_labels = [item["label"] for item in info["analytics"] if item.get("enabled")]
+            enabled_total += len(enabled_labels)
+            cameras_with_analytics += 1 if enabled_labels else 0
             camera_label = camera_names.get(camera_id, f"Camera {camera_id}")
-            if entitlements:
-                summary = f"{len(enabled)} of {len(entitlements)} paid analytics enabled"
-            else:
-                summary = "No paid analytics assigned yet — ask your installer to add features"
+            summary = ("Analytics: " + ", ".join(enabled_labels)) if enabled_labels else "No analytics enabled on this camera"
+            live_href = f"/customer/cameras/{escape(str(info['id']), quote=True)}/live" if info["id"] else "/customer-live"
             cards.append(
                 f'''<article class="feature-card">
                   <div class="feature-icon">▣</div>
                   <h2>{escape(camera_label)}</h2>
-                  <p class="health-detail">Camera {camera_id}</p>
-                  <p>{summary}</p>
-                  <a class="download" href="/camera/{camera_id}">Open camera</a>
+                  <p>{escape(summary)}</p>
+                  <a class="download" href="{live_href}">Open camera</a>
                 </article>'''
             )
 
@@ -218,7 +236,7 @@ def register_customer_platform_routes(
         </header>
         <section class="launch-summary">
           <article class="launch-stat"><span>Authorized cameras</span><strong>{len(cameras)}</strong></article>
-          <article class="launch-stat"><span>Paid analytics</span><strong>{entitled_total}</strong></article>
+          <article class="launch-stat"><span>Cameras with analytics</span><strong>{cameras_with_analytics}</strong></article>
           <article class="launch-stat"><span>Analytics enabled</span><strong>{enabled_total}</strong></article>
           <article class="launch-stat"><span>Portal status</span><strong>Active</strong></article>
         </section>
@@ -251,24 +269,14 @@ def register_customer_platform_routes(
             f'<option value="{camera}">{escape(camera_names.get(camera, f"Camera {camera}"))}</option>'
             for camera in cameras
         )
-        analytic_options = "".join(
-            f'''<label class="feature-toggle" data-feature="{key}" style="display:flex;align-items:center;gap:12px">
-              <span style="display:flex;flex-direction:column;gap:2px;flex:1">
-                <strong>{item["label"]}</strong>
-                <small style="color:var(--muted)">{item["description"]}</small>
-              </span>
-              <input type="checkbox" id="feature-{key}">
-              <em id="entitlement-{key}" style="font-style:normal;font-weight:600;text-transform:none">Checking plan…</em>
-            </label>'''
-            for key, item in ANALYTICS_CATALOG.items()
-        )
         no_cameras_notice = "" if cameras else (
             '<div class="health-detail" id="no-cameras-notice" style="margin-top:8px">'
             'No cameras are set up on your account yet. Once a camera is added, its analytics and alerts can be configured here.</div>'
         )
         content = f'''
+        <style>#camera-select,#camera-name-input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}</style>
         <header class="topbar">
-          <div><p class="eyebrow">Mobile app settings</p><h1>Camera analytics and alerts</h1></div>
+          <div><p class="eyebrow">Settings</p><h1>Camera analytics and alerts</h1></div>
           <a class="ghost-button" href="/settings/notifications">Notification settings</a>
           <a class="ghost-button" href="/customer-portal">Back to customer portal</a>
         </header>
@@ -285,39 +293,23 @@ def register_customer_platform_routes(
         </section>
         <div class="notification-grid" style="margin-top:16px">
           <section class="panel">
-            <div class="panel-head"><div><h2>Paid analytics</h2><div class="health-detail">Locked features require an active entitlement assigned by ANY AI CAM.</div></div></div>
-            <div class="customer-feature-grid">{analytic_options}</div>
-            <button class="action-button" id="save-features" type="button">Save camera analytics</button>
+            <div class="panel-head"><div><h2>Analytics</h2><div class="health-detail">Analytics run per camera from your plan -- the same status the camera's live page shows.</div></div></div>
+            <div id="camera-analytics-list" class="health-list"><div class="health-detail">Loading…</div></div>
           </section>
-          <section class="panel">
-            <div class="panel-head"><div><h2>Notifications</h2><div class="health-detail">Program alerts for this camera.</div></div></div>
-            <form class="notification-form" id="alert-form">
-              <label><span><input id="alerts-enabled" type="checkbox" checked> Enable alerts for this camera</span></label>
-              <label>Recipient email<input id="recipient-email" type="email" value="{escape(user.get("email") or "")}"></label>
-              <label><span><input id="email-enabled" type="checkbox" checked> Email notifications</span></label>
-              <label><span><input id="push-enabled" type="checkbox" checked> Mobile push notifications</span></label>
-              <div class="event-check-grid">
-                <label><input class="event-type" value="motion" type="checkbox" checked> Motion</label>
-                <label><input class="event-type" value="person" type="checkbox" checked> Person</label>
-                <label><input class="event-type" value="vehicle" type="checkbox"> Vehicle</label>
-                <label><input class="event-type" value="offline" type="checkbox"> Camera offline</label>
-              </div>
-              <label><span><input id="quiet-enabled" type="checkbox"> Quiet hours</span></label>
-              <label>Quiet hours start<input id="quiet-start" type="time" value="22:00"></label>
-              <label>Quiet hours end<input id="quiet-end" type="time" value="07:00"></label>
-              <button class="action-button" type="submit">Save alert program</button>
-            </form>
-            <div class="push-status" style="margin-top:14px">
-              <strong>Push enrollment</strong>
-              <p class="health-detail">Install the mobile app, allow browser notifications, then enroll this device.</p>
-              <button class="compact-button" id="enable-push" type="button">Enable push on this device</button>
+          <section class="panel" id="alert-program">
+            <div class="panel-head"><div><h2>Alerts</h2><div class="health-detail">Choose which events alert you, for which cameras, by email or text, and quiet hours.</div></div></div>
+            <a class="action-button" href="/settings/notifications">Open notification settings</a>
+            <div class="push-status" style="margin-top:16px">
+              <strong>Phone alerts</strong>
+              <p class="health-detail">Pair your phone with the AnyAiCam app to get push alerts, or pause alerts for a paired device.</p>
+              <a class="ghost-button" href="/mobile-devices">Manage mobile devices</a>
             </div>
           </section>
         </div>
         '''
         scripts = '''
         <script>
-        const catalog=['smart_motion','people_counting','lpr','ppe_detection'];
+        const isOwner=''' + json.dumps(str(user.get("role") or "").lower() == "customer_owner") + ''';
         const cameraSelect=document.getElementById('camera-select');
         const cameraNameInput=document.getElementById('camera-name-input');
         const rawCameraNames=''' + json.dumps(raw_camera_names) + ''';
@@ -348,91 +340,32 @@ def register_customer_platform_routes(
           showToast(data.message||'Camera name saved.');
         };
 
+        function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+        const analyticsList=document.getElementById('camera-analytics-list');
         async function loadCameraSettings(){
           const cameraId=cameraSelect.value;
-          if(!cameraId){
-            catalog.forEach(name=>{
-              document.getElementById(`feature-${name}`).disabled=true;
-              document.getElementById(`entitlement-${name}`).textContent='No camera yet';
-            });
-            return;
-          }
+          if(!cameraId){analyticsList.innerHTML='<div class="health-detail">No camera yet.</div>';return}
+          analyticsList.innerHTML='<div class="health-detail">Loading…</div>';
           const response=await fetch(`/api/customer/cameras/${cameraId}/app-settings`);
           const data=await response.json().catch(()=>({}));
-          if(!response.ok||!data.features){showToast(data.detail||'Could not load settings for this camera.');return}
-          const entitlements=new Set(data.features.entitlements||[]);
-          const enabled=data.features.analytics_enabled||{};
-          catalog.forEach(name=>{
-            const input=document.getElementById(`feature-${name}`);
-            const badge=document.getElementById(`entitlement-${name}`);
-            const paid=entitlements.has(name);
-            input.disabled=!paid;
-            input.checked=Boolean(paid&&enabled[name]);
-            badge.textContent=paid?'Included in plan':'Upgrade required';
-            badge.className=paid?'active-badge':'pending-badge';
-          });
-          const a=data.alerts||{};
-          document.getElementById('alerts-enabled').checked=a.enabled!==false;
-          document.getElementById('recipient-email').value=a.recipient_email||'';
-          document.getElementById('email-enabled').checked=a.email_enabled!==false;
-          document.getElementById('push-enabled').checked=a.push_enabled!==false;
-          document.getElementById('quiet-enabled').checked=Boolean(a.quiet_hours_enabled);
-          document.getElementById('quiet-start').value=a.quiet_start||'22:00';
-          document.getElementById('quiet-end').value=a.quiet_end||'07:00';
-          document.querySelectorAll('.event-type').forEach(box=>{
-            box.checked=(a.event_types||['motion','person']).includes(box.value);
-          });
+          if(!response.ok||!Array.isArray(data.analytics)){
+            analyticsList.innerHTML=`<div class="health-detail">${esc(data.detail||'Could not load analytics for this camera.')}</div>`;return;
+          }
+          analyticsList.innerHTML=data.analytics.map(item=>{
+            const status=item.enabled
+              ?'<span class="active-badge">Enabled on this camera</span>'
+              :`<span class="pending-badge">Not enabled</span> <a class="download" href="/subscription-portal">View plans</a>${isOwner&&data.camera_uuid?` <button class="compact-button" type="button" data-add="${esc(item.key)}">Add to this camera</button>`:''}`;
+            return `<div class="health-row"><span><span class="health-name">${esc(item.label)}</span><br><span class="health-detail">${esc(item.description)}</span></span><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end">${status}</span></div>`;
+          }).join('');
+          analyticsList.querySelectorAll('[data-add]').forEach(button=>button.addEventListener('click',async()=>{
+            button.disabled=true;
+            const r=await fetch(`/api/customer/cameras/${encodeURIComponent(data.camera_uuid)}/analytics/${encodeURIComponent(button.dataset.add)}`,{method:'POST',credentials:'same-origin'});
+            const body=await r.json().catch(()=>({}));
+            if(!r.ok){showToast(typeof body.detail==='string'?body.detail:'This analytic could not be added.');button.disabled=false;return}
+            showToast(body.message||'Analytic enabled for this camera.');
+            loadCameraSettings();
+          }));
         }
-
-        document.getElementById('save-features').onclick=async()=>{
-          if(noCamera())return;
-          const analytics_enabled={};
-          catalog.forEach(name=>analytics_enabled[name]=document.getElementById(`feature-${name}`).checked);
-          const response=await fetch(`/api/customer/cameras/${cameraSelect.value}/features`,{
-            method:'PUT',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({analytics_enabled})
-          });
-          const data=await response.json();
-          showToast(data.message||'Analytics updated.');
-          loadCameraSettings();
-        };
-
-        document.getElementById('alert-form').onsubmit=async event=>{
-          event.preventDefault();
-          if(noCamera())return;
-          const payload={
-            enabled:document.getElementById('alerts-enabled').checked,
-            recipient_email:document.getElementById('recipient-email').value,
-            email_enabled:document.getElementById('email-enabled').checked,
-            push_enabled:document.getElementById('push-enabled').checked,
-            quiet_hours_enabled:document.getElementById('quiet-enabled').checked,
-            quiet_start:document.getElementById('quiet-start').value,
-            quiet_end:document.getElementById('quiet-end').value,
-            event_types:[...document.querySelectorAll('.event-type:checked')].map(x=>x.value)
-          };
-          const response=await fetch(`/api/customer/cameras/${cameraSelect.value}/alerts`,{
-            method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)
-          });
-          const data=await response.json();
-          showToast(data.message||'Alert program saved.');
-        };
-
-        document.getElementById('enable-push').onclick=async()=>{
-          if(!('Notification' in window)){return showToast('Push notifications are not supported on this browser.');}
-          const permission=await Notification.requestPermission();
-          if(permission!=='granted')return showToast('Notification permission was not granted.');
-          const response=await fetch('/api/mobile/push/enroll',{
-            method:'POST',headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({
-              device_name:navigator.userAgent.includes('iPhone')?'iPhone':'Android or desktop browser',
-              platform:navigator.platform||'web',
-              endpoint:'browser-permission',
-              keys:{}
-            })
-          });
-          const data=await response.json();
-          showToast(data.message||'This device is enrolled.');
-        };
 
         cameraSelect.onchange=()=>{loadCameraSettings();populateCameraName()};
         loadCameraSettings();
@@ -449,8 +382,11 @@ def register_customer_platform_routes(
         if camera_id not in _portal_customer_camera_ids(user):
             raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")
         key = _camera_key(user["id"], camera_id)
+        real = _portal_camera_analytics(user).get(camera_id) or {"id": None, "analytics": []}
         return {
             "camera_id": camera_id,
+            "camera_uuid": real["id"],
+            "analytics": real["analytics"],
             "features": _features().get(key, {"entitlements": [], "analytics_enabled": {}}),
             "alerts": _alerts().get(key, {
                 "enabled": True,
