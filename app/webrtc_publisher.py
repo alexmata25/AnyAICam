@@ -99,6 +99,7 @@ import json
 import logging
 import appliance_config_cache
 import camera_capabilities
+import camera_stream_selection
 import os
 import asyncio
 import secrets
@@ -635,13 +636,10 @@ _p2p_source_choice: dict = {}
 
 
 def _onvif_soap_call():
-    """The existing ONVIF SOAP client (talk_down_discovery) -- imported
-    lazily so this module stays import-safe."""
-    try:
-        import talk_down_discovery
-        return talk_down_discovery._soap_call
-    except Exception:
-        return None
+    """The ONVIF SOAP client for capability discovery: talk_down_
+    discovery's WS-Security client, routed to the device or media service
+    (camera_capabilities.onvif_soap_call)."""
+    return camera_capabilities.onvif_soap_call
 
 
 def _load_capabilities(camera_id: str):
@@ -676,8 +674,9 @@ def p2p_source_for(camera_id: str, main_url: str) -> tuple[str, str]:
         _clean, username, password = camera_capabilities.split_credentials(main_url)
         record = _load_capabilities(camera_id)
         if camera_capabilities.needs_reprobe(record, main_url):
-            record = camera_capabilities.discover(main_url, soap_call=_onvif_soap_call(), url_candidates=substream_candidates)
-        for stream in camera_capabilities.select_streams(record, "live_p2p"):
+            record = camera_capabilities.discover(main_url, soap_call=_onvif_soap_call(), url_candidates=substream_candidates,
+                                                  previous=record)
+        for stream in camera_stream_selection.select_streams(record, "live_p2p"):
             if stream.get("role") == "main":
                 break
             candidate = camera_capabilities.with_credentials(stream["uri"], username, password)
