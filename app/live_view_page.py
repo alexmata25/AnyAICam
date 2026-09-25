@@ -1476,6 +1476,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'.analytics-thumb--empty{{display:grid;place-items:center;color:var(--muted);font-size:18px}}'
             f'.analytics-row-text{{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}}'
             f'.analytics-row-action{{flex:0 0 auto;color:#8df0ea;font-size:12px;font-weight:700;white-space:nowrap}}'
+            f'.analytics-view-all{{display:inline-block;margin-top:12px}}'
             f'@media(max-width:560px){{.analytics-thumb{{width:72px;height:40px}}.analytics-row-action{{font-size:0}}.analytics-row-action span{{font-size:16px}}}}</style>'
             f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
             f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
@@ -1918,22 +1919,25 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       // the detection itself (time/confidence), not the plate number.
       const plate=data.latest_plate||(recent.length?'Plate text is kept on the appliance':'No plates read yet');
       analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?percent(data.latest_confidence):'—')
-        +recent.map(item=>eventRow(item,'License plate read',[item&&item.plate?`Plate ${{item.plate}}`:null,confidenceNote(item)])).join('');
+        +recent.slice(0,3).map(item=>eventRow(item,'License plate read',[item&&item.plate?`Plate ${{item.plate}}`:null,confidenceNote(item)])).join('');
     }}else if(key==='people_counting'){{
       analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`)
         +(data.latest_timestamp?row('Last activity',asOf):'')
-        +recent.slice(0,5).map(item=>eventRow(item,eventLabel(item&&item.event_type))).join('');
+        +recent.slice(0,3).map(item=>eventRow(item,eventLabel(item&&item.event_type))).join('');
     }}else if(key==='ppe'){{
       const status=data.latest_status==='compliant'?'Compliant':data.latest_status==='violation'?'Violation':(data.latest_status||'No PPE events yet');
       analyticsPanel.innerHTML=row('Latest status',status)+(data.latest_timestamp?row('As of',asOf):'')
-        +recent.map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check',[confidenceNote(item)])).join('');
+        +recent.slice(0,3).map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check')).join('');  // PPE stores no real confidence (0.0)
     }}else if(key==='facial_recognition'){{
-      const rows=recent.map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[confidenceNote(item)])).join('');
+      const rows=recent.slice(0,3).map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[confidenceNote(item)])).join('');
       analyticsPanel.innerHTML=rows||row('','No face matches yet');
     }}else{{
-      const rows=recent.map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');
+      const rows=recent.slice(0,3).map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');
       analyticsPanel.innerHTML=rows||row('','No motion, person or vehicle events yet');
     }}
+    // The full, filterable history lives in the Analytics workspace;
+    // this camera page keeps a concise summary (2026-09-25).
+    analyticsPanel.insertAdjacentHTML('beforeend',`<a class="download analytics-view-all" href="/analytics?type=${{encodeURIComponent(key)}}&camera=${{encodeURIComponent(cameraId)}}">View Analytics for this camera <span aria-hidden="true">→</span></a>`);
   }}
 
   async function selectAnalytic(key){{

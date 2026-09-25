@@ -41861,6 +41861,7 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     "/events",
     "/alerts",
     "/investigate",
+    "/analytics",
     "/subscription-portal",
     # /aaco (app/aaco_web.py) is the same shape bug as every other entry
     # above: a bare, cloud-only, customer-facing nav path that
@@ -47009,7 +47010,7 @@ NAV_ITEMS = [
 
 
 
-    ("analytics", "/analytics", "⌕", "Analytics"),
+    ("analytics", "/analytics", "▥", "Analytics"),
 
 
 
@@ -47606,7 +47607,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "investigate", "dashboard", "aac",
+            "live", "events", "alerts", "playback", "analytics", "investigate", "dashboard", "aac",
 
 
 
@@ -48596,6 +48597,9 @@ register_provisioning_api_routes(app)
 register_live_playlist_routes(app, hls_folder=HLS_FOLDER, local_identity=lambda: own_appliance_identity())
 register_live_view_session_routes(app)
 register_live_view_page_routes(app, page_shell)
+from customer_analytics_workspace import register_customer_analytics_routes
+from partner_portal import partner_identity as _analytics_partner_identity
+register_customer_analytics_routes(app, lambda request: _customer_playback_cameras(request), _analytics_partner_identity)
 from customer_analytics_rules import register_customer_analytics_rules_routes
 register_customer_analytics_rules_routes(app, page_shell)
 register_live_view_p2p_customer_routes(app)
@@ -78246,23 +78250,14 @@ def sales_training_resource_file(item_id: str, request: Request) -> Response:
 
 
 @app.get("/analytics", response_class=HTMLResponse)
-
-
-
-
-
-
-
-
 def analytics(request: Request) -> str:
-
-
-
-
-
-
-
-
+    # Portal customers get their own Analytics workspace (2026-09-25),
+    # the same branch /events and /playback use; everyone else keeps the
+    # existing page unchanged.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        import customer_analytics_workspace
+        return customer_analytics_workspace.render_page(request, customer_cameras, page_shell)
     user = current_user(request)
 
 
