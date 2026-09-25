@@ -40476,6 +40476,14 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    # Orphaned live-HLS segments left by every FFmpeg restart (see
+    # hls_segment_sweeper.py): wherever cameras stream locally.
+    import hls_segment_sweeper
+    hls_segment_sweeper_task = (
+        asyncio.create_task(hls_segment_sweeper.hls_segment_sweeper_worker(HLS_FOLDER))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # camera_url is main.py's own credentialed-RTSP-URL builder -- injected
     # rather than imported by webrtc_publisher.py, which this module
     # imports to wire this task, exactly the same circular-import
@@ -40736,6 +40744,8 @@ async def lifespan(app: FastAPI):
             live_relay_task.cancel()
         if live_relay_idle_sweep_task:
             live_relay_idle_sweep_task.cancel()
+        if hls_segment_sweeper_task:
+            hls_segment_sweeper_task.cancel()
         if webrtc_publisher_task:
             webrtc_publisher_task.cancel()
         if local_storage_manager_task:
@@ -40850,6 +40860,8 @@ async def lifespan(app: FastAPI):
             pending.append(live_relay_task)
         if live_relay_idle_sweep_task:
             pending.append(live_relay_idle_sweep_task)
+        if hls_segment_sweeper_task:
+            pending.append(hls_segment_sweeper_task)
         if webrtc_publisher_task:
             pending.append(webrtc_publisher_task)
         if local_storage_manager_task:
