@@ -76743,7 +76743,7 @@ function buildEventCard(event){
 
 
 
-    if(event.thumbnail){const image=document.createElement('img');image.src=event.thumbnail;image.alt=`${event.event_type||'Motion'} on Camera ${event.camera||'?'}`;image.loading='lazy';imageWrap.appendChild(image)}else{const fallback=document.createElement('div');fallback.className='dashboard-event-fallback';fallback.innerHTML='<strong>No thumbnail</strong><span>Preview unavailable</span>';imageWrap.appendChild(fallback)}
+    if(event.thumbnail){const image=document.createElement('img');image.src=event.thumbnail;image.alt=`${event.type_label||event.event_type||'Motion'} on ${event.camera_name||('Camera '+(event.camera||''))}`;image.loading='lazy';imageWrap.appendChild(image)}else{const fallback=document.createElement('div');fallback.className='dashboard-event-fallback';fallback.innerHTML='<strong>No thumbnail</strong><span>Preview unavailable</span>';imageWrap.appendChild(fallback)}
 
 
 
@@ -76761,7 +76761,7 @@ function buildEventCard(event){
 
 
 
-    const camera=document.createElement('span');camera.className='dashboard-event-camera';camera.textContent=`Camera ${event.camera||'?'}`;imageWrap.appendChild(camera);
+    const camera=document.createElement('span');camera.className='dashboard-event-camera';camera.textContent=event.camera_name||(event.camera?`Camera ${event.camera}`:'');camera.hidden=!camera.textContent;imageWrap.appendChild(camera);
 
 
 
