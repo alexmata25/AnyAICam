@@ -182,3 +182,8 @@ def test_hidden_filters_stay_hidden(client):
     html = client.get("/analytics", cookies=_cookie()).text
     assert ".analytics-filter[hidden]{display:none}" in html
     assert 'id="analytics-from-wrap" hidden' in html and 'id="analytics-to-wrap" hidden' in html
+
+
+def test_face_scores_are_labelled_as_match_only_for_recognized_people(client):
+    html = client.get("/analytics", cookies=_cookie()).text
+    assert "d.state==='known'&&e.confidence!=null?`${Math.round(e.confidence*100)}% match`:null" in html

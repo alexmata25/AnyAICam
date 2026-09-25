@@ -1929,7 +1929,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       analyticsPanel.innerHTML=row('Latest status',status)+(data.latest_timestamp?row('As of',asOf):'')
         +recent.slice(0,3).map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check')).join('');  // PPE stores no real confidence (0.0)
     }}else if(key==='facial_recognition'){{
-      const rows=recent.slice(0,3).map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[confidenceNote(item)])).join('');
+      const rows=recent.slice(0,3).map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[item.state==='known'&&percent(item.confidence)?`${{percent(item.confidence)}} match`:null])).join('');
       analyticsPanel.innerHTML=rows||row('','No face matches yet');
     }}else{{
       const rows=recent.slice(0,3).map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');

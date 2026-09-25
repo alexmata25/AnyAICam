@@ -335,7 +335,9 @@ function extra(e){{
     const part=(name,v)=>v==null?null:`${{name}} ${{v?'✓':'✗ missing'}}`;
     return [part('Hard hat',d.hard_hat),part('Vest',d.vest)];
   }}
-  if(state.tab==='facial_recognition')return [d.watchlist?`Watchlist: ${{d.watchlist}}`:null,pct(e.confidence)];
+  // A face score is similarity to an enrolled person: meaningful as a
+  // match score for a recognized person, misleading for an unknown face.
+  if(state.tab==='facial_recognition')return [d.watchlist?`Watchlist: ${{d.watchlist}}`:null,d.state==='known'&&e.confidence!=null?`${{Math.round(e.confidence*100)}}% match`:null];
   if(state.tab==='lpr')return [d.plate?null:'Plate text kept on the appliance',pct(e.confidence)];
   if(state.tab==='smart_motion')return [d.object_count>1?`${{d.object_count}} objects`:null,pct(e.confidence)];
   return [];
