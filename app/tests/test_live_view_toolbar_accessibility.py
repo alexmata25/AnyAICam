@@ -46,10 +46,8 @@ CAMERA_CASES = [("cam-tools-a", 9), ("cam-tools-b", 40)]
 TOOLBAR_LABELS = {
     "live-view-mute": "Mute",
     "live-view-snapshot": "Snapshot",
-    "live-view-download": "Download",
-    "live-view-share": "Share",
+    "live-view-fullscreen": "Fullscreen",
     "live-view-analytics": "Analytics",
-    "live-view-bookmark": "Bookmark",
     "live-view-stop": "Stop",
     "live-view-retry": "Retry",
 }
@@ -115,26 +113,21 @@ def test_every_toolbar_button_has_an_explicit_aria_label(client, camera_id, came
 def test_playback_toolbar_link_has_an_explicit_aria_label(client, camera_id, camera_number):
     response = client.get(f"/customer/cameras/{camera_id}/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert '<a class="camera-tool" href="/playback" title="Playback" aria-label="Playback">' in response.text
+    # Opens this camera's own recordings (2026-09-25), not bare /playback.
+    assert f'<a class="camera-tool" href="/playback?camera={camera_id}" title="Playback" aria-label="Playback">' in response.text
 
 
 @pytest.mark.parametrize("camera_id,camera_number", CAMERA_CASES)
-def test_download_button_shows_a_clean_sentence_not_a_comingsoon_run_on(client, camera_id, camera_number):
+def test_only_working_controls_are_shown(client, camera_id, camera_number):
+    """2026-09-25 standing rule: a button either works or does not
+    appear. Download (a toast pointing at Playback) and Share/Bookmark
+    ("coming soon") were placeholders on a live stream and are removed;
+    Fullscreen -- already supported by double-click -- gets a real button."""
     response = client.get(f"/customer/cameras/{camera_id}/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert "downloadButton.addEventListener('click',()=>showToast('Download applies to recorded clips in Playback.'))" in response.text
-    # The old broken concatenation must be gone entirely, not just
-    # supplemented -- comingSoon() must never be called with this label.
-    assert "comingSoon('Download applies to recorded clips in Playback')" not in response.text
-
-
-@pytest.mark.parametrize("camera_id,camera_number", CAMERA_CASES)
-def test_share_and_bookmark_remain_honest_coming_soon_placeholders(client, camera_id, camera_number):
-    """Share/Bookmark are genuinely unbuilt features, not misrouted
-    messaging like Download was -- they should keep using comingSoon()
-    unchanged, so a customer clicking them still gets an honest
-    "coming soon" notice rather than nothing happening."""
-    response = client.get(f"/customer/cameras/{camera_id}/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert response.status_code == 200
-    assert "shareButton.addEventListener('click',()=>comingSoon('Share'))" in response.text
-    assert "bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'))" in response.text
+    html = response.text
+    for gone in ('id="live-view-download"', 'id="live-view-share"', 'id="live-view-bookmark"',
+                 "comingSoon('Share')", "comingSoon('Bookmark')", "Download applies to recorded clips"):
+        assert gone not in html, gone
+    assert "fullscreenButton.addEventListener('click'" in html
+    assert "cameraView.requestFullscreen().catch" in html and "video.webkitEnterFullscreen()" in html

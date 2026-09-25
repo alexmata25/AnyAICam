@@ -696,6 +696,8 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         for channel in relay_control.VALID_CHANNELS
     )
     pulse_value = camera.get('door_relay_pulse_ms') or relay_control.DEFAULT_PULSE_MS
+    # Shown in seconds (2026-09-25); stored and posted in milliseconds.
+    pulse_seconds = f'{pulse_value / 1000:g}'
     door_enabled = bool(camera.get('door_access_enabled'))
 
     if not door_enabled:
@@ -731,9 +733,14 @@ def _door_access_settings_panel(camera: dict, viewers: list[dict]) -> str:
         f'(e.g. "Front Door") so alerts and the live tile are easy to recognize.</div></div></div>'
         f'<label><span><input id="door-access-enabled" type="checkbox" {"checked" if door_enabled else ""}> '
         f'Enable Face Access for this camera</span></label>'
+        f'<style>.face-access-field{{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:13px}}'
+        f'.face-access-field select,.face-access-field input{{min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);'
+        f'border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}}'
+        f'#door-access-fields[hidden]{{display:none!important}}</style>'  # its inline display:grid beat [hidden]
         f'<div id="door-access-fields" style="display:grid;gap:14px;max-width:360px;margin-top:12px" {"" if door_enabled else "hidden"}>'
-        f'<label>Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
-        f'<label>Unlock duration (milliseconds)<input id="door-relay-pulse-ms" type="number" min="1" step="1" value="{pulse_value}"></label>'
+        f'<label class="face-access-field">Relay channel<select id="door-relay-channel">{channel_options}</select></label>'
+        f'<label class="face-access-field">Unlock duration (seconds)<input id="door-relay-pulse-seconds" type="number" min="0.5" max="60" step="0.5" '
+        f'inputmode="decimal" value="{pulse_seconds}"></label>'
         f'</div>'
         f'<button class="action-button" id="save-door-access" type="button" style="margin-top:12px">Save Face Access settings</button>'
         f'{viewer_access_section}'
@@ -1460,11 +1467,13 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
             f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
             f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot" aria-label="Snapshot">◉</button>'
-            f'<button class="camera-tool" id="live-view-download" title="Download" aria-label="Download">⬇</button>'
-            f'<button class="camera-tool" id="live-view-share" title="Share" aria-label="Share">↗</button>'
-            f'<a class="camera-tool" href="/playback" title="Playback" aria-label="Playback">◴</a>'
+            # 2026-09-25: only controls that work. Download/Share/Bookmark were
+            # placeholders ("coming soon" / "use Playback") and are gone;
+            # Playback opens this camera's own recordings; Fullscreen exposes
+            # the fullscreen the frame already supported by double-click.
+            f'<button class="camera-tool" id="live-view-fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>'
+            f'<a class="camera-tool" href="/playback?camera={quote(camera_id)}" title="Playback" aria-label="Playback">◴</a>'
             f'<button class="camera-tool" id="live-view-analytics" title="Analytics" aria-label="Analytics">⌕</button>'
-            f'<button class="camera-tool" id="live-view-bookmark" title="Bookmark" aria-label="Bookmark">◈</button>'
             f'<button class="camera-tool" id="live-view-stop" title="Stop" aria-label="Stop">◼</button>'
             f'<button class="camera-tool" id="live-view-retry" title="Retry" aria-label="Retry" hidden>↻</button>'
             f'{unlock_tool_button}'
@@ -1500,10 +1509,8 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const statusLabel=document.getElementById('live-view-status');
   const muteButton=document.getElementById('live-view-mute');
   const snapshotButton=document.getElementById('live-view-snapshot');
-  const downloadButton=document.getElementById('live-view-download');
-  const shareButton=document.getElementById('live-view-share');
+  const fullscreenButton=document.getElementById('live-view-fullscreen');
   const analyticsButton=document.getElementById('live-view-analytics');
-  const bookmarkButton=document.getElementById('live-view-bookmark');
   const stopButton=document.getElementById('live-view-stop');
   const retryButton=document.getElementById('live-view-retry');
   let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
@@ -1706,15 +1713,15 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       comingSoon('Snapshot is not available for this stream right now');
     }}
   }});
-  // Not a comingSoon() call: this isn't an unbuilt feature, it's a
-  // redirect to where download already works today (Playback) --
-  // comingSoon() always appends "is ready for a future update." to
-  // whatever label it's given, which turned this into a broken
-  // run-on sentence.
-  downloadButton.addEventListener('click',()=>showToast('Download applies to recorded clips in Playback.'));
-  shareButton.addEventListener('click',()=>comingSoon('Share'));
+  // Frame fullscreen where the browser supports it; iPhone Safari only
+  // supports it on the <video> itself. Hidden when neither exists.
+  if(!cameraView.requestFullscreen&&!video.webkitEnterFullscreen)fullscreenButton.hidden=true;
+  fullscreenButton.addEventListener('click',()=>{{
+    if(document.fullscreenElement){{document.exitFullscreen().catch(()=>{{}});return}}
+    if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
+    else if(video.webkitEnterFullscreen)video.webkitEnterFullscreen();
+  }});
   analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
-  bookmarkButton.addEventListener('click',()=>comingSoon('Bookmark'));
   stopButton.addEventListener('click',()=>{{stopPolling();destroyHls();stopSession(false)}});
   retryButton.addEventListener('click',startSession);
 
@@ -1756,7 +1763,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
   const doorEnabledCheckbox=document.getElementById('door-access-enabled');
   const doorFields=document.getElementById('door-access-fields');
   const doorRelayChannel=document.getElementById('door-relay-channel');
-  const doorRelayPulseMs=document.getElementById('door-relay-pulse-ms');
+  const doorRelayPulseSeconds=document.getElementById('door-relay-pulse-seconds');
   const saveDoorAccessButton=document.getElementById('save-door-access');
   if(doorEnabledCheckbox){{
     doorEnabledCheckbox.addEventListener('change',()=>{{
@@ -1769,8 +1776,10 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       const payload={{door_access_enabled:enabled}};
       if(enabled){{
         payload.door_relay_channel=parseInt(doorRelayChannel.value,10);
-        const pulseRaw=doorRelayPulseMs.value.trim();
-        payload.door_relay_pulse_ms=pulseRaw?parseInt(pulseRaw,10):{relay_control.DEFAULT_PULSE_MS};
+        const secondsRaw=doorRelayPulseSeconds.value.trim();
+        const seconds=secondsRaw?Number(secondsRaw):{relay_control.DEFAULT_PULSE_MS}/1000;
+        if(!Number.isFinite(seconds)||seconds<=0||seconds>60){{showToast('Enter an unlock duration between 0.5 and 60 seconds.');return}}
+        payload.door_relay_pulse_ms=Math.round(seconds*1000);
       }}
       saveDoorAccessButton.disabled=true;
       let response,data;
