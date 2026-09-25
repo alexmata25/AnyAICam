@@ -243,7 +243,7 @@ def _run_worker_for(seconds, monkeypatch, *, honored):
     # worker compares against time.monotonic() (time since boot), so
     # stub the refresh itself -- no network/MediaMTX call in this test.
     monkeypatch.setattr(wp, "_refresh_camera_map", lambda: None)
-    monkeypatch.setattr(wp, "sync_camera_paths", lambda camera_url_fn: None)
+    monkeypatch.setattr(wp, "reconcile_camera_paths", lambda camera_url_fn: None)
     ticks = {"n": 0}
 
     async def fake_bridge_tick(camera_url_fn):

@@ -78,6 +78,8 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
     calls: list = []
     fail_whep = False
     fail_config = False
+    api_down = False
+    fail_list = False
     existing: set = set()
 
     def log_message(self, *a):
@@ -118,8 +120,35 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_GET(self):
+        self.__class__.calls.append((self.command, self.path, b"", self._headers_lower()))
+        if self.__class__.api_down:
+            self.send_response(503)
+            self.end_headers()
+            return
+        if self.path == "/v3/config/global/get":
+            body = b"{}"
+        elif self.path.startswith("/v3/config/paths/list"):
+            if self.__class__.fail_list:
+                self.send_response(500)
+                self.end_headers()
+                return
+            # Same shape as the real v1.21 API (confirmed on the Ryzen):
+            # paginated, and the static all_others path is listed too.
+            names = sorted(self.__class__.existing | {"all_others"})
+            body = json.dumps({"itemCount": len(names), "pageCount": 1, "items": [{"name": n} for n in names]}).encode()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_DELETE(self):
         self.__class__.calls.append((self.command, self.path, b"", self._headers_lower()))
+        self.__class__.existing.discard(self.path.rsplit("/", 1)[-1])
         self.send_response(200)
         self.end_headers()
 
@@ -155,6 +184,8 @@ def fake_mediamtx(monkeypatch):
     _FakeMediaMTX.calls = []
     _FakeMediaMTX.fail_whep = False
     _FakeMediaMTX.fail_config = False
+    _FakeMediaMTX.api_down = False
+    _FakeMediaMTX.fail_list = False
     _FakeMediaMTX.existing = set()
     server = http.server.HTTPServer(("127.0.0.1", 0), _FakeMediaMTX)
     port = server.server_address[1]
@@ -179,6 +210,9 @@ def _no_real_capability_discovery(monkeypatch):
     monkeypatch.setattr(wp, "_save_capabilities", lambda camera_id, record: None)
     monkeypatch.setattr(wp, "_onvif_soap_call", lambda: None)
     monkeypatch.setattr(wp, "_probe_video_stream", lambda url: False)
+    monkeypatch.setattr(wp, "_paths_resync_pending", False)
+    monkeypatch.setattr(wp, "_whep_sessions", {})
+    monkeypatch.setattr(wp, "_applied_hosts", [])  # a MediaMTX (re)start sets it; never leak it to other tests
 
 
 # --------------------------------------------------------------- path sync
@@ -543,7 +577,7 @@ async def test_worker_ticks_when_enabled_on_edge_role(monkeypatch):
     # worker compares against time.monotonic() (time since boot), so
     # stub the refresh itself -- no network/MediaMTX call in this test.
     monkeypatch.setattr(wp, "_refresh_camera_map", lambda: None)
-    monkeypatch.setattr(wp, "sync_camera_paths", lambda camera_url_fn: None)
+    monkeypatch.setattr(wp, "reconcile_camera_paths", lambda camera_url_fn: None)
 
     async def fake_bridge_tick(camera_url_fn):
         ticks["value"] += 1
@@ -718,3 +752,148 @@ def test_host_changes_are_applied_live_only_when_they_change(fake_mediamtx, tmp_
     wp.sync_additional_hosts()
     patches = [json.loads(c[2]) for c in fake_mediamtx.calls if c[1] == "/v3/config/global/patch"]
     assert patches == [{"webrtcAdditionalHosts": ["192.168.0.228"]}, {"webrtcAdditionalHosts": ["192.168.0.99"]}]
+
+
+# --------------------------------------------------------------- MediaMTX crash/restart recovery
+
+CAMERAS = {f"cam-{n}": n for n in range(1, 8)}  # any count; nothing below depends on it
+
+
+def _url(n):
+    return f"rtsp://u:p@10.0.0.{n}/main"
+
+
+def _crash_and_restart(fake, tmp_path, monkeypatch):
+    """The MediaMTX child dies (taking every runtime path with it) and the
+    worker's own _ensure_mediamtx_running() spawns a new one."""
+    monkeypatch.setattr(wp, "MEDIAMTX_CONFIG_PATH", tmp_path / "mediamtx.yml")
+    monkeypatch.setattr(wp.subprocess, "Popen", lambda *a, **k: _FakeProcess(returncode=None))
+    monkeypatch.setattr(wp, "_mediamtx_process", _FakeProcess(returncode=1))
+    fake.existing.clear()
+    wp._ensure_mediamtx_running()
+
+
+@pytest.fixture()
+def configured(fake_mediamtx, monkeypatch):
+    monkeypatch.setattr(wp, "_camera_map", dict(CAMERAS))
+    monkeypatch.setattr(wp, "_known_paths", set())
+    monkeypatch.setattr(wp, "MEDIAMTX_STARTUP_GRACE_SECONDS", 0.2)
+    wp.reconcile_camera_paths(_url)
+    assert fake_mediamtx.existing == set(CAMERAS) and wp._known_paths == set(CAMERAS)
+    fake_mediamtx.calls.clear()
+    return fake_mediamtx
+
+
+def _adds(fake):
+    return sorted(c[1].rsplit("/", 1)[-1] for c in fake.calls
+                  if c[0] == "POST" and c[1].startswith(("/v3/config/paths/add/", "/v3/config/paths/replace/")))
+
+
+def test_a_mediamtx_restart_re_adds_every_camera_path_without_a_vms_restart(configured, tmp_path, monkeypatch):
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    assert wp._known_paths == set() and wp._paths_resync_pending is True
+    wp.reconcile_camera_paths(_url)
+    assert configured.existing == set(CAMERAS) == wp._known_paths
+    assert _adds(configured) == sorted(CAMERAS)
+    assert wp._paths_resync_pending is False
+
+
+def test_offers_after_a_restart_wait_for_the_path_then_reach_mediamtx_again(configured, tmp_path, monkeypatch):
+    posted = []
+    monkeypatch.setattr(wp, "_control_plane_post", lambda path, payload: posted.append(path))
+    wp._whep_sessions["old-session"] = "http://127.0.0.1:1/old/whep/x"
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    assert wp._whep_sessions == {}  # belonged to the dead process
+    offer = {"session_id": "s1", "camera_id": "cam-3", "kind": "offer", "payload": {"sdp": "v=0\r\n"}}
+    wp._handle_pending_signal(None, offer)  # not re-added yet: refused, the viewer falls back to relay
+    assert not [c for c in configured.calls if c[1].endswith("/whep")]
+    wp.reconcile_camera_paths(_url)
+    wp._handle_pending_signal(None, dict(offer, session_id="s2"))
+    assert [c[1] for c in configured.calls if c[1].endswith("/whep")] == ["/cam-3/whep"]
+    assert posted == ["/api/appliance/live/cam-3/p2p/answer"]
+
+
+def test_a_still_starting_mediamtx_keeps_the_resync_pending_until_its_api_answers(configured, tmp_path, monkeypatch):
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    configured.api_down = True
+    wp.reconcile_camera_paths(_url)
+    assert _adds(configured) == [] and wp._paths_resync_pending is True
+    configured.api_down = False
+    wp.reconcile_camera_paths(_url)
+    assert configured.existing == set(CAMERAS) == wp._known_paths
+
+
+def test_steady_state_never_recreates_paths(configured):
+    for _ in range(3):
+        wp.reconcile_camera_paths(_url)
+    assert _adds(configured) == []
+    assert {c[0] for c in configured.calls} == {"GET"}  # one read-only list per refresh
+
+
+def test_a_path_mediamtx_lost_without_an_observed_restart_is_re_added_alone(configured):
+    configured.existing.discard("cam-5")
+    wp.reconcile_camera_paths(_url)
+    assert _adds(configured) == ["cam-5"] and wp._known_paths == set(CAMERAS)
+
+
+def test_an_unreadable_path_list_changes_nothing(configured):
+    configured.fail_list = True
+    wp.reconcile_camera_paths(_url)
+    assert _adds(configured) == [] and wp._known_paths == set(CAMERAS)
+
+
+def test_a_restart_keeps_the_substream_choice_and_lan_hosts_without_reprobing(configured, tmp_path, monkeypatch):
+    probes = []
+    monkeypatch.setattr(wp, "_probe_video_stream", lambda url: probes.append(url) or True)
+    main = "rtsp://u:p@10.0.0.9/Streaming/Channels/101"
+    monkeypatch.setattr(wp, "_camera_map", {"cam-x": 9})
+    monkeypatch.setattr(wp, "_known_paths", set())
+    wp.reconcile_camera_paths(lambda n: main)
+    first_source = json.loads([c for c in configured.calls if c[1] == "/v3/config/paths/add/cam-x"][0][2])["source"]
+    assert first_source.endswith("/Streaming/Channels/102") and len(probes) == 1
+    _write_lan(tmp_path, monkeypatch, ["192.168.0.228"])
+    configured.calls.clear()
+    _crash_and_restart(configured, tmp_path, monkeypatch)
+    assert "192.168.0.228" in (tmp_path / "mediamtx.yml").read_text()
+    wp.reconcile_camera_paths(lambda n: main)
+    readded = json.loads([c for c in configured.calls if c[1] == "/v3/config/paths/add/cam-x"][0][2])["source"]
+    assert readded == first_source and len(probes) == 1  # cached choice, no re-probe
+    wp.sync_additional_hosts()
+    assert not [c for c in configured.calls if c[1] == "/v3/config/global/patch"]  # new process already has them
+
+
+@pytest.mark.anyio
+async def test_the_worker_resyncs_right_after_a_restart_not_at_the_next_refresh(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(wp, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(wp, "LIVE_P2P_ENABLED", True)
+    monkeypatch.setattr(wp, "SCAN_SECONDS", 0.5)
+    monkeypatch.setattr(wp, "CONFIG_REFRESH_SECONDS", 9999)
+    monkeypatch.setattr(wp, "_ensure_mediamtx_running", lambda: None)
+    monkeypatch.setattr(wp, "stop_mediamtx", lambda: None)
+    monkeypatch.setattr(wp, "_refresh_camera_map", lambda: None)
+    monkeypatch.setattr(wp, "sync_additional_hosts", lambda: None)
+    resyncs = []
+
+    def fake_reconcile(camera_url_fn):
+        resyncs.append(wp._paths_resync_pending)
+        wp._paths_resync_pending = False
+
+    monkeypatch.setattr(wp, "reconcile_camera_paths", fake_reconcile)
+
+    async def fake_bridge_tick(camera_url_fn):
+        await asyncio.sleep(0.01)
+        return False
+
+    monkeypatch.setattr(wp, "_bridge_tick", fake_bridge_tick)
+    task = asyncio.ensure_future(wp.webrtc_publisher_worker(lambda n: "rtsp://u:p@h:554/x"))
+    await asyncio.sleep(0.2)
+    assert resyncs == [False]  # only the first (due) refresh
+    wp._paths_resync_pending = True  # what _start_mediamtx() sets on a restart
+    await asyncio.sleep(0.8)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert resyncs == [False, True]  # re-synced within one loop; the refresh is still not due
