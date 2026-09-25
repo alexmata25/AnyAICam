@@ -179,6 +179,8 @@ run_validate() {
     check "VMS local ready endpoint is reachable and self-test passes (business readiness -- e.g. a camera actually recording -- is intentionally not required at install time)" retry_until_vms_started ready_endpoint_self_test_ok
     check "VMS /version reports exact approved commit" retry_until_vms_started version_reports_release
     check "MediaMTX is present, executable, and checksum-verified when P2P live view is enabled" mediamtx_required_and_usable
+    check "WebRTC media port (UDP 8189) is restricted to private/Tailscale sources" "${WEBRTC_FIREWALL_SCRIPT:-/usr/local/sbin/anyaicam-webrtc-firewall}" check
+    check "anyaicam-webrtc-firewall.service is enabled" systemctl is-enabled --quiet anyaicam-webrtc-firewall.service
 
     if [[ "$FAILURES" -eq 0 ]]; then
         log "Validation PASSED (0 failures; expected VMS release $VMS_RELEASE_COMMIT)."

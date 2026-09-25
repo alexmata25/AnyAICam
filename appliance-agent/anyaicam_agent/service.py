@@ -16,6 +16,7 @@ from .camera_binding import (CameraBindingStore,DiscoveredCameraStore,
 from .config import AgentConfig,load_credential
 from .discovery import scan
 from .metrics import collect
+from .lan_addresses import publish as publish_lan_addresses
 from .onvif_media import resolve_media_uri
 from .portal import PortalClient,PortalError,sanitize
 from .provisioning import locate_device,verify_device
@@ -440,8 +441,13 @@ class ApplianceAgent:
             merged=reconcile_cloud_cameras(cloud_cameras,self.discovered_store.cameras(),self.binding_store.bindings(),self.vms_status)
             atomic_write_json(self.config.cameras_file,merged)
         except PortalError as error: self.log.debug('Configuration sync unavailable: %s',error)
+    def publish_lan_addresses(self):
+        """Host LAN addresses for WebRTC ICE (see lan_addresses.py) --
+        best-effort, never allowed to break the agent cycle."""
+        try: publish_lan_addresses(self.config.state_dir)
+        except Exception: self.log.debug('LAN address publish failed', exc_info=True)
     def cycle(self):
-        self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement()
+        self.publish_lan_addresses(); self.sync_configuration(); cameras=self.cameras(); heartbeat=collect(self.config,cameras); self.send_or_queue('/api/appliance/heartbeat',heartbeat,'heartbeat-'+str(int(time.time())//self.config.checkin_seconds)); self.send_or_queue('/api/appliance/cameras',{'cameras':cameras},'cameras-'+str(int(time.time())//self.config.checkin_seconds)); self.flush(); self.poll_commands(); self.poll_discovery(); self.poll_provisioning(); self.check_for_source_update(); self.poll_entitlement()
     def _await_activation(self):
         """Waits for `anyaicam-setup` (interactive or --claim) to write a
         real credential, instead of treating a freshly-installed,

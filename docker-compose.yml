@@ -4,6 +4,12 @@ services:
     container_name: anyaicam-vms
     ports:
     - 8000:8000
+    # WebRTC media (MediaMTX) for viewers on the appliance's own LAN /
+    # Tailscale. IPv4 only. Reachable ONLY from private/Tailscale sources:
+    # enforced in Docker's DOCKER-USER chain by anyaicam-webrtc-firewall
+    # (UFW cannot restrict Docker-published ports). No router port
+    # forwarding is needed or used.
+    - 0.0.0.0:8189:8189/udp
     env_file:
     - /etc/anyaicam/vms.env
     volumes:

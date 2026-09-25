@@ -59,6 +59,7 @@ INSTALLER_RUNTIME_FILES = (
     "06-deploy-vms.sh",
     "07-install-agent.sh",
     "10-install-mediamtx.sh",
+    "11-webrtc-firewall.sh",
     "08-systemd-setup.sh",
     "09-identity.sh",
     "validate.sh",

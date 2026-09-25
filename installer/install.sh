@@ -113,6 +113,8 @@ source "$INSTALLER_DIR/06-deploy-vms.sh"
 source "$INSTALLER_DIR/07-install-agent.sh"
 # shellcheck source=10-install-mediamtx.sh
 source "$INSTALLER_DIR/10-install-mediamtx.sh"
+# shellcheck source=11-webrtc-firewall.sh
+source "$INSTALLER_DIR/11-webrtc-firewall.sh"
 # shellcheck source=08-systemd-setup.sh
 source "$INSTALLER_DIR/08-systemd-setup.sh"
 # shellcheck source=09-identity.sh
@@ -143,6 +145,7 @@ run_install() {
     deploy_vms "$INSTALL_STATE"
     install_agent "$INSTALL_STATE"
     install_mediamtx "$INSTALL_STATE"
+    install_webrtc_firewall
     systemd_setup
     disable_system_suspend
     identity_provision "$INSTALL_STATE"

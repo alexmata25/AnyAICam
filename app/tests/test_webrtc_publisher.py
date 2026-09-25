@@ -126,6 +126,10 @@ class _FakeMediaMTX(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         body = self._body()
         self.__class__.calls.append((self.command, self.path, body, self._headers_lower()))
+        if self.path == "/v3/config/global/patch":
+            self.send_response(200)
+            self.end_headers()
+            return
         # Validates the media line the real way MediaMTX itself does
         # (confirmed live against the real v1.21.0 binary, 2026-09-17):
         # "m=<media> <port> <proto> <fmt...>" with a real numeric port --
@@ -674,3 +678,43 @@ def test_recording_and_live_hls_still_use_the_main_stream_only():
     import main
     source = open(main.__file__, encoding="utf-8").read()
     assert "p2p_source_for" not in source and "substream_candidates" not in source
+
+
+# ------------------------------------------------ LAN ICE candidates
+# 2026-09-25: a viewer on the appliance's own LAN never reached MediaMTX
+# (container-only candidates); the agent now publishes the host's LAN
+# addresses and they are advertised as webrtcAdditionalHosts.
+
+
+def _write_lan(tmp_path, monkeypatch, addresses):
+    path = tmp_path / "lan_addresses.json"
+    path.write_text(json.dumps({"addresses": addresses}))
+    monkeypatch.setattr(wp, "LAN_ADDRESSES_FILE", path)
+
+
+def test_advertised_hosts_accept_only_lan_and_tailscale_ipv4(tmp_path, monkeypatch):
+    _write_lan(tmp_path, monkeypatch, ["192.168.0.228", "10.0.5.3", "100.77.253.28", "203.0.113.9", "8.8.8.8",
+                                       "127.0.0.1", "169.254.1.1", "fd00::1", "garbage", "192.168.0.228"])
+    assert wp.advertised_hosts() == ["192.168.0.228", "10.0.5.3", "100.77.253.28"]
+
+
+def test_a_missing_address_file_changes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(wp, "LAN_ADDRESSES_FILE", tmp_path / "absent.json")
+    assert wp.advertised_hosts() == []
+    assert "webrtcAdditionalHosts" not in wp.render_mediamtx_config()
+
+
+def test_lan_hosts_are_in_the_mediamtx_config(tmp_path, monkeypatch):
+    _write_lan(tmp_path, monkeypatch, ["192.168.0.228"])
+    assert 'webrtcAdditionalHosts: ["192.168.0.228"]' in wp.render_mediamtx_config().splitlines()
+
+
+def test_host_changes_are_applied_live_only_when_they_change(fake_mediamtx, tmp_path, monkeypatch):
+    monkeypatch.setattr(wp, "_applied_hosts", None)
+    _write_lan(tmp_path, monkeypatch, ["192.168.0.228"])
+    wp.sync_additional_hosts()
+    wp.sync_additional_hosts()
+    _write_lan(tmp_path, monkeypatch, ["192.168.0.99"])  # DHCP moved the host
+    wp.sync_additional_hosts()
+    patches = [json.loads(c[2]) for c in fake_mediamtx.calls if c[1] == "/v3/config/global/patch"]
+    assert patches == [{"webrtcAdditionalHosts": ["192.168.0.228"]}, {"webrtcAdditionalHosts": ["192.168.0.99"]}]
