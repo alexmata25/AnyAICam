@@ -7,9 +7,9 @@ test_customer_camera_names.py already established), and a throwaway
 sqlite DB via override_target(). No mocked identity, no hand-copied
 query standing in for the real endpoint.
 
-Entitlements/analytics_enabled state lives in a JSON file
-(customer_platform.FEATURES_FILE), not the sqlite DB -- redirected to
-a tmp_path file per test the same way the DB itself is redirected.
+Per-camera analytics entitlements live in the sqlite DB
+(camera_analytics_entitlements) since 2026-09-25 -- the legacy
+customer_camera_features.json store was retired.
 """
 
 import json
@@ -82,25 +82,12 @@ def _seed_notification(conn, notification_id, camera_id, event_type, title, mess
     conn.commit()
 
 
-def _grant_entitlements(monkeypatch, tmp_path, camera_number, features):
-    features_file = tmp_path / "customer_camera_features.json"
-    monkeypatch.setattr(customer_platform, "FEATURES_FILE", features_file)
-    key = customer_platform._camera_key("user-1", camera_number)
-    features_file.write_text(json.dumps({
-        key: {
-            "entitlements": list(features),
-            "analytics_enabled": {name: True for name in features},
-        }
-    }), encoding="utf-8")
-
-
 def _owner_cookie(customer_id="cust-1"):
     return partner_portal._token(f"owner-{customer_id}@example.test", "customer_owner", None, customer_id, None)
 
 
 @pytest.fixture()
 def client(db_path, tmp_path, monkeypatch):
-    monkeypatch.setattr(customer_platform, "FEATURES_FILE", tmp_path / "customer_camera_features.json")
     with override_target(sqlite_path=db_path):
         initialize_database()
         with sqlite3.connect(db_path) as conn:

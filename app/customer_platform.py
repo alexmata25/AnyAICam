@@ -2,7 +2,6 @@
 import json
 from datetime import datetime
 from html import escape
-from pathlib import Path
 from typing import Callable
 
 from fastapi import HTTPException, Request
@@ -12,67 +11,16 @@ from pydantic import BaseModel, Field
 from partner_portal import partner_identity
 from partner_db import connection, row, rows
 
-RECORDINGS_FOLDER = Path("/app/recordings")
-FEATURES_FILE = RECORDINGS_FOLDER / "customer_camera_features.json"
-ALERTS_FILE = RECORDINGS_FOLDER / "customer_camera_alerts.json"
-
-ANALYTICS_CATALOG = {
-    "smart_motion": {"label": "Smart Motion", "description": "People, vehicle, and animal event filtering."},
-    "people_counting": {"label": "People Counting", "description": "Occupancy and foot-traffic reporting."},
-    "lpr": {"label": "License Plate Recognition", "description": "Plate capture and searchable vehicle events."},
-    "ppe_detection": {"label": "PPE Detection", "description": "Hard-hat, vest, and safety-equipment monitoring."},
-}
-
-
-class CameraFeatureUpdate(BaseModel):
-    analytics_enabled: dict[str, bool] = Field(default_factory=dict)
-
-
 class CameraNameUpdate(BaseModel):
     name: str = Field(default="", max_length=60)
 
 
-class CameraAlertUpdate(BaseModel):
-    enabled: bool = True
-    event_types: list[str] = Field(default_factory=lambda: ["motion", "person"])
-    email_enabled: bool = True
-    push_enabled: bool = True
-    recipient_email: str = ""
-    quiet_hours_enabled: bool = False
-    quiet_start: str = "22:00"
-    quiet_end: str = "07:00"
+class AdminEntitlementChange(BaseModel):
+    """One per-camera analytic on/off, by cameras.id (2026-09-25)."""
+    camera_id: str = Field(min_length=1, max_length=64)
+    analytic_key: str = Field(min_length=1, max_length=64)
+    enabled: bool
 
-
-class EntitlementUpdate(BaseModel):
-    user_id: str
-    camera_id: int = Field(ge=1, le=256)
-    entitlements: list[str] = Field(default_factory=list)
-
-
-def _load(path: Path, default):
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    return default
-
-
-def _save(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    temporary.replace(path)
-
-
-def _features() -> dict:
-    value = _load(FEATURES_FILE, {})
-    return value if isinstance(value, dict) else {}
-
-
-def _alerts() -> dict:
-    value = _load(ALERTS_FILE, {})
-    return value if isinstance(value, dict) else {}
 
 
 def _portal_camera_analytics(user: dict) -> dict[int, dict]:
@@ -98,10 +46,6 @@ def _portal_camera_analytics(user: dict) -> dict[int, dict]:
                 item["description"] = (UPGRADE_CARD_CONTENT.get(item["key"]) or {}).get("description", "")
             out[int(camera["camera_number"])] = {"id": camera["id"], "analytics": analytics}
     return out
-
-
-def _camera_key(user_id: str, camera_id: int) -> str:
-    return f"{user_id}:{camera_id}"
 
 
 def _is_customer(user: dict) -> bool:
@@ -381,65 +325,8 @@ def register_customer_platform_routes(
             raise HTTPException(status_code=403, detail="Customer account required.")
         if camera_id not in _portal_customer_camera_ids(user):
             raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")
-        key = _camera_key(user["id"], camera_id)
         real = _portal_camera_analytics(user).get(camera_id) or {"id": None, "analytics": []}
-        return {
-            "camera_id": camera_id,
-            "camera_uuid": real["id"],
-            "analytics": real["analytics"],
-            "features": _features().get(key, {"entitlements": [], "analytics_enabled": {}}),
-            "alerts": _alerts().get(key, {
-                "enabled": True,
-                "event_types": ["motion", "person"],
-                "email_enabled": True,
-                "push_enabled": True,
-                "recipient_email": user.get("email", ""),
-                "quiet_hours_enabled": False,
-                "quiet_start": "22:00",
-                "quiet_end": "07:00",
-            }),
-        }
-
-    @app.put("/api/customer/cameras/{camera_id}/features")
-    def update_customer_camera_features(camera_id: int, payload: CameraFeatureUpdate, request: Request):
-        user = _portal_customer_user(request)
-        if str(user.get("role") or "").lower() != "customer_owner":
-            raise HTTPException(status_code=403, detail="Customer owner permission required.")
-        if camera_id not in _portal_customer_camera_ids(user):
-            raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")
-
-        all_features = _features()
-        key = _camera_key(user["id"], camera_id)
-        state = all_features.get(key, {"entitlements": [], "analytics_enabled": {}})
-        entitlements = set(state.get("entitlements") or [])
-        state["analytics_enabled"] = {
-            feature: bool(enabled and feature in entitlements)
-            for feature, enabled in payload.analytics_enabled.items()
-            if feature in ANALYTICS_CATALOG
-        }
-        state["updated_at"] = datetime.now().isoformat()
-        all_features[key] = state
-        _save(FEATURES_FILE, all_features)
-        record_audit(request, "update", f"customer-camera:{camera_id}", "Customer updated per-camera paid analytics.")
-        return {"status": "complete", "features": state, "message": "Camera analytics saved. Locked features were not enabled."}
-
-    @app.put("/api/customer/cameras/{camera_id}/alerts")
-    def update_customer_camera_alerts(camera_id: int, payload: CameraAlertUpdate, request: Request):
-        user = _portal_customer_user(request)
-        if str(user.get("role") or "").lower() != "customer_owner":
-            raise HTTPException(status_code=403, detail="Customer owner permission required.")
-        if camera_id not in _portal_customer_camera_ids(user):
-            raise HTTPException(status_code=403, detail="Camera is not assigned to this account.")
-
-        allowed_events = {"motion", "person", "vehicle", "offline"}
-        state = payload.model_dump()
-        state["event_types"] = [event for event in state["event_types"] if event in allowed_events]
-        state["updated_at"] = datetime.now().isoformat()
-        alerts = _alerts()
-        alerts[_camera_key(user["id"], camera_id)] = state
-        _save(ALERTS_FILE, alerts)
-        record_audit(request, "update", f"customer-camera:{camera_id}", "Customer updated per-camera notification program.")
-        return {"status": "complete", "alerts": state, "message": "Camera alert program saved."}
+        return {"camera_id": camera_id, "camera_uuid": real["id"], "analytics": real["analytics"]}
 
     @app.put("/api/customer/cameras/{camera_id}/name")
     def update_customer_camera_name(camera_id: int, payload: CameraNameUpdate, request: Request):
@@ -468,65 +355,108 @@ def register_customer_platform_routes(
         display_name = name or f"Camera {camera_id}"
         return {"status": "complete", "name": name, "display_name": display_name, "message": "Camera name saved."}
 
+    # Admin analytics entitlements (2026-09-25): the same per-camera system
+    # the customer portal, the camera page and the Analytics workspace use
+    # (camera_analytics_entitlements via customer_analytics_panel), and the
+    # same billing cap (analytics_subscriptions licenses). This page used to
+    # write customer_camera_features.json, which nothing that runs analytics
+    # reads -- one source of truth now.
+    def _require_master_admin(request: Request) -> dict:
+        user = current_user(request)
+        if not is_master_admin(user):
+            raise HTTPException(status_code=403, detail="Master administrator required.")
+        return user
+
     @app.get("/analytics-entitlements", response_class=HTMLResponse)
     def analytics_entitlements_page(request: Request):
-        user = current_user(request)
-        if not is_master_admin(user):
-            raise HTTPException(status_code=403, detail="Master administrator required.")
-        content = '''
+        _require_master_admin(request)
+        content = """
         <header class="topbar"><div><p class="eyebrow">Paid feature control</p><h1>Analytics entitlements</h1></div></header>
         <section class="panel">
-          <div class="panel-head"><div><h2>Assign paid analytics per customer and camera</h2><div class="health-detail">Customers can only enable features that are granted here or by a future Stripe entitlement webhook.</div></div></div>
-          <form class="notification-form" id="entitlement-form">
-            <label>Customer user ID<input id="ent-user" required placeholder="User ID from Business users"></label>
-            <label>Camera number<input id="ent-camera" type="number" min="1" value="1" required></label>
-            <div class="event-check-grid">
-              <label><input class="ent-feature" value="smart_motion" type="checkbox"> Smart Motion</label>
-              <label><input class="ent-feature" value="people_counting" type="checkbox"> People Counting</label>
-              <label><input class="ent-feature" value="lpr" type="checkbox"> LPR</label>
-              <label><input class="ent-feature" value="ppe_detection" type="checkbox"> PPE Detection</label>
-            </div>
-            <button class="action-button" type="submit">Save paid entitlements</button>
-          </form>
-          <div id="entitlement-message" class="health-detail" style="margin-top:12px"></div>
+          <div class="panel-head"><div><h2>Per-camera analytics</h2><div class="health-detail">Turns an analytic on or off for one camera -- the same setting customers see on the camera page and in Settings. Capacity comes from the customer's purchased licenses for that site.</div></div></div>
+          <label style="display:grid;gap:7px;max-width:420px">Customer<select id="ent-customer"><option value="">Choose a customer…</option></select></label>
+          <div id="ent-cameras" class="health-list" style="margin-top:14px"></div>
+          <div id="entitlement-message" class="health-detail" role="status" aria-live="polite" style="margin-top:12px"></div>
         </section>
-        '''
-        scripts = '''
+        """
+        scripts = """
         <script>
-        document.getElementById('entitlement-form').onsubmit=async event=>{
-          event.preventDefault();
-          const payload={
-            user_id:document.getElementById('ent-user').value.trim(),
-            camera_id:Number(document.getElementById('ent-camera').value),
-            entitlements:[...document.querySelectorAll('.ent-feature:checked')].map(x=>x.value)
-          };
-          const response=await fetch('/api/admin/analytics-entitlements',{
-            method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)
-          });
-          const data=await response.json();
-          document.getElementById('entitlement-message').textContent=data.message||data.detail||'Saved.';
-          showToast(data.message||'Entitlements saved.');
-        };
+        const customerSelect=document.getElementById('ent-customer');
+        const cameraList=document.getElementById('ent-cameras');
+        const message=document.getElementById('entitlement-message');
+        function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+        async function loadCustomers(){
+          const r=await fetch('/api/admin/analytics-entitlements');const d=await r.json().catch(()=>({}));
+          if(!r.ok){message.textContent=d.detail||'Could not load customers.';return}
+          customerSelect.insertAdjacentHTML('beforeend',d.customers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join(''));
+        }
+        async function loadCameras(){
+          cameraList.innerHTML='';message.textContent='';
+          if(!customerSelect.value)return;
+          const r=await fetch(`/api/admin/analytics-entitlements?customer_id=${encodeURIComponent(customerSelect.value)}`);
+          const d=await r.json().catch(()=>({}));
+          if(!r.ok){message.textContent=d.detail||'Could not load cameras.';return}
+          if(!d.cameras.length){cameraList.innerHTML='<div class="health-detail">This customer has no cameras yet.</div>';return}
+          cameraList.innerHTML=d.cameras.map(camera=>`<div class="health-row" style="align-items:flex-start"><span><span class="health-name">${esc(camera.name)}</span><br><span class="health-detail">${esc(camera.site||'')}</span></span><span style="display:flex;flex-wrap:wrap;gap:12px;justify-content:flex-end">${camera.analytics.map(a=>`<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-camera="${esc(camera.id)}" data-key="${esc(a.key)}" ${a.enabled?'checked':''}> ${esc(a.label)}</label>`).join('')}</span></div>`).join('');
+        }
+        cameraList.addEventListener('change',async event=>{
+          const box=event.target.closest('input[data-key]');if(!box)return;
+          box.disabled=true;
+          const r=await fetch('/api/admin/analytics-entitlements',{method:'PUT',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({camera_id:box.dataset.camera,analytic_key:box.dataset.key,enabled:box.checked})});
+          const d=await r.json().catch(()=>({}));
+          box.disabled=false;
+          if(!r.ok){box.checked=!box.checked;message.textContent=typeof d.detail==='string'?d.detail:'Not saved.';return}
+          message.textContent=d.message||'Saved.';
+        });
+        customerSelect.addEventListener('change',loadCameras);
+        loadCustomers();
         </script>
-        '''
+        """
         return page_shell("Analytics entitlements", "analytics-entitlements", content, scripts)
 
+    @app.get("/api/admin/analytics-entitlements")
+    def admin_entitlements_state(request: Request, customer_id: str = ""):
+        _require_master_admin(request)
+        from customer_analytics_panel import analytics_row_state, camera_entitlement_rows
+        with connection() as db:
+            if not customer_id:
+                return {"customers": [dict(item) for item in db.execute("SELECT id, name FROM customers ORDER BY name").fetchall()]}
+            if not db.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="Customer not found.")
+            cameras = []
+            for camera in db.execute(
+                "SELECT c.id, c.name, c.camera_number, s.name AS site_name FROM cameras c LEFT JOIN sites s ON s.id=c.site_id "
+                "WHERE c.customer_id=? ORDER BY s.name, c.camera_number", (customer_id,)
+            ).fetchall():
+                cameras.append({
+                    "id": camera["id"],
+                    "name": (camera["name"] or "").strip() or f"Camera {camera['camera_number']}",
+                    "site": camera["site_name"],
+                    "analytics": analytics_row_state(camera_entitlement_rows(db, camera["id"])),
+                })
+        return {"customer_id": customer_id, "cameras": cameras}
+
     @app.put("/api/admin/analytics-entitlements")
-    def update_entitlements(payload: EntitlementUpdate, request: Request):
-        user = current_user(request)
-        if not is_master_admin(user):
-            raise HTTPException(status_code=403, detail="Master administrator required.")
-        allowed = [item for item in payload.entitlements if item in ANALYTICS_CATALOG]
-        features = _features()
-        key = _camera_key(payload.user_id, payload.camera_id)
-        prior = features.get(key, {})
-        enabled = prior.get("analytics_enabled") or {}
-        features[key] = {
-            "entitlements": allowed,
-            "analytics_enabled": {name: bool(enabled.get(name) and name in allowed) for name in ANALYTICS_CATALOG},
-            "updated_at": datetime.now().isoformat(),
-            "updated_by": user.get("id"),
-        }
-        _save(FEATURES_FILE, features)
-        record_audit(request, "update", f"analytics-entitlements:{key}", f"Assigned paid analytics: {', '.join(allowed) or 'none'}.")
-        return {"status": "complete", "features": features[key], "message": "Paid analytics entitlements saved."}
+    def update_entitlements(payload: AdminEntitlementChange, request: Request):
+        _require_master_admin(request)
+        from customer_analytics_panel import ANALYTIC_LABELS, LicenseLimitExceeded, assign_entitlement, remove_entitlement
+        if payload.analytic_key not in ANALYTIC_LABELS:
+            raise HTTPException(status_code=400, detail="Unknown analytic.")
+        now = datetime.now().isoformat()
+        with connection() as db:
+            camera = db.execute("SELECT id, customer_id FROM cameras WHERE id=?", (payload.camera_id,)).fetchone()
+            if not camera:
+                raise HTTPException(status_code=404, detail="Camera not found.")
+            try:
+                if payload.enabled:
+                    assign_entitlement(db, payload.camera_id, payload.analytic_key, now=now)
+                else:
+                    remove_entitlement(db, payload.camera_id, payload.analytic_key, now=now)
+            except LicenseLimitExceeded as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        label = ANALYTIC_LABELS[payload.analytic_key][0]
+        record_audit(request, "update", f"camera-analytics:{payload.camera_id}:{payload.analytic_key}",
+                     f"{'Enabled' if payload.enabled else 'Disabled'} {label} for camera {payload.camera_id} (customer {camera['customer_id']}).")
+        return {"status": "complete", "camera_id": payload.camera_id, "analytic_key": payload.analytic_key, "enabled": payload.enabled,
+                "message": f"{label} {'enabled' if payload.enabled else 'disabled'} for this camera."}

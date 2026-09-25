@@ -202,8 +202,6 @@ def customer_settings_client(tmp_path, monkeypatch):
     from database_backend import override_target
     from partner_db import initialize_database
 
-    monkeypatch.setattr(customer_platform, "FEATURES_FILE", tmp_path / "customer_camera_features.json")
-    monkeypatch.setattr(customer_platform, "ALERTS_FILE", tmp_path / "customer_camera_alerts.json")
     db_path = tmp_path / "test_settings_nav.db"
     with override_target(sqlite_path=db_path):
         initialize_database()
