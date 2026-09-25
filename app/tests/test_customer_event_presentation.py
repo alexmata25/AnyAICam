@@ -15,7 +15,7 @@ def test_event_type_labels():
     assert event_type_label("people_counting_in") == "Entry"
     assert event_type_label("people_counting_out") == "Exit"
     assert event_type_label("plate") == "License plate"
-    assert event_type_label("smart_motion") == "Motion"
+    assert event_type_label("smart_motion") == "Smart Motion"  # the product name customers buy
     assert event_type_label("aac_voice_call") == "Voice call"
     assert event_type_label("person") == "Person"
     assert event_type_label("some_new_type") == "Some New Type"
@@ -52,3 +52,18 @@ def test_investigate_page_escapes_localizes_and_drops_dead_filters():
     assert "new Date(event.timestamp_ms)" in source
     # The legacy (non-customer) investigation page is untouched.
     assert "investigation-color" in inspect.getsource(main.investigation_page)
+
+
+def test_alert_cards_replace_generated_raw_titles_but_keep_custom_text():
+    assert main._customer_alert_text({"event_type": "ppe", "title": "Ppe", "message": "Ppe detected"}) == ("PPE", "PPE detected")
+    assert main._customer_alert_text({"event_type": "people_counting_in", "title": "People Counting In",
+                                      "message": "People Counting In detected"}) == ("Entry", "Person entered")
+    assert main._customer_alert_text({"event_type": "aac_voice_call", "title": "Aac Voice Call",
+                                      "message": "Someone is at Front Door."}) == ("Voice call", "Someone is at Front Door.")
+    assert main._customer_alert_text({"event_type": "person", "title": "Intruder rule", "message": "Custom"}) == ("Intruder rule", "Custom")
+
+
+def test_new_notifications_use_customer_names():
+    import notification_engine
+    source = inspect.getsource(notification_engine)
+    assert "title=event_type_label(event_type)" in source and "event_type_message(event_type)" in source

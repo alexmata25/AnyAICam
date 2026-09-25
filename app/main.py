@@ -122140,6 +122140,23 @@ def _render_customer_events(request: Request) -> str:
     return page_shell("Events", "events", content, '<script src="/static/event_media.js"></script>' + scripts)
 
 
+def _customer_alert_text(notification: dict) -> tuple[str, str]:
+    """Title/message for an alert card. Rows stored before 2026-09-25 carry
+    the raw title-cased type ('Ppe', 'Ppe detected', 'Aac Voice Call');
+    those generated defaults are replaced by the customer names, while any
+    custom title/message (e.g. 'Someone is at Front Door.') is kept."""
+    from customer_analytics_panel import event_type_label, event_type_message
+    event_type = str(notification.get("event_type") or "")
+    raw_default = event_type.replace("_", " ").title()
+    title = str(notification.get("title") or "Alert")
+    message = str(notification.get("message") or "")
+    if event_type and title == raw_default:
+        title = event_type_label(event_type)
+    if event_type and message == f"{raw_default} detected":
+        message = event_type_message(event_type)
+    return title, message
+
+
 def _render_customer_alerts(request: Request) -> str:
     """Real, tenant-scoped Smart Alerts page. Reuses _customer_notifications()
     (real notifications rows, written by notification_engine.fanout_
@@ -122213,14 +122230,15 @@ def _render_customer_alerts(request: Request) -> str:
             actions_html = _customer_event_actions(
                 notification.get("camera_id"), raw_timestamp, notification.get("event_id"), notification.get("has_event_clip")
             )
+        alert_title, alert_message = _customer_alert_text(notification)
         mark_read_html = (
             '' if is_read else
             f'<button class="ghost-button mark-alert-read" type="button" data-notification-id="{escape(str(notification["id"]), quote=True)}">Mark read</button>'
         )
         cards.append(
             f'<article class="feature-card{"" if is_read else " alert-unread"}" data-alert-camera="{escape(str(camera_number or ""), quote=True)}" data-notification-id="{escape(str(notification["id"]), quote=True)}" data-read="{"1" if is_read else "0"}">{thumbnail}'
-            f'<h2>{escape(str(notification.get("title") or "Alert"))} · {escape(camera_label)}</h2>'
-            f'<p>{escape(str(notification.get("message") or ""))}</p>'
+            f'<h2>{escape(alert_title)} · {escape(camera_label)}</h2>'
+            f'<p>{escape(alert_message)}</p>'
             f'<p class="health-detail">{escape(timestamp_label)}</p>'
             f'<div class="dashboard-event-actions">{actions_html}{mark_read_html}</div></article>'
         )

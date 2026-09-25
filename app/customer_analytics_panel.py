@@ -316,10 +316,23 @@ def epoch_ms(raw_timestamp) -> int | None:
 
 
 EVENT_TYPE_LABELS = {
-    "motion": "Motion", "smart_motion": "Motion", "ppe": "PPE", "plate": "License plate", "lpr": "License plate",
+    "motion": "Motion", "smart_motion": "Smart Motion", "ppe": "PPE", "plate": "License plate", "lpr": "License plate",
     "people_counting": "People count", "people_counting_in": "Entry", "people_counting_out": "Exit",
     "facial_recognition": "Face", "aac_voice_call": "Voice call", "line_crossing": "Line crossing",
 }
+
+
+EVENT_TYPE_MESSAGES = {
+    "people_counting_in": "Person entered", "people_counting_out": "Person left",
+    "plate": "License plate read", "lpr": "License plate read",
+}
+
+
+def event_type_message(event_type) -> str:
+    """Default one-line alert message for an event type ('PPE detected',
+    'Person entered')."""
+    key = str(event_type or "").strip().lower()
+    return EVENT_TYPE_MESSAGES.get(key) or f"{event_type_label(key)} detected"
 
 
 def event_type_label(event_type) -> str:
