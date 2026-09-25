@@ -144058,7 +144058,20 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         # untouched. Saves real, no-tradeoff space rather than shrinking
         # the video itself (the one thing this whole feature exists to
         # keep usable) to force-fit the remainder.
-        '.playback-workspace-solo .panel{display:flex;justify-content:center;padding:6px}'
+        # Live-style media card (2026-09-25 camera-tile consistency pass):
+        # the panel is now the camera card itself -- hugging the video at
+        # the same width budget as the .camera-view rule above, with the
+        # recording's own actions (download/share/bookmark) in the shared
+        # .camera-tools strip directly beneath the video, inside the card,
+        # exactly like the Live detail page. Timeline, dates and clip
+        # navigation stay outside the card.
+        '.playback-workspace-solo .panel.playback-media-card{display:block;padding:10px;margin:0 auto;'
+        'width:min(calc(34vh * 16 / 9 + 22px),calc(340px * 16 / 9 + 22px),100%)}'
+        '.playback-media-card .camera-view{width:100%;max-height:none;margin:0}'
+        '.playback-media-card .camera-tools{justify-content:center}'
+        '@media(max-width:900px){.playback-media-card .camera-tool{width:44px;height:40px;font-size:17px}}'
+        '.playback-media-card .camera-tool:disabled{opacity:.4;cursor:default}'
+        '.playback-media-card .camera-tool:focus-visible{outline:2px solid var(--brand,#47d7ac);outline-offset:1px}'
         # The .event-* classes were already used by this legend (and by
         # the /analytics search results legend) but never actually had
         # a background color defined anywhere -- every dot rendered
@@ -144168,9 +144181,14 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
         '<section class="playback-workspace-solo" style="margin-top:6px">'
-        '<div class="panel"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
+        '<div class="panel playback-media-card"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
         '<div class="camera-placeholder" id="playback-placeholder"><span class="signal">◴</span><strong id="playback-status">No recordings available yet.</strong></div>'
+        '</div>'
+        '<div class="camera-tools" id="playback-media-tools" role="toolbar" aria-label="Recording actions">'
+        '<button id="download-selected" type="button" disabled class="camera-tool" title="Download" aria-label="Download">⬇</button>'
+        '<button id="share-selected" type="button" disabled class="camera-tool" title="Share" aria-label="Share">↗</button>'
+        '<button id="bookmark-selected" type="button" disabled class="camera-tool" title="Bookmarking from Playback is not available yet." aria-label="Bookmark">◈</button>'
         '</div>'
         '</div>'
         '</section>'
@@ -144206,10 +144224,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<button id="skip-forward" type="button" disabled title="Forward 10 seconds" aria-label="Forward 10 seconds">⏩</button>'
         '</div>'
         '<div class="monitor-toolbar-group">'
-        '<button id="download-selected" type="button" disabled title="Download" aria-label="Download">⬇</button>'
-        '<button id="share-selected" type="button" disabled title="Share" aria-label="Share">⤴</button>'
         '<button id="create-clip" type="button" disabled>Create clip</button>'
-        '<button id="bookmark-selected" type="button" disabled title="Bookmarking from Playback is not available yet." aria-label="Bookmark">☆</button>'
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
         '</div>'
