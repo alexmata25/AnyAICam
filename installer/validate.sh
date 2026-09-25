@@ -147,6 +147,26 @@ mediamtx_required_and_usable() {
     fi
 }
 
+# A repair/upgrade must leave a usable rollback point (06-deploy-vms.sh's
+# create_rollback_point()). Passes when no point was taken for THIS
+# release (a clean install, or ANYAICAM_SKIP_ROLLBACK_POINT=1).
+rollback_point_usable() {
+    local manifest="${ANYAICAM_ROLLBACK_DIR:-/var/lib/anyaicam/rollback}/latest.env" value
+    [[ -f "$manifest" ]] || return 0
+    grep -qx "UPGRADE_TO_COMMIT=$VMS_RELEASE_COMMIT" "$manifest" || return 0
+    value="$(sed -n 's/^ROLLBACK_IMAGE=//p' "$manifest")"
+    [[ "$value" == "none" ]] || docker image inspect "$value" >/dev/null 2>&1 || return 1
+    value="$(sed -n 's/^ROLLBACK_CODE_ARCHIVE=//p' "$manifest")"
+    [[ "$value" == "none" ]] || gzip -t "$value" || return 1
+    value="$(sed -n 's/^ROLLBACK_DATABASE_BACKUP=//p' "$manifest")"
+    [[ "$value" == "none" || -s "$value" ]]
+}
+
+# Read-only: SQLite's own quick_check on the live database, inside the VMS.
+vms_database_integrity_ok() {
+    docker exec "${ANYAICAM_VMS_CONTAINER:-anyaicam-vms}" python3 -c 'import sqlite3,sys; c=sqlite3.connect("file:/app/recordings/partner_portal.db?mode=ro",uri=True); sys.exit(0 if c.execute("PRAGMA quick_check").fetchone()[0]=="ok" else 1)'
+}
+
 run_validate() {
     load_release_metadata
     detect_install_state
@@ -189,6 +209,8 @@ run_validate() {
     check "WebRTC media port (UDP 8189) is published by the VMS container and by nothing else" webrtc_port_owned_by_vms
     check "WebRTC media port (UDP 8189) is restricted to private/Tailscale sources" "${WEBRTC_FIREWALL_SCRIPT:-/usr/local/sbin/anyaicam-webrtc-firewall}" check
     check "anyaicam-webrtc-firewall.service is enabled" systemctl is-enabled --quiet anyaicam-webrtc-firewall.service
+    check "VMS database passes SQLite integrity check (read-only)" retry_until_vms_started vms_database_integrity_ok
+    check "a repair/upgrade left a usable rollback point (image, code archive, database backup)" rollback_point_usable
 
     if [[ "$FAILURES" -eq 0 ]]; then
         log "Validation PASSED (0 failures; expected VMS release $VMS_RELEASE_COMMIT)."

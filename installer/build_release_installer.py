@@ -64,6 +64,7 @@ INSTALLER_RUNTIME_FILES = (
     "09-identity.sh",
     "validate.sh",
     "uninstall.sh",
+    "rollback.sh",
     "README.md",
 )
 DANGEROUS_NAME_PATTERNS = (
