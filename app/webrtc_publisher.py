@@ -189,6 +189,15 @@ P2P_STREAM_PREFERENCE = os.environ.get("ANYAICAM_LIVE_P2P_STREAM", "auto").strip
 P2P_SUBSTREAM_PROBE_TIMEOUT_SECONDS = max(3.0, float(os.environ.get("ANYAICAM_LIVE_P2P_SUBSTREAM_PROBE_SECONDS", "10")))
 MEDIAMTX_RESTART_BACKOFF_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_RESTART_BACKOFF_SECONDS", "5.0")))
 MEDIAMTX_STARTUP_GRACE_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_MEDIAMTX_STARTUP_GRACE_SECONDS", "3.0")))
+# A path add MediaMTX never answered (2026-09-25, confirmed live on Ryzen:
+# right after a MediaMTX restart the API answered a GET, then one camera's
+# add and replace each hit the 5s timeout) is retried with backoff
+# (base, 2x base, ... capped at 8x base) instead of waiting for the next
+# CONFIG_REFRESH_SECONDS; path_add_failed is logged only once every
+# attempt is used up.
+MEDIAMTX_API_TIMEOUT_SECONDS = 5.0
+PATH_ADD_MAX_ATTEMPTS = max(1, int(os.environ.get("ANYAICAM_MEDIAMTX_PATH_ADD_ATTEMPTS", "5")))
+PATH_ADD_RETRY_BASE_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_MEDIAMTX_PATH_ADD_RETRY_SECONDS", "1.0")))
 
 webrtc_publisher_state: dict = {"worker_status": "disabled", "mediamtx_status": "stopped", "last_scan_at": None, "last_error": None}
 
@@ -201,6 +210,9 @@ _mediamtx_process: "subprocess.Popen | None" = None
 # runtime paths (they are added through its API, never its config file), so
 # every camera path must be re-added once its API answers.
 _paths_resync_pending = False
+# camera_id -> (failed attempts, time.monotonic() the next one is due) for
+# path adds MediaMTX did not answer at all (status 0).
+_path_add_retries: dict[str, tuple[int, float]] = {}
 
 
 # --------------------------------------------------------------- appliance identity / control plane
@@ -440,6 +452,7 @@ def _forget_runtime_paths() -> None:
     with _lock:
         _known_paths.clear()
     _whep_sessions.clear()
+    _path_add_retries.clear()  # the new process gets a full resync anyway
     _paths_resync_pending = True
 
 
@@ -480,7 +493,7 @@ def _config_request(method: str, path: str, payload: dict | None = None) -> tupl
     request = urllib.request.Request(MEDIAMTX_API_BASE + path, data=data, method=method,
                                       headers={"Content-Type": "application/json"} if data is not None else {})
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=MEDIAMTX_API_TIMEOUT_SECONDS) as response:
             return response.status, response.read().decode()
     except urllib.error.HTTPError as error:
         return error.code, error.read().decode() if error.fp else ""
@@ -527,15 +540,43 @@ def _forget_paths_mediamtx_lost() -> None:
     (a restart this process did not observe, a config reload), so the next
     sync re-adds just those. One read-only GET per config refresh; while
     the two agree nothing is re-added, and an unreadable list changes
-    nothing."""
+    nothing.
+
+    A camera whose add is awaiting a retry but that MediaMTX already has
+    (the unanswered add was applied after our timeout) is adopted here,
+    with no second POST."""
     actual = _mediamtx_path_names()
     if actual is None:
         return
+    adopted = set(_path_add_retries) & actual
     with _lock:
         lost = _known_paths - actual
         _known_paths.difference_update(lost)
+        _known_paths.update(adopted)
+    for camera_id in adopted:
+        _path_add_retries.pop(camera_id, None)
+        logger.info("webrtc_publisher.path_add_confirmed camera_id=%s", camera_id)
     if lost:
         logger.warning("webrtc_publisher.paths_missing_in_mediamtx count=%s", len(lost))
+
+
+def _path_add_retry_due() -> bool:
+    now = time.monotonic()
+    return any(due <= now for _attempts, due in _path_add_retries.values())
+
+
+def _defer_path_add(camera_id: str) -> bool:
+    """Schedules another attempt for an add MediaMTX did not answer. False
+    once PATH_ADD_MAX_ATTEMPTS are used up: the caller then logs the
+    failure and the next config refresh starts over, as before."""
+    attempts = _path_add_retries.get(camera_id, (0, 0.0))[0] + 1
+    if attempts >= PATH_ADD_MAX_ATTEMPTS:
+        _path_add_retries.pop(camera_id, None)
+        return False
+    delay = PATH_ADD_RETRY_BASE_SECONDS * min(2 ** (attempts - 1), 8)
+    _path_add_retries[camera_id] = (attempts, time.monotonic() + delay)
+    logger.info("webrtc_publisher.path_add_retry_scheduled camera_id=%s attempt=%s retry_in=%.1fs", camera_id, attempts, delay)
+    return True
 
 
 def reconcile_camera_paths(camera_url_fn) -> None:
@@ -683,6 +724,9 @@ def sync_camera_paths(camera_url_fn) -> None:
         else:
             logger.warning("webrtc_publisher.path_delete_failed camera_id=%s status=%s", camera_id, status)
 
+    for camera_id in set(_path_add_retries) - desired:
+        _path_add_retries.pop(camera_id, None)
+
     for camera_id in desired - _known_paths:
         camera_number = camera_map[camera_id]
         try:
@@ -693,7 +737,13 @@ def sync_camera_paths(camera_url_fn) -> None:
         source, _stream_kind = p2p_source_for(camera_id, source)
         path_config = {"source": source, "sourceOnDemand": True}
         status, _ = _config_request("POST", f"/v3/config/paths/add/{camera_id}", path_config)
-        if status not in (200, 201):
+        if status == 0 and _defer_path_add(camera_id):
+            # MediaMTX never answered (2026-09-25, Ryzen: a timeout right
+            # after a restart). A replace now would most likely wait out the
+            # same timeout; the retry first checks MediaMTX's path list, so
+            # an add that was applied after all is adopted, not re-posted.
+            continue
+        if status not in (0, 200, 201):
             # 2026-09-24, confirmed live on Ryzen: under startup load an add
             # can time out HERE after MediaMTX has already created the path,
             # and every later add then fails 400 ("already exists") -- the
@@ -703,6 +753,7 @@ def sync_camera_paths(camera_url_fn) -> None:
             status, _ = _config_request("POST", f"/v3/config/paths/replace/{camera_id}", path_config)
         if status in (200, 201):
             _known_paths.add(camera_id)
+            _path_add_retries.pop(camera_id, None)
         else:
             logger.warning("webrtc_publisher.path_add_failed camera_id=%s status=%s", camera_id, status)
 
@@ -880,7 +931,9 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
 
     webrtc_publisher_state["worker_status"] = "running"
     logger.info("webrtc_publisher.worker_started")
-    last_config_refresh = 0.0
+    # -inf, not 0.0: time.monotonic() counts from boot, so 0.0 delayed the
+    # first refresh (the first path sync) until CONFIG_REFRESH_SECONDS of uptime.
+    last_config_refresh = float("-inf")
     try:
         while True:
             long_poll_honored = False
@@ -892,9 +945,10 @@ async def webrtc_publisher_worker(camera_url_fn) -> None:
                     await asyncio.to_thread(reconcile_camera_paths, camera_url_fn)
                     await asyncio.to_thread(sync_additional_hosts)
                     last_config_refresh = now
-                elif _paths_resync_pending:
-                    # MediaMTX was just restarted: re-add its paths now,
-                    # not at the next CONFIG_REFRESH_SECONDS.
+                elif _paths_resync_pending or _path_add_retry_due():
+                    # MediaMTX was just restarted, or an unanswered path add
+                    # is due again: do it now, not at the next
+                    # CONFIG_REFRESH_SECONDS.
                     await asyncio.to_thread(reconcile_camera_paths, camera_url_fn)
                 long_poll_honored = bool(await _bridge_tick(camera_url_fn))
                 webrtc_publisher_state["last_scan_at"] = time.time()
