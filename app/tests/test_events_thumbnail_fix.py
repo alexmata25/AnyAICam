@@ -173,4 +173,5 @@ def test_events_page_row_without_a_thumbnail_still_shows_the_em_dash(monkeypatch
     # patch it in place once media becomes ready -- the em dash itself
     # is unchanged for an old, genuinely clipless event (well outside
     # the pending window relative to this fixture's fixed timestamp).
-    assert '<td class="event-thumbnail-cell">—</td>' in html
+    # 2026-09-25: "No clip" (explained on hover) instead of a bare em dash.
+    assert '<td class="event-thumbnail-cell"><span class="event-thumb-none"' in html and ">No clip</span>" in html

@@ -169,7 +169,9 @@ def test_returned_shape_matches_customer_detection_events_exactly(db_path):
             "event_type", "direction", "timestamp", "confidence", "thumbnail",
             "linked_recording", "has_event_clip", "media_state", "plate_number", "vehicle_color", "mock",
         }
-        assert set(bounded[0].keys()) == expected_keys
+        # 2026-09-25: plus four additive, customer-ready fields the Dashboard
+        # uses (friendly label, epoch-ms time, real confidence, Playback link).
+        assert set(bounded[0].keys()) == expected_keys | {"type_label", "timestamp_ms", "display_confidence", "playback_href"}
 
 
 # --------------------------------------------------------- tenant / camera scoping

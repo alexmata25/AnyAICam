@@ -76743,7 +76743,7 @@ function buildEventCard(event){
 
 
 
-    if(event.thumbnail){const image=document.createElement('img');image.src=event.thumbnail;image.alt=`${event.type_label||event.event_type||'Motion'} on ${event.camera_name||('Camera '+(event.camera||''))}`;image.loading='lazy';imageWrap.appendChild(image)}else{const fallback=document.createElement('div');fallback.className='dashboard-event-fallback';fallback.innerHTML='<strong>No thumbnail</strong><span>Preview unavailable</span>';imageWrap.appendChild(fallback)}
+    if(event.thumbnail){const image=document.createElement('img');image.loading='lazy';image.decoding='async';image.src=event.thumbnail;image.alt=`${event.type_label||event.event_type||'Motion'} on ${event.camera_name||('Camera '+(event.camera||''))}`;image.loading='lazy';imageWrap.appendChild(image)}else{const fallback=document.createElement('div');fallback.className='dashboard-event-fallback';fallback.innerHTML='<strong>No thumbnail</strong><span>Preview unavailable</span>';imageWrap.appendChild(fallback)}
 
 
 
@@ -121629,8 +121629,12 @@ def _customer_event_actions(camera_id, timestamp=None, event_id=None, has_event_
     )
     if event_id and not has_event_clip:
         state=customer_event_media_state(False,timestamp)
-        label='Processing…' if state=='processing' else 'Not ready yet'
-        return f'{live_link}<span class="event-action-pending" aria-disabled="true">{label}</span>'
+        if state == 'processing':
+            return f'{live_link}<span class="event-action-pending" aria-disabled="true">Processing…</span>'
+        # An event past the processing window without a clip never gets
+        # one (analytics-only detection) -- 'Not ready yet' implied it would.
+        return (f'{live_link}<span class="event-action-pending" aria-disabled="true" '
+                f'title="Analytics-only detection: no video clip was recorded for this event">No clip</span>')
     playback_href = _customer_event_playback_href(camera_id, timestamp, event_id, has_event_clip)
     return f'{live_link}<a class="download" href="{playback_href}">Playback</a>'
 
@@ -121697,7 +121701,9 @@ def _render_customer_events(request: Request) -> str:
             # many requests at once" shape and changes no visible
             # behavior for a normal-sized event list.
             f'<img src="{escape(event["thumbnail"], quote=True)}" alt="Event thumbnail" loading="lazy" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">'
-            if event.get("thumbnail") else "—"
+            if event.get("thumbnail") else
+            # 2026-09-25: says what it means instead of a bare em dash.
+            '<span class="event-thumb-none" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>'
         )
         # Inline event-clip player (2026-09-02): a same-page thumbnail
         # click is a genuine, synchronous user gesture -- browsers give
@@ -121796,6 +121802,7 @@ def _render_customer_events(request: Request) -> str:
 .event-thumb-loading{{width:96px;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
 .event-thumb-pending{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:#e8b93f;font-size:11px;background:#0b1018;border-radius:4px;text-align:center;padding:0 6px}}
 .event-action-pending{{opacity:.55;cursor:default;pointer-events:none}}
+.event-thumb-none{{display:flex;width:96px;aspect-ratio:16/9;align-items:center;justify-content:center;color:var(--muted,#8f9baa);font-size:11px;background:#0b1018;border-radius:4px}}
 </style>
 <header class="topbar"><div><p class="eyebrow">Recorded activity</p><h1>Events</h1></div>
 <div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
@@ -122005,22 +122012,25 @@ def _render_customer_events(request: Request) -> str:
 
   function eventActionCellHtml(cameraId,timestamp,eventId,hasEventClip,mediaState){
     const liveLink=cameraId?`<a class="download" href="/customer/cameras/${encodeURIComponent(cameraId)}/live">Live view</a> `:'';
-    if(mediaState!=='ready'){
+    if(mediaState==='processing'){
       return `${liveLink}<span class="download event-action-pending" aria-disabled="true" title="Playback will be available once processing completes">Playback</span>`;
+    }
+    if(mediaState!=='ready'){
+      return `${liveLink}<span class="event-action-pending" aria-disabled="true" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>`;
     }
     return `${liveLink}<a class="download" href="${eventPlaybackHref(cameraId,timestamp,eventId,hasEventClip)}">Playback</a>`;
   }
 
   function eventThumbnailCellHtml(event,mediaState){
     if(event.thumbnail||event.has_event_clip){
-      const img=event.thumbnail?`<img src="${AnyAiCamEventMedia.escape(event.thumbnail)}" alt="Event thumbnail" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`:'<span>Event clip</span>';
+      const img=event.thumbnail?`<img src="${AnyAiCamEventMedia.escape(event.thumbnail)}" alt="Event thumbnail" loading="lazy" decoding="async" style="width:96px;aspect-ratio:16/9;object-fit:cover;display:block">`:'<span>Event clip</span>';
       if(event.has_event_clip&&event.camera_id&&event.id){
         const escapedImg=img.replace(/"/g,'&quot;');
         return `<div class="event-thumb-player" tabindex="0" role="button" aria-label="Play event clip" data-camera-id="${AnyAiCamEventMedia.escape(event.camera_id)}" data-event-id="${AnyAiCamEventMedia.escape(event.id)}" data-thumb-html="${escapedImg}">${img}<span class="event-thumb-play-badge" aria-hidden="true">▶</span></div>`;
       }
       return img;
     }
-    return mediaState==='processing'?'<span class="event-thumb-pending">Processing…</span>':'—';
+    return mediaState==='processing'?'<span class="event-thumb-pending">Processing…</span>':'<span class="event-thumb-none" title="Analytics-only detection: no video clip was recorded for this event">No clip</span>';
   }
 
   // Round 2 fix: updates both server-rendered "N event(s)" pill
@@ -122101,9 +122111,9 @@ def _render_customer_events(request: Request) -> str:
       if(ageMs<EVENT_PENDING_WINDOW_MS)return;
       row.dataset.mediaState='unavailable';
       const pendingLabel=row.querySelector('.event-thumbnail-cell .event-thumb-pending');
-      if(pendingLabel)pendingLabel.textContent='Not ready yet';
+      if(pendingLabel){pendingLabel.textContent='No clip';pendingLabel.className='event-thumb-none';pendingLabel.title='Analytics-only detection: no video clip was recorded for this event';}
       const actionPending=row.querySelector('.event-action-cell .event-action-pending');
-      if(actionPending)actionPending.title='Still processing -- check back soon';
+      if(actionPending){actionPending.textContent='No clip';actionPending.classList.remove('download');actionPending.title='Analytics-only detection: no video clip was recorded for this event';}
     });
   }
 
@@ -145140,10 +145150,10 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       const media=event.thumbnail
         ? `<img class="mobile-media-thumb" src="${{AnyAiCamEventMedia.escape(event.thumbnail)}}" alt="" loading="lazy" onerror="this.style.display='none';this.parentElement.classList.add('mobile-media-card--fallback')">`
         : gaveUp
-          ? `<div class="mobile-media-fallback mobile-media-fallback--expired">${{label}} · Not ready yet</div>`
+          ? `<div class="mobile-media-fallback mobile-media-fallback--expired" title="Analytics-only detection: no video clip was recorded for this event">${{label}} · No clip</div>`
           : pending
             ? `<div class="mobile-media-fallback mobile-media-fallback--pending">${{label}} · Processing…</div>`
-            : `<div class="mobile-media-fallback">${{label}} · ${{playable?'Event clip':'Not ready yet'}}</div>`;
+            : `<div class="mobile-media-fallback">${{label}} · ${{playable?'Event clip':'No clip'}}</div>`;
 
       return `<div class="mobile-media-card${{event.thumbnail?'':' mobile-media-card--fallback'}}" data-mobile-event="${{AnyAiCamEventMedia.escape(event.timestamp)}}" data-mobile-event-id="${{AnyAiCamEventMedia.escape(event.id||'')}}" data-mobile-event-clip="${{playable?'1':'0'}}" ${{interaction}}>
         ${{media}}

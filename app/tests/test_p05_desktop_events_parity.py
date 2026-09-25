@@ -200,11 +200,14 @@ def test_old_clipless_event_still_shows_the_em_dash_unchanged(http_client, db_pa
 
     response = http_client.get("/events", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
     row_html = _table_body(response.text)
-    assert '<td class="event-thumbnail-cell">—</td>' in row_html
+    # 2026-09-25: says what it means -- an old clip-less event never gets a
+    # clip, so "No clip" (explained on hover), not a bare em dash or
+    # "Not ready yet". Still no Processing state and no Playback link.
+    assert '<td class="event-thumbnail-cell"><span class="event-thumb-none"' in row_html and ">No clip</span>" in row_html
     assert "Processing…" not in row_html
     assert 'event-thumb-pending' not in row_html
     assert 'data-media-state="unavailable"' in row_html
-    assert "Not ready yet" in row_html
+    assert "Not ready yet" not in row_html
     assert 'href="/playback' not in row_html
 
 
