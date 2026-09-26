@@ -47,6 +47,10 @@ def client(db_path):
             db.execute("INSERT INTO partners(id,name,approval_status,source,created_at) VALUES('p1','P','approved','real',?)", (NOW,))
             db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-1','p1','C1','c1@example.test','active','real',?)", (NOW,))
             db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-2','p1','C2','c2@example.test','active','real',?)", (NOW,))
+            # The test administrator is a real platform administrator: tenant
+            # reach comes from a live global grant, never the bare role (2026-09-26).
+            db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES('u-admin','p1','admin@example.test','A','administrator','x',1,?)", (NOW,))
+            db.execute("INSERT INTO identity_grants(id,user_id,role,scope_type,scope_id,granted_at,granted_by) VALUES('g-admin','u-admin','administrator','global',NULL,?,'test')", (NOW,))
         app = FastAPI()
         facial_recognition_ui.register_facial_recognition_routes(app, _shell)
         with TestClient(app) as test_client:

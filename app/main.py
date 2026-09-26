@@ -9876,319 +9876,30 @@ def invite_base_url(request: Request | None = None) -> str:
 
 
 def send_user_invitation_email(invite: dict, request: Request | None = None) -> tuple[bool, str]:
-
-
-
-
-
-
-
-
-    if not SMTP_HOST or not SMTP_FROM:
-
-
-
-
-
-
-
-
-        return False, "SMTP is not configured."
-
-
-
-
-
-
-
-
+    # Admin portal pass (2026-09-26): sent through email_service like every
+    # other account email instead of a separate raw-SMTP path, so it honours
+    # ANYAICAM_EMAIL_BACKEND (preview in development) and ANYAICAM_EMAIL_FROM.
     invite_url = f"{invite_base_url(request)}/accept-invite?token={quote(invite['token'])}"
-
-
-
-
-
-
-
-
-    message = EmailMessage()
-
-
-
-
-
-
-
-
-    message["Subject"] = "You have been invited to AnyAiCam"
-
-
-
-
-
-
-
-
-    message["From"] = SMTP_FROM
-
-
-
-
-
-
-
-
-    message["To"] = invite["email"]
-
-
-
-
-
-
-
-
-    message.set_content(
-
-
-
-
-
-
-
-
-        "\n".join(
-
-
-
-
-
-
-
-
-            [
-
-
-
-
-
-
-
-
-                "You have been invited to access AnyAiCam.",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"Permission level: {invite['role']}",
-
-
-
-
-
-
-
-
-                f"Camera access: {'All cameras' if invite.get('all_cameras') else ', '.join('Camera ' + str(item) for item in invite.get('camera_ids', []))}",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"Create your account: {invite_url}",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"This invitation expires {invite['expires_at']}.",
-
-
-
-
-
-
-
-
-            ]
-
-
-
-
-
-
-
-
-        )
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    context = ssl.create_default_context()
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
-
-
-
-
-
-
-
-
-            if SMTP_USE_TLS:
-
-
-
-
-
-
-
-
-                smtp.starttls(context=context)
-
-
-
-
-
-
-
-
-            if SMTP_USERNAME:
-
-
-
-
-
-
-
-
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-
-
-
-
-
-
-
-
-            smtp.send_message(message)
-
-
-
-
-
-
-
-
+    cameras = "All cameras" if invite.get("all_cameras") else ", ".join("Camera " + str(item) for item in invite.get("camera_ids", []))
+    text = "\n".join([
+        "You have been invited to access AnyAiCam.",
+        "",
+        f"Permission level: {invite['role']}",
+        f"Camera access: {cameras}",
+        "",
+        f"Create your account: {invite_url}",
+        "",
+        f"This invitation expires {invite['expires_at']}.",
+    ])
+    from email_service import get_email_service
+
+    result = get_email_service().send("invitation", invite["email"], "You have been invited to AnyAiCam", text)
+    status = str(result.get("status") or "")
+    if status == "sent":
         return True, "Invitation email sent."
-
-
-
-
-
-
-
-
-    except (OSError, smtplib.SMTPException) as error:
-
-
-
-
-
-
-
-
-        return False, str(error)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    if status == "preview":
+        return True, "Invitation prepared (email preview mode -- nothing was sent)."
+    return False, "the email could not be sent. Check the email settings and use Resend."
 
 def load_sessions() -> dict:
 
@@ -132547,7 +132258,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-        "Set ANYAICAM_PHONE_URL to the Samsung LAN or Tailscale address."
+        "Set ANYAICAM_PHONE_URL to this appliance's LAN or Tailscale address."
 
 
 
