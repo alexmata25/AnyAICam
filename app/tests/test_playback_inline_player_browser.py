@@ -29,6 +29,8 @@ pytestmark = pytest.mark.skipif(
 
 ORIGIN = "https://anyaicam.test"
 EVENT_MEDIA_JS = (Path(__file__).resolve().parents[1] / "static" / "event_media.js").read_text(encoding="utf-8")
+INLINE_MEDIA_JS = (Path(__file__).resolve().parents[1] / "static" / "inline_media.js").read_text(encoding="utf-8")
+INLINE_MEDIA_CSS = (Path(__file__).resolve().parents[1] / "static" / "inline_media.css").read_text(encoding="utf-8")
 BROWSERS = [("chromium", None), ("msedge", "msedge")]
 
 
@@ -55,7 +57,7 @@ def _render_playback_page():
         with TestClient(main.app, base_url=ORIGIN, follow_redirects=False) as client:
             cookie = {partner_portal.SESSION_COOKIE: partner_portal._token("o@e.test", "customer_owner", None, "cust", None)}
             html = client.get("/playback", cookies=cookie).text
-    assert "createPlaybackInlinePlayer" in html
+    assert "AnyAiCamInlineMedia.create(" in html and "/static/inline_media.js" in html
     return html
 
 
@@ -123,6 +125,10 @@ def _open(playwright_instance, engine, channel, html, webm, *, mobile=False):
             return route.fulfill(status=200, content_type="text/html", body=html)
         if url.startswith(f"{ORIGIN}/static/event_media.js"):
             return route.fulfill(status=200, content_type="application/javascript", body=EVENT_MEDIA_JS)
+        if url.startswith(f"{ORIGIN}/static/inline_media.js"):
+            return route.fulfill(status=200, content_type="application/javascript", body=INLINE_MEDIA_JS)
+        if url.startswith(f"{ORIGIN}/static/inline_media.css"):
+            return route.fulfill(status=200, content_type="text/css", body=INLINE_MEDIA_CSS)
         if "/media" in url and "/api/customer/recordings/" in url:
             media_requests.append(url)
             return route.fulfill(status=200, content_type="video/webm", body=webm)

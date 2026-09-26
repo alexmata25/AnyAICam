@@ -47995,33 +47995,23 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
+    # Portal customers: the one Analytics entry opens a flyout / phone
+    # submenu listing only the analytics they actually have (2026-09-25).
+    analytics_menu = None
+    if shell_role in CUSTOMER_PORTAL_ROLES and request is not None:
+        try:
+            import customer_analytics_workspace
+            _menu_cameras = _customer_playback_cameras(request) or []
+            analytics_menu = customer_analytics_workspace.nav_menu_html(
+                customer_analytics_workspace.available_workspaces((shell_user or {}).get("customer_id"), [c["id"] for c in _menu_cameras]),
+                request.url.path,
+            )
+        except Exception:
+            analytics_menu = None
     navigation = "".join(
-
-
-
-
-
-
-
-
+        analytics_menu[0] if (analytics_menu and key == "analytics") else
         f'<a class="{"active" if key == active else ""}" href="{url}"><span class="nav-icon">{icon}</span><span>{label}</span></a>'
-
-
-
-
-
-
-
-
         for key, url, icon, label in visible_nav_items
-
-
-
-
-
-
-
-
     )
 
 
@@ -48307,6 +48297,12 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
     )
+    if analytics_menu:
+        mobile_links = [f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>' for key, url, label in mobile_items]
+        mobile_links.insert(2, analytics_menu[1])  # Cameras, Alerts, Analytics, Playback, Account
+        mobile = "".join(mobile_links)
+        import customer_analytics_workspace
+        scripts = analytics_menu[2] + customer_analytics_workspace.NAV_ASSETS + scripts
 
 
 
@@ -78360,7 +78356,13 @@ def analytics(request: Request) -> str:
     customer_cameras = _customer_playback_cameras(request)
     if customer_cameras is not None:
         import customer_analytics_workspace
-        return customer_analytics_workspace.render_page(request, customer_cameras, page_shell)
+        legacy_type = request.query_params.get("type")
+        if legacy_type in customer_analytics_workspace.WORKSPACES:
+            # Older links (/analytics?type=ppe&camera=...) -> the dedicated page.
+            slug = customer_analytics_workspace.WORKSPACES[legacy_type]["slug"]
+            camera = request.query_params.get("camera")
+            return RedirectResponse(f"/analytics/{slug}" + (f"?camera={quote(camera)}" if camera else ""), status_code=303)
+        return customer_analytics_workspace.render_landing(request, customer_cameras, page_shell)
     user = current_user(request)
 
 
@@ -121317,15 +121319,13 @@ def investigation_cases_page(request: Request) -> str:
 
 
 @app.get("/analytics/{analytics_slug}", response_class=HTMLResponse)
-
-
-
-
-
-
-
-
-def analytics_detail(analytics_slug: str) -> str:
+def analytics_detail(analytics_slug: str, request: Request) -> str:
+    # Portal customers: one dedicated workspace per analytic (2026-09-25);
+    # everyone else keeps the existing pages unchanged.
+    customer_cameras = _customer_playback_cameras(request)
+    if customer_cameras is not None:
+        import customer_analytics_workspace
+        return customer_analytics_workspace.render_workspace(request, customer_cameras, page_shell, analytics_slug)
 
 
 
@@ -144057,118 +144057,11 @@ def _customer_camera_recordings(camera_id: str) -> list[dict]:
 # Playback's inline recording player (2026-09-25) -- see the comment at the
 # top of the script. Kept as plain constants (single braces) and injected
 # into the page's f-string template.
-_PLAYBACK_INLINE_PLAYER_JS = '''  // Inline recording player (2026-09-25): a recording chosen from the list
-  // plays right where it was tapped, in a Live-style card, instead of in the
-  // top player -- which stays the timeline/scrub/date player. One at a time
-  // (opening another replaces it; tapping the open one again closes it). The
-  // list re-renders on refresh, so the card is re-attached after its row in
-  // the same task (a media element re-inserted synchronously keeps playing),
-  // and nothing here ever scrolls the page to the top.
-  function createPlaybackInlinePlayer(opts){
-    let current=null;
-    function shareUrl(cameraId,item){
-      const cam=encodeURIComponent(cameraId);
-      if(item.kind==='event')return `${location.origin}/playback?camera=${cam}&event=${encodeURIComponent(item.id)}&autoplay=event`;
-      const ms=opts.dateOf(item.start).getTime();
-      return `${location.origin}/playback?camera=${cam}${Number.isFinite(ms)?`&t=${ms}`:''}&autoplay=event`;
-    }
-    function close(){
-      if(!current)return;
-      const closing=current;current=null;
-      try{if(closing.player)closing.player.cancel();}catch(error){}
-      closing.video.pause();closing.video.removeAttribute('src');closing.video.load();
-      closing.card.remove();
-      if(closing.row)closing.row.setAttribute('aria-expanded','false');
-    }
-    function open(row,cameraId,item){
-      const key=`${item.kind}:${item.id}`;
-      if(current&&current.key===key){close();return;}
-      close();
-      if(opts.topVideo&&!opts.topVideo.paused)opts.topVideo.pause();
-      const card=document.createElement('div');
-      card.className='inline-media-card';
-      card.dataset.inlineFor=key;
-      card.setAttribute('role','region');
-      card.setAttribute('aria-label',`Playing ${item.title||'recording'}`);
-      card.innerHTML=`<div class="camera-view inline-media-view"><video playsinline preload="auto"></video></div>
-        <p class="inline-media-status health-detail" role="status" aria-live="polite">Loading…</p>
-        <div class="camera-tools inline-media-tools" role="toolbar" aria-label="Recording controls">
-          <button class="camera-tool" type="button" data-act="play" title="Pause" aria-label="Pause">⏸</button>
-          <button class="camera-tool" type="button" data-act="mute" title="Mute" aria-label="Mute">♪</button>
-          <button class="camera-tool" type="button" data-act="fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>
-          <a class="camera-tool" data-act="download" title="Download" aria-label="Download" target="_blank" rel="noopener" download hidden>⬇</a>
-          <button class="camera-tool" type="button" data-act="share" title="Share link" aria-label="Share link">↗</button>
-          <button class="camera-tool" type="button" data-act="close" title="Close player" aria-label="Close player">✕</button>
-        </div>`;
-      row.after(card);
-      row.setAttribute('aria-expanded','true');
-      const clipVideo=card.querySelector('video');
-      const statusEl=card.querySelector('.inline-media-status');
-      const download=card.querySelector('[data-act="download"]');
-      const playButton=card.querySelector('[data-act="play"]');
-      const muteButton=card.querySelector('[data-act="mute"]');
-      const view=card.querySelector('.inline-media-view');
-      current={key,card,video:clipVideo,row,list:row.parentElement,player:null};
-      const syncPlay=()=>{const label=clipVideo.paused?'Play':'Pause';playButton.textContent=clipVideo.paused?'▶':'⏸';playButton.title=label;playButton.setAttribute('aria-label',label)};
-      const syncMute=()=>{const label=clipVideo.muted?'Unmute':'Mute';muteButton.textContent=clipVideo.muted?'🔇':'♪';muteButton.title=label;muteButton.setAttribute('aria-label',label)};
-      clipVideo.addEventListener('play',()=>{syncPlay();statusEl.textContent=''});
-      clipVideo.addEventListener('pause',syncPlay);
-      clipVideo.addEventListener('volumechange',syncMute);
-      clipVideo.addEventListener('error',()=>{if(clipVideo.getAttribute('src'))statusEl.textContent='This recording could not be played.'});
-      const start=()=>Promise.resolve(clipVideo.play()).catch(()=>{clipVideo.muted=true;return clipVideo.play()}).catch(()=>{statusEl.textContent='Press play to start.'});
-      if(item.kind==='event'){
-        const mine=current;
-        current.player=AnyAiCamEventMedia.player({video:clipVideo,status:statusEl,isCurrent:()=>current===mine,onReady:()=>{
-          const src=clipVideo.getAttribute('src')||clipVideo.currentSrc;
-          if(src){download.href=src;download.hidden=false;}
-        }});
-        current.player.start(cameraId,item.id,true);
-      }else{
-        const url=opts.mediaUrl(cameraId,item.id);
-        clipVideo.src=url;download.href=url;download.hidden=false;
-        start();
-      }
-      if(!view.requestFullscreen&&!clipVideo.webkitEnterFullscreen)card.querySelector('[data-act="fullscreen"]').hidden=true;
-      card.addEventListener('click',event=>{
-        const control=event.target.closest('[data-act]');
-        if(!control)return;
-        const act=control.dataset.act;
-        if(act==='play'){if(clipVideo.paused)start();else clipVideo.pause();}
-        else if(act==='mute'){clipVideo.muted=!clipVideo.muted;}
-        else if(act==='fullscreen'){
-          if(document.fullscreenElement)document.exitFullscreen().catch(()=>{});
-          else if(view.requestFullscreen)view.requestFullscreen().catch(()=>{});
-          else if(clipVideo.webkitEnterFullscreen)clipVideo.webkitEnterFullscreen();
-        }
-        else if(act==='share'){
-          const url=shareUrl(cameraId,item);
-          if(navigator.share){navigator.share({title:item.title||'AnyAiCam recording',url}).catch(()=>{});}
-          else if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(url).then(()=>{statusEl.textContent='Link copied -- it opens this recording for people on your account.'}).catch(()=>{statusEl.textContent=url});}
-          else{statusEl.textContent=url;}
-        }
-        else if(act==='close'){const openedFrom=current&&current.row;close();if(openedFrom&&openedFrom.focus)openedFrom.focus({preventScroll:true});}
-      });
-      syncPlay();syncMute();
-      card.scrollIntoView({block:'nearest',behavior:'smooth'});
-    }
-    function reattach(container){
-      // Only the list it was opened from (the desktop and mobile lists
-      // share keys, and the hidden one re-renders too).
-      if(!current||container!==current.list)return;
-      const row=container.querySelector(`[data-inline-key="${CSS.escape(current.key)}"]`);
-      if(!row){if(!current.card.isConnected)close();return;}
-      current.row=row;
-      row.setAttribute('aria-expanded','true');
-      if(row.nextElementSibling!==current.card)row.after(current.card);
-    }
-    // The top (timeline) player taking over pauses an inline recording.
-    if(opts.topVideo)opts.topVideo.addEventListener('play',()=>{if(current&&!current.video.paused)current.video.pause()});
-    return {open,close,reattach,isOpen:()=>Boolean(current)};
-  }
-  const inlinePlayer=createPlaybackInlinePlayer({topVideo:video,mediaUrl:recordingMediaUrl,dateOf:playbackDate});
-  function openFromKeyboard(event,action){if(event.key==='Enter'||event.key===' '){event.preventDefault();action()}}
+_PLAYBACK_INLINE_PLAYER_JS = '''  // Inline recording player: /static/inline_media.js (shared with the
+  // Analytics workspaces). The top player stays the timeline/scrub player.
+  const inlinePlayer=AnyAiCamInlineMedia.create({topVideo:video,mediaUrl:recordingMediaUrl,dateOf:playbackDate});
+  const openFromKeyboard=AnyAiCamInlineMedia.openFromKeyboard;
 '''
-_PLAYBACK_INLINE_PLAYER_CSS = '.inline-media-card{grid-column:1/-1;justify-self:center;width:100%;max-width:960px;margin:6px 0 12px;padding:8px;border-radius:14px;background:rgba(24,33,50,.94)}.inline-media-card .inline-media-view{width:100%;border-radius:10px}.inline-media-card .inline-media-tools{justify-content:center;flex-wrap:wrap}.inline-media-card .camera-tool[hidden]{display:none}.inline-media-card .camera-tool:focus-visible{outline:2px solid var(--brand,#47d7ac);outline-offset:1px}.inline-media-status{margin:6px 4px 0}.inline-media-status:empty{display:none}@media(max-width:900px){.inline-media-card .camera-tool{width:44px;height:40px;font-size:17px}}'
 
 
 def _render_customer_playback(cameras: list[dict], request: Request) -> str:
@@ -144486,7 +144379,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.mobile-media-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;text-align:center;padding:0 12px;background:#141b26}'
         '.mobile-media-fallback--pending{color:#e8b93f}'
         '.mobile-media-fallback--expired{color:#8f9baa;font-style:italic}'
-        + _PLAYBACK_INLINE_PLAYER_CSS +
         '</style>'
         '<section class="panel mobile-recent-events" style="margin-top:14px">'
         '<div class="panel-head"><div><p class="eyebrow">Recorded activity</p><h2>Recent events</h2></div></div>'
@@ -146350,7 +146242,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 }})();
 </script>'''
 
-    return page_shell("Playback", "playback", content, '<script src="/static/event_media.js"></script>' + scripts)
+    return page_shell("Playback", "playback", content, '<link rel="stylesheet" href="/static/inline_media.css"><script src="/static/event_media.js"></script><script src="/static/inline_media.js"></script>' + scripts)
 
 
 @app.get("/playback", response_class=HTMLResponse)

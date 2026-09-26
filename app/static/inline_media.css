@@ -1,0 +1,11 @@
+/* AnyAiCam inline media card (Playback + Analytics), 2026-09-25. */
+.inline-media-card{grid-column:1/-1;justify-self:center;width:100%;max-width:960px;margin:6px 0 12px;padding:8px;border-radius:14px;background:rgba(24,33,50,.94)}
+.inline-media-card .inline-media-view{width:100%;border-radius:10px}
+.inline-media-card .inline-media-view img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#080a0e}
+.inline-media-card .inline-media-tools{justify-content:center;flex-wrap:wrap}
+.inline-media-card .camera-tool[hidden]{display:none}
+.inline-media-card .camera-tool:focus-visible{outline:2px solid var(--brand,#47d7ac);outline-offset:1px}
+.inline-media-status{margin:6px 4px 0}
+.inline-media-status:empty{display:none}
+@media(max-width:900px){.inline-media-card .camera-tool{width:44px;height:40px;font-size:17px}
+}
