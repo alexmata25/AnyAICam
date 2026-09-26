@@ -155715,14 +155715,34 @@ class _ClassicAacoBoundary:
             "context": {"camera_id": camera_id, "playback_at": timestamp},
         }
 
-    def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> dict:
+    def camera_names(self, identity: dict) -> list[str]:
+        """Display names of the cameras this customer may see (playback or
+        live) -- what AACO's free-form interpreter matches camera mentions
+        against. Never authority: every command is still resolved and
+        authorized again by the methods below."""
+        from live_view_page import _customer_live_cameras
+        from partner_db import connection
+        with connection() as db:
+            live_cameras = _customer_live_cameras(db, identity, "")
+        names = [str(camera.get("name") or "").strip() for camera in [*(_customer_playback_cameras(self.request) or []), *live_cameras]]
+        return sorted({name for name in names if name})
+
+    def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime, limit: int | None = None) -> dict:
         normalized_type = _aaco_event_category(event_type) if event_type else None
-        # Reuses Classic's own customer-scoped event representation.  The
-        # bounded response is filtered before presentation, with no media
-        # lookup and no creation/export side effect.
+        # A named camera (free-form requests like "anyone at the front door
+        # today?") narrows the search; execute() already authorized it.
+        camera = self._camera(camera_id) if camera_id else None
+        if camera_id and not camera:
+            raise PermissionError("Camera is unavailable.")
+        # Reuses Classic's own customer-scoped event representation (newest
+        # first). The bounded response is filtered before presentation, with
+        # no media lookup and no creation/export side effect.
         candidates = _customer_detection_events(self.request) or []
+        cap = min(limit, 100) if limit else 100
         matches = []
         for event in candidates:
+            if camera and event.get("camera_id") != camera["id"]:
+                continue
             if normalized_type and _aaco_event_category(event.get("event_type")) != normalized_type:
                 continue
             try:
@@ -155736,9 +155756,13 @@ class _ClassicAacoBoundary:
                     "href": f'/investigate?{urlencode({"camera": event.get("camera_id", ""), "t": event.get("timestamp", "")})}',
                     "context": {"camera_id": f'camera-{event.get("camera")}', "event_at": str(event.get("timestamp"))},
                 })
-            if len(matches) >= 100:
+            if len(matches) >= cap:
                 break
-        return {"kind": "events", "message": f"{len(matches)} authorized event result(s).", "events": matches, "context": matches[0]["context"] if matches else None}
+        if limit == 1:
+            message = "Latest authorized event." if matches else "No authorized event matches that yet."
+        else:
+            message = f"{len(matches)} authorized event result(s)."
+        return {"kind": "events", "message": message, "events": matches, "context": matches[0]["context"] if matches else None}
 
     def previous_event(self, identity: dict, camera_id: str, before: datetime) -> dict:
         camera = self._camera(camera_id)
@@ -155950,8 +155974,13 @@ def _aaco_language_adapter():
     # DeterministicLanguageAdapter, so wiring this in unconditionally
     # is a no-op today and the only place a future local-inference
     # rollout needs to touch to turn on.
+    #
+    # 2026-09-26: wrapped in FreeFormAacoLanguageAdapter so AACO understands
+    # free-form typed or spoken requests; every command the grammar (or a
+    # validated local model) already understands is returned unchanged.
+    import aaco_freeform
     import aaco_llm
-    return aaco_llm.NaturalAacoLanguageAdapter(aaco_llm.default_interpreter())
+    return aaco_freeform.FreeFormAacoLanguageAdapter(aaco_llm.NaturalAacoLanguageAdapter(aaco_llm.default_interpreter()))
 
 
 register_aaco_routes(
