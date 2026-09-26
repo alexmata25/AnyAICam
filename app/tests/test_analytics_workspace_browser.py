@@ -71,7 +71,8 @@ def _render_pages():
         conn.close()
         with TestClient(main.app, base_url=ORIGIN, follow_redirects=False) as client:
             cookie = {partner_portal.SESSION_COOKIE: partner_portal._token("o@e.test", "customer_owner", None, "cust", None)}
-            pages = {path: client.get(path, cookies=cookie).text for path in ("/analytics/smart-motion", "/analytics", "/analytics/ppe")}
+            pages = {path: client.get(path, cookies=cookie).text for path in (
+                "/analytics/smart-motion", "/analytics", "/analytics/ppe", "/analytics/smart-rules", "/customer/cameras/cam-1/analytics-rules")}
     assert "window.__AW=" in pages["/analytics/smart-motion"]
     return pages
 
@@ -363,5 +364,30 @@ def test_no_preview_is_said_plainly_never_a_black_box(playwright_instance, pages
         card.wait_for()
         assert card.locator(".inline-media-empty").inner_text() == "No preview available"
         assert card.locator("img").count() == 0
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "phone"])
+@pytest.mark.parametrize("path", ["/analytics/smart-rules", "/customer/cameras/cam-1/analytics-rules"], ids=["smart-rules", "rule-editor"])
+def test_smart_rules_pages_fit_the_screen(playwright_instance, pages, webm, path, mobile):
+    """Analytics > Smart Rules and the rule editor it opens: no sideways
+    scrolling on a phone, even after a captured frame widens the canvas."""
+    browser, page = _open(playwright_instance, "chromium", None, pages, webm, path, mobile=mobile)
+    try:
+        page.wait_for_selector("h1")
+        fits = "() => document.documentElement.scrollWidth <= window.innerWidth"
+        assert page.evaluate(fits), page.evaluate("() => [document.documentElement.scrollWidth, window.innerWidth]")
+        if path.endswith("/analytics-rules"):
+            # What "Capture frame" does: the canvas takes the camera frame's own size.
+            page.evaluate("() => { const c = document.getElementById('rule-canvas'); c.width = 1280; c.height = 720; }")
+            assert page.evaluate(fits), page.evaluate("() => [document.documentElement.scrollWidth, window.innerWidth]")
+            box = page.locator("#rule-canvas").bounding_box()
+            assert box["x"] >= 0 and box["x"] + box["width"] <= page.viewport_size["width"]
+            if not mobile:
+                assert 600 <= box["width"] <= 640  # desktop keeps the full-size drawing area
+            assert page.locator(".topbar .eyebrow a[href='/analytics/smart-rules']").is_visible()
+        else:
+            assert page.locator("a.aw-tile[href='/customer/cameras/cam-1/analytics-rules']").is_visible()
     finally:
         browser.close()
