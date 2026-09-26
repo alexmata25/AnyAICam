@@ -301,6 +301,9 @@ def test_zone_change_through_real_save_load_path_invalidates_mask(monkeypatch, t
     camera_number = 3
     event_settings_file = tmp_path / "event_settings.json"
     monkeypatch.setattr(main, "EVENT_SETTINGS_FILE", event_settings_file)
+    # The PUT route requires manage_settings since 2026-09-26; call it as an administrator.
+    monkeypatch.setattr(main, "current_user", lambda request: {"id": "local-admin", "role": "administrator"})
+    admin_request = object()
 
     zone_a = _zone(x=0.0, y=0.0, width=0.3, height=0.3, name="A")
     zone_b = _zone(x=0.6, y=0.6, width=0.3, height=0.3, name="B")
@@ -309,6 +312,7 @@ def test_zone_change_through_real_save_load_path_invalidates_mask(monkeypatch, t
     response_a = main.update_event_settings(
         camera_number,
         main.EventSettingsModel(camera=camera_number, enabled=True, zones=[zone_a]),
+        admin_request,
     )
     assert response_a["status"] == "complete"
 
@@ -337,6 +341,7 @@ def test_zone_change_through_real_save_load_path_invalidates_mask(monkeypatch, t
     response_b = main.update_event_settings(
         camera_number,
         main.EventSettingsModel(camera=camera_number, enabled=True, zones=[zone_b]),
+        admin_request,
     )
     assert response_b["status"] == "complete"
 
