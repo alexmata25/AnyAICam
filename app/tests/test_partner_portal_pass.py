@@ -230,3 +230,32 @@ def test_salesperson_cannot_invite_and_email_is_required(client, sent_mail):
 def test_invite_form_is_offered_to_partner_owners_only(client):
     assert 'id="team-invite-form"' in client.get("/partner", cookies=ALPHA).text
     assert 'id="team-invite-form"' not in client.get("/partner", cookies=cookies("salesperson", "p-alpha")).text
+
+
+# ------------------------------------------------------------ price sheet / appliances / wizard copy
+
+
+def test_price_sheet_honours_percentage_pricing(client, monkeypatch):
+    import pricing_config
+
+    config = pricing_config.load_pricing()
+    config["partner"]["pricing_mode"] = "percentage"
+    config["partner"]["percentage_discount"] = 20
+    monkeypatch.setattr(partner_portal, "load_pricing", lambda: config)
+    page = client.get("/partner-prices", cookies=ALPHA).text
+    assert "$6.39" in page  # 7.99 retail less 20%
+    assert "20.0%" in page
+    assert "2mp.motion.2" not in page and "Motion · 2 days" in page
+
+
+def test_appliance_dashboard_shows_own_unactivated_appliances_only(client):
+    with connection() as db:
+        db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-a','cust-p-alpha','Main',?)", (NOW,))
+        db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-a','cust-p-alpha','site-a','AIC-ALPHA-001',?)", (NOW,))
+    assert "AIC-ALPHA-001" in client.get("/partner/appliance-dashboard", cookies=cookies("technician", "p-alpha")).text
+    assert "AIC-ALPHA-001" not in client.get("/partner/appliance-dashboard", cookies=cookies("technician", "p-bravo")).text
+
+
+def test_onboarding_wizard_does_not_show_infrastructure_wording(client):
+    page = client.get("/partner/onboarding", cookies=ALPHA).text
+    assert "send to AWS" not in page and "AWS provisioning result" not in page and "issued by AWS" not in page

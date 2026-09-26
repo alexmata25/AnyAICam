@@ -2200,7 +2200,11 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             else:
                 db.execute("UPDATE appliances SET state='offline',online_status='offline' WHERE partner_id=? AND state IN ('online','degraded') AND (last_check_in IS NULL OR last_check_in<?)",(owned_partner_id,stale_before))
         clauses=['1=1']; params=[]
-        if not is_global: clauses.append('a.partner_id=?'); params.append(owned_partner_id)
+        # Partner portal pass (2026-09-26): appliances.partner_id is only
+        # backfilled at activation, so a partner's own newly provisioned
+        # appliances were invisible to its owner/technicians. Same rule as
+        # authorize_appliance_tenant(): fall back to the owning customer's partner.
+        if not is_global: clauses.append('COALESCE(a.partner_id,c.partner_id)=?'); params.append(owned_partner_id)
         for value,column in [(partner,'a.partner_id'),(customer,'a.customer_id'),(site,'a.site_id'),(status,'a.state'),(version,'a.software_version')]:
             if value: clauses.append(column+'=?'); params.append(value)
         appliances=rows('SELECT a.*,c.name customer_name,s.name site_name FROM appliances a LEFT JOIN customers c ON c.id=a.customer_id LEFT JOIN sites s ON s.id=a.site_id WHERE '+' AND '.join(clauses)+' ORDER BY a.last_check_in DESC',params)

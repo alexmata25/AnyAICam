@@ -12,7 +12,7 @@ from typing import Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from pricing_config import calculate_partner_quote, load_pricing, public_pricing, save_pricing
+from pricing_config import _partner_unit_price, calculate_partner_quote, load_pricing, public_pricing, save_pricing
 from partner_db import authenticate_detailed, audit, allowed, connection, create_first_admin, FirstAdminAlreadyExists, password_hash, tenant_owns_partner, verify_password
 from cloud_config import settings
 from cloud_security import clear_login_failures,login_blocked,record_login_failure
@@ -360,8 +360,17 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         if not allowed(identity,'pricing.view'): raise HTTPException(status_code=403,detail='Pricing permission required.')
         config=load_pricing(); rows=[]
         for key,term in config['partner']['plan_terms'].items():
-            retail=term.get('retail_monthly_price'); wholesale=term.get('partner_monthly_price'); cost=term.get('partner_cost'); suggested=term.get('suggested_retail_price'); profit=(suggested-wholesale) if suggested is not None and wholesale is not None else None; margin=(profit/suggested*100) if profit is not None and suggested else None
-            rows.append(f'<tr><td>{key}</td><td>{"—" if retail is None else f"${retail:.2f}"}</td><td>{"Not configured" if wholesale is None else f"${wholesale:.2f}"}</td><td>{"Not configured" if cost is None else f"${cost:.2f}"}</td><td>{"—" if suggested is None else f"${suggested:.2f}"}</td><td>{"—" if profit is None else f"${profit:.2f}"}</td><td>{"—" if margin is None else f"{margin:.1f}%"}</td></tr>')
+            retail=term.get('retail_monthly_price'); cost=term.get('partner_cost'); suggested=term.get('suggested_retail_price')
+            # Partner portal pass (2026-09-26): the sheet only read fixed partner
+            # prices, so percentage / volume pricing (which the quote calculator
+            # honours via the same _partner_unit_price()) showed "Not configured".
+            try: wholesale=_partner_unit_price(float(retail),term,1,config) if retail is not None else None
+            except ValueError: wholesale=None
+            selling=suggested if suggested is not None else retail
+            profit=(selling-wholesale) if selling is not None and wholesale is not None else None; margin=(profit/selling*100) if profit is not None and selling else None
+            resolution,recording,retention=(key.split('.')+['','',''])[:3]
+            label=f"{config['plans'].get(resolution,{}).get('label',resolution.upper())} · {recording.title()} · {retention} days"
+            rows.append(f'<tr><td>{label}</td><td>{"—" if retail is None else f"${retail:.2f}"}</td><td>{"Not configured" if wholesale is None else f"${wholesale:.2f}"}</td><td>{"Not configured" if cost is None else f"${cost:.2f}"}</td><td>{"—" if suggested is None else f"${suggested:.2f}"}</td><td>{"—" if profit is None else f"${profit:.2f}"}</td><td>{"—" if margin is None else f"{margin:.1f}%"}</td></tr>')
         content=f'''<header class="topbar"><div><p class="eyebrow">Confidential · {identity['role'].replace('_',' ').title()}</p><h1>Partner price sheet</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header><div class="mock-banner">Confidential partner information. Do not share this page with retail customers.</div><section class="panel" style="overflow:auto"><table class="data-table"><thead><tr><th>Plan</th><th>Retail</th><th>Partner price</th><th>Partner cost</th><th>Suggested retail</th><th>Profit/camera</th><th>Margin</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section>'''
         return shell('Partner prices','partner-prices',content)
 
