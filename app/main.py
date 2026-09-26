@@ -45895,6 +45895,20 @@ def portal_login_submit(request: Request, payload: dict):
                 partner_role = candidate_role
             else:
                 partner_user = None
+        # The cloud itself (no own appliance) authenticates directly against
+        # partner_db, which carries no grant scope of its own -- so a live
+        # global administrator grant was never consulted here and every
+        # platform administrator landed on the Partner Portal and skipped
+        # the platform-owner MFA gate below (admin portal pass 2026-09-26).
+        # Same live check cloud_administrator_bridge() uses on every request;
+        # a partner-scoped administrator still gets no scope (-> /partner).
+        if partner_role == "administrator":
+            from appliance_identity import has_global_administrator_grant
+            from partner_db import connection as _grant_db_connection
+
+            with _grant_db_connection() as _grant_db:
+                if has_global_administrator_grant(_grant_db, email=email):
+                    partner_administrator_scope = "global"
     # own_appliance is set but no (valid) portal was selected: the
     # delegated contract requires a portal to check one bucket against
     # (see authenticate_operator()'s own docstring) -- resolve_portal_
@@ -105853,6 +105867,35 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
+# Admin portal pass (2026-09-26): platform_owner.py's MFA/recovery-code
+# API existed with no page anywhere calling it, so no administrator could
+# actually turn MFA on. This card is that missing front end -- it only
+# calls the existing, already-gated /api/platform-owner/* routes, and
+# shows a neutral note to any session those routes don't serve (a legacy
+# local admin, or an administrator without a live global grant).
+ADMIN_SIGNIN_SECURITY_CARD = """<article class="admin-command-card" id="admin-signin-security"><h2>Sign-in security</h2>
+<div class="admin-command-meta" id="admin-mfa-status">Checking two-factor authentication…</div>
+<div id="admin-mfa-setup" hidden><p class="admin-command-meta">Add this key to your authenticator app (Google Authenticator, 1Password, Authy…), then enter the 6-digit code it shows.</p>
+<p><code id="admin-mfa-secret" style="user-select:all;word-break:break-all"></code></p>
+<p class="admin-command-meta"><a id="admin-mfa-uri" href="#">Open in authenticator app</a></p>
+<form id="admin-mfa-confirm-form" class="admin-mfa-form"><label>Code <input id="admin-mfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required></label> <button type="submit">Confirm</button></form></div>
+<div id="admin-mfa-codes" hidden><p><strong>Recovery codes (shown once).</strong> Each works once if you lose your authenticator. Store them somewhere safe.</p><pre id="admin-mfa-code-list" style="user-select:all"></pre></div>
+<div class="admin-command-actions"><button type="button" id="admin-mfa-enable" hidden>Turn on two-factor authentication</button><button type="button" id="admin-mfa-regenerate" hidden>New recovery codes</button></div>
+<div class="admin-command-meta" id="admin-mfa-feedback" role="status"></div></article>"""
+
+ADMIN_SIGNIN_SECURITY_SCRIPT = """<script>(()=>{const $=id=>document.getElementById(id);const status=$('admin-mfa-status'),feedback=$('admin-mfa-feedback');
+const call=async(url,method='GET',body)=>{const response=await fetch(url,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});let data={};try{data=await response.json()}catch{}if(!response.ok)throw Object.assign(new Error(data.detail||'Request failed.'),{status:response.status});return data};
+const showCodes=codes=>{$('admin-mfa-code-list').textContent=codes.join('\\n');$('admin-mfa-codes').hidden=false};
+const refresh=async()=>{try{const data=await call('/api/platform-owner/mfa/status');$('admin-mfa-setup').hidden=true;
+if(data.mfa_enabled){status.textContent='Two-factor authentication is on. Recovery codes left: '+data.recovery_codes_remaining+'.';$('admin-mfa-enable').hidden=true;$('admin-mfa-regenerate').hidden=false}
+else{status.textContent='Two-factor authentication is off. Turn it on to require a code from your phone at every Administrator sign-in.';$('admin-mfa-enable').hidden=false;$('admin-mfa-regenerate').hidden=true}}
+catch(error){status.textContent=error.status===403?'Two-factor authentication applies to platform administrator accounts signed in through the Administrator portal.':'Two-factor status is unavailable right now.';$('admin-mfa-enable').hidden=true;$('admin-mfa-regenerate').hidden=true}};
+$('admin-mfa-enable').onclick=async()=>{feedback.textContent='';try{const data=await call('/api/platform-owner/mfa/enroll','POST');$('admin-mfa-secret').textContent=data.secret_base32;$('admin-mfa-uri').href=data.provisioning_uri;$('admin-mfa-setup').hidden=false;$('admin-mfa-enable').hidden=true;$('admin-mfa-code').focus()}catch(error){feedback.textContent=error.message}};
+$('admin-mfa-confirm-form').onsubmit=async event=>{event.preventDefault();feedback.textContent='';try{const data=await call('/api/platform-owner/mfa/confirm','POST',{code:$('admin-mfa-code').value.trim()});$('admin-mfa-secret').textContent='';showCodes(data.recovery_codes);feedback.textContent=data.message;await refresh()}catch(error){feedback.textContent=error.message}};
+$('admin-mfa-regenerate').onclick=async()=>{if(!confirm('Replace your recovery codes? The old ones stop working.'))return;feedback.textContent='';try{const data=await call('/api/platform-owner/recovery-codes/regenerate','POST');showCodes(data.recovery_codes);feedback.textContent='New recovery codes created. The old ones no longer work.';await refresh()}catch(error){feedback.textContent=error.message}};
+refresh()})();</script>"""
+
+
 @app.get("/admin-portal", response_class=HTMLResponse)
 
 
@@ -107437,7 +107480,8 @@ def administrator_portal_page(request: Request) -> str:
 
 
 
-        content,
+        content.replace('<article class="admin-command-card"><h2>Administrator tools</h2>', ADMIN_SIGNIN_SECURITY_CARD + '<article class="admin-command-card"><h2>Administrator tools</h2>', 1),
+        ADMIN_SIGNIN_SECURITY_SCRIPT,
 
 
 

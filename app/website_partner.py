@@ -19,6 +19,9 @@ VALID_APPLICATION_STATUSES={'pending','approved','rejected','more_information_re
 def _clean(value,limit=500): return str(value or '').strip()[:limit]
 
 
+LOGIN_PAGE_HEADERS={'Cache-Control':'no-cache'}
+
+
 def _portal_destination(login_url,path):
     portal=urlsplit(login_url); destination=urlsplit(path)
     return urlunsplit((portal.scheme,portal.netloc,destination.path,destination.query,''))
@@ -26,11 +29,14 @@ def _portal_destination(login_url,path):
 
 def register_website_partner_routes(app: FastAPI,shell) -> None:
     @app.get('/partner.html')
-    def public_partner_page(): return FileResponse(PAGE,media_type='text/html')
+    # Sign-in pages carry the login script itself: without Cache-Control a
+    # browser may heuristically reuse an old copy after a deploy (seen in the
+    # 2026-09-26 admin pass -- a stale partner.html missed the MFA step).
+    def public_partner_page(): return FileResponse(PAGE,media_type='text/html',headers=LOGIN_PAGE_HEADERS)
 
     @app.get('/customer-login.html')
     def public_customer_login_page():
-        return FileResponse(CUSTOMER_LOGIN_PAGE,media_type='text/html')
+        return FileResponse(CUSTOMER_LOGIN_PAGE,media_type='text/html',headers=LOGIN_PAGE_HEADERS)
 
     @app.get('/api/website/partner-session')
     def website_session(request: Request):
