@@ -89,7 +89,7 @@
   }
   results.addEventListener('click',ev=>{const b=ev.target.closest('.aw-card');if(b)openItem(b)});
 
-  function stat(name,value){return `<div class="aw-stat"><span>${esc(name)}</span><strong>${esc(value)}</strong></div>`}
+  function stat(name,value){return `<div class="aw-stat"><span>${esc(name)}</span><strong>${esc(typeof value==='number'?value.toLocaleString():value)}</strong></div>`}
   function renderSummary(s){
     const t=s.total||0,by=s.by_type||{},res=s.by_result||{};
     const sum=keys=>keys.reduce((n,k)=>n+(by[k]||0),0);

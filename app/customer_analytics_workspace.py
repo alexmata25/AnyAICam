@@ -473,7 +473,7 @@ NAV_ASSETS = """<style>
 .nav .nav-flyout a:hover,.nav .nav-flyout a:focus-visible,.nav .nav-flyout a[aria-current="page"]{background:rgba(67,209,204,.14);color:#a7faf4;outline:none}
 .mobile-analytics-toggle{border:0;background:transparent;color:inherit;font:inherit;padding:10px 4px;border-radius:10px;cursor:pointer}
 .mobile-analytics-toggle.active,.mobile-analytics-toggle[aria-expanded="true"]{background:#193329;color:#7ee8c7}
-.mobile-analytics-sheet{position:fixed;z-index:25;left:12px;right:12px;bottom:78px;padding:8px;border-radius:15px;background:rgba(17,26,40,.98);border:1px solid rgba(170,196,207,.22);box-shadow:0 -10px 30px rgba(0,0,0,.4);display:grid;gap:2px}
+.mobile-analytics-sheet{position:fixed;z-index:10000;left:12px;right:12px;bottom:78px;padding:8px;border-radius:15px;background:rgba(17,26,40,.98);border:1px solid rgba(170,196,207,.22);box-shadow:0 -10px 30px rgba(0,0,0,.4);display:grid;gap:2px}
 .mobile-analytics-sheet[hidden]{display:none}
 .mobile-analytics-sheet a{display:block;padding:13px 14px;border-radius:10px;color:#e8eef6;text-decoration:none;font-weight:700}
 .mobile-analytics-sheet a:active,.mobile-analytics-sheet a[aria-current="page"]{background:rgba(67,209,204,.14);color:#a7faf4}

@@ -293,3 +293,13 @@ def test_existing_live_grid_tiles_and_controls_are_unchanged(client):
     assert 'id="unlock-door-cam-door"' in response.text
     assert "wireUnlockButton" in response.text
     assert "querySelectorAll('.unlock-door')" in response.text
+
+
+def test_floating_button_sits_above_the_phone_tab_bar(client):
+    """2026-09-25: on phones the button (right:10px;bottom:10px) covered the
+    bottom tab bar's last tab (Account); where the bar exists it now sits
+    above it, and the Analytics submenu opens above the button."""
+    html = client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()}).text
+    assert "mobile-nav" in html
+    assert "@media (max-width:760px){body:has(.mobile-nav) .aaco-float-root{bottom:84px}" in html
+    assert ".mobile-analytics-sheet{position:fixed;z-index:10000;" in html or "mobile-analytics-sheet" not in html
