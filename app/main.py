@@ -11355,6 +11355,23 @@ def append_audit_entry(entry: dict) -> None:
 
 
 
+def append_audit_log(action: str, *, user: dict, details: dict | None = None) -> None:
+    """Audit helper the investigation-case routes call. It was never defined,
+    so creating or updating a case saved the record and then failed with a
+    NameError 500 (admin portal pass 2026-09-26). Writes the same audit
+    entry shape as every other route (append_audit_entry)."""
+    details = details or {}
+    case_id = details.get("case_id")
+    append_audit_entry(AuditEntryModel(
+        user_id=str(user.get("id") or "unknown"),
+        user_name=str(user.get("display_name") or user.get("email") or user.get("id") or "Unknown user"),
+        role=str(user.get("role") or "viewer"),
+        action=action,
+        resource=f"investigation_case:{case_id}" if case_id else action,
+        detail=json.dumps(details, default=str)[:500],
+    ).model_dump(mode="json"))
+
+
 def record_audit(
 
 
@@ -25620,7 +25637,7 @@ def backup_source_files(
 
 
 
-        INVITATIONS_FILE,
+        USER_INVITES_FILE,
 
 
 
@@ -53081,7 +53098,11 @@ def events_api(camera: int | None = None, date: str | None = None, limit: int = 
 
 
 
-def save_snapshot(request: SnapshotRequest) -> dict:
+def save_snapshot(request: SnapshotRequest, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): no permission or camera check before.
+    snapshot_user = current_user(http_request)
+    if not has_permission(snapshot_user, "view_live") or request.camera not in user_camera_ids(snapshot_user):
+        raise HTTPException(status_code=403, detail="Camera access is required.")
 
 
 
@@ -53729,7 +53750,11 @@ def read_event_settings(camera_number: int) -> dict:
 
 
 
-def update_event_settings(camera_number: int, settings: EventSettingsModel) -> dict:
+def update_event_settings(camera_number: int, settings: EventSettingsModel, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): this legacy settings route had no
+    # permission check, so any signed-in account could change it.
+    if not has_permission(current_user(http_request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
 
 
 
@@ -53909,7 +53934,11 @@ def read_alert_rule(camera_number: int) -> dict:
 
 
 
-def update_alert_rule(camera_number: int, rule: AlertRuleModel) -> dict:
+def update_alert_rule(camera_number: int, rule: AlertRuleModel, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): this legacy settings route had no
+    # permission check, so any signed-in account could change it.
+    if not has_permission(current_user(http_request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
 
 
 
@@ -58933,7 +58962,11 @@ def analytics_rules_api(camera: int | None = None) -> dict:
 
 
 
-def create_analytics_rule(rule: AnalyticsRuleModel) -> dict:
+def create_analytics_rule(rule: AnalyticsRuleModel, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): this legacy settings route had no
+    # permission check, so any signed-in account could change it.
+    if not has_permission(current_user(http_request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
 
 
 
@@ -66940,7 +66973,12 @@ def enterprise_incident_response_page(request: Request) -> str:
 
 
 
-    incident_data = '<script id="incident-data" type="application/json">' + escape(json.dumps(incidents)) + '</script>'
+    # Script-safe JSON, not HTML-escaped: a <script> body is never entity-decoded,
+    # so escape()'s &quot; made JSON.parse throw and killed the whole Incidents
+    # page script (admin portal pass 2026-09-26). <, > and & are unicode-escaped
+    # so no stored value can close the tag.
+    incident_json = json.dumps(incidents).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    incident_data = '<script id="incident-data" type="application/json">' + incident_json + '</script>'
 
 
 
@@ -109883,7 +109921,7 @@ def administrator_activation_operations_page(request: Request) -> str:
 
 
 
-              <option value="active">Active</option>
+              <option value="completed">Active (onboarding complete)</option>
 
 
 
@@ -109892,7 +109930,7 @@ def administrator_activation_operations_page(request: Request) -> str:
 
 
 
-              <option value="needs_attention">Needs attention</option>
+              <option value="needs_changes">Needs attention</option>
 
 
 
@@ -112394,7 +112432,7 @@ def subscription_admin_page(request: Request) -> str:
 
 
 
-      requestsHost.innerHTML=(data.requests||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.request_type.replaceAll('_',' '))}</strong><div class="subscription-meta">Plan: ${escAdmin(item.requested_plan||'—')} · Cameras: ${item.requested_camera_limit??'—'}<br>${escAdmin(item.reason||'')}</div><div class="subscription-actions"><button onclick="updateRequest('${item.id}','approved')">Approve</button><button onclick="updateRequest('${item.id}','declined')">Decline</button><button onclick="updateRequest('${item.id}','completed')">Complete</button></div></div>`).join('')||'<div class="empty">No subscription requests.</div>';
+      requestsHost.innerHTML=(data.requests||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.request_type.replaceAll('_',' '))}</strong> <span class="subscription-status">${escAdmin(String(item.status||'pending').replaceAll('_',' '))}</span><div class="subscription-meta">Plan: ${escAdmin(item.requested_plan||'—')} · Cameras: ${item.requested_camera_limit??'—'}<br>${escAdmin(item.reason||'')}${item.admin_note?`<br>Admin note: ${escAdmin(item.admin_note)}`:''}</div><div class="subscription-actions"><button onclick="updateRequest('${item.id}','approved')">Approve</button><button onclick="updateRequest('${item.id}','declined')">Decline</button><button onclick="updateRequest('${item.id}','completed')">Complete</button></div></div>`).join('')||'<div class="empty">No subscription requests.</div>';
 
 
 
@@ -112403,7 +112441,7 @@ def subscription_admin_page(request: Request) -> str:
 
 
 
-      ticketsHost.innerHTML=(data.tickets||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.subject)}</strong><div class="subscription-meta">${escAdmin(item.priority)} · ${escAdmin(item.message)}</div><div class="subscription-actions"><button onclick="updateTicket('${item.id}','in_progress')">In progress</button><button onclick="updateTicket('${item.id}','resolved')">Resolve</button><button onclick="updateTicket('${item.id}','closed')">Close</button></div></div>`).join('')||'<div class="empty">No billing tickets.</div>';
+      ticketsHost.innerHTML=(data.tickets||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.subject)}</strong> <span class="subscription-status">${escAdmin(String(item.status||'open').replaceAll('_',' '))}</span><div class="subscription-meta">${escAdmin(item.priority)} · ${escAdmin(item.message)}${item.admin_note?`<br>Admin note: ${escAdmin(item.admin_note)}`:''}</div><div class="subscription-actions"><button onclick="updateTicket('${item.id}','in_progress')">In progress</button><button onclick="updateTicket('${item.id}','resolved')">Resolve</button><button onclick="updateTicket('${item.id}','closed')">Close</button></div></div>`).join('')||'<div class="empty">No billing tickets.</div>';
 
 
 

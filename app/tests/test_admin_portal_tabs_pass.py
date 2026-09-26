@@ -237,3 +237,62 @@ def test_billing_admin_api_refuses_non_admins(cloud_client, billing_files):
 def test_forms_reset_with_event_target_after_await():
     source = (main.Path(main.__file__)).read_text(encoding="utf-8")
     assert "event.currentTarget.reset()" not in source  # currentTarget is null once the handler awaits
+
+
+# ------------------------------------------------------------ runtime NameErrors / unguarded legacy routes
+
+
+def test_backup_creation_no_longer_crashes(cloud_client, tmp_path, monkeypatch):
+    for name in ("BACKUP_FOLDER", "BACKUPS_FOLDER"):
+        monkeypatch.setattr(main, name, tmp_path / "backups")
+    (tmp_path / "backups").mkdir()
+    monkeypatch.setattr(main, "BACKUP_JOBS_FILE", tmp_path / "backup_jobs.json")
+    monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit.jsonl")
+    response = cloud_client.post("/api/backups", json={"label": "admin pass"}, cookies=_legacy_admin_cookies())
+    assert response.status_code == 200, response.text[:300]  # was NameError: INVITATIONS_FILE
+    assert list((tmp_path / "backups").iterdir()), "no archive was written"
+
+
+def test_investigation_case_create_and_update_succeed(cloud_client, tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "INVESTIGATION_CASES_FILE", tmp_path / "cases.json")
+    monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit.jsonl")
+    cookies = _legacy_admin_cookies()
+    created = cloud_client.post("/api/investigation-cases", json={"title": "Break-in review"}, cookies=cookies)
+    assert created.status_code == 200, created.text[:300]  # was NameError: append_audit_log after saving
+    case_id = created.json()["case"]["id"]
+    updated = cloud_client.put(f"/api/investigation-cases/{case_id}", json={"title": "Break-in review", "priority": "high", "status": "open"}, cookies=cookies)
+    assert updated.status_code == 200, updated.text[:300]
+    audit = (tmp_path / "audit.jsonl").read_text(encoding="utf-8")
+    assert "investigation.case_created" in audit and "investigation.case_updated" in audit
+
+
+def _customer_cookies():
+    return {partner_portal.SESSION_COOKIE: partner_portal._token("owner@example.test", "customer_owner", None, "cust-1", None)}
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("PUT", "/api/pricing-config-legacy", {"trial_days": 0}),
+    ("GET", "/pricing-admin-legacy", None),
+    ("POST", "/api/quotes", {"resolution": "2mp", "recording": "motion", "retention": 7, "quantity": 1}),
+    ("PUT", "/api/cameras/1/event-settings", {"camera": 1}),
+    ("PUT", "/api/cameras/1/alert-rule", {"camera": 1}),
+    ("POST", "/api/analytics/rules", {"camera": 1, "name": "Gate", "analytic_type": "intrusion"}),
+    ("POST", "/api/snapshots", {"camera": 1, "image_data": "data:image/png;base64,AAAA"}),
+])
+def test_customers_cannot_use_admin_or_camera_settings_routes(cloud_client, method, path, body):
+    response = cloud_client.request(method, path, json=body, cookies=_customer_cookies(), follow_redirects=False)
+    assert response.status_code in (401, 403), (path, response.status_code, response.text[:200])
+
+
+def test_admin_can_still_edit_legacy_pricing_and_camera_settings(cloud_client, tmp_path, monkeypatch):
+    import pricing_config
+
+    saved = {}
+    monkeypatch.setattr(pricing_config, "save_pricing", lambda config: saved.update(config))
+    import pricing_portal
+    monkeypatch.setattr(pricing_portal, "save_pricing", lambda config: saved.update(config))
+    monkeypatch.setattr(main, "ALERT_RULES_FILE", tmp_path / "alert_rules.json")
+    cookies = _legacy_admin_cookies()
+    assert cloud_client.put("/api/pricing-config-legacy", json={"trial_days": 14}, cookies=cookies).status_code == 200
+    assert saved.get("trial_days") == 14
+    assert cloud_client.put("/api/cameras/1/alert-rule", json={"camera": 1}, cookies=cookies).status_code == 200
