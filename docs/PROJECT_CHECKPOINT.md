@@ -4054,3 +4054,21 @@ Next: stage the `8e1f166` installer on the Ryzen and install with `--repair` (th
 ### State to resume from
 
 Staging is live on `2ccbe34`. Ryzen untouched (still on `34f144d`); production untouched. Next development phase, before the Ryzen rollout: give PPE, Facial Recognition and People Counting real visual media on their Analytics pages (today none of their detections store a snapshot or clip).
+
+## Milestone: Ryzen updated to golden `f44e753` (controlled installer update, rollback preserved) and validated -- 2026-09-26
+
+**Authorized by the user** ("Deploy the current tested golden build to the Ryzen as a controlled update, preserving rollback, then validate the same UI there"). Same division of labor as every Ryzen release: Claude built, hash-verified and staged the release without sudo; the operator ran the privileged install.
+
+**Before**: Ryzen on `23deea550e61` (healthy, 18 h uptime); rollback images back to `rollback-f0ca3cb` present.
+
+**Build**: `installer/build_release_installer.py --vms-commit f44e753739c7ea9fc7676b987175dca16cd5d7cd --vms-repo . --mediamtx-binary ... --mediamtx-sha256 9fac297a...` -> `anyaicam-appliance-installer-1.1.0-vms-f44e753739c7.tar.gz`, SHA-256 `b501a516cca105820970b564e5e5a086593ace763e044f9861ed5291776bed70`; all builder checks PASS (16 scripts LF, executable bits). Installer scripts taken from `b3d6fcb` -- verified zero diff vs `f44e753` under `installer/` and `appliance-agent/`. MediaMTX v1.21.0: official tarball matches the project's `checksums.sha256` (`e02e34c3...`), extracted binary `9fac297a...` byte-identical to the one already installed at `/opt/anyaicam/mediamtx/mediamtx`. Artifact `scp`'d to `~/`, hash re-verified on the Ryzen, extracted to `~/anyaicam-release-f44e753` (`VMS_RELEASE_COMMIT=f44e753...`, embedded MediaMTX hash re-verified).
+
+**Install**: operator ran `sudo ./install.sh --repair` + `sudo bash validate.sh`. Rollback point created by the installer: image `anyaicam-vms:rollback-23deea550e61`, DB backup `partner_portal-pre-f44e753739c7-20260926T070201Z.db`, `/var/lib/anyaicam/rollback/latest.env` (restore: `sudo ./rollback.sh` from the release folder, `--restore-database` to also restore the DB).
+
+**Verified after**: `/health` build `f44e753739c7...`, `/ready` 200, container healthy, `RestartCount=0`, `anyaicam-agent.service` active; 16 FFmpeg processes; all 5 cameras writing fresh recordings; 5 live HLS playlists updating; clips, analytics events, alerts being written; no errors in the post-start logs. Customer UI (cloud portal, staging, signed-in customer): 13 Smart Motion results recorded by the Ryzen in the first ~2 minutes after the update, 11 with clip + snapshot; newest cards show their real snapshot before click; a post-update clip (Living Room, 02:03-02:05 local) plays inline; switching to another post-update result keeps a single player. (The Ryzen's own `/analytics` is behind the local emergency-recovery sign-in, by design for an edge appliance.)
+
+**Not included**: `feature/analytics-event-media-20260926` (`b3d6fcb` PPE/Facial Recognition/People Counting media reuse, `962957b` customer exclusion zones) -- tested, not merged to golden, not deployed anywhere.
+
+### State to resume from
+
+Staging `2ccbe34` (code == golden `f44e753`), Ryzen `f44e753`. Next: review/merge `feature/analytics-event-media-20260926`, deploy to staging, then a Ryzen update to exercise PPE/Facial/People Counting media and exclusion zones on real cameras.
