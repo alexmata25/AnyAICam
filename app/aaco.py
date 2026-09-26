@@ -17,6 +17,10 @@ class AacoCommand:
     end: datetime | None = None
     event_type: str | None = None
     offset_minutes: int | None = None
+    # Optional result cap for event_search (2026-09-26): 1 means "the latest
+    # matching event" (aaco_freeform.py); None keeps every existing command
+    # exactly as before.
+    limit: int | None = None
 
 
 @dataclass(frozen=True)
@@ -33,7 +37,7 @@ class VmsBoundary(Protocol):
     def authorized_camera(self, identity: dict, camera_id: str) -> object: ...
     def live_view(self, identity: dict, camera_id: str) -> object: ...
     def playback(self, identity: dict, camera_id: str, start: datetime, end: datetime) -> object: ...
-    def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime) -> object: ...
+    def search_events(self, identity: dict, *, event_type: str | None, camera_id: str | None, start: datetime, end: datetime, limit: int | None = None) -> object: ...
     def previous_event(self, identity: dict, camera_id: str, before: datetime) -> object: ...
     def camera_status(self, identity: dict) -> object: ...
     def unlock_door(self, identity: dict, door_id: str) -> object: ...
@@ -178,6 +182,10 @@ _VIEW_FRAME_PATTERNS = (
 _TALK_FRAME = re.compile(r"^(?:talk to|talk down to|talk down at|speak to|say something to) (?:the |my |our )?(?P<phrase>[a-z0-9][a-z0-9 &'_-]{0,80})$")
 
 
+UNKNOWN_REQUEST_MESSAGE = "I can show an authorized camera, playback, events, offline cameras, the previous event, unlock an authorized door, or navigate current playback."
+PREVIOUS_EVENT_NEEDS_CONTEXT = "Select an event before asking for the previous event."
+
+
 class DeterministicLanguageAdapter:
     """A small safe grammar; a future LLM may only emit ``AacoCommand``.
 
@@ -199,7 +207,7 @@ class DeterministicLanguageAdapter:
             return AacoCommand("live_view", camera_id=context["camera_id"])
         if value in _PREVIOUS_EVENT_PHRASES:
             if not context or not context.get("camera_id") or not context.get("event_at"):
-                return Clarification("Select an event before asking for the previous event.")
+                return Clarification(PREVIOUS_EVENT_NEEDS_CONTEXT)
             return AacoCommand("event_navigation", camera_id=context["camera_id"], end=context["event_at"])
         match = re.fullmatch(r"(?:go back|rewind|back up) (\d+|ten|twenty|thirty) minutes?", value)
         if match:
@@ -266,7 +274,7 @@ class DeterministicLanguageAdapter:
             if door_name in {"door", "doors"}:
                 return Clarification("Tell me which authorized door you want to unlock.")
             return AacoCommand("unlock_door", camera_id=_camera_token(door_name))
-        return Clarification("I can show an authorized camera, playback, events, offline cameras, the previous event, unlock an authorized door, or navigate current playback.")
+        return Clarification(UNKNOWN_REQUEST_MESSAGE)
 
 
 def execute(command: AacoCommand, *, identity: dict, vms: VmsBoundary) -> object:
@@ -276,7 +284,17 @@ def execute(command: AacoCommand, *, identity: dict, vms: VmsBoundary) -> object
     if command.operation == "event_search":
         if not command.start or not command.end:
             raise ValueError("Event range required.")
-        return vms.search_events(identity, event_type=command.event_type, camera_id=command.camera_id, start=command.start, end=command.end)
+        if command.camera_id:
+            # A named camera goes through the same gate as every other
+            # camera-taking operation below: ask when it is ambiguous, fail
+            # closed when it is not this customer's.
+            authorized = vms.authorized_camera(identity, command.camera_id)
+            if isinstance(authorized, Clarification):
+                return authorized
+            if not authorized:
+                raise PermissionError("Camera is unavailable.")
+        extra = {"limit": command.limit} if command.limit else {}
+        return vms.search_events(identity, event_type=command.event_type, camera_id=command.camera_id, start=command.start, end=command.end, **extra)
     if command.operation == "unlock_door":
         # Deliberately bypasses the generic authorized_camera() gate
         # below -- that gate only proves live/playback fleet membership,
