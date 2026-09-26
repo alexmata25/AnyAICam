@@ -42226,6 +42226,15 @@ PARTNER_IDENTITY_ONLY_NAV_KEYS = {
 CUSTOMER_VIDEO_NAV_KEYS = {"events", "alerts", "playback", "media", "dashboard"}
 
 
+# Admin portal pass (2026-09-26): the single-appliance footage pages. On the
+# cloud they only read the portal container's own local event store -- stale
+# demo events whose snapshots 404 -- and they are exactly the customer-footage
+# surface the rule above keeps away from administrators. Hidden from the
+# cloud Administrator portal nav only; edge appliances keep them, and the
+# routes themselves are unchanged.
+CLOUD_ADMIN_EDGE_FOOTAGE_NAV_KEYS = {"analytics", "investigate", "ai-detection"}
+
+
 
 
 
@@ -47342,7 +47351,10 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
         # see PARTNER_IDENTITY_ONLY_NAV_KEYS -- and not to customer video/
         # footage nav items, which being an administrator must never imply
         # -- see CUSTOMER_VIDEO_NAV_KEYS. Every other item stays visible.
-        return {key for key, _url, _icon, _label in NAV_ITEMS} - PARTNER_IDENTITY_ONLY_NAV_KEYS - CUSTOMER_VIDEO_NAV_KEYS
+        hidden = PARTNER_IDENTITY_ONLY_NAV_KEYS | CUSTOMER_VIDEO_NAV_KEYS
+        if RUNTIME_ROLE == "cloud":
+            hidden = hidden | CLOUD_ADMIN_EDGE_FOOTAGE_NAV_KEYS
+        return {key for key, _url, _icon, _label in NAV_ITEMS} - hidden
 
 
 

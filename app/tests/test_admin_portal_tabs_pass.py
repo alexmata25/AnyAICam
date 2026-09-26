@@ -310,3 +310,11 @@ def test_audit_log_filters_match_real_roles_and_namespaced_actions(cloud_client,
     assert "investigation.case_created" in get(action="create")
     roles = {e["role"] for e in cloud_client.get("/api/audit-logs", params={"role": "administrator"}, cookies=cookies).json()["entries"]}
     assert roles == {"administrator"}
+
+
+def test_cloud_admin_nav_omits_single_appliance_footage_pages(cloud_client, monkeypatch):
+    tabs = _nav_hrefs(cloud_client.get("/admin-portal", cookies=_platform_admin_cookies()).text)
+    for href in ("/analytics", "/investigate", "/ai-detection"):
+        assert href not in tabs
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
+    assert main.navigation_keys_for_role("administrator") >= {"analytics", "investigate", "ai-detection"}
