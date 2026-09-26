@@ -31,8 +31,20 @@ STATIC = Path(__file__).resolve().parents[1] / "static"
 ASSETS = {name: (STATIC / name).read_text(encoding="utf-8")
           for name in ("event_media.js", "inline_media.js", "inline_media.css", "analytics_workspace.js")}
 BROWSERS = [("chromium", None), ("msedge", "msedge")]
-# 1x1 PNG snapshot
-PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkqPtfDwAEtQHgPbYKbQAAAABJRU5ErkJggg==")
+
+
+def _snapshot_jpeg():
+    """A bright, recognizable 480x270 'snapshot' (what ?size=card serves)."""
+    import cv2
+    import numpy as np
+    image = np.full((270, 480, 3), (60, 170, 230), dtype=np.uint8)
+    cv2.rectangle(image, (120, 60), (360, 210), (250, 250, 250), -1)
+    return cv2.imencode(".jpg", image)[1].tobytes()
+
+
+SNAPSHOT = _snapshot_jpeg()
+HELD = []
+NO_THUMBNAIL, FAILING_THUMBNAIL, SNAPSHOT_ONLY = "ev-6", "ev-7", "ev-3"
 
 
 def _render_pages():
@@ -69,8 +81,9 @@ def _events():
     events = []
     for index in range(8):
         events.append({"event_id": f"ev-{index}", "camera_id": "cam-1", "event_type": "person" if index % 2 else "car",
-                       "timestamp_ms": now - index * 600000, "confidence": 0.8, "has_clip": index != 3,
-                       "has_thumbnail": True, "details": {"object_count": 1}})
+                       "timestamp_ms": now - index * 600000, "confidence": 0.8,
+                       "has_clip": f"ev-{index}" not in (SNAPSHOT_ONLY, NO_THUMBNAIL),
+                       "has_thumbnail": f"ev-{index}" != NO_THUMBNAIL, "details": {"object_count": 1}})
     return {"events": events, "summary": {"total": 8, "by_type": {"person": 4, "car": 4}}, "next_before": None,
             "enabled_camera_ids": ["cam-1"]}
 
@@ -108,7 +121,7 @@ def webm(playwright_instance):
         browser.close()
 
 
-def _open(playwright_instance, engine, channel, pages, webm, path, *, mobile=False):
+def _open(playwright_instance, engine, channel, pages, webm, path, *, mobile=False, hold_thumbnail=None, seen=None):
     try:
         browser = playwright_instance.chromium.launch(channel=channel) if channel else playwright_instance.chromium.launch()
     except Exception as error:  # browser not installed on this machine
@@ -128,7 +141,15 @@ def _open(playwright_instance, engine, channel, pages, webm, path, *, mobile=Fal
         if tail == "/api/customer/analytics/smart_motion/events":
             return route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
         if tail.endswith("/thumbnail"):
-            return route.fulfill(status=200, content_type="image/png", body=PNG)
+            event_id = tail.split("/")[-2]
+            if seen is not None:
+                seen.append(url[len(ORIGIN):])
+            if event_id == FAILING_THUMBNAIL:
+                return route.fulfill(status=404, body="")
+            if event_id == hold_thumbnail:
+                HELD.append(route)  # the test releases it to observe the loading state
+                return None
+            return route.fulfill(status=200, content_type="image/jpeg", body=SNAPSHOT)
         if tail.endswith("/media/url"):
             event_id = tail.split("/")[-3]
             return route.fulfill(status=200, content_type="application/json", body=json.dumps({"url": f"/clips/{event_id}.webm"}))
@@ -258,5 +279,89 @@ def test_phone_analytics_submenu_and_inline_playback(playwright_instance, pages,
         _wait_playing(page)
         tools = page.locator(".inline-media-card [data-act]:visible")
         assert all(box["height"] >= 40 for box in tools.evaluate_all("els => els.map(e => e.getBoundingClientRect().toJSON())"))
+    finally:
+        browser.close()
+
+
+def _brightness(page, selector):
+    """Mean brightness (0-255) of what the card preview actually renders."""
+    import cv2
+    import numpy as np
+    shot = page.locator(selector).screenshot()
+    return float(cv2.imdecode(np.frombuffer(shot, dtype=np.uint8), cv2.IMREAD_GRAYSCALE).mean())
+
+
+def _thumb(event_id):
+    return f'#aw-results .aw-card[data-event="{event_id}"] .aw-thumb'
+
+
+@pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "phone"])
+@pytest.mark.parametrize("engine,channel", BROWSERS, ids=[b[0] for b in BROWSERS])
+def test_results_show_their_snapshot_before_they_are_opened(playwright_instance, pages, webm, engine, channel, mobile):
+    seen = []
+    browser, page = _open(playwright_instance, engine, channel, pages, webm, "/analytics/smart-motion", mobile=mobile, seen=seen)
+    try:
+        for event_id in ("ev-1", "ev-2"):
+            page.wait_for_selector(f'{_thumb(event_id)}[data-preview="ready"]', timeout=15000)
+            page.wait_for_function("(sel) => { const i = document.querySelector(sel + ' img'); return i.naturalWidth > 0 && getComputedStyle(i).opacity === '1'; }", arg=_thumb(event_id))
+            assert _brightness(page, _thumb(event_id)) > 90, event_id  # the snapshot, not a black rectangle
+            assert page.locator(f"{_thumb(event_id)} .aw-thumb-note").is_hidden()
+        # Card-sized previews of the stored snapshot, the first screenful requested at once.
+        assert seen and all(url.endswith("/thumbnail?size=card") for url in seen)
+        assert page.locator('#aw-results .aw-card img[loading="eager"]').count() >= 5
+        # The card still carries camera, local time and the analytic's own label.
+        text = page.locator('#aw-results .aw-card[data-event="ev-1"]').inner_text()
+        assert "Person detected" in text and "Porch" in text and ("Today" in text or "Yesterday" in text) and "80% confidence" in text
+        # Selecting it expands in place and plays, with the snapshot as the poster meanwhile.
+        page.locator('#aw-results .aw-card[data-event="ev-1"]').click()
+        assert page.locator(".inline-media-card video").get_attribute("poster") == "/api/customer/events/cam-1/ev-1/thumbnail?size=card"
+        _wait_playing(page)
+        page.locator('#aw-results .aw-card[data-event="ev-2"]').click()
+        _wait_playing(page)
+        assert page.locator(".inline-media-card").count() == 1
+        assert page.evaluate("() => document.querySelector('#aw-results .aw-card[data-event=\"ev-2\"]').nextElementSibling.classList.contains('inline-media-card')")
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS, ids=[b[0] for b in BROWSERS])
+def test_a_preview_still_loading_is_a_neutral_labelled_state(playwright_instance, pages, webm, engine, channel):
+    seen = []
+    browser, page = _open(playwright_instance, engine, channel, pages, webm, "/analytics/smart-motion", hold_thumbnail="ev-4", seen=seen)
+    try:
+        HELD.clear()
+        page.wait_for_selector(f'{_thumb("ev-4")}[data-preview="loading"]', timeout=15000)
+        for _ in range(100):
+            if HELD:
+                break
+            page.wait_for_timeout(100)
+        assert HELD, "the preview request was never made"
+        page.wait_for_timeout(500)
+        assert page.locator(f'{_thumb("ev-4")}[data-preview="loading"]').count() == 1
+        assert page.locator(f"{_thumb('ev-4')} .aw-thumb-note").inner_text() == "Loading preview…"
+        assert _brightness(page, _thumb("ev-4")) > 30  # neutral slate placeholder, not the old near-black tile (~15)
+        HELD.pop().fulfill(status=200, content_type="image/jpeg", body=SNAPSHOT)
+        page.wait_for_selector(f'{_thumb("ev-4")}[data-preview="ready"]', timeout=15000)
+        page.wait_for_timeout(400)  # fade-in
+        assert _brightness(page, _thumb("ev-4")) > 90
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "phone"])
+def test_no_preview_is_said_plainly_never_a_black_box(playwright_instance, pages, webm, mobile):
+    browser, page = _open(playwright_instance, "chromium", None, pages, webm, "/analytics/smart-motion", mobile=mobile)
+    try:
+        for event_id in (NO_THUMBNAIL, FAILING_THUMBNAIL):
+            page.wait_for_selector(f'{_thumb(event_id)}[data-preview="none"]', timeout=15000)
+            assert page.locator(f"{_thumb(event_id)} .aw-thumb-note").inner_text() == "No preview available", event_id
+            assert page.locator(f"{_thumb(event_id)} img").count() == 0
+            assert _brightness(page, _thumb(event_id)) > 30, event_id
+        # Opening a result with no media at all explains itself too.
+        page.locator(f'#aw-results .aw-card[data-event="{NO_THUMBNAIL}"]').click()
+        card = page.locator(".inline-media-card")
+        card.wait_for()
+        assert card.locator(".inline-media-empty").inner_text() == "No preview available"
+        assert card.locator("img").count() == 0
     finally:
         browser.close()

@@ -67,13 +67,17 @@
     const kind=key==='line_crossing'?'Line crossed':'Zone intrusion';
     return [key==='line_crossing'?'Line':'Zone','',d.rule?`${kind}: ${d.rule}`:kind,[d.direction?`Direction: ${pretty(d.direction)}`:null,e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
   }
-  function card(e){
+  const thumbUrl=(e,size)=>`/api/customer/events/${encodeURIComponent(e.camera_id)}/${encodeURIComponent(e.event_id)}/thumbnail${size?`?size=${size}`:''}`;
+  const EAGER_CARDS=8;  // the first screenful loads at once; the rest as they scroll into view
+  function card(e,index){
     const [badge,badgeClass,title,lines]=describe(e);
-    const img=e.has_thumbnail?`<img src="/api/customer/events/${encodeURIComponent(e.camera_id)}/${encodeURIComponent(e.event_id)}/thumbnail" alt="" loading="lazy" decoding="async" onerror="this.remove()">`:'<span>No snapshot</span>';
+    const img=e.has_thumbnail
+      ?`<span class="aw-thumb-note">Loading preview…</span><img src="${thumbUrl(e,'card')}" alt="" loading="${index<EAGER_CARDS?'eager':'lazy'}" decoding="async"${index<EAGER_CARDS?' fetchpriority="high"':''}>`
+      :'<span class="aw-thumb-note">No preview available</span>';
     const plate=key==='lpr'&&e.details&&e.details.plate?`<span class="aw-plate">${esc(e.details.plate)}</span>`:'';
     const meta=[cameraName[e.camera_id]||'Camera',when(e.timestamp_ms),...lines].filter(Boolean).map(esc).join(' · ');
     return `<button type="button" class="aw-card" data-inline-key="${e.has_clip?'event':'snapshot'}:${esc(e.event_id)}" data-event="${esc(e.event_id)}" aria-expanded="false" aria-label="${esc(title)}, ${esc(when(e.timestamp_ms))}${e.has_clip?', play clip':''}">
-      <span class="aw-thumb">${img}<span class="aw-badge ${badgeClass}">${esc(badge)}</span>${plate}${e.has_clip?'<span class="aw-play" aria-hidden="true">▶</span>':''}</span>
+      <span class="aw-thumb" data-preview="${e.has_thumbnail?'loading':'none'}">${img}<span class="aw-badge ${badgeClass}">${esc(badge)}</span>${plate}${e.has_clip?'<span class="aw-play" aria-hidden="true">▶</span>':''}</span>
       <span class="aw-body"><strong>${esc(title)}</strong><span class="aw-meta">${meta}</span></span></button>`;
   }
   function openItem(button){
@@ -82,12 +86,19 @@
     const href=playbackHref(e);
     inline.open(button,e.camera_id,{
       kind:e.has_clip?'event':'snapshot',id:e.event_id,start:e.timestamp_ms,title:`${title} — ${cameraName[e.camera_id]||''}`,
-      thumbnail:e.has_thumbnail?`/api/customer/events/${encodeURIComponent(e.camera_id)}/${encodeURIComponent(e.event_id)}/thumbnail`:'',
+      thumbnail:e.has_thumbnail?thumbUrl(e):'',poster:e.has_thumbnail?thumbUrl(e,'card'):'',
       note:e.has_thumbnail?'No video clip was recorded for this detection.':'No snapshot or clip was recorded for this detection.',
       playbackHref:href,shareUrl:location.origin+href,
     });
   }
   results.addEventListener('click',ev=>{const b=ev.target.closest('.aw-card');if(b)openItem(b)});
+  // Preview images: load/error don't bubble, so listen in the capture phase.
+  results.addEventListener('load',ev=>{const t=ev.target;if(t.tagName==='IMG'&&t.parentElement.classList.contains('aw-thumb'))t.parentElement.dataset.preview='ready'},true);
+  results.addEventListener('error',ev=>{
+    const t=ev.target;if(t.tagName!=='IMG'||!t.parentElement.classList.contains('aw-thumb'))return;
+    const thumb=t.parentElement;thumb.dataset.preview='none';t.remove();
+    const note=thumb.querySelector('.aw-thumb-note');if(note)note.textContent='No preview available';
+  },true);
 
   function stat(name,value){return `<div class="aw-stat"><span>${esc(name)}</span><strong>${esc(typeof value==='number'?value.toLocaleString():value)}</strong></div>`}
   function renderSummary(s){
@@ -126,7 +137,8 @@
       if(!r.ok)throw new Error(typeof body.detail==='string'?body.detail:'Analytics could not be loaded.');
       if(!append)renderSummary(body.summary||{});
       body.events.forEach(e=>state.items.set(e.event_id,e));
-      const html=body.events.map(card).join('');
+      const offset=append?results.querySelectorAll('.aw-card').length:0;
+      const html=body.events.map((e,i)=>card(e,offset+i)).join('');
       if(append){results.insertAdjacentHTML('beforeend',html);inline.reattach(results)}
       else results.innerHTML=html||`<div class="aw-empty">${esc(EMPTY[key]||'Nothing')} in this period.</div>`;
       state.before=body.next_before;more.hidden=!body.next_before;

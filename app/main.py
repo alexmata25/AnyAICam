@@ -1,6 +1,6 @@
 from event_media import media_state as customer_event_media_state
 import asyncio
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 
 
@@ -143410,12 +143410,74 @@ def _customer_event_thumbnail_url(camera_id: str, event_id: str) -> str | None:
     return _presigned_recording_url(key)
 
 
+# Card-sized previews of the stored event snapshot (2026-09-25): the
+# snapshot is the full camera frame (typically 140-280 KB, 1280 px), and a
+# page of 48 Analytics result cards (~300 px wide each) downloading those in
+# full left the cards blank for seconds on phones. ?size=card returns the
+# SAME stored snapshot scaled to 480 px wide, made in memory (nothing new is
+# stored) and kept in a small bounded per-process cache; any failure falls
+# back to the normal redirect to the full snapshot.
+_CARD_THUMBNAIL_WIDTH = 480
+_CARD_THUMBNAIL_CACHE_MAX = 256
+_card_thumbnail_cache: "OrderedDict[str, bytes]" = OrderedDict()
+_card_thumbnail_cache_guard = threading.Lock()
+
+
+def _fetch_presigned_bytes(url: str, limit: int = 8 * 1024 * 1024) -> bytes | None:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = response.read(limit + 1)
+    except Exception:
+        return None
+    return data if 0 < len(data) <= limit else None
+
+
+def _card_thumbnail_bytes(s3_key: str) -> bytes | None:
+    with _card_thumbnail_cache_guard:
+        cached = _card_thumbnail_cache.get(s3_key)
+        if cached is not None:
+            _card_thumbnail_cache.move_to_end(s3_key)
+            return cached
+    url = _presigned_recording_url(s3_key)
+    original = _fetch_presigned_bytes(url) if url else None
+    if not original:
+        return None
+    try:
+        import cv2
+        import numpy as np
+        image = cv2.imdecode(np.frombuffer(original, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        height, width = image.shape[:2]
+        if width > _CARD_THUMBNAIL_WIDTH:
+            image = cv2.resize(image, (_CARD_THUMBNAIL_WIDTH, max(1, round(height * _CARD_THUMBNAIL_WIDTH / width))),
+                               interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+    except Exception:
+        return None
+    if not ok:
+        return None
+    data = encoded.tobytes()
+    with _card_thumbnail_cache_guard:
+        _card_thumbnail_cache[s3_key] = data
+        _card_thumbnail_cache.move_to_end(s3_key)
+        while len(_card_thumbnail_cache) > _CARD_THUMBNAIL_CACHE_MAX:
+            _card_thumbnail_cache.popitem(last=False)
+    return data
+
+
 @app.get("/api/customer/events/{camera_id}/{event_id}/thumbnail")
-def customer_event_thumbnail(camera_id: str, event_id: str, request: Request):
+def customer_event_thumbnail(camera_id: str, event_id: str, request: Request, size: str = ""):
     if not _customer_authorized_camera_id(request, camera_id):
         raise HTTPException(status_code=403, detail="Not authorized for this camera.")
 
     key = _customer_event_thumbnail_s3_key(camera_id, event_id)
+    if key and size == "card":
+        card = _card_thumbnail_bytes(key)
+        if card:
+            # private: only this already-authorized browser may cache it.
+            return Response(content=card, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
     response = _cacheable_presigned_redirect(key) if key else None
     if response is None:
         raise HTTPException(status_code=404, detail="Event thumbnail not available.")
