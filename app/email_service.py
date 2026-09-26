@@ -25,6 +25,9 @@ EMAIL_TYPES={
     # cloud_features.py's change_customer_account_email(). Additive only;
     # every type above is unchanged.
     'account_email_changed',
+    # Admin portal pass (2026-09-26): Customer accounts' payment reminder,
+    # previously sent through a separate raw-SMTP path in main.py.
+    'payment_reminder',
 }
 
 
