@@ -287,7 +287,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
 
         content = f'''
         <header class="topbar">
-          <div><p class="eyebrow">Detection rules</p><h1>Lines, zones &amp; people counting &middot; {camera_name}</h1></div>
+          <div><p class="eyebrow"><a class="download" href="/analytics">Analytics</a> &rsaquo; <a class="download" href="/analytics/smart-rules">Smart Rules</a></p><h1>Lines, zones &amp; people counting &middot; {camera_name}</h1></div>
           <a class="ghost-button" href="/customer/cameras/{camera_id}/live">Back to live view</a>
         </header>
         <section class="panel">
@@ -587,4 +587,4 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   startPreview();
 })();</script>''')
 
-        return page_shell(f'Detection rules · {camera_name}', 'live', content, scripts)
+        return page_shell(f'Detection rules · {camera_name}', 'analytics', content, scripts)
