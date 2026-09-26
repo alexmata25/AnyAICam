@@ -92,7 +92,19 @@ def _resolve_customer_id(identity: dict, requested: str | None) -> str:
     # legitimate id; it exists purely to make a path-traversal payload
     # (e.g. "../../etc") fail fast, here, before it can reach any query
     # or, later, any filesystem path built from this value.
-    return _require_safe_path_segment(requested, field="customer_id")
+    customer_id = _require_safe_path_segment(requested, field="customer_id")
+    # Admin portal pass (2026-09-26): staff roles were only format-checked,
+    # so a partner owner/technician/salesperson could read or change ANY
+    # customer's facial people and biometric enrollments by typing another
+    # partner's customer_id. Same tenant rule as every other partner route:
+    # a live global administrator reaches all customers, everyone else only
+    # their own partner's -- and an unknown or foreign id both answer 404.
+    from partner_db import authorize_customer_tenant, connection as _tenant_connection
+
+    with _tenant_connection() as db:
+        if not authorize_customer_tenant(db, identity, customer_id):
+            raise HTTPException(status_code=404, detail="Customer not found.")
+    return customer_id
 
 
 def _require(request: Request, permission: str) -> dict:
@@ -191,8 +203,36 @@ def _save_face_crop(image_bgr, observation, *, customer_id: str, person_id: str,
     return str(path)
 
 
+# Admin portal pass (2026-09-26): staff previously had to type a raw
+# customer id on every Facial Recognition page. The field keeps its id
+# (each page script reads .value) but now offers the customers within the
+# caller's tenant reach, by name, from GET /api/aac/customers.
+def _customer_picker(input_id: str) -> str:
+    return (
+        f'<label>Customer<input id="{input_id}" list="aac-customer-options" placeholder="Choose or type a customer id" autocomplete="off"></label>'
+        '<datalist id="aac-customer-options"></datalist>'
+        "<script>fetch('/api/aac/customers').then(r=>r.ok?r.json():{customers:[]}).then(d=>{const list=document.getElementById('aac-customer-options');"
+        "(d.customers||[]).forEach(c=>{const o=document.createElement('option');o.value=c.id;o.label=c.name||c.id;o.textContent=c.name||c.id;list.appendChild(o)})}).catch(()=>{})</script>\n"
+    )
+
+
 def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     # ---------------------------------------------------------------- API
+
+    @app.get("/api/aac/customers")
+    def aac_customers(request: Request) -> dict:
+        """Customers within the caller's tenant reach (same rule as
+        _resolve_customer_id): a customer account sees only itself."""
+        identity = _require(request, "facial.view")
+        from partner_db import connection as _tenant_connection, tenant_owns_partner
+
+        with _tenant_connection() as db:
+            rows = db.execute("SELECT id, name, partner_id FROM customers ORDER BY name").fetchall()
+            if identity["role"] in ("customer_owner", "customer_viewer"):
+                visible = [row for row in rows if row["id"] == identity.get("customer_id")]
+            else:
+                visible = [row for row in rows if tenant_owns_partner(db, identity, row["partner_id"])]
+        return {"customers": [{"id": row["id"], "name": row["name"] or row["id"]} for row in visible]}
 
     @app.get("/api/aac/capability")
     def aac_capability(request: Request) -> dict:
@@ -481,8 +521,8 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         facial_ctx = _customer_facial_context(identity)
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Facial Recognition · People", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>People</h1></div></header>' + _FACE_ACCESS_UPSELL)
-        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="aac-customer-id" placeholder="cust-..."></label>\n'
-        empty_message = "Search or refresh to load your enrolled people." if facial_ctx else "Enter a customer id and refresh."
+        customer_id_field = "" if facial_ctx else _customer_picker("aac-customer-id")
+        empty_message = "Search or refresh to load your enrolled people." if facial_ctx else "Choose a customer and refresh."
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>People</h1></div>
 <a class="action-button" href="/aac/people/enroll">Enroll person</a></header>
@@ -527,7 +567,7 @@ document.getElementById('aac-refresh').addEventListener('click',aacLoadPeople);
         facial_ctx = _customer_facial_context(identity)
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Enroll person", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>' + _FACE_ACCESS_UPSELL)
-        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="e-customer-id" placeholder="cust-..."></label>\n'
+        customer_id_field = "" if facial_ctx else _customer_picker("e-customer-id")
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>
 <section class="panel rule-form" style="max-width:640px">
@@ -581,7 +621,7 @@ document.getElementById('e-upload').addEventListener('click',async()=>{
         facial_ctx = _customer_facial_context(identity)
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Facial Recognition · Watchlists", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Watchlists</h1></div></header>' + _FACE_ACCESS_UPSELL)
-        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="w-customer-id"></label>\n'
+        customer_id_field = "" if facial_ctx else _customer_picker("w-customer-id")
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         auto_load_js = "wLoad();" if facial_ctx else ""
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Watchlists</h1></div></header>
@@ -623,7 +663,7 @@ document.getElementById('w-customer-id')?.addEventListener('change',wLoad);
         facial_ctx = _customer_facial_context(identity)
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Facial Recognition · Events", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Events</h1></div></header>' + _FACE_ACCESS_UPSELL)
-        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="ev-customer-id"></label>\n'
+        customer_id_field = "" if facial_ctx else _customer_picker("ev-customer-id")
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Events</h1></div></header>
 <section class="panel">''' + customer_id_field + '''<label>Match state<select id="ev-state"><option value="">All</option><option value="known">Known</option><option value="unknown">Unknown</option><option value="watchlist">Watchlist</option></select></label>
@@ -714,7 +754,7 @@ function aacEsc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&am
         facial_ctx = _customer_facial_context(identity)
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Facial Recognition · Settings", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Settings</h1></div></header>' + _FACE_ACCESS_UPSELL)
-        customer_id_field = "" if facial_ctx else '<label>Customer ID<input id="s-customer-id"></label>\n'
+        customer_id_field = "" if facial_ctx else _customer_picker("s-customer-id")
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         auto_load_js = "sLoad();" if facial_ctx else ""
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Settings</h1></div></header>

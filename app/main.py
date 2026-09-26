@@ -9876,319 +9876,30 @@ def invite_base_url(request: Request | None = None) -> str:
 
 
 def send_user_invitation_email(invite: dict, request: Request | None = None) -> tuple[bool, str]:
-
-
-
-
-
-
-
-
-    if not SMTP_HOST or not SMTP_FROM:
-
-
-
-
-
-
-
-
-        return False, "SMTP is not configured."
-
-
-
-
-
-
-
-
+    # Admin portal pass (2026-09-26): sent through email_service like every
+    # other account email instead of a separate raw-SMTP path, so it honours
+    # ANYAICAM_EMAIL_BACKEND (preview in development) and ANYAICAM_EMAIL_FROM.
     invite_url = f"{invite_base_url(request)}/accept-invite?token={quote(invite['token'])}"
-
-
-
-
-
-
-
-
-    message = EmailMessage()
-
-
-
-
-
-
-
-
-    message["Subject"] = "You have been invited to AnyAiCam"
-
-
-
-
-
-
-
-
-    message["From"] = SMTP_FROM
-
-
-
-
-
-
-
-
-    message["To"] = invite["email"]
-
-
-
-
-
-
-
-
-    message.set_content(
-
-
-
-
-
-
-
-
-        "\n".join(
-
-
-
-
-
-
-
-
-            [
-
-
-
-
-
-
-
-
-                "You have been invited to access AnyAiCam.",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"Permission level: {invite['role']}",
-
-
-
-
-
-
-
-
-                f"Camera access: {'All cameras' if invite.get('all_cameras') else ', '.join('Camera ' + str(item) for item in invite.get('camera_ids', []))}",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"Create your account: {invite_url}",
-
-
-
-
-
-
-
-
-                "",
-
-
-
-
-
-
-
-
-                f"This invitation expires {invite['expires_at']}.",
-
-
-
-
-
-
-
-
-            ]
-
-
-
-
-
-
-
-
-        )
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    context = ssl.create_default_context()
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
-
-
-
-
-
-
-
-
-            if SMTP_USE_TLS:
-
-
-
-
-
-
-
-
-                smtp.starttls(context=context)
-
-
-
-
-
-
-
-
-            if SMTP_USERNAME:
-
-
-
-
-
-
-
-
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-
-
-
-
-
-
-
-
-            smtp.send_message(message)
-
-
-
-
-
-
-
-
+    cameras = "All cameras" if invite.get("all_cameras") else ", ".join("Camera " + str(item) for item in invite.get("camera_ids", []))
+    text = "\n".join([
+        "You have been invited to access AnyAiCam.",
+        "",
+        f"Permission level: {invite['role']}",
+        f"Camera access: {cameras}",
+        "",
+        f"Create your account: {invite_url}",
+        "",
+        f"This invitation expires {invite['expires_at']}.",
+    ])
+    from email_service import get_email_service
+
+    result = get_email_service().send("invitation", invite["email"], "You have been invited to AnyAiCam", text)
+    status = str(result.get("status") or "")
+    if status == "sent":
         return True, "Invitation email sent."
-
-
-
-
-
-
-
-
-    except (OSError, smtplib.SMTPException) as error:
-
-
-
-
-
-
-
-
-        return False, str(error)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    if status == "preview":
+        return True, "Invitation prepared (email preview mode -- nothing was sent)."
+    return False, "the email could not be sent. Check the email settings and use Resend."
 
 def load_sessions() -> dict:
 
@@ -42515,6 +42226,15 @@ PARTNER_IDENTITY_ONLY_NAV_KEYS = {
 CUSTOMER_VIDEO_NAV_KEYS = {"events", "alerts", "playback", "media", "dashboard"}
 
 
+# Admin portal pass (2026-09-26): the single-appliance footage pages. On the
+# cloud they only read the portal container's own local event store -- stale
+# demo events whose snapshots 404 -- and they are exactly the customer-footage
+# surface the rule above keeps away from administrators. Hidden from the
+# cloud Administrator portal nav only; edge appliances keep them, and the
+# routes themselves are unchanged.
+CLOUD_ADMIN_EDGE_FOOTAGE_NAV_KEYS = {"analytics", "investigate", "ai-detection"}
+
+
 
 
 
@@ -47631,7 +47351,10 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
         # see PARTNER_IDENTITY_ONLY_NAV_KEYS -- and not to customer video/
         # footage nav items, which being an administrator must never imply
         # -- see CUSTOMER_VIDEO_NAV_KEYS. Every other item stays visible.
-        return {key for key, _url, _icon, _label in NAV_ITEMS} - PARTNER_IDENTITY_ONLY_NAV_KEYS - CUSTOMER_VIDEO_NAV_KEYS
+        hidden = PARTNER_IDENTITY_ONLY_NAV_KEYS | CUSTOMER_VIDEO_NAV_KEYS
+        if RUNTIME_ROLE == "cloud":
+            hidden = hidden | CLOUD_ADMIN_EDGE_FOOTAGE_NAV_KEYS
+        return {key for key, _url, _icon, _label in NAV_ITEMS} - hidden
 
 
 
@@ -126159,7 +125882,13 @@ def audit_logs_api(
 
 
 
-        entries = [item for item in entries if item.get("action") == action]
+        # Also match namespaced actions ("update" finds billing.account_updated,
+        # investigation.case_updated...): the filter offers generic verbs only.
+        wanted = action.lower()
+        entries = [item for item in entries if str(item.get("action") or "").lower() == wanted
+                   or wanted in str(item.get("action") or "").lower().replace(".", "_").split("_")
+                   or str(item.get("action") or "").lower().endswith(wanted + "d")
+                   or str(item.get("action") or "").lower().endswith(wanted + "ed")]
 
 
 
@@ -129579,7 +129308,7 @@ def audit_logs(request: Request) -> str:
 
 
 
-            <select id="audit-role"><option value="">All roles</option><option>admin</option><option>installer</option><option>operator</option><option>viewer</option></select>
+            <select id="audit-role"><option value="">All roles</option><option>administrator</option><option>support_admin</option><option>admin</option><option>installer</option><option>operator</option><option>viewer</option></select>
 
 
 
@@ -132547,7 +132276,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-        "Set ANYAICAM_PHONE_URL to the Samsung LAN or Tailscale address."
+        "Set ANYAICAM_PHONE_URL to this appliance's LAN or Tailscale address."
 
 
 
