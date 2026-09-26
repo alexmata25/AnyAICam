@@ -292,6 +292,9 @@ def render_aaco_floating_widget() -> str:
 .aaco-float-panel-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-weight:600}}
 .aaco-float-close{{background:none;border:none;font-size:20px;line-height:1;cursor:pointer;color:inherit;padding:2px 6px}}
 @media (max-width:480px){{.aaco-float-root{{right:10px;bottom:10px}}.aaco-float-panel{{right:10px;bottom:70px}}}}
+/* Phones with the portal's bottom tab bar (<=760px): sit above the bar so
+   the button never covers its last tab (2026-09-25). */
+@media (max-width:760px){{body:has(.mobile-nav) .aaco-float-root{{bottom:84px}}body:has(.mobile-nav) .aaco-float-panel{{bottom:146px;max-height:min(60vh,520px)}}}}
 </style>
 <div class="aaco-float-root">
 <div id="aaco-float-panel" class="aaco-float-panel" hidden>
