@@ -202,3 +202,32 @@ def test_a_real_outage_after_the_stop_rolls_back_to_the_previous_container():
 
 def test_default_watch_outlasts_a_caddy_health_interval():
     assert cut.Cutover(live="l", candidate="c", image="i", build_id=NEW).watch_seconds > 30
+
+
+def test_public_checks_identify_themselves_to_cloudflare(monkeypatch):
+    """Cloudflare refuses Python's default agent (403, error 1010) -- the
+    first real run aborted on exactly that."""
+    seen = {}
+
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def read(self, _n): return b'{"build_id": "x"}'
+
+    def urlopen(request, timeout):
+        seen.update({k.lower(): v for k, v in request.header_items()})
+        return Response()
+
+    monkeypatch.setattr(cut.urllib.request, "urlopen", urlopen)
+    assert cut.Cutover._http_get("https://portal-staging.anyaicam.com/health")[0] == 200
+    assert seen["user-agent"] == cut.USER_AGENT and "python-urllib" not in seen["user-agent"].lower()
+    assert seen["cache-control"] == "no-cache"
+
+
+def test_public_proof_allows_for_a_small_share_of_traffic_reaching_the_candidate():
+    """On the real run Caddy sent ~10% of requests to the candidate while
+    both held the aliases; the proof window must be long enough for 3 hits
+    per endpoint at that rate."""
+    job = cut.Cutover(live="l", candidate="c", image="i", build_id=NEW)
+    assert job.public_timeout >= 180 and job.public_successes == 3
