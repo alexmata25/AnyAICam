@@ -296,3 +296,17 @@ def test_admin_can_still_edit_legacy_pricing_and_camera_settings(cloud_client, t
     assert cloud_client.put("/api/pricing-config-legacy", json={"trial_days": 14}, cookies=cookies).status_code == 200
     assert saved.get("trial_days") == 14
     assert cloud_client.put("/api/cameras/1/alert-rule", json={"camera": 1}, cookies=cookies).status_code == 200
+
+
+def test_audit_log_filters_match_real_roles_and_namespaced_actions(cloud_client, tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "AUDIT_LOG_FILE", tmp_path / "audit.jsonl")
+    for action, role in (("billing.account_updated", "administrator"), ("investigation.case_created", "administrator"), ("view", "viewer")):
+        main.append_audit_entry(main.AuditEntryModel(user_id="u", user_name="u", role=role, action=action, resource="r").model_dump(mode="json"))
+    cookies = _legacy_admin_cookies()
+    page = cloud_client.get("/audit-logs", cookies=cookies).text
+    assert "<option>administrator</option>" in page
+    get = lambda **params: [e["action"] for e in cloud_client.get("/api/audit-logs", params=params, cookies=cookies).json()["entries"] if e["action"] != "view" or params.get("action") == "view"]
+    assert "billing.account_updated" in get(action="update")
+    assert "investigation.case_created" in get(action="create")
+    roles = {e["role"] for e in cloud_client.get("/api/audit-logs", params={"role": "administrator"}, cookies=cookies).json()["entries"]}
+    assert roles == {"administrator"}

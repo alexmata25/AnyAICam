@@ -125870,7 +125870,13 @@ def audit_logs_api(
 
 
 
-        entries = [item for item in entries if item.get("action") == action]
+        # Also match namespaced actions ("update" finds billing.account_updated,
+        # investigation.case_updated...): the filter offers generic verbs only.
+        wanted = action.lower()
+        entries = [item for item in entries if str(item.get("action") or "").lower() == wanted
+                   or wanted in str(item.get("action") or "").lower().replace(".", "_").split("_")
+                   or str(item.get("action") or "").lower().endswith(wanted + "d")
+                   or str(item.get("action") or "").lower().endswith(wanted + "ed")]
 
 
 
@@ -129290,7 +129296,7 @@ def audit_logs(request: Request) -> str:
 
 
 
-            <select id="audit-role"><option value="">All roles</option><option>admin</option><option>installer</option><option>operator</option><option>viewer</option></select>
+            <select id="audit-role"><option value="">All roles</option><option>administrator</option><option>support_admin</option><option>admin</option><option>installer</option><option>operator</option><option>viewer</option></select>
 
 
 
