@@ -64,6 +64,10 @@ STAGING_MOUNTS = (
     "/var/lib/anyaicam-staging/data-config:/opt/anyaicam/data/config",
 )
 APP_COMMAND = ("uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers")
+# Cloudflare in front of staging answers Python's default "Python-urllib/x"
+# agent with 403 (error 1010) -- found on the first real run, where every
+# public check was refused and the cutover (correctly) aborted.
+USER_AGENT = "AnyAiCam-cutover-check/1.0"
 
 
 class Cutover:
@@ -73,7 +77,7 @@ class Cutover:
                  network: str = "deploy_default", aliases: tuple[str, ...] = ("portal", "vms"),
                  env_file: str = "/etc/anyaicam-staging/vms-staging.env",
                  mounts: tuple[str, ...] = STAGING_MOUNTS,
-                 candidate_timeout: float = 120, public_timeout: float = 120, public_successes: int = 3,
+                 candidate_timeout: float = 120, public_timeout: float = 180, public_successes: int = 3,
                  watch_seconds: float = 45, outage_grace: float = 70, poll: float = 2,
                  run=None, http_get=None, sleep=time.sleep, clock=time.monotonic, log=print):
         self.live, self.candidate, self.image, self.build_id = live, candidate, image, build_id
@@ -94,7 +98,7 @@ class Cutover:
 
     @staticmethod
     def _http_get(url: str) -> tuple[int, str]:
-        request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+        request = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "User-Agent": USER_AGENT})
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
                 return response.status, response.read(4096).decode("utf-8", "replace")
