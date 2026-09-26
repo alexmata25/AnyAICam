@@ -15,8 +15,7 @@ import main
 APP = Path(__file__).resolve().parents[1]
 MEDIA_ACTIONS = ("download-selected", "share-selected", "bookmark-selected")
 PAGE_LEVEL_CONTROLS = ("skip-back", "timeline-play", "skip-forward", "create-clip", "browse-recordings",
-                       "playback-date-input", "playback-date-prev", "playback-date-today", "playback-date-next",
-                       "playback-available-dates")
+                       "playback-date-input")
 
 
 def _render(monkeypatch):

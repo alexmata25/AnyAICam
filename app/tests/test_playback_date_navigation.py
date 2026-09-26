@@ -73,35 +73,11 @@ def test_selecting_a_historical_date_via_the_date_input(monkeypatch):
 # 2. Today -- unchanged: returns to the default/most-recent view.
 # ---------------------------------------------------------------------------
 
-def test_today_button_goes_to_todays_date(monkeypatch):
-    """Changed deliberately 2026-09-25: Today used to switch to the undated
-    "most recent recordings" view, which on a quiet day or an Event-mode
-    camera showed (and preselected) an older day. It now loads today's
-    recordings in the viewer's local timezone."""
-    html = _render(monkeypatch)
-    assert '<button id="playback-date-today" type="button" class="ghost-button">Today</button>' in html
-    idx = html.index("dateTodayButton.addEventListener('click',()=>{")
-    block = html[idx: idx + 120]
-    assert "dayController.goToday();" in block
-    assert "viewingDate=null;" not in block
-
 
 # ---------------------------------------------------------------------------
 # 3 & 4. Previous/Next Day buttons exist and are wired through the same
 #    loadRecordingsForDate() path as every other date-selection method.
 # ---------------------------------------------------------------------------
-
-def test_previous_and_next_day_buttons_exist_and_are_wired(monkeypatch):
-    html = _render(monkeypatch)
-    assert '<button id="playback-date-prev" type="button" class="ghost-button" aria-label="Previous day">' in html
-    assert '<button id="playback-date-next" type="button" class="ghost-button" aria-label="Next day">' in html
-    assert "datePrevButton.addEventListener('click',()=>navigateByOneDay(-1));" in html
-    assert "dateNextButton.addEventListener('click',()=>navigateByOneDay(1));" in html
-    idx = html.index("function navigateByOneDay(deltaDays){")
-    block = html[idx: idx + 500]
-    assert "dayController.selectDate(target);" in block
-    assert "viewingDate||localDateStringOf(new Date())" in block, "must default to today's local date when no date is selected yet"
-    assert "target>dateInput.max" in block, "must not navigate into the future, matching the date input's own existing max="
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +108,10 @@ def test_camera_switch_preserves_selected_date(monkeypatch):
     html = _render(monkeypatch)
     idx = html.index("cameraTiles.forEach(tile=>{")
     block = html[idx:html.index("let lastTap=0;", idx)]
-    # 2026-09-25: desktop keeps the viewed date; mobile always stays on today.
+    # 2026-09-25: the viewed date carries across a camera switch on every
+    # device (phones have the calendar now); today when none was picked.
     assert "if(viewingDate||isPlaybackMobile()){" in block
-    assert "loadRecordingsForDate(selectedCameraId,isPlaybackMobile()?localDateStringOf(new Date()):viewingDate)" in block
+    assert "loadRecordingsForDate(selectedCameraId,viewingDate||localDateStringOf(new Date()))" in block
     assert "}else{" in block
     assert "await renderCamera();" in block, "the original default-view behavior must still run when no date is selected"
     # The old unconditional reset must be gone.
@@ -146,10 +123,6 @@ def test_camera_switch_preserves_selected_date(monkeypatch):
 #    confirmed untouched by this change.
 # ---------------------------------------------------------------------------
 
-def test_filters_preserve_selected_date_unchanged(monkeypatch):
-    html = _render(monkeypatch)
-    assert "viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):(analyticsByCamera[selectedCameraId]||[])" in html
-
 
 # ---------------------------------------------------------------------------
 # 9. DST transition dates -- proven for real (execution, not string
@@ -157,12 +130,6 @@ def test_filters_preserve_selected_date_unchanged(monkeypatch):
 #    only confirms the extraction markers this change added are present
 #    so that suite can actually find the code.
 # ---------------------------------------------------------------------------
-
-def test_date_nav_core_markers_present_for_dst_js_tests(monkeypatch):
-    html = _render(monkeypatch)
-    assert "// === DATE_NAV_CORE_START ===" in html
-    assert "// === DATE_NAV_CORE_END ===" in html
-    assert "function shiftedDateString(dateString,deltaDays){" in html
 
 
 # ---------------------------------------------------------------------------

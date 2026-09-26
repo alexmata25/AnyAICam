@@ -148,8 +148,10 @@ def test_category_filtering_logic_unchanged(monkeypatch):
     assert "const category=filterCategory(event.event_type);" in html
     assert "if(category&&!activeFilters.has(category))return;" in html
     assert "function filterCategory(eventType){" in html
-    for filter_name in ["motion", "person", "vehicle", "lpr", "people_counting", "intrusion"]:
-        assert f'data-filter="{filter_name}"' in html
+    # 2026-09-25: the filter buttons left Playback (filtering lives in
+    # Analytics/Events/Investigate/Smart alerts); every category shows.
+    assert 'data-filter="' not in html
+    assert "let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);" in html
 
 
 # ---------------------------------------------------------------------------

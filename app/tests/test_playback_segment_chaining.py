@@ -212,11 +212,9 @@ def test_chaining_uses_the_same_state_date_mode_already_populates(monkeypatch):
 def test_no_regression_to_date_navigation(monkeypatch):
     html = _render(monkeypatch)
     assert '<input id="playback-date-input" type="date" autocomplete="off">' in html  # 2026-09-25: no browser-restored stale date
-    assert 'id="playback-date-prev"' in html
-    assert 'id="playback-date-today"' in html
-    assert 'id="playback-date-next"' in html
-    assert "function navigateByOneDay(deltaDays){" in html
-    assert "await loadRecordingsForDate(selectedCameraId,isPlaybackMobile()?localDateStringOf(new Date()):viewingDate)" in html  # camera-switch date preservation (desktop), today (mobile)
+    for removed in ('id="playback-date-prev"', 'id="playback-date-today"', 'id="playback-date-next"', "function navigateByOneDay("):
+        assert removed not in html  # 2026-09-25: the calendar is the one date control
+    assert "await loadRecordingsForDate(selectedCameraId,viewingDate||localDateStringOf(new Date()))" in html  # camera-switch date preservation (desktop), today (mobile)
 
 
 def test_no_regression_to_analytics_lanes(monkeypatch):

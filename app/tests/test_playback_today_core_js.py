@@ -80,15 +80,17 @@ def test_first_open_goes_to_the_viewers_today_and_deep_links_still_open_their_ev
 
 def test_mobile_hides_the_date_controls_at_the_same_breakpoint_as_the_layout(monkeypatch):
     html = _render(monkeypatch)
-    assert "@media (max-width:900px){#playback-date-bar,#playback-available-dates{display:none!important}}" in html
+    # 2026-09-25: phones get the compact calendar too (no longer hidden).
+    assert "#playback-date-bar,#playback-available-dates{display:none" not in html
+    assert '<div class="playback-date-row" id="playback-date-bar">' in html
     assert "window.matchMedia('(max-width:900px)')" in _script(html)
 
 
 def test_today_and_manual_picks_go_through_the_day_controller(monkeypatch):
     script = _script(_render(monkeypatch))
-    assert "dateTodayButton.addEventListener('click',()=>{\n    dayController.goToday();\n  });" in script
+    # Only the calendar remains (Previous/Today/Next removed 2026-09-25).
     assert "dayController.selectDate(dateInput.value);" in script
-    assert "dayController.selectDate(target);" in script
+    assert "dateTodayButton" not in script and "navigateByOneDay" not in script
 
 
 def test_the_refresh_never_touches_the_player(monkeypatch):
@@ -105,9 +107,11 @@ def test_the_mobile_events_poll_renders_the_latest_clips_and_only_the_viewed_day
     assert "renderMobileRecentEvents(cameraId,state.clips||clips,viewingDate?eventsForLocalDate(state.events,viewingDate):state.events);" in script
 
 
-def test_mobile_camera_switch_stays_on_today(monkeypatch):
+def test_mobile_camera_switch_keeps_the_viewed_day(monkeypatch):
+    """Today by default; a date picked on the phone's calendar carries
+    across a camera switch, same as desktop (2026-09-25)."""
     script = _script(_render(monkeypatch))
-    assert "await loadRecordingsForDate(selectedCameraId,isPlaybackMobile()?localDateStringOf(new Date()):viewingDate)" in script
+    assert "await loadRecordingsForDate(selectedCameraId,viewingDate||localDateStringOf(new Date()))" in script
 
 
 def test_no_timezone_is_hardcoded_in_the_day_logic():

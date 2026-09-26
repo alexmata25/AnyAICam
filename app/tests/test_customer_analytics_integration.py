@@ -341,7 +341,8 @@ def test_playback_embeds_real_analytics_events_grouped_by_camera(client, db_path
     assert '"cam-1"' in response.text.split("analyticsByCamera=")[1][:2000]
 
 
-def test_playback_filter_buttons_are_no_longer_disabled(client):
+def test_playback_has_no_dead_filter_buttons(client):
+    # 2026-09-25: Playback's event filter buttons were removed (filtering
+    # lives in Analytics/Events/Investigate); none may linger disabled.
     response = client.get("/playback", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    filters_html = response.text.split('class="monitor-filters"')[1][:1500]
-    assert "disabled" not in filters_html
+    assert 'class="monitor-filters"' not in response.text and 'data-filter="' not in response.text

@@ -509,6 +509,17 @@ def _build_payload(event: dict) -> dict:
             # relays).
             "door_notify_message": event.get("door_notify_message"),
         }]
+    # Line crossing / intrusion (2026-09-25): which rule fired and the
+    # crossing direction live as loose keys on the local event (see
+    # customer_analytics_rule_worker.record_rule_event()) -- forwarded the same
+    # way as PPE/AAC above so the customer Analytics workspaces can show
+    # them. No new column; cloud stores them in detections_json.
+    if str(event.get("event_type") or "").strip() in ("line_crossing", "intrusion") and payload_detections is None:
+        payload_detections = [{
+            "rule_name": event.get("rule_name"),
+            "rule_id": event.get("rule_id"),
+            "direction": event.get("direction"),
+        }]
     return {
         "local_event_id": str(event.get("id") or "").strip(),
         "event_type": str(event.get("event_type") or "").strip(),

@@ -104,14 +104,6 @@ def test_load_recordings_for_date_passes_the_selected_date(monkeypatch):
     assert "renderTimeline(cameraId,clips,eventsForLocalDate(analyticsByCamera[cameraId]||[],date),date);" in body
 
 
-def test_filter_toggle_rerender_passes_the_active_day(monkeypatch):
-    html = _render(monkeypatch)
-    assert (
-        "renderTimeline(selectedCameraId,currentClips,"
-        "viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):"
-        "(analyticsByCamera[selectedCameraId]||[]),viewingDate||localDateStringOf(new Date()));"
-    ) in html
-
 
 # ---------------------------------------------------------------------------
 # Bug 2's root cause on the query side: no server timezone should be
