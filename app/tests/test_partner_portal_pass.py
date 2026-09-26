@@ -182,3 +182,51 @@ def test_workspace_shows_real_partner_details_and_honest_materials(client):
     assert "bravo" not in page.lower()
     assert "Partner owner" in page and "· partner_owner</p>" not in page
     assert "comingSoon('Brochures')" not in page and "Coming soon" in page
+
+
+# ------------------------------------------------------------ team invitations
+
+
+@pytest.fixture()
+def sent_mail(monkeypatch):
+    import partner_workspace
+
+    sent = []
+
+    class Mail:
+        def send(self, message_type, to, subject, text, html=None, metadata=None):
+            sent.append((message_type, to, text))
+            return {"status": "sent"}
+
+    monkeypatch.setattr(partner_workspace, "get_email_service", lambda: Mail())
+    return sent
+
+
+def test_customer_owner_cannot_invite_partner_staff(client, sent_mail):
+    customer = {partner_portal.SESSION_COOKIE: partner_portal._token("owner@cust-p-alpha.test", "customer_owner", "p-alpha", "cust-p-alpha")}
+    for role in ("partner_owner", "salesperson", "technician"):
+        response = client.post("/api/partner/users/invite", json={"email": f"x-{role}@example.test", "role": role}, cookies=customer)
+        assert response.status_code == 403, (role, response.text)
+    with connection() as db:
+        assert db.execute("SELECT COUNT(*) AS n FROM partner_users WHERE email LIKE 'x-%'").fetchone()["n"] == 0
+    assert sent_mail == []
+
+
+def test_partner_owner_invites_a_team_member_and_the_email_is_sent(client, sent_mail):
+    response = client.post("/api/partner/users/invite", json={"email": "new-tech@example.test", "name": "New Tech", "role": "technician"}, cookies=ALPHA)
+    assert response.status_code == 200, response.text
+    assert response.json()["email_status"] == "sent"
+    assert sent_mail and sent_mail[0][0] == "invitation" and sent_mail[0][1] == "new-tech@example.test"
+    with connection() as db:
+        created = db.execute("SELECT partner_id, role, must_change_password FROM partner_users WHERE email='new-tech@example.test'").fetchone()
+    assert (created["partner_id"], created["role"], created["must_change_password"]) == ("p-alpha", "technician", 1)
+
+
+def test_salesperson_cannot_invite_and_email_is_required(client, sent_mail):
+    assert client.post("/api/partner/users/invite", json={"email": "a@example.test", "role": "technician"}, cookies=cookies("salesperson", "p-alpha")).status_code == 403
+    assert client.post("/api/partner/users/invite", json={"email": "not-an-email", "role": "technician"}, cookies=ALPHA).status_code == 400
+
+
+def test_invite_form_is_offered_to_partner_owners_only(client):
+    assert 'id="team-invite-form"' in client.get("/partner", cookies=ALPHA).text
+    assert 'id="team-invite-form"' not in client.get("/partner", cookies=cookies("salesperson", "p-alpha")).text
