@@ -41941,6 +41941,17 @@ PUBLIC_PATH_PREFIXES = (
 
 
 
+def _partner_must_change_password(identity: dict) -> bool:
+    try:
+        from partner_db import connection as _pw_connection
+
+        with _pw_connection() as db:
+            record = db.execute("SELECT must_change_password FROM partner_users WHERE lower(email)=?", (str(identity.get("email") or "").lower(),)).fetchone()
+        return bool(record and record["must_change_password"])
+    except Exception:
+        return False
+
+
 @app.middleware("http")
 
 
@@ -42038,6 +42049,14 @@ async def authentication_middleware(request: Request, call_next):
 
     if portal_identity:
         request.state.partner_identity = portal_identity
+        # Partner portal pass (2026-09-26): an invited account signing in with
+        # its temporary password (must_change_password) went straight into
+        # the portal and could keep using the emailed/relayed password
+        # indefinitely. Until it sets its own, page navigations go to
+        # /change-password (APIs it needs to do that, and logout, stay open).
+        if request.method == "GET" and not path.startswith(("/api/", "/static/")) and path not in {"/change-password", "/partner-logout", "/logout"}:
+            if _partner_must_change_password(portal_identity):
+                return RedirectResponse("/change-password", status_code=303)
         return await call_next(request)
 
 
@@ -45724,8 +45743,11 @@ def portal_login_submit(request: Request, payload: dict):
 
     from partner_portal import establish_partner_session
 
+    # Same rule as POST /api/partner-login: an account still on its temporary
+    # (invited / partner-issued) password must choose its own first.
+    destination = "/change-password" if partner_user and partner_user.get("must_change_password") else decision["destination"]
     return establish_partner_session(
-        decision["destination"], request=request, email=email, role=decision["role"], user=partner_user,
+        destination, request=request, email=email, role=decision["role"], user=partner_user,
         authorization_version_at_login=partner_authorization_version,
     )
 

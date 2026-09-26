@@ -27,6 +27,19 @@ def _portal_destination(login_url,path):
     return urlunsplit((portal.scheme,portal.netloc,destination.path,destination.query,''))
 
 
+def _require_global_admin(request: Request) -> dict:
+    """Partner portal pass (2026-09-26): partner applications (applicant contact
+    details, approval) are a platform-wide admin tool. The bare 'administrator'
+    role label is also carried by partner-scoped company admins, so reach
+    requires a live global administrator grant, like /partner-pricing-admin."""
+    identity=require_partner_access(request,{'administrator'})
+    from appliance_identity import has_global_administrator_grant
+    with connection() as db:
+        if not has_global_administrator_grant(db,email=identity.get('email','')):
+            raise HTTPException(status_code=403,detail='Platform administrator access is required.')
+    return identity
+
+
 def register_website_partner_routes(app: FastAPI,shell) -> None:
     @app.get('/partner.html')
     # Sign-in pages carry the login script itself: without Cache-Control a
@@ -100,7 +113,7 @@ def register_website_partner_routes(app: FastAPI,shell) -> None:
 
     @app.get('/api/admin/partner-applications')
     def list_applications(request: Request,status: str='pending'):
-        require_partner_access(request,{'administrator'})
+        _require_global_admin(request)
         if status=='all': return rows('SELECT * FROM partner_applications ORDER BY submitted_at DESC')
         if status not in VALID_APPLICATION_STATUSES: raise HTTPException(status_code=400,detail='Unknown application status.')
         return rows('SELECT * FROM partner_applications WHERE status=? ORDER BY submitted_at DESC',(status,))
@@ -109,14 +122,14 @@ def register_website_partner_routes(app: FastAPI,shell) -> None:
     def applications_page(request: Request):
         identity=partner_identity(request)
         if not identity: return RedirectResponse('/partner.html',status_code=303)
-        require_partner_access(request,{'administrator'})
+        _require_global_admin(request)
         content='''<header class="topbar"><div><p class="eyebrow">Administrator only</p><h1>Partner applications</h1></div><a class="ghost-button" href="/partner">Back to Portal</a></header><section class="panel"><label>Status <select id="application-filter"><option value="pending">Pending</option><option value="more_information_required">More information required</option><option value="approved">Approved</option><option value="rejected">Rejected</option><option value="all">All</option></select></label><div id="application-list" class="activity-list"></div></section>'''
         scripts='''<script>const list=document.getElementById('application-list'),filter=document.getElementById('application-filter');async function load(){const response=await fetch('/api/admin/partner-applications?status='+filter.value),items=await response.json();list.innerHTML=items.length?items.map(item=>`<article class="panel"><div class="health-row"><div><strong>${escapeHtml(item.company_name)}</strong><div class="health-detail">${escapeHtml(item.contact_name)} · ${escapeHtml(item.email)} · ${escapeHtml(item.service_area)}</div></div><span class="status-pill">${escapeHtml(item.status.replaceAll('_',' '))}</span></div><p>${escapeHtml(item.notes||'No notes')}</p>${item.status==='pending'||item.status==='more_information_required'?`<div class="dialog-actions"><button class="action-button review" data-id="${item.id}" data-status="approved">Approve</button><button class="ghost-button review" data-id="${item.id}" data-status="more_information_required">Request information</button><button class="ghost-button review" data-id="${item.id}" data-status="rejected">Reject</button></div>`:''}</article>`).join(''):'<div class="empty">No applications in this status.</div>';document.querySelectorAll('.review').forEach(button=>button.onclick=()=>review(button))}async function review(button){const response=await fetch('/api/admin/partner-applications/'+button.dataset.id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:button.dataset.status})}),result=await response.json();if(!response.ok)return showToast(result.detail);if(result.temporary_password)alert('Invitation preview\n\n'+result.email_preview);showToast(result.message);load()}filter.onchange=load;load()</script>'''
         return shell('Partner applications','partner',content,scripts)
 
     @app.put('/api/admin/partner-applications/{application_id}')
     def review_application(application_id: str,payload: dict,request: Request):
-        identity=require_partner_access(request,{'administrator'}); status=_clean(payload.get('status'),40)
+        identity=_require_global_admin(request); status=_clean(payload.get('status'),40)
         if status not in VALID_APPLICATION_STATUSES-{'pending'}: raise HTTPException(status_code=400,detail='Choose approved, rejected, or more information required.')
         with connection() as db:
             application=db.execute('SELECT * FROM partner_applications WHERE id=?',(application_id,)).fetchone()

@@ -259,3 +259,38 @@ def test_appliance_dashboard_shows_own_unactivated_appliances_only(client):
 def test_onboarding_wizard_does_not_show_infrastructure_wording(client):
     page = client.get("/partner/onboarding", cookies=ALPHA).text
     assert "send to AWS" not in page and "AWS provisioning result" not in page and "issued by AWS" not in page
+
+
+# ------------------------------------------------------------ partner applications (platform tool)
+
+
+def test_partner_applications_require_a_global_administrator(client):
+    with connection() as db:
+        db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES('u-company-admin','p-alpha','company-admin@p-alpha.test','CA','administrator','x',1,?)", (NOW,))
+        appliance_identity.create_grant(db, user_id="u-company-admin", role="administrator", scope_type="partner", scope_id="p-alpha", granted_by="test")
+        db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at) VALUES('u-global','p-alpha','global@anyaicam.test','G','administrator','x',1,?)", (NOW,))
+        appliance_identity.create_grant(db, user_id="u-global", role="administrator", scope_type="global", scope_id=None, granted_by="test")
+    company_admin = {partner_portal.SESSION_COOKIE: partner_portal._token("company-admin@p-alpha.test", "administrator", "p-alpha")}
+    global_admin = {partner_portal.SESSION_COOKIE: partner_portal._token("global@anyaicam.test", "administrator", "p-alpha")}
+    assert client.get("/api/admin/partner-applications", cookies=company_admin).status_code == 403
+    assert client.put("/api/admin/partner-applications/x", json={"status": "approved"}, cookies=company_admin).status_code == 403
+    assert client.get("/api/admin/partner-applications", cookies=global_admin).status_code == 200
+    assert client.get("/api/admin/partner-applications", cookies=ALPHA).status_code == 403
+
+
+# ------------------------------------------------------------ temporary passwords
+
+
+def test_temporary_password_accounts_must_choose_their_own(client):
+    with connection() as db:
+        db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,created_at,must_change_password) VALUES('u-temp','p-alpha','temp-tech@p-alpha.test','T','technician',?,1,?,1)",
+                   (password_hash("Temp-Pass-12345!"), NOW))
+    login = client.post("/api/portal-login", json={"email": "temp-tech@p-alpha.test", "password": "Temp-Pass-12345!", "portal": "technician"}, follow_redirects=False)
+    assert login.status_code == 303 and login.headers["location"] == "/change-password"
+    session = {partner_portal.SESSION_COOKIE: login.cookies[partner_portal.SESSION_COOKIE]}
+    blocked = client.get("/partner/appliance-dashboard", cookies=session, follow_redirects=False)
+    assert blocked.status_code == 303 and blocked.headers["location"] == "/change-password"
+    assert client.get("/change-password", cookies=session).status_code == 200
+    with connection() as db:
+        db.execute("UPDATE partner_users SET must_change_password=0 WHERE id='u-temp'")
+    assert client.get("/partner/appliance-dashboard", cookies=session, follow_redirects=False).status_code == 200
