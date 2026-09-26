@@ -35520,6 +35520,11 @@ def _compare_motion_frames(
     downstream (motion_score, changed_ratio, effective_threshold,
     cooldown/event-creation state machine) is unchanged."""
     mask = _motion_zone_mask(camera_number, zones)
+    # Customer exclusion zones (2026-09-26): changes inside an area the
+    # customer chose to ignore never count as motion (detection_exclusion.py).
+    excluded = detection_exclusion.motion_exclusion_mask(camera_number)
+    if excluded is not None:
+        mask = mask & ~excluded
 
     current = np.frombuffer(frame, dtype=np.uint8)
     previous = np.frombuffer(previous_frame, dtype=np.uint8)
@@ -37087,6 +37092,10 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
+    # Customer exclusion zones (2026-09-26): a detection centred inside an
+    # area the customer chose to ignore never reaches any analytic -- see
+    # detection_exclusion.py. Cameras without one are unaffected.
+    detections = detection_exclusion.filter_detections(camera_number, detections, frame)
     return {
 
 
@@ -40221,6 +40230,7 @@ import ppe
 import smart_motion
 import people_counting
 import event_media_sharing
+import detection_exclusion
 from customer_analytics_rule_worker import customer_analytics_rule_worker
 import facial_embedding_sync
 import facial_events
