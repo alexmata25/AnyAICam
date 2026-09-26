@@ -298,7 +298,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
           </div></div></div>
           {"" if can_edit else '<div class="health-detail" style="color:#b45309;margin-bottom:12px">You have view-only access to this camera. Ask the account owner to grant Camera Settings access to draw or edit rules.</div>'}
           <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px">
-            <div>
+            <div style="flex:1 1 640px;min-width:0;max-width:640px">
               <div style="position:relative;width:640px;max-width:100%;background:#111;border-radius:8px;overflow:hidden">
                 <video id="rule-video" muted playsinline style="width:100%;display:block"></video>
                 <canvas id="rule-canvas" width="640" height="360" style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair"></canvas>
