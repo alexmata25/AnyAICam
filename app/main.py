@@ -122252,7 +122252,8 @@ def _render_customer_events(request: Request) -> str:
 })();
 </script>"""
 
-    return page_shell("Events", "events", content, '<script src="/static/event_media.js"></script>' + scripts)
+    import customer_analytics_workspace
+    return page_shell("Events", "events", content, customer_analytics_workspace.versioned('<script src="/static/event_media.js"></script>') + scripts)
 
 
 def _customer_alert_text(notification: dict) -> tuple[str, str]:
@@ -146242,7 +146243,8 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
 }})();
 </script>'''
 
-    return page_shell("Playback", "playback", content, '<link rel="stylesheet" href="/static/inline_media.css"><script src="/static/event_media.js"></script><script src="/static/inline_media.js"></script>' + scripts)
+    import customer_analytics_workspace
+    return page_shell("Playback", "playback", content, customer_analytics_workspace.versioned('<link rel="stylesheet" href="/static/inline_media.css"><script src="/static/event_media.js"></script><script src="/static/inline_media.js"></script>') + scripts)
 
 
 @app.get("/playback", response_class=HTMLResponse)

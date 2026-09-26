@@ -19,6 +19,7 @@ for line crossing and intrusion). Nothing new is stored.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -28,6 +29,19 @@ from fastapi import FastAPI, HTTPException, Request
 
 from customer_analytics_panel import _parse_detections, _ppe_status, epoch_ms, real_confidence
 from partner_db import connection
+
+# Static assets are cached at the edge (Cloudflare, max-age 4 h); the build
+# id in the URL makes each deploy's pages load that deploy's JS/CSS.
+ASSET_VERSION = re.sub(r"[^0-9A-Za-z]", "", os.environ.get("ANYAICAM_BUILD_ID", "local"))[:12] or "local"
+
+
+def versioned(html: str) -> str:
+    """Append ?v=<build> to this app's own /static/*.js|css references."""
+    return _STATIC_ASSET.sub(lambda m: f"{m.group(1)}?v={ASSET_VERSION}", html)
+
+
+_STATIC_ASSET = re.compile(r"""(/static/[A-Za-z0-9_]+\.(?:js|css))(?=["'])""")
+
 
 VEHICLE_TYPES = ("vehicle", "car", "truck", "bus", "motorcycle", "bicycle")
 
@@ -379,7 +393,7 @@ def render_landing(request: Request, cameras: list[dict], page_shell: Callable) 
         body = f'<div class="aw-landing">{"".join(tiles)}</div>'
     content = (PAGE_CSS + '<header class="topbar"><div><p class="eyebrow">Reports</p><h1>Analytics</h1></div>'
                '<a class="ghost-button" href="/investigate">Search evidence</a></header>' + body)
-    return page_shell("Analytics", "analytics", content)
+    return page_shell("Analytics", "analytics", versioned(content))
 
 
 def render_workspace(request: Request, cameras: list[dict], page_shell: Callable, slug: str) -> str:
@@ -395,7 +409,7 @@ def render_workspace(request: Request, cameras: list[dict], page_shell: Callable
         body = ('<section class="panel"><h2>Not enabled for your cameras</h2><p class="health-detail">'
                 f'{escape(spec["label"])} is added per camera from your plan.</p>'
                 '<a class="action-button" href="/subscription-portal">View plans</a></section>')
-        return page_shell(spec["label"], "analytics", PAGE_CSS + header + body)
+        return page_shell(spec["label"], "analytics", versioned(PAGE_CSS + header + body))
     with connection() as db:
         entitled = set(entitled_camera_ids(db, [c["id"] for c in cameras], key))
     camera_data = [c for c in _camera_data(cameras) if c["id"] in entitled]
@@ -445,7 +459,7 @@ def render_workspace(request: Request, cameras: list[dict], page_shell: Callable
     scripts = ('<script src="/static/event_media.js"></script><script src="/static/inline_media.js"></script>'
                f'<script>window.__AW={json.dumps({"config": config, "cameras": camera_data})};</script>'
                '<script src="/static/analytics_workspace.js"></script>')
-    return page_shell(spec["label"], "analytics", content, scripts)
+    return page_shell(spec["label"], "analytics", versioned(content), versioned(scripts))
 
 
 def nav_menu_html(workspaces: list[dict], active_path: str) -> tuple[str, str, str]:
