@@ -35520,6 +35520,11 @@ def _compare_motion_frames(
     downstream (motion_score, changed_ratio, effective_threshold,
     cooldown/event-creation state machine) is unchanged."""
     mask = _motion_zone_mask(camera_number, zones)
+    # Customer exclusion zones (2026-09-26): changes inside an area the
+    # customer chose to ignore never count as motion (detection_exclusion.py).
+    excluded = detection_exclusion.motion_exclusion_mask(camera_number)
+    if excluded is not None:
+        mask = mask & ~excluded
 
     current = np.frombuffer(frame, dtype=np.uint8)
     previous = np.frombuffer(previous_frame, dtype=np.uint8)
@@ -37087,6 +37092,10 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
+    # Customer exclusion zones (2026-09-26): a detection centred inside an
+    # area the customer chose to ignore never reaches any analytic -- see
+    # detection_exclusion.py. Cameras without one are unaffected.
+    detections = detection_exclusion.filter_detections(camera_number, detections, frame)
     return {
 
 
@@ -37157,6 +37166,74 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
+
+async def _build_and_upload_owned_analytics_clip(
+    event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None
+) -> None:
+    """A Facial Recognition / People Counting result that no registered clip
+    covers gets its own clip (see event_media_sharing.py), built and
+    uploaded exactly like save_yolo_events()'s own AI clip; results that
+    reuse it are registered once it lands."""
+    registered = False
+    try:
+        clip_url = await build_motion_event_clip(event_id, camera_number, moment, moment)
+        if clip_url:
+            from event_media_uploader import upload_motion_event_media
+            registered = bool(await asyncio.to_thread(
+                upload_motion_event_media,
+                event_id=event_id,
+                camera_number=camera_number,
+                event_start=moment,
+                event_end=moment,
+                clip_url=clip_url,
+                thumbnail_url=thumbnail_url,
+                already_classified=True,
+            ))
+    except Exception as error:
+        print(f"Analytics event {event_id} camera {camera_number}: clip build/upload failed: {type(error).__name__}: {error}")
+    finally:
+        await asyncio.to_thread(event_media_sharing.owner_finished, event_id, camera_number, registered)
+
+
+def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None) -> None:
+    """Schedule _build_and_upload_owned_analytics_clip() from a detection
+    worker thread (save_yolo_events() runs via asyncio.to_thread) or from
+    the event loop itself (people_counting_worker())."""
+    coroutine = _build_and_upload_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url)
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    try:
+        if running is not None:
+            task = running.create_task(coroutine)
+            clip_tasks.add(task)
+            task.add_done_callback(clip_tasks.discard)
+        elif _ai_event_media_loop is not None:
+            asyncio.run_coroutine_threadsafe(coroutine, _ai_event_media_loop)
+        else:
+            raise RuntimeError("no main event loop captured yet")
+    except RuntimeError as error:
+        coroutine.close()
+        print(f"Analytics event {event_id}: could not schedule clip build/upload: {error}")
+        event_media_sharing.owners.finish(event_id, False)
+
+
+def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime) -> str | None:
+    """The local id of the event whose clip this result shows: a
+    registered clip covering this moment on this camera; or, when there is
+    none and one can be kept, event_id itself (the caller then schedules
+    that build via _build_and_upload_owned_analytics_clip()); or None (no
+    media for this result)."""
+    from event_clips import compute_clip_window
+    owner = event_media_sharing.owners.covering(camera_number, moment)
+    if owner:
+        return owner
+    if event_media_sharing.should_build_own_clip(camera_number):
+        window = compute_clip_window(moment, moment)
+        event_media_sharing.owners.register(camera_number, event_id, window.start, window.end)
+        return event_id
+    return None
 
 
 def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
@@ -37858,6 +37935,10 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
         if not is_duplicate:
             primary_class_name = qualifying_detections[0]["class_name"]
+            # PPE / Facial Recognition results from this scan (and later
+            # ones inside this window) reuse this clip -- see
+            # event_media_sharing.py.
+            event_media_sharing.owners.register(camera_number, event_group_id, window.start, window.end)
             # Optimistic path, matching store_motion_event()'s own
             # convention: extraction/upload run in the background (the
             # extractor waits out the post-roll first), so this is the
@@ -37867,7 +37948,17 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 f"/recordings/clips/motion/motion_{event_group_id}.mp4"
             )
 
+            # Whether this clip landed, for the PPE / Facial Recognition
+            # results that reuse it (event_media_sharing.owner_finished()).
+            ai_media_registered = [False]
+
             async def build_and_upload_ai_event_media() -> None:
+                try:
+                    await _build_and_upload_ai_event_media_inner()
+                finally:
+                    await asyncio.to_thread(event_media_sharing.owner_finished, event_group_id, camera_number, ai_media_registered[0])
+
+            async def _build_and_upload_ai_event_media_inner() -> None:
                 try:
                     clip_url = await build_motion_event_clip(
                         event_group_id, camera_number, now, now
@@ -37901,7 +37992,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                     return
                 try:
                     from event_media_uploader import upload_motion_event_media
-                    await asyncio.to_thread(
+                    ai_media_registered[0] = bool(await asyncio.to_thread(
                         upload_motion_event_media,
                         event_id=event_group_id,
                         camera_number=camera_number,
@@ -37910,7 +38001,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         clip_url=clip_url,
                         thumbnail_url=thumbnail_url,
                         already_classified=True,
-                    )
+                    ))
                 except Exception as error:
                     print(
                         f"AI event {event_group_id}: media upload failed: "
@@ -37942,11 +38033,13 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         f"AI event {event_group_id}: could not schedule "
                         f"clip build/upload: {type(error).__name__}: {error}"
                     )
+                    event_media_sharing.owners.finish(event_group_id, False)
             else:
                 print(
                     f"AI event {event_group_id}: could not schedule clip "
                     f"build/upload: no main event loop captured yet."
                 )
+                event_media_sharing.owners.finish(event_group_id, False)
 
         # 2026-09-20, moved outside `if not is_duplicate:` on 2026-09-22:
         # the same Event-mode persistence the basic motion path already
@@ -38239,7 +38332,12 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 ).model_dump(mode="json")
                 ppe_event["hard_hat_present"] = ppe_result["hard_hat_present"]
                 ppe_event["safety_vest_present"] = ppe_result["safety_vest_present"]
+                # PPE only runs in a scan that builds a clip (`not
+                # is_duplicate` above), so its result shows that clip --
+                # the same frame's own clip owner, event_group_id.
+                event_media_sharing.link(ppe_event, event_group_id)
                 append_analytics_event(ppe_event)
+                event_media_sharing.attach_child(event_group_id, ppe_event["id"], camera_number)
                 saved_events.append(ppe_event)
         # AAC (facial recognition / access-control analytics).
         # Same shape as the PPE hook directly above: a person's own crop
@@ -38294,27 +38392,35 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                             appliance_id=active_appliance_id(),
                         )
                     for aac_event in aac_events_created:
-                        append_analytics_event(
-                            {
-                                "id": aac_event["id"],
-                                "camera": camera_number,
-                                "event_type": "facial_recognition",
-                                "timestamp": now.isoformat(),
-                                "confidence": aac_event["confidence"],
-                                "object_count": 1,
-                                "thumbnail": thumbnail_url,
-                                "linked_recording": linked_recording,
-                                "mock": False,
-                                "match_state": aac_event["match_state"],
-                                "matched_person_id": aac_event["matched_person_id"],
-                                "matched_person_name": aac_event["matched_person_name"],
-                                "matched_watchlist_id": aac_event["matched_watchlist_id"],
-                                "matched_watchlist_name": aac_event["matched_watchlist_name"],
-                                "engine": aac_event["engine"],
-                                "engine_version": aac_event["engine_version"],
-                                "door_notify_message": aac_event.get("door_notify_message"),
-                            }
-                        )
+                        facial_local_event = {
+                            "id": aac_event["id"],
+                            "camera": camera_number,
+                            "event_type": "facial_recognition",
+                            "timestamp": now.isoformat(),
+                            "confidence": aac_event["confidence"],
+                            "object_count": 1,
+                            "thumbnail": thumbnail_url,
+                            "linked_recording": linked_recording,
+                            "mock": False,
+                            "match_state": aac_event["match_state"],
+                            "matched_person_id": aac_event["matched_person_id"],
+                            "matched_person_name": aac_event["matched_person_name"],
+                            "matched_watchlist_id": aac_event["matched_watchlist_id"],
+                            "matched_watchlist_name": aac_event["matched_watchlist_name"],
+                            "engine": aac_event["engine"],
+                            "engine_version": aac_event["engine_version"],
+                            "door_notify_message": aac_event.get("door_notify_message"),
+                        }
+                        # Media (2026-09-26): the clip covering this moment on
+                        # this camera, else a clip of its own -- see
+                        # event_media_sharing.py.
+                        media_owner = _analytics_media_owner(camera_number, aac_event["id"], now)
+                        event_media_sharing.link(facial_local_event, media_owner)
+                        append_analytics_event(facial_local_event)
+                        if media_owner == aac_event["id"]:
+                            _schedule_owned_analytics_clip(aac_event["id"], camera_number, now, thumbnail_url)
+                        elif media_owner:
+                            event_media_sharing.attach_child(media_owner, aac_event["id"], camera_number)
                         facial_event_ids.append(aac_event["id"])
                 except Exception as error:
                     print(f"Camera {camera_number} AAC facial recognition skipped (non-fatal): {error}")
@@ -38820,7 +38926,17 @@ async def people_counting_worker(camera_number: int) -> None:
                             record["occupancy"] = counter.occupancy
                             record["in_count"] = counter.in_count
                             record["out_count"] = counter.out_count
+                            # Media (2026-09-26): the clip covering this
+                            # crossing on this camera, else one of its own
+                            # (a second crossing in this frame reuses it) --
+                            # see event_media_sharing.py.
+                            media_owner = _analytics_media_owner(camera_number, record["id"], now)
+                            event_media_sharing.link(record, media_owner)
                             append_analytics_event(record)
+                            if media_owner == record["id"]:
+                                _schedule_owned_analytics_clip(record["id"], camera_number, now, thumbnail_url)
+                            elif media_owner:
+                                event_media_sharing.attach_child(media_owner, record["id"], camera_number)
                             event_ids.append(record["id"])
                         if event_ids and _local_recording_settings(camera_number)["mode"] == "event":
                             asyncio.create_task(_backfill_ai_event_linked_recording(camera_number, event_ids, now))
@@ -40113,6 +40229,8 @@ import lpr
 import ppe
 import smart_motion
 import people_counting
+import event_media_sharing
+import detection_exclusion
 from customer_analytics_rule_worker import customer_analytics_rule_worker
 import facial_embedding_sync
 import facial_events

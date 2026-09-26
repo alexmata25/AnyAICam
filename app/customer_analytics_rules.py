@@ -43,10 +43,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from partner_db import audit, connection
 from partner_portal import partner_identity
 
-RULE_TYPES = ("intrusion", "line_crossing", "people_counting")
+RULE_TYPES = ("intrusion", "line_crossing", "people_counting", "exclusion")
 # Two-point line rules; "people_counting" is People Counting's counting
 # line (at most one per camera), "line_crossing" an alert rule.
 LINE_RULE_TYPES = ("line_crossing", "people_counting")
+# Polygon rules: "intrusion" detects activity inside the zone; "exclusion"
+# (2026-09-26) ignores it -- detections centred inside, and pixel motion
+# inside, never become events on that camera (detection_exclusion.py).
+ZONE_RULE_TYPES = ("intrusion", "exclusion")
 LINE_CROSSING_DIRECTIONS = ("both", "inbound", "outbound")
 MIN_POLYGON_POINTS = 3
 MAX_POLYGON_POINTS = 20
@@ -142,11 +146,11 @@ def _validate_geometry(rule_type: str, geometry, direction):
             raise HTTPException(status_code=400, detail=f'direction must be one of {list(LINE_CROSSING_DIRECTIONS)} for a line.')
         return points, direction
     if len(points) < MIN_POLYGON_POINTS:
-        raise HTTPException(status_code=400, detail=f'An intrusion zone needs at least {MIN_POLYGON_POINTS} points.')
+        raise HTTPException(status_code=400, detail=f'A zone needs at least {MIN_POLYGON_POINTS} points.')
     if len(points) > MAX_POLYGON_POINTS:
-        raise HTTPException(status_code=400, detail=f'An intrusion zone supports at most {MAX_POLYGON_POINTS} points.')
+        raise HTTPException(status_code=400, detail=f'A zone supports at most {MAX_POLYGON_POINTS} points.')
     if direction not in (None, ''):
-        raise HTTPException(status_code=400, detail='direction does not apply to an intrusion zone.')
+        raise HTTPException(status_code=400, detail='direction does not apply to a zone.')
     return points, None
 
 
@@ -288,9 +292,9 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         </header>
         <section class="panel">
           <div class="panel-head"><div><h2>Draw a rule</h2><div class="health-detail">
-            Capture a frame from this camera, then draw a line to watch for crossings
-            or a zone to watch for intrusions. Points are saved relative to the frame,
-            so a rule still lines up if the camera's resolution ever changes.
+            Capture a frame from this camera, then draw a line to watch for crossings,
+            a zone to watch for activity inside it, or a zone to ignore. Points are saved
+            relative to the frame, so a rule still lines up if the camera's resolution ever changes.
           </div></div></div>
           {"" if can_edit else '<div class="health-detail" style="color:#b45309;margin-bottom:12px">You have view-only access to this camera. Ask the account owner to grant Camera Settings access to draw or edit rules.</div>'}
           <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px">
@@ -303,13 +307,14 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                 <button class="compact-button" id="capture-frame" type="button">Capture frame</button>
                 <button class="compact-button" id="clear-drawing" type="button">Clear drawing</button>
               </div>
-              <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then click on the image to place points. A line needs 2 points; a zone needs at least 3.</p>
+              <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then click on the image to place points. A line needs 2 points; a zone needs at least 3. Zones to ignore are drawn in red.</p>
             </div>
             <div style="flex:1;min-width:260px;display:grid;gap:12px;align-content:start">
               <label style="display:grid;gap:6px">Rule type
                 <select id="rule-type" {"disabled" if not can_edit else ""}>
+                  <option value="intrusion">Detect inside zone</option>
                   <option value="line_crossing">Line crossing</option>
-                  <option value="intrusion">Intrusion zone</option>
+                  <option value="exclusion">Ignore detections in zone</option>
                   <option value="people_counting">People counting line</option>
                 </select>
               </label>
@@ -339,11 +344,14 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
           <div class="panel-head"><div><h2>What this does today</h2></div></div>
           <p class="health-detail">
             Saved rules are sent to this camera's appliance and checked there.
-            A line crossing or an entry into an intrusion zone creates an event
+            A line crossing or activity inside a detection zone creates an event
             (and an alert, if you have alerts turned on) on cameras with Smart
             Motion. A people counting line counts people walking across it in
             each direction on cameras with People Counting; each camera has one
-            counting line. Changes take effect within a few minutes.
+            counting line. Anything centred inside a zone to ignore &mdash; people,
+            vehicles, motion &mdash; never becomes an event, alert, count or clip on
+            this camera, for every analytic; the rest of the picture is unaffected.
+            Changes take effect within a few minutes.
           </p>
         </section>
         '''
@@ -358,7 +366,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   const ctx=canvas.getContext('2d');
   const ruleType=document.getElementById('rule-type');
   const isLine=t=>t==='line_crossing'||t==='people_counting';
-  const typeLabels={line_crossing:'Line crossing',intrusion:'Intrusion zone',people_counting:'People counting line'};
+  const isZone=t=>t==='intrusion'||t==='exclusion';
+  const typeLabels={line_crossing:'Line crossing',intrusion:'Detect inside zone',exclusion:'Ignore detections in zone',people_counting:'People counting line'};
   const directionField=document.getElementById('direction-field');
   const bgCanvas=document.createElement('canvas');
   let hasFrame=false, points=[], editingRuleId=null, sessionId=null, hls=null, pollTimer=null, stopped=false;
@@ -375,13 +384,17 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   function redraw(){
     drawBackground();
     if(!points.length)return;
-    ctx.strokeStyle='#22c55e';ctx.fillStyle='#22c55e';ctx.lineWidth=2;
+    const color=ruleType.value==='exclusion'?'#ef4444':'#22c55e';
+    ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;
     ctx.beginPath();
     points.forEach((p,i)=>{
       const x=p.x*canvas.width, y=p.y*canvas.height;
       if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
     });
-    if(ruleType.value==='intrusion'&&points.length>2)ctx.closePath();
+    if(isZone(ruleType.value)&&points.length>2){
+      ctx.closePath();
+      if(ruleType.value==='exclusion'){ctx.save();ctx.globalAlpha=0.25;ctx.fill();ctx.restore();}
+    }
     ctx.stroke();
     points.forEach(p=>{
       const x=p.x*canvas.width, y=p.y*canvas.height;
@@ -439,7 +452,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     if(!name){alert('Name is required.');return;}
     const type=ruleType.value;
     if(isLine(type)&&points.length!==2){alert('Draw exactly 2 points for a line.');return;}
-    if(type==='intrusion'&&points.length<''' + str(MIN_POLYGON_POINTS) + '''){alert('Draw at least ''' + str(MIN_POLYGON_POINTS) + ''' points for an intrusion zone.');return;}
+    if(isZone(type)&&points.length<''' + str(MIN_POLYGON_POINTS) + '''){alert('Draw at least ''' + str(MIN_POLYGON_POINTS) + ''' points for a zone.');return;}
     const payload={
       rule_type:type,
       name:name,

@@ -527,8 +527,22 @@ def _build_payload(event: dict) -> dict:
         "object_count": event.get("object_count"),
         "detections": payload_detections,
         "event_timestamp": str(event.get("timestamp") or "").strip(),
-        "parent_local_event_id": (str(event["motion_event_id"]).strip() or None) if event.get("motion_event_id") else None,
+        "parent_local_event_id": _parent_local_event_id(event),
     }
+
+
+def _parent_local_event_id(event: dict) -> str | None:
+    """The local id of the event whose media this one reuses: a Smart
+    Motion event's base Motion event (motion_event_id), or -- PPE, Facial
+    Recognition, People Counting (2026-09-26) -- the event that owns the
+    clip covering this moment (media_parent_event_id, set by
+    event_media_sharing.py). Same wire field for both; the cloud checks
+    which parent types each event type may name."""
+    for key in ("motion_event_id", "media_parent_event_id"):
+        value = str(event.get(key) or "").strip()
+        if value:
+            return value
+    return None
 
 
 # Real detections emit the SPECIFIC vehicle sub-class YOLO produced

@@ -266,6 +266,54 @@ def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_loca
     return parent['id'] if parent else None
 
 
+# Analytics media reuse (2026-09-26): PPE, Facial Recognition and People
+# Counting results show an already-uploaded clip instead of storing a new
+# one when the appliance names, by LOCAL id, the event that owns a clip
+# covering that exact moment on the same camera (event_media_sharing.py
+# decides that on the appliance). Each child type may only point at the
+# parent types listed here -- the YOLO scan's clip-owning class events, or
+# (Facial Recognition / People Counting) an event of its own kind that
+# owns a clip because nothing else covered the moment. smart_motion keeps
+# its own 'motion'-only rule in _resolve_parent_motion_event() above,
+# unchanged.
+AI_CLIP_PARENT_TYPES=frozenset({'person','car','truck','bus','motorcycle','bicycle','dog','cat','bird','backpack','suitcase'})
+ANALYTICS_MEDIA_PARENT_TYPES={
+    'ppe':AI_CLIP_PARENT_TYPES,
+    'facial_recognition':AI_CLIP_PARENT_TYPES|{'facial_recognition'},
+    'people_counting_in':AI_CLIP_PARENT_TYPES|{'people_counting_in','people_counting_out'},
+    'people_counting_out':AI_CLIP_PARENT_TYPES|{'people_counting_in','people_counting_out'},
+}
+
+
+def _resolve_parent_event(db,camera_id: str,appliance_id: str,parent_local_event_id: str,child_event_type: str) -> str | None:
+    """_resolve_parent_motion_event() generalized to every child type that
+    may reuse another event's media: same camera, same authenticated
+    appliance, and a parent type allowed for this child. None (never
+    raises) when unresolvable, exactly like the Motion-only resolver."""
+    if child_event_type=='smart_motion':
+        return _resolve_parent_motion_event(db,camera_id,appliance_id,parent_local_event_id)
+    allowed=ANALYTICS_MEDIA_PARENT_TYPES.get(child_event_type)
+    if not allowed or not parent_local_event_id:
+        return None
+    parent=db.execute(
+        'SELECT id,event_type FROM detection_events WHERE camera_id=? AND appliance_id=? AND local_event_id=?',
+        (camera_id,appliance_id,parent_local_event_id),
+    ).fetchone()
+    return parent['id'] if parent and parent['event_type'] in allowed else None
+
+
+def _moment_within(moment: str,started_at: str,ended_at: str) -> bool:
+    """True when an event's own timestamp lies inside a clip's recorded
+    window -- the explicit matching tolerance for reused media is the
+    clip's own pre-roll/post-roll window, nothing wider. Unparseable or
+    mixed naive/aware values never match."""
+    try:
+        at,start,end=(datetime.fromisoformat(str(value)) for value in (moment,started_at,ended_at))
+        return start<=at<=end
+    except (TypeError,ValueError):
+        return False
+
+
 def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: Callable[[Request],dict] | None=None) -> None:
     @app.get('/api/appliance/config')
     def appliance_config() -> dict:
@@ -919,8 +967,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         aac_voice_call_duplicate_of=None
         with connection() as db:
             parent_detection_event_id=(
-                _resolve_parent_motion_event(db,camera_id,appliance['id'],parent_local_event_id)
-                if event_type=='smart_motion' and parent_local_event_id else None
+                _resolve_parent_event(db,camera_id,appliance['id'],parent_local_event_id,event_type)
+                if parent_local_event_id and (event_type=='smart_motion' or event_type in ANALYTICS_MEDIA_PARENT_TYPES) else None
             )
             try:
                 db.execute(
@@ -1363,13 +1411,18 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
 
         with connection() as db:
             child=db.execute(
-                'SELECT id,event_type,appliance_id,camera_id,customer_id,site_id,parent_detection_event_id '
+                'SELECT id,event_type,appliance_id,camera_id,customer_id,site_id,parent_detection_event_id,event_timestamp '
                 'FROM detection_events WHERE camera_id=? AND local_event_id=?',
                 (camera_id,local_event_id),
             ).fetchone()
             if not child:
                 raise HTTPException(status_code=404,detail='Detection event has not reached the cloud yet.')
-            if child['event_type']!='smart_motion':
+            # smart_motion (Phase A) keeps its exact rules; PPE, Facial
+            # Recognition and People Counting (2026-09-26) may also reuse
+            # media, from the parent types ANALYTICS_MEDIA_PARENT_TYPES
+            # allows and only for a moment inside the parent's clip.
+            analytics_child=child['event_type'] in ANALYTICS_MEDIA_PARENT_TYPES
+            if child['event_type']!='smart_motion' and not analytics_child:
                 raise HTTPException(status_code=403,detail='Only a smart_motion event may use shared media registration.')
             if child['appliance_id']!=appliance['id']:
                 raise HTTPException(status_code=403,detail='Event does not belong to this appliance.')
@@ -1382,7 +1435,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # equal the child's own already-frozen, previously-verified
             # correlation. A request can never silently reassign a
             # different parent after the fact.
-            resolved_parent_id=_resolve_parent_motion_event(db,camera_id,appliance['id'],parent_local_event_id)
+            resolved_parent_id=_resolve_parent_event(db,camera_id,appliance['id'],parent_local_event_id,child['event_type'])
             if resolved_parent_id is None or resolved_parent_id!=child['parent_detection_event_id']:
                 raise HTTPException(status_code=403,detail="parent_local_event_id does not match this event's established correlation.")
 
@@ -1392,7 +1445,10 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             ).fetchone()
             if not parent:
                 raise HTTPException(status_code=404,detail='Claimed parent Motion event no longer exists.')
-            if parent['event_type']!='motion':
+            if analytics_child:
+                if parent['event_type'] not in ANALYTICS_MEDIA_PARENT_TYPES[child['event_type']]:
+                    raise HTTPException(status_code=403,detail='parent_local_event_id does not identify an event whose media this event may use.')
+            elif parent['event_type']!='motion':
                 raise HTTPException(status_code=403,detail='parent_local_event_id does not identify a base Motion event.')
             if parent['appliance_id']!=appliance['id']:
                 raise HTTPException(status_code=403,detail='Claimed parent Motion event does not belong to this appliance.')
@@ -1402,12 +1458,21 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 raise HTTPException(status_code=403,detail='Claimed parent Motion event belongs to a different customer or site.')
 
             parent_media=db.execute(
-                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes,local_relative_path '
+                'SELECT id,s3_key,thumbnail_s3_key,started_at,ended_at,duration_seconds,size_bytes,local_relative_path,source_media_id '
                 'FROM detection_event_media WHERE detection_event_id=?',
                 (parent['id'],),
             ).fetchone()
             if not parent_media:
                 raise HTTPException(status_code=409,detail='parent_media_pending: base Motion event has no registered media yet.')
+            if analytics_child:
+                # Only an original upload may be shared (the retention
+                # sweep cascades a root's deletion one level, to rows
+                # whose source_media_id is that root), and only for a
+                # moment its clip actually recorded -- never "close enough".
+                if parent_media['source_media_id'] is not None:
+                    raise HTTPException(status_code=403,detail="Claimed parent's media is itself shared.")
+                if not _moment_within(child['event_timestamp'],parent_media['started_at'],parent_media['ended_at']):
+                    raise HTTPException(status_code=403,detail="This event's moment is outside the claimed parent's clip.")
 
             existing=db.execute('SELECT id,source_media_id FROM detection_event_media WHERE detection_event_id=?',(child['id'],)).fetchone()
             if existing:

@@ -37,6 +37,11 @@ multi-tenant authorization boundary change deliberately left for a
 dedicated follow-up pass rather than done inside this audit. These
 tests exist so that follow-up changes this exact, currently-correct
 behavior on purpose, not by accident.
+
+2026-09-26: that follow-up is done for PPE and Facial Recognition (and
+People Counting) -- see event_media_sharing.py and
+test_event_media_sharing.py / test_analytics_media_reuse_cloud.py; the
+PPE test below is now the positive path. LPR ("plate") is unchanged.
 """
 
 import sys
@@ -120,17 +125,15 @@ def _standard_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
 
 
-def test_ppe_event_in_same_scan_as_its_own_clip_still_gets_no_shared_media(
+def test_ppe_event_in_same_scan_shares_that_scans_clip(
     monkeypatch, tmp_path, fake_media_pipeline, background_loop
 ):
     """A person is detected (this scan's own primary_class_name, so a
     real clip build+upload IS scheduled for it) AND PPE fires on that
-    same person crop in the same scan. Today: the person event gets its
-    own real upload_motion_event_media() call; the sibling PPE event
-    gets neither call at all, even though the exact same physical
-    window it happened in is already being uploaded a few lines away.
-    This is the confirmed, currently-correct (not a bug) gap this audit
-    found -- flip this test's own assertion the day it's fixed."""
+    same person crop in the same scan. The gap this audit found is closed
+    (2026-09-26, event_media_sharing.py): the PPE event names the person
+    event as its media parent and registers the SAME clip via
+    register_shared_event_media() once it lands -- no second upload."""
     monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
 
     async def fake_build_motion_event_clip(event_id, camera_number, start, end):
@@ -172,15 +175,13 @@ def test_ppe_event_in_same_scan_as_its_own_clip_still_gets_no_shared_media(
     assert _wait_until(lambda: len(fake_media_pipeline.upload_calls) == 1)
     assert fake_media_pipeline.upload_calls[0]["event_id"] == person_event["id"]
 
-    # Give a wrongly-scheduled shared-media call a chance to land, then
-    # confirm it never does -- this is the actual audit finding.
-    time.sleep(0.3)
-    assert fake_media_pipeline.register_calls == [], (
-        "PPE event currently registers no shared media at all -- if this "
-        "assertion ever fails, PPE has been wired to share the primary "
-        "clip and this characterization test should be rewritten as a "
-        "real positive-path test instead of deleted."
-    )
+    # ...and the PPE event reuses it, once, naming the person event.
+    assert ppe_event["media_parent_event_id"] == person_event["id"]
+    assert _wait_until(lambda: len(fake_media_pipeline.register_calls) == 1)
+    assert fake_media_pipeline.register_calls == [
+        {"event_id": ppe_event["id"], "camera_number": 170, "parent_local_event_id": person_event["id"]}
+    ]
+    assert len(fake_media_pipeline.upload_calls) == 1
 
 
 def test_ppe_event_is_suppressed_when_merged_into_the_immediately_prior_window(
