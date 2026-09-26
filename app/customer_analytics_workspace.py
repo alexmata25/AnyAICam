@@ -371,6 +371,7 @@ PAGE_CSS = """<link rel="stylesheet" href="/static/inline_media.css"><style>
 .aw-tile{display:flex;flex-direction:column;gap:6px;padding:18px;border-radius:14px;background:rgba(24,33,50,.94);border:1px solid rgba(170,196,207,.16);color:inherit;text-decoration:none}
 .aw-tile:hover,.aw-tile:focus-visible{border-color:rgba(67,209,204,.6);outline:none}
 .aw-tile strong{font-size:17px}.aw-tile .aw-count{font-size:26px;font-weight:800}
+.aw-rules-action{margin-top:auto;padding-top:6px;color:#43d1cc;font-weight:700;font-size:14px}
 @media(max-width:640px){.aw-filter{flex:1 1 140px}.aw-grid{grid-template-columns:1fr}.aw-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>"""
 
@@ -397,12 +398,77 @@ def render_landing(request: Request, cameras: list[dict], page_shell: Callable) 
                              f'<span class="aw-count">{count:,}</span><span class="aw-meta">in the last 24 hours</span>'
                              f'<span class="aw-meta">{escape(spec["description"])}</span></a>')
         body = f'<div class="aw-landing">{"".join(tiles)}</div>'
+    rules_tile = (f'<a class="aw-tile" href="{SMART_RULES_HREF}"><strong>{SMART_RULES_LABEL}</strong>'
+                  f'<span class="aw-meta">{escape(SMART_RULES_DESCRIPTION)}</span><span class="aw-rules-action">Choose a camera &rsaquo;</span></a>')
     content = (PAGE_CSS + '<header class="topbar"><div><p class="eyebrow">Reports</p><h1>Analytics</h1></div>'
-               '<a class="ghost-button" href="/investigate">Search evidence</a></header>' + body)
+               '<a class="ghost-button" href="/investigate">Search evidence</a></header>' + body
+               + f'<h2 class="aw-section">Set up</h2><div class="aw-landing">{rules_tile}</div>')
     return page_shell("Analytics", "analytics", versioned(content))
 
 
+# Smart Rules (2026-09-26): the Analytics entry for the per-camera rule
+# editor (customer_analytics_rules.py, /customer/cameras/<id>/analytics-rules)
+# -- detection zones, line crossing, zones to ignore and the people
+# counting line. This page only picks the camera; the editor is unchanged.
+SMART_RULES_SLUG = "smart-rules"
+SMART_RULES_HREF = f"/analytics/{SMART_RULES_SLUG}"
+SMART_RULES_LABEL = "Smart Rules"
+SMART_RULES_DESCRIPTION = "Draw detection zones, line crossings, zones to ignore and counting lines on each camera."
+RULE_KIND_LABELS = (("intrusion", "detection zone", "detection zones"), ("line_crossing", "line crossing", "line crossings"),
+                    ("exclusion", "zone to ignore", "zones to ignore"), ("people_counting", "counting line", "counting lines"))
+
+
+def _rules_editor_href(camera_id: str) -> str:
+    from urllib.parse import quote
+    return f"/customer/cameras/{quote(camera_id, safe='')}/analytics-rules"
+
+
+def render_smart_rules(request: Request, cameras: list[dict], page_shell: Callable) -> str:
+    """Every camera this customer can see, what rules it has, and a link to
+    draw them on that camera's own image."""
+    import customer_analytics_rules
+    identity = _identity(request)
+    camera_data = _camera_data(cameras)
+    ids = [c["id"] for c in camera_data]
+    counts: dict[str, dict[str, int]] = {}
+    editable: dict[str, bool] = {}
+    if ids and identity.get("customer_id"):
+        with connection() as db:
+            for row in db.execute(
+                    f"SELECT camera_id, rule_type, COUNT(*) AS n FROM customer_analytics_rules WHERE customer_id=? AND enabled=1 "
+                    f"AND camera_id IN ({','.join('?' for _ in ids)}) GROUP BY camera_id, rule_type", (identity["customer_id"], *ids)):
+                counts.setdefault(row["camera_id"], {})[row["rule_type"]] = row["n"]
+            for camera_id in ids:
+                try:
+                    editable[camera_id] = customer_analytics_rules._authorized_camera_for_rules(db, camera_id, identity)[1]
+                except HTTPException:
+                    editable[camera_id] = False
+    header = (f'<header class="topbar"><div><p class="eyebrow"><a class="download" href="/analytics">Analytics</a></p>'
+              f'<h1>{SMART_RULES_LABEL}</h1><p class="health-detail" style="margin:4px 0 0">{escape(SMART_RULES_DESCRIPTION)} '
+              'Pick a camera to open its rule editor.</p></div></header>')
+    if not camera_data:
+        body = '<section class="panel"><h2>No cameras yet</h2><p class="health-detail">Rules are drawn per camera once a camera is added.</p></section>'
+    else:
+        tiles = []
+        for camera in camera_data:
+            mine = counts.get(camera["id"], {})
+            summary = ", ".join(f"{mine[kind]} {one if mine[kind] == 1 else many}"
+                                for kind, one, many in RULE_KIND_LABELS if mine.get(kind)) or "No rules yet"
+            action = "Draw rules" if editable.get(camera["id"]) else "View rules"
+            site = f'<span class="aw-meta">{escape(camera["site_name"])}</span>' if camera.get("site_name") else ""
+            tiles.append(f'<a class="aw-tile" href="{_rules_editor_href(camera["id"])}" data-camera="{escape(camera["id"], quote=True)}">'
+                         f'<strong>{escape(camera["name"])}</strong>{site}<span class="aw-meta">{escape(summary)}</span>'
+                         f'<span class="aw-rules-action">{action} &rsaquo;</span></a>')
+        body = (f'<div class="aw-landing" aria-label="Cameras">{"".join(tiles)}</div>'
+                '<p class="health-detail" style="margin-top:16px">Detection zones and line crossings create events on cameras with '
+                'Smart Motion; a counting line counts people on cameras with People Counting; anything inside a zone to ignore never '
+                'becomes an event on that camera.</p>')
+    return page_shell(SMART_RULES_LABEL, "analytics", versioned(PAGE_CSS + header + body))
+
+
 def render_workspace(request: Request, cameras: list[dict], page_shell: Callable, slug: str) -> str:
+    if slug == SMART_RULES_SLUG:
+        return render_smart_rules(request, cameras, page_shell)
     key = BY_SLUG.get(slug)
     identity = _identity(request)
     if key is None:
@@ -471,10 +537,13 @@ def render_workspace(request: Request, cameras: list[dict], page_shell: Callable
 def nav_menu_html(workspaces: list[dict], active_path: str) -> tuple[str, str, str]:
     """(desktop sidebar item, mobile bar item, mobile sheet) for the one
     Analytics entry. The flyout/sheet list only the analytics given."""
+    items = [*workspaces, {"href": SMART_RULES_HREF, "label": SMART_RULES_LABEL}]  # rules: any camera, no plan needed
+    in_rule_editor = active_path.startswith("/customer/cameras/") and active_path.endswith("/analytics-rules")
+    current = SMART_RULES_HREF if in_rule_editor else active_path
     links = '<a role="menuitem" href="/analytics">All analytics</a>' + "".join(
-        f'<a role="menuitem" href="{w["href"]}"{" aria-current=\"page\"" if active_path == w["href"] else ""}>{escape(w["label"])}</a>'
-        for w in workspaces)
-    active = active_path == "/analytics" or active_path.startswith("/analytics/")
+        f'<a role="menuitem" href="{w["href"]}"{" aria-current=\"page\"" if current == w["href"] else ""}>{escape(w["label"])}</a>'
+        for w in items)
+    active = active_path == "/analytics" or active_path.startswith("/analytics/") or in_rule_editor
     desktop = (f'<div class="nav-flyout-wrap" data-nav-flyout>'
                f'<a class="{"active" if active else ""}" href="/analytics" aria-haspopup="menu" aria-expanded="false" data-nav-flyout-toggle>'
                f'<span class="nav-icon">▥</span><span>Analytics</span></a>'

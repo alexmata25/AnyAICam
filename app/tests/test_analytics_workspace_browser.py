@@ -175,7 +175,7 @@ def test_desktop_flyout_lists_only_entitled_analytics(playwright_instance, pages
         assert menu.is_hidden()
         toggle.hover()  # a mouse shows the list on hover...
         menu.wait_for(state="visible")
-        assert menu.locator("a").all_inner_texts() == ["All analytics", "Smart Motion", "PPE"]
+        assert menu.locator("a").all_inner_texts() == ["All analytics", "Smart Motion", "PPE", "Smart Rules"]
         box, anchor = menu.bounding_box(), toggle.bounding_box()
         # ...and it stays open while the pointer crosses the gap into it.
         page.mouse.move(anchor["x"] + anchor["width"] + 4, anchor["y"] + anchor["height"] / 2)
@@ -266,7 +266,7 @@ def test_phone_analytics_submenu_and_inline_playback(playwright_instance, pages,
         toggle.tap()
         sheet.wait_for(state="visible")
         assert toggle.get_attribute("aria-expanded") == "true"
-        assert sheet.locator("a").all_inner_texts() == ["All analytics", "Smart Motion", "PPE"]
+        assert sheet.locator("a").all_inner_texts() == ["All analytics", "Smart Motion", "PPE", "Smart Rules"]
         assert sheet.bounding_box()["y"] + sheet.bounding_box()["height"] <= page.locator(".mobile-nav").bounding_box()["y"] + 1  # above the bar
         page.mouse.click(195, 200)
         sheet.wait_for(state="hidden")

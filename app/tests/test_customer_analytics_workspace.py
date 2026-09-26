@@ -207,7 +207,7 @@ def test_menu_lists_only_what_the_customer_has(client):
 def test_desktop_flyout_and_mobile_submenu_on_customer_pages(client):
     html = client.get("/playback", cookies=_cookie()).text
     flyout = re.search(r'<div class="nav-flyout" role="menu" aria-label="Analytics" hidden>(.*?)</div>', html, re.S).group(1)
-    assert re.findall(r'>([^<]+)</a>', flyout) == ["All analytics", "Smart Motion", "People Counting", "License Plates", "PPE"]
+    assert re.findall(r'>([^<]+)</a>', flyout) == ["All analytics", "Smart Motion", "People Counting", "License Plates", "PPE", "Smart Rules"]
     assert "Voice" not in flyout  # AAC Voice Call keeps its own place
     assert html.count("data-nav-flyout-toggle>") == 1  # one Analytics entry, not one per analytic
     assert '<button type="button" class="mobile-analytics-toggle' in html
@@ -251,9 +251,73 @@ def test_unavailable_workspace_explains_itself(client):
 def test_overview_and_legacy_links(client):
     html = client.get("/analytics", cookies=_cookie()).text
     assert "view_analytics" not in html
-    assert html.count('class="aw-tile"') == 4 and 'href="/analytics/ppe"' in html
+    assert html.count('class="aw-tile"') == 5 and 'href="/analytics/ppe"' in html  # 4 analytics + Smart Rules
     response = client.get("/analytics?type=ppe&camera=cam-a", cookies=_cookie())
     assert response.status_code == 303 and response.headers["location"] == "/analytics/ppe?camera=cam-a"
+
+
+# ---------------------------------------------------------------- Smart Rules
+
+def _rule(db_path, rule_id, camera, rule_type, customer="cust-1", enabled=1):
+    geometry = '[{"x":0.1,"y":0.1},{"x":0.9,"y":0.1}]' if rule_type in ("line_crossing", "people_counting") else         '[{"x":0.1,"y":0.1},{"x":0.5,"y":0.1},{"x":0.5,"y":0.5}]'
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO customer_analytics_rules(id,customer_id,site_id,appliance_id,camera_id,rule_type,name,direction,geometry_json,enabled,created_at,updated_at) "
+                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (rule_id, customer, f"site-{customer}", "app", camera, rule_type, rule_id,
+                                                   "both" if rule_type in ("line_crossing", "people_counting") else None, geometry, enabled, "x", "x"))
+    conn.commit()
+    conn.close()
+
+
+def _rules_tiles(html):
+    return {m.group(1): m.group(2) for m in re.finditer(r'<a class="aw-tile" href="/customer/cameras/([^/]+)/analytics-rules"[^>]*>(.*?)</a>', html, re.S)}
+
+
+def test_smart_rules_is_in_the_analytics_menu_for_every_customer(client):
+    html = client.get("/playback", cookies=_cookie()).text
+    for container in (r'<div class="nav-flyout" role="menu" aria-label="Analytics" hidden>(.*?)</div>',
+                      r'<div class="mobile-analytics-sheet" id="mobile-analytics-sheet"[^>]*>(.*?)</div>'):
+        assert '<a role="menuitem" href="/analytics/smart-rules">Smart Rules</a>' in re.search(container, html, re.S).group(1)
+    # Rules need no plan (a zone to ignore works on any camera): even with no analytics at all it is there.
+    desktop, mobile, sheet = ws.nav_menu_html([], "/playback")
+    assert 'href="/analytics/smart-rules"' in desktop and 'href="/analytics/smart-rules"' in sheet
+
+
+def test_smart_rules_page_picks_a_camera_and_opens_its_existing_editor(client, db_path):
+    _rule(db_path, "z1", "cam-a", "intrusion")
+    _rule(db_path, "z2", "cam-a", "exclusion")
+    _rule(db_path, "z3", "cam-a", "exclusion")
+    _rule(db_path, "l1", "cam-b", "line_crossing")
+    _rule(db_path, "p1", "cam-b", "people_counting")
+    _rule(db_path, "off", "cam-c", "intrusion", enabled=0)
+    _rule(db_path, "theirs", "cam-x", "exclusion", customer="cust-2")
+    response = client.get("/analytics/smart-rules", cookies=_cookie())
+    assert response.status_code == 200
+    html = response.text
+    assert "<h1>Smart Rules</h1>" in html and 'href="/analytics"' in html
+    tiles = _rules_tiles(html)
+    assert set(tiles) == {"cam-a", "cam-b", "cam-c"}  # never another customer's camera
+    assert "1 detection zone, 2 zones to ignore" in tiles["cam-a"] and "Draw rules" in tiles["cam-a"]
+    assert "1 line crossing, 1 counting line" in tiles["cam-b"]
+    assert "No rules yet" in tiles["cam-c"]  # a disabled rule isn't counted
+    assert '<a role="menuitem" href="/analytics/smart-rules" aria-current="page">Smart Rules</a>' in html
+    # The editor it opens is the existing one, with a way back.
+    editor = client.get("/customer/cameras/cam-a/analytics-rules", cookies=_cookie()).text
+    assert "Ignore detections in zone" in editor and 'href="/analytics/smart-rules">Smart Rules</a>' in editor
+    assert '<a role="menuitem" href="/analytics/smart-rules" aria-current="page">Smart Rules</a>' in editor
+
+
+def test_smart_rules_respects_viewer_permissions_and_tenants(client, db_path):
+    viewer = client.get("/analytics/smart-rules", cookies=_cookie("viewer@c1.test", "customer_viewer")).text
+    tiles = _rules_tiles(viewer)
+    assert set(tiles) == {"cam-a"} and "View rules" in tiles["cam-a"]  # no Camera Settings access -> view only
+    other = client.get("/analytics/smart-rules", cookies=_other()).text
+    assert set(_rules_tiles(other)) == {"cam-x"}
+    assert client.get("/analytics/smart-rules").status_code in (302, 303, 401, 403)
+
+
+def test_overview_offers_smart_rules(client):
+    html = client.get("/analytics", cookies=_cookie()).text
+    assert '<a class="aw-tile" href="/analytics/smart-rules"><strong>Smart Rules</strong>' in html
 
 
 def test_face_scores_are_labelled_as_match_only_for_recognized_people():
