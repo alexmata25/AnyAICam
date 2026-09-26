@@ -11355,6 +11355,23 @@ def append_audit_entry(entry: dict) -> None:
 
 
 
+def append_audit_log(action: str, *, user: dict, details: dict | None = None) -> None:
+    """Audit helper the investigation-case routes call. It was never defined,
+    so creating or updating a case saved the record and then failed with a
+    NameError 500 (admin portal pass 2026-09-26). Writes the same audit
+    entry shape as every other route (append_audit_entry)."""
+    details = details or {}
+    case_id = details.get("case_id")
+    append_audit_entry(AuditEntryModel(
+        user_id=str(user.get("id") or "unknown"),
+        user_name=str(user.get("display_name") or user.get("email") or user.get("id") or "Unknown user"),
+        role=str(user.get("role") or "viewer"),
+        action=action,
+        resource=f"investigation_case:{case_id}" if case_id else action,
+        detail=json.dumps(details, default=str)[:500],
+    ).model_dump(mode="json"))
+
+
 def record_audit(
 
 
@@ -12452,7 +12469,12 @@ def load_json_file(path: Path, default: dict) -> dict:
 
 
 
-            return data if isinstance(data, dict) else default
+            # Same shape as the caller's default, not dict-only: 14 stores
+            # (billing events, license history, onboarding activity, backup
+            # history, incidents, the cloud upload queue...) are JSON lists,
+            # and a dict-only check made every read of them return [] so each
+            # append silently replaced the whole file (admin pass 2026-09-26).
+            return data if isinstance(data, type(default)) else default
 
 
 
@@ -25615,7 +25637,7 @@ def backup_source_files(
 
 
 
-        INVITATIONS_FILE,
+        USER_INVITES_FILE,
 
 
 
@@ -42635,6 +42657,11 @@ def is_master_admin(user: dict | None) -> bool:
 
 
         or user.get("super_admin") is True
+        # A platform owner/admin (live global administrator grant, re-checked
+        # by cloud_administrator_bridge() on every request) is the top of
+        # the role hierarchy (platform_owner.py) -- the Admin Portal nav
+        # already offered it Business users, then denied it on arrival.
+        or user.get("via_cloud_administrator_grant") is True
 
 
 
@@ -48032,12 +48059,14 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
     # Prefer the newer partner/customer identity when available.
     # Fall back to the legacy VMS identity for older/internal accounts.
     shell_user = None
+    shell_has_partner_identity = False
     if request is not None:
         try:
             from partner_portal import partner_identity
             shell_user = partner_identity(request)
         except Exception:
             shell_user = None
+        shell_has_partner_identity = bool(shell_user)
 
         if not shell_user:
             shell_user = current_user(request)
@@ -48109,7 +48138,10 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
         # specific to AAC) -- those roles won't see this link even
         # though partner_owner/technician do hold facial.view/
         # facial.manage. See the Phase 2 report's own nav section.
-        and (item[0] != "aac" or _facial_view_permitted(shell_user, shell_role))
+        # ...and only for a Partner Portal session: every /aac/* route
+        # authenticates through partner_identity() alone, so a legacy
+        # local admin saw the link and got a bare 401 (admin pass 2026-09-26).
+        and (item[0] != "aac" or (shell_has_partner_identity and _facial_view_permitted(shell_user, shell_role)))
 
 
 
@@ -53066,7 +53098,11 @@ def events_api(camera: int | None = None, date: str | None = None, limit: int = 
 
 
 
-def save_snapshot(request: SnapshotRequest) -> dict:
+def save_snapshot(request: SnapshotRequest, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): no permission or camera check before.
+    snapshot_user = current_user(http_request)
+    if not has_permission(snapshot_user, "view_live") or request.camera not in user_camera_ids(snapshot_user):
+        raise HTTPException(status_code=403, detail="Camera access is required.")
 
 
 
@@ -53714,7 +53750,11 @@ def read_event_settings(camera_number: int) -> dict:
 
 
 
-def update_event_settings(camera_number: int, settings: EventSettingsModel) -> dict:
+def update_event_settings(camera_number: int, settings: EventSettingsModel, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): this legacy settings route had no
+    # permission check, so any signed-in account could change it.
+    if not has_permission(current_user(http_request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
 
 
 
@@ -53894,7 +53934,11 @@ def read_alert_rule(camera_number: int) -> dict:
 
 
 
-def update_alert_rule(camera_number: int, rule: AlertRuleModel) -> dict:
+def update_alert_rule(camera_number: int, rule: AlertRuleModel, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): this legacy settings route had no
+    # permission check, so any signed-in account could change it.
+    if not has_permission(current_user(http_request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
 
 
 
@@ -58918,7 +58962,11 @@ def analytics_rules_api(camera: int | None = None) -> dict:
 
 
 
-def create_analytics_rule(rule: AnalyticsRuleModel) -> dict:
+def create_analytics_rule(rule: AnalyticsRuleModel, http_request: Request) -> dict:
+    # Admin portal pass (2026-09-26): this legacy settings route had no
+    # permission check, so any signed-in account could change it.
+    if not has_permission(current_user(http_request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Settings permission is required.")
 
 
 
@@ -61795,7 +61843,7 @@ def enterprise_deployment_readiness_page(request: Request) -> str:
 
 
 
-          <div class="enterprise-actions"><a href="/release-readiness">Release readiness</a><a href="/diagnostics">Diagnostics</a></div>
+          <div class="enterprise-actions"><a href="/release-readiness">Release readiness</a><a href="/operations">Diagnostics</a></div>
 
 
 
@@ -63172,7 +63220,7 @@ def enterprise_observability_page(request: Request) -> str:
 
 
 
-          <div class="obs-actions"><a href="/operations">Operations</a><a href="/diagnostics">Diagnostics</a><a href="/cloud-recording">Cloud recording</a></div>
+          <div class="obs-actions"><a href="/operations">Operations</a><a href="/operations">Diagnostics</a><a href="/cloud-recording">Cloud recording</a></div>
 
 
 
@@ -64603,7 +64651,7 @@ def enterprise_backup_disaster_recovery_page(request: Request) -> str:
 
 
 
-            <a href="/diagnostics">Diagnostics</a>
+            <a href="/operations">Diagnostics</a>
 
 
 
@@ -66925,7 +66973,12 @@ def enterprise_incident_response_page(request: Request) -> str:
 
 
 
-    incident_data = '<script id="incident-data" type="application/json">' + escape(json.dumps(incidents)) + '</script>'
+    # Script-safe JSON, not HTML-escaped: a <script> body is never entity-decoded,
+    # so escape()'s &quot; made JSON.parse throw and killed the whole Incidents
+    # page script (admin portal pass 2026-09-26). <, > and & are unicode-escaped
+    # so no stored value can close the tag.
+    incident_json = json.dumps(incidents).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    incident_data = '<script id="incident-data" type="application/json">' + incident_json + '</script>'
 
 
 
@@ -73953,7 +74006,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-    const get_camera_count()=__CAMERA_COUNT__;
+    const CAMERA_COUNT=__CAMERA_COUNT__;
 
 
 
@@ -74603,7 +74656,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-        document.getElementById('health-online-count').textContent=`${onlineCount}/${cameras.length||get_camera_count()}`;
+        document.getElementById('health-online-count').textContent=`${onlineCount}/${cameras.length||CAMERA_COUNT}`;
 
 
 
@@ -74612,7 +74665,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-        document.getElementById('health-recording-count').textContent=`${recordingCount}/${cameras.length||get_camera_count()}`;
+        document.getElementById('health-recording-count').textContent=`${recordingCount}/${cameras.length||CAMERA_COUNT}`;
 
 
 
@@ -90050,7 +90103,7 @@ def incident_reports_page(request: Request) -> str:
 
 
 
-      showToast(data.message);event.currentTarget.reset();await loadReports();openReport(data.report.id);
+      showToast(data.message);event.target.reset();await loadReports();openReport(data.report.id);
 
 
 
@@ -91400,7 +91453,7 @@ def enterprise_notifications_page(request: Request) -> str:
 
 
 
-    document.getElementById('notification-rule-form').addEventListener('submit',async event=>{event.preventDefault();const payload={name:document.getElementById('notification-name').value,enabled:document.getElementById('notification-enabled').checked,event_types:selectedValues('notification-event-types'),camera_ids:selectedValues('notification-cameras').map(Number),minimum_confidence:Number(document.getElementById('notification-confidence').value||0),severity:document.getElementById('notification-severity').value,channels:selectedValues('notification-channels'),recipients:document.getElementById('notification-recipients').value.split(',').map(value=>value.trim()).filter(Boolean),quiet_hours_start:document.getElementById('notification-quiet-start').value,quiet_hours_end:document.getElementById('notification-quiet-end').value,cooldown_seconds:Number(document.getElementById('notification-cooldown').value||0)};const response=await fetch('/api/notification-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();if(!response.ok)return showToast(data.detail||'Could not create rule.');showToast(data.message);event.currentTarget.reset();document.getElementById('notification-enabled').checked=true;loadRules()});
+    document.getElementById('notification-rule-form').addEventListener('submit',async event=>{event.preventDefault();const payload={name:document.getElementById('notification-name').value,enabled:document.getElementById('notification-enabled').checked,event_types:selectedValues('notification-event-types'),camera_ids:selectedValues('notification-cameras').map(Number),minimum_confidence:Number(document.getElementById('notification-confidence').value||0),severity:document.getElementById('notification-severity').value,channels:selectedValues('notification-channels'),recipients:document.getElementById('notification-recipients').value.split(',').map(value=>value.trim()).filter(Boolean),quiet_hours_start:document.getElementById('notification-quiet-start').value,quiet_hours_end:document.getElementById('notification-quiet-end').value,cooldown_seconds:Number(document.getElementById('notification-cooldown').value||0)};const response=await fetch('/api/notification-rules',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();if(!response.ok)return showToast(data.detail||'Could not create rule.');showToast(data.message);event.target.reset();document.getElementById('notification-enabled').checked=true;loadRules()});
 
 
 
@@ -96248,7 +96301,7 @@ def backup_restore_page(request: Request) -> str:
 
 
 
-      showToast(data.message);event.currentTarget.reset();loadBackups();
+      showToast(data.message);event.target.reset();loadBackups();
 
 
 
@@ -100055,7 +100108,7 @@ def update_billing_account(
 
 
 
-    if payload.payment_status not in {"current", "past_due", "suspended", "cancelled"}:
+    if payload.payment_status not in {"current", "trial", "past_due", "suspended", "cancelled"}:
 
 
 
@@ -101315,7 +101368,7 @@ def billing_operations_page(request: Request) -> str:
 
 
 
-          <label>Payment status<select id="billing-payment-status"><option value="current">Current</option><option value="past_due">Past due</option><option value="suspended">Suspended</option><option value="cancelled">Cancelled</option></select></label>
+          <label>Payment status<select id="billing-payment-status"><option value="current">Current</option><option value="trial">Trial</option><option value="past_due">Past due</option><option value="suspended">Suspended</option><option value="cancelled">Cancelled</option></select></label>
 
 
 
@@ -102251,7 +102304,7 @@ def billing_operations_page(request: Request) -> str:
 
 
 
-      showToast(data.message);event.currentTarget.reset();loadBilling();
+      showToast(data.message);event.target.reset();loadBilling();
 
 
 
@@ -105633,7 +105686,7 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
-      showToast(data.message);event.currentTarget.reset();loadSubscriptionPortal();
+      showToast(data.message);event.target.reset();loadSubscriptionPortal();
 
 
 
@@ -105741,7 +105794,7 @@ def subscription_portal_page(request: Request) -> str:
 
 
 
-      showToast(data.message);event.currentTarget.reset();loadSubscriptionPortal();
+      showToast(data.message);event.target.reset();loadSubscriptionPortal();
 
 
 
@@ -107527,303 +107580,33 @@ def administrator_portal_page(request: Request) -> str:
 
 
 def send_payment_reminder_email(account: dict) -> tuple[bool, str]:
-
-
-
-
-
-
-
-
+    # Admin portal pass (2026-09-26): sent through email_service like every
+    # other outbound account email (password reset, invitations...) instead
+    # of a separate raw-SMTP path with its own From/config -- so it honours
+    # ANYAICAM_EMAIL_BACKEND (preview in development) and ANYAICAM_EMAIL_FROM.
     recipient = str(account.get("billing_email") or "").strip()
-
-
-
-
-
-
-
-
     if not recipient:
-
-
-
-
-
-
-
-
         return False, "This customer does not have a billing email."
-
-
-
-
-
-
-
-
-    if not SMTP_HOST or not SMTP_FROM:
-
-
-
-
-
-
-
-
-        return False, "SMTP is not configured."
-
-
-
-
-
-
-
-
     company = str(account.get("company_name") or account.get("customer_name") or "Customer")
-
-
-
-
-
-
-
-
-    message = EmailMessage()
-
-
-
-
-
-
-
-
-    message["Subject"] = "AnyAiCam payment reminder"
-
-
-
-
-
-
-
-
-    message["From"] = SMTP_FROM
-
-
-
-
-
-
-
-
-    message["To"] = recipient
-
-
-
-
-
-
-
-
-    message.set_content(
-
-
-
-
-
-
-
-
-        "\n".join([
-
-
-
-
-
-
-
-
-            f"Hello {company},",
-
-
-
-
-
-
-
-
-            "",
-
-
-
-
-
-
-
-
-            "This is a reminder that your AnyAiCam account requires billing attention.",
-
-
-
-
-
-
-
-
-            "Please sign in to your customer portal to review your subscription, payment method, and invoices.",
-
-
-
-
-
-
-
-
-            "",
-
-
-
-
-
-
-
-
-            f"Customer portal: {invite_base_url()}/customer-portal",
-
-
-
-
-
-
-
-
-            "",
-
-
-
-
-
-
-
-
-            "If you have already resolved the issue, no further action is required.",
-
-
-
-
-
-
-
-
-        ])
-
-
-
-
-
-
-
-
-    )
-
-
-
-
-
-
-
-
-    context = ssl.create_default_context()
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
-
-
-
-
-
-
-
-
-            if SMTP_USE_TLS:
-
-
-
-
-
-
-
-
-                smtp.starttls(context=context)
-
-
-
-
-
-
-
-
-            if SMTP_USERNAME:
-
-
-
-
-
-
-
-
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-
-
-
-
-
-
-
-
-            smtp.send_message(message)
-
-
-
-
-
-
-
-
-        return True, "Payment reminder sent."
-
-
-
-
-
-
-
-
-    except (OSError, smtplib.SMTPException) as error:
-
-
-
-
-
-
-
-
-        return False, str(error)
+    text = "\n".join([
+        f"Hello {company},",
+        "",
+        "This is a reminder that your AnyAiCam account requires billing attention.",
+        "Please sign in to your customer portal to review your subscription, payment method, and invoices.",
+        "",
+        f"Customer portal: {invite_base_url()}/customer-portal",
+        "",
+        "If you have already resolved the issue, no further action is required.",
+    ])
+    from email_service import get_email_service
+
+    result = get_email_service().send("payment_reminder", recipient, "AnyAiCam payment reminder", text)
+    status = str(result.get("status") or "")
+    if status == "sent":
+        return True, f"Payment reminder sent to {recipient}."
+    if status == "preview":
+        return True, "Payment reminder prepared (email preview mode -- nothing was sent)."
+    return False, "The payment reminder could not be sent. Check the email settings and try again."
 
 
 
@@ -108202,6 +107985,7 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
                   data-id="{escape(account_id, quote=True)}"
+                  data-external="{escape(external_id, quote=True)}"
 
 
 
@@ -108550,7 +108334,7 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
 
-          <label>Billing cycle<select id="admin-customer-cycle"><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label>
+          <label>Billing cycle<select id="admin-customer-cycle"><option value="monthly">Monthly</option><option value="annual">Annual</option><option value="manual">Manual</option></select></label>
 
 
 
@@ -108722,6 +108506,7 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
       field('admin-customer-id').value=button.dataset.id||'';
+      customerForm.dataset.external=button.dataset.external||'';
 
 
 
@@ -108892,7 +108677,7 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
 
-        external_customer_id:accountId,
+        external_customer_id:customerForm.dataset.external||'',
 
 
 
@@ -109198,151 +108983,9 @@ def administrator_customer_accounts_page(request: Request) -> str:
 
 
 
-@app.put("/api/billing/accounts/{account_id}")
-
-
-
-
-
-
-
-
-async def update_billing_account_from_admin(account_id: str, request: Request, payload: BillingAccountUpdateModel) -> JSONResponse:
-
-
-
-
-
-
-
-
-    user = current_user(request)
-
-
-
-
-
-
-
-
-    if not has_permission(user, "manage_settings"):
-
-
-
-
-
-
-
-
-        return JSONResponse({"detail": "Administrator access is required."}, status_code=403)
-
-
-
-
-
-
-
-
-    accounts = load_billing_accounts()
-
-
-
-
-
-
-
-
-    if account_id not in accounts:
-
-
-
-
-
-
-
-
-        return JSONResponse({"detail": "Billing account not found."}, status_code=404)
-
-
-
-
-
-
-
-
-    existing = accounts[account_id]
-
-
-
-
-
-
-
-
-    existing.update(payload.model_dump())
-
-
-
-
-
-
-
-
-    existing["id"] = account_id
-
-
-
-
-
-
-
-
-    existing["updated_at"] = datetime.now().isoformat()
-
-
-
-
-
-
-
-
-    existing["updated_by"] = user.get("display_name") or user.get("email") or "Administrator"
-
-
-
-
-
-
-
-
-    accounts[account_id] = existing
-
-
-
-
-
-
-
-
-    save_billing_accounts(accounts)
-
-
-
-
-
-
-
-
-    record_audit(request, "billing.account_updated", f"billing_account:{account_id}", f"Payment status set to {existing.get('payment_status')}.")
-
-
-
-
-
-
-
-
-    return JSONResponse({"status": "complete", "message": "Customer billing account updated.", "account": existing})
+# (A second PUT /api/billing/accounts/{account_id} handler used to live here.
+# FastAPI only ever dispatched to the first one, update_billing_account()
+# above, so it was dead code -- removed in the 2026-09-26 admin pass.)
 
 
 
@@ -110278,7 +109921,7 @@ def administrator_activation_operations_page(request: Request) -> str:
 
 
 
-              <option value="active">Active</option>
+              <option value="completed">Active (onboarding complete)</option>
 
 
 
@@ -110287,7 +109930,7 @@ def administrator_activation_operations_page(request: Request) -> str:
 
 
 
-              <option value="needs_attention">Needs attention</option>
+              <option value="needs_changes">Needs attention</option>
 
 
 
@@ -112789,7 +112432,7 @@ def subscription_admin_page(request: Request) -> str:
 
 
 
-      requestsHost.innerHTML=(data.requests||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.request_type.replaceAll('_',' '))}</strong><div class="subscription-meta">Plan: ${escAdmin(item.requested_plan||'—')} · Cameras: ${item.requested_camera_limit??'—'}<br>${escAdmin(item.reason||'')}</div><div class="subscription-actions"><button onclick="updateRequest('${item.id}','approved')">Approve</button><button onclick="updateRequest('${item.id}','declined')">Decline</button><button onclick="updateRequest('${item.id}','completed')">Complete</button></div></div>`).join('')||'<div class="empty">No subscription requests.</div>';
+      requestsHost.innerHTML=(data.requests||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.request_type.replaceAll('_',' '))}</strong> <span class="subscription-status">${escAdmin(String(item.status||'pending').replaceAll('_',' '))}</span><div class="subscription-meta">Plan: ${escAdmin(item.requested_plan||'—')} · Cameras: ${item.requested_camera_limit??'—'}<br>${escAdmin(item.reason||'')}${item.admin_note?`<br>Admin note: ${escAdmin(item.admin_note)}`:''}</div><div class="subscription-actions"><button onclick="updateRequest('${item.id}','approved')">Approve</button><button onclick="updateRequest('${item.id}','declined')">Decline</button><button onclick="updateRequest('${item.id}','completed')">Complete</button></div></div>`).join('')||'<div class="empty">No subscription requests.</div>';
 
 
 
@@ -112798,7 +112441,7 @@ def subscription_admin_page(request: Request) -> str:
 
 
 
-      ticketsHost.innerHTML=(data.tickets||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.subject)}</strong><div class="subscription-meta">${escAdmin(item.priority)} · ${escAdmin(item.message)}</div><div class="subscription-actions"><button onclick="updateTicket('${item.id}','in_progress')">In progress</button><button onclick="updateTicket('${item.id}','resolved')">Resolve</button><button onclick="updateTicket('${item.id}','closed')">Close</button></div></div>`).join('')||'<div class="empty">No billing tickets.</div>';
+      ticketsHost.innerHTML=(data.tickets||[]).map(item=>`<div class="subscription-card"><strong>${escAdmin(item.user_name)} — ${escAdmin(item.subject)}</strong> <span class="subscription-status">${escAdmin(String(item.status||'open').replaceAll('_',' '))}</span><div class="subscription-meta">${escAdmin(item.priority)} · ${escAdmin(item.message)}${item.admin_note?`<br>Admin note: ${escAdmin(item.admin_note)}`:''}</div><div class="subscription-actions"><button onclick="updateTicket('${item.id}','in_progress')">In progress</button><button onclick="updateTicket('${item.id}','resolved')">Resolve</button><button onclick="updateTicket('${item.id}','closed')">Close</button></div></div>`).join('')||'<div class="empty">No billing tickets.</div>';
 
 
 
@@ -121408,7 +121051,7 @@ def investigation_cases_page(request: Request) -> str:
 
 
 
-      event.currentTarget.reset();showToast(data.message);await loadCases();renderCaseDetail(data.case);
+      event.target.reset();showToast(data.message);await loadCases();renderCaseDetail(data.case);
 
 
 
@@ -132718,7 +132361,7 @@ def settings_detail(settings_slug: str, request: Request) -> str:
 
 
 
-        scripts = """<script>const camera=document.getElementById('event-camera'),sensitivity=document.getElementById('motion-sensitivity');sensitivity.addEventListener('input',()=>document.getElementById('sensitivity-value').textContent=sensitivity.value);async function loadEventConfiguration(){const [settingsResponse,ruleResponse]=await Promise.all([fetch(`/api/cameras/${camera.value}/event-settings`),fetch(`/api/cameras/${camera.value}/alert-rule`)]),settings=(await settingsResponse.json()).settings,rule=(await ruleResponse.json()).rule;document.getElementById('motion-enabled').checked=settings.enabled;sensitivity.value=settings.sensitivity;document.getElementById('sensitivity-value').textContent=settings.sensitivity;document.getElementById('minimum-duration').value=settings.minimum_duration_seconds;document.getElementById('motion-cooldown').value=settings.cooldown_seconds;const zone=settings.zones[0]||{x:0,y:0,width:1,height:1};['x','y','width','height'].forEach(key=>document.getElementById(`zone-${key}`).value=zone[key]);document.getElementById('alerts-enabled').checked=rule.enabled;document.getElementById('alert-motion').checked=rule.event_types.includes('motion');document.getElementById('alert-person').checked=rule.event_types.includes('person');document.getElementById('alert-vehicle').checked=rule.event_types.includes('vehicle');document.getElementById('schedule-start').value=rule.schedule_start;document.getElementById('schedule-end').value=rule.schedule_end;document.getElementById('delivery-in-app').checked=rule.delivery_methods.includes('in_app')}camera.addEventListener('change',loadEventConfiguration);document.getElementById('motion-settings-form').addEventListener('submit',async event=>{event.preventDefault();const payload={camera:Number(camera.value),enabled:document.getElementById('motion-enabled').checked,sensitivity:Number(sensitivity.value),minimum_duration_seconds:Number(document.getElementById('minimum-duration').value),cooldown_seconds:Number(document.getElementById('motion-cooldown').value),zones:[{name:'Primary zone',x:Number(document.getElementById('zone-x').value),y:Number(document.getElementById('zone-y').value),width:Number(document.getElementById('zone-width').value),height:Number(document.getElementById('zone-height').value)}]},response=await fetch(`/api/cameras/${camera.value}/event-settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=await response.json();showToast(result.message)});document.getElementById('alert-rule-form').addEventListener('submit',async event=>{event.preventDefault();const types=['motion','person','vehicle'].filter(type=>document.getElementById(`alert-${type}`).checked),payload={camera:Number(camera.value),enabled:document.getElementById('alerts-enabled').checked,event_types:types,schedule_start:document.getElementById('schedule-start').value,schedule_end:document.getElementById('schedule-end').value,delivery_methods:document.getElementById('delivery-in-app').checked?['in_app']:[]},response=await fetch(`/api/cameras/${camera.value}/alert-rule`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=await response.json();showToast(result.message)});loadEventConfiguration();</script>"""
+        scripts = """<script>const camera=document.getElementById('event-camera'),sensitivity=document.getElementById('motion-sensitivity');sensitivity.addEventListener('input',()=>document.getElementById('sensitivity-value').textContent=sensitivity.value);async function loadEventConfiguration(){if(!camera.value){document.querySelectorAll('#motion-settings-form button,#alert-rule-form button').forEach(button=>button.disabled=true);showToast('No cameras are available to configure here.');return}const [settingsResponse,ruleResponse]=await Promise.all([fetch(`/api/cameras/${camera.value}/event-settings`),fetch(`/api/cameras/${camera.value}/alert-rule`)]);if(!settingsResponse.ok||!ruleResponse.ok){showToast('Settings for this camera could not be loaded.');return}const settings=(await settingsResponse.json()).settings,rule=(await ruleResponse.json()).rule;document.getElementById('motion-enabled').checked=settings.enabled;sensitivity.value=settings.sensitivity;document.getElementById('sensitivity-value').textContent=settings.sensitivity;document.getElementById('minimum-duration').value=settings.minimum_duration_seconds;document.getElementById('motion-cooldown').value=settings.cooldown_seconds;const zone=settings.zones[0]||{x:0,y:0,width:1,height:1};['x','y','width','height'].forEach(key=>document.getElementById(`zone-${key}`).value=zone[key]);document.getElementById('alerts-enabled').checked=rule.enabled;document.getElementById('alert-motion').checked=rule.event_types.includes('motion');document.getElementById('alert-person').checked=rule.event_types.includes('person');document.getElementById('alert-vehicle').checked=rule.event_types.includes('vehicle');document.getElementById('schedule-start').value=rule.schedule_start;document.getElementById('schedule-end').value=rule.schedule_end;document.getElementById('delivery-in-app').checked=rule.delivery_methods.includes('in_app')}camera.addEventListener('change',loadEventConfiguration);document.getElementById('motion-settings-form').addEventListener('submit',async event=>{event.preventDefault();const payload={camera:Number(camera.value),enabled:document.getElementById('motion-enabled').checked,sensitivity:Number(sensitivity.value),minimum_duration_seconds:Number(document.getElementById('minimum-duration').value),cooldown_seconds:Number(document.getElementById('motion-cooldown').value),zones:[{name:'Primary zone',x:Number(document.getElementById('zone-x').value),y:Number(document.getElementById('zone-y').value),width:Number(document.getElementById('zone-width').value),height:Number(document.getElementById('zone-height').value)}]},response=await fetch(`/api/cameras/${camera.value}/event-settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=await response.json().catch(()=>({}));showToast(result.message||result.detail||'Not saved.')});document.getElementById('alert-rule-form').addEventListener('submit',async event=>{event.preventDefault();const types=['motion','person','vehicle'].filter(type=>document.getElementById(`alert-${type}`).checked),payload={camera:Number(camera.value),enabled:document.getElementById('alerts-enabled').checked,event_types:types,schedule_start:document.getElementById('schedule-start').value,schedule_end:document.getElementById('schedule-end').value,delivery_methods:document.getElementById('delivery-in-app').checked?['in_app']:[]},response=await fetch(`/api/cameras/${camera.value}/alert-rule`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),result=await response.json().catch(()=>({}));showToast(result.message||result.detail||'Not saved.')});loadEventConfiguration();</script>"""
 
 
 
@@ -151248,7 +150891,7 @@ def phase6e_stability_page(request: Request):
       event.preventDefault();
       const payload={scenario:document.getElementById('phase6e-scenario').value,owner:document.getElementById('phase6e-owner').value,result:document.getElementById('phase6e-result').value,recovery_minutes:Number(document.getElementById('phase6e-recovery').value||0),notes:document.getElementById('phase6e-drill-notes').value};
       const response=await fetch('/api/operations/drills',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();
-      showToast(data.message||data.detail||'Drill saved.'); if(response.ok){event.currentTarget.reset();phase6eLoad();}
+      showToast(data.message||data.detail||'Drill saved.'); if(response.ok){event.target.reset();phase6eLoad();}
     };
     phase6eLoad();
     </script>
@@ -151703,7 +151346,7 @@ def phase6f_pilots_page(request: Request):
       };
       const response=await fetch('/api/pilots',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await response.json();
       showToast(data.message||data.detail||'Pilot request complete.');
-      if(response.ok){event.currentTarget.reset();document.getElementById('p6f-window').value='72';p6fLoad();}
+      if(response.ok){event.target.reset();document.getElementById('p6f-window').value='72';p6fLoad();}
     };
     p6fLoad();
     </script>

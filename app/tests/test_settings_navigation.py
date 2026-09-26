@@ -124,7 +124,7 @@ def test_hub_denies_role_without_manage_settings(monkeypatch):
 
 def test_events_alerts_detail_route_renders_the_real_working_page(monkeypatch):
     monkeypatch.setattr(main, "current_user", lambda request: _admin_user())
-    monkeypatch.setattr(main, "get_camera_numbers", lambda: [1, 2, 3])
+    monkeypatch.setattr(main, "get_camera_numbers", lambda *args, **kwargs: [1, 2, 3])
     result = main.settings_detail("events-alerts", _stub_request())
     assert 'id="motion-settings-form"' in result
     assert 'id="alert-rule-form"' in result

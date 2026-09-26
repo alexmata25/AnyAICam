@@ -41,6 +41,28 @@ def _calculator_script(prefix='calc', save_quote=False) -> str:
     return f'''<script>const form=document.getElementById('{prefix}-form'),summary=document.getElementById('{prefix}-summary');form.addEventListener('submit',async event=>{{event.preventDefault();const payload={{resolution:form.querySelector('#resolution').value,recording:form.querySelector('#recording').value,retention:Number(form.querySelector('#retention').value),quantity:Number(form.querySelector('#quantity').value),addons:[...form.querySelectorAll('.addon:checked')].map(item=>item.value)}};const response=await fetch('/api/pricing/calculate',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),result=await response.json();if(!response.ok){{summary.innerHTML=`<div class="mock-banner">${{result.detail}}</div>`;showToast(result.detail);return}}{save}summary.innerHTML=`<h2>Quote summary</h2><div class="health-row"><span>Cloud recording subtotal</span><strong>${{money(result.cloud_subtotal)}}</strong></div><div class="health-row"><span>Analytics subtotal</span><strong>${{money(result.analytics_subtotal)}}</strong></div><div class="health-row"><span>Per-camera total</span><strong>${{money(result.per_camera_total)}}</strong></div><div class="health-row"><span>Estimated monthly total</span><strong>${{money(result.monthly_total)}}</strong></div><div class="health-row"><span>Estimated annual total (${{result.annual_discount_percent}}% discount)</span><strong>${{money(result.annual_total)}}</strong></div><p class="health-detail">${{result.trial_days}}-day free cloud-storage trial for new activations. Estimate only until the order is confirmed.</p>`;showToast('Pricing estimate calculated.')}});function money(value){{return new Intl.NumberFormat('en-US',{{style:'currency',currency:'USD'}}).format(value)}}</script>'''
 
 
+def _require_pricing_admin(request: Request) -> None:
+    """Admin portal pass (2026-09-26): PUT /api/pricing-config-legacy and
+    /pricing-admin-legacy had no check at all -- any signed-in account (a
+    customer included) could rewrite the price list, trial length and
+    discounts. Same gate as the rest of the Administrator portal."""
+    import main
+
+    if not main.has_permission(main.current_user(request), "manage_settings"):
+        raise HTTPException(status_code=403, detail="Administrator access is required.")
+
+
+def _require_quote_author(request: Request) -> None:
+    """POST /api/quotes: the same partner-staff check /quotes itself uses,
+    or an administrator."""
+    import main
+
+    if main.has_permission(main.current_user(request), "manage_settings"):
+        return
+    if main.partner_page_authorization_response(request) is not None:
+        raise HTTPException(status_code=403, detail="Partner access is required.")
+
+
 def register_pricing_routes(app: FastAPI, shell: Callable) -> None:
     @app.get('/api/pricing-config')
     def pricing_config() -> dict:
@@ -54,7 +76,8 @@ def register_pricing_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.put('/api/pricing-config-legacy', include_in_schema=False)
-    def pricing_update(payload: dict) -> dict:
+    def pricing_update(payload: dict, request: Request) -> dict:
+        _require_pricing_admin(request)
         config = load_pricing()
         if 'trial_days' in payload:
             config['trial_days'] = max(0, min(365, int(payload['trial_days'])))
@@ -76,7 +99,8 @@ def register_pricing_routes(app: FastAPI, shell: Callable) -> None:
         return {'status': 'complete', 'message': 'Pricing configuration saved.', 'config': config}
 
     @app.post('/api/quotes')
-    def save_quote(payload: dict) -> dict:
+    def save_quote(payload: dict, request: Request) -> dict:
+        _require_quote_author(request)
         try:
             totals = calculate_quote(payload)
         except ValueError as error:
@@ -161,7 +185,8 @@ def register_pricing_routes(app: FastAPI, shell: Callable) -> None:
         return shell('Subscription', 'subscription', '<header class="topbar"><div><p class="eyebrow">Account estimate</p><h1>Subscription summary</h1></div></header><div class="mock-banner">Estimate only until the order is confirmed.</div>'+f'<section class="panel">{summary}</section>')
 
     @app.get('/pricing-admin-legacy', response_class=HTMLResponse, include_in_schema=False)
-    def pricing_admin_page() -> str:
+    def pricing_admin_page(request: Request) -> str:
+        _require_pricing_admin(request)
         config = load_pricing(); price_inputs=[]
         for resolution, plan in config['plans'].items():
             for recording in ('motion','continuous'):
