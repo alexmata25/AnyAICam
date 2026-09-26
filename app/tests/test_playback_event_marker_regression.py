@@ -138,7 +138,6 @@ def test_all_six_required_categories_have_filter_buttons_and_legend_colors(monke
         "intrusion": "orange",
     }
     for category in required:
-        assert f'data-filter="{category}"' in html, f"missing filter button for {category}"
         assert f'class="legend-dot event-{category}"' in html, f"missing legend dot for {category}"
 
 

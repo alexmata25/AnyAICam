@@ -71,15 +71,30 @@ test('desktop: a manually selected historical date stays selected, across refres
   assert.deepEqual(h.loads.map(l => l[0]), [expectedToday, '2026-09-20']);
 });
 
-test('mobile always requests today, ignoring a stale day and date picks', async () => {
+test('mobile: a stale restored day (not one the customer picked) rolls to today', async () => {
   const h = harness({ mobile: true });
   h.controller.open();
   h.controller.noteLoaded('2026-08-01', []);  // e.g. a day restored from an earlier session
-  assert.equal(h.controller.selectDate('2026-09-01'), h.controller.state.viewingDate);  // picks ignored on mobile
   await h.fire();
   assert.equal(h.controller.state.viewingDate, expectedToday);
   assert.deepEqual(h.dayChanges, [expectedToday]);
   assert.deepEqual(h.refreshes, [expectedToday]);
+});
+
+test('mobile: a picked date stays (no live refresh); picking today resumes the 5 s refresh', async () => {
+  const h = harness({ mobile: true });
+  h.controller.open();
+  assert.equal(h.controller.selectDate('2026-09-01'), '2026-09-01');  // 2026-09-25: phones have the calendar
+  assert.equal(h.controller.state.manual, true);
+  await h.fire(); await h.fire();
+  assert.equal(h.controller.state.viewingDate, '2026-09-01');
+  assert.deepEqual(h.refreshes, []);
+  assert.deepEqual(h.dayChanges, []);
+  h.controller.selectDate(expectedToday);
+  assert.equal(h.controller.state.manual, false);
+  await h.fire();
+  assert.deepEqual(h.refreshes, [expectedToday]);
+  assert.deepEqual(h.loads.map(l => l[0]), [expectedToday, '2026-09-01', expectedToday]);
 });
 
 test('mobile refreshes every 5 seconds', async () => {

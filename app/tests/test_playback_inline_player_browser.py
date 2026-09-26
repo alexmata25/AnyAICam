@@ -228,8 +228,8 @@ def test_iphone_recording_plays_where_tapped_and_survives_refresh(playwright_ins
         time.sleep(6.5)  # past the mobile list's 5 s refresh
         still = page.evaluate("(v) => ({connected: v.isConnected, paused: v.paused, t: v.currentTime, cards: document.querySelectorAll('.inline-media-card').length})", video)
         assert still["connected"] and not still["paused"] and still["t"] > t0 and still["cards"] == 1, still
-        # Desktop-only date/timeline controls stay hidden on the phone.
-        assert not page.is_visible("#playback-date-input") and not page.is_visible("#playback-monitor-timeline")
+        # The phone has the compact calendar but not the desktop timeline.
+        assert page.is_visible("#playback-date-input") and not page.is_visible("#playback-monitor-timeline")
         buttons = page.evaluate("() => [...document.querySelectorAll('.inline-media-card .camera-tool:not([hidden])')].map(b => b.getBoundingClientRect().width)")
         assert buttons and min(buttons) >= 44
     finally:
@@ -246,5 +246,46 @@ def test_event_clip_plays_inline_with_download(playwright_instance, page_html, w
         assert row.evaluate("r => r.nextElementSibling && r.nextElementSibling.classList.contains('inline-media-card')")
         download = page.locator('.inline-media-card [data-act="download"]')
         assert download.is_visible() and download.get_attribute("href") == "/api/customer/recordings/cam-1/evt-1-file/media"
+    finally:
+        browser.close()
+
+
+REMOVED_HEADER = ("#playback-date-prev", "#playback-date-today", "#playback-date-next", "#playback-available-dates",
+                  ".monitor-filter", "#playback-selected-date-label")
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS[:1], ids=["chromium"])
+def test_desktop_header_is_just_the_calendar(playwright_instance, page_html, webm, engine, channel):
+    browser, page, _ = _open(playwright_instance, engine, channel, page_html, webm)
+    try:
+        page.locator(_row_selector(False)).first.wait_for(timeout=15000)
+        assert page.is_visible("#playback-date-input") and page.is_visible("#playback-monitor-timeline")
+        for selector in REMOVED_HEADER:
+            assert page.locator(selector).count() == 0, selector
+        assert "Dates with recordings" not in page.inner_text("main, .content")
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("engine,channel", BROWSERS[:1], ids=["chromium"])
+def test_phone_has_a_compact_calendar_that_sticks_and_plays_inline(playwright_instance, page_html, webm, engine, channel):
+    browser, page, _ = _open(playwright_instance, engine, channel, page_html, webm, mobile=True)
+    requested = []
+    page.on("request", lambda r: requested.append(r.url) if "/api/customer/recordings/cam-1?" in r.url else None)
+    try:
+        page.locator(_row_selector(True)).first.wait_for(timeout=15000)
+        assert page.is_visible("#playback-date-input") and not page.is_visible("#playback-monitor-timeline")
+        for selector in REMOVED_HEADER:
+            assert page.locator(selector).count() == 0, selector
+        box = page.locator("#playback-date-input").bounding_box()
+        assert box["height"] >= 40 and box["x"] + box["width"] <= 390
+        page.fill("#playback-date-input", "2026-09-01")
+        page.dispatch_event("#playback-date-input", "change")
+        page.wait_for_timeout(7000)  # past the 5 s refresh: the picked day must stay
+        assert page.input_value("#playback-date-input") == "2026-09-01"
+        assert any("date=2026-09-01" in url for url in requested), requested[-3:]
+        assert not any("date=2026-09-01" not in url for url in requested[-2:])  # no refresh back to today
+        page.locator(_row_selector(True)).first.tap()
+        _wait_playing(page)
     finally:
         browser.close()

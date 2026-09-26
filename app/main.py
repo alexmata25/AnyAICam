@@ -144446,6 +144446,12 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         'font-size:15px;line-height:1}'
         '</style>'
         f'<div class="playback-camera-tiles">{camera_tiles}</div>'
+        # Playback header (2026-09-25): just the calendar -- select date ->
+        # scrub / browse -> play. Event-type filtering lives in Analytics,
+        # Events, Investigate and Smart alerts; deep-link parameters
+        # (?camera, ?event, ?t, ?autoplay) are unchanged.
+        '<div class="playback-date-row" id="playback-date-bar"><label for="playback-date-input">Date</label>'
+        '<input id="playback-date-input" type="date" autocomplete="off"></div>'
         '<section class="playback-workspace-solo" style="margin-top:6px">'
         '<div class="panel playback-media-card"><div class="camera-view playback-view" id="playback-view-frame" style="border-radius:10px">'
         '<video id="playback-video" controls playsinline style="width:100%;height:100%"></video>'
@@ -144458,7 +144464,11 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '</div>'
         '</div>'
         '</section>'
-        '<style>@media (max-width:900px){#playback-date-bar,#playback-available-dates{display:none!important}}</style>'
+        '<style>.playback-date-row{display:flex;align-items:center;gap:10px;margin:10px 0 4px}'
+        '.playback-date-row label{color:var(--muted);font-size:13px}'
+        '.playback-date-row input{min-height:40px;padding:7px 11px;border:1px solid rgba(170,196,207,.3);border-radius:9px;'
+        'background:#111827;color:#fff;font:inherit;font-size:15px;color-scheme:dark}'
+        '@media (max-width:900px){.playback-date-row{margin:8px 0}.playback-date-row input{flex:1;max-width:220px}}</style>'
         '<style>@media (max-width:900px){.monitor-timeline{display:none!important}.mobile-recent-events{display:block!important}}@media (min-width:901px){.mobile-recent-events{display:none!important}.monitor-timeline{display:block}}</style>'
         # 2026-09-04: video-first mobile cards -- the section's own
         # container (.mobile-recent-events) is already hidden above
@@ -144494,24 +144504,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<button id="create-clip" type="button" disabled>Create clip</button>'
         '<button id="browse-recordings" type="button" class="ghost-button">Browse recordings</button>'
         '</div>'
-        '</div>'
-        '<div class="monitor-toolbar-group" id="playback-date-bar" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px">'
-        '<label for="playback-date-input" class="health-detail">Date</label>'
-        '<input id="playback-date-input" type="date" autocomplete="off">'
-        '<button id="playback-date-prev" type="button" class="ghost-button" aria-label="Previous day">\u2190 Previous Day</button>'
-        '<button id="playback-date-today" type="button" class="ghost-button">Today</button>'
-        '<button id="playback-date-next" type="button" class="ghost-button" aria-label="Next day">Next Day \u2192</button>'
-        '<span id="playback-selected-date-label" class="health-detail"></span>'
-        '</div>'
-        '<div id="playback-available-dates" class="health-detail" style="margin-top:2px"></div>'
-        '<div class="monitor-filters">'
-        '<button class="monitor-filter active" data-filter="all" type="button">All</button>'
-        '<button class="monitor-filter active" data-filter="motion" type="button">Motion</button>'
-        '<button class="monitor-filter active" data-filter="person" type="button">Person</button>'
-        '<button class="monitor-filter active" data-filter="vehicle" type="button">Vehicle</button>'
-        '<button class="monitor-filter active" data-filter="lpr" type="button">License plate</button>'
-        '<button class="monitor-filter active" data-filter="people_counting" type="button">People count</button>'
-        '<button class="monitor-filter active" data-filter="intrusion" type="button">Intrusion</button>'
         '</div>'
         '<div class="timeline-hours"><span>00:00</span><span>02:00</span><span>04:00</span><span>06:00</span>'
         '<span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span>'
@@ -144646,11 +144638,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   const shareButton=document.getElementById('share-selected');
   const createClipButton=document.getElementById('create-clip');
   const dateInput=document.getElementById('playback-date-input');
-  const datePrevButton=document.getElementById('playback-date-prev');
-  const dateTodayButton=document.getElementById('playback-date-today');
-  const dateNextButton=document.getElementById('playback-date-next');
-  const selectedDateLabel=document.getElementById('playback-selected-date-label');
-  const availableDatesEl=document.getElementById('playback-available-dates');
   const datesByCamera={{}};
   const datesLoaded=new Set();
 
@@ -144687,7 +144674,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   let currentClips=[];
   // null = the existing default/most-recent view (unchanged pagination).
   // A YYYY-MM-DD string means the customer explicitly picked a
-  // calendar date -- see loadRecordingsForDate()/dateTodayButton below.
+  // calendar date -- see loadRecordingsForDate() below.
   let viewingDate=null;
   // Set at boot (see PLAYBACK_TODAY_CORE below); decides the viewed day.
   let dayController=null;
@@ -144729,7 +144716,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       return state.viewingDate;
     }}
     function selectDate(date){{
-      if(deps.isMobile())return state.viewingDate;  // mobile is a "latest recordings" view: always today
       state.manual=date!==today();
       state.viewingDate=date;
       deps.loadDay(date,{{reason:'manual'}});
@@ -144749,6 +144735,9 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       state.timer=null;
       try{{
         if(!deps.isMobile()||deps.isHidden())return;
+        // A day the customer picked is a fixed history view -- no live
+        // refresh, no rollover (2026-09-25: phones get the calendar too).
+        if(state.manual)return;
         const day=today();
         if(day!==state.viewingDate){{  // local midnight, or a stale/restored day
           state.viewingDate=day;
@@ -144884,14 +144873,13 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       // guards against a stale response from this same race.
       stopMobileEventPoll();
       clipPanel.hidden=true;
-      renderAvailableDates(selectedCameraId).catch(()=>{{}});
       if(viewingDate||isPlaybackMobile()){{
         // Preserve the selected date across a camera switch "when
         // possible" -- i.e. whenever a date was actually active.
         // loadRecordingsForDate() already handles the no-recordings-
         // for-this-date case honestly (status text below), so nothing
         // extra is needed here for that.
-        await loadRecordingsForDate(selectedCameraId,isPlaybackMobile()?localDateStringOf(new Date()):viewingDate).catch(error=>{{
+        await loadRecordingsForDate(selectedCameraId,viewingDate||localDateStringOf(new Date())).catch(error=>{{
           debugLog(`loadRecordingsForDate (camera switch) failed: ${{error && error.message}}`);
         }});
       }}else{{
@@ -145091,7 +145079,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   }}
 
   let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
-  const filterButtons=[...document.querySelectorAll('.monitor-filter')];
 
   // P0 #5 remediation round 2 (2026-09-05, Codex second review) --
   // two further gaps in round 1's design: (1) MOBILE_EVENT_FETCH_
@@ -145521,7 +145508,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     // constant, never selectedCameraId directly, so a camera switch
     // in flight can never write one camera's older page into another
     // camera's cache/render -- the same cameraId-capture guard this
-    // file already uses for renderAvailableDates()/loadRecordingsForDate().
+    // file already uses for loadRecordingsForDate().
     const cameraId=selectedCameraId;
     const clips=recordingsByCamera[cameraId]||[];
 
@@ -145692,45 +145679,18 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   // to determine this (see _customer_recording_dates()'s own
   // docstring), and any older retained date not shown here is still
   // directly reachable via the date input above.
-  async function renderAvailableDates(cameraId){{
-    const dates=await ensureDatesLoaded(cameraId);
-    if(cameraId!==selectedCameraId)return;
-    availableDatesEl.innerHTML='';
-    if(!dates.length){{
-      availableDatesEl.textContent='No retained recordings found yet for this camera.';
-      return;
-    }}
-    const label=document.createElement('span');
-    label.textContent='Dates with recordings: ';
-    availableDatesEl.appendChild(label);
-    [...dates].reverse().slice(0,14).forEach(date=>{{
-      const chip=document.createElement('button');
-      chip.type='button';
-      chip.className='ghost-button';
-      chip.style.cssText='padding:3px 8px;margin:2px;font-size:12px';
-      chip.textContent=date;
-      if(date===viewingDate)chip.style.fontWeight='700';
-      chip.addEventListener('click',()=>{{
-        loadRecordingsForDate(cameraId,date).catch(error=>{{
-          debugLog(`loadRecordingsForDate failed: ${{error && error.message}}`);
-        }});
-      }});
-      availableDatesEl.appendChild(chip);
-    }});
-  }}
 
   // Selecting a date reloads the timeline for that date (a fresh
   // date=-scoped fetch, replacing what's shown) rather than merely
   // paginating backward through recordingsByCamera's own cached list
   // -- that existing cache/pagination (ensureClipsLoaded/loadOlderButton)
   // is left completely untouched by date mode, and resumes exactly as
-  // before once dateTodayButton is pressed.
+  // before once the calendar returns to today.
   async function loadRecordingsForDate(cameraId,date){{
     if(cameraId!==selectedCameraId)return;
     viewingDate=date;
     dateInput.value=date;
-    selectedDateLabel.textContent=`Showing recordings for ${{date}}`;
-    clipPanel.hidden=false;
+        clipPanel.hidden=false;
     video.pause();
     video.removeAttribute('src');
     video.load();
@@ -145770,7 +145730,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     status.textContent=clips.length
       ?`${{clips.length}} recording(s) found for ${{date}}. Select one, or a point on the timeline, to play.`
       :`No recordings are available for ${{date}}.`;
-    renderAvailableDates(cameraId).catch(()=>{{}});
     if(dayController)dayController.noteLoaded(date,clips);
   }}
 
@@ -145778,50 +145737,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     if(!dateInput.value)return;
     dayController.selectDate(dateInput.value);
   }});
-
-  // Today = today's recordings in the viewer's local timezone (it used to
-  // switch to an undated "most recent" list, which on a quiet day or an
-  // Event-mode camera showed -- and preselected -- an older day).
-  dateTodayButton.addEventListener('click',()=>{{
-    dayController.goToday();
-  }});
-
-  // Previous/Next Day: shift by exactly one LOCAL calendar day from
-  // whichever date is currently in view -- today's own local date if
-  // none is selected yet (the Today button/default view case).
-  // Date's own local-time setDate() is used deliberately instead of
-  // any fixed-24-hour-offset math specifically because it is DST-safe:
-  // it operates on the wall-clock day-of-month field itself, so it
-  // still lands on the correct next/previous calendar date on a
-  // spring-forward (23-hour) or fall-back (25-hour) day, unlike adding
-  // a fixed 86400000ms would. localDateStringOf() is the exact same
-  // formatter dateInput.max and loadRecordingsForDate() already use,
-  // reused here rather than introduced a second time.
-  // === DATE_NAV_CORE_START ===
-  function localDateStringOf_forDateNavCore(value){{
-    const d=(value instanceof Date)?value:new Date(value);
-    const y=d.getFullYear();
-    const m=String(d.getMonth()+1).padStart(2,'0');
-    const day=String(d.getDate()).padStart(2,'0');
-    return `${{y}}-${{m}}-${{day}}`;
-  }}
-  function shiftedDateString(dateString,deltaDays){{
-    const [y,m,d]=dateString.split('-').map(Number);
-    const shifted=new Date(y,m-1,d);
-    shifted.setDate(shifted.getDate()+deltaDays);
-    return localDateStringOf_forDateNavCore(shifted);
-  }}
-  // === DATE_NAV_CORE_END ===
-
-  function navigateByOneDay(deltaDays){{
-    const base=viewingDate||localDateStringOf(new Date());
-    const target=shiftedDateString(base,deltaDays);
-    if(target>dateInput.max)return;  // never navigate into the future, matching the date input's own existing max=
-    dayController.selectDate(target);
-  }}
-
-  datePrevButton.addEventListener('click',()=>navigateByOneDay(-1));
-  dateNextButton.addEventListener('click',()=>navigateByOneDay(1));
 
   // Genuine feature added 2026-09-15 (customer request: "a true video
   // scrubbing timeline, like a professional VMS"): click OR drag the
@@ -146373,25 +146288,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     }}
   }});
 
-  filterButtons.forEach(button=>{{
-    button.addEventListener('click',()=>{{
-      if(button.dataset.filter==='all'){{
-        activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
-      }}else if(activeFilters.has(button.dataset.filter)){{
-        activeFilters.delete(button.dataset.filter);
-      }}else{{
-        activeFilters.add(button.dataset.filter);
-      }}
-      filterButtons.forEach(item=>item.classList.toggle('active',item.dataset.filter==='all'?activeFilters.size===6:activeFilters.has(item.dataset.filter)));
-      // currentClips, not recordingsByCamera directly -- so toggling a
-      // filter while a date is selected re-renders that date's
-      // timeline instead of silently reverting to the default
-      // most-recent-page view. eventsForLocalDate() mirrors
-      // loadRecordingsForDate()'s own date-scoping of the event markers.
-      renderTimeline(selectedCameraId,currentClips,viewingDate?eventsForLocalDate(analyticsByCamera[selectedCameraId]||[],viewingDate):(analyticsByCamera[selectedCameraId]||[]),viewingDate||localDateStringOf(new Date()));
-    }});
-  }});
-
   dateInput.value='';  // never a date the browser restored from an earlier visit
   dateInput.max=localDateStringOf(new Date());
   // Mobile refresh: list-only. Never pauses, reloads or seeks the player;
@@ -146431,8 +146327,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
       viewingDate=date;
       dateInput.max=date;
       dateInput.value=date;
-      selectedDateLabel.textContent=`Showing recordings for ${{date}}`;
-    }},
+          }},
     setTimer:(fn,ms)=>setTimeout(fn,ms),
     clearTimer:handle=>clearTimeout(handle),
   }});
@@ -146441,9 +146336,6 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
   playbackMobileMedia.addEventListener('change',()=>dayController.wake());
   // Desktop: keep "Next day" usable after midnight without changing the viewed date.
   setInterval(()=>{{dateInput.max=localDateStringOf(new Date())}},60000);
-  renderAvailableDates(selectedCameraId).catch(error=>{{
-    debugLog(`available dates fetch failed: ${{error && error.message}}`);
-  }});
   if(initialEventId||initialTimestamp){{
     // Event deep links keep opening their own event and time.
     debugLog(`[boot] calling renderCamera(initialTimestamp=${{initialTimestamp}})`);
