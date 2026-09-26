@@ -58,6 +58,7 @@ def target_key():
 
 def _postgres_sql(sql: str) -> str:
     converted=sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT','BIGSERIAL PRIMARY KEY')
+    converted=re.sub(r'\bBLOB\b','BYTEA',converted,flags=re.I)
     if re.match(r'\s*INSERT OR IGNORE\s+',converted,re.I):
         converted=re.sub(r'INSERT OR IGNORE','INSERT',converted,count=1,flags=re.I).rstrip().rstrip(';')+' ON CONFLICT DO NOTHING'
     return converted.replace('?','%s')
@@ -66,7 +67,15 @@ def _postgres_sql(sql: str) -> str:
 @contextmanager
 def connect():
     if backend()=='sqlite':
-        path=sqlite_target_path(); path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path); db.row_factory=sqlite3.Row; db.execute('PRAGMA foreign_keys=ON')
+        # 2026-09-16: busy_timeout was previously unset -- SQLite's own
+        # default (0) means a second connection hitting a write lock held
+        # by another connection to the same file fails immediately with
+        # "database is locked" rather than waiting, which a longer
+        # migration transaction (see db_migrations.py's RDM-enforcement
+        # backfill) made a real, reproducible test failure instead of a
+        # rare race. 5s is generous for a local SQLite file and never
+        # blocks the common case (no real contention) at all.
+        path=sqlite_target_path(); path.parent.mkdir(parents=True,exist_ok=True); db=sqlite3.connect(path,timeout=5.0); db.row_factory=sqlite3.Row; db.execute('PRAGMA busy_timeout=5000'); db.execute('PRAGMA foreign_keys=ON')
     else:
         try:
             import psycopg

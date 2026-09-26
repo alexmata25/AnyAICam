@@ -9,3 +9,16 @@ logs.txt
 __pycache__/
 *.pyc
 .phase6-migration-test-*.db
+/dist/
+
+# AnyAiCam e2e (Playwright) -- local credentials and any captured
+# session/browser artifacts must never be committed. e2e/.env is also
+# already covered by the bare `.env` rule above; listed again here so
+# this directory's own security requirement is self-evident without
+# relying on the reader knowing that.
+e2e/.env
+e2e/.auth/
+e2e/artifacts/
+e2e/test-results/
+e2e/playwright-report/
+e2e/.pytest_cache/

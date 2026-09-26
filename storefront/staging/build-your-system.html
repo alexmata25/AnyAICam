@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Build Your System (STAGING TEST) | ANY AI CAM</title>
+<!--
+  STAGING/REVIEW COPY -- NOT the live Bluehost file. New page: no live
+  equivalent exists yet. Built for the Local/Hybrid camera-slot
+  subscription + analytics add-on checkout flow this repo has never had
+  before (see checkout-catalog.php/checkout-session.php for the backend
+  half). Do not promote this page's PRICES to production as-is -- every
+  dollar figure on this page is a Stripe TEST-mode sandbox amount, not
+  real retail (see the banner below and each section's own note).
+-->
+<style>
+:root{--navy:#0b1332;--ink:#182443;--blue:#5a72d8;--pink:#bf2a91;--cyan:#31cad2;--paper:#f5f7fc;--muted:#61708c;--warn:#8b1730;--warnbg:#fff0f2}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink);background:var(--paper)}
+.test-banner{background:var(--warn);color:#fff;text-align:center;padding:.85rem 1rem;font-weight:800;letter-spacing:.02em}
+.test-banner small{display:block;font-weight:600;opacity:.9;margin-top:.15rem}
+header.site-header{display:flex;align-items:center;justify-content:space-between;padding:1rem clamp(1rem,4vw,3rem);background:#fff;border-bottom:1px solid #dde3f0}
+.brand{font-weight:900;color:var(--navy);text-decoration:none;font-size:1.15rem}
+main{max-width:1200px;margin:0 auto;padding:1.5rem clamp(1rem,3vw,2rem) 4rem}
+h1{font-size:clamp(1.6rem,3vw,2.2rem);margin:.4rem 0 .2rem}
+.lead{color:var(--muted);margin:0 0 1.5rem}
+.section{background:#fff;border:1px solid #dde3f0;border-radius:16px;padding:1.25rem clamp(1rem,3vw,1.75rem);margin-bottom:1.25rem}
+.section h2{margin:0 0 .25rem;font-size:1.15rem}
+.section .hint{color:var(--muted);font-size:.9rem;margin:0 0 1rem}
+.option-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.75rem}
+.option-card{position:relative;border:2px solid #e1e6f0;border-radius:12px;padding:.9rem 1rem;cursor:pointer;transition:border-color .15s}
+.option-card:hover{border-color:var(--blue)}
+.option-card input{position:absolute;top:.8rem;right:.8rem}
+.option-card.selected{border-color:var(--pink);background:#fdf3fa}
+.option-card .name{font-weight:800;display:block;margin-bottom:.15rem}
+.option-card .model{color:var(--muted);font-size:.82rem;display:block;margin-bottom:.5rem}
+.option-card .price{font-weight:900;font-size:1.05rem}
+.option-card .price small{font-weight:600;color:var(--muted);font-size:.75rem}
+.analytics-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.6rem}
+.analytics-row{display:flex;align-items:center;gap:.6rem;border:1px solid #e1e6f0;border-radius:10px;padding:.6rem .75rem}
+.analytics-row label{flex:1;font-weight:700;cursor:pointer}
+.analytics-row .price{font-weight:800;color:var(--blue)}
+.email-row{display:flex;flex-wrap:wrap;gap:.75rem;align-items:flex-end}
+.email-row label{font-weight:700;font-size:.9rem}
+.email-row input{display:block;margin-top:.35rem;padding:.65rem .75rem;border:1px solid #abb7cc;border-radius:10px;font:inherit;width:280px;max-width:100%}
+.summary{position:sticky;bottom:0;background:#fff;border-top:2px solid var(--navy);padding:1rem clamp(1rem,3vw,1.75rem);margin-top:1.5rem;border-radius:16px 16px 0 0;box-shadow:0 -8px 24px rgba(11,19,50,.08)}
+.summary h2{margin:0 0 .5rem}
+.summary-columns{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem}
+@media(max-width:640px){.summary-columns{grid-template-columns:1fr}}
+.summary-list{list-style:none;margin:0 0 .5rem;padding:0}
+.summary-list li{display:flex;justify-content:space-between;padding:.25rem 0;font-size:.92rem}
+.summary-subtotal{display:flex;justify-content:space-between;font-weight:900;border-top:1px solid #e1e6f0;padding-top:.5rem;margin-top:.25rem}
+.summary-empty{color:var(--muted);font-size:.9rem}
+.checkout-button{margin-top:1rem;width:100%;background:linear-gradient(135deg,var(--pink),var(--blue));color:#fff;border:0;border-radius:999px;padding:1rem;font-weight:900;font-size:1.05rem;cursor:pointer}
+.checkout-button:disabled{opacity:.5;cursor:not-allowed}
+.error-box{display:none;margin-top:.75rem;padding:.75rem 1rem;border-radius:10px;background:var(--warnbg);color:var(--warn);font-weight:700}
+.journey-note{font-size:.82rem;color:var(--muted);margin-top:.5rem}
+</style>
+</head>
+<body>
+<div class="test-banner">SANDBOX / STRIPE TEST MODE ONLY -- every price on this page is a test amount, never real retail
+  <small>This page and every price shown must never be promoted to production. See staging/stripe-config.php for the real Stripe TEST Price IDs behind each item.</small>
+</div>
+<header class="site-header"><a class="brand" href="vms.html">ANY AI CAM</a><span style="color:var(--muted);font-weight:700;font-size:.9rem">Build Your System &middot; Staging Sandbox</span></header>
+
+<main>
+  <h1>Build your AnyAiCam system</h1>
+  <p class="lead">Select one appliance, one camera-slot plan (Local or Hybrid), any analytics add-ons, and the relay accessory if you need it. Checkout runs one Stripe TEST Checkout Session per item you select -- see the note at the bottom of this page for why.</p>
+
+  <section class="section">
+    <h2>Appliance</h2>
+    <p class="hint">Choose one. One-time purchase.</p>
+    <div class="option-grid" id="appliance-options"></div>
+  </section>
+
+  <section class="section">
+    <h2>Camera service</h2>
+    <p class="hint">Local or Hybrid -- not both at once. Recurring monthly subscription.</p>
+    <div class="option-grid" id="service-options">
+      <label class="option-card" data-service="local"><input type="radio" name="camera-service" value="local"><span class="name">Local</span><span class="model">Recorded and served from the appliance on-site.</span></label>
+      <label class="option-card" data-service="hybrid"><input type="radio" name="camera-service" value="hybrid"><span class="name">Hybrid</span><span class="model">Local recording plus cloud-protected off-site copy.</span></label>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Camera capacity</h2>
+    <p class="hint">Choose the tier that matches your camera count. Price depends on the camera service selected above.</p>
+    <div class="option-grid" id="capacity-options"></div>
+  </section>
+
+  <section class="section">
+    <h2>Analytics add-ons</h2>
+    <p class="hint">Optional. Select any number. Each is billed as its own separate recurring subscription.</p>
+    <div class="analytics-grid" id="analytics-options"></div>
+  </section>
+
+  <section class="section">
+    <h2>Accessory</h2>
+    <p class="hint">Optional. One-time purchase.</p>
+    <div class="option-grid" id="relay-options"></div>
+  </section>
+
+  <section class="section">
+    <h2>Your email</h2>
+    <p class="hint">Used to send this sandbox purchase to Stripe TEST Checkout and to match it to your AnyAiCam account (now or once you register).</p>
+    <div class="email-row">
+      <label>Email<input type="email" id="customer-email" placeholder="you@example.test" required></label>
+    </div>
+  </section>
+
+  <div class="summary">
+    <h2>Order summary</h2>
+    <div class="summary-columns">
+      <div>
+        <h3 style="margin:.2rem 0">One-time</h3>
+        <ul class="summary-list" id="summary-one-time"></ul>
+        <div class="summary-subtotal"><span>One-time subtotal</span><span id="summary-one-time-total">$0.00</span></div>
+      </div>
+      <div>
+        <h3 style="margin:.2rem 0">Monthly</h3>
+        <ul class="summary-list" id="summary-monthly"></ul>
+        <div class="summary-subtotal"><span>Monthly subtotal</span><span id="summary-monthly-total">$0.00</span></div>
+      </div>
+    </div>
+    <div class="error-box" id="checkout-error"></div>
+    <button class="checkout-button" id="checkout-button" disabled>Proceed to Stripe TEST Checkout</button>
+    <p class="journey-note" id="journey-note"></p>
+  </div>
+</main>
+
+<script>
+const APPLIANCES = [
+  {sku:'AIC-APPLIANCE-RYZEN-STARTER', name:'AnyAiCam Starter', model:'MINISFORUM AI X1-255 (Ryzen 7 255)', price:0.50},
+  {sku:'AIC-APPLIANCE-RYZEN-ENTERPRISE', name:'AnyAiCam Professional', model:'MINISFORUM AI X1 (Ryzen AI 9 HX 470)', price:0.51},
+  {sku:'AIC-APPLIANCE-RYZEN-AAC-FACIAL', name:'AnyAiCam Enterprise', model:'MINISFORUM AI X1 Pro-470', price:0.52},
+];
+const RELAY = {sku:'AIC-RELAY-NUMATO-3CH', name:'Numato 3-Channel Relay Module', model:'Numato 3-channel Ethernet relay', price:0.53};
+const CAPACITY_TIERS = ['1_8','9_16','17_32','33_64'];
+const CAPACITY_LABELS = {'1_8':'1–8 cameras','9_16':'9–16 cameras','17_32':'17–32 cameras','33_64':'33–64 cameras'};
+const LOCAL_PRICES = {'1_8':0.60,'9_16':0.61,'17_32':0.62,'33_64':0.63};
+const HYBRID_PRICES = {'1_8':0.70,'9_16':0.71,'17_32':0.72,'33_64':0.73};
+// Facial Recognition stays an analytics add-on here, never an appliance category.
+const ANALYTICS = [
+  {key:'smart_motion', label:'Smart Motion', price:0.80},
+  {key:'people_counting', label:'People Counting', price:0.81},
+  {key:'lpr', label:'License Plate Recognition', price:0.82},
+  {key:'ppe', label:'PPE Detection', price:0.83},
+  {key:'talk_down', label:'Talk Down', price:0.84},
+  {key:'ai_essentials', label:'AnyAiCam AI Essentials', price:0.85},
+  {key:'ai_professional', label:'AnyAiCam AI Professional', price:0.86},
+  {key:'vehicle_intelligence', label:'Vehicle Intelligence', price:0.87},
+  {key:'cloud_overflow', label:'Cloud Overflow', price:0.88},
+  {key:'facial_recognition', label:'Facial Recognition', price:0.89},
+];
+
+const state = {applianceSku:null, relay:false, service:null, tier:null, analytics:new Set()};
+
+const money = v => Number(v || 0).toLocaleString('en-US', {style:'currency', currency:'USD'});
+
+function renderOptionGrid(containerId, items, {selectedKey, onSelect, groupName}) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = items.map(item => `
+    <label class="option-card${selectedKey === item.key ? ' selected' : ''}" data-key="${item.key}">
+      <input type="radio" name="${groupName}" value="${item.key}" ${selectedKey === item.key ? 'checked' : ''}>
+      <span class="name">${item.name}</span>
+      ${item.model ? `<span class="model">${item.model}</span>` : ''}
+      <span class="price">${money(item.price)} ${item.recurring ? '<small>/month</small>' : '<small>one-time</small>'}</span>
+    </label>`).join('');
+  container.querySelectorAll('input').forEach(input => input.addEventListener('change', () => onSelect(input.value)));
+}
+
+function renderAppliances() {
+  renderOptionGrid('appliance-options', APPLIANCES.map(a => ({key:a.sku, name:a.name, model:a.model, price:a.price})), {
+    selectedKey: state.applianceSku,
+    groupName: 'appliance',
+    onSelect: sku => { state.applianceSku = sku; renderAppliances(); renderAll(); },
+  });
+}
+
+function renderRelay() {
+  renderOptionGrid('relay-options', [{key:'none', name:'No relay', price:0}, {key:RELAY.sku, name:RELAY.name, model:RELAY.model, price:RELAY.price}], {
+    selectedKey: state.relay ? RELAY.sku : 'none',
+    groupName: 'relay',
+    onSelect: key => { state.relay = (key === RELAY.sku); renderRelay(); renderAll(); },
+  });
+}
+
+function renderService() {
+  document.querySelectorAll('#service-options .option-card').forEach(card => {
+    const isSelected = card.dataset.service === state.service;
+    card.classList.toggle('selected', isSelected);
+    card.querySelector('input').checked = isSelected;
+  });
+}
+
+function renderCapacity() {
+  if (!state.service) {
+    document.getElementById('capacity-options').innerHTML = '<p class="hint">Choose a camera service above first.</p>';
+    return;
+  }
+  const prices = state.service === 'local' ? LOCAL_PRICES : HYBRID_PRICES;
+  renderOptionGrid('capacity-options', CAPACITY_TIERS.map(tier => ({key:tier, name:CAPACITY_LABELS[tier], price:prices[tier], recurring:true})), {
+    selectedKey: state.tier,
+    groupName: 'capacity',
+    onSelect: tier => { state.tier = tier; renderCapacity(); renderAll(); },
+  });
+}
+
+function renderAnalytics() {
+  const container = document.getElementById('analytics-options');
+  container.innerHTML = ANALYTICS.map(item => `
+    <div class="analytics-row">
+      <input type="checkbox" id="an-${item.key}" ${state.analytics.has(item.key) ? 'checked' : ''}>
+      <label for="an-${item.key}">${item.label}</label>
+      <span class="price">${money(item.price)}/mo</span>
+    </div>`).join('');
+  ANALYTICS.forEach(item => {
+    document.getElementById(`an-${item.key}`).addEventListener('change', event => {
+      if (event.target.checked) state.analytics.add(item.key); else state.analytics.delete(item.key);
+      renderAll();
+    });
+  });
+}
+
+function currentLegs() {
+  const legs = [];
+  if (state.applianceSku) {
+    const appliance = APPLIANCES.find(a => a.sku === state.applianceSku);
+    legs.push({kind:'hardware', key:appliance.sku, label:appliance.name, amount:appliance.price, mode:'one_time'});
+  }
+  if (state.relay) {
+    legs.push({kind:'hardware', key:RELAY.sku, label:RELAY.name, amount:RELAY.price, mode:'one_time'});
+  }
+  if (state.service && state.tier) {
+    const prices = state.service === 'local' ? LOCAL_PRICES : HYBRID_PRICES;
+    legs.push({kind:'camera_plan', key:`${state.service}_${state.tier}`, label:`${state.service === 'local' ? 'Local' : 'Hybrid'} ${CAPACITY_LABELS[state.tier]}`, amount:prices[state.tier], mode:'monthly'});
+  }
+  ANALYTICS.forEach(item => {
+    if (state.analytics.has(item.key)) legs.push({kind:'analytics', key:item.key, label:item.label, amount:item.price, mode:'monthly'});
+  });
+  return legs;
+}
+
+function renderSummary() {
+  const legs = currentLegs();
+  const oneTime = legs.filter(l => l.mode === 'one_time');
+  const monthly = legs.filter(l => l.mode === 'monthly');
+
+  const listEl = (elId, items) => {
+    const el = document.getElementById(elId);
+    el.innerHTML = items.length
+      ? items.map(i => `<li><span>${i.label}</span><span>${money(i.amount)}</span></li>`).join('')
+      : '<li class="summary-empty">Nothing selected</li>';
+  };
+  listEl('summary-one-time', oneTime);
+  listEl('summary-monthly', monthly);
+  document.getElementById('summary-one-time-total').textContent = money(oneTime.reduce((s, i) => s + i.amount, 0));
+  document.getElementById('summary-monthly-total').textContent = money(monthly.reduce((s, i) => s + i.amount, 0));
+
+  const email = document.getElementById('customer-email').value.trim();
+  const button = document.getElementById('checkout-button');
+  button.disabled = legs.length === 0 || !email || !email.includes('@');
+  document.getElementById('journey-note').textContent = legs.length > 1
+    ? `This will open ${legs.length} separate Stripe TEST Checkout pages in sequence, one per item (${legs.map(l => l.label).join(', ')}) -- see the technical note in this page's source for why.`
+    : (legs.length === 1 ? 'This will open one Stripe TEST Checkout page.' : '');
+  return legs;
+}
+
+function renderAll() {
+  renderAppliances(); renderRelay(); renderService(); renderCapacity(); renderAnalytics();
+  return renderSummary();
+}
+
+document.querySelectorAll('#service-options .option-card').forEach(card => {
+  card.querySelector('input').addEventListener('change', () => {
+    state.service = card.dataset.service;
+    state.tier = null; // switching service clears the tier -- prices differ, and Local/Hybrid are mutually exclusive by construction (state.service is a single value, never a set)
+    renderAll();
+  });
+});
+document.getElementById('customer-email').addEventListener('input', renderSummary);
+
+document.getElementById('checkout-button').addEventListener('click', async () => {
+  const legs = currentLegs().map(l => ({kind: l.kind, key: l.key}));
+  const email = document.getElementById('customer-email').value.trim();
+  const errorBox = document.getElementById('checkout-error');
+  errorBox.style.display = 'none';
+  const button = document.getElementById('checkout-button');
+  button.disabled = true;
+  button.textContent = 'Opening Stripe TEST Checkout…';
+  try {
+    const response = await fetch('checkout-session.php', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({customer_email: email, stripe_customer_id: '', legs}),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || 'Checkout could not be started.');
+    }
+    sessionStorage.setItem('anyaicamSandboxEmail', email);
+    location.href = data.checkout_url;
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.style.display = 'block';
+    button.disabled = false;
+    button.textContent = 'Proceed to Stripe TEST Checkout';
+  }
+});
+
+renderAll();
+</script>
+</body>
+</html>

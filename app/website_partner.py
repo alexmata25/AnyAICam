@@ -34,13 +34,47 @@ def register_website_partner_routes(app: FastAPI,shell) -> None:
 
     @app.get('/api/website/partner-session')
     def website_session(request: Request):
+        # Confirmed live on Samsung: the "Administration" nav link sent an
+        # administrator to https://portal.anyaicam.com/partner?tab=
+        # customers, which doesn't resolve at all from an edge appliance
+        # -- settings.partner_login_url/customer_login_url resolve
+        # through Settings.partner_login_url's environment-keyed lookup,
+        # which is exactly right for cloud (one real public domain) but
+        # wrong for edge (no fixed address; reached via whatever LAN/
+        # Tailscale host the browser is actually using -- same reasoning
+        # as password_reset_request()'s own edge_production fix in
+        # cloud_features.py). For edge_production, every link here is
+        # instead built from this exact request's own Host header.
+        if settings.edge_production:
+            scheme=request.headers.get('x-forwarded-proto',request.url.scheme)
+            host=request.headers.get('host') or request.url.netloc
+            local_base=f'{scheme}://{host}'
+            public_navigation={'partner_url':local_base+'/partner.html','customer_url':local_base+'/customer-login.html'}
+        else:
+            local_base=None
+            public_navigation={'partner_url':settings.partner_login_url,'customer_url':settings.customer_login_url}
         identity=partner_identity(request)
-        public_navigation={'partner_url':settings.partner_login_url,'customer_url':settings.customer_login_url}
         if not identity: return {'authenticated':False,**public_navigation}
         experience='partner' if identity.get('role') in PARTNER_ROLES else 'customer'
         label='Administration' if identity['role']=='administrator' else ('Partner Portal' if experience=='partner' else 'My Cameras')
+        # role_destination('administrator') is a fixed '/partner?tab=
+        # customers' regardless of grant scope -- correct for a partner-
+        # scoped (company-level) administrator, but not for a true
+        # scope_type='global' administrator, who actually lands on
+        # /admin-portal (see cloud_administrator_bridge()'s own docstring
+        # in main.py and portal_login_submit()'s real login-redirect
+        # logic). This mirrors that same distinction here so the nav
+        # link matches where signing in would actually send them,
+        # without touching login/session establishment itself.
+        destination_path=destination_for_role(identity['role'])
+        if identity['role']=='administrator':
+            from appliance_identity import has_global_administrator_grant
+            with connection() as db:
+                if has_global_administrator_grant(db,email=identity['email']):
+                    destination_path='/admin-portal'
         login_url=settings.partner_login_url if experience=='partner' else settings.customer_login_url
-        return {'authenticated':True,'experience':experience,'role':identity['role'],'portal_url':_portal_destination(login_url,destination_for_role(identity['role'])),'navigation_label':label,**public_navigation}
+        portal_url=(local_base+destination_path) if settings.edge_production else _portal_destination(login_url,destination_path)
+        return {'authenticated':True,'experience':experience,'role':identity['role'],'portal_url':portal_url,'navigation_label':label,**public_navigation}
 
     @app.post('/api/partner-applications',status_code=201)
     def submit_application(payload: dict,request: Request):

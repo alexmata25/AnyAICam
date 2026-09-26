@@ -1,6 +1,7 @@
 import hmac
 import secrets
 import time
+import os
 from datetime import datetime,timedelta
 
 from fastapi import HTTPException,Request
@@ -12,7 +13,105 @@ from partner_db import connection,password_hash,row,verify_password
 from token_security import sign,unsign
 from redirect_security import safe_redirect
 
+def _media_src_csp() -> str:
+    """The <video> element that plays a customer's recordings loads
+    directly from a real presigned S3 URL (see _presigned_recording_url()
+    in main.py) -- media-src must allow that exact bucket's origin or
+    every browser blocks the load as a CSP violation before the video
+    element ever gets a chance to fetch anything. This was the real,
+    silent root cause behind a customer-reported Playback regression:
+    every server-side and curl/node-based test of the presigned URL
+    succeeded (CSP is a browser-only enforcement, invisible to any
+    non-browser HTTP client), while every real browser -- hard refresh,
+    incognito, made no difference -- silently refused to load it,
+    leaving the player permanently at 0:00 with no console-visible
+    network failure. Falls back to media-src 'self' blob: only (today's
+    prior behavior) if the recording bucket is not configured -- never
+    widened beyond exactly this one bucket."""
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    if not bucket:
+        return "media-src 'self' blob:"
+    return f"media-src 'self' blob: https://{bucket}.s3.amazonaws.com"
+
+
+def _img_src_csp() -> str:
+    """Allow customer recording/event thumbnails from the same exact
+    recordings bucket used by Playback media, while keeping the image
+    policy otherwise restricted to same-origin/data/blob sources."""
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    if not bucket:
+        return "img-src 'self' data: blob:"
+    return f"img-src 'self' data: blob: https://{bucket}.s3.amazonaws.com"
+
+
+def _connect_src_csp() -> str:
+    """Allow browser/service-worker fetches to the exact recordings
+    bucket used by presigned Playback media and thumbnails."""
+    sources = [
+        "'self'",
+        *settings.allowed_origins,
+        "https://d31cxfv0l904ar.cloudfront.net",
+    ]
+    bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
+    if bucket:
+        sources.append(f"https://{bucket}.s3.amazonaws.com")
+    return "connect-src " + " ".join(sources)
+
+
+def _frame_ancestors_csp(request: Request) -> str:
+    """'none' (never framable, by anyone, anywhere) for every page
+    except the customer single-camera Live view -- confirmed live
+    (2026-09-23, found via independent review of AAC Voice Call Phase
+    1): that page's own AAC Voice Call call screen (main.py's
+    aac_voice_call.py, GET /aac/voice-call/{event_id}) embeds it via
+    <iframe> as its camera video, exactly matching the product spec's
+    own "reuse the existing Live camera... instead of creating a
+    completely separate streaming system" instruction -- but the
+    blanket frame-ancestors 'none'/X-Frame-Options: DENY below applied
+    unconditionally to every route including this one, so the browser
+    silently refused to render the iframe at all ("refused to
+    connect"), even though the embedding page is this SAME application,
+    already carrying the same authenticated session. 'self' here means
+    same-origin framing only -- an attacker's site still cannot frame
+    this page from anywhere else; only this application can frame its
+    own already-authenticated page, and only for this one route."""
+    path = request.url.path
+    if path.startswith("/customer/cameras/") and path.endswith("/live"):
+        return "self"
+    return "none"
+
+
 _MAX_CSRF_FORM_BODY_BYTES = 65_536  # generous for a login/registration form; not a general upload limit
+
+# Provisioning Phase 4: Stripe's real webhook POST carries a
+# Stripe-Signature header, never our anyaicam_csrf cookie/token pair --
+# Stripe cannot present a token it was never issued. Confirmed live on
+# app.anyaicam.com: every POST to this route, including one with a
+# stripe-signature header, was rejected 403 "CSRF validation failed"
+# before ever reaching that route's own cryptographic signature check
+# (verify_stripe_webhook_signature() in main.py), which means no real
+# Stripe event could ever have been processed. Exempted by EXACT path
+# only -- not a prefix -- so this never widens to /api/payments/* or
+# /api/* (e.g. POST /api/payments/checkout, a browser-originated
+# request that legitimately carries the CSRF cookie/token, keeps
+# requiring it exactly as before). The route itself remains fully
+# protected: it still requires and verifies Stripe-Signature against
+# the configured webhook signing secret before doing anything else --
+# this exemption removes only the CSRF check, never authentication.
+#
+# POST /api/provisioning/refresh (provisioning_api.py) is appliance-
+# authenticated exactly like every /api/appliance/* route (signed
+# X-Appliance-Id/X-Request-Timestamp/X-Request-Nonce/Bearer credential,
+# already CSRF-exempt via this dispatch method's own `not bearer` check
+# above whenever a real appliance sends its Bearer credential) but lives
+# under a different path prefix, so the '/api/appliance/' prefix
+# exemption below never covered it. Added here, by exact path, for the
+# same reason as the webhook route above: an appliance request with no
+# credentials at all (e.g. a misconfigured/compromised device, or this
+# module's own test coverage of that case) must still fail with
+# authenticate_appliance()'s own 401, not a misleading "CSRF validation
+# failed" that has nothing to do with why the request was rejected.
+CSRF_EXEMPT_EXACT_PATHS = {'/api/payments/stripe/webhook', '/api/provisioning/refresh'}
 
 
 class ProductionSecurityMiddleware(BaseHTTPMiddleware):
@@ -58,7 +157,14 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
 
         # Allow ordinary browser page navigation. Enforce the origin allowlist
         # only for CORS preflight and requests that can change server state.
-        if origin and (unsafe_method or preflight) and origin not in settings.allowed_origins:
+        # effective_allowed_origins (cloud_config.py) is settings.allowed_
+        # origins itself for every profile except edge_production with an
+        # untouched default, where it's ["*"] -- an edge appliance has no
+        # fixed address to enumerate in advance, unlike cloud's single
+        # fixed public domain, so "*" here means "any origin accepted",
+        # never a literal Origin header value a browser could send.
+        allowed_origins=settings.effective_allowed_origins
+        if origin and (unsafe_method or preflight) and '*' not in allowed_origins and origin not in allowed_origins:
             return JSONResponse({'detail':'Origin is not allowed.'},status_code=403)
 
         if preflight:
@@ -70,7 +176,7 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if request.url.query: destination+='?'+request.url.query
             return RedirectResponse(destination,status_code=308)
         bearer=request.headers.get('authorization','').lower().startswith('bearer ')
-        if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout':
+        if settings.csrf_enabled and not bearer and request.method in {'POST','PUT','PATCH','DELETE'} and not request.url.path.startswith('/api/appliance/') and request.url.path!='/partner-logout' and request.url.path not in CSRF_EXEMPT_EXACT_PATHS:
             cookie=request.cookies.get('anyaicam_csrf'); token=request.headers.get('x-csrf-token')
             # No cookie means the final check below can never pass regardless of
             # what the body contains -- fail now instead of buffering a body an
@@ -104,23 +210,45 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
             if isinstance(token,str): token=self._unquote_double_submit_value(token)
             if not cookie or not token or not hmac.compare_digest(cookie,token) or unsign(cookie)!='csrf': return JSONResponse({'detail':'CSRF validation failed.'},status_code=403)
         if response is None: response=await call_next(request)
-        response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
-        response.headers['Content-Security-Policy']="default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' "+' '.join(settings.allowed_origins)+" https://d31cxfv0l904ar.cloudfront.net; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        frame_ancestors=_frame_ancestors_csp(request)
+        response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY' if frame_ancestors=='none' else 'SAMEORIGIN'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
+        response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp()+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors '"+frame_ancestors+"'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'
         if settings.csrf_enabled and not request.cookies.get('anyaicam_csrf'): response.set_cookie('anyaicam_csrf',sign('csrf',28800),secure=settings.secure_cookies,httponly=False,samesite='strict',max_age=28800,domain=settings.cookie_domain or None)
-        if settings.production: response.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
+        # Confirmed live on Samsung: this used to fire for any production
+        # profile, so a plain-HTTP edge appliance (no TLS listener at
+        # all) was telling browsers "only ever connect to this host over
+        # HTTPS" -- a promise the appliance can't keep, and one that
+        # locks a customer's browser out of the LAN/Tailscale address
+        # they actually use. Cloud/combined production is unaffected and
+        # still gets this unconditionally, same as before.
+        if settings.production and not settings.edge_production: response.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
         if settings.staging: response.headers['X-AnyAiCam-Environment']='staging'
         return response
 
 
 def login_blocked(email: str):
-    record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),)); return bool(record and record.get('locked_until') and datetime.fromisoformat(record['locked_until'])>datetime.now())
+    record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),))
+    if not record or not record.get('locked_until'):
+        return False
+    return datetime.fromisoformat(record['locked_until']) > datetime.now()
 
 
 def record_login_failure(email: str):
-    now=datetime.now(); record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),)); attempts=(record['attempts'] if record else 0)+1; locked=(now+timedelta(minutes=settings.login_lockout_minutes)).isoformat() if attempts>=settings.login_attempt_limit else None
+    now=datetime.now(); record=row('SELECT * FROM account_lockouts WHERE email=?',(email.lower(),)); attempts=0
+    if record:
+        # A lockout is a bounded security window, not a permanent strike
+        # counter.  Once its timer has elapsed, the next bad password starts
+        # a fresh window instead of immediately re-locking the customer.
+        last_attempt=record.get('last_attempt_at')
+        locked_until=record.get('locked_until')
+        expired_lock=bool(locked_until and datetime.fromisoformat(locked_until)<=now)
+        stale_attempt=bool(last_attempt and datetime.fromisoformat(last_attempt)<=now-timedelta(minutes=settings.login_lockout_minutes))
+        if not expired_lock and not stale_attempt:
+            attempts=record['attempts']
+    attempts+=1; locked=(now+timedelta(minutes=settings.login_lockout_minutes)).isoformat() if attempts>=settings.login_attempt_limit else None
     with connection() as db: db.execute('INSERT INTO account_lockouts(email,attempts,locked_until,last_attempt_at) VALUES(?,?,?,?) ON CONFLICT(email) DO UPDATE SET attempts=excluded.attempts,locked_until=excluded.locked_until,last_attempt_at=excluded.last_attempt_at',(email.lower(),attempts,locked,now.isoformat()))
 
 
@@ -129,15 +257,72 @@ def clear_login_failures(email: str):
 
 
 def create_password_reset(user_id: str,email: str):
-    raw=secrets.token_urlsafe(32); token_hash=password_hash(raw); now=datetime.now()
-    with connection() as db: db.execute('INSERT INTO password_reset_tokens(id,user_id,email,token_hash,expires_at,used_at,created_at) VALUES(?,?,?,?,?,?,?)',(secrets.token_hex(8),user_id,email,token_hash,(now+timedelta(hours=1)).isoformat(),None,now.isoformat()))
-    return raw
+    """Single-use, one-hour reset token. The emailed value is
+    "<row id>.<secret>" (2026-09-24): the id lets consume_password_reset()
+    verify exactly ONE stored hash instead of hashing the submitted value
+    against every outstanding token in the system (310k-iteration PBKDF2
+    each -- an unauthenticated CPU amplification on /api/password-reset/
+    complete). Only the secret part is hashed and stored; the id is not a
+    secret and grants nothing on its own."""
+    token_id=secrets.token_hex(8); secret=secrets.token_urlsafe(32); now=datetime.now()
+    with connection() as db: db.execute('INSERT INTO password_reset_tokens(id,user_id,email,token_hash,expires_at,used_at,created_at) VALUES(?,?,?,?,?,?,?)',(token_id,user_id,email,password_hash(secret),(now+timedelta(hours=1)).isoformat(),None,now.isoformat()))
+    return f'{token_id}.{secret}'
+
+
+# Reset links issued before the "<id>.<secret>" format (a bare secret) stay
+# valid for the rest of their one-hour life; they are matched by scanning,
+# bounded to this many of the newest outstanding tokens.
+LEGACY_RESET_TOKEN_SCAN_LIMIT = 25
+
+
+def _matching_reset_token(raw: str):
+    now=datetime.now().isoformat()
+    token_id,separator,secret=raw.partition('.')
+    with connection() as db:
+        if separator and token_id and secret:
+            record=db.execute('SELECT * FROM password_reset_tokens WHERE id=? AND used_at IS NULL AND expires_at>?',(token_id,now)).fetchone()
+            return dict(record) if record and verify_password(secret,record['token_hash']) else None
+        records=[dict(item) for item in db.execute(
+            'SELECT * FROM password_reset_tokens WHERE used_at IS NULL AND expires_at>? ORDER BY created_at DESC LIMIT ?',
+            (now,LEGACY_RESET_TOKEN_SCAN_LIMIT),
+        ).fetchall()]
+    return next((item for item in records if verify_password(raw,item['token_hash'])),None)
 
 
 def consume_password_reset(raw: str,new_password: str):
-    records=[]
-    with connection() as db: records=[dict(item) for item in db.execute('SELECT * FROM password_reset_tokens WHERE used_at IS NULL AND expires_at>?',(datetime.now().isoformat(),)).fetchall()]
-    match=next((item for item in records if verify_password(raw,item['token_hash'])),None)
-    if not match: return False
-    with connection() as db: db.execute('UPDATE partner_users SET password_hash=? WHERE id=?',(password_hash(new_password),match['user_id'])); db.execute('UPDATE password_reset_tokens SET used_at=? WHERE id=?',(datetime.now().isoformat(),match['id']))
-    return True
+    """Returns the account's role on success (a truthy string -- every
+    partner_users role is a non-empty value), or None if the token was
+    invalid/expired/already used. Callers that only care about success/
+    failure can keep using this exactly like the old bool return; the
+    role is additionally needed to route a customer_owner/customer_viewer
+    account back to the customer sign-in page instead of the partner one
+    (see password_reset_complete() in cloud_features.py) -- confirmed
+    live on staging: the reset page previously always redirected to
+    /partner-login regardless of role, which (a) is the wrong page for a
+    customer account and (b) wasn't even reachable pre-login itself (see
+    PUBLIC_PATH_PREFIXES's own history), together producing the exact
+    "redirected to the emergency recovery page, then invalid email or
+    password" report this fixes.
+    also clears must_change_password: the user just set a real password
+    of their own choosing through this exact flow, so forcing them
+    through ANOTHER "create your permanent password" step immediately
+    after logging in would be a confusing loop, not a security
+    improvement -- must_change_password exists for a partner-issued
+    temporary password the recipient has never chosen themselves, which
+    this is no longer true of the moment this function runs."""
+    match=_matching_reset_token(str(raw or ''))
+    if not match: return None
+    with connection() as db:
+        now=datetime.now().isoformat()
+        # Claim the token atomically.  A concurrent reset cannot reuse a
+        # token after this update, and all other outstanding reset links for
+        # the account are invalidated as soon as the password changes.
+        claimed=db.execute('UPDATE password_reset_tokens SET used_at=? WHERE id=? AND used_at IS NULL',(now,match['id']))
+        if not claimed.rowcount:
+            return None
+        db.execute('UPDATE partner_users SET password_hash=?,must_change_password=0 WHERE id=?',(password_hash(new_password),match['user_id']))
+        db.execute('UPDATE password_reset_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL',(now,match['user_id']))
+        db.execute('DELETE FROM account_lockouts WHERE email=?',(match['email'].lower(),))
+        db.execute('UPDATE user_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL',(now,match['user_id']))
+        role_row=db.execute('SELECT role FROM partner_users WHERE id=?',(match['user_id'],)).fetchone()
+    return role_row['role'] if role_row else None

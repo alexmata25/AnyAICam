@@ -7,7 +7,16 @@ name = "anyaicam-appliance-agent"
 version = "0.1.0"
 description = "AnyAiCam Linux appliance agent"
 requires-python = ">=3.11"
-dependencies = []
+# updater/verify.py imports cryptography unconditionally, and it is
+# reachable from the anyaicam-agent entrypoint at process start
+# (service.py -> updater.factory -> updater.state_machine ->
+# updater.verify) -- confirmed via ModuleNotFoundError on a real
+# Ubuntu 24.04 agent-service start, and confirmed as the only
+# undeclared runtime dependency: every import statement in this
+# package, at any indentation level including dynamic __import__()
+# calls, was inventoried and cryptography is the sole third-party
+# package referenced anywhere.
+dependencies = ["cryptography"]
 
 [project.scripts]
 anyaicam-agent = "anyaicam_agent.service:main"
