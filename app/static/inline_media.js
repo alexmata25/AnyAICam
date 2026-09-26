@@ -38,7 +38,7 @@ function create(opts){
     card.setAttribute('aria-label',`Playing ${item.title||'recording'}`);
     const snapshot=item.kind==='snapshot';
     const esc=value=>String(value==null?'':value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[ch]);
-    card.innerHTML=`<div class="camera-view inline-media-view">${snapshot?`<img alt="" src="${esc(item.thumbnail||'')}">`:''}<video playsinline preload="auto"${snapshot?' hidden':''}></video></div>
+    card.innerHTML=`<div class="camera-view inline-media-view">${snapshot?(item.thumbnail?`<img alt="" src="${esc(item.thumbnail)}">`:'<div class="inline-media-empty">No preview available</div>'):''}<video playsinline preload="auto"${snapshot?' hidden':''}></video></div>
       <p class="inline-media-status health-detail" role="status" aria-live="polite">Loading…</p>
       <div class="camera-tools inline-media-tools" role="toolbar" aria-label="Recording controls">
         <button class="camera-tool" type="button" data-act="play" title="Pause" aria-label="Pause">⏸</button>
@@ -69,6 +69,7 @@ function create(opts){
       ['play','mute','download'].forEach(act=>{card.querySelector(`[data-act="${act}"]`).hidden=true});
       statusEl.textContent=item.note||'No video clip was recorded for this detection.';
     }else if(item.kind==='event'){
+      if(item.poster||item.thumbnail)clipVideo.poster=item.poster||item.thumbnail;
       const mine=current;
       current.player=AnyAiCamEventMedia.player({video:clipVideo,status:statusEl,isCurrent:()=>current===mine,onReady:()=>{
         const src=clipVideo.getAttribute('src')||clipVideo.currentSrc;

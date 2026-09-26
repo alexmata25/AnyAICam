@@ -342,8 +342,14 @@ PAGE_CSS = """<link rel="stylesheet" href="/static/inline_media.css"><style>
 .aw-card{display:flex;flex-direction:column;border-radius:14px;overflow:hidden;background:rgba(24,33,50,.94);border:1px solid rgba(170,196,207,.14);cursor:pointer;color:inherit;text-align:left;padding:0;font:inherit}
 .aw-card:hover,.aw-card:focus-visible{border-color:rgba(67,209,204,.6);outline:none}
 .aw-card[aria-expanded="true"]{border-color:#43d1cc;box-shadow:0 0 0 1px #43d1cc}
-.aw-thumb{position:relative;aspect-ratio:16/9;background:#0b1018;display:grid;place-items:center;color:var(--muted);font-size:12px}
-.aw-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.aw-thumb{position:relative;aspect-ratio:16/9;background:linear-gradient(135deg,#243349,#1a2638);display:grid;place-items:center;color:#aebdce;font-size:13px}
+.aw-thumb-note{display:flex;align-items:center;gap:7px}
+.aw-thumb-note::before{content:"";width:16px;height:12px;border:2px solid currentColor;border-radius:3px;opacity:.7}
+.aw-thumb[data-preview="loading"] .aw-thumb-note{animation:aw-pulse 1.4s ease-in-out infinite}
+@keyframes aw-pulse{50%{opacity:.45}}
+.aw-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .2s}
+.aw-thumb[data-preview="ready"] img{opacity:1}
+.aw-thumb[data-preview="ready"] .aw-thumb-note{visibility:hidden}
 .aw-badge{position:absolute;top:8px;left:8px;padding:3px 8px;border-radius:999px;background:rgba(8,10,14,.78);color:#fff;font-size:11px;font-weight:800;letter-spacing:.02em}
 .aw-badge.bad{background:#7b2331}.aw-badge.good{background:#1f5b4d}
 .aw-play{position:absolute;right:8px;bottom:8px;width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:rgba(8,10,14,.72);color:#fff;font-size:14px}
