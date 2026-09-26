@@ -405,6 +405,22 @@ def _consume_pending_mfa_login(db, *, token: str) -> dict | None:
 
 
 def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
+    @app.get("/api/platform-owner/mfa/status")
+    def platform_owner_mfa_status(request: Request) -> dict:
+        """What the Admin Portal's sign-in security card shows: never the
+        secret or any code, only whether MFA is on and how many unused
+        recovery codes remain."""
+        actor = _require_global_grant_session(request)
+        from partner_db import connection
+
+        with connection() as db:
+            confirmed = mfa_is_confirmed(db, user_id=actor["user_id"])
+            remaining = db.execute(
+                "SELECT COUNT(*) AS n FROM platform_owner_recovery_codes WHERE user_id=? AND used_at IS NULL",
+                (actor["user_id"],),
+            ).fetchone()["n"]
+        return {"mfa_enabled": confirmed, "recovery_codes_remaining": int(remaining) if confirmed else 0}
+
     @app.post("/api/platform-owner/mfa/enroll")
     def platform_owner_mfa_enroll(request: Request) -> dict:
         actor = _require_global_grant_session(request)
@@ -463,22 +479,34 @@ def register_platform_owner_routes(app: FastAPI, shell: Callable) -> None:
         from partner_db import audit as partner_audit
         from partner_db import connection
 
+        # Every failure below is raised only AFTER this block commits: raising
+        # inside it rolled back _consume_pending_mfa_login()'s claim, so a
+        # wrong code left the pending login reusable and one password check
+        # allowed unlimited code guesses for its whole 5-minute life (admin
+        # portal pass 2026-09-26). A wrong code now spends the attempt.
+        failure: HTTPException | None = None
         with connection() as db:
             pending = _consume_pending_mfa_login(db, token=mfa_pending_token)
             if not pending:
-                raise HTTPException(status_code=400, detail="This sign-in attempt has expired. Sign in again.")
+                failure = HTTPException(status_code=400, detail="This sign-in attempt has expired. Sign in again.")
             # Re-verify the grant is STILL live right now -- the pending
             # row is only a "password already checked, MFA still owed"
             # marker, never itself a source of authorization.
-            if not has_global_administrator_grant(db, email=pending["email"]):
-                raise HTTPException(status_code=403, detail="This account no longer has platform owner access.")
-            mfa_row = db.execute("SELECT secret_base32, confirmed_at FROM platform_owner_mfa WHERE user_id=?", (pending["user_id"],)).fetchone()
-            ok = bool(mfa_row and mfa_row["confirmed_at"] and verify_totp_code(mfa_row["secret_base32"], code))
-            if not ok:
-                ok = consume_recovery_code(db, user_id=pending["user_id"], code=code)
-            if not ok:
-                raise HTTPException(status_code=400, detail="Incorrect code.")
-            user_row = db.execute("SELECT id,partner_id,customer_id FROM partner_users WHERE id=?", (pending["user_id"],)).fetchone()
+            elif not has_global_administrator_grant(db, email=pending["email"]):
+                failure = HTTPException(status_code=403, detail="This account no longer has platform owner access.")
+            else:
+                mfa_row = db.execute("SELECT secret_base32, confirmed_at FROM platform_owner_mfa WHERE user_id=?", (pending["user_id"],)).fetchone()
+                ok = bool(mfa_row and mfa_row["confirmed_at"] and verify_totp_code(mfa_row["secret_base32"], code))
+                if not ok:
+                    ok = consume_recovery_code(db, user_id=pending["user_id"], code=code)
+                if not ok:
+                    failure = HTTPException(status_code=400, detail="Incorrect code. Sign in again to get a new attempt.")
+                else:
+                    user_row = db.execute("SELECT id,partner_id,customer_id FROM partner_users WHERE id=?", (pending["user_id"],)).fetchone()
+        if failure is not None:
+            if failure.status_code == 400 and pending:
+                partner_audit({"email": pending["email"], "role": "administrator"}, "mfa_login_failed", "session", pending["user_id"])
+            raise failure
         partner_audit({"email": pending["email"], "role": "administrator"}, "mfa_login_verify", "session", pending["user_id"])
 
         from partner_portal import establish_partner_session

@@ -374,7 +374,9 @@ def test_forgot_password_pages_surface_the_real_error_instead_of_fake_success():
     source = (app_dir / "cloud_features.py").read_text(encoding="utf-8")
     # 2026-09-24: a non-JSON error body no longer throws (r falls back to
     # {}), and the fallbacks read clearly -- still never a fake success.
-    assert "r=await response.json().catch(()=>({}));showToast(response.ok?(r.message||'If the account exists, a password-reset message has been prepared.'):(r.detail||'Request failed. Please try again.'))" in source
+    # 2026-09-26: /forgot-password is a standalone page now and reports in
+    # place via say(text, ok) instead of a toast -- same no-fake-success rule.
+    assert "r=await response.json().catch(()=>({}));say(response.ok?(r.message||'If the account exists, a password-reset message has been prepared.'):(r.detail||'Request failed. Please try again.'),response.ok)" in source
     assert "box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed. Please try again.')" in source
 
 
