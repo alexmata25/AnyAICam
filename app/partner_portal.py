@@ -110,14 +110,25 @@ def require_partner_access(request: Request, roles=PARTNER_ROLES) -> dict:
     return _require(request, roles)
 
 
+def _read_all_quotes() -> list:
+    try:
+        data = json.loads(QUOTES_FILE.read_text(encoding='utf-8')) if QUOTES_FILE.exists() else []
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
 def _read_quotes() -> list:
-    try: return json.loads(QUOTES_FILE.read_text(encoding='utf-8')) if QUOTES_FILE.exists() else []
-    except (OSError, json.JSONDecodeError): return []
+    # Shared file with main.py's quote builder (records carrying quote_name);
+    # only calculator quotes are returned, and _save_quotes() keeps the
+    # builder's records (partner portal pass 2026-09-26).
+    return [item for item in _read_all_quotes() if 'quote_name' not in item]
 
 
 def _save_quotes(quotes: list) -> None:
+    builder = [item for item in _read_all_quotes() if 'quote_name' in item]
     QUOTES_FILE.parent.mkdir(parents=True, exist_ok=True); temp=QUOTES_FILE.with_suffix('.tmp')
-    temp.write_text(json.dumps(quotes, indent=2), encoding='utf-8'); temp.replace(QUOTES_FILE)
+    temp.write_text(json.dumps(builder + [item for item in quotes if 'quote_name' not in item], indent=2), encoding='utf-8'); temp.replace(QUOTES_FILE)
 
 
 def register_partner_routes(app: FastAPI, shell: Callable) -> None:
@@ -351,7 +362,7 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         for key,term in config['partner']['plan_terms'].items():
             retail=term.get('retail_monthly_price'); wholesale=term.get('partner_monthly_price'); cost=term.get('partner_cost'); suggested=term.get('suggested_retail_price'); profit=(suggested-wholesale) if suggested is not None and wholesale is not None else None; margin=(profit/suggested*100) if profit is not None and suggested else None
             rows.append(f'<tr><td>{key}</td><td>{"—" if retail is None else f"${retail:.2f}"}</td><td>{"Not configured" if wholesale is None else f"${wholesale:.2f}"}</td><td>{"Not configured" if cost is None else f"${cost:.2f}"}</td><td>{"—" if suggested is None else f"${suggested:.2f}"}</td><td>{"—" if profit is None else f"${profit:.2f}"}</td><td>{"—" if margin is None else f"{margin:.1f}%"}</td></tr>')
-        content=f'''<header class="topbar"><div><p class="eyebrow">Confidential · {identity['role']}</p><h1>Partner price sheet</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header><div class="mock-banner">Confidential partner information. Do not share this page with retail customers.</div><section class="panel" style="overflow:auto"><table class="data-table"><thead><tr><th>Plan</th><th>Retail</th><th>Partner price</th><th>Partner cost</th><th>Suggested retail</th><th>Profit/camera</th><th>Margin</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section>'''
+        content=f'''<header class="topbar"><div><p class="eyebrow">Confidential · {identity['role'].replace('_',' ').title()}</p><h1>Partner price sheet</h1></div><form method="post" action="/partner-logout"><button class="ghost-button">Sign out</button></form></header><div class="mock-banner">Confidential partner information. Do not share this page with retail customers.</div><section class="panel" style="overflow:auto"><table class="data-table"><thead><tr><th>Plan</th><th>Retail</th><th>Partner price</th><th>Partner cost</th><th>Suggested retail</th><th>Profit/camera</th><th>Margin</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section>'''
         return shell('Partner prices','partner-prices',content)
 
     @app.get('/partner-quotes', response_class=HTMLResponse)
