@@ -272,3 +272,17 @@ def test_static_scripts_are_valid_javascript():
     for name in ("analytics_workspace.js", "inline_media.js"):
         result = subprocess.run(["node", "--check", str(STATIC / name)], capture_output=True, text=True)
         assert result.returncode == 0, (name, result.stderr)
+
+
+def test_static_assets_are_versioned_per_build(client):
+    """Cloudflare caches /static for 4 h; each page must request this
+    build's JS/CSS (?v=<build>) so a deploy never runs against stale files."""
+    tag = f"?v={ws.ASSET_VERSION}"
+    workspace = client.get("/analytics/smart-motion", cookies=_cookie()).text
+    for asset in ("analytics_workspace.js", "inline_media.js", "inline_media.css", "event_media.js"):
+        assert f"/static/{asset}{tag}" in workspace, asset
+    playback = client.get("/playback", cookies=_cookie()).text
+    for asset in ("inline_media.js", "inline_media.css", "event_media.js"):
+        assert f"/static/{asset}{tag}" in playback, asset
+    assert f"/static/inline_media.css{tag}" in client.get("/analytics", cookies=_cookie()).text
+    assert ws.versioned('src="/static/a.js"') == f'src="/static/a.js{tag}"'
