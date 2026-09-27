@@ -28,25 +28,85 @@ Cameras without an exclusion zone are untouched: no filtering, no mask.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
+from datetime import datetime
 
 import analytics_rules_engine
 import recording_uploader
 
+logger = logging.getLogger("anyaicam.detection_exclusion")
+
 RULE_TYPE = "exclusion"
 CACHE_SECONDS = 10.0  # a newly synced/removed zone takes effect within this
 MOTION_GRID = (160, 90)  # motion_detector()'s own comparison frame
+SUPPRESSION_LOG_SECONDS = 60.0  # at most one "suppressed" log line per camera per minute
 
 _cache_lock = threading.Lock()
 _zone_cache: dict[int, tuple[float, tuple]] = {}
 _mask_cache: dict[int, tuple[tuple, object]] = {}
+# Per-camera suppression evidence (2026-09-27). A suppressed detection
+# produces no event at all -- by design -- which left nothing to check
+# during a physical zone walk test short of re-running YOLO on footage.
+# These counters (surfaced by /api/ai/status) show that people WERE seen
+# inside the zone and dropped: how many, when, which classes, and where
+# (normalized centres, never image data).
+_stats_lock = threading.Lock()
+_stats: dict[int, dict] = {}
+_last_log: dict[int, float] = {}
 
 
 def reset_cache() -> None:
     with _cache_lock:
         _zone_cache.clear()
         _mask_cache.clear()
+
+
+def reset_stats() -> None:
+    with _stats_lock:
+        _stats.clear()
+        _last_log.clear()
+
+
+def _record_suppression(camera_number: int, dropped: list[tuple[dict, tuple[float, float]]]) -> None:
+    now = time.monotonic()
+    with _stats_lock:
+        entry = _stats.setdefault(camera_number, {"suppressed_total": 0, "suppressed_by_class": {}})
+        entry["suppressed_total"] += len(dropped)
+        for detection, _ in dropped:
+            name = str(detection.get("class_name") or "unknown")
+            entry["suppressed_by_class"][name] = entry["suppressed_by_class"].get(name, 0) + 1
+        entry["last_suppressed_at"] = datetime.now().isoformat()
+        entry["last_suppressed"] = [
+            {"class_name": d.get("class_name"), "confidence": d.get("confidence"),
+             "centre": [round(c[0], 3), round(c[1], 3)]}
+            for d, c in dropped[:5]
+        ]
+        should_log = now - _last_log.get(camera_number, -SUPPRESSION_LOG_SECONDS) >= SUPPRESSION_LOG_SECONDS
+        if should_log:
+            _last_log[camera_number] = now
+        total = entry["suppressed_total"]
+    if should_log:
+        logger.info(
+            "detection_exclusion.suppressed camera=%s count=%s total=%s classes=%s",
+            camera_number, len(dropped), total,
+            ",".join(sorted({str(d.get("class_name")) for d, _ in dropped})),
+        )
+
+
+def status(camera_number: int) -> dict:
+    """What /api/ai/status reports for one camera's exclusion zones."""
+    zones = zones_for_camera(camera_number)
+    with _stats_lock:
+        entry = dict(_stats.get(camera_number) or {})
+    entry.setdefault("suppressed_total", 0)
+    entry["suppressed_by_class"] = dict(entry.get("suppressed_by_class") or {})
+    entry.setdefault("last_suppressed_at", None)
+    entry.setdefault("last_suppressed", [])
+    entry["zones_active"] = len(zones)
+    entry["zones"] = [[[round(x, 4), round(y, 4)] for x, y in zone] for zone in zones]
+    return entry
 
 
 def _load_zones(camera_id: str) -> tuple:
@@ -99,8 +159,16 @@ def filter_detections(camera_number: int, detections: list[dict], frame) -> list
     if not zones or frame is None or getattr(frame, "shape", None) is None:
         return detections
     height, width = frame.shape[0], frame.shape[1]
-    return [d for d in detections
-            if not is_excluded(analytics_rules_engine.normalize_centroid(d, width, height), zones)]
+    kept, dropped = [], []
+    for detection in detections:
+        centre = analytics_rules_engine.normalize_centroid(detection, width, height)
+        if is_excluded(centre, zones):
+            dropped.append((detection, centre))
+        else:
+            kept.append(detection)
+    if dropped:
+        _record_suppression(camera_number, dropped)
+    return kept
 
 
 def motion_exclusion_mask(camera_number: int):

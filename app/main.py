@@ -41593,7 +41593,7 @@ async def forwarded_https_middleware(request: Request, call_next):
 
 
 
-        "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        "Permissions-Policy", "camera=(self), microphone=(self), geolocation=()"  # same-origin mic: Talk and AACO voice (cloud_security.py sets the same)
 
 
 
@@ -55579,7 +55579,7 @@ def ai_detection_status() -> dict:
 
 
 
-            {"camera": camera_number, **ai_detection_state[camera_number]}
+            {"camera": camera_number, **ai_detection_state[camera_number], "exclusion_zones": detection_exclusion.status(camera_number)}
 
 
 
