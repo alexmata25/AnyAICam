@@ -130,7 +130,7 @@ def get_provider() -> GreetingAudioProvider:
     global _provider
     with _provider_lock:
         if _provider is None:
-            _provider = MockGreetingAudioProvider()
+            _provider = _default_provider()
         return _provider
 
 
@@ -140,3 +140,172 @@ def reset_provider() -> None:
     global _provider
     with _provider_lock:
         _provider = None
+
+
+# ---------------------------------------------------------------- spoken greeting on the edge (2026-09-27)
+# The real provider: offline text-to-speech on the appliance (espeak-ng,
+# installed in the release image -- no cloud round trip, so the greeting
+# still works through an internet outage) played through the camera's
+# own speaker over the same local ISAPI two-way-audio relay the
+# homeowner's live Talk uses (talk_audio_relay._LocalIsapiTalkRelay).
+#
+# Safety, matching the Talk path: only cameras confirmed talk-capable
+# (talk_down_supported == 1) are contacted; a camera in its login-failure
+# cooldown is never contacted; a homeowner already talking through that
+# camera always wins (the greeting is skipped, or cut short, never mixed
+# in); one greeting at a time per camera. speak() synthesizes and checks
+# all of that synchronously (a fraction of a second) and then plays the
+# audio on a background thread, so the detection loop is never held for
+# the seconds the greeting takes to say. `delivered` therefore means
+# "handed to the camera speaker"; the camera's own open/playback result
+# is logged under anyaicam.aac_voice_call_greeting.
+import io
+import logging
+import os
+import shutil
+import subprocess
+import wave
+
+logger = logging.getLogger("anyaicam.aac_voice_call_greeting")
+
+GREETING_VOICE = os.environ.get("ANYAICAM_GREETING_TTS_VOICE", "en-us")
+GREETING_WORDS_PER_MINUTE = int(os.environ.get("ANYAICAM_GREETING_TTS_WPM", "150"))
+GREETING_CHUNK_SECONDS = 0.1
+
+
+def synthesize_speech(text: str, *, voice: str = GREETING_VOICE, words_per_minute: int = GREETING_WORDS_PER_MINUTE) -> tuple[bytes, int]:
+    """Text -> (PCM16 mono bytes, sample rate) with espeak-ng. The text is
+    passed as one argv item, never through a shell."""
+    binary = shutil.which("espeak-ng")
+    if not binary:
+        raise RuntimeError("espeak-ng is not installed")
+    wav = subprocess.run(
+        [binary, "-v", voice, "-s", str(int(words_per_minute)), "--stdout", "--", text[:500]],
+        capture_output=True, timeout=15, check=True,
+    ).stdout
+    with wave.open(io.BytesIO(wav)) as reader:
+        if reader.getsampwidth() != 2 or reader.getnchannels() != 1:
+            raise RuntimeError("unexpected espeak-ng audio format")
+        return reader.readframes(reader.getnframes()), reader.getframerate()
+
+
+def _talk_camera(camera_id: str) -> dict | None:
+    from database_backend import connect
+
+    with connect() as db:
+        found = db.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    return dict(found) if found else None
+
+
+def _camera_in_customer_talk(camera_id: str) -> bool:
+    import talk_audio_relay
+
+    return any(item.get("camera_id") == camera_id for item in list(talk_audio_relay._active_relays.values()))
+
+
+def _open_relay(camera: dict, sample_rate: int):
+    import talk_audio_relay
+
+    return talk_audio_relay._LocalIsapiTalkRelay(camera, sample_rate, session_id="aac-greeting")
+
+
+def _auth_cooldown(camera_id: str) -> int:
+    import talk_audio_relay
+
+    return talk_audio_relay.camera_auth_cooldown_remaining(camera_id)
+
+
+class IsapiTtsGreetingProvider:
+    def __init__(self, *, synthesize=synthesize_speech, camera_lookup=_talk_camera,
+                 talk_active=_camera_in_customer_talk, auth_cooldown=_auth_cooldown,
+                 relay_factory=_open_relay, background=True, sleep=time.sleep) -> None:
+        self._synthesize = synthesize
+        self._camera_lookup = camera_lookup
+        self._talk_active = talk_active
+        self._auth_cooldown = auth_cooldown
+        self._relay_factory = relay_factory
+        self._background = background
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._speaking: set[str] = set()
+
+    def capability(self) -> dict:
+        return {
+            "provider": "isapi_tts",
+            "hardware_connected": True,
+            "tts_engine": "espeak-ng",
+            "note": "Offline edge text-to-speech played through the camera's own two-way audio speaker.",
+        }
+
+    def _skip(self, request: GreetingRequest, reason: str) -> GreetingResult:
+        logger.info("aac_greeting camera_id=%s event_id=%s skipped=%s", request.camera_id, request.event_id, reason)
+        return GreetingResult(camera_id=request.camera_id, delivered=False, suppressed_reason=reason)
+
+    def speak(self, request: GreetingRequest) -> GreetingResult:
+        camera = self._camera_lookup(request.camera_id)
+        if not camera:
+            return self._skip(request, "camera_not_found")
+        if camera.get("talk_down_supported") != 1:
+            return self._skip(request, "camera_not_talk_capable")
+        if self._auth_cooldown(request.camera_id):
+            return self._skip(request, "camera_auth_cooldown")
+        if self._talk_active(request.camera_id):
+            return self._skip(request, "customer_talk_active")
+        with self._lock:
+            if request.camera_id in self._speaking:
+                return self._skip(request, "greeting_already_playing")
+            self._speaking.add(request.camera_id)
+        try:
+            pcm, rate = self._synthesize(request.text)
+        except Exception as error:
+            with self._lock:
+                self._speaking.discard(request.camera_id)
+            logger.warning("aac_greeting camera_id=%s tts_failed=%s", request.camera_id, type(error).__name__)
+            return self._skip(request, "tts_unavailable")
+        if self._background:
+            threading.Thread(target=self._play, args=(request, camera, pcm, rate),
+                             name=f"aac-greeting-{request.camera_id}", daemon=True).start()
+        else:
+            self._play(request, camera, pcm, rate)
+        return GreetingResult(camera_id=request.camera_id, delivered=True)
+
+    def _play(self, request: GreetingRequest, camera: dict, pcm: bytes, rate: int) -> None:
+        relay = None
+        try:
+            relay = self._relay_factory(camera, rate)
+            if not relay.start():
+                logger.warning("aac_greeting camera_id=%s event_id=%s camera_open_failed=%s",
+                               request.camera_id, request.event_id, getattr(relay, "error_reason", None))
+                return
+            chunk = max(2, int(rate * GREETING_CHUNK_SECONDS) * 2)
+            played = 0
+            for offset in range(0, len(pcm), chunk):
+                if self._talk_active(request.camera_id):
+                    logger.info("aac_greeting camera_id=%s interrupted=customer_talk", request.camera_id)
+                    break
+                relay.send_pcm16(pcm[offset:offset + chunk])
+                played += len(pcm[offset:offset + chunk])
+                self._sleep(GREETING_CHUNK_SECONDS)  # real-time pacing; the relay queue drops stale audio
+            self._sleep(0.5)  # let the camera finish playing the tail
+            logger.info("aac_greeting camera_id=%s event_id=%s played_seconds=%.1f",
+                        request.camera_id, request.event_id, played / 2.0 / rate)
+        except Exception as error:
+            logger.warning("aac_greeting camera_id=%s playback_failed=%s", request.camera_id, type(error).__name__)
+        finally:
+            if relay is not None:
+                try:
+                    relay.stop()
+                except Exception:
+                    pass
+            with self._lock:
+                self._speaking.discard(request.camera_id)
+
+
+def _default_provider() -> GreetingAudioProvider:
+    """ANYAICAM_GREETING_AUDIO_PROVIDER: "auto" (default) speaks for real
+    when espeak-ng is installed (the release image), else the mock;
+    "mock" and "isapi_tts" force one."""
+    choice = os.environ.get("ANYAICAM_GREETING_AUDIO_PROVIDER", "auto").strip().lower()
+    if choice == "isapi_tts" or (choice == "auto" and shutil.which("espeak-ng")):
+        return IsapiTtsGreetingProvider()
+    return MockGreetingAudioProvider()
