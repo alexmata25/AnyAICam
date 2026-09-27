@@ -1,7 +1,7 @@
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tesseract-ocr curl wireguard-tools iproute2 \
+    && apt-get install -y --no-install-recommends ffmpeg tesseract-ocr espeak-ng curl wireguard-tools iproute2 \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements-cpu.txt /tmp/requirements-cpu.txt
 COPY requirements.txt /tmp/requirements.txt
@@ -49,4 +49,14 @@ RUN mkdir -p /opt/anyaicam-aac-models \
     && echo "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79  /opt/anyaicam-aac-models/face_recognition_sface_2021dec.onnx" | sha256sum -c - \
     && curl -fsSL -o /opt/anyaicam-aac-models/arcfaceresnet100-11-int8.onnx "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/body_analysis/arcface/model/arcfaceresnet100-11-int8.onnx" \
     && echo "c625ca68a422418c48aa84f73341337e0a92b111f327909005d1eec07c95f936  /opt/anyaicam-aac-models/arcfaceresnet100-11-int8.onnx" | sha256sum -c -
+# Licence-plate detector (2026-09-27): the Haar cascade never fires on US
+# plates, so app/lpr.py's detect_plate() uses this YOLOv11n plate model
+# (morsetechlab/yolov11-license-plate-detection, AGPL-3.0), pinned to an
+# exact Hugging Face commit and checksum. Baked outside /app for the same
+# bind-mount reason as the PPE model; lpr.py falls back to the cascade if
+# the file is missing.
+RUN mkdir -p /opt/anyaicam-lpr-model \
+    && curl -fsSL -o /opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/251a30d7daedca065f56e04b0af04052c907c68f/license-plate-finetune-v1n.pt" \
+    && echo "0aec75976c56eb6f26dfb274c430620ec65137915ff1ae47c3a48c7af8afb7b2  /opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt" | sha256sum -c -
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

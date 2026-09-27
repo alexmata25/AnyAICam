@@ -38268,7 +38268,23 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         vehicle_detection["height"],
                     )
                     vehicle_crop = frame[vy : vy + vh, vx : vx + vw]
-                    plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
+                    if not lpr.should_attempt(camera_number, (vx, vy, vw, vh)):
+                        continue  # parked vehicle already read (or tried) enough
+                    # A downscaled analytics frame (720p substream) is too
+                    # coarse for plates; read from the full-resolution
+                    # recording buffer when that adds pixels.
+                    full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+                    full_crop = lpr.full_resolution_vehicle_crop(frame, (vx, vy, vw, vh), full_frame)
+                    plate_result = lpr.recognize_plate(full_crop, camera_number=camera_number) if full_crop is not None else None
+                    if plate_result is not None:
+                        vehicle_crop = full_crop  # plate region coordinates refer to this crop
+                    else:
+                        plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
+                    # Only corroborated reads become plate events (repeated
+                    # identical reads; a parked car is not re-reported).
+                    plate_result = lpr.confirm_plate(camera_number, plate_result)
+                    if plate_result is not None:
+                        lpr.mark_vehicle_read(camera_number, (vx, vy, vw, vh))
                 except Exception as error:
                     plate_result = None
                     print(f"Camera {camera_number} LPR skipped (non-fatal): {error}")
