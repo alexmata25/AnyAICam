@@ -191,7 +191,23 @@ def test_repeated_events_within_the_cooldown_window_suppress_the_second_email(fa
         _set_preferences(db, user_id=user_id, customer_id="cust-1", email_address="owner@example.test", email_enabled=True, event_types=["smart_motion"])
     notification_engine.fanout_appliance_event(_appliance(), {"camera_id": "cam-1", "event_type": "smart_motion", "id": "evt-1"})
     notification_engine.fanout_appliance_event(_appliance(), {"camera_id": "cam-1", "event_type": "smart_motion", "id": "evt-2"})
-    assert len(fake_channels["email"].calls) == 1  # not 2
+    # 2026-09-27: detection-alert emails are held until their media reaches
+    # the cloud (notification_email.waits_for_media) and sent by
+    # notification_retry_worker -- so assert the queued emails: the first
+    # event gets exactly one, the second (inside the cooldown) none.
+    with connection() as db:
+        queued = db.execute("SELECT COUNT(*) FROM notification_deliveries WHERE channel='email' AND status='pending_media'").fetchone()[0]
+    assert queued == 1  # not 2
+    import notification_email
+    import notification_retry_worker
+    from datetime import datetime, timedelta
+    original_channels = notification_retry_worker.CHANNELS
+    notification_retry_worker.CHANNELS = fake_channels
+    try:
+        notification_retry_worker.send_pending_media_emails(now=datetime.now() + timedelta(seconds=notification_email.MEDIA_WAIT_SECONDS + 1))
+    finally:
+        notification_retry_worker.CHANNELS = original_channels
+    assert len(fake_channels["email"].calls) == 1  # sent once, after the hold
     # Both events still each got their own in-app notification row -- the
     # existing Smart Alerts list behavior is completely unaffected.
     with connection() as db:

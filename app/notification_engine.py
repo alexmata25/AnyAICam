@@ -201,6 +201,13 @@ def fanout_appliance_event(appliance: dict,event: dict):
         channels={'in_app':True,'email':external['email'],'sms':external['sms']}
         for channel in ('in_app','email','sms'):
             if not channels.get(channel): continue
+            if channel=='email':
+                import notification_email
+                if notification_email.waits_for_media(event_type,event.get('id')):
+                    # Held until the thumbnail/clip reach the cloud (or a short
+                    # deadline): notification_retry_worker.send_pending_media_emails().
+                    with connection() as db: db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,'email','pending_media','configured_email',None,recipients['email'],0,now.isoformat()))
+                    continue
             try: result=CHANNELS[channel].send(notification,recipients[channel])
             except Exception as error: result={'channel':channel,'status':'error','provider':'configured','error':str(error)}
             with connection() as db: db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,channel,result['status'],result.get('provider'),result.get('error'),recipients[channel],1,now.isoformat()))

@@ -139,6 +139,58 @@ def retry_failed_deliveries() -> dict:
     return {"candidates": len(candidates), "attempted": attempted, "succeeded": succeeded}
 
 
+PENDING_MEDIA_SCAN_SECONDS = max(5.0, float(os.environ.get("ANYAICAM_ALERT_EMAIL_PENDING_SCAN_SECONDS", "15")))
+
+
+def send_pending_media_emails(*, now: datetime | None = None) -> dict:
+    """Sends detection-alert emails held by notification_engine until
+    their thumbnail reached the cloud (2026-09-27), or once
+    notification_email.MEDIA_WAIT_SECONDS has passed (link only). One
+    new delivery row per send (attempt 1) -- a failure then follows the
+    normal retry path above. The email allowlist is re-checked, so a
+    narrowed allowlist also covers already-held emails."""
+    import notification_email
+    from notification_engine import email_alert_allowed
+    now = now or datetime.now()
+    sent = held = skipped = 0
+    with connection() as db:
+        pending = [dict(r) for r in db.execute(
+            "SELECT nd.* FROM notification_deliveries nd WHERE nd.channel='email' AND nd.status='pending_media' "
+            "AND NOT EXISTS (SELECT 1 FROM notification_deliveries later WHERE later.notification_id=nd.notification_id "
+            "AND later.channel='email' AND later.rowid>nd.rowid) ORDER BY nd.rowid LIMIT 200").fetchall()]
+    for delivery in pending:
+        with connection() as db:
+            context = notification_email.alert_context(db, delivery["notification_id"])
+        if not context:
+            continue
+        try:
+            age = (now - datetime.fromisoformat(delivery["created_at"])).total_seconds()
+        except (TypeError, ValueError):
+            age = notification_email.MEDIA_WAIT_SECONDS
+        if not email_alert_allowed(str(context.get("event_type") or "")):
+            status, result = "skipped_allowlist", {"provider": "configured_email", "error": None}
+            skipped += 1
+        elif notification_email.media_ready(context) or age >= notification_email.MEDIA_WAIT_SECONDS:
+            try:
+                result = CHANNELS["email"].send({"id": context["id"], "title": context["title"], "message": context["message"]}, delivery["recipient"])
+            except Exception as error:
+                result = {"status": "error", "provider": "configured", "error": str(error)}
+            status = result.get("status")
+            sent += status == "sent"
+        else:
+            held += 1
+            continue
+        import secrets
+        with connection() as db:
+            db.execute(
+                "INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (secrets.token_hex(12), delivery["notification_id"], "email", status, result.get("provider"),
+                 result.get("error"), delivery["recipient"], 1, now.isoformat()),
+            )
+    return {"pending": len(pending), "sent": sent, "held": held, "skipped": skipped}
+
+
 async def notification_retry_worker() -> None:
     if RUNTIME_ROLE not in {"cloud", "combined"}:
         retry_worker_state["worker_status"] = "disabled"
@@ -146,16 +198,23 @@ async def notification_retry_worker() -> None:
             await asyncio.sleep(3600)
     retry_worker_state["worker_status"] = "running"
     logger.info("notification_retry.worker_started")
+    last_retry_scan = 0.0
     while True:
         try:
-            stats = await asyncio.to_thread(retry_failed_deliveries)
-            retry_worker_state["last_scan_at"] = datetime.now().isoformat()
+            # Held detection-alert emails go out on a fast cadence; the
+            # (heavier) retry scan keeps its own SCAN_SECONDS cadence.
+            retry_worker_state["last_pending_media"] = await asyncio.to_thread(send_pending_media_emails)
+            loop_now = asyncio.get_running_loop().time()
+            if loop_now - last_retry_scan >= SCAN_SECONDS:
+                last_retry_scan = loop_now
+                stats = await asyncio.to_thread(retry_failed_deliveries)
+                retry_worker_state["last_scan_at"] = datetime.now().isoformat()
+                retry_worker_state["last_stats"] = stats
             retry_worker_state["last_error"] = None
-            retry_worker_state["last_stats"] = stats
-            await asyncio.sleep(SCAN_SECONDS)
+            await asyncio.sleep(PENDING_MEDIA_SCAN_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as error:
             retry_worker_state["last_error"] = str(error)
             logger.warning("notification_retry.worker_iteration_failed error=%s", error)
-            await asyncio.sleep(SCAN_SECONDS)
+            await asyncio.sleep(PENDING_MEDIA_SCAN_SECONDS)
