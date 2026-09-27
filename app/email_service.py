@@ -33,21 +33,27 @@ EMAIL_TYPES={
 
 class EmailBackend(ABC):
     @abstractmethod
-    def send(self,message_type,to,subject,text,html=None,metadata=None): ...
+    def send(self,message_type,to,subject,text,html=None,metadata=None,images=None): ...
 
 
 class PreviewEmail(EmailBackend):
     def __init__(self,root=None): self.root=Path(root or settings.email_preview_dir); self.root.mkdir(parents=True,exist_ok=True)
-    def send(self,message_type,to,subject,text,html=None,metadata=None):
+    def send(self,message_type,to,subject,text,html=None,metadata=None,images=None):
         if message_type not in EMAIL_TYPES: raise ValueError('Unsupported email type.')
-        identifier=datetime.now().strftime('%Y%m%d-%H%M%S-%f'); record={'id':identifier,'type':message_type,'to':to,'from':settings.email_from,'subject':subject,'text':text,'html':html,'metadata':metadata or {},'created_at':datetime.now().isoformat(),'status':'preview'}; path=self.root/f'{identifier}.json'; path.write_text(json.dumps(record,indent=2),encoding='utf-8'); return record
+        identifier=datetime.now().strftime('%Y%m%d-%H%M%S-%f'); record={'id':identifier,'type':message_type,'to':to,'from':settings.email_from,'subject':subject,'text':text,'html':html,'metadata':metadata or {},'images':[{'cid':cid,'bytes':len(data)} for cid,data in (images or [])],'created_at':datetime.now().isoformat(),'status':'preview'}; path=self.root/f'{identifier}.json'; path.write_text(json.dumps(record,indent=2),encoding='utf-8'); return record
 
 
 class SMTPEmail(EmailBackend):
-    def send(self,message_type,to,subject,text,html=None,metadata=None):
+    def send(self,message_type,to,subject,text,html=None,metadata=None,images=None):
         if settings.email_backend!='smtp' or not settings.smtp_host: raise RuntimeError('SMTP email is disabled or incomplete.')
         message=EmailMessage(); message['From']=settings.email_from; message['To']=to; message['Subject']=subject; message.set_content(text)
-        if html: message.add_alternative(html,subtype='html')
+        if html:
+            message.add_alternative(html,subtype='html')
+            # Inline images (2026-09-27, alert thumbnails): attached to the
+            # HTML part as multipart/related, referenced as cid:<name>.
+            html_part=message.get_payload()[-1]
+            for cid,data in images or []:
+                html_part.add_related(data,maintype='image',subtype='jpeg',cid=f'<{cid}>',filename=f'{cid}.jpg')
         context=ssl.create_default_context()
         try:
             with smtplib.SMTP(settings.smtp_host,settings.smtp_port,timeout=20) as client:

@@ -15,7 +15,28 @@ class InAppChannel(NotificationChannel):
 
 class EmailChannel(NotificationChannel):
     def send(self,notification,recipient):
-        message=get_email_service().send('appliance_alert',recipient,notification['title'],notification.get('message') or notification['title'],metadata={'notification_id':notification['id']}); return {'channel':'email','status':message['status'],'provider':'configured_email','error':message.get('error')}
+        # Rich content (camera, local time, thumbnail, event link) when the
+        # notification's context can be read; the original title/message
+        # email otherwise -- a rendering problem must never drop an alert.
+        content=_rich_alert_content(notification)
+        if content:
+            message=get_email_service().send('appliance_alert',recipient,content['subject'],content['text'],html=content['html'],metadata={'notification_id':notification['id']},images=content['images'])
+        else:
+            message=get_email_service().send('appliance_alert',recipient,notification['title'],notification.get('message') or notification['title'],metadata={'notification_id':notification['id']})
+        return {'channel':'email','status':message['status'],'provider':'configured_email','error':message.get('error')}
+
+
+def _rich_alert_content(notification):
+    try:
+        import notification_email
+        from partner_db import connection
+        with connection() as db:
+            context=notification_email.alert_context(db,notification['id'])
+        if not context:
+            return None
+        return notification_email.build_alert_email(context,image=notification_email.thumbnail_bytes(context))
+    except Exception:
+        return None
 
 
 class WebPushPreparation(NotificationChannel):
