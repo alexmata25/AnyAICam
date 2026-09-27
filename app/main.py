@@ -1663,6 +1663,33 @@ BACKUP_INCLUDE_HLS = os.environ.get(
 SMTP_HOST = os.environ.get("ANYAICAM_SMTP_HOST", "").strip()
 
 
+def _last_email_delivery() -> dict | None:
+    """The most recent real email attempt -- account mail (email_messages)
+    or a notification email (notification_deliveries) -- with its status
+    and, when it failed, the provider's reason (2026-09-27). Staging
+    reported password_reset_email_ready=True for a week while every send
+    was rejected with SMTP 535, because readiness only looked at config.
+    Newest row by rowid (insertion order), so this stays cheap as the
+    delivery tables grow. None when nothing was ever sent or on error."""
+    try:
+        from partner_db import connection as _email_connection
+        with _email_connection() as db:
+            account = db.execute("SELECT status, created_at, metadata_json FROM email_messages ORDER BY rowid DESC LIMIT 1").fetchone()
+            alert = db.execute("SELECT status, created_at, error FROM notification_deliveries WHERE channel='email' ORDER BY rowid DESC LIMIT 1").fetchone()
+    except Exception:
+        return None
+    candidates = []
+    if account:
+        try:
+            reason = (json.loads(account["metadata_json"] or "{}") or {}).get("error")
+        except (TypeError, ValueError, AttributeError):
+            reason = None
+        candidates.append({"kind": "account", "status": account["status"], "at": account["created_at"], "error": reason})
+    if alert:
+        candidates.append({"kind": "notification", "status": alert["status"], "at": alert["created_at"], "error": alert["error"]})
+    return max(candidates, key=lambda item: str(item["at"] or "")) if candidates else None
+
+
 def _password_reset_email_ready() -> bool:
     """Can email_service.py actually deliver password-reset mail? (See the
     readiness snapshot's password_reset_email_ready.)"""
@@ -12117,6 +12144,19 @@ def configuration_issues() -> list[dict]:
 
 
 
+    # Email delivery outcome (2026-09-27): a configured SMTP backend whose
+    # most recent real send failed is a warning an operator must see
+    # (reset links and alerts are not reaching anyone), not silence.
+    from cloud_config import settings as _email_settings
+    if _email_settings.email_backend == "smtp":
+        last_email = _last_email_delivery()
+        if last_email and last_email.get("status") == "failed":
+            issues.append({
+                "key": "ANYAICAM_EMAIL_DELIVERY",
+                "severity": "warning",
+                "message": f"The most recent email ({last_email['kind']}, {last_email['at']}) was not delivered: "
+                           f"{last_email.get('error') or 'no reason recorded'}. Check the SMTP credentials/provider.",
+            })
     return issues
 
 
@@ -12677,6 +12717,9 @@ def cloud_configuration_snapshot() -> dict:
         # 'preview' backend (the default) only writes reset links to local
         # JSON files -- fine for development, never for real customers.
         "password_reset_email_ready": _password_reset_email_ready(),
+        # The last real delivery outcome (kind/status/at/error) -- config
+        # can look complete while every send is rejected.
+        "email_last_delivery": _last_email_delivery(),
 
 
 

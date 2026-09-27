@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse,HTMLResponse,StreamingResponse
 from cloud_config import settings
 from cloud_security import consume_password_reset,create_password_reset
 from appliance_protocol import RateLimiter
-from email_service import get_email_service
+from email_service import email_error_fields, get_email_service
 from object_storage import LocalStorage,get_storage,safe_key
 from partner_db import audit,authorize_customer_tenant,connection,require_permission,row,rows,tenant_owns_partner
 from partner_portal import partner_identity,require_partner_access
@@ -143,7 +143,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
                 base=customer_reset_url() if user['role'] in CUSTOMER_RESET_ROLES else settings.password_reset_url
                 link=base+'?token='+raw
             message=get_email_service().send('password_reset',email,'Reset your AnyAiCam password',f'Use this one-hour password reset link:\n{link}',metadata={'expires_minutes':60})
-            with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',email,message['status'],settings.email_backend,json.dumps({'expires_minutes':60}),datetime.now().isoformat()))
+            with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',email,message['status'],settings.email_backend,json.dumps(email_error_fields(message)|{'expires_minutes':60}),datetime.now().isoformat()))
             audit({'email':email,'role':'account'},'password_reset.requested','partner_user',user['id'],{'provider':settings.email_backend})
         return {'message':'If the account exists, a password-reset message has been prepared.'}
 
@@ -201,7 +201,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
             # Always a customer account here (see the role filter above).
             link=customer_reset_url()+'?token='+raw
         message=get_email_service().send('password_reset',user['email'],'Reset your AnyAiCam password',f'An administrator started a password reset for your account. Use this one-hour link to set a new password:\n{link}',metadata={'expires_minutes':60,'initiated_by':'admin'})
-        with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',user['email'],message['status'],settings.email_backend,json.dumps({'expires_minutes':60,'initiated_by':'admin'}),datetime.now().isoformat()))
+        with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',user['email'],message['status'],settings.email_backend,json.dumps(email_error_fields(message)|{'expires_minutes':60,'initiated_by':'admin'}),datetime.now().isoformat()))
         audit(identity,'customer_account.password_reset_initiated','partner_user',user_id,{'customer_id':customer_id,'provider':settings.email_backend})
         return {'message':'Password-reset message sent to the account on file. The customer\'s current password remains unchanged until they complete the reset.'}
 
@@ -252,7 +252,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         # notice needs to reach the address an attacker (or a support
         # mistake) just moved away from, not the one they moved to.
         message=get_email_service().send('account_email_changed',old_email,'Your AnyAiCam account email was changed',f'An administrator changed the email address on your AnyAiCam account from {old_email} to {new_email}. If you did not request this, contact support immediately.',metadata={'old_email':old_email,'new_email':new_email,'initiated_by':'admin'})
-        with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'account_email_changed',old_email,message['status'],settings.email_backend,json.dumps({'old_email':old_email,'new_email':new_email,'initiated_by':'admin'}),datetime.now().isoformat()))
+        with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'account_email_changed',old_email,message['status'],settings.email_backend,json.dumps(email_error_fields(message)|{'old_email':old_email,'new_email':new_email,'initiated_by':'admin'}),datetime.now().isoformat()))
         audit(identity,'customer_account.email_changed','partner_user',user_id,{'customer_id':customer_id,'old_email':old_email,'new_email':new_email})
         return {'message':'Email address updated. The customer should sign in with the new email address from now on.','old_email':old_email,'new_email':new_email}
 

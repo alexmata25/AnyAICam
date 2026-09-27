@@ -73,3 +73,14 @@ class SMTPEmail(EmailBackend):
 
 
 def get_email_service(): return SMTPEmail() if settings.email_backend=='smtp' else PreviewEmail()
+
+
+def email_error_fields(message) -> dict:
+    """{'error': <reason>} for a failed send, else {} (2026-09-27). The
+    reason is the provider's own reply -- an SMTP status code and server
+    text such as (535, b'5.7.8 Username and Password not accepted') --
+    never a credential. Stored with every email record so a delivery
+    outage is diagnosable from the product, not only from container logs."""
+    if isinstance(message, dict) and message.get('status') == 'failed' and message.get('error'):
+        return {'error': str(message['error'])[:300]}
+    return {}
