@@ -105,9 +105,15 @@ def retry_failed_deliveries() -> dict:
             # or a genuinely empty recipient -- nothing safe to retry to.
             continue
         with connection() as db:
-            notification = row("SELECT id,title,message FROM notifications WHERE id=?", (delivery["notification_id"],))
+            notification = row("SELECT id,title,message,event_type FROM notifications WHERE id=?", (delivery["notification_id"],))
         if not notification:
             continue
+        # The operator email allowlist applies to retries too, so narrowing
+        # email alerts can never be undone by re-sending older failures.
+        from notification_engine import email_alert_allowed
+        if delivery["channel"] == "email" and not email_alert_allowed(str(notification["event_type"] or "")):
+            continue
+        notification = {key: notification[key] for key in ("id", "title", "message")}
         attempted += 1
         try:
             result = CHANNELS[delivery["channel"]].send(dict(notification), delivery["recipient"])

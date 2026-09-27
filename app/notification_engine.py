@@ -55,6 +55,25 @@ SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion
 NOTIFICATION_CHANNEL_COOLDOWN_SECONDS=max(0,int(os.environ.get("ANYAICAM_NOTIFICATION_CHANNEL_COOLDOWN_SECONDS","300")))
 
 
+def _email_alert_event_types() -> frozenset[str] | None:
+    """Operator allowlist for EMAIL alerts only (2026-09-27):
+    ANYAICAM_EMAIL_ALERT_EVENT_TYPES="aac_voice_call,camera_offline,...".
+    Unset/empty = no restriction (every event type the customer selected).
+    It narrows email and nothing else: the customer's saved preferences,
+    SMS (which shares the same event-type list), in-app notifications and
+    transactional mail (password resets, invitations) are untouched. Used
+    on staging so a test SMTP account never approaches the provider's daily
+    sending limit; removing the variable restores normal behaviour."""
+    raw = os.environ.get("ANYAICAM_EMAIL_ALERT_EVENT_TYPES", "")
+    types = frozenset(item.strip() for item in raw.split(",") if item.strip())
+    return types or None
+
+
+def email_alert_allowed(event_type: str) -> bool:
+    allowed = _email_alert_event_types()
+    return allowed is None or event_type in allowed
+
+
 def _within_quiet_hours(current_time: str, quiet_start: str, quiet_end: str) -> bool:
     """HH:MM string comparison, wrap-aware: quiet_start > quiet_end means
     the window crosses midnight (e.g. 22:00-07:00), matching notification_
@@ -137,7 +156,7 @@ def _external_channels(db,*,user,customer_id: str,camera_id: str | None,event_ty
     if _external_channel_recently_notified(db,user_id=user['id'],camera_id=camera_id,event_type=event_type,now=now,exclude_notification_id=notification_id):
         return disabled
     return {
-        'email':bool(prefs['email_enabled'] and prefs['email_address']),
+        'email':bool(prefs['email_enabled'] and prefs['email_address'] and email_alert_allowed(event_type)),
         'sms':bool(prefs['sms_enabled'] and prefs['phone_number']),
         'email_address':prefs['email_address'],
         'phone_number':prefs['phone_number'],
