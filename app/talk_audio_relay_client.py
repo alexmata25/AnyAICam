@@ -82,6 +82,35 @@ talk_audio_relay_state: dict = {"channel_status": "disabled", "active_sessions":
 
 _sessions: dict[str, dict] = {}  # session_id -> {"process": Popen, "transport": TalkDownTransport, "camera_id": str}
 
+# Talkdown completion pass (2026-09-26). The cloud now hears back about
+# every "start": {"type": "started"} once the camera's backchannel is
+# open, or {"type": "error", "reason": ...} when it could not be, so the
+# customer sees why talk failed instead of speaking into nothing.
+# Reason keys match talk_audio_relay.TALK_ERROR_MESSAGES on the cloud.
+_last_start_error: dict[str, str] = {}  # session_id -> reason its start failed
+
+# A camera that rejects its login (RTSP 401/403) is not contacted again
+# for this long -- many cameras lock the account out after repeated
+# failures, and every press of Talk was another digest attempt.
+CAMERA_AUTH_COOLDOWN_SECONDS = 300
+_camera_auth_failures: dict[str, float] = {}  # camera_id -> monotonic time of the last auth rejection
+
+
+def _is_camera_auth_error(text: str) -> bool:
+    text = f" {text} "
+    return " 401 " in text or " 403 " in text
+
+
+def _camera_auth_cooldown_remaining(camera_id: str) -> int:
+    failed_at = _camera_auth_failures.get(camera_id)
+    if failed_at is None:
+        return 0
+    remaining = CAMERA_AUTH_COOLDOWN_SECONDS - (time.monotonic() - failed_at)
+    if remaining <= 0:
+        _camera_auth_failures.pop(camera_id, None)
+        return 0
+    return int(remaining) + 1
+
 
 def _load_appliance_identity() -> tuple[str, str] | None:
     try:
@@ -225,13 +254,20 @@ def _start_session(session_id: str, camera_id: str, metadata: dict, sample_rate:
     _sessions[session_id]."""
     if session_id in _sessions:
         return False  # a duplicate "start" for an already-running session -- ignore, never restart what's already live
+    _last_start_error.pop(session_id, None)
     camera_number = _camera_number_for(camera_id, camera_map)
     if camera_number is None:
         logger.warning("talk_audio_relay_client.unknown_camera session_id=%s camera_id=%s", session_id, camera_id)
+        _last_start_error[session_id] = "unknown_camera"
+        return False
+    if _camera_auth_cooldown_remaining(camera_id):
+        logger.warning("talk_audio_relay_client.camera_auth_cooldown session_id=%s camera_number=%s", session_id, camera_number)
+        _last_start_error[session_id] = "camera_auth_cooldown"
         return False
     credentials = _camera_transport_credentials(camera_number)
     if not credentials:
         logger.warning("talk_audio_relay_client.no_camera_credentials session_id=%s camera_number=%s", session_id, camera_number)
+        _last_start_error[session_id] = "no_camera_credentials"
         return False
     host, port, rtsp_path, username, password = credentials
 
@@ -256,6 +292,13 @@ def _start_session(session_id: str, camera_id: str, metadata: dict, sample_rate:
             "talk_audio_relay_client.transport_connect_failed session_id=%s camera_id=%s camera_number=%s error=%s",
             session_id, camera_id, camera_number, error,
         )
+        if _is_camera_auth_error(str(error)):
+            _camera_auth_failures[camera_id] = time.monotonic()
+            _last_start_error[session_id] = "camera_auth_failed"
+        elif isinstance(error, OSError) and not isinstance(error, ConnectionError):
+            _last_start_error[session_id] = "camera_unreachable"  # refused / timed out / no route
+        else:
+            _last_start_error[session_id] = "camera_talk_unavailable"
         _terminate_process(process)
         try:
             transport.close()
@@ -295,7 +338,7 @@ def _stop_session(session_id: str) -> None:
         pass
 
 
-async def _drain_transcoded_audio(session_id: str) -> None:
+async def _drain_transcoded_audio(session_id: str, send=None) -> None:
     """Reads transcoded PCMU bytes from one session's ffmpeg stdout and
     hands each chunk to that session's own transport -- never any other
     session's. Exits cleanly (without touching _sessions itself, which
@@ -320,12 +363,22 @@ async def _drain_transcoded_audio(session_id: str) -> None:
                 transport.send(chunk)
             except Exception as error:
                 logger.warning("talk_audio_relay_client.transport_send_failed session_id=%s error=%s", session_id, error)
+                await _reply(send, {"type": "error", "session_id": session_id, "reason": "camera_unreachable"})
                 break
     except Exception as error:
         logger.warning("talk_audio_relay_client.drain_failed session_id=%s error=%s", session_id, error)
 
 
-async def _handle_message(raw_message: str, camera_map: dict[int, dict]) -> None:
+async def _reply(send, message: dict) -> None:
+    if send is None:
+        return
+    try:
+        await send(json.dumps(message))
+    except Exception as error:
+        logger.warning("talk_audio_relay_client.reply_failed type=%s error=%s", message.get("type"), error)
+
+
+async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=None) -> None:
     try:
         message = json.loads(raw_message)
     except json.JSONDecodeError:
@@ -341,9 +394,17 @@ async def _handle_message(raw_message: str, camera_map: dict[int, dict]) -> None
         sample_rate = message.get("sample_rate") if isinstance(message.get("sample_rate"), int) else 48000
         if not isinstance(camera_id, str):
             return
-        started = _start_session(session_id, camera_id, metadata, sample_rate, camera_map)
+        was_running = session_id in _sessions
+        # Off the event loop: connect() is a blocking RTSP exchange (up
+        # to its own socket timeout), and it must not stall the channel
+        # for every other session on this appliance meanwhile.
+        started = await asyncio.to_thread(_start_session, session_id, camera_id, metadata, sample_rate, camera_map)
         if started:
-            asyncio.create_task(_drain_transcoded_audio(session_id))
+            asyncio.create_task(_drain_transcoded_audio(session_id, send) if send is not None else _drain_transcoded_audio(session_id))
+            await _reply(send, {"type": "started", "session_id": session_id})
+        elif not was_running:
+            reason = _last_start_error.pop(session_id, None) or "camera_talk_unavailable"
+            await _reply(send, {"type": "error", "session_id": session_id, "reason": reason})
         # A duplicate start (already running), an unknown camera, missing
         # credentials, or a failed transport.connect() all return False --
         # in every one of those cases the session either doesn't exist or
@@ -396,7 +457,7 @@ async def talk_audio_relay_client_worker() -> None:
                 talk_audio_relay_state["channel_status"] = "connected"
                 logger.info("talk_audio_relay_client.channel_connected")
                 async for raw_message in connection:
-                    await _handle_message(raw_message, camera_map)
+                    await _handle_message(raw_message, camera_map, connection.send)
         except asyncio.CancelledError:
             for session_id in list(_sessions):
                 _stop_session(session_id)

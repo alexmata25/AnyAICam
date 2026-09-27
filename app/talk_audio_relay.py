@@ -71,6 +71,53 @@ IDLE_TIMEOUT_SECONDS = 10
 # rather than a second, potentially-drifting constant here.
 MAX_RELAY_SECONDS = TALK_SESSION_DURATION_SECONDS
 
+# How long the cloud waits for the appliance to confirm a session reached
+# the camera before telling the browser it is live anyway (older appliance
+# builds never acknowledge).
+APPLIANCE_ACK_WAIT_SECONDS = 4
+
+# Talkdown completion pass (2026-09-26): a camera that rejects its login
+# (HTTP/RTSP 401 or 403) must not be retried on every press -- many
+# cameras lock the account out after repeated failures, and each press
+# was another digest attempt. Talk to that camera is paused for this long
+# after an auth failure, failing fast without contacting it.
+CAMERA_AUTH_COOLDOWN_SECONDS = 300
+_camera_auth_failures: dict[str, float] = {}  # camera_id -> monotonic time of the last auth rejection
+
+# User-facing wording for why a talk session could not start or ended.
+TALK_ERROR_MESSAGES = {
+    "camera_auth_failed": "The camera rejected its login. Check the camera's username and password; talk is paused for a few minutes to avoid locking the camera.",
+    "camera_auth_cooldown": "Talk is paused for this camera after a recent login failure. Try again in a few minutes.",
+    "camera_unreachable": "The camera's speaker could not be reached. Check that the camera is online.",
+    "camera_talk_unavailable": "The camera did not accept the talk request.",
+    "no_camera_credentials": "This camera has no stored login, so talk cannot connect.",
+    "unknown_camera": "The appliance does not recognise this camera yet.",
+}
+
+
+def is_camera_auth_error(text: str | None) -> bool:
+    """True for an HTTP or RTSP 401/403 status in an error/status string."""
+    text = f" {text or ''} "
+    return any(marker in text for marker in (" 401 ", " 403 ", "HTTP 401", "HTTP 403", " 401\n", " 403\n"))
+
+
+def note_camera_auth_failure(camera_id: str | None) -> None:
+    if camera_id:
+        _camera_auth_failures[camera_id] = time.monotonic()
+
+
+def camera_auth_cooldown_remaining(camera_id: str | None) -> int:
+    """Seconds left before talk may contact this camera again (0 = allowed)."""
+    failed_at = _camera_auth_failures.get(camera_id or "")
+    if failed_at is None:
+        return 0
+    remaining = CAMERA_AUTH_COOLDOWN_SECONDS - (time.monotonic() - failed_at)
+    if remaining <= 0:
+        _camera_auth_failures.pop(camera_id, None)
+        return 0
+    return int(remaining) + 1
+
+
 _appliance_channels: dict[str, WebSocket] = {}  # appliance_id -> its single open control WebSocket
 _active_relays: dict[str, dict] = {}  # session_id -> {"camera_id","appliance_id","customer_id","created_at"}
 
@@ -172,6 +219,62 @@ async def _end_relay(session_id: str, notify_appliance: bool, reason: str) -> No
         )
 
 
+async def _handle_appliance_message(appliance_id: str, raw: str) -> None:
+    try:
+        message = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    session_id = message.get("session_id") if isinstance(message, dict) else None
+    relay = _active_relays.get(session_id) if isinstance(session_id, str) else None
+    if relay is None or relay.get("appliance_id") != appliance_id:
+        return  # never act on another appliance's session
+    kind = message.get("type")
+    if kind == "started":
+        event = relay.get("started_event")
+        if event is not None:
+            event.set()
+    elif kind == "error":
+        reason = message.get("reason") if message.get("reason") in TALK_ERROR_MESSAGES else "camera_talk_unavailable"
+        relay["error_reason"] = reason
+        event = relay.get("started_event")
+        if event is not None:
+            event.set()
+        customer_socket = relay.get("websocket")
+        if customer_socket is not None:
+            await _send_talk_error(customer_socket, reason)
+
+
+async def _announce_when_appliance_ready(session_id: str, websocket: WebSocket) -> None:
+    relay = _active_relays.get(session_id)
+    event = relay.get("started_event") if relay else None
+    if event is None:
+        return
+    try:
+        await asyncio.wait_for(event.wait(), timeout=APPLIANCE_ACK_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+    relay = _active_relays.get(session_id)
+    if relay is None or relay.get("error_reason"):
+        return  # ended, or the error path already told the browser
+    try:
+        await websocket.send_text(json.dumps({"type": "ready"}))
+    except Exception:
+        pass
+
+
+async def _send_talk_error(websocket: WebSocket, reason: str) -> None:
+    """Tells the browser why talk ended (JSON text frame + close reason)."""
+    message = TALK_ERROR_MESSAGES.get(reason, TALK_ERROR_MESSAGES["camera_talk_unavailable"])
+    try:
+        await websocket.send_text(json.dumps({"type": "error", "reason": reason, "message": message}))
+    except Exception:
+        pass
+    try:
+        await websocket.close(code=4502, reason=reason)
+    except Exception:
+        pass
+
+
 async def stop_active_relay_if_any(session_id: str) -> None:
     """2026-09-23 fix: talk_sessions.py's stop_talk_session() (the REST
     "hang up" route -- the shared interface AACO/AAC Voice Call are
@@ -219,6 +322,7 @@ class _LocalIsapiTalkRelay:
         self.error = None
         self.rate_state = None
         self.stopped = False
+        self.error_reason = None  # one of TALK_ERROR_MESSAGES' keys when start() fails
         self._logged_first_frame = False
 
         self.target = self._target()
@@ -300,8 +404,15 @@ class _LocalIsapiTalkRelay:
             self.session_id, self.camera.get("id"), self._start_requested_at,
         )
 
+        # Never contact a camera that just rejected its login (see
+        # CAMERA_AUTH_COOLDOWN_SECONDS) -- fail fast instead.
+        if camera_auth_cooldown_remaining(self.camera.get("id")):
+            self.error = "camera_auth_cooldown"
+            self.error_reason = "camera_auth_cooldown"
+            return False
         if not self.target:
             self.error = "Camera credentials or host unavailable."
+            self.error_reason = "no_camera_credentials"
             logger.warning(
                 "talk_isapi_diagnostic session=%s camera_id=%s event=start_failed reason=%s",
                 self.session_id, self.camera.get("id"), self.error,
@@ -317,6 +428,7 @@ class _LocalIsapiTalkRelay:
 
         if not self.started.wait(timeout=7):
             self.error = self.error or "Timed out opening camera talk channel."
+            self.error_reason = self.error_reason or "camera_unreachable"
             logger.warning(
                 "talk_isapi_diagnostic session=%s camera_id=%s event=start_timeout reason=%s",
                 self.session_id, self.camera.get("id"), self.error,
@@ -366,6 +478,9 @@ class _LocalIsapiTalkRelay:
                 self.session_id, self.camera.get("id"), opened.status_code,
             )
 
+            if opened.status_code in (401, 403):
+                note_camera_auth_failure(self.camera.get("id"))
+                self.error_reason = "camera_auth_failed"
             if opened.status_code < 200 or opened.status_code >= 300:
                 raise RuntimeError(
                     f"camera talk open returned HTTP {opened.status_code}"
@@ -471,6 +586,8 @@ class _LocalIsapiTalkRelay:
 
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"
+            if not getattr(self, "error_reason", None):
+                self.error_reason = "camera_talk_unavailable" if self.target and "HTTP" in self.error else "camera_unreachable"
             exit_reason = f"exception:{type(error).__name__}"
             logger.warning(
                 "local ISAPI talk relay failed camera_id=%s error=%s",
@@ -487,15 +604,21 @@ class _LocalIsapiTalkRelay:
 
         finally:
             close_status = None
-            try:
-                closed = requests.put(
-                    base + "/close",
-                    auth=auth,
-                    timeout=5,
-                )
-                close_status = closed.status_code
-            except Exception as close_error:
-                close_status = f"exception:{type(close_error).__name__}"
+            # A camera that just rejected the login must not get a second
+            # digest attempt from /close -- that doubled the failed logins
+            # per press and is how cameras end up locked out.
+            if self.error_reason == "camera_auth_failed":
+                close_status = "skipped_auth_failed"
+            else:
+                try:
+                    closed = requests.put(
+                        base + "/close",
+                        auth=auth,
+                        timeout=5,
+                    )
+                    close_status = closed.status_code
+                except Exception as close_error:
+                    close_status = f"exception:{type(close_error).__name__}"
             logger.info(
                 "talk_isapi_diagnostic session=%s camera_id=%s event=close_response status=%s "
                 "exit_reason=%s at=%s",
@@ -597,7 +720,12 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
         _appliance_channels[appliance["id"]] = websocket
         try:
             while True:
-                await websocket.receive_text()  # reserved for future ack/error signalling; currently just keeps the loop alive until disconnect
+                raw = await websocket.receive_text()
+                # Talkdown completion pass (2026-09-26): the appliance now
+                # acknowledges each session ("started") or reports why it
+                # could not reach the camera ("error"), so a camera failure
+                # is shown to the customer instead of silently eating audio.
+                await _handle_appliance_message(appliance["id"], raw)
         except WebSocketDisconnect:
             pass
         finally:
@@ -676,7 +804,20 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                     camera["id"],
                     local_relay.error,
                 )
-                await websocket.close(code=4503)
+                reason = getattr(local_relay, "error_reason", None) or "camera_talk_unavailable"
+                message = TALK_ERROR_MESSAGES.get(reason, TALK_ERROR_MESSAGES["camera_talk_unavailable"])
+                try:
+                    await websocket.send_text(json.dumps({"type": "error", "reason": reason, "message": message}))
+                except Exception:
+                    pass
+                await websocket.close(code=4503, reason=reason)
+                # The session row used to stay 'requested' until its expiry
+                # sweep; end it now, recording why (logged + audited).
+                _active_relays[session_id] = {
+                    "camera_id": camera["id"], "appliance_id": camera["appliance_id"],
+                    "customer_id": identity["customer_id"], "created_at": time.monotonic(),
+                }
+                await _end_relay(session_id, notify_appliance=False, reason=reason)
                 return
 
         now = time.monotonic()
@@ -686,8 +827,13 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
             "appliance_id": camera["appliance_id"],
             "customer_id": identity["customer_id"],
             "created_at": now,
+            "websocket": websocket,
+            "started_event": asyncio.Event() if appliance_channel is not None else None,
         }
+        if local_relay is not None:
+            await websocket.send_text(json.dumps({"type": "ready"}))
 
+        ack_task = None
         if appliance_channel is not None:
             try:
                 metadata = json.loads(
@@ -705,6 +851,11 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                     "sample_rate": sample_rate,
                 })
             )
+            # The appliance's confirmation is awaited in the background so
+            # audio keeps flowing (and a quick release still ends the
+            # session immediately); an older appliance never acknowledges,
+            # and after the wait the browser is told the session is live.
+            ack_task = asyncio.create_task(_announce_when_appliance_ready(session_id, websocket))
 
         # 2026-09-23 fix: _end_relay() now records WHY a relay ended (see
         # its own docstring) -- this default covers the loop's two
@@ -758,10 +909,17 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
                     })
                 )
 
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, RuntimeError):
+            # RuntimeError: the socket was already closed server-side (an
+            # appliance "error" closes it via _send_talk_error()).
             end_reason = "customer_disconnected"
 
         finally:
+            if ack_task is not None:
+                ack_task.cancel()
+            relay_now = _active_relays.get(session_id)
+            if relay_now is not None and relay_now.get("error_reason"):
+                end_reason = relay_now["error_reason"]
             if local_relay is not None:
                 await asyncio.to_thread(local_relay.stop)
 

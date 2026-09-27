@@ -317,6 +317,35 @@ function wireTalkMic(button, cameraId) {
   let ws = null, audioCtx = null, mediaStream = null, processor = null, source = null, silentGain = null;
   let sessionId = null;   // the REST-created session this press currently owns, if any
   let wsOpened = false;   // true only once this session's WebSocket has actually finished connecting
+  // Talkdown completion pass (2026-09-26): every way talk can fail now
+  // tells the user why -- previously a refused /talk/start (no
+  // permission, camera without two-way audio), an unreachable camera or
+  // a rejected camera login all just left the button doing nothing.
+  function talkToast(message) {
+    try { if (typeof showToast === 'function') showToast(message); } catch (e) {}
+  }
+  async function startFailureMessage(response) {
+    let detail = '';
+    try {
+      const data = await response.json();
+      detail = data && (data.detail || data.message);
+    } catch (e) {}
+    if (typeof detail === 'string' && detail) return detail;
+    if (response.status === 403) return 'You do not have permission to talk on this camera.';
+    if (response.status === 404) return 'Camera not found.';
+    if (response.status === 409) return 'This camera does not support two-way audio.';
+    if (response.status === 429) return 'Too many talk requests. Please wait a moment and try again.';
+    return 'Talk could not start. Please try again.';
+  }
+  function microphoneFailureMessage(error) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return 'Microphone is unavailable here. Talk needs a secure (HTTPS) connection or localhost.';
+    }
+    const name = error && error.name;
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') return 'No microphone was found on this device.';
+    if (name === 'NotReadableError') return 'The microphone is in use by another application.';
+    return 'Microphone permission denied or unavailable.';
+  }
 
   function cleanupOrphanSession(sid) {
     // Best-effort: releases a REST-created talk session that will never
@@ -358,6 +387,7 @@ function wireTalkMic(button, cameraId) {
     held = false;
     pressId++;   // invalidates any in-flight start() still awaiting something for the press that just ended
     button.classList.remove('active');
+    button.classList.remove('live');
     const sid = sessionId;
     const openedBeforeStop = wsOpened;
     sessionId = null;
@@ -405,10 +435,12 @@ function wireTalkMic(button, cameraId) {
       response = await fetch(`/api/customer/cameras/${cameraId}/talk/start`, { method: 'POST' });
     } catch (e) {
       if (myPress === pressId) held = false;
+      talkToast('Talk could not start: the server could not be reached.');
       return;
     }
     if (!response.ok) {
       if (myPress === pressId) held = false;
+      talkToast(await startFailureMessage(response));
       return;
     }
     const body = await response.json();
@@ -432,7 +464,7 @@ function wireTalkMic(button, cameraId) {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
       if (myPress === pressId) { held = false; sessionId = null; }
-      showToast('Microphone permission denied or unavailable.');
+      talkToast(microphoneFailureMessage(e));
       cleanupOrphanSession(sid);
       return;
     }
@@ -465,7 +497,29 @@ function wireTalkMic(button, cameraId) {
       wsOpened = true;
       button.classList.add('active');
     };
-    socket.onclose = () => { if (myPress === pressId) stop(); };
+    // The server says {"type":"ready"} once the camera's speaker is
+    // actually connected ('live' class), or {"type":"error"} with the
+    // reason when it could not be (then closes with a 45xx code).
+    let serverErrorShown = false;
+    socket.onmessage = (event) => {
+      if (myPress !== pressId || typeof event.data !== 'string') return;
+      let message;
+      try { message = JSON.parse(event.data); } catch (e) { return; }
+      if (message && message.type === 'ready') {
+        button.classList.add('live');
+      } else if (message && message.type === 'error') {
+        serverErrorShown = true;
+        talkToast(message.message || 'Talk ended: the camera could not be reached.');
+      }
+    };
+    socket.onclose = (event) => {
+      if (myPress !== pressId) return;
+      const code = event && event.code;
+      if (!serverErrorShown && code >= 4000) {
+        talkToast(code === 4401 || code === 4403 ? 'Talk session is no longer authorized.' : code === 4409 ? 'This camera does not support two-way audio.' : 'Talk ended: the camera could not be reached.');
+      }
+      stop();
+    };
     socket.onerror = () => { if (myPress === pressId) stop(); };
     ws = socket;
 
@@ -909,6 +963,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             # preventDefault()/stopPropagation()/setPointerCapture()).
             f'.talk-mic{{touch-action:none}}'
             f'.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}'
+            f'.talk-mic.active.live{{box-shadow:0 0 0 3px rgba(66,228,220,.45)}}'
             f'.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}'
             f'.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
             # Brief, purely visual pulse on the tile AACO just switched
@@ -1448,7 +1503,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
+            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic.active.live{{box-shadow:0 0 0 3px rgba(66,228,220,.45)}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
             # Camera Hub mobile polish: on a narrow phone screen this
             # row's ~10 tool buttons no longer force horizontal
             # scrolling -- they wrap onto additional lines instead,
