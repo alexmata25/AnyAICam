@@ -45,7 +45,7 @@ Until Phase D, Samsung keeps working **locally** on the new release: VMS, analyt
 ## 2. Artifact locations
 
 - **Dell:** `C:\Users\Alejandro Mata\OneDrive\Desktop\AnyAiCam-VMS-reconciliation\dist\samsung-step3\` holds both tarballs.
-- **Thumbdrive:** `E:\samsung-step3\` holds both tarballs, plus everything in `deploy/samsung-step3/`.
+- **Thumbdrive: not copied yet.** The drive was removed during the overnight work. Copy the whole Dell folder above (both tarballs, the kit files and `SHA256SUMS`) to the thumbdrive as `samsung-step3\`, then run `sha256sum -c SHA256SUMS` in that folder on the Samsung.
 - **Repo:** `deploy/samsung-step3/` on the authoritative branch holds this handoff, `docker-compose.samsung.yml`, `step3-verify-artifacts.sh`, `step3-vms-env.sh`, `step3-smoke.sh` and `RELEASE_MANIFEST.json`.
 - **Private S3 backup copy:** `s3://anyaicam2026/releases/samsung-step3/`. The bucket blocks all public access.
 
@@ -159,7 +159,7 @@ Rules while doing this:
 - Run each block, check its output, and stop on any FAIL.
 - Never print secrets, RTSP URLs or credential values.
 - Do not touch the QIXIANG, any camera, or the Ryzen.
-- `ART=/home/alejandro-mata/samsung-step3`: copy `E:\samsung-step3\*` from the thumbdrive there.
+- `ART=/home/alejandro-mata/samsung-step3`: copy the `samsung-step3` folder from the thumbdrive there, and check it with `sha256sum -c SHA256SUMS`.
 
 ### Phase A: preflight, artifacts and a fresh backup (0.9.0 keeps running)
 ```bash
