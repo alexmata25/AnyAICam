@@ -41941,6 +41941,17 @@ PUBLIC_PATH_PREFIXES = (
 
 
 
+def _partner_must_change_password(identity: dict) -> bool:
+    try:
+        from partner_db import connection as _pw_connection
+
+        with _pw_connection() as db:
+            record = db.execute("SELECT must_change_password FROM partner_users WHERE lower(email)=?", (str(identity.get("email") or "").lower(),)).fetchone()
+        return bool(record and record["must_change_password"])
+    except Exception:
+        return False
+
+
 @app.middleware("http")
 
 
@@ -42038,6 +42049,14 @@ async def authentication_middleware(request: Request, call_next):
 
     if portal_identity:
         request.state.partner_identity = portal_identity
+        # Partner portal pass (2026-09-26): an invited account signing in with
+        # its temporary password (must_change_password) went straight into
+        # the portal and could keep using the emailed/relayed password
+        # indefinitely. Until it sets its own, page navigations go to
+        # /change-password (APIs it needs to do that, and logout, stay open).
+        if request.method == "GET" and not path.startswith(("/api/", "/static/")) and path not in {"/change-password", "/partner-logout", "/logout"}:
+            if _partner_must_change_password(portal_identity):
+                return RedirectResponse("/change-password", status_code=303)
         return await call_next(request)
 
 
@@ -42180,6 +42199,11 @@ PARTNER_PORTAL_ROLES = {"partner_admin", "partner_sales", "installer"}
 
 
 CUSTOMER_PORTAL_ROLES = {"customer_owner", "customer_viewer"}
+
+
+# The Partner Portal's own account roles (partner_db), distinct from the legacy
+# users.json PARTNER_PORTAL_ROLES above.
+PARTNER_DB_ROLES = {"partner_owner", "salesperson", "technician"}
 
 
 
@@ -45719,8 +45743,11 @@ def portal_login_submit(request: Request, payload: dict):
 
     from partner_portal import establish_partner_session
 
+    # Same rule as POST /api/partner-login: an account still on its temporary
+    # (invited / partner-issued) password must choose its own first.
+    destination = "/change-password" if partner_user and partner_user.get("must_change_password") else decision["destination"]
     return establish_partner_session(
-        decision["destination"], request=request, email=email, role=decision["role"], user=partner_user,
+        destination, request=request, email=email, role=decision["role"], user=partner_user,
         authorization_version_at_login=partner_authorization_version,
     )
 
@@ -47373,33 +47400,16 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
     if role == "installer":
-
-
-
-
-
-
-
-
         return {
-
-
-
-
-
-
-
-
             "partner-install", "media", "help",
-
-
-
-
-
-
-
-
         }
+    # Partner portal pass (2026-09-26): the Partner Portal's own roles
+    # (partner_db partner_owner / salesperson / technician) fell through to
+    # the legacy permission map below. Their portal is /partner (tabs,
+    # price sheet, quote builder, revenue); technicians also work from the
+    # appliance dashboard.
+    if role in PARTNER_DB_ROLES:
+        return {"partner", "appliances", "help"} if role == "technician" else {"partner", "help"}
 
 
 
@@ -48043,15 +48053,14 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
+    elif shell_role in PARTNER_DB_ROLES:
+        mobile_items = [("partner", "/partner", "Partner portal")]
+        if shell_role == "technician":
+            mobile_items.append(("appliances", "/partner/appliance-dashboard", "Appliances"))
+        if shell_role != "technician":
+            mobile_items.append(("partner-quotes", "/partner-quotes", "Quotes"))
+        mobile_items.append(("help", "/help", "Help"))
     elif shell_role in CUSTOMER_PORTAL_ROLES:
-
-
-
-
-
-
-
-
         mobile_items = [
             ("live", "/customer-live", "Cameras"),
             ("alerts", "/alerts", "Alerts"),
@@ -48216,7 +48225,9 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
 
-    content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
+    # Partner roles see no platform licensing (they cannot open /license-management).
+    if shell_role not in PARTNER_DB_ROLES:
+        content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
 
     # 2026-09-19: the persistent floating AACO assistant is injected
     # HERE, once, in the one shared shell every normal customer page
@@ -55221,15 +55232,8 @@ def partner_customers_api(request: Request) -> dict:
 
 
     require_partner_access(request)
-
-
-
-
-
-
-
-
-    return {"customers": load_partner_customers()}
+    visible = partner_record_scope(request)
+    return {"customers": [item for item in load_partner_customers() if visible(item.get("partner_id"))]}
 
 
 
@@ -55328,7 +55332,7 @@ def create_partner_customer(request: Request, customer: PartnerCustomerModel) ->
 
 
 
-    customers.append(customer.model_dump(mode="json"))
+    customers.append({**customer.model_dump(mode="json"), "partner_id": partner_record_owner(request)})
 
 
 
@@ -132744,25 +132748,101 @@ def help_page() -> str:
 
 
 
+# Partner portal pass (2026-09-26): one tenant rule for every partner list
+# and record below. The older partner pages/APIs (sales, installations,
+# performance, quote detail, legacy customer + installation APIs) read
+# JSON stores with no ownership filter, so any partner saw -- and could
+# edit -- every other partner's quotes, installations and customers.
+# Global administrators see everything; a partner sees only records
+# stamped with its own partner_id; an unowned record is visible to
+# global administrators only (fail closed, like authorize_customer_tenant).
+def partner_permission_denied(request: Request, permission: str, title: str, active: str) -> Response | None:
+    """Partner portal pass (2026-09-26): the older partner pages only checked
+    "is a partner", so a technician (no quote/pricing permission) could open
+    the sales pipeline and commission pages. Same partner_db.allowed() rule
+    the newer partner routes use; legacy (non-partner-session) accounts keep
+    their existing behaviour."""
+    from partner_db import allowed
+    from partner_portal import partner_identity
+
+    identity = partner_identity(request)
+    if identity is not None and not allowed(identity, permission):
+        return HTMLResponse(permission_denied_page(title, active, permission), status_code=403)
+    return None
+
+
+def partner_record_scope(request: Request):
+    from appliance_identity import has_global_administrator_grant
+    from partner_db import connection as _scope_connection
+    from partner_portal import partner_identity
+
+    identity = partner_identity(request)
+    if identity is None:
+        user = current_user(request)
+        if has_permission(user, "manage_settings"):
+            return lambda partner_id: True
+        identity = {"email": "", "partner_id": None}
+    with _scope_connection() as db:
+        if identity.get("email") and has_global_administrator_grant(db, email=identity["email"]):
+            return lambda partner_id: True
+    own = identity.get("partner_id") or "anyaicam-primary"
+    return lambda partner_id: bool(partner_id) and partner_id == own
+
+
+def partner_record_owner(request: Request) -> str:
+    from partner_portal import partner_identity
+
+    identity = partner_identity(request) or {}
+    return identity.get("partner_id") or "anyaicam-primary"
+
+
+def scoped_partner_customers(request: Request) -> list[dict]:
+    """Real (SQL) customers plus legacy JSON customers, both tenant-scoped."""
+    from partner_db import rows as _partner_rows
+
+    visible = partner_record_scope(request)
+    customers = [
+        {"id": row["id"], "name": row.get("name") or "", "company": row.get("company") or "",
+         "email": row.get("email") or "", "status": row.get("status") or "active",
+         "partner_id": row.get("partner_id"), "site_name": ""}
+        for row in _partner_rows("SELECT id,name,company,email,status,partner_id FROM customers ORDER BY created_at DESC")
+        if visible(row.get("partner_id"))
+    ]
+    known = {item["id"] for item in customers}
+    customers += [item for item in load_partner_customers() if item.get("id") not in known and visible(item.get("partner_id"))]
+    return customers
+
+
+def scoped_partner_quotes(request: Request) -> list[dict]:
+    visible = partner_record_scope(request)
+    return [item for item in load_partner_quotes() if visible(item.get("partner_id"))]
+
+
+def partner_installation_owner(record: dict) -> str | None:
+    if record.get("partner_id"):
+        return record["partner_id"]
+    from partner_db import rows as _partner_rows
+
+    found = _partner_rows("SELECT partner_id FROM customers WHERE id=?", (str(record.get("customer_id") or ""),))
+    if found:
+        return found[0].get("partner_id")
+    legacy = next((item for item in load_partner_customers() if item.get("id") == record.get("customer_id")), {})
+    return legacy.get("partner_id")
+
+
+def scoped_partner_installations(request: Request) -> list[dict]:
+    visible = partner_record_scope(request)
+    return [item for item in load_partner_installations() if visible(partner_installation_owner(item))]
+
+
 def load_partner_quotes() -> list[dict]:
-
-
-
-
-
-
-
-
+    # PARTNER_QUOTES_FILE is shared with partner_portal.py's quote calculator,
+    # which saves a different record shape (no quote_name). Only builder
+    # quotes are returned here, and save_partner_quotes() keeps the
+    # calculator's records instead of overwriting them (partner portal
+    # pass 2026-09-26; the list-store fix made both sides see each other).
     quotes = load_json_file(PARTNER_QUOTES_FILE, [])
-
-
-
-
-
-
-
-
-    return quotes if isinstance(quotes, list) else []
+    return [item for item in quotes if isinstance(item, dict) and "quote_name" in item] if isinstance(quotes, list) else []
 
 
 
@@ -132790,15 +132870,9 @@ def load_partner_quotes() -> list[dict]:
 
 
 def save_partner_quotes(quotes: list[dict]) -> None:
-
-
-
-
-
-
-
-
-    save_json_file(PARTNER_QUOTES_FILE, quotes[-5000:])
+    stored = load_json_file(PARTNER_QUOTES_FILE, [])
+    calculator = [item for item in stored if isinstance(item, dict) and "quote_name" not in item]
+    save_json_file(PARTNER_QUOTES_FILE, calculator[-5000:] + quotes[-5000:])
 
 
 
@@ -133303,6 +133377,9 @@ def partner_sales_command_center(request: Request) -> Response:
 
 
         return authorization_response
+    denied = partner_permission_denied(request, "quote.create", "Partner sales", "partner-sales")
+    if denied is not None:
+        return denied
 
 
 
@@ -133311,7 +133388,7 @@ def partner_sales_command_center(request: Request) -> Response:
 
 
 
-    customers = load_partner_customers()
+    customers = scoped_partner_customers(request)
 
 
 
@@ -134841,7 +134918,8 @@ def update_partner_customer(
 
 
 
-    existing = next((item for item in customers if item.get("id") == customer_id), None)
+    visible = partner_record_scope(request)
+    existing = next((item for item in customers if item.get("id") == customer_id and visible(item.get("partner_id"))), None)
 
 
 
@@ -137301,7 +137379,7 @@ def partner_customer_quote_page(quote_id: str, request: Request) -> Response:
 
 
 
-    quote_item = next((item for item in load_partner_quotes() if item.get("id") == quote_id), None)
+    quote_item = next((item for item in scoped_partner_quotes(request) if item.get("id") == quote_id), None)
 
 
 
@@ -137328,7 +137406,7 @@ def partner_customer_quote_page(quote_id: str, request: Request) -> Response:
 
 
 
-    customer = next((item for item in load_partner_customers() if item.get("id") == quote_item.get("customer_id")), {})
+    customer = next((item for item in scoped_partner_customers(request) if item.get("id") == quote_item.get("customer_id")), {})
 
 
 
@@ -137512,6 +137590,9 @@ def create_partner_quote(request: Request, payload: PartnerQuoteCreateModel) -> 
     from partner_db import authorize_customer_tenant, connection
 
     identity = require_partner_access(request)
+    from partner_db import allowed as _quote_allowed
+    if not _quote_allowed(identity, "quote.create"):
+        raise HTTPException(status_code=403, detail="Quote permission required.")
     with connection() as db:
         if not authorize_customer_tenant(db, identity, payload.customer_id):
             return {"status": "error", "message": "Partner customer not found."}
@@ -137674,7 +137755,10 @@ def update_partner_quote(quote_id: str, request: Request, payload: PartnerQuoteU
 
 
 
-    require_partner_access(request)
+    identity = require_partner_access(request)
+    from partner_db import allowed as _quote_allowed
+    if not _quote_allowed(identity, "quote.create"):
+        raise HTTPException(status_code=403, detail="Quote permission required.")
 
 
 
@@ -137692,7 +137776,8 @@ def update_partner_quote(quote_id: str, request: Request, payload: PartnerQuoteU
 
 
 
-    quote_item = next((item for item in quotes if item.get("id") == quote_id), None)
+    visible = partner_record_scope(request)
+    quote_item = next((item for item in quotes if item.get("id") == quote_id and visible(item.get("partner_id"))), None)
 
 
 
@@ -137881,7 +137966,7 @@ def partner_installations_page(request: Request) -> Response:
 
 
 
-    customers = load_partner_customers()
+    customers = scoped_partner_customers(request)
 
 
 
@@ -137890,7 +137975,7 @@ def partner_installations_page(request: Request) -> Response:
 
 
 
-    quotes = load_partner_quotes()
+    quotes = scoped_partner_quotes(request)
 
 
 
@@ -137899,7 +137984,7 @@ def partner_installations_page(request: Request) -> Response:
 
 
 
-    installations = load_partner_installations()
+    installations = scoped_partner_installations(request)
 
 
 
@@ -139618,15 +139703,11 @@ def create_partner_installation(request: Request, payload: PartnerInstallationCr
 
 
 
-    if not any(item.get("id") == payload.customer_id for item in load_partner_customers()):
-
-
-
-
-
-
-
-
+    # Validated against the real customer records within the caller's
+    # tenant (the legacy JSON list alone never held real customers, so
+    # this always failed), and stamped with the owning partner.
+    owner = next((item.get("partner_id") for item in scoped_partner_customers(request) if item.get("id") == payload.customer_id), None)
+    if owner is None:
         return {"status": "error", "message": "Partner customer not found."}
 
 
@@ -139655,14 +139736,7 @@ def create_partner_installation(request: Request, payload: PartnerInstallationCr
 
 
         **payload.model_dump(),
-
-
-
-
-
-
-
-
+        "partner_id": owner,
         "created_at": datetime.now().isoformat(),
 
 
@@ -139825,7 +139899,8 @@ def update_partner_installation(
 
 
 
-    record = next((item for item in records if item.get("id") == installation_id), None)
+    visible = partner_record_scope(request)
+    record = next((item for item in records if item.get("id") == installation_id and visible(partner_installation_owner(item))), None)
 
 
 
@@ -139988,6 +140063,9 @@ def partner_performance_center(request: Request) -> Response:
 
 
         return authorization_response
+    denied = partner_permission_denied(request, "quote.create", "Partner performance", "partner-performance")
+    if denied is not None:
+        return denied
 
 
 
@@ -140005,7 +140083,7 @@ def partner_performance_center(request: Request) -> Response:
 
 
 
-    customers = load_partner_customers()
+    customers = scoped_partner_customers(request)
 
 
 
@@ -140014,7 +140092,7 @@ def partner_performance_center(request: Request) -> Response:
 
 
 
-    quotes = load_partner_quotes()
+    quotes = scoped_partner_quotes(request)
 
 
 
@@ -140023,7 +140101,7 @@ def partner_performance_center(request: Request) -> Response:
 
 
 
-    installations = load_partner_installations()
+    installations = scoped_partner_installations(request)
 
 
 
