@@ -21,6 +21,11 @@ def _clean(value,limit=500): return str(value or '').strip()[:limit]
 
 LOGIN_PAGE_HEADERS={'Cache-Control':'no-cache'}
 
+# Public partner applications (see PUBLIC_PATH_PREFIXES in main.py): bounded
+# per client address, same limiter the public password-reset request uses.
+from appliance_protocol import RateLimiter
+_application_ip_limiter=RateLimiter(limit=10,window_seconds=3600)
+
 
 def _portal_destination(login_url,path):
     portal=urlsplit(login_url); destination=urlsplit(path)
@@ -97,6 +102,7 @@ def register_website_partner_routes(app: FastAPI,shell) -> None:
 
     @app.post('/api/partner-applications',status_code=201)
     def submit_application(payload: dict,request: Request):
+        if not _application_ip_limiter.allow(request.client.host if request.client else 'unknown'): raise HTTPException(status_code=429,detail='Too many applications from this address. Please try again later.')
         required={field:_clean(payload.get(field),200) for field in ('company_name','contact_name','email','phone','service_area','company_type')}
         if any(not value for value in required.values()): raise HTTPException(status_code=400,detail='Complete all required company and contact fields.')
         if '@' not in required['email']: raise HTTPException(status_code=400,detail='Enter a valid email address.')
