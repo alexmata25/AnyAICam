@@ -4088,3 +4088,18 @@ Staging `2ccbe34` (code == golden `f44e753`), Ryzen `f44e753`. Next: review/merg
 ### State to resume from
 
 Staging `f5a6d87`, Ryzen `f5a6d87`, Samsung legacy 0.9.0 executing Step 3 Phase A. Next: (1) Samsung Phase B/C, then Phase D after the customer/site decision; (2) deploy `cde9d32` to staging (gated cutover) so the Front Door AACO physical test can run; (3) Talkdown physical test once the correct page URL is confirmed (Ryzen: `http://localhost:8000`, Bedroom camera).
+
+## Milestone: Samsung Step 3 Phases A-D COMPLETE -- 2026-09-27
+
+Samsung executed the Step 3 kit (`deploy/samsung-step3/`, image `anyaicam-vms:f5a6d87` = `sha256:d5cd5fc2...054b`, no source bind mount) Phases A-D; Phase D claimed it into staging via the device claim flow (`PHASE_D_ENROLLMENT_PATH.md`).
+
+**Cloud verification (read-only, staging, 2026-09-27T17:51Z) -- PASS:**
+- Exactly **one** appliance for cloud ID `66AA5864-B13E-4E8C-AE45-5C71EC3E2FCA`: `9cf63b90855f415be3b1fac56a3cacf7`, created 16:00:16Z, customer `d75bdbecdd4887de4d2b89a9fcea9092` (owner anyaicamtest@gmail.com), site `f67fa371cd` "Primary site"; one credential (`created_by='claim'`, not revoked, used 17:51:51Z); **online** (`last_check_in` 17:51:10Z, ~41 s before the check); 0 cameras.
+- The Ryzen (`2f941627b4`, AIC-C814766E) remains a separate appliance under the same customer/site; its 8 camera rows (Living Room 1, Driveway Right 2, Driveway Left 3, Bedroom 4, Front Door 5, Cameras 6-8 pending) are unchanged.
+- Claim `3c9c77f8...` (device `66aa5864-...`) is `completed`, linked to the appliance; claim code **AE30138C** verified against its stored hash; proof plaintext/ciphertext cleared. Audit: `appliance_claim.confirmed` by anyaicamtest@gmail.com 16:00:13Z, `appliance_claim.completed` by the appliance 16:00:16Z, then provisioning polls about every 62 s.
+- No stray records: it is the only appliance and the only claim created on 2026-09-27; nothing was created around 15:54Z (the claim session opened at 15:56:56Z). The only non-terminal claims are two pre-existing, long-expired `pending` rows from 2026-09-11/12 for other devices (`0da1c986-...`, `637ad320-...`).
+- Observations, not failures (left as-is): claim-created records keep `activation_status='pending'` and `appliance_type`/`camera_capacity` unset (the claim insert sets only customer/site/cloud ID; activation-flow records say `activated`) -- worth aligning in code later; the agent writes one `camera.provisioning_jobs_delivered` audit row per minute (about 1,440/day per appliance).
+
+### State to resume from
+
+Samsung: f5a6d87 self-contained, claimed into staging (`9cf63b90...`), online, 0 cameras -- Step 3 complete. Staging: cutover to `06816d5` in progress/validation. Ryzen: `f5a6d87`.
