@@ -441,6 +441,86 @@ test("internal stop() calls with no event at all (ws.onclose, pagehide) never th
   assert(!button.classList.contains("active"), "stop() with no event must still clear the active state");
 });
 
+// ------------------------------------------ Talkdown completion pass (2026-09-26): failures are shown
+
+async function openedSocket(sid) {
+  resetAll();
+  triggerListener(button, "pointerdown");
+  fetchCalls[0].deferred.resolve(fakeStartResponse(sid));
+  await flush();
+  gumCalls[0].resolve(makeMediaStream());
+  await flush();
+  const ws = FakeWebSocket.instances[0];
+  ws.triggerOpen();
+  return ws;
+}
+
+test("refused /talk/start shows the server's reason and resets", async () => {
+  resetAll();
+  triggerListener(button, "pointerdown");
+  fetchCalls[0].deferred.resolve({ ok: false, status: 409, json: () => Promise.resolve({ detail: "Talk-down is not supported on this camera." }) });
+  await flush();
+  assert(toastMessages.length === 1 && toastMessages[0] === "Talk-down is not supported on this camera.", `unexpected toasts: ${JSON.stringify(toastMessages)}`);
+  assert(FakeWebSocket.instances.length === 0, "no socket after a refused start");
+  triggerListener(button, "pointerdown");
+  assert(fetchCallsMatching("/talk/start").length === 2, "the next press must be able to start again");
+});
+
+test("refused /talk/start without a JSON body falls back to a status message", async () => {
+  resetAll();
+  triggerListener(button, "pointerdown");
+  fetchCalls[0].deferred.resolve({ ok: false, status: 403, json: () => Promise.reject(new Error("not json")) });
+  await flush();
+  assert(toastMessages.length === 1 && /permission/i.test(toastMessages[0]), `unexpected toasts: ${JSON.stringify(toastMessages)}`);
+});
+
+test("network failure on /talk/start is shown", async () => {
+  resetAll();
+  triggerListener(button, "pointerdown");
+  fetchCalls[0].deferred.reject(new TypeError("Failed to fetch"));
+  await flush();
+  assert(toastMessages.length === 1, "expected one toast for an unreachable server");
+});
+
+test("server 'ready' marks the button live; release clears it", async () => {
+  const ws = await openedSocket("sess-ready");
+  ws.onmessage({ data: JSON.stringify({ type: "ready" }) });
+  assert(button.classList.contains("live"), "ready must add the live class");
+  triggerListener(button, "pointerup");
+  assert(!button.classList.contains("live") && !button.classList.contains("active"), "release clears live/active");
+  assert(toastMessages.length === 0, "a clean session shows no toast");
+});
+
+test("server 'error' is shown once, even though the close follows", async () => {
+  const ws = await openedSocket("sess-err");
+  ws.onmessage({ data: JSON.stringify({ type: "error", reason: "camera_auth_failed", message: "The camera rejected its login." }) });
+  ws.onclose({ code: 4502 });
+  assert(toastMessages.length === 1 && toastMessages[0] === "The camera rejected its login.", `unexpected toasts: ${JSON.stringify(toastMessages)}`);
+  assert(!button.classList.contains("active"), "the session is torn down");
+});
+
+test("abnormal close without an error message still tells the user", async () => {
+  const ws = await openedSocket("sess-close");
+  ws.onclose({ code: 4503 });
+  assert(toastMessages.length === 1, "expected a toast for a 45xx close");
+});
+
+test("normal close (user released / server stop) shows nothing", async () => {
+  const ws = await openedSocket("sess-normal-close");
+  ws.onclose({ code: 1000 });
+  assert(toastMessages.length === 0, "no toast for a normal close");
+});
+
+test("insecure context (no mediaDevices) explains why the mic is unavailable", async () => {
+  resetAll();
+  setGlobal("navigator", {});
+  triggerListener(button, "pointerdown");
+  fetchCalls[0].deferred.resolve(fakeStartResponse("sess-insecure"));
+  await flush();
+  assert(toastMessages.length === 1 && /HTTPS|localhost/.test(toastMessages[0]), `unexpected toasts: ${JSON.stringify(toastMessages)}`);
+  assert(fetchCallsMatching("/talk/sessions/sess-insecure/stop").length === 1, "the session is released");
+});
+
 // ---------------------------------------------------------------- runner
 
 const failures = [];
