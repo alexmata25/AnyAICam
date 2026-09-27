@@ -15,7 +15,7 @@ class InAppChannel(NotificationChannel):
 
 class EmailChannel(NotificationChannel):
     def send(self,notification,recipient):
-        message=get_email_service().send('appliance_alert',recipient,notification['title'],notification.get('message') or notification['title'],metadata={'notification_id':notification['id']}); return {'channel':'email','status':message['status'],'provider':'configured_email'}
+        message=get_email_service().send('appliance_alert',recipient,notification['title'],notification.get('message') or notification['title'],metadata={'notification_id':notification['id']}); return {'channel':'email','status':message['status'],'provider':'configured_email','error':message.get('error')}
 
 
 class WebPushPreparation(NotificationChannel):
