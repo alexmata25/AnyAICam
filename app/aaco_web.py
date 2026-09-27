@@ -56,6 +56,86 @@ return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',header
 .then(function(result){if(result.ok){onSuccess(result.body)}else{onError(result.body||{detail:'AACO could not complete that command.'})}})
 .catch(function(){onError({detail:'AACO could not reach the authorized VMS service.'})})
 };
+// Voice input, shared by every AACO box (the floating panel and the /aaco
+// workspace), 2026-09-27. Tap to start listening, tap again (or a final
+// result) to stop. Recognized speech is never sent to AACO directly by
+// this code -- it is written into the same <input> a typed command uses,
+// then submitted through that form's own submit listener via
+// form.requestSubmit(), never a parallel call to window.aacoSubmitCommand.
+// Each recognition session carries a generation number: a late
+// onend/onerror/onresult from a session that a newer one has replaced
+// (tap stop, then quickly tap start again) is ignored instead of
+// stopping the new session.
+window.aacoAttachVoice=function(form,input,status,micButton){
+var SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition;
+if(micButton&&SpeechRecognitionCtor){
+micButton.disabled=false;
+micButton.title='Press to speak a command';
+micButton.setAttribute('aria-label','Press to speak a command');
+var recognition=null,listening=false,generation=0;
+function stopListening(){
+listening=false;
+micButton.classList.remove('aaco-mic-listening');
+micButton.setAttribute('aria-pressed','false');
+if(recognition){try{recognition.stop()}catch(e){}}
+}
+function deniedMessage(){
+if(window.isSecureContext===false){return 'The microphone needs a secure page: open the VMS over HTTPS or at http://localhost. Type your command instead.'}
+return 'Microphone permission was denied. Type your command instead.';
+}
+// isRetry=true marks the one automatic re-attempt after a first
+// no-speech error (some browsers end a session almost immediately when
+// the first moment is silent). The retry is a new generation, so the
+// first session's own onend can no longer drop the "listening" state.
+function attemptRecognition(isRetry){
+var session,mine=++generation;
+try{session=new SpeechRecognitionCtor()}catch(e){stopListening();status.textContent='Voice input is unavailable right now. Type your command instead.';return}
+recognition=session;
+recognition.lang=navigator.language||'en-US';
+recognition.interimResults=true;
+recognition.maxAlternatives=1;
+session.onresult=function(event){
+if(mine!==generation)return;
+var result=event.results&&event.results[event.results.length-1];
+var alt=result&&result[0];
+var transcript=alt&&alt.transcript;
+if(!transcript)return;
+if(!result.isFinal){status.textContent='Hearing: “'+transcript+'”…';return}
+stopListening();
+input.value=transcript;
+status.textContent='Heard: “'+transcript+'” — sending to AACO…';
+if(typeof form.requestSubmit==='function'){form.requestSubmit()}else{form.dispatchEvent(new Event('submit',{cancelable:true}))}
+};
+session.onerror=function(event){
+if(mine!==generation)return;
+if(event.error==='no-speech'&&!isRetry){
+status.textContent='Still listening — go ahead and speak your command.';
+attemptRecognition(true);
+return;
+}
+stopListening();
+if(event.error==='not-allowed'||event.error==='permission-denied'){status.textContent=deniedMessage()}
+else if(event.error==='service-not-allowed'){status.textContent='Speech recognition is blocked in this browser. Type your command instead.'}
+else if(event.error==='audio-capture'){status.textContent='No microphone was found. Connect one, or type your command instead.'}
+else if(event.error==='network'){status.textContent='Speech recognition needs an internet connection in this browser. Type your command instead.'}
+else if(event.error==='no-speech'){status.textContent='No audio detected. Check that your microphone is unmuted and the correct input device is selected.'}
+else if(event.error==='aborted'){status.textContent='Stopped listening.'}
+else{status.textContent='Voice input is unavailable right now. Type your command instead.'}
+};
+session.onend=function(){if(mine===generation)stopListening()};
+try{session.start()}catch(e){if(mine===generation){stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
+}
+micButton.addEventListener('click',function(){
+if(listening){stopListening();return}
+listening=true;
+micButton.classList.add('aaco-mic-listening');
+micButton.setAttribute('aria-pressed','true');
+status.textContent='Listening…';
+attemptRecognition(false);
+});
+window.addEventListener('pagehide',function(){if(listening)stopListening()});
+}
+};
 """
 # The one place any page ever calls POST /api/aaco/command from the
 # browser. Both the standalone /aaco workspace (_workspace() below)
@@ -170,72 +250,7 @@ input.focus();
 status.textContent=error.detail||'AACO could not complete that command.';
 }});
 }});
-// Voice input: tap to start listening, tap again (or a final
-// result) to stop. Recognized speech is never sent to AACO directly
-// by this code -- it is written into the same <input> a typed
-// command uses, then submitted through the exact same submit
-// listener above via form.requestSubmit(), never a parallel call to
-// window.aacoSubmitCommand of its own.
-var SpeechRecognitionCtor=window.SpeechRecognition||window.webkitSpeechRecognition;
-if(micButton&&SpeechRecognitionCtor){{
-micButton.disabled=false;
-micButton.title='Press to speak a command';
-micButton.setAttribute('aria-label','Press to speak a command');
-var recognition=null,listening=false;
-function stopListening(){{
-listening=false;
-micButton.classList.remove('aaco-mic-listening');
-micButton.setAttribute('aria-pressed','false');
-if(recognition){{try{{recognition.stop()}}catch(e){{}}}}
-}}
-// isRetry=true marks the one automatic re-attempt after a first
-// no-speech error -- see the function docstring above for why this
-// exists. A retry's own onend must NOT drop the visual "listening"
-// state (the retrying flag suppresses that single onend), otherwise
-// the mic would flicker to idle for an instant between the two
-// attempts even though a fresh recognition session starts
-// immediately after.
-function attemptRecognition(isRetry){{
-var retrying=false;
-try{{recognition=new SpeechRecognitionCtor()}}catch(e){{stopListening();status.textContent='Voice input is unavailable right now. Type your command instead.';return}}
-recognition.lang=navigator.language||'en-US';
-recognition.interimResults=true;
-recognition.maxAlternatives=1;
-recognition.onresult=function(event){{
-var result=event.results&&event.results[event.results.length-1];
-var alt=result&&result[0];
-var transcript=alt&&alt.transcript;
-if(!transcript)return;
-if(!result.isFinal){{status.textContent='Hearing: “'+transcript+'”…';return}}
-stopListening();
-input.value=transcript;
-status.textContent='Heard: “'+transcript+'” — sending to AACO…';
-if(typeof form.requestSubmit==='function'){{form.requestSubmit()}}else{{form.dispatchEvent(new Event('submit',{{cancelable:true}}))}}
-}};
-recognition.onerror=function(event){{
-if(event.error==='no-speech'&&!isRetry){{
-retrying=true;
-status.textContent='Still listening — go ahead and speak your command.';
-attemptRecognition(true);
-return;
-}}
-stopListening();
-if(event.error==='not-allowed'||event.error==='permission-denied'){{status.textContent='Microphone permission was denied. Type your command instead.'}}
-else if(event.error==='no-speech'){{status.textContent='No audio detected. Check that your microphone is unmuted and the correct input device is selected.'}}
-else{{status.textContent='Voice input is unavailable right now. Type your command instead.'}}
-}};
-recognition.onend=function(){{if(!retrying)stopListening()}};
-try{{recognition.start()}}catch(e){{stopListening();status.textContent='Voice input could not start. Type your command instead.'}}
-}}
-micButton.addEventListener('click',function(){{
-if(listening){{stopListening();return}}
-listening=true;
-micButton.classList.add('aaco-mic-listening');
-micButton.setAttribute('aria-pressed','true');
-status.textContent='Listening…';
-attemptRecognition(false);
-}});
-}}
+window.aacoAttachVoice(form,input,status,micButton);
 }})();
 </script>
 """
@@ -359,16 +374,17 @@ def _workspace() -> str:
 <header class="topbar"><div><p class="eyebrow">AnyAiCam Operator</p><h1>AACO</h1></div><a class="ghost-button" href="/customer-account">Classic workspace</a></header>
 <style>
 .aaco-layout{display:grid;grid-template-columns:minmax(240px,.72fr) minmax(0,2fr);gap:16px}.aaco-panel{border:1px solid rgba(170,196,207,.18);border-radius:14px;background:rgba(24,33,50,.92);padding:18px}.aaco-panel h2{margin:0 0 6px}.aaco-muted{color:var(--muted);font-size:12px;line-height:1.5}.aaco-examples{display:grid;gap:8px;margin-top:14px}.aaco-example{width:100%;text-align:left;padding:10px;border:1px solid var(--line);border-radius:9px;background:#111827;color:#dce7ee;font:inherit;font-size:12px;cursor:pointer}.aaco-example:hover{border-color:var(--brand)}.aaco-command-row{display:flex;gap:8px}.aaco-command-row input{min-width:0;flex:1}.aaco-conversation{display:grid;gap:12px;min-height:350px}.aaco-turn{max-width:min(92%,700px);padding:12px 14px;border-radius:12px;line-height:1.45}.aaco-turn.customer{justify-self:end;background:#285d5a}.aaco-turn.operator{background:#111827;border:1px solid rgba(170,196,207,.15)}.aaco-turn .eyebrow{margin:0 0 5px;font-size:10px}.aaco-result-list{display:grid;gap:8px;margin-top:10px}.aaco-result-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border:1px solid rgba(170,196,207,.15);border-radius:9px}.aaco-result-row span{color:var(--muted);font-size:11px}.aaco-context{margin-top:12px;padding:9px 11px;border-left:3px solid var(--brand);color:#b9cfda;font-size:11px}.aaco-loading{opacity:.7}@media(max-width:760px){.aaco-layout{grid-template-columns:1fr}.aaco-command-row{flex-direction:column}.aaco-command-row button{width:100%}.aaco-conversation{min-height:260px}}
+.aaco-mic-listening{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}@keyframes aaco-mic-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 </style>
 <main class="aaco-layout" aria-label="AACO operator workspace">
  <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO loads VMS data only after a command. Search shows metadata; it never creates a clip.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
- <section class="aaco-panel"><form id="aaco-command-form"><label class="eyebrow" for="aaco-command">Command</label><div class="aaco-command-row"><input id="aaco-command" name="command" maxlength="500" autocomplete="off" required placeholder="What would you like to see?"><button class="action-button">Run command</button></div></form><p id="aaco-status" class="aaco-muted" role="status" aria-live="polite">Ready. No historical media is loaded until you ask.</p><div id="aaco-conversation" class="aaco-conversation" aria-live="polite"><div class="aaco-turn operator"><p class="eyebrow">AACO</p>What would you like to see?</div></div><div id="aaco-context" class="aaco-context" hidden></div></section>
+ <section class="aaco-panel"><form id="aaco-command-form"><label class="eyebrow" for="aaco-command">Command</label><div class="aaco-command-row"><input id="aaco-command" name="command" maxlength="500" autocomplete="off" required placeholder="What would you like to see?"><button type="button" class="camera-tool aaco-mic-button" id="aaco-mic" title="Voice commands are not supported in this browser" aria-label="Voice commands are not supported in this browser" aria-pressed="false" disabled>🎤</button><button class="action-button">Run command</button></div></form><p id="aaco-status" class="aaco-muted" role="status" aria-live="polite">Ready. No historical media is loaded until you ask.</p><div id="aaco-conversation" class="aaco-conversation" aria-live="polite"><div class="aaco-turn operator"><p class="eyebrow">AACO</p>What would you like to see?</div></div><div id="aaco-context" class="aaco-context" hidden></div></section>
 </main>
 <script>%%AACO_CORE_JS%%
 (()=>{const form=document.getElementById('aaco-command-form'),input=document.getElementById('aaco-command'),status=document.getElementById('aaco-status'),conversation=document.getElementById('aaco-conversation'),contextLine=document.getElementById('aaco-context');let operatorContext=null;const node=(tag,value)=>{const el=document.createElement(tag);el.append(document.createTextNode(String(value??'')));return el};const turn=(who)=>{const el=document.createElement('div');el.className='aaco-turn '+who;const label=node('p',who==='customer'?'You':'AACO');label.className='eyebrow';el.append(label);conversation.append(el);return el};const link=(label,href)=>{const a=node('a',label);a.className='download';a.href=href;return a};function updateContext(value){operatorContext=value||null;if(!operatorContext){contextLine.hidden=true;return}contextLine.hidden=false;contextLine.textContent='Current context: '+operatorContext.camera_id+(operatorContext.playback_at?' · playback selected':'')+(operatorContext.event_at?' · event selected':'')}
 const KIND_LABELS={live:'Live view',playback:'Playback',events:'Requested events',door_unlock:'Door',status:'Camera status'};
 function render(body){const box=turn('operator');if(body.kind==='clarification'){box.append(node('div',body.message));return}box.append(node('strong',KIND_LABELS[body.kind]||'Camera status'));box.append(node('p',body.message));if(body.kind==='live'||body.kind==='playback'){box.append(link(body.kind==='live'?'Open authorized Live':'Open authorized Playback',body.href));updateContext(body.context||operatorContext);return}if(body.kind==='door_unlock'){if(body.context)updateContext(body.context);return}const list=document.createElement('div');list.className='aaco-result-list';const rows=body.kind==='events'?body.events||[]:body.cameras||[];if(!rows.length)box.append(node('p',body.kind==='events'?'No authorized events matched this request.':'No authorized cameras are available.'));rows.forEach(row=>{const item=document.createElement('div');item.className='aaco-result-row';const copy=document.createElement('div');copy.append(node('strong',row.label));copy.append(node('span',row.timestamp||row.state||''));item.append(copy);if(row.href)item.append(link('Open in Classic',row.href));if(row.context){const pick=node('button','Use context');pick.type='button';pick.className='ghost-button';pick.addEventListener('click',()=>updateContext(row.context));item.append(pick)}list.append(item)});box.append(list);if(body.context)updateContext(body.context)}
-document.querySelectorAll('.aaco-example').forEach(button=>button.addEventListener('click',()=>{input.value=button.textContent.trim();input.focus()}));form.addEventListener('submit',event=>{event.preventDefault();const command=input.value.trim();if(!command)return;turn('customer').append(node('div',command));status.textContent='Working with your authorized VMS…';conversation.classList.add('aaco-loading');window.aacoSubmitCommand(command,operatorContext,body=>{status.textContent=body.message||'Completed.';render(body);conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()},error=>{const box=turn('operator');box.append(node('div',error.detail||'AACO could not complete that command.'));status.textContent='Command was not completed.';conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()})})})();
+window.aacoAttachVoice(form,input,status,document.getElementById('aaco-mic'));document.querySelectorAll('.aaco-example').forEach(button=>button.addEventListener('click',()=>{input.value=button.textContent.trim();input.focus()}));form.addEventListener('submit',event=>{event.preventDefault();const command=input.value.trim();if(!command)return;turn('customer').append(node('div',command));status.textContent='Working with your authorized VMS…';conversation.classList.add('aaco-loading');window.aacoSubmitCommand(command,operatorContext,body=>{status.textContent=body.message||'Completed.';render(body);conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()},error=>{const box=turn('operator');box.append(node('div',error.detail||'AACO could not complete that command.'));status.textContent='Command was not completed.';conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()})})})();
 </script>
 """.replace("%%AACO_CORE_JS%%", _AACO_CLIENT_CORE_JS)
 

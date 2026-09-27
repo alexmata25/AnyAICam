@@ -93,7 +93,8 @@ _EVENT_TYPES = (  # checked in order; a sentence naming two different kinds is a
     ("people_counting", r"\bpeople count(?:ing|s)?\b|\bhow many people\b|\bentries and exits\b"),
     ("lpr", r"\blicen[cs]e plates?\b|\bnumber plates?\b|\bplates?\b|\blpr\b"),
     ("intrusion", r"\bintrusions?\b|\bintruders?\b|\btrespass\w*"),
-    ("person", r"\bpersons?\b|\bpeople\b|\bsome ?one\b|\bsome ?body\b|\bany ?one\b|\bany ?body\b|\bvisitors?\b|\bhumans?\b|\bpedestrians?\b|\bwho\b"),
+    ("person", r"\bpersons?\b|\bpeople\b|\bsome ?one\b|\bsome ?body\b|\bany ?one\b|\bany ?body\b|\bvisitors?\b|\bhumans?\b|\bpedestrians?\b|\bwho\b"
+                r"|\bdeliver(?:y|ies|ed)\b|\bcouriers?\b|\bmail ?(?:man|men|carriers?)\b|\bpost ?man\b"),
     ("vehicle", r"\bvehicles?\b|\bcars?\b|\btrucks?\b|\bvans?\b|\bmotorcycles?\b|\bbikes?\b|\bbicycles?\b"),
     ("motion", r"\bmotion\b|\bmovement\b|\bmoving\b"),
 )
@@ -173,6 +174,11 @@ def _time_range(value: str, now: datetime) -> tuple[datetime, datetime] | None:
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if _has(value, r"\blast night\b|\bovernight\b"):
         return midnight - timedelta(hours=6), min(now, midnight + timedelta(hours=6))
+    part = re.search(r"\byesterday (morning|afternoon|evening|night)\b|\b(morning|afternoon|evening) yesterday\b", value)
+    if part:  # "yesterday evening" is part of yesterday, not all of it
+        start_hour, end_hour = {"morning": (5, 12), "afternoon": (12, 17), "evening": (17, 24), "night": (18, 30)}[part.group(1) or part.group(2)]
+        day = midnight - timedelta(days=1)
+        return day + timedelta(hours=start_hour), min(now, day + timedelta(hours=end_hour))
     if _has(value, r"\byesterday\b"):
         return midnight - timedelta(days=1), midnight
     for pattern, start_hour, end_hour in ((r"\bthis morning\b", 5, 12), (r"\bthis afternoon\b", 12, 17),
@@ -199,12 +205,16 @@ def _camera(value: str, camera_names) -> str | None:
     if numbered:
         return f"camera-{numbered.group(1)}"
     names = [" ".join(str(name).lower().split()) for name in camera_names or () if str(name).strip()]
-    exact = [name for name in names if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", value)]
+    # "right now" is never part of a camera name: "the driveway right now" must
+    # not pick a camera called "Driveway Right".
+    named = re.sub(r"\bright now\b", " ", value)
+    exact = [name for name in names if re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", named)]
     if exact:
         return f"camera-name:{max(exact, key=len)}"
     # Words that belong to the command itself never count toward a camera
     # name: "play back 3:15" must not pick a camera called "Back Lot".
     loose = re.sub(_COMMAND_PHRASES, " ", value)
+    loose = re.sub(r"\bdoorbells?\b", "door", loose)  # "who rang the doorbell" -> the door camera
     text_words = [word for word in _words(loose) if word not in _STOP]
     if names:
         best, hits = 0, []
@@ -252,6 +262,14 @@ class FreeFormIntentParser:
         eventish = bool(kinds) or _has(value, _EVENT_GENERIC) or recency
         playbackish = _has(value, _PLAYBACK)
         happened = _has(value, _HAPPENED)
+        since = _has(value, r"\bsince\b")
+        past = _has(value, r"\b(?:was|were|did|came|come|been|earlier|happened|went|rang|dropped|left)\b")
+        # "Who is at the door right now?" / "Is someone at the front door?":
+        # a question about this moment is a live view, not a history search.
+        live_now = bool(camera and not span and not point and not recency and not past and not playbackish
+                        and set(kinds) <= {"person"}
+                        and (_has(value, r"\bright now\b|\bat the moment\b|\bcurrently\b|\bnow\b")
+                             or _has(value, r"^(?:is|are) (?:there )?(?:any ?one|some ?one|any ?body|some ?body|people)\b")))
 
         if _has(value, _STATUS) and _has(value, _STATUS_SUBJECT) and not eventish and not point:
             return AacoCommand("camera_status")
@@ -271,12 +289,16 @@ class FreeFormIntentParser:
                 return Clarification(f"What time should playback start? For example, {example}.")
             return AacoCommand("playback", camera_id=camera, start=point, end=point + PLAYBACK_LENGTH)
 
+        if live_now:
+            return AacoCommand("live_view", camera_id=camera)
         if eventish or happened:
             event_type = kinds[0] if kinds else None
             if recency and not span and not point:
                 return AacoCommand("event_search", camera_id=camera, event_type=event_type,
                                    start=now - LATEST_LOOKBACK, end=now, limit=1)
-            if point:
+            if since and (point or span):  # "since noon", "since this morning": from then until now
+                start, end = (point or span[0]), now
+            elif point:
                 start, end = point - POINT_EVENT_WINDOW, min(now, point + POINT_EVENT_WINDOW)
             elif span:
                 start, end = span
