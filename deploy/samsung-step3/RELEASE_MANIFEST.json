@@ -1,0 +1,45 @@
+{
+  "release": "AnyAiCam VMS appliance release for Samsung Step 3",
+  "product_version": "0.9.0",
+  "branch": "reconcile/golden-foundation-20260911",
+  "vms_commit": "f5a6d875c5cc9bd313e85ac7a330359f39255150",
+  "image": {
+    "tag": "anyaicam-vms:f5a6d87",
+    "image_id": "sha256:d5cd5fc263445dd18ce75e06bbc053feec935bb31f45ec0f53ab934babe5054b",
+    "platform": "linux/amd64",
+    "label_anyaicam.commit": "f5a6d875c5cc9bd313e85ac7a330359f39255150",
+    "dockerfile": "Dockerfile (appliance image; single uvicorn process; models baked outside /app)",
+    "base_image": "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea",
+    "uncompressed_size_bytes": 3208937139,
+    "built_on": "AnyAiCam amd64 build host (staging EC2), clean checkout, dirty=0",
+    "same_image_as": "staging portal container portal-f5a6d87 (deploy-portal:f5a6d87)"
+  },
+  "artifacts": {
+    "anyaicam-vms-f5a6d875c5cc-linux-amd64.tar.gz": {
+      "sha256": "aaa33eebf12a7d1b0d34d6dbbcf7925b888fb95c60570832ed3ef96555eb4826",
+      "bytes": 796614699,
+      "content": "docker save anyaicam-vms:f5a6d87 | gzip"
+    },
+    "anyaicam-appliance-installer-1.1.0-vms-f5a6d875c5cc.tar.gz": {
+      "sha256": "96e08e123f463033751ec0a20aa3a160aff4e18a8c6a93912cc27daa4d8f29b6",
+      "bytes": 35593059,
+      "use_in_step3": "payload/agent only (authoritative appliance-agent at f5a6d87); install.sh is NOT run on Samsung"
+    }
+  },
+  "bundled_analytics": {
+    "tesseract": "5.5.0 (eng, osd)",
+    "pytesseract": "0.3.13",
+    "ultralytics": "8.3.40",
+    "torch": "2.5.1+cpu",
+    "opencv": "4.10.0",
+    "models": {
+      "/app/yolov8n.pt": 6549796,
+      "/opt/anyaicam-ppe-model/yolov8n-ppe.pt": 5625014,
+      "/opt/anyaicam-aac-models/face_detection_yunet_2023mar.onnx": 232589,
+      "/opt/anyaicam-aac-models/face_recognition_sface_2021dec.onnx": 38696353,
+      "/opt/anyaicam-aac-models/arcfaceresnet100-11-int8.onnx": 65764892
+    }
+  },
+  "cloud_endpoint": "https://portal-staging.anyaicam.com",
+  "prepared": "2026-09-27"
+}

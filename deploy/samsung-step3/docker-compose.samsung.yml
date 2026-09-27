@@ -1,0 +1,44 @@
+# AnyAiCam VMS -- Samsung Step 3 appliance compose (self-contained release).
+#
+# Replaces the legacy /opt/anyaicam/docker-compose.yml on the Samsung.
+# Differences from the legacy file (and from the installer's generic
+# appliance compose that the Ryzen still uses):
+#   - image: the prebuilt, digest-verified release image; NO `build: .`
+#     and NO `./app:/app` source bind mount -- the application code is
+#     the code inside the image (commit f5a6d875c5cc).
+#   - pull_policy: never -- the image is loaded from the verified
+#     tarball; Compose must never try to pull or rebuild it.
+#   - WebRTC/P2P (MediaMTX mount + UDP 8189) is deliberately left out of
+#     Step 3 (ANYAICAM_LIVE_P2P_ENABLED=false). HLS Live View works
+#     without it. Enabling P2P later needs the MediaMTX binary and the
+#     anyaicam-webrtc-firewall service; see the handoff, "Deferred".
+# Everything the appliance keeps (recordings + database, HLS, config,
+# the agent's read-only identity) is on the same host paths as before.
+name: anyaicam
+services:
+  vms:
+    image: anyaicam-vms:f5a6d87
+    pull_policy: never
+    container_name: anyaicam-vms
+    ports:
+      - "8000:8000"
+    env_file:
+      - /etc/anyaicam/vms.env
+    volumes:
+      - /var/lib/anyaicam/vms/recordings:/app/recordings
+      - /var/lib/anyaicam/vms/hls:/app/static/hls
+      - /var/lib/anyaicam/vms/data-config:/opt/anyaicam/data/config
+      # Read-only: the VMS uploaders authenticate with the agent's own
+      # credential.json (STATE_DIR/credential.json); never writable here.
+      - /var/lib/anyaicam:/var/lib/anyaicam:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; r=urllib.request.Request('http://localhost:8000/health', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(r, timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
