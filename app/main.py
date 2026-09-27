@@ -41776,6 +41776,10 @@ PUBLIC_PATH_PREFIXES = (
     "/settings/notifications",
 
     "/api/partner-login",
+    # The public "Become a partner" form on /partner.html (partner portal pass
+    # 2026-09-26): it always answered 401 to the visitors it is for.
+    # Exact path only -- /api/admin/partner-applications stays protected.
+    "/api/partner-applications",
 
     "/api/portal-login",
 

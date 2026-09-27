@@ -294,3 +294,24 @@ def test_temporary_password_accounts_must_choose_their_own(client):
     with connection() as db:
         db.execute("UPDATE partner_users SET must_change_password=0 WHERE id='u-temp'")
     assert client.get("/partner/appliance-dashboard", cookies=session, follow_redirects=False).status_code == 200
+
+
+# ------------------------------------------------------------ public partner application
+
+
+APPLICATION = {"company_name": "New Installer Co", "contact_name": "Pat", "email": "pat@newinstaller.test", "phone": "555-0101",
+               "service_area": "North", "company_type": "Security installer", "estimated_installations": "5"}
+
+
+def test_public_partner_application_accepts_anonymous_visitors(client):
+    response = client.post("/api/partner-applications", json=APPLICATION)
+    assert response.status_code == 201, response.text  # was 401 "Authentication required" on the cloud
+    assert client.get("/api/admin/partner-applications").status_code in (401, 403)  # review stays protected
+
+
+def test_public_partner_application_is_rate_limited(client):
+    import website_partner
+
+    website_partner._application_ip_limiter.events.clear()
+    statuses = [client.post("/api/partner-applications", json={**APPLICATION, "email": f"p{i}@newinstaller.test"}).status_code for i in range(12)]
+    assert statuses[:10] == [201] * 10 and statuses[10:] == [429, 429]

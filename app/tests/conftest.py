@@ -51,3 +51,16 @@ def _reset_password_reset_completion_limiter():
     if limiter is not None:
         limiter.events.clear()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_partner_application_limiter():
+    """website_partner's per-IP limit on the public partner application form
+    is process-wide; every TestClient request shares one client address."""
+    import sys
+
+    module = sys.modules.get("website_partner")
+    limiter = getattr(module, "_application_ip_limiter", None) if module else None
+    if limiter is not None:
+        limiter.events.clear()
+    yield
