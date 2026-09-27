@@ -4122,3 +4122,18 @@ Samsung: f5a6d87 self-contained, claimed into staging (`9cf63b90...`), online, 0
 ### State to resume from
 
 Staging `432c9a2`, Ryzen `f5a6d87`, Samsung `f5a6d87` (claimed `9cf63b90...`). Next: owner fixes the email provider credential (and SMS provider); then the physical tests (Talkdown, Front Door AACO voice, zone walk after a Ryzen update to get the evidence counters, LPR).
+
+## Milestone: staging email working, alert volume capped, rich alert emails -- staging `3fa8853`, 2026-09-27
+
+- **SMTP credential replaced by the owner** through a secret-free host script (`/opt/anyaicam-staging-build/set-smtp-password.sh`: hidden input, Gmail login check before saving, env-file backup). The password was never in chat or logs. A controlled password reset was **sent**.
+- **Email alert allowlist** (`e5b3bf3`): `ANYAICAM_EMAIL_ALERT_EVENT_TYPES=aac_voice_call,camera_offline,appliance_offline,storage_problem` in `/etc/anyaicam-staging/vms-staging.env` (backup `...bak-before-email-allowlist-20260927T185824Z`). It narrows EMAIL alerts only: customer preferences, SMS (which shares the event-type list), in-app and transactional mail are untouched, and noisy failed emails are never retried. Projection: at most 27/day (visitor calls, before cooldown), down from about 282/day. Remove the variable to restore full alert email.
+- **Rich alert emails** (`3fa8853`, `notification_email.py`): camera name, local time, inline thumbnail, and an event-video link (Playback deep link / Voice Call screen / alerts list). Detection-alert emails are held as `pending_media` until the thumbnail arrives (60-150 s after the event, measured) or 180 s have passed. Visitor calls and camera/appliance/storage problems are sent immediately. One controlled test email was sent with a 31 KB inline thumbnail.
+- Cutovers `e5b3bf3` was folded into `3fa8853` (19:33Z, 167/167 polls 200). Rollbacks kept: `portal-432c9a2-smtp-pre-3fa8853-...`, `portal-432c9a2-pre-432c9a2-smtp-...`, `portal-06816d5-pre-432c9a2-...`. Full suite at `3fa8853`: 87 failed / 4256 passed / 125 skipped, 0 new.
+
+### Fleet rule (owner, 2026-09-27)
+
+Samsung (`9cf63b90...`, self-contained image kit) is now part of the managed appliance fleet with the Ryzen. **Every VMS release must be deployed, validated and rollback-tested on BOTH appliances, tracked independently.** The Ryzen uses the release installer; the Samsung uses a pinned self-contained image (currently `f5a6d87`). **Samsung update-path validation is pending** and needs: a camera added to Samsung (it has 0 cameras on staging), a release image/kit for the target commit, and Samsung-side execution.
+
+### State to resume from
+
+Staging `3fa8853`; Ryzen `f5a6d87`; Samsung `f5a6d87` (0 cameras). Next: a generalized per-release Samsung kit + Samsung update-path validation (after a Samsung camera exists); a Ryzen update to the current release (installer); then the physical tests.
