@@ -4103,3 +4103,22 @@ Samsung executed the Step 3 kit (`deploy/samsung-step3/`, image `anyaicam-vms:f5
 ### State to resume from
 
 Samsung: f5a6d87 self-contained, claimed into staging (`9cf63b90...`), online, 0 cameras -- Step 3 complete. Staging: cutover to `06816d5` in progress/validation. Ryzen: `f5a6d87`.
+
+## Milestone: staging on `432c9a2` (zone evidence, AACO voice/Front Door, email observability) -- 2026-09-27
+
+- Gated blue/green cutovers, both `CUTOVER_COMPLETE` with zero non-200 outside polls: `06816d5` at 15:57Z (705/705), then **`432c9a2`** at 18:23Z (102/102). Rollbacks kept: `portal-06816d5-pre-432c9a2-20260927T182323Z-rollback`, `portal-f5a6d87-pre-06816d5-20260927T155723Z-rollback`. The Samsung image `anyaicam-vms:f5a6d87` on the build host is untouched.
+- **Staging validation (read-only, live container, real HTTP)** -- all real checks pass:
+  - `/aaco` mic and shared voice code shipped.
+  - Typed AACO works.
+  - Front Door phrasing fixes, since/yesterday-evening ranges, delivery/courier/mailman wording, and the "driveway right now" ambiguity all behave correctly.
+  - `Permissions-Policy: camera=(self), microphone=(self)`.
+  - A loose "open up for the mailman" returns 403; another tenant can't open this Front Door.
+  - Customer pages return 200 (`/analytics-entitlements` is master-admin only).
+  - Zone telemetry shape ships in `/api/ai/status`.
+- **Email outage diagnosed**: Gmail SMTP rejects the staging credential (`535 5.7.8 Username and Password not accepted`) -- no email has been delivered from staging (4,522 notification emails and 4 password resets failed in 7 days). SMS goes to preview (no provider). `432c9a2` now records the provider's reason on every email record, adds `email_last_delivery` to readiness, and raises an `ANYAICAM_EMAIL_DELIVERY` warning -- all verified live. **Fix needs the owner**: a new Gmail app password, or preferably SES (Gmail allows about 500/day; staging attempts about 650 notification emails/day).
+- Full suite at `432c9a2`: 87 failed / 4231 passed / 125 skipped; the only change against the previous baseline is the known intermittent `test_semaphore_releases_after_cancellation`.
+- Staging `/ready` = 503 because of pre-existing cloud-production requirements (`database_configured`, `secrets_manager_configured`, `ANYAICAM_PORTAL_SECRET`), not this release.
+
+### State to resume from
+
+Staging `432c9a2`, Ryzen `f5a6d87`, Samsung `f5a6d87` (claimed `9cf63b90...`). Next: owner fixes the email provider credential (and SMS provider); then the physical tests (Talkdown, Front Door AACO voice, zone walk after a Ryzen update to get the evidence counters, LPR).
