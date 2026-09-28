@@ -4198,6 +4198,15 @@ Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both d
 - **Visitor answer capture and STT** (`cbb7bd4`): 14 new tests. Real Ryzen diagnostic (temporary, removed afterwards): an 8 kHz AAC phrase transcribed correctly (0.97); real Front Door ambient audio was captured and correctly produced no transcript.
 - **Access-log secret redaction** (`57fa39c`, `48f01ac`): closes "password-reset tokens logged in plaintext".
 
+- **Stripe test-mode end to end on staging `1175932` (04:56-04:58Z):**
+  - staging's real `/api/payments/hardware-checkout` created `cs_test_...` for SKU `AIC-RELAY-NUMATO-3CH` as the test customer (the script refuses non-test keys);
+  - paid on Stripe's hosted sandbox page with test card 4242;
+  - the Stripe webhook reached staging and was signature-verified;
+  - `hardware_orders` row `b842342b...` has status `paid` and is linked to customer `d75bdbec...`;
+  - the success redirect for a signed-out browser landed on the customer login with the full `next` preserved.
+
+  Finding (logged, not changed): the order stores the catalog `amount_cents` (14999), not Stripe's actual `amount_total` (the $0.53 sandbox price). Prefer the session's `amount_total` so coupons and tax are reflected.
+
 ### PENDING USER ACTION
 1. Paste the Ryzen `validate.sh` output for the 5d02f25 install (optional; the remote checks passed).
 2. **Front Door audio, one test after a Ryzen release that contains the transport fix (5d02f25 has it):** stand at the door; one greeting play with one login; report heard or nothing.
