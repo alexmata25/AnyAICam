@@ -90,8 +90,11 @@ def _owner_cookie(customer_id):
 
 
 def _href_for(html, camera_number):
-    marker = f'id="dashboard-camera-{camera_number}"'
-    start = html.rindex('href="', 0, html.index(marker)) + len('href="')
+    """The camera card's primary link: its first quick action (Live when
+    the viewer may watch live, else Playback, else the generic fallback)."""
+    card_start = html.index(f'id="dashboard-camera-{camera_number}"')
+    nav = html.index('class="dash-cam-actions"', card_start)
+    start = html.index('href="', nav) + len('href="')
     return html[start:html.index('"', start)]
 
 
@@ -138,7 +141,7 @@ def test_viewer_visibility_is_not_reduced_camera_still_appears_on_dashboard(http
     conn.commit()
     conn.close()
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _viewer_cookie("viewer@example.test", "cust-1")})
-    assert response.text.count('class="dashboard-camera-card"') == 1
+    assert response.text.count('data-dashboard-camera="') == 1
     assert 'id="dashboard-camera-1"' in response.text
 
 
@@ -154,7 +157,7 @@ def test_a_viewer_with_neither_permission_never_sees_the_camera_at_all(http_clie
     conn.commit()
     conn.close()
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _viewer_cookie("viewer@example.test", "cust-1")})
-    assert response.text.count('class="dashboard-camera-card"') == 0
+    assert response.text.count('data-dashboard-camera="') == 0
 
 
 def test_mixed_fleet_each_camera_routes_independently(http_client, db_path):

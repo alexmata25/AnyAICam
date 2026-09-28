@@ -654,6 +654,10 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   redraw();
   loadRules();
   startPreview();
+  // A preview that starts but stalls (a dropped relay segment makes hls.js
+  // wait without a fatal error -- seen on staging) must not leave the
+  // canvas empty: after 15 s without a frame, use the server-side still.
+  setTimeout(()=>{if(!hasFrame)previewUnavailable();},15000);
 })();</script>''')
 
         return page_shell(f'Detection rules · {camera_name}', 'analytics', content, scripts)

@@ -46363,7 +46363,7 @@ STYLES += """
 
 
 
-.dashboard-camera-section{margin-bottom:24px}.dashboard-camera-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.dashboard-camera-card{display:block;overflow:hidden;border:1px solid rgba(170,196,207,.2);border-radius:15px;background:rgba(24,33,50,.96);color:var(--text);text-decoration:none;box-shadow:0 10px 26px rgba(7,12,20,.18);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}.dashboard-camera-card:hover{transform:translateY(-2px);border-color:rgba(67,209,204,.7);box-shadow:0 14px 34px rgba(7,12,20,.3)}.dashboard-camera-card.offline{border-color:rgba(255,107,107,.3)}.dashboard-camera-preview{position:relative;aspect-ratio:16/9;overflow:hidden;background:#080a0e}.dashboard-camera-preview video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .25s ease}.dashboard-camera-preview video.ready{opacity:1}.dashboard-camera-placeholder{position:absolute;inset:0;display:grid;place-content:center;gap:6px;padding:20px;text-align:center;color:var(--muted)}.dashboard-camera-placeholder[hidden]{display:none}.dashboard-camera-placeholder .signal{font-size:25px}.dashboard-camera-placeholder strong{color:#dce4ec}.dashboard-live-badge,.dashboard-rec-badge{position:absolute;z-index:2;top:12px;padding:6px 9px;border-radius:999px;background:rgba(8,10,14,.82);font-size:10px;font-weight:850;letter-spacing:.1em}.dashboard-live-badge{left:12px;color:#7ee8c7}.dashboard-live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--accent)}.dashboard-live-badge.wait{color:#ffd48a}.dashboard-live-badge.wait::before{background:#f0b84b}.dashboard-rec-badge{right:12px;color:#ff8c8c}.dashboard-rec-badge.inactive{color:var(--muted)}.dashboard-camera-info{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 16px}.dashboard-camera-name{font-size:15px;font-weight:800}.dashboard-camera-detail{margin-top:4px;color:var(--muted);font-size:12px}.dashboard-open-icon{font-size:20px;color:var(--brand-soft)}@media(max-width:900px){.dashboard-camera-grid{grid-template-columns:1fr}}@media(max-width:760px){.dashboard-camera-grid{gap:12px}.dashboard-camera-info{padding:13px 14px}}
+.dashboard-camera-section{margin-bottom:24px}.dashboard-camera-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px}.dash-cam{display:flex;flex-direction:column;gap:10px;padding:12px;border:1px solid rgba(170,196,207,.2);border-radius:14px;background:rgba(24,33,50,.96);color:var(--text)}.dash-cam.offline,.dash-cam.attention{border-color:rgba(255,107,107,.45)}.dash-cam-head{display:flex;gap:12px;align-items:center}.dash-cam-snap-wrap{position:relative;flex:0 0 112px;margin:0;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:#080a0e}.dash-cam-snap{width:100%;height:100%;object-fit:cover;display:block}.dash-cam-snap[hidden]{display:none}.dash-cam-snap-empty{position:absolute;inset:0;display:grid;place-content:center;font-size:11px;color:var(--muted)}.dash-cam-snap-empty[hidden]{display:none}.dash-cam-snap-wrap figcaption{position:absolute;left:4px;bottom:4px;padding:1px 6px;border-radius:999px;background:rgba(8,10,14,.8);font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#cfd8e3}.dash-cam-title{display:grid;gap:4px;min-width:0}.dash-cam-title strong{font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dash-cam-state{justify-self:start;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(126,232,199,.14);color:#7ee8c7}.dash-cam-state.offline{background:rgba(255,107,107,.16);color:#ff8f8f}.dash-cam-state.checking{background:rgba(170,196,207,.12);color:var(--muted)}.dash-cam-facts{display:grid;gap:4px;margin:0;font-size:12px}.dash-cam-facts div{display:flex;justify-content:space-between;gap:8px}.dash-cam-facts dt{color:var(--muted)}.dash-cam-facts dd{margin:0;text-align:right}.dash-cam-facts dd.problem{color:#ff8f8f}.dash-cam-warning{margin:0;padding:6px 8px;border-radius:8px;background:rgba(255,107,107,.12);color:#ffb3b3;font-size:12px}.dash-cam-warning[hidden]{display:none}.dash-cam-actions{display:flex;flex-wrap:wrap;gap:6px}.dash-cam-action{padding:5px 10px;border:1px solid rgba(170,196,207,.25);border-radius:999px;color:var(--text);text-decoration:none;font-size:12px}.dash-cam-action:hover{border-color:rgba(67,209,204,.7)}.dash-attention{margin-left:10px;font-size:12px;color:#7ee8c7}.dash-attention.problem{color:#ff8f8f}.dashboard-camera-card{display:block;overflow:hidden;border:1px solid rgba(170,196,207,.2);border-radius:15px;background:rgba(24,33,50,.96);color:var(--text);text-decoration:none;box-shadow:0 10px 26px rgba(7,12,20,.18);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}.dashboard-camera-card:hover{transform:translateY(-2px);border-color:rgba(67,209,204,.7);box-shadow:0 14px 34px rgba(7,12,20,.3)}.dashboard-camera-card.offline{border-color:rgba(255,107,107,.3)}.dashboard-camera-preview{position:relative;aspect-ratio:16/9;overflow:hidden;background:#080a0e}.dashboard-camera-preview video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .25s ease}.dashboard-camera-preview video.ready{opacity:1}.dashboard-camera-placeholder{position:absolute;inset:0;display:grid;place-content:center;gap:6px;padding:20px;text-align:center;color:var(--muted)}.dashboard-camera-placeholder[hidden]{display:none}.dashboard-camera-placeholder .signal{font-size:25px}.dashboard-camera-placeholder strong{color:#dce4ec}.dashboard-live-badge,.dashboard-rec-badge{position:absolute;z-index:2;top:12px;padding:6px 9px;border-radius:999px;background:rgba(8,10,14,.82);font-size:10px;font-weight:850;letter-spacing:.1em}.dashboard-live-badge{left:12px;color:#7ee8c7}.dashboard-live-badge::before{content:"";display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;background:var(--accent)}.dashboard-live-badge.wait{color:#ffd48a}.dashboard-live-badge.wait::before{background:#f0b84b}.dashboard-rec-badge{right:12px;color:#ff8c8c}.dashboard-rec-badge.inactive{color:var(--muted)}.dashboard-camera-info{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 16px}.dashboard-camera-name{font-size:15px;font-weight:800}.dashboard-camera-detail{margin-top:4px;color:var(--muted);font-size:12px}.dashboard-open-icon{font-size:20px;color:var(--brand-soft)}@media(max-width:900px){.dashboard-camera-grid{grid-template-columns:1fr}}@media(max-width:760px){.dashboard-camera-grid{gap:12px}.dashboard-camera-info{padding:13px 14px}}
 
 
 
@@ -74721,6 +74721,93 @@ def camera_health_page(request: Request) -> str:
 
 
 
+
+_DASHBOARD_ANALYTICS_LABELS = (
+    ("smart_motion_enabled", "Smart Motion"),
+    ("people_counting_enabled", "People Counting"),
+    ("lpr_enabled", "LPR"),
+    ("ppe_enabled", "PPE"),
+)
+
+
+def _dashboard_camera_health_facts(customer_cameras, camera_ids_by_number) -> dict:
+    """{camera_number: {recording_mode, analytics, last_event_type, last_event_at}}
+    for the cameras the Dashboard already resolved (camera_ids_by_number):
+    one query for their recording mode/analytics flags, one grouped query
+    for each camera's newest event. Fails soft (no facts, never an error)."""
+    facts: dict = {}
+    ids = {camera_id: number for number, camera_id in (camera_ids_by_number or {}).items()}
+    if not ids:
+        return facts
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        from partner_db import connection
+        with connection() as db:
+            for row in db.execute(
+                "SELECT id, local_recording_mode, " + ", ".join(column for column, _ in _DASHBOARD_ANALYTICS_LABELS) +
+                f" FROM cameras WHERE id IN ({placeholders})", tuple(ids),
+            ).fetchall():
+                facts[ids[row["id"]]] = {
+                    "recording_mode": "Event" if row["local_recording_mode"] == "event" else "Continuous",
+                    "analytics": [label for column, label in _DASHBOARD_ANALYTICS_LABELS if row[column]],
+                }
+            for row in db.execute(
+                "SELECT de.camera_id, de.event_type, de.event_timestamp FROM detection_events de "
+                "JOIN (SELECT camera_id, max(event_timestamp) AS newest FROM detection_events "
+                f"WHERE camera_id IN ({placeholders}) GROUP BY camera_id) latest "
+                "ON latest.camera_id=de.camera_id AND latest.newest=de.event_timestamp",
+                tuple(ids),
+            ).fetchall():
+                entry = facts.setdefault(ids[row["camera_id"]], {})
+                entry["last_event_type"] = row["event_type"]
+                entry["last_event_at"] = row["event_timestamp"]
+    except Exception:
+        pass
+    return facts
+
+
+def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, facts, live_href) -> str:
+    safe_name = escape(name)
+    analytics = facts.get("analytics") or []
+    analytics_text = ", ".join(analytics) if analytics else "None enabled"
+    last_type = facts.get("last_event_type")
+    last_at = facts.get("last_event_at") or ""
+    last_text = _customer_event_type_label(last_type) if last_type else "No events yet"
+    actions = []
+    if camera_id:
+        quoted = quote(str(camera_id), safe="")
+        if can_live:
+            actions.append(f'<a class="dash-cam-action" href="/customer/cameras/{quoted}/live">Live</a>')
+        actions.append(f'<a class="dash-cam-action" href="/playback?camera={quoted}">Playback</a>')
+        actions.append(f'<a class="dash-cam-action" href="/events?camera={quoted}">Events</a>')
+        actions.append(f'<a class="dash-cam-action" href="/customer/cameras/{quoted}/analytics-rules">Rules</a>')
+    else:
+        actions.append(f'<a class="dash-cam-action" href="{escape(live_href, quote=True)}">Open</a>')
+    return (
+        f'<article class="dash-cam" id="dashboard-camera-{camera_number}" data-dashboard-camera="{camera_number}"'
+        f' data-camera-id="{escape(str(camera_id or ""), quote=True)}">'
+        '<div class="dash-cam-head">'
+        '<figure class="dash-cam-snap-wrap">'
+        f'<img class="dash-cam-snap" id="dashboard-snapshot-{camera_number}" alt="Latest snapshot from {safe_name}" hidden>'
+        f'<div class="dash-cam-snap-empty" id="dashboard-placeholder-{camera_number}">No snapshot</div>'
+        '<figcaption>Snapshot</figcaption>'
+        '</figure>'
+        '<div class="dash-cam-title">'
+        f'<strong>{safe_name}</strong>'
+        f'{"" if can_live or not camera_id else "<span class=\"pill\">Playback only</span>"}'
+        f'<span class="dash-cam-state checking" id="dashboard-live-{camera_number}">Checking…</span>'
+        '</div></div>'
+        '<dl class="dash-cam-facts">'
+        f'<div><dt>Recording</dt><dd id="dashboard-rec-{camera_number}">{escape(facts.get("recording_mode", "—"))}</dd></div>'
+        f'<div><dt>Analytics</dt><dd>{escape(analytics_text)}</dd></div>'
+        f'<div><dt>Last event</dt><dd id="dashboard-last-event-{camera_number}" data-at="{escape(last_at, quote=True)}">'
+        f'{escape(last_text)}<time datetime="{escape(last_at, quote=True)}"></time></dd></div>'
+        '</dl>'
+        f'<p class="dash-cam-warning" id="dashboard-detail-{camera_number}" hidden></p>'
+        f'<nav class="dash-cam-actions" aria-label="{safe_name} actions">{"".join(actions)}</nav>'
+        '</article>'
+    )
+
 @app.get("/dashboard", response_class=HTMLResponse)
 
 
@@ -75008,195 +75095,26 @@ def dashboard(request: Request) -> str:
 
 
 
+    # Camera health cards (2026-09-28): the Dashboard is for CAMERA HEALTH
+    # and RECENT ACTIVITY, not a second multi-camera live viewer -- live
+    # video, talk and PTZ stay on the Live page. Each card is compact:
+    # online/offline, recording state, analytics in use, last event, a
+    # warning only when something needs attention, a small snapshot that
+    # is clearly a snapshot, and quick links. Data comes from what the
+    # page already loads (the existing /api/cameras/status and recent-
+    # events polls) plus one grouped query here for each camera's last
+    # event -- no new polling.
+    _dashboard_camera_facts = _dashboard_camera_health_facts(_customer_dashboard_cameras, _dashboard_camera_ids_by_number)
     camera_cards = "".join(
-
-
-
-
-
-
-
-
-        f"""<a class="dashboard-camera-card" href="{_dashboard_camera_hrefs[camera_number]}" id="dashboard-camera-{camera_number}">
-
-
-
-
-
-
-
-
-        <div class="dashboard-camera-preview">
-
-
-
-
-
-
-
-
-            <img id="dashboard-snapshot-{camera_number}" class="dashboard-camera-snapshot" alt="{escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')} snapshot" hidden>
-
-
-
-
-
-
-
-
-            <div class="dashboard-camera-placeholder" id="dashboard-placeholder-{camera_number}">
-
-
-
-
-
-
-
-
-                <span class="signal">◉</span>
-
-
-
-
-
-
-
-
-                <strong>Connecting to {escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')}</strong>
-
-
-
-
-
-
-
-
-                <small>Live preview will appear when the stream is ready.</small>
-
-
-
-
-
-
-
-
-            </div>
-
-
-
-
-
-
-
-
-            <span class="dashboard-live-badge wait" id="dashboard-live-{camera_number}">Connecting</span>
-
-
-
-
-
-
-
-
-            <span class="dashboard-rec-badge" id="dashboard-rec-{camera_number}">● REC</span>
-
-
-
-
-
-
-
-
-        </div>
-
-
-
-
-
-
-
-
-        <div class="dashboard-camera-info">
-
-
-
-
-
-
-
-
-            <div>
-
-
-
-
-
-
-
-
-                <div class="dashboard-camera-name">{escape(_dashboard_camera_names_by_number.get(camera_number) or f'Camera {camera_number}')}{' <span class=\"pill\">Playback only</span>' if camera_number in _dashboard_camera_playback_only else ''}</div>
-
-
-
-
-
-
-
-
-                <div class="dashboard-camera-detail" id="dashboard-detail-{camera_number}">Checking stream and recording status…</div>
-
-
-
-
-
-
-
-
-            </div>
-
-
-
-
-
-
-
-
-            <span class="dashboard-open-icon" aria-hidden="true">{('▶' if camera_number in _dashboard_camera_playback_only else '↗')}</span>
-
-
-
-
-
-
-
-
-        </div>
-
-
-
-
-
-
-
-
-        </a>"""
-
-
-
-
-
-
-
-
+        _render_dashboard_camera_card(
+            camera_number,
+            name=_dashboard_camera_names_by_number.get(camera_number) or f"Camera {camera_number}",
+            camera_id=_dashboard_camera_ids_by_number.get(camera_number),
+            can_live=camera_number not in _dashboard_camera_playback_only,
+            facts=_dashboard_camera_facts.get(camera_number, {}),
+            live_href=_dashboard_camera_hrefs[camera_number],
+        )
         for camera_number in _dashboard_camera_numbers
-
-
-
-
-
-
-
-
     )
 
 
@@ -75838,7 +75756,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="section-head"><div><h2>Live cameras</h2><p>Click any camera to open its full live view.</p></div><span class="health-detail" id="dashboard-camera-summary">Checking cameras…</span></div>
+        <div class="section-head"><div><h2>Live cameras</h2><p>Click any camera to open its full live view.</p></div><span class="health-detail" id="dashboard-camera-summary">Checking cameras…</span><span class="dash-attention" id="dashboard-attention" role="status"></span></div>
 
 
 
@@ -76158,15 +76076,13 @@ def dashboard(request: Request) -> str:
 // Camera-count-agnostic: discovers every rendered tile from the DOM
 // (id^="dashboard-camera-") rather than a fixed camera-number range --
 // the previous 1..4 loop silently never even attempted Camera 5.
-const DASHBOARD_SNAPSHOT_REFRESH_MS=20000;
+const DASHBOARD_SNAPSHOT_REFRESH_MS=60000;  // a snapshot, not live video
 function attachDashboardSnapshot(cameraNumber){
     const card=document.getElementById(`dashboard-camera-${cameraNumber}`);
     const img=document.getElementById(`dashboard-snapshot-${cameraNumber}`);
     const placeholder=document.getElementById(`dashboard-placeholder-${cameraNumber}`);
     if(!card||!img||!placeholder)return;
-    const href=card.getAttribute('href')||'';
-    const match=href.match(/\/cameras\/([^/]+)\//)||href.match(/[?&]camera=([^&]+)/);
-    const cameraId=match&&match[1];
+    const cameraId=card.dataset.cameraId;
     if(!cameraId)return;
     const url=`/api/customer/cameras/${encodeURIComponent(cameraId)}/latest-thumbnail`;
     function refresh(){
@@ -76179,7 +76095,10 @@ function attachDashboardSnapshot(cameraNumber){
     refresh();
     setInterval(refresh,DASHBOARD_SNAPSHOT_REFRESH_MS);
 }
-document.querySelectorAll('[id^="dashboard-camera-"]').forEach(card=>attachDashboardSnapshot(card.id.replace('dashboard-camera-','')));
+document.querySelectorAll('[data-dashboard-camera]').forEach(card=>attachDashboardSnapshot(card.dataset.dashboardCamera));
+function relativeTime(value){const d=new Date(/Z$|[+-]\d\d:?\d\d$/.test(value)?value:value+'Z');if(Number.isNaN(d.getTime()))return '';const s=Math.round((Date.now()-d.getTime())/1000);if(s<60)return 'just now';if(s<3600)return `${Math.round(s/60)} min ago`;if(s<86400)return `${Math.round(s/3600)} h ago`;return d.toLocaleDateString();}
+function paintLastEvents(){document.querySelectorAll('[id^="dashboard-last-event-"]').forEach(cell=>{const t=cell.querySelector('time');if(t&&cell.dataset.at)t.textContent=' · '+relativeTime(cell.dataset.at);});}
+paintLastEvents();
 
 
 
@@ -76278,115 +76197,27 @@ async function updateDashboard(){
 
 
 
+        let attention=0;
         statusData.cameras.forEach(camera=>{
-
-
-
-
-
-
-
-
-            const live=document.getElementById(`dashboard-live-${camera.camera}`);
-
-
-
-
-
-
-
-
+            const state=document.getElementById(`dashboard-live-${camera.camera}`);
             const rec=document.getElementById(`dashboard-rec-${camera.camera}`);
-
-
-
-
-
-
-
-
-            const detail=document.getElementById(`dashboard-detail-${camera.camera}`);
-
-
-
-
-
-
-
-
+            const warning=document.getElementById(`dashboard-detail-${camera.camera}`);
             const card=document.getElementById(`dashboard-camera-${camera.camera}`);
-
-
-
-
-
-
-
-
+            if(!state||!rec||!warning||!card)return;
             if(camera.online)onlineCount++;
-
-
-
-
-
-
-
-
-            live.textContent=camera.online?'LIVE':'OFFLINE';live.classList.toggle('wait',!camera.online);
-
-
-
-
-
-
-
-
-            rec.classList.toggle('inactive',camera.recording!=='running');
-
-
-
-
-
-
-
-
-            detail.textContent=camera.online
-
-
-
-
-
-
-
-
-                ? `Online · ${camera.recording==='running'?'Recording active':'Recording '+camera.recording}`
-
-
-
-
-
-
-
-
-                : `Stream ${camera.stream} · recording ${camera.recording}`;
-
-
-
-
-
-
-
-
-            card.classList.toggle('offline',!camera.online);
-
-
-
-
-
-
-
-
+            const recordingOk=camera.recording==='running';
+            state.textContent=camera.online?'Online':'Offline';
+            state.classList.remove('checking');state.classList.toggle('offline',!camera.online);
+            rec.dataset.mode=rec.dataset.mode||rec.textContent;
+            rec.textContent=`${rec.dataset.mode} · ${recordingOk?'recording':'recording '+camera.recording}`;
+            rec.classList.toggle('problem',!recordingOk);
+            const problem=!camera.online?`Camera offline (stream ${camera.stream}).`:(!recordingOk?`Recording problem: ${camera.recording}.`:'');
+            warning.textContent=problem;warning.hidden=!problem;
+            if(problem)attention++;
+            card.classList.toggle('offline',!camera.online);card.classList.toggle('attention',!!problem);
         });
+        const attentionEl=document.getElementById('dashboard-attention');
+        if(attentionEl){attentionEl.textContent=attention?`${attention} need${attention===1?'s':''} attention`:'All cameras healthy';attentionEl.classList.toggle('problem',attention>0);}
 
 
 
@@ -76850,7 +76681,7 @@ async function updateRecentEvents(){const grid=document.getElementById('dashboar
     // identical to what buildEventCard() above already expects, so
     // nothing else here changes. It has no ?limit= of its own (always
     // returns its own bounded page), so the 6-card cap moves client-side.
-    const response=await fetch('/api/customer/events/recent',{cache:'no-store'});const data=await response.json();grid.replaceChildren();const events=(data.events||[]).slice(0,6);if(!events.length){const empty=document.createElement('div');empty.className='empty dashboard-event-empty';empty.textContent='Recent events will appear here after motion is detected.';grid.appendChild(empty)}else{events.forEach(event=>grid.appendChild(buildEventCard(event)))}status.textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}`}catch(error){status.textContent='Event refresh unavailable'}}
+    const response=await fetch('/api/customer/events/recent',{cache:'no-store'});const data=await response.json();grid.replaceChildren();(data.events||[]).forEach(event=>{const cell=document.getElementById(`dashboard-last-event-${event.camera}`);const at=String(event.timestamp||event.start_time||'');if(cell&&at&&(!cell.dataset.at||at>cell.dataset.at)){cell.dataset.at=at;cell.firstChild.textContent=String(event.event_type_label||event.event_type||'Event').replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());}});paintLastEvents();const events=(data.events||[]).slice(0,6);if(!events.length){const empty=document.createElement('div');empty.className='empty dashboard-event-empty';empty.textContent='Recent events will appear here after motion is detected.';grid.appendChild(empty)}else{events.forEach(event=>grid.appendChild(buildEventCard(event)))}status.textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}`}catch(error){status.textContent='Event refresh unavailable'}}
 
 
 
@@ -121300,8 +121131,13 @@ def _render_customer_events(request: Request) -> str:
     cameras = _customer_playback_cameras(request) or []
     events_list = _customer_detection_events(request, limit=200) or []
 
+    # ?camera=<id> (e.g. a Dashboard camera card's "Events" link) opens the
+    # page filtered to that one camera; any other value is ignored.
+    requested_camera_id = request.query_params.get("camera")
+    if requested_camera_id not in {str(camera.get("id")) for camera in cameras}:
+        requested_camera_id = None
     camera_options = "".join(
-        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}" '
+        f'<label class="picker-camera"><input type="checkbox" {"checked " if requested_camera_id in (None, str(camera.get("id"))) else ""}data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}" '
         f'data-camera-id="{escape(str(camera.get("id") or ""), quote=True)}"> '
         f'{escape(_camera_display_label(camera))}</label>'
         for camera in cameras
@@ -121455,7 +121291,7 @@ def _render_customer_events(request: Request) -> str:
 <div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
-<input class="picker-search" id="events-search" type="search" placeholder="Search" aria-label="Search cameras"><div id="events-camera-filters">{camera_options}</div></aside>
+<input class="picker-search" id="events-search" type="search" placeholder="Search" aria-label="Search cameras"><div id="events-camera-filters"{' data-initial-filter="1"' if requested_camera_id else ""}>{camera_options}</div></aside>
 <section class="work-area" style="min-width:0"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
 <div style="overflow-x:auto;max-width:100%"><table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
 <tbody>{event_body}</tbody></table></div></section></div>"""
@@ -121531,6 +121367,7 @@ def _render_customer_events(request: Request) -> str:
   }
   filters.addEventListener('change',apply);
   search.addEventListener('input',apply);
+  if(filters.dataset.initialFilter==='1')apply();  // opened with ?camera=<id>
 
   // Inline event-clip player -- see this row's own Python docstring
   // (the has_event_clip branch building .event-thumb-player) for why

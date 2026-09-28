@@ -246,7 +246,7 @@ def test_dashboard_page_renders_5_camera_cards_for_the_real_customer_not_10(http
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
     assert response.status_code == 200
     html = response.text
-    assert html.count('class="dashboard-camera-card"') == 5
+    assert html.count('data-dashboard-camera="') == 5
     for n in range(1, 6):
         assert f'id="dashboard-camera-{n}"' in html
 

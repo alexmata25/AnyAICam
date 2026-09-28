@@ -132,3 +132,9 @@ def test_rules_page_shows_the_live_preview_and_falls_back_to_the_server_still():
     assert "setTimeout(()=>{if(!hasFrame)captureFrame();},800)" in source  # first frame captured automatically
     assert "alert('Live preview is not ready yet.')" not in source
     assert "frameIsBlank()" in source  # a black browser capture falls back to the server still
+
+
+def test_a_stalled_preview_falls_back_to_the_server_still_after_a_timeout():
+    import inspect
+    source = inspect.getsource(customer_analytics_rules)
+    assert "setTimeout(()=>{if(!hasFrame)previewUnavailable();},15000)" in source
