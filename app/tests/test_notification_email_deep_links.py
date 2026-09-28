@@ -215,3 +215,6 @@ def test_call_screen_audio_line_reflects_the_cameras_talk_capability(http_client
     # One interface on the full real page shell: no nested Live page.
     assert "<iframe" not in page and page.count("<html") == 1
     assert page.count('id="live-view-video"') == 1 and page.count('class="camera-tool talk-mic"') == 1
+    # Call controls come before the video; the camera's analytics panel is not loaded on a call.
+    assert page.index('id="voice-call-answer"') < page.index('id="live-view-video"')
+    assert "// analytics are not shown on this screen" in page

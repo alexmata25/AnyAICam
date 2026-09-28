@@ -1029,7 +1029,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         try:
             with connection() as db:
                 live_camera = live_view_page._authorized_camera(db, event["camera_id"], identity)
-            live_panel_html, live_panel_scripts = live_view_page.camera_live_panel(live_camera, identity, show_unlock_tool=False)
+            live_panel_html, live_panel_scripts = live_view_page.camera_live_panel(live_camera, identity, show_unlock_tool=False, show_analytics=False)
         except HTTPException:
             live_panel_html = '<section class="panel"><p class="health-detail">You do not have live access to this camera.</p></section>'
 
@@ -1041,12 +1041,12 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
   <p><strong>Call state:</strong> <span id="voice-call-state">{esc(event.get("state") or "triggered")}</span></p>
   <p class="health-detail">{esc(audio_status)}</p>
 </section>
-{live_panel_html}
 <section class="panel dialog-actions">
   <button class="action-button" id="voice-call-answer" type="button">Answer</button>
   <button class="ghost-button" id="voice-call-end" type="button">End call</button>
   {'<button class="ghost-button" id="voice-call-unlock" type="button">Unlock Door</button>' if show_unlock_button else ''}
 </section>
+{live_panel_html}
 {'<p id="voice-call-unlock-status" class="health-detail"></p>' if show_unlock_button else ''}'''
         scripts = live_panel_scripts + f'''<script>
 const eventId={event_id!r};
