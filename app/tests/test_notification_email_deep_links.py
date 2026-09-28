@@ -211,4 +211,7 @@ def test_call_screen_audio_line_reflects_the_cameras_talk_capability(http_client
     con.commit()
     con.close()
     page = http_client.get(f"/aac/voice-call/{tenants['call_a']}").text
-    assert "Press and hold Talk" in page and "not confirmed to reach" not in page
+    assert "Press and hold the microphone button" in page and "not confirmed to reach" not in page
+    # One interface on the full real page shell: no nested Live page.
+    assert "<iframe" not in page and page.count("<html") == 1
+    assert page.count('id="live-view-video"') == 1 and page.count('class="camera-tool talk-mic"') == 1

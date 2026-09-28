@@ -872,6 +872,592 @@ def _intrusion_alarm_banner(request: Request, camera_id: str, identity: dict) ->
     )
 
 
+def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = True) -> tuple[str, str]:
+    """The single-camera live panel -- video, talk mic and camera tools,
+    plus the (initially hidden) analytics section -- and its scripts,
+    without any page chrome. Rendered by the Live page and embedded
+    directly (never as an iframe of a whole page) by the AAC Voice Call
+    screen, so a phone shows one navigation bar and one assistant."""
+    camera_id = camera['id']
+    camera_name = _camera_display_label(camera)
+    start_url = f'/api/customer/cameras/{camera_id}/live/start'
+    playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
+    talk_state = _talk_down_state(camera.get('talk_down_supported'))
+    talk_tooltip = talk_state['tooltip'] or 'Press and hold to talk'
+    # camera came from _authorized_camera()'s own `SELECT *`, so the
+    # door columns (added by the Face Access migration) are already
+    # present here with no extra query.
+    door_enabled = bool(camera.get('door_access_enabled'))
+    unlock_tool_button = (
+        f'<button class="camera-tool unlock-door" id="unlock-door-{escape(camera_id, quote=True)}" '
+        f'data-camera-id="{escape(camera_id, quote=True)}" title="Unlock door" aria-label="Unlock door">🔓</button>'
+        if door_enabled else ''
+    )
+
+    if not show_unlock_tool:
+        unlock_tool_button = ''
+    panel_html = (
+        f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic.active.live{{box-shadow:0 0 0 3px rgba(66,228,220,.45)}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
+        # Camera Hub mobile polish: on a narrow phone screen this
+        # row's ~10 tool buttons no longer force horizontal
+        # scrolling -- they wrap onto additional lines instead,
+        # every tool staying reachable without a sideways swipe.
+        f'@media(max-width:480px){{.camera-tools{{flex-wrap:wrap;overflow-x:visible}}}}'
+        f'</style>'
+        f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
+        f'<video id="live-view-video" controls muted playsinline></video>'
+        f'<div class="camera-placeholder" id="live-view-placeholder">'
+        f'<span class="signal">◉</span>'
+        f'<strong id="live-view-status">Starting live view…</strong>'
+        f'<small>This can take a few seconds.</small></div></div>'
+        f'<div class="camera-tools" style="justify-content:center">'
+        f'<button class="camera-tool" id="live-view-mute" title="Mute" aria-label="Mute">♪</button>'
+        f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
+        f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
+        f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
+        f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot" aria-label="Snapshot">◉</button>'
+        # 2026-09-25: only controls that work. Download/Share/Bookmark were
+        # placeholders ("coming soon" / "use Playback") and are gone;
+        # Playback opens this camera's own recordings; Fullscreen exposes
+        # the fullscreen the frame already supported by double-click.
+        f'<button class="camera-tool" id="live-view-fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>'
+        f'<a class="camera-tool" href="/playback?camera={quote(camera_id)}" title="Playback" aria-label="Playback">◴</a>'
+        f'<button class="camera-tool" id="live-view-analytics" title="Analytics" aria-label="Analytics">⌕</button>'
+        f'<button class="camera-tool" id="live-view-stop" title="Stop" aria-label="Stop">◼</button>'
+        f'<button class="camera-tool" id="live-view-retry" title="Retry" aria-label="Retry" hidden>↻</button>'
+        f'{unlock_tool_button}'
+        f'</div></section>'
+        f'<style>.analytics-event-row{{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;border-radius:8px}}'
+        f'a.analytics-event-row:hover,a.analytics-event-row:focus-visible{{background:rgba(67,209,204,.07);outline:none}}'
+        f'a.analytics-event-row:focus-visible{{box-shadow:0 0 0 2px var(--brand,#47d7ac)}}'
+        f'.analytics-thumb{{flex:0 0 auto;width:96px;height:54px;border-radius:6px;object-fit:cover;background:#0b1018}}'
+        f'.analytics-thumb--empty{{display:grid;place-items:center;color:var(--muted);font-size:18px}}'
+        f'.analytics-row-text{{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}}'
+        f'.analytics-row-action{{flex:0 0 auto;color:#8df0ea;font-size:12px;font-weight:700;white-space:nowrap}}'
+        f'.analytics-view-all{{display:inline-block;margin-top:12px}}'
+        f'@media(max-width:560px){{.analytics-thumb{{width:72px;height:40px}}.analytics-row-action{{font-size:0}}.analytics-row-action span{{font-size:16px}}}}</style>'
+        f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
+        f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
+        f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
+        f'<div id="live-analytics-panel" class="health-list"></div>'
+        f'</section>'
+    )
+    scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
+(function(){{
+  const cameraId={json.dumps(camera_id)};
+  const isOwner={json.dumps(identity.get('role') == 'customer_owner')};
+  const startUrl={json.dumps(start_url)};
+  const playlistUrl={json.dumps(playlist_url)};
+  const pollIntervalMs={POLL_INTERVAL_MS};
+  const pollTimeoutMs={POLL_TIMEOUT_MS};
+  const video=document.getElementById('live-view-video');
+  const cameraView=document.querySelector('.camera-view');
+  const placeholder=document.getElementById('live-view-placeholder');
+  const statusLabel=document.getElementById('live-view-status');
+  const muteButton=document.getElementById('live-view-mute');
+  const snapshotButton=document.getElementById('live-view-snapshot');
+  const fullscreenButton=document.getElementById('live-view-fullscreen');
+  const analyticsButton=document.getElementById('live-view-analytics');
+  const stopButton=document.getElementById('live-view-stop');
+  const retryButton=document.getElementById('live-view-retry');
+  let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
+  let transport=null, p2pConnection=null, startedAt=null;
+  const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
+
+  function setStatus(text){{statusLabel.textContent=text}}
+  function stopPolling(){{if(pollTimer){{clearTimeout(pollTimer);pollTimer=null}}}}
+  function destroyHls(){{if(hls){{try{{hls.destroy()}}catch(e){{}}hls=null}}}}
+
+  // Same claim semantics as the multi-camera grid page (live_view_p2p.py's
+  // module docstring): 'claimed' the first time a transport wins (report
+  // once), 'already' on that transport's own later reconnect, 'blocked'
+  // for the transport that lost the race.
+  // P2P UPGRADE: same rule as the grid page's claimTransport() -- P2P may
+  // take over from relay/WireGuard; nothing else displaces a winner.
+  function claimTransport(t){{
+    if(transport===t)return'already';
+    if(transport){{
+      if(t==='p2p'&&(transport==='relay'||transport==='wireguard')){{transport='p2p';return'upgrade'}}
+      return'blocked';
+    }}
+    transport=t;
+    return'claimed';
+  }}
+
+  async function stopSession(isUnload){{
+    if(!sessionId||stopped)return;
+    stopped=true;
+    if(p2pConnection){{try{{p2pConnection.close()}}catch(e){{}}p2pConnection=null}}
+    const url=`/api/customer/live/sessions/${{sessionId}}/stop`;
+    if(isUnload){{
+      try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}
+    }}else{{
+      try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}
+    }}
+  }}
+
+  function showUnavailable(){{
+    stopPolling();
+    setStatus('Live view unavailable right now.');
+    retryButton.hidden=false;
+  }}
+
+  async function pollPlaylist(deadline){{
+    if(stopped)return;
+    if(Date.now()>deadline){{showUnavailable();return}}
+    let response=null;
+    try{{response=await fetch(playlistUrl,{{cache:'no-store'}})}}catch(e){{}}
+    if(response&&response.ok){{
+      const text=await response.text();
+      if(text.includes('#EXTINF')){{attachPlayer();return}}
+    }}else if(response&&[403,404,409,503].includes(response.status)){{
+      // Structural failures never resolve by polling longer -- stop
+      // immediately rather than waiting out the full timeout.
+      showUnavailable();return;
+    }}
+    pollTimer=setTimeout(()=>pollPlaylist(deadline),pollIntervalMs);
+  }}
+
+  function handleFatalError(data){{
+    // Fatal-error recovery (2026-09-13): confirmed live -- a brief,
+    // already-self-healing relay/upload gap (the same transient-blip
+    // category documented elsewhere in this project) briefly starved
+    // this camera's manifest, hls.js surfaced that as a fatal error, and
+    // the ONLY thing that used to happen here was setStatus('Reconnecting…')
+    // -- a label change with no actual recovery action, so the player
+    // stayed dead forever even once the underlying stream had fully
+    // recovered server-side. NETWORK_ERROR/MEDIA_ERROR get hls.js's own
+    // documented in-place recovery calls first (bounded by
+    // MAX_INPLACE_RECOVERY_ATTEMPTS, reset on the next successful
+    // MANIFEST_PARSED, so a persistently broken stream doesn't retry
+    // forever in place); anything else -- or exhausting those attempts --
+    // falls back to a full teardown and reattachment through the exact
+    // same bounded playlist-poll flow a fresh page load already uses.
+    // The still-valid live_view_session/relay is never restarted here --
+    // only the browser-side player -- and pollPlaylist's own
+    // pollTimeoutMs deadline is what eventually shows "unavailable" if
+    // the stream genuinely never returns, so no separate give-up path is
+    // needed in this function.
+    if(stopped)return;
+    recoveryAttempts++;
+    if(recoveryAttempts<=MAX_INPLACE_RECOVERY_ATTEMPTS){{
+      setStatus('Reconnecting…');
+      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();return}}
+      if(data.type===Hls.ErrorTypes.MEDIA_ERROR){{hls.recoverMediaError();return}}
+    }}
+    destroyHls();
+    placeholder.hidden=false;
+    setStatus('Reconnecting…');
+    stopPolling();
+    pollPlaylist(Date.now()+pollTimeoutMs);
+  }}
+
+  function attachPlayer(url,transport){{
+    url=url||playlistUrl;
+    transport=transport||'relay';
+    const claim=claimTransport(transport);
+    if(claim==='blocked'){{stopPolling();return}}  // a faster transport already won
+    stopPolling();
+    destroyHls();  // guards against ever running two instances at once
+    setStatus('Connecting…');
+    // Black-tile fix (2026-09-21): see the grid page's own attachPlayer()
+    // for the full root-cause comment -- MANIFEST_PARSED/loadedmetadata
+    // fire once the playlist is parsed, well before any frame has
+    // decoded, exposing the <video> element's own default black
+    // background. 'playing' only ever fires once a real frame is
+    // genuinely visible.
+    video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
+    if(window.Hls&&Hls.isSupported()){{
+      hls=new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{recoveryAttempts=0;video.play().catch(()=>{{}})}});
+      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(data)}});
+    }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
+      video.src=url;
+      video.addEventListener('loadedmetadata',()=>{{video.play().catch(()=>{{}})}});
+    }}else{{
+      setStatus('This browser cannot play live video.');
+    }}
+    if(claim==='claimed')reportLiveTransportOutcome(sessionId,transport,startedAt?Date.now()-startedAt:null,null);
+  }}
+
+  function attemptP2P(){{
+    window.attemptLiveP2P(sessionId).then(result=>{{
+      if(stopped){{try{{result.pc.close()}}catch(e){{}}return}}
+      const claim=claimTransport('p2p');
+      if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
+      stopPolling();
+      if(claim==='upgrade'){{
+        destroyHls();
+        video.removeAttribute('src');
+        try{{video.load()}}catch(e){{}}
+      }}
+      video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
+      video.srcObject=result.stream;
+      p2pConnection=result.pc;
+      video.play().catch(()=>{{}});
+      if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
+      window.watchLiveP2P(result.pc,()=>{{
+        if(stopped||p2pConnection!==result.pc)return;
+        p2pConnection=null;
+        video.srcObject=null;
+        transport=null;
+        placeholder.hidden=false;
+        setStatus('Reconnecting…');
+        pollPlaylist(Date.now()+pollTimeoutMs);
+      }});
+    }}).catch(()=>{{
+      // Disabled/timed out/ICE failed -- the relay poll already running in
+      // parallel is unaffected; resolves via relay or showUnavailable().
+    }});
+  }}
+
+  // Opportunistic fourth transport (2026-09-18): see the multi-camera
+  // grid page's own attemptWireGuardForTile() for the full rationale --
+  // identical shape here, reusing this page's own attachPlayer()/
+  // claimTransport() so error recovery and instrumentation stay
+  // identical to the relay path. Fire-and-forget: never awaited by
+  // startSession(), so it can never delay pollPlaylist()'s own relay
+  // attempt starting in the same tick.
+  async function attemptWireGuard(){{
+    let config;
+    try{{config=await(await fetch('/api/customer/live/wireguard/config')).json()}}catch(e){{return}}
+    if(!config||!config.enabled)return;
+    if(stopped||transport)return;
+    const wireguardUrl=`/api/customer/live/sessions/${{sessionId}}/wireguard/playlist.m3u8`;
+    let response;
+    try{{response=await fetch(wireguardUrl,{{cache:'no-store'}})}}catch(e){{return}}
+    if(!response||!response.ok)return;  // not enabled for this camera, or gateway/tunnel unavailable
+    if(stopped||transport)return;  // relay or P2P already won while this was in flight
+    attachPlayer(wireguardUrl,'wireguard');
+  }}
+
+  async function startSession(){{
+    stopped=false;recoveryAttempts=0;transport=null;startedAt=Date.now();retryButton.hidden=true;setStatus('Starting live view…');
+    let response;
+    try{{response=await fetch(startUrl,{{method:'POST'}})}}catch(e){{showUnavailable();return}}
+    if(!response.ok){{showUnavailable();return}}
+    const body=await response.json();
+    sessionId=body.session_id;
+    attemptP2P();
+    attemptWireGuard();
+    pollPlaylist(Date.now()+pollTimeoutMs);
+  }}
+
+  muteButton.addEventListener('click',()=>{{video.muted=!video.muted;muteButton.textContent=video.muted?'♪':'♫'}});
+  snapshotButton.addEventListener('click',()=>{{
+    try{{
+      if(!video.videoWidth)throw new Error('not ready');
+      const canvas=document.createElement('canvas');
+      canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+      canvas.getContext('2d').drawImage(video,0,0);
+      const link=document.createElement('a');
+      link.href=canvas.toDataURL('image/png');
+      link.download=`snapshot-${{Date.now()}}.png`;
+      document.body.appendChild(link);link.click();link.remove();
+    }}catch(e){{
+      comingSoon('Snapshot is not available for this stream right now');
+    }}
+  }});
+  // Frame fullscreen where the browser supports it; iPhone Safari only
+  // supports it on the <video> itself. Hidden when neither exists.
+  if(!cameraView.requestFullscreen&&!video.webkitEnterFullscreen)fullscreenButton.hidden=true;
+  fullscreenButton.addEventListener('click',()=>{{
+    if(document.fullscreenElement){{document.exitFullscreen().catch(()=>{{}});return}}
+    if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
+    else if(video.webkitEnterFullscreen)video.webkitEnterFullscreen();
+  }});
+  analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
+  stopButton.addEventListener('click',()=>{{stopPolling();destroyHls();stopSession(false)}});
+  retryButton.addEventListener('click',startSession);
+
+  // Real browser fullscreen (double-click on desktop, double-tap on
+  // touch) on the camera-view frame itself -- the grid's own tile
+  // double-click/double-tap navigates here instead of calling
+  // requestFullscreen() directly, so this Focused Live View page is
+  // the one place that capability lives. .catch(()=>{{}}) is
+  // deliberate: a browser that denies or lacks the Fullscreen API
+  // (e.g. iOS Safari on some elements) silently no-ops rather than
+  // surfacing an error -- the video keeps playing normally either way.
+  let lastVideoTap=0;
+  cameraView.addEventListener('dblclick',()=>{{if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}})}});
+  cameraView.addEventListener('touchend',()=>{{
+    const now=Date.now();
+    if(now-lastVideoTap<350&&cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
+    lastVideoTap=now;
+  }});
+
+  // Push-to-talk: press-and-hold only, real mic capture, no always-open
+  // duplex mode. This button already reflects the server-persisted
+  // capability (talk_down_supported) at page-render time; wireTalkMic()'s
+  // own start-session call still gets its own fresh rejection if
+  // authorization or capability has changed since the page loaded --
+  // never assumes render-time state still holds.
+  const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
+  wireTalkMic(talkButton, {json.dumps(camera_id)});
+
+  // Unlock Door: the button only exists in the DOM at all when this
+  // camera is door-enabled (see live_view_page()'s own unlock_tool_button
+  // gate above) -- null here just means "not a door camera".
+  const unlockButton=document.getElementById({json.dumps('unlock-door-' + camera_id)});
+  if(unlockButton)wireUnlockButton(unlockButton,{json.dumps(camera_id)});
+
+  // Camera Settings -- Face Access: this whole section only ever
+  // renders for identity.role==='customer_owner' (see live_view_page()'s
+  // own call site), so every element below is null for a customer_viewer
+  // and each handler is skipped rather than wired.
+  const doorEnabledCheckbox=document.getElementById('door-access-enabled');
+  const doorFields=document.getElementById('door-access-fields');
+  const doorRelayChannel=document.getElementById('door-relay-channel');
+  const doorRelayPulseSeconds=document.getElementById('door-relay-pulse-seconds');
+  const saveDoorAccessButton=document.getElementById('save-door-access');
+  if(doorEnabledCheckbox){{
+    doorEnabledCheckbox.addEventListener('change',()=>{{
+      doorFields.hidden=!doorEnabledCheckbox.checked;
+    }});
+  }}
+  if(saveDoorAccessButton){{
+    saveDoorAccessButton.addEventListener('click',async()=>{{
+      const enabled=doorEnabledCheckbox.checked;
+      const payload={{door_access_enabled:enabled}};
+      if(enabled){{
+        payload.door_relay_channel=parseInt(doorRelayChannel.value,10);
+        const secondsRaw=doorRelayPulseSeconds.value.trim();
+        const seconds=secondsRaw?Number(secondsRaw):{relay_control.DEFAULT_PULSE_MS}/1000;
+        if(!Number.isFinite(seconds)||seconds<=0||seconds>60){{showToast('Enter an unlock duration between 0.5 and 60 seconds.');return}}
+        payload.door_relay_pulse_ms=Math.round(seconds*1000);
+      }}
+      saveDoorAccessButton.disabled=true;
+      let response,data;
+      try{{
+        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config`,{{
+          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),
+        }});
+        data=await response.json().catch(()=>({{}}));
+      }}catch(e){{
+        saveDoorAccessButton.disabled=false;
+        showToast('Could not save Face Access settings.');
+        return;
+      }}
+      saveDoorAccessButton.disabled=false;
+      if(!response.ok){{showToast(data.detail||'Could not save Face Access settings.');return}}
+      showToast(data.message||'Face Access settings saved.');
+      setTimeout(()=>location.reload(),700);
+    }});
+  }}
+
+  // Viewer access ("who can press Unlock Door") -- only present at all
+  // when this camera is already door-configured (see
+  // _door_access_settings_panel()'s own guard), so a null
+  // saveUnlockAccessButton here just means "not a door yet", same
+  // pattern as every other optional element on this page.
+  const saveUnlockAccessButton=document.getElementById('save-unlock-access');
+  if(saveUnlockAccessButton){{
+    saveUnlockAccessButton.addEventListener('click',async()=>{{
+      const userIds=[...document.querySelectorAll('.unlock-viewer-toggle:checked')].map(box=>box.dataset.userId);
+      saveUnlockAccessButton.disabled=true;
+      let response,data;
+      try{{
+        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config/unlock-access`,{{
+          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_ids:userIds}}),
+        }});
+        data=await response.json().catch(()=>({{}}));
+      }}catch(e){{
+        saveUnlockAccessButton.disabled=false;
+        showToast('Could not save unlock access.');
+        return;
+      }}
+      saveUnlockAccessButton.disabled=false;
+      if(!response.ok){{showToast(data.detail||'Could not save unlock access.');return}}
+      showToast(data.message||'Unlock access saved.');
+    }});
+  }}
+
+  window.addEventListener('pagehide',()=>{{stopSession(true)}});
+
+  // Focused Live View's switchable analytics row (punch-list item 1).
+  // The video itself is never paused/reloaded by any of this -- switching
+  // pills only swaps the summary panel below it.
+  const analyticsSection=document.getElementById('live-analytics-section');
+  const analyticsPills=document.getElementById('live-analytics-pills');
+  const analyticsPanel=document.getElementById('live-analytics-panel');
+  let activeAnalytic=null;
+  let analyticsByKey={{}};
+
+  function renderUpgradeCard(key){{
+    const info=analyticsByKey[key].upgrade;
+    const benefits=info.benefits.map(item=>`<li>${{esc(item)}}</li>`).join('');
+    // Real actions only (2026-09-25): "View plans" opens My subscription;
+    // "Add to This Camera" (owners) calls the existing license-capped
+    // assignment route. No placeholder "coming soon" buttons.
+    const addButton=isOwner?`<button class="ghost-button" id="upgrade-add-${{key}}" type="button">Add to This Camera</button>`:'';
+    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{esc(info.description)}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><a class="action-button" href="/subscription-portal">View plans</a>${{addButton}}</div><p class="health-detail" id="upgrade-result-${{key}}" role="status" aria-live="polite"></p></div>`;
+    if(!isOwner)return;
+    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',async(event)=>{{
+      const button=event.currentTarget;
+      const result=document.getElementById(`upgrade-result-${{key}}`);
+      button.disabled=true;
+      result.textContent='Adding…';
+      try{{
+        const response=await fetch(`/api/customer/cameras/${{encodeURIComponent(cameraId)}}/analytics/${{encodeURIComponent(key)}}`,{{method:'POST',credentials:'same-origin'}});
+        const body=await response.json().catch(()=>({{}}));
+        if(!response.ok)throw new Error(typeof body.detail==='string'?body.detail:'This analytic could not be added to this camera.');
+        analyticsByKey[key].enabled=true;
+        const pill=[...analyticsPills.children].find(item=>item.dataset.key===key);
+        const badge=pill&&pill.querySelector('.pill');
+        if(badge)badge.remove();
+        selectAnalytic(key);
+      }}catch(error){{
+        result.textContent=error.message;
+        button.disabled=false;
+      }}
+    }});
+  }}
+
+  // Every value below comes from stored event data (appliance-reported
+  // event types, OCR'd plate text, names) -- always HTML-escaped before it
+  // is placed in innerHTML (2026-09-24).
+  function esc(value){{
+    return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
+  }}
+  function row(name,detail){{return `<div class="health-row"><span class="health-name">${{esc(name)}}</span><span class="health-detail">${{esc(detail)}}</span></div>`}}
+  // Customer-facing presentation of stored results (2026-09-25): friendly
+  // labels, viewer-local times, the event's own thumbnail and a link into
+  // Playback -- all from data the summary route already returns.
+  const EVENT_LABELS={{motion:'Motion detected',smart_motion:'Motion detected',person:'Person detected',vehicle:'Vehicle detected',car:'Car detected',truck:'Truck detected',bus:'Bus detected',motorcycle:'Motorcycle detected',bicycle:'Bicycle detected',intrusion:'Zone intrusion',line_crossing:'Line crossed',people_counting_in:'Person entered',people_counting_out:'Person left',people_counting:'People count updated',plate:'License plate read',lpr:'License plate read'}};
+  function eventLabel(type){{
+    const key=String(type||'').toLowerCase();
+    if(EVENT_LABELS[key])return EVENT_LABELS[key];
+    return key?key.replace(/_/g,' ').replace(/^./,ch=>ch.toUpperCase())+' detected':'Activity detected';
+  }}
+  function friendlyTime(ms,raw){{
+    let date=null;
+    if(typeof ms==='number')date=new Date(ms);
+    else if(raw){{const text=String(raw);date=new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(text)?text:text+'Z')}}
+    if(!date||isNaN(date.getTime()))return '';
+    const now=new Date();
+    const yesterday=new Date(now.getFullYear(),now.getMonth(),now.getDate()-1);
+    const time=date.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit',second:'2-digit'}});
+    if(date.toDateString()===now.toDateString())return `Today, ${{time}}`;
+    if(date.toDateString()===yesterday.toDateString())return `Yesterday, ${{time}}`;
+    const day=date.toLocaleDateString([],date.getFullYear()===now.getFullYear()?{{month:'short',day:'numeric'}}:{{month:'short',day:'numeric',year:'numeric'}});
+    return `${{day}}, ${{time}}`;
+  }}
+  function percent(value){{
+    if(value==null||value==='')return null;
+    const number=Number(value);
+    return Number.isFinite(number)?Math.round(number*100)+'%':null;
+  }}
+  function playbackHref(item){{
+    const camera=encodeURIComponent(cameraId);
+    if(item.event_id&&item.has_clip)return `/playback?camera=${{camera}}&event=${{encodeURIComponent(item.event_id)}}&autoplay=event`;
+    if(typeof item.timestamp_ms==='number')return `/playback?camera=${{camera}}&t=${{item.timestamp_ms}}&autoplay=event`;
+    return null;
+  }}
+  function eventRow(item,title,extra){{
+    item=item||{{}};
+    const href=playbackHref(item);
+    const thumb=item.has_thumbnail&&item.event_id
+      ? `<img class="analytics-thumb" src="/api/customer/events/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(item.event_id)}}/thumbnail" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`
+      : '<span class="analytics-thumb analytics-thumb--empty" aria-hidden="true">◴</span>';
+    const detail=[friendlyTime(item.timestamp_ms,item.timestamp),...(extra||[])].filter(Boolean).map(esc).join(' · ');
+    const action=href?`<span class="analytics-row-action">${{item.has_clip?'Play clip':'Open in Playback'}} <span aria-hidden="true">→</span></span>`:'';
+    const inner=`${{thumb}}<span class="analytics-row-text"><span class="health-name">${{esc(title)}}</span><span class="health-detail">${{detail}}</span></span>${{action}}`;
+    return href?`<a class="health-row analytics-event-row" href="${{esc(href)}}">${{inner}}</a>`:`<div class="health-row analytics-event-row">${{inner}}</div>`;
+  }}
+  function confidenceNote(item){{const value=percent(item&&item.confidence);return value?`${{value}} confidence`:null}}
+  function renderAnalyticsSummary(key,data){{
+    const recent=Array.isArray(data.recent)?data.recent:[];
+    const asOf=friendlyTime(data.latest_timestamp_ms,data.latest_timestamp)||'—';
+    if(key==='lpr'){{
+      // Plate text is read and kept on the appliance; the cloud receives
+      // the detection itself (time/confidence), not the plate number.
+      const plate=data.latest_plate||(recent.length?'Plate text is kept on the appliance':'No plates read yet');
+      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?percent(data.latest_confidence):'—')
+        +recent.slice(0,3).map(item=>eventRow(item,'License plate read',[item&&item.plate?`Plate ${{item.plate}}`:null,confidenceNote(item)])).join('');
+    }}else if(key==='people_counting'){{
+      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`)
+        +(data.latest_timestamp?row('Last activity',asOf):'')
+        +recent.slice(0,3).map(item=>eventRow(item,eventLabel(item&&item.event_type))).join('');
+    }}else if(key==='ppe'){{
+      const status=data.latest_status==='compliant'?'Compliant':data.latest_status==='violation'?'Violation':(data.latest_status||'No PPE events yet');
+      analyticsPanel.innerHTML=row('Latest status',status)+(data.latest_timestamp?row('As of',asOf):'')
+        +recent.slice(0,3).map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check')).join('');  // PPE stores no real confidence (0.0)
+    }}else if(key==='facial_recognition'){{
+      const rows=recent.slice(0,3).map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[item.state==='known'&&percent(item.confidence)?`${{percent(item.confidence)}} match`:null])).join('');
+      analyticsPanel.innerHTML=rows||row('','No face matches yet');
+    }}else{{
+      const rows=recent.slice(0,3).map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');
+      analyticsPanel.innerHTML=rows||row('','No motion, person or vehicle events yet');
+    }}
+    // The full, filterable history lives in the Analytics workspace;
+    // this camera page keeps a concise summary (2026-09-25).
+    analyticsPanel.insertAdjacentHTML('beforeend',`<a class="download analytics-view-all" href="/analytics?type=${{encodeURIComponent(key)}}&camera=${{encodeURIComponent(cameraId)}}">View Analytics for this camera <span aria-hidden="true">→</span></a>`);
+  }}
+
+  async function selectAnalytic(key){{
+    activeAnalytic=key;
+    [...analyticsPills.children].forEach(pill=>{{
+      const isActive=pill.dataset.key===key;
+      pill.classList.toggle('active',isActive);
+      pill.setAttribute('aria-selected',isActive?'true':'false');
+    }});
+    if(!analyticsByKey[key].enabled){{renderUpgradeCard(key);return}}
+    analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Loading…</span></div>';
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics/${{key}}/summary`);
+      if(!response.ok)throw new Error('summary request failed');
+      renderAnalyticsSummary(key,await response.json());
+    }}catch(e){{
+      analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Analytics data is temporarily unavailable.</span></div>';
+    }}
+  }}
+
+  async function loadEnabledAnalytics(){{
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics`);
+      if(!response.ok)return;
+      const {{analytics}}=await response.json();
+      if(!analytics.length)return;
+      analyticsByKey={{}};
+      analytics.forEach(item=>{{analyticsByKey[item.key]=item}});
+      // Every analytic always gets a pill -- enabled ones show real
+      // results, disabled ones show an upgrade card (punch-list:
+      // "no dead space, never leave the analytics section blank").
+      analyticsPills.innerHTML=analytics.map(item=>`<button type="button" class="filter" role="tab" data-key="${{item.key}}">${{item.label}}${{item.enabled?'':' <span class="pill wait" style="margin-left:4px">Upgrade</span>'}}</button>`).join('');
+      [...analyticsPills.children].forEach(pill=>pill.addEventListener('click',()=>selectAnalytic(pill.dataset.key)));
+      analyticsSection.hidden=false;
+      const firstEnabled=analytics.find(item=>item.enabled);
+      selectAnalytic((firstEnabled||analytics[0]).key);  // one panel active at a time, default to the first real analytic if any is enabled
+    }}catch(e){{}}
+  }}
+
+  async function checkCameraStatusThenStart(){{
+    try{{
+      const response=await fetch(`/api/customer/cameras/${{cameraId}}/status`);
+      if(response.ok){{
+        const {{state,message}}=await response.json();
+        if(state==='not_configured'){{setStatus(message||'Not configured');placeholder.hidden=false;return}}
+        if(state==='appliance_offline'){{setStatus(message||'Appliance offline');placeholder.hidden=false;return}}
+        // 'degraded' is a health warning (e.g. low disk), not an outage --
+        // the appliance is still heartbeating and relaying, so live view
+        // proceeds normally; the warning is only surfaced as a transient
+        // status line, never blocking startSession() below.
+        if(state==='degraded'){{setStatus(message||'Appliance health warning -- starting live view…')}}
+      }}
+    }}catch(e){{}}
+    startSession();
+  }}
+
+  checkCameraStatusThenStart();
+  loadEnabledAnalytics();
+}})();
+</script>'''
+
+    return panel_html, scripts
+
+
 def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     @app.get('/customer-live', response_class=HTMLResponse)
     def customer_live_landing(request: Request, appliance_id: str = ''):
@@ -1517,583 +2103,14 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             )
 
         camera_name = _camera_display_label(camera)
-        start_url = f'/api/customer/cameras/{camera_id}/live/start'
-        playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
-        talk_state = _talk_down_state(camera.get('talk_down_supported'))
-        talk_tooltip = talk_state['tooltip'] or 'Press and hold to talk'
-        # camera came from _authorized_camera()'s own `SELECT *`, so the
-        # door columns (added by the Face Access migration) are already
-        # present here with no extra query.
-        door_enabled = bool(camera.get('door_access_enabled'))
-        unlock_tool_button = (
-            f'<button class="camera-tool unlock-door" id="unlock-door-{escape(camera_id, quote=True)}" '
-            f'data-camera-id="{escape(camera_id, quote=True)}" title="Unlock door" aria-label="Unlock door">🔓</button>'
-            if door_enabled else ''
-        )
-
+        panel_html, scripts = camera_live_panel(camera, identity)
         content = (
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
-            + _intrusion_alarm_banner(request, camera_id, identity) +
-            f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic.active.live{{box-shadow:0 0 0 3px rgba(66,228,220,.45)}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
-            # Camera Hub mobile polish: on a narrow phone screen this
-            # row's ~10 tool buttons no longer force horizontal
-            # scrolling -- they wrap onto additional lines instead,
-            # every tool staying reachable without a sideways swipe.
-            f'@media(max-width:480px){{.camera-tools{{flex-wrap:wrap;overflow-x:visible}}}}'
-            f'</style>'
-            f'<section class="panel"><div class="camera-view" style="border-radius:10px">'
-            f'<video id="live-view-video" controls muted playsinline></video>'
-            f'<div class="camera-placeholder" id="live-view-placeholder">'
-            f'<span class="signal">◉</span>'
-            f'<strong id="live-view-status">Starting live view…</strong>'
-            f'<small>This can take a few seconds.</small></div></div>'
-            f'<div class="camera-tools" style="justify-content:center">'
-            f'<button class="camera-tool" id="live-view-mute" title="Mute" aria-label="Mute">♪</button>'
-            f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
-            f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
-            f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
-            f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot" aria-label="Snapshot">◉</button>'
-            # 2026-09-25: only controls that work. Download/Share/Bookmark were
-            # placeholders ("coming soon" / "use Playback") and are gone;
-            # Playback opens this camera's own recordings; Fullscreen exposes
-            # the fullscreen the frame already supported by double-click.
-            f'<button class="camera-tool" id="live-view-fullscreen" title="Fullscreen" aria-label="Fullscreen">⛶</button>'
-            f'<a class="camera-tool" href="/playback?camera={quote(camera_id)}" title="Playback" aria-label="Playback">◴</a>'
-            f'<button class="camera-tool" id="live-view-analytics" title="Analytics" aria-label="Analytics">⌕</button>'
-            f'<button class="camera-tool" id="live-view-stop" title="Stop" aria-label="Stop">◼</button>'
-            f'<button class="camera-tool" id="live-view-retry" title="Retry" aria-label="Retry" hidden>↻</button>'
-            f'{unlock_tool_button}'
-            f'</div></section>'
-            f'<style>.analytics-event-row{{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none;border-radius:8px}}'
-            f'a.analytics-event-row:hover,a.analytics-event-row:focus-visible{{background:rgba(67,209,204,.07);outline:none}}'
-            f'a.analytics-event-row:focus-visible{{box-shadow:0 0 0 2px var(--brand,#47d7ac)}}'
-            f'.analytics-thumb{{flex:0 0 auto;width:96px;height:54px;border-radius:6px;object-fit:cover;background:#0b1018}}'
-            f'.analytics-thumb--empty{{display:grid;place-items:center;color:var(--muted);font-size:18px}}'
-            f'.analytics-row-text{{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}}'
-            f'.analytics-row-action{{flex:0 0 auto;color:#8df0ea;font-size:12px;font-weight:700;white-space:nowrap}}'
-            f'.analytics-view-all{{display:inline-block;margin-top:12px}}'
-            f'@media(max-width:560px){{.analytics-thumb{{width:72px;height:40px}}.analytics-row-action{{font-size:0}}.analytics-row-action span{{font-size:16px}}}}</style>'
-            f'<section class="panel" style="margin-top:16px" id="live-analytics-section" hidden>'
-            f'<div class="panel-head"><div><h2>Analytics</h2></div></div>'
-            f'<div id="live-analytics-pills" class="filter-row" role="tablist" aria-label="Camera analytics"></div>'
-            f'<div id="live-analytics-panel" class="health-list"></div>'
-            f'</section>'
+            + _intrusion_alarm_banner(request, camera_id, identity)
+            + panel_html
             + (_door_access_settings_panel(camera, viewers) if identity.get('role') == 'customer_owner' else '')
         )
-
-        scripts = f'''<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script><script>{_TALK_MIC_JS}</script><script>{_UNLOCK_DOOR_JS}</script><script>{_P2P_JS}</script><script>
-(function(){{
-  const cameraId={json.dumps(camera_id)};
-  const isOwner={json.dumps(identity.get('role') == 'customer_owner')};
-  const startUrl={json.dumps(start_url)};
-  const playlistUrl={json.dumps(playlist_url)};
-  const pollIntervalMs={POLL_INTERVAL_MS};
-  const pollTimeoutMs={POLL_TIMEOUT_MS};
-  const video=document.getElementById('live-view-video');
-  const cameraView=document.querySelector('.camera-view');
-  const placeholder=document.getElementById('live-view-placeholder');
-  const statusLabel=document.getElementById('live-view-status');
-  const muteButton=document.getElementById('live-view-mute');
-  const snapshotButton=document.getElementById('live-view-snapshot');
-  const fullscreenButton=document.getElementById('live-view-fullscreen');
-  const analyticsButton=document.getElementById('live-view-analytics');
-  const stopButton=document.getElementById('live-view-stop');
-  const retryButton=document.getElementById('live-view-retry');
-  let sessionId=null, hls=null, pollTimer=null, stopped=false, recoveryAttempts=0;
-  let transport=null, p2pConnection=null, startedAt=null;
-  const MAX_INPLACE_RECOVERY_ATTEMPTS=3;
-
-  function setStatus(text){{statusLabel.textContent=text}}
-  function stopPolling(){{if(pollTimer){{clearTimeout(pollTimer);pollTimer=null}}}}
-  function destroyHls(){{if(hls){{try{{hls.destroy()}}catch(e){{}}hls=null}}}}
-
-  // Same claim semantics as the multi-camera grid page (live_view_p2p.py's
-  // module docstring): 'claimed' the first time a transport wins (report
-  // once), 'already' on that transport's own later reconnect, 'blocked'
-  // for the transport that lost the race.
-  // P2P UPGRADE: same rule as the grid page's claimTransport() -- P2P may
-  // take over from relay/WireGuard; nothing else displaces a winner.
-  function claimTransport(t){{
-    if(transport===t)return'already';
-    if(transport){{
-      if(t==='p2p'&&(transport==='relay'||transport==='wireguard')){{transport='p2p';return'upgrade'}}
-      return'blocked';
-    }}
-    transport=t;
-    return'claimed';
-  }}
-
-  async function stopSession(isUnload){{
-    if(!sessionId||stopped)return;
-    stopped=true;
-    if(p2pConnection){{try{{p2pConnection.close()}}catch(e){{}}p2pConnection=null}}
-    const url=`/api/customer/live/sessions/${{sessionId}}/stop`;
-    if(isUnload){{
-      try{{fetch(url,{{method:'POST',keepalive:true}})}}catch(e){{}}
-    }}else{{
-      try{{await fetch(url,{{method:'POST'}})}}catch(e){{}}
-    }}
-  }}
-
-  function showUnavailable(){{
-    stopPolling();
-    setStatus('Live view unavailable right now.');
-    retryButton.hidden=false;
-  }}
-
-  async function pollPlaylist(deadline){{
-    if(stopped)return;
-    if(Date.now()>deadline){{showUnavailable();return}}
-    let response=null;
-    try{{response=await fetch(playlistUrl,{{cache:'no-store'}})}}catch(e){{}}
-    if(response&&response.ok){{
-      const text=await response.text();
-      if(text.includes('#EXTINF')){{attachPlayer();return}}
-    }}else if(response&&[403,404,409,503].includes(response.status)){{
-      // Structural failures never resolve by polling longer -- stop
-      // immediately rather than waiting out the full timeout.
-      showUnavailable();return;
-    }}
-    pollTimer=setTimeout(()=>pollPlaylist(deadline),pollIntervalMs);
-  }}
-
-  function handleFatalError(data){{
-    // Fatal-error recovery (2026-09-13): confirmed live -- a brief,
-    // already-self-healing relay/upload gap (the same transient-blip
-    // category documented elsewhere in this project) briefly starved
-    // this camera's manifest, hls.js surfaced that as a fatal error, and
-    // the ONLY thing that used to happen here was setStatus('Reconnecting…')
-    // -- a label change with no actual recovery action, so the player
-    // stayed dead forever even once the underlying stream had fully
-    // recovered server-side. NETWORK_ERROR/MEDIA_ERROR get hls.js's own
-    // documented in-place recovery calls first (bounded by
-    // MAX_INPLACE_RECOVERY_ATTEMPTS, reset on the next successful
-    // MANIFEST_PARSED, so a persistently broken stream doesn't retry
-    // forever in place); anything else -- or exhausting those attempts --
-    // falls back to a full teardown and reattachment through the exact
-    // same bounded playlist-poll flow a fresh page load already uses.
-    // The still-valid live_view_session/relay is never restarted here --
-    // only the browser-side player -- and pollPlaylist's own
-    // pollTimeoutMs deadline is what eventually shows "unavailable" if
-    // the stream genuinely never returns, so no separate give-up path is
-    // needed in this function.
-    if(stopped)return;
-    recoveryAttempts++;
-    if(recoveryAttempts<=MAX_INPLACE_RECOVERY_ATTEMPTS){{
-      setStatus('Reconnecting…');
-      if(data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();return}}
-      if(data.type===Hls.ErrorTypes.MEDIA_ERROR){{hls.recoverMediaError();return}}
-    }}
-    destroyHls();
-    placeholder.hidden=false;
-    setStatus('Reconnecting…');
-    stopPolling();
-    pollPlaylist(Date.now()+pollTimeoutMs);
-  }}
-
-  function attachPlayer(url,transport){{
-    url=url||playlistUrl;
-    transport=transport||'relay';
-    const claim=claimTransport(transport);
-    if(claim==='blocked'){{stopPolling();return}}  // a faster transport already won
-    stopPolling();
-    destroyHls();  // guards against ever running two instances at once
-    setStatus('Connecting…');
-    // Black-tile fix (2026-09-21): see the grid page's own attachPlayer()
-    // for the full root-cause comment -- MANIFEST_PARSED/loadedmetadata
-    // fire once the playlist is parsed, well before any frame has
-    // decoded, exposing the <video> element's own default black
-    // background. 'playing' only ever fires once a real frame is
-    // genuinely visible.
-    video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
-    if(window.Hls&&Hls.isSupported()){{
-      hls=new Hls();
-      hls.loadSource(url);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED,()=>{{recoveryAttempts=0;video.play().catch(()=>{{}})}});
-      hls.on(Hls.Events.ERROR,(_,data)=>{{if(data.fatal)handleFatalError(data)}});
-    }}else if(video.canPlayType('application/vnd.apple.mpegurl')){{
-      video.src=url;
-      video.addEventListener('loadedmetadata',()=>{{video.play().catch(()=>{{}})}});
-    }}else{{
-      setStatus('This browser cannot play live video.');
-    }}
-    if(claim==='claimed')reportLiveTransportOutcome(sessionId,transport,startedAt?Date.now()-startedAt:null,null);
-  }}
-
-  function attemptP2P(){{
-    window.attemptLiveP2P(sessionId).then(result=>{{
-      if(stopped){{try{{result.pc.close()}}catch(e){{}}return}}
-      const claim=claimTransport('p2p');
-      if(claim==='blocked'){{try{{result.pc.close()}}catch(e){{}}return}}
-      stopPolling();
-      if(claim==='upgrade'){{
-        destroyHls();
-        video.removeAttribute('src');
-        try{{video.load()}}catch(e){{}}
-      }}
-      video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
-      video.srcObject=result.stream;
-      p2pConnection=result.pc;
-      video.play().catch(()=>{{}});
-      if(claim==='claimed'||claim==='upgrade')reportLiveTransportOutcome(sessionId,'p2p',result.connect_ms,null);
-      window.watchLiveP2P(result.pc,()=>{{
-        if(stopped||p2pConnection!==result.pc)return;
-        p2pConnection=null;
-        video.srcObject=null;
-        transport=null;
-        placeholder.hidden=false;
-        setStatus('Reconnecting…');
-        pollPlaylist(Date.now()+pollTimeoutMs);
-      }});
-    }}).catch(()=>{{
-      // Disabled/timed out/ICE failed -- the relay poll already running in
-      // parallel is unaffected; resolves via relay or showUnavailable().
-    }});
-  }}
-
-  // Opportunistic fourth transport (2026-09-18): see the multi-camera
-  // grid page's own attemptWireGuardForTile() for the full rationale --
-  // identical shape here, reusing this page's own attachPlayer()/
-  // claimTransport() so error recovery and instrumentation stay
-  // identical to the relay path. Fire-and-forget: never awaited by
-  // startSession(), so it can never delay pollPlaylist()'s own relay
-  // attempt starting in the same tick.
-  async function attemptWireGuard(){{
-    let config;
-    try{{config=await(await fetch('/api/customer/live/wireguard/config')).json()}}catch(e){{return}}
-    if(!config||!config.enabled)return;
-    if(stopped||transport)return;
-    const wireguardUrl=`/api/customer/live/sessions/${{sessionId}}/wireguard/playlist.m3u8`;
-    let response;
-    try{{response=await fetch(wireguardUrl,{{cache:'no-store'}})}}catch(e){{return}}
-    if(!response||!response.ok)return;  // not enabled for this camera, or gateway/tunnel unavailable
-    if(stopped||transport)return;  // relay or P2P already won while this was in flight
-    attachPlayer(wireguardUrl,'wireguard');
-  }}
-
-  async function startSession(){{
-    stopped=false;recoveryAttempts=0;transport=null;startedAt=Date.now();retryButton.hidden=true;setStatus('Starting live view…');
-    let response;
-    try{{response=await fetch(startUrl,{{method:'POST'}})}}catch(e){{showUnavailable();return}}
-    if(!response.ok){{showUnavailable();return}}
-    const body=await response.json();
-    sessionId=body.session_id;
-    attemptP2P();
-    attemptWireGuard();
-    pollPlaylist(Date.now()+pollTimeoutMs);
-  }}
-
-  muteButton.addEventListener('click',()=>{{video.muted=!video.muted;muteButton.textContent=video.muted?'♪':'♫'}});
-  snapshotButton.addEventListener('click',()=>{{
-    try{{
-      if(!video.videoWidth)throw new Error('not ready');
-      const canvas=document.createElement('canvas');
-      canvas.width=video.videoWidth;canvas.height=video.videoHeight;
-      canvas.getContext('2d').drawImage(video,0,0);
-      const link=document.createElement('a');
-      link.href=canvas.toDataURL('image/png');
-      link.download=`snapshot-${{Date.now()}}.png`;
-      document.body.appendChild(link);link.click();link.remove();
-    }}catch(e){{
-      comingSoon('Snapshot is not available for this stream right now');
-    }}
-  }});
-  // Frame fullscreen where the browser supports it; iPhone Safari only
-  // supports it on the <video> itself. Hidden when neither exists.
-  if(!cameraView.requestFullscreen&&!video.webkitEnterFullscreen)fullscreenButton.hidden=true;
-  fullscreenButton.addEventListener('click',()=>{{
-    if(document.fullscreenElement){{document.exitFullscreen().catch(()=>{{}});return}}
-    if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
-    else if(video.webkitEnterFullscreen)video.webkitEnterFullscreen();
-  }});
-  analyticsButton.addEventListener('click',()=>{{document.getElementById('live-analytics-section').scrollIntoView({{behavior:'smooth',block:'nearest'}})}});
-  stopButton.addEventListener('click',()=>{{stopPolling();destroyHls();stopSession(false)}});
-  retryButton.addEventListener('click',startSession);
-
-  // Real browser fullscreen (double-click on desktop, double-tap on
-  // touch) on the camera-view frame itself -- the grid's own tile
-  // double-click/double-tap navigates here instead of calling
-  // requestFullscreen() directly, so this Focused Live View page is
-  // the one place that capability lives. .catch(()=>{{}}) is
-  // deliberate: a browser that denies or lacks the Fullscreen API
-  // (e.g. iOS Safari on some elements) silently no-ops rather than
-  // surfacing an error -- the video keeps playing normally either way.
-  let lastVideoTap=0;
-  cameraView.addEventListener('dblclick',()=>{{if(cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}})}});
-  cameraView.addEventListener('touchend',()=>{{
-    const now=Date.now();
-    if(now-lastVideoTap<350&&cameraView.requestFullscreen)cameraView.requestFullscreen().catch(()=>{{}});
-    lastVideoTap=now;
-  }});
-
-  // Push-to-talk: press-and-hold only, real mic capture, no always-open
-  // duplex mode. This button already reflects the server-persisted
-  // capability (talk_down_supported) at page-render time; wireTalkMic()'s
-  // own start-session call still gets its own fresh rejection if
-  // authorization or capability has changed since the page loaded --
-  // never assumes render-time state still holds.
-  const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
-  wireTalkMic(talkButton, {json.dumps(camera_id)});
-
-  // Unlock Door: the button only exists in the DOM at all when this
-  // camera is door-enabled (see live_view_page()'s own unlock_tool_button
-  // gate above) -- null here just means "not a door camera".
-  const unlockButton=document.getElementById({json.dumps('unlock-door-' + camera_id)});
-  if(unlockButton)wireUnlockButton(unlockButton,{json.dumps(camera_id)});
-
-  // Camera Settings -- Face Access: this whole section only ever
-  // renders for identity.role==='customer_owner' (see live_view_page()'s
-  // own call site), so every element below is null for a customer_viewer
-  // and each handler is skipped rather than wired.
-  const doorEnabledCheckbox=document.getElementById('door-access-enabled');
-  const doorFields=document.getElementById('door-access-fields');
-  const doorRelayChannel=document.getElementById('door-relay-channel');
-  const doorRelayPulseSeconds=document.getElementById('door-relay-pulse-seconds');
-  const saveDoorAccessButton=document.getElementById('save-door-access');
-  if(doorEnabledCheckbox){{
-    doorEnabledCheckbox.addEventListener('change',()=>{{
-      doorFields.hidden=!doorEnabledCheckbox.checked;
-    }});
-  }}
-  if(saveDoorAccessButton){{
-    saveDoorAccessButton.addEventListener('click',async()=>{{
-      const enabled=doorEnabledCheckbox.checked;
-      const payload={{door_access_enabled:enabled}};
-      if(enabled){{
-        payload.door_relay_channel=parseInt(doorRelayChannel.value,10);
-        const secondsRaw=doorRelayPulseSeconds.value.trim();
-        const seconds=secondsRaw?Number(secondsRaw):{relay_control.DEFAULT_PULSE_MS}/1000;
-        if(!Number.isFinite(seconds)||seconds<=0||seconds>60){{showToast('Enter an unlock duration between 0.5 and 60 seconds.');return}}
-        payload.door_relay_pulse_ms=Math.round(seconds*1000);
-      }}
-      saveDoorAccessButton.disabled=true;
-      let response,data;
-      try{{
-        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config`,{{
-          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload),
-        }});
-        data=await response.json().catch(()=>({{}}));
-      }}catch(e){{
-        saveDoorAccessButton.disabled=false;
-        showToast('Could not save Face Access settings.');
-        return;
-      }}
-      saveDoorAccessButton.disabled=false;
-      if(!response.ok){{showToast(data.detail||'Could not save Face Access settings.');return}}
-      showToast(data.message||'Face Access settings saved.');
-      setTimeout(()=>location.reload(),700);
-    }});
-  }}
-
-  // Viewer access ("who can press Unlock Door") -- only present at all
-  // when this camera is already door-configured (see
-  // _door_access_settings_panel()'s own guard), so a null
-  // saveUnlockAccessButton here just means "not a door yet", same
-  // pattern as every other optional element on this page.
-  const saveUnlockAccessButton=document.getElementById('save-unlock-access');
-  if(saveUnlockAccessButton){{
-    saveUnlockAccessButton.addEventListener('click',async()=>{{
-      const userIds=[...document.querySelectorAll('.unlock-viewer-toggle:checked')].map(box=>box.dataset.userId);
-      saveUnlockAccessButton.disabled=true;
-      let response,data;
-      try{{
-        response=await fetch(`/api/customer/cameras/${{cameraId}}/door-config/unlock-access`,{{
-          method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{user_ids:userIds}}),
-        }});
-        data=await response.json().catch(()=>({{}}));
-      }}catch(e){{
-        saveUnlockAccessButton.disabled=false;
-        showToast('Could not save unlock access.');
-        return;
-      }}
-      saveUnlockAccessButton.disabled=false;
-      if(!response.ok){{showToast(data.detail||'Could not save unlock access.');return}}
-      showToast(data.message||'Unlock access saved.');
-    }});
-  }}
-
-  window.addEventListener('pagehide',()=>{{stopSession(true)}});
-
-  // Focused Live View's switchable analytics row (punch-list item 1).
-  // The video itself is never paused/reloaded by any of this -- switching
-  // pills only swaps the summary panel below it.
-  const analyticsSection=document.getElementById('live-analytics-section');
-  const analyticsPills=document.getElementById('live-analytics-pills');
-  const analyticsPanel=document.getElementById('live-analytics-panel');
-  let activeAnalytic=null;
-  let analyticsByKey={{}};
-
-  function renderUpgradeCard(key){{
-    const info=analyticsByKey[key].upgrade;
-    const benefits=info.benefits.map(item=>`<li>${{esc(item)}}</li>`).join('');
-    // Real actions only (2026-09-25): "View plans" opens My subscription;
-    // "Add to This Camera" (owners) calls the existing license-capped
-    // assignment route. No placeholder "coming soon" buttons.
-    const addButton=isOwner?`<button class="ghost-button" id="upgrade-add-${{key}}" type="button">Add to This Camera</button>`:'';
-    analyticsPanel.innerHTML=`<div class="upgrade-card"><span class="pill wait">Not enabled on this camera</span><p class="health-detail">${{esc(info.description)}}</p><ul style="margin:8px 0 12px 18px;padding:0">${{benefits}}</ul><div class="dialog-actions"><a class="action-button" href="/subscription-portal">View plans</a>${{addButton}}</div><p class="health-detail" id="upgrade-result-${{key}}" role="status" aria-live="polite"></p></div>`;
-    if(!isOwner)return;
-    document.getElementById(`upgrade-add-${{key}}`).addEventListener('click',async(event)=>{{
-      const button=event.currentTarget;
-      const result=document.getElementById(`upgrade-result-${{key}}`);
-      button.disabled=true;
-      result.textContent='Adding…';
-      try{{
-        const response=await fetch(`/api/customer/cameras/${{encodeURIComponent(cameraId)}}/analytics/${{encodeURIComponent(key)}}`,{{method:'POST',credentials:'same-origin'}});
-        const body=await response.json().catch(()=>({{}}));
-        if(!response.ok)throw new Error(typeof body.detail==='string'?body.detail:'This analytic could not be added to this camera.');
-        analyticsByKey[key].enabled=true;
-        const pill=[...analyticsPills.children].find(item=>item.dataset.key===key);
-        const badge=pill&&pill.querySelector('.pill');
-        if(badge)badge.remove();
-        selectAnalytic(key);
-      }}catch(error){{
-        result.textContent=error.message;
-        button.disabled=false;
-      }}
-    }});
-  }}
-
-  // Every value below comes from stored event data (appliance-reported
-  // event types, OCR'd plate text, names) -- always HTML-escaped before it
-  // is placed in innerHTML (2026-09-24).
-  function esc(value){{
-    return String(value==null?'':value).replace(/[&<>"']/g,ch=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]);
-  }}
-  function row(name,detail){{return `<div class="health-row"><span class="health-name">${{esc(name)}}</span><span class="health-detail">${{esc(detail)}}</span></div>`}}
-  // Customer-facing presentation of stored results (2026-09-25): friendly
-  // labels, viewer-local times, the event's own thumbnail and a link into
-  // Playback -- all from data the summary route already returns.
-  const EVENT_LABELS={{motion:'Motion detected',smart_motion:'Motion detected',person:'Person detected',vehicle:'Vehicle detected',car:'Car detected',truck:'Truck detected',bus:'Bus detected',motorcycle:'Motorcycle detected',bicycle:'Bicycle detected',intrusion:'Zone intrusion',line_crossing:'Line crossed',people_counting_in:'Person entered',people_counting_out:'Person left',people_counting:'People count updated',plate:'License plate read',lpr:'License plate read'}};
-  function eventLabel(type){{
-    const key=String(type||'').toLowerCase();
-    if(EVENT_LABELS[key])return EVENT_LABELS[key];
-    return key?key.replace(/_/g,' ').replace(/^./,ch=>ch.toUpperCase())+' detected':'Activity detected';
-  }}
-  function friendlyTime(ms,raw){{
-    let date=null;
-    if(typeof ms==='number')date=new Date(ms);
-    else if(raw){{const text=String(raw);date=new Date(/[zZ]$|[+-][0-9][0-9]:?[0-9][0-9]$/.test(text)?text:text+'Z')}}
-    if(!date||isNaN(date.getTime()))return '';
-    const now=new Date();
-    const yesterday=new Date(now.getFullYear(),now.getMonth(),now.getDate()-1);
-    const time=date.toLocaleTimeString([],{{hour:'numeric',minute:'2-digit',second:'2-digit'}});
-    if(date.toDateString()===now.toDateString())return `Today, ${{time}}`;
-    if(date.toDateString()===yesterday.toDateString())return `Yesterday, ${{time}}`;
-    const day=date.toLocaleDateString([],date.getFullYear()===now.getFullYear()?{{month:'short',day:'numeric'}}:{{month:'short',day:'numeric',year:'numeric'}});
-    return `${{day}}, ${{time}}`;
-  }}
-  function percent(value){{
-    if(value==null||value==='')return null;
-    const number=Number(value);
-    return Number.isFinite(number)?Math.round(number*100)+'%':null;
-  }}
-  function playbackHref(item){{
-    const camera=encodeURIComponent(cameraId);
-    if(item.event_id&&item.has_clip)return `/playback?camera=${{camera}}&event=${{encodeURIComponent(item.event_id)}}&autoplay=event`;
-    if(typeof item.timestamp_ms==='number')return `/playback?camera=${{camera}}&t=${{item.timestamp_ms}}&autoplay=event`;
-    return null;
-  }}
-  function eventRow(item,title,extra){{
-    item=item||{{}};
-    const href=playbackHref(item);
-    const thumb=item.has_thumbnail&&item.event_id
-      ? `<img class="analytics-thumb" src="/api/customer/events/${{encodeURIComponent(cameraId)}}/${{encodeURIComponent(item.event_id)}}/thumbnail" alt="" loading="lazy" onerror="this.style.visibility='hidden'">`
-      : '<span class="analytics-thumb analytics-thumb--empty" aria-hidden="true">◴</span>';
-    const detail=[friendlyTime(item.timestamp_ms,item.timestamp),...(extra||[])].filter(Boolean).map(esc).join(' · ');
-    const action=href?`<span class="analytics-row-action">${{item.has_clip?'Play clip':'Open in Playback'}} <span aria-hidden="true">→</span></span>`:'';
-    const inner=`${{thumb}}<span class="analytics-row-text"><span class="health-name">${{esc(title)}}</span><span class="health-detail">${{detail}}</span></span>${{action}}`;
-    return href?`<a class="health-row analytics-event-row" href="${{esc(href)}}">${{inner}}</a>`:`<div class="health-row analytics-event-row">${{inner}}</div>`;
-  }}
-  function confidenceNote(item){{const value=percent(item&&item.confidence);return value?`${{value}} confidence`:null}}
-  function renderAnalyticsSummary(key,data){{
-    const recent=Array.isArray(data.recent)?data.recent:[];
-    const asOf=friendlyTime(data.latest_timestamp_ms,data.latest_timestamp)||'—';
-    if(key==='lpr'){{
-      // Plate text is read and kept on the appliance; the cloud receives
-      // the detection itself (time/confidence), not the plate number.
-      const plate=data.latest_plate||(recent.length?'Plate text is kept on the appliance':'No plates read yet');
-      analyticsPanel.innerHTML=row('Latest plate',plate)+row('Confidence',data.latest_confidence!=null?percent(data.latest_confidence):'—')
-        +recent.slice(0,3).map(item=>eventRow(item,'License plate read',[item&&item.plate?`Plate ${{item.plate}}`:null,confidenceNote(item)])).join('');
-    }}else if(key==='people_counting'){{
-      analyticsPanel.innerHTML=row('Currently inside (est.)',data.latest_count!=null?data.latest_count:'No counts yet')+row('Entries / exits (recent)',`${{data.entries!=null?data.entries:'—'}} / ${{data.exits!=null?data.exits:'—'}}`)
-        +(data.latest_timestamp?row('Last activity',asOf):'')
-        +recent.slice(0,3).map(item=>eventRow(item,eventLabel(item&&item.event_type))).join('');
-    }}else if(key==='ppe'){{
-      const status=data.latest_status==='compliant'?'Compliant':data.latest_status==='violation'?'Violation':(data.latest_status||'No PPE events yet');
-      analyticsPanel.innerHTML=row('Latest status',status)+(data.latest_timestamp?row('As of',asOf):'')
-        +recent.slice(0,3).map(item=>eventRow(item,item&&item.status==='compliant'?'PPE compliant':item&&item.status==='violation'?'PPE violation':'PPE check')).join('');  // PPE stores no real confidence (0.0)
-    }}else if(key==='facial_recognition'){{
-      const rows=recent.slice(0,3).map(item=>eventRow(item,item.person||(item.state==='unknown'?'Unknown person':item.state==='known'?'Known person':'Face detected'),[item.state==='known'&&percent(item.confidence)?`${{percent(item.confidence)}} match`:null])).join('');
-      analyticsPanel.innerHTML=rows||row('','No face matches yet');
-    }}else{{
-      const rows=recent.slice(0,3).map(item=>eventRow(item,eventLabel(item.event_type),[confidenceNote(item)])).join('');
-      analyticsPanel.innerHTML=rows||row('','No motion, person or vehicle events yet');
-    }}
-    // The full, filterable history lives in the Analytics workspace;
-    // this camera page keeps a concise summary (2026-09-25).
-    analyticsPanel.insertAdjacentHTML('beforeend',`<a class="download analytics-view-all" href="/analytics?type=${{encodeURIComponent(key)}}&camera=${{encodeURIComponent(cameraId)}}">View Analytics for this camera <span aria-hidden="true">→</span></a>`);
-  }}
-
-  async function selectAnalytic(key){{
-    activeAnalytic=key;
-    [...analyticsPills.children].forEach(pill=>{{
-      const isActive=pill.dataset.key===key;
-      pill.classList.toggle('active',isActive);
-      pill.setAttribute('aria-selected',isActive?'true':'false');
-    }});
-    if(!analyticsByKey[key].enabled){{renderUpgradeCard(key);return}}
-    analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Loading…</span></div>';
-    try{{
-      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics/${{key}}/summary`);
-      if(!response.ok)throw new Error('summary request failed');
-      renderAnalyticsSummary(key,await response.json());
-    }}catch(e){{
-      analyticsPanel.innerHTML='<div class="health-row"><span class="health-detail">Analytics data is temporarily unavailable.</span></div>';
-    }}
-  }}
-
-  async function loadEnabledAnalytics(){{
-    try{{
-      const response=await fetch(`/api/customer/cameras/${{cameraId}}/analytics`);
-      if(!response.ok)return;
-      const {{analytics}}=await response.json();
-      if(!analytics.length)return;
-      analyticsByKey={{}};
-      analytics.forEach(item=>{{analyticsByKey[item.key]=item}});
-      // Every analytic always gets a pill -- enabled ones show real
-      // results, disabled ones show an upgrade card (punch-list:
-      // "no dead space, never leave the analytics section blank").
-      analyticsPills.innerHTML=analytics.map(item=>`<button type="button" class="filter" role="tab" data-key="${{item.key}}">${{item.label}}${{item.enabled?'':' <span class="pill wait" style="margin-left:4px">Upgrade</span>'}}</button>`).join('');
-      [...analyticsPills.children].forEach(pill=>pill.addEventListener('click',()=>selectAnalytic(pill.dataset.key)));
-      analyticsSection.hidden=false;
-      const firstEnabled=analytics.find(item=>item.enabled);
-      selectAnalytic((firstEnabled||analytics[0]).key);  // one panel active at a time, default to the first real analytic if any is enabled
-    }}catch(e){{}}
-  }}
-
-  async function checkCameraStatusThenStart(){{
-    try{{
-      const response=await fetch(`/api/customer/cameras/${{cameraId}}/status`);
-      if(response.ok){{
-        const {{state,message}}=await response.json();
-        if(state==='not_configured'){{setStatus(message||'Not configured');placeholder.hidden=false;return}}
-        if(state==='appliance_offline'){{setStatus(message||'Appliance offline');placeholder.hidden=false;return}}
-        // 'degraded' is a health warning (e.g. low disk), not an outage --
-        // the appliance is still heartbeating and relaying, so live view
-        // proceeds normally; the warning is only surfaced as a transient
-        // status line, never blocking startSession() below.
-        if(state==='degraded'){{setStatus(message||'Appliance health warning -- starting live view…')}}
-      }}
-    }}catch(e){{}}
-    startSession();
-  }}
-
-  checkCameraStatusThenStart();
-  loadEnabledAnalytics();
-}})();
-</script>'''
 
         return page_shell(f'Live view · {camera_name}', 'live', content, scripts)
