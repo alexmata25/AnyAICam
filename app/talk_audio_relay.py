@@ -118,6 +118,118 @@ def camera_auth_cooldown_remaining(camera_id: str | None) -> int:
     return int(remaining) + 1
 
 
+
+# ---------------------------------------------------------------- ISAPI talk upload (2026-09-27)
+
+class IsapiUploadRejected(RuntimeError):
+    def __init__(self, status_code: int):
+        super().__init__(f"camera audioData returned HTTP {status_code}")
+        self.status_code = status_code
+
+
+class _IsapiAudioUpload:
+    """An accepted audioData upload: raw G.711 bytes go straight onto the
+    camera's TCP connection (no HTTP chunk framing)."""
+
+    def __init__(self, sock, status_code):
+        self._sock = sock
+        self.status_code = status_code  # None: the camera sent no immediate reply
+
+    def sendall(self, data: bytes) -> None:
+        self._sock.sendall(data)
+
+    def close(self) -> None:
+        import socket as _socket
+
+        try:
+            self._sock.shutdown(_socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+
+
+def _read_http_head(sock, timeout: float):
+    """(status, lowercase headers) of one HTTP response; its body is read
+    and discarded when it has a Content-Length."""
+    sock.settimeout(timeout)
+    data = b""
+    while b"\r\n\r\n" not in data:
+        piece = sock.recv(4096)
+        if not piece:
+            raise ConnectionError("camera closed the connection")
+        data += piece
+        if len(data) > 65536:
+            raise ConnectionError("oversized camera response")
+    head, _, rest = data.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    remaining = int(headers.get("content-length") or 0) - len(rest)
+    while remaining > 0:
+        piece = sock.recv(min(remaining, 4096))
+        if not piece:
+            break
+        remaining -= len(piece)
+    return status, headers
+
+
+def _send_audio_put(sock, host: str, path: str, authorization: str | None = None) -> None:
+    lines = [
+        f"PUT {path} HTTP/1.1",
+        f"Host: {host}",
+        "Content-Type: application/octet-stream",
+        "Content-Length: 0",
+        "Connection: keep-alive",
+    ]
+    if authorization:
+        lines.append(f"Authorization: {authorization}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+
+
+def open_isapi_audio_upload(host: str, path: str, username: str, password: str, *, timeout: float = 5.0) -> _IsapiAudioUpload:
+    """Start an ISAPI two-way-audio upload the way cameras accept it:
+    PUT <path> with Content-Length: 0 (digest-authenticated; the one 401
+    challenge is the normal digest handshake, not a failed login), then
+    the caller writes raw audio on the returned connection. A camera
+    that sends no immediate reply is still streamed to."""
+    import socket as _socket
+
+    from requests.auth import HTTPDigestAuth
+    from requests.utils import parse_dict_header
+
+    hostname, _, port = host.partition(":")
+    address = (hostname, int(port or 80))
+    sock = _socket.create_connection(address, timeout=timeout)
+    try:
+        _send_audio_put(sock, host, path)
+        try:
+            status, headers = _read_http_head(sock, timeout)
+        except _socket.timeout:
+            status, headers = None, {}
+        if status == 401 and headers.get("www-authenticate", "").lower().startswith("digest"):
+            if headers.get("connection", "").lower() == "close":
+                sock.close()
+                sock = _socket.create_connection(address, timeout=timeout)
+            digest = HTTPDigestAuth(username, password)
+            digest.init_per_thread_state()
+            digest._thread_local.chal = parse_dict_header(headers["www-authenticate"].split(" ", 1)[1])
+            _send_audio_put(sock, host, path, digest.build_digest_header("PUT", f"http://{host}{path}"))
+            try:
+                status, headers = _read_http_head(sock, timeout)
+            except _socket.timeout:
+                status = None
+        if status is not None and not 200 <= status < 300:
+            raise IsapiUploadRejected(status)
+        sock.settimeout(timeout)
+        return _IsapiAudioUpload(sock, status)
+    except BaseException:
+        sock.close()
+        raise
+
+
 _appliance_channels: dict[str, WebSocket] = {}  # appliance_id -> its single open control WebSocket
 _active_relays: dict[str, dict] = {}  # session_id -> {"camera_id","appliance_id","customer_id","created_at"}
 
@@ -536,53 +648,40 @@ class _LocalIsapiTalkRelay:
 
                         yield chunk
 
-            # Hikvision-style audioData behaves like a long-lived upload.
-            # The camera may begin playing audio immediately without
-            # returning a normal response until the upload connection ends.
-            # Therefore do not use a short read timeout or treat the absence
-            # of an immediate response as a failure.
+            # audioData transport (2026-09-27, found on the real Front Door
+            # camera): the camera accepted /open and every byte of a
+            # chunked-transfer requests upload, yet played nothing, while
+            # the Videoloft app talked through the same camera fine. The
+            # camera does not decode HTTP chunked bodies. Cameras expect
+            # the ISAPI talk upload the way go2rtc sends it: PUT audioData
+            # with Content-Length: 0, the camera answers 200, and the raw
+            # G.711 bytes then follow on that same TCP connection until it
+            # is closed. See open_isapi_audio_upload().
             logger.info(
                 "talk_isapi_diagnostic session=%s camera_id=%s event=audiodata_starting",
                 self.session_id, self.camera.get("id"),
             )
             audiodata_started = True
             try:
-                audio_response = requests.put(
-                    base + "/audioData",
-                    auth=auth,
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "Connection": "keep-alive",
-                    },
-                    data=audio_chunks(),
-                    timeout=(5, None),
+                upload = open_isapi_audio_upload(
+                    host, f"/ISAPI/System/TwoWayAudio/channels/{channel_id}/audioData",
+                    target["username"], target["password"],
                 )
-
-                logger.info(
-                    "talk_isapi_diagnostic session=%s camera_id=%s event=audiodata_response status=%s",
-                    self.session_id, self.camera.get("id"), audio_response.status_code,
-                )
-
-                if (
-                    audio_response.status_code < 200
-                    or audio_response.status_code >= 300
-                ):
-                    raise RuntimeError(
-                        "camera audioData returned HTTP "
-                        f"{audio_response.status_code}"
-                    )
+            except IsapiUploadRejected as rejected:
+                if rejected.status_code in (401, 403):
+                    note_camera_auth_failure(self.camera.get("id"))
+                    self.error_reason = "camera_auth_failed"
+                raise RuntimeError(f"camera audioData returned HTTP {rejected.status_code}")
+            logger.info(
+                "talk_isapi_diagnostic session=%s camera_id=%s event=audiodata_response status=%s",
+                self.session_id, self.camera.get("id"), upload.status_code,
+            )
+            try:
+                for chunk in audio_chunks():
+                    upload.sendall(chunk)
                 exit_reason = "audiodata_completed_normally"
-
-            except requests.exceptions.ReadTimeout:
-                # Some cameras keep audioData open while audio is playing
-                # and do not send a conventional response until disconnect.
-                # Treat that as non-fatal for live talk-down.
-                logger.info(
-                    "talk_isapi_diagnostic session=%s camera_id=%s event=audiodata_readtimeout_expected "
-                    "note=camera_kept_connection_open_no_response_before_disconnect",
-                    self.session_id, self.camera.get("id"),
-                )
-                exit_reason = "audiodata_readtimeout_expected"
+            finally:
+                upload.close()
 
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"

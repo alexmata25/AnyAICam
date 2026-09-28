@@ -57,9 +57,13 @@ def test_visitor_call_links_to_the_call_screen():
     assert "Open the visitor call: https://p/aac/voice-call/call-9" in content["text"]
 
 
-def test_problem_alerts_link_to_the_alerts_list():
+def test_problem_alerts_link_to_the_camera_and_never_to_the_admin_page():
     content = notification_email.build_alert_email(_context(event_type="camera_offline", event_id=None, title="Camera offline"), base_url="https://p", tz=CHICAGO)
-    assert "View alerts: https://p/notifications" in content["text"]
+    assert "View camera: https://p/customer/cameras/cam-1/live" in content["text"]
+    content = notification_email.build_alert_email(_context(event_type="storage_problem", event_id=None, camera_id=None, title="Storage"), base_url="https://p", tz=CHICAGO)
+    assert "Open AnyAiCam: https://p/dashboard" in content["text"]
+    assert "https://p/notifications" not in content["text"]
+    assert "Manage alert emails: https://p/customer-app-settings" in content["text"]
 
 
 def test_camera_names_are_escaped_in_html():

@@ -337,6 +337,7 @@ def test_cloud_customer_nav_path_prefixes_defined_and_matches_the_customer_nav()
     assert set(main.CLOUD_CUSTOMER_NAV_PATH_PREFIXES) == {
         "/dashboard", "/playback", "/events", "/alerts",
         "/investigate", "/analytics", "/subscription-portal", "/aaco",
+        "/aac/voice-call",  # the Voice Call email's call screen (test_notification_email_deep_links.py)
     }
 
 

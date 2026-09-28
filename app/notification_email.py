@@ -28,7 +28,7 @@ import html
 import logging
 import os
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("anyaicam.notification_email")
@@ -39,6 +39,9 @@ MEDIA_EVENT_TYPES = frozenset({"person", "vehicle", "smart_motion", "motion", "p
 MEDIA_WAIT_SECONDS = max(0, int(os.environ.get("ANYAICAM_ALERT_EMAIL_MEDIA_WAIT_SECONDS", "180")))
 THUMBNAIL_CID = "event-thumbnail"
 DEFAULT_DISPLAY_TIMEZONE = "America/Chicago"  # main.APPLIANCE_TIMEZONE
+# The customer's own alert settings page (/notifications is the admin
+# page and turns a customer away).
+MANAGE_ALERTS_PATH = "/customer-app-settings"
 
 
 def waits_for_media(event_type: str, event_id: str | None) -> bool:
@@ -122,7 +125,9 @@ def event_path(context: dict) -> str:
             return main._customer_event_playback_href(camera_id, context.get("timestamp"), event_id, bool(context.get("has_clip")))
         except Exception:
             return f"/events?event_id={event_id}"
-    return "/notifications"
+    if camera_id:
+        return f"/customer/cameras/{quote(str(camera_id), safe='')}/live"
+    return "/dashboard"
 
 
 def thumbnail_bytes(context: dict) -> bytes | None:
@@ -144,9 +149,16 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     camera = str(context.get("camera_name") or "").strip()
     when = local_time_label(context.get("timestamp") or context.get("created_at"), tz)
     message = str(context.get("message") or "").strip()
-    link = base + event_path(context)
-    button = "Open the visitor call" if context.get("event_type") == "aac_voice_call" else (
-        "View event video" if context.get("event_type") in MEDIA_EVENT_TYPES else "View alerts")
+    path = event_path(context)
+    link = base + path
+    if path.startswith("/aac/voice-call/"):
+        button = "Open the visitor call"
+    elif path.startswith(("/playback", "/events")):
+        button = "View event video"
+    elif path.endswith("/live"):
+        button = "View camera"
+    else:
+        button = "Open AnyAiCam"
     subject = " · ".join(part for part in (title, camera, when) if part)
 
     lines = [title]
@@ -157,7 +169,7 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     if message and message != title:
         lines.append("")
         lines.append(message)
-    lines += ["", f"{button}: {link}", "", f"Manage alert emails: {base}/notifications"]
+    lines += ["", f"{button}: {link}", "", f"Manage alert emails: {base}{MANAGE_ALERTS_PATH}"]
     text = "\n".join(lines)
 
     esc = html.escape
@@ -175,7 +187,7 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
         f"{image_html}{message_html}"
         f'<p style="margin:16px 0"><a href="{esc(link, quote=True)}" style="background:#0e7c7b;color:#ffffff;padding:10px 16px;'
         f'border-radius:6px;text-decoration:none;display:inline-block">{esc(button)}</a></p>'
-        f'<p style="color:#667085;font-size:12px">AnyAiCam alert. <a href="{esc(base + "/notifications", quote=True)}" style="color:#667085">Manage alert emails</a></p>'
+        f'<p style="color:#667085;font-size:12px">AnyAiCam alert. <a href="{esc(base + MANAGE_ALERTS_PATH, quote=True)}" style="color:#667085">Manage alert emails</a></p>'
         "</div>"
     )
     images = [(THUMBNAIL_CID, image)] if image else []
