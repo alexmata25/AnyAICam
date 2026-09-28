@@ -4158,5 +4158,13 @@ Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both d
 - **Software defect to investigate (Dell):** `_LocalIsapiTalkRelay` uploads `audioData` with chunked transfer encoding (a requests generator). These cameras probably discard chunked bodies and need a fixed `Content-Length`. The Bedroom speaker was never confirmed audible either.
 - **Visitor-response processing is NOT IMPLEMENTED** (no speech-to-text of the camera microphone; only the simulate-visitor-utterance route). It is still required for AAC VC.
 
+**Videoloft control test (operator, ~22:30):** two-way talk through the Videoloft app to the SAME Front Door camera is audible. The speaker hardware and the camera's remote-talk capability are confirmed. The silent AnyAiCam greeting is therefore an AnyAiCam audio-transport or interoperability defect, not a camera setting or hardware problem.
+
+**Living Room zone walk: COMPLETE, PASS (22:28-22:36).**
+- Temporary test zone: rule `6366b6fdb4d8`, x 0.339-0.619, y 0.099-0.994.
+- Walk A, inside: the walker was detected by unfiltered YOLO at 0.84-0.89 with centre x 0.42-0.46. The only event in that window (22:29:08) contained just the two sofa occupants (x 0.83/0.80).
+- Walk B, stairs: person event at 22:35:18, centre x 0.17, with thumbnail and clip.
+- The test zone was deleted afterwards; the cloud and the Ryzen both show 0 Living Room exclusion zones.
+
 **Talkdown:** still pending, because the Ryzen has no microphone.
 
