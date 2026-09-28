@@ -182,3 +182,20 @@ def test_quiet_hours_use_the_customers_local_time_not_the_hosts_utc_clock():
     assert not notification_engine._within_quiet_hours("17:12", "22:00", "07:00")
     late_utc = datetime(2026, 9, 29, 4, 30, tzinfo=timezone.utc)  # 11:30 PM CDT
     assert notification_engine._within_quiet_hours(notification_engine._quiet_hours_clock(late_utc, chicago), "22:00", "07:00")
+
+
+def test_fifteen_minute_video_cooldown_keeps_voice_calls_on_five_and_alarms_immediate(ch, monkeypatch):
+    monkeypatch.setattr(notification_engine, "NOTIFICATION_CHANNEL_COOLDOWN_SECONDS", 900)
+    monkeypatch.setattr(notification_engine, "VOICE_CALL_CHANNEL_COOLDOWN_SECONDS", 300)
+    _seed()
+    _event("person", "front", 0)            # emailed
+    _event("person", "front", 10)           # within 15 min: held back
+    _event("person", "front", 16)           # 15 min since the last email: emailed
+    _event("aac_voice_call", "front", 0.5)  # emailed
+    _event("aac_voice_call", "front", 6)    # second visitor after 5 min: emailed
+    _event("intrusion_alarm", "front", 1)
+    _event("intrusion_alarm", "front", 1.5)
+    titles = [n["title"] for n, _ in ch["email"].calls]
+    assert titles.count(notification_engine.event_type_label("person")) == 2
+    assert titles.count(notification_engine.event_type_label("aac_voice_call")) == 2
+    assert titles.count(notification_engine.event_type_label("intrusion_alarm")) == 2
