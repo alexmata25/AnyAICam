@@ -119,6 +119,9 @@ def event_path(context: dict) -> str:
     event_type, event_id, camera_id = context.get("event_type"), context.get("event_id"), context.get("camera_id")
     if event_type == "aac_voice_call" and event_id:
         return f"/aac/voice-call/{event_id}"
+    if event_type == "intrusion_alarm" and camera_id:
+        alarm = f"?alarm={quote(str(event_id), safe='')}" if event_id else ""
+        return f"/customer/cameras/{quote(str(camera_id), safe='')}/live{alarm}"
     if camera_id and event_id and event_type in MEDIA_EVENT_TYPES:
         try:
             import main
@@ -153,6 +156,8 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     link = base + path
     if path.startswith("/aac/voice-call/"):
         button = "Open the visitor call"
+    elif context.get("event_type") == "intrusion_alarm":
+        button = "Open live camera"
     elif path.startswith(("/playback", "/events")):
         button = "View event video"
     elif path.endswith("/live"):
@@ -169,7 +174,12 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     if message and message != title:
         lines.append("")
         lines.append(message)
-    lines += ["", f"{button}: {link}", "", f"Manage alert emails: {base}{MANAGE_ALERTS_PATH}"]
+    alarm = context.get("event_type") == "intrusion_alarm"
+    lines += ["", f"{button}: {link}"]
+    if alarm:
+        # One tap to the phone dialer; AnyAiCam never calls 911 itself.
+        lines += ["Emergency? Call 911: tel:911"]
+    lines += ["", f"Manage alert emails: {base}{MANAGE_ALERTS_PATH}"]
     text = "\n".join(lines)
 
     esc = html.escape
@@ -182,11 +192,14 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
     message_html = f'<p style="color:#344054;margin:12px 0">{esc(message)}</p>' if message and message != title else ""
     html_body = (
         '<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;padding:16px">'
-        f'<h2 style="margin:0 0 8px;color:#101828">{esc(title)}</h2>'
+        f'<h2 style="margin:0 0 8px;color:{"#b42318" if alarm else "#101828"}">{esc(title)}</h2>'
         f'<table style="border-collapse:collapse;font-size:14px">{details}</table>'
         f"{image_html}{message_html}"
         f'<p style="margin:16px 0"><a href="{esc(link, quote=True)}" style="background:#0e7c7b;color:#ffffff;padding:10px 16px;'
-        f'border-radius:6px;text-decoration:none;display:inline-block">{esc(button)}</a></p>'
+        f'border-radius:6px;text-decoration:none;display:inline-block">{esc(button)}</a>'
+        + ('<a href="tel:911" style="background:#b42318;color:#ffffff;padding:10px 16px;border-radius:6px;text-decoration:none;'
+           'display:inline-block;margin-left:8px">Call 911</a>' if alarm else '')
+        + '</p>'
         f'<p style="color:#667085;font-size:12px">AnyAiCam alert. <a href="{esc(base + MANAGE_ALERTS_PATH, quote=True)}" style="color:#667085">Manage alert emails</a></p>'
         "</div>"
     )

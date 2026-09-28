@@ -840,6 +840,38 @@ def _authorized_camera(db, camera_id: str, identity: dict) -> dict:
     return dict(camera)
 
 
+def _intrusion_alarm_banner(request: Request, camera_id: str, identity: dict) -> str:
+    """Opened from an INTRUSION ALARM notification (?alarm=<event id>): a
+    red banner with the alarm time, a Talk shortcut to this page's own
+    push-to-talk button, and a Call 911 link that only opens the phone's
+    dialer -- AnyAiCam never places the call itself. Scoped to this
+    customer's own intrusion_alarm event on this camera; anything else
+    renders nothing."""
+    alarm_id = (request.query_params.get('alarm') or '').strip()
+    if not alarm_id:
+        return ''
+    with connection() as db:
+        event = db.execute(
+            "SELECT id,event_timestamp FROM detection_events WHERE id=? AND camera_id=? AND customer_id=? AND event_type='intrusion_alarm'",
+            (alarm_id, camera_id, identity.get('customer_id')),
+        ).fetchone()
+    if not event:
+        return ''
+    when = escape(str(event['event_timestamp'] or '')[:19].replace('T', ' '))
+    return (
+        '<section class="panel" role="alert" id="intrusion-alarm-banner" '
+        'style="border:2px solid #b42318;background:rgba(180,35,24,.14)">'
+        '<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between">'
+        f'<div><h2 style="margin:0;color:#f97066">INTRUSION ALARM</h2>'
+        f'<div class="health-detail">A person crossed into a protected area at {when}. The clip is saved in Events.</div></div>'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+        '<button type="button" class="ghost-button" onclick="var m=document.querySelector(&#39;.talk-mic&#39;);if(m){m.scrollIntoView({block:&#39;center&#39;});m.focus();}">Talk (hold the mic button)</button>'
+        f'<a class="ghost-button" href="/events?camera={quote(camera_id, safe="")}">View event clip</a>'
+        '<a href="tel:911" style="background:#b42318;color:#fff;padding:10px 16px;border-radius:8px;text-decoration:none;font-weight:700">Call 911</a>'
+        '</div></div></section>'
+    )
+
+
 def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     @app.get('/customer-live', response_class=HTMLResponse)
     def customer_live_landing(request: Request, appliance_id: str = ''):
@@ -1503,6 +1535,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
             f'<header class="topbar"><div><p class="eyebrow">Live view</p>'
             f'<h1>{escape(camera_name)}</h1></div>'
             f'<a class="ghost-button" href="/customer-live">Back to Live</a></header>'
+            + _intrusion_alarm_banner(request, camera_id, identity) +
             f'<style>.talk-mic{{touch-action:none}}.talk-mic.active{{background:var(--accent,#42e4dc);color:#04211f}}.talk-mic.active.live{{box-shadow:0 0 0 3px rgba(66,228,220,.45)}}.talk-mic:disabled{{opacity:.4;cursor:not-allowed}}.unlock-door:disabled{{opacity:.4;cursor:not-allowed}}'
             # Camera Hub mobile polish: on a narrow phone screen this
             # row's ~10 tool buttons no longer force horizontal

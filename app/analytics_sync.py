@@ -522,7 +522,7 @@ def _build_payload(event: dict) -> dict:
     # customer_analytics_rule_worker.record_rule_event()) -- forwarded the same
     # way as PPE/AAC above so the customer Analytics workspaces can show
     # them. No new column; cloud stores them in detections_json.
-    if str(event.get("event_type") or "").strip() in ("line_crossing", "intrusion") and payload_detections is None:
+    if str(event.get("event_type") or "").strip() in ("line_crossing", "intrusion", "intrusion_alarm") and payload_detections is None:
         payload_detections = [{
             "rule_name": event.get("rule_name"),
             "rule_id": event.get("rule_id"),
@@ -646,6 +646,11 @@ def _forward_notification(event: dict, camera_id: str) -> None:
     # for an AAC Voice Call trigger (through the authoritative session it
     # creates) -- forwarding it here too would send a second, generic one.
     if str(event.get("event_type") or "") in ("aac_voice_call", "aac_voice_call_utterance"):
+        return
+    # An INTRUSION ALARM is already fanned out (as an emergency, which
+    # skips the usual per-camera spacing) by the cloud's analytics-event
+    # ingestion; a second POST here would page the homeowner twice.
+    if str(event.get("event_type") or "") == "intrusion_alarm":
         return
     payload = _build_notification_payload(event, camera_id)
     if not payload["id"] or not payload["event_type"] or not payload["timestamp"]:

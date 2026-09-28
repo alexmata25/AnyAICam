@@ -4255,3 +4255,31 @@ Design: `docs/vehicle-access-design.md`. It covers architecture, reused componen
 - **First milestone (P1):** one simulated lane. Plate read (existing LPR) plus simulated RFID are correlated, the member looked up and the rules evaluated; the result is a transaction with snapshot and clip, and a SIMULATED gate command. Estimate: 6-8 days; P1-P5 production single lane about 4-6 weeks.
 - **Real gate output:** only after separate, explicit approval, bench-tested first.
 
+
+## 2026-09-28: Armed security (Arm Stay / Arm Away / Disarm + INTRUSION ALARM) -- built, staging only
+
+- **Modes** (`security_modes.py`): per customer site, `disarmed` / `stay` / `away`. Stay arms only the cameras picked for Stay; Away arms every camera unless narrowed. Armed state gates security responses only. It never changes recording, normal analytics or normal alerts.
+- **Cloud/edge split:**
+  - The cloud owns the state and settings (`security_portal.py`: `GET /api/customer/security`, owner-only `POST /api/customer/security/mode` and `PUT /api/customer/security/settings`, each audited as `security.mode_changed` / `security.settings_changed`; `/customer-security` page; Dashboard control).
+  - The state rides in the appliance configuration payload (`security` key). The edge mirrors it (`edge_camera_sync._reconcile_security`) and decides per detection from the local copy.
+  - A missing field never disarms the edge, and an outage keeps the last state.
+- **Security line** (`security_rules.py`, rule type `security_line`):
+  - person-only;
+  - feet footprint;
+  - the track must first be seen outside, then fully across with both bottom corners past the line by a 0.02 margin, for 2 consecutive readings;
+  - one protected side (`inbound` = right-hand side walking from the first point to the second; `both` is rejected);
+  - per-rule cooldown (default 60 s).
+  - The Smart Rules editor shades the protected side.
+- **Alarm path:**
+  - The event type is `intrusion_alarm` with critical severity.
+  - It is ingested by the existing analytics-event route and fanned out as an emergency: it skips quiet hours, the 5-minute spacing, the event-type selection and the email allowlist, but still only reaches enabled channels and permitted viewers.
+  - Delivery covers SMS (customer can turn it off in Security Settings) and an email with an "Open live camera" button and a `tel:911` Call 911 button.
+  - The Live page shows an `?alarm=` banner with Talk and Call 911.
+  - Automatic talk-down reuses the AAC greeting TTS provider.
+  - **AnyAiCam never calls 911 itself.**
+  - The edge does not forward a second notification for an alarm.
+- **Not done / pending:**
+  - Mobile push needs FCM/APNs credentials; today the "push" is in-app, email and SMS.
+  - Siren: no siren integration exists; the setting is shown as "coming soon".
+  - Real-camera walk tests on the Ryzen (PENDING USER ACTION, after the next installer release).
+- **Tests:** `test_security_line_intrusion.py`, `test_security_modes.py`, `test_security_alarm_wiring.py`.
