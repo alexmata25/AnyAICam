@@ -4248,3 +4248,10 @@ Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both d
   - a real gateway;
   - `anyaicam-setup --wireguard-enroll` on the Ryzen (sudo).
 
+## Roadmap: new product track -- Vehicle Access (car-wash lanes), added 2026-09-28
+Design: `docs/vehicle-access-design.md`. It covers architecture, reused components, schema, APIs, UI, the RFID adapter and gate-output interfaces, correlation, fail-safe behaviour, phases/effort and prototype hardware.
+- **Status:** design only. No code, and NOT deployed anywhere.
+- **Module:** a licensed AnyAiCam module called "Vehicle Access", not a separate app. The edge decides and pulses; the cloud owns members, policy, UI and audit.
+- **First milestone (P1):** one simulated lane. Plate read (existing LPR) plus simulated RFID are correlated, the member looked up and the rules evaluated; the result is a transaction with snapshot and clip, and a SIMULATED gate command. Estimate: 6-8 days; P1-P5 production single lane about 4-6 weeks.
+- **Real gate output:** only after separate, explicit approval, bench-tested first.
+
