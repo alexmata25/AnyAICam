@@ -461,6 +461,14 @@ def _build_payload(event: dict) -> dict:
             "greeting_text_used": event.get("greeting_text_used"),
             "greeting_delivered": bool(event.get("greeting_delivered")),
         }]
+    # AAC Voice Call visitor answer (2026-09-28): the edge transcript and
+    # which trigger it answers; the cloud attaches it to that session.
+    if str(event.get("event_type") or "").strip() == "aac_voice_call_utterance" and payload_detections is None:
+        payload_detections = [{
+            "voice_call_local_event_id": event.get("voice_call_local_event_id"),
+            "transcript_text": event.get("transcript_text"),
+            "stt_engine": event.get("stt_engine"),
+        }]
     # PPE's hard_hat_present/safety_vest_present booleans are set as
     # loose extra keys on the local event dict by main.py's PPE hook in
     # save_yolo_events() (ppe.py's own summarize_ppe() output) -- not
@@ -637,7 +645,7 @@ def _forward_notification(event: dict, camera_id: str) -> None:
     # The cloud's analytics-event route already notifies the homeowner
     # for an AAC Voice Call trigger (through the authoritative session it
     # creates) -- forwarding it here too would send a second, generic one.
-    if str(event.get("event_type") or "") == "aac_voice_call":
+    if str(event.get("event_type") or "") in ("aac_voice_call", "aac_voice_call_utterance"):
         return
     payload = _build_notification_payload(event, camera_id)
     if not payload["id"] or not payload["event_type"] or not payload["timestamp"]:

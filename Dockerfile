@@ -59,4 +59,15 @@ RUN mkdir -p /opt/anyaicam-lpr-model \
     && curl -fsSL -o /opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt "https://huggingface.co/morsetechlab/yolov11-license-plate-detection/resolve/251a30d7daedca065f56e04b0af04052c907c68f/license-plate-finetune-v1n.pt" \
     && echo "0aec75976c56eb6f26dfb274c430620ec65137915ff1ae47c3a48c7af8afb7b2  /opt/anyaicam-lpr-model/license-plate-finetune-v1n.pt" | sha256sum -c -
 
+# Offline speech-to-text for AAC Voice Call visitor answers (2026-09-28):
+# Vosk small English model (Apache-2.0), checksum-pinned; used by
+# app/aac_voice_call_listen.py. Baked outside /app for the same bind-mount
+# reason as the models above; listening is skipped if it is missing.
+RUN mkdir -p /opt/anyaicam-stt-model \
+    && curl -fsSL -o /tmp/vosk-model.zip "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip" \
+    && echo "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498  /tmp/vosk-model.zip" | sha256sum -c - \
+    && python -c "import zipfile; zipfile.ZipFile('/tmp/vosk-model.zip').extractall('/opt/anyaicam-stt-model')" \
+    && rm /tmp/vosk-model.zip \
+    && test -d /opt/anyaicam-stt-model/vosk-model-small-en-us-0.15/am
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

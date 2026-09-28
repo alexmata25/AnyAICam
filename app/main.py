@@ -38245,12 +38245,15 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         camera_number=camera_number,
                         confidence=max((float(item.get("confidence") or 0.0) for item in class_detections), default=None),
                         forward_event=_queue_voice_call_for_cloud,
+                        buffer_root=RECORDINGS_FOLDER,
                     )
                 elif vc_context:
                     aac_voice_call.handle_person_detected(
                         customer_id=vc_context["customer_id"],
                         camera_id=vc_context["id"],
                         thumbnail_s3_key=thumbnail_url,
+                        camera_number=camera_number,
+                        buffer_root=RECORDINGS_FOLDER,
                     )
             except Exception as error:
                 print(f"Camera {camera_number} AAC Voice Call proactive greeting skipped (non-fatal): {error}")
