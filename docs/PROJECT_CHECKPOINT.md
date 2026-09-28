@@ -4227,3 +4227,24 @@ Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both d
 - **Ryzen power loss/reboot at 21:07-21:20 CDT**, not investigated.
 - **`/ready` is false on edge appliances by design** (old item, still open).
 
+## Morning 2026-09-28 (operator at work) -- resume point
+- **Golden = staging = `064739f`.** Gated cutover 13:53Z, 136/136 polls returned 200. Rollback container: `portal-1175932-pre-064739f-20260928T135303Z-rollback`. Full suite: 85 failures, all in the pre-existing baseline; no new failures.
+- **Ryzen = `1175932`**, installed by the operator; `validate.sh` PASS with 0 failures. Next package staged, NOT installed: `~/anyaicam-release-064739f`, sha256 `1aad304d05593b147247e45a887e07b56aae55f8c9cb11b71c70243e99727d28`.
+- **Stripe order AIC-HW-B842342B verified as test mode only**, straight from the Stripe API: session and PaymentIntent `livemode=false`, amount received 53 ($0.53 sandbox). Staging key is test mode. The order was never fulfilled.
+- **New on golden:**
+  - `cd916ad` Stripe test-mode emails: `[TEST]` subject plus a "TEST MODE — NO REAL CHARGE" banner, decided from trusted server-side state only; a live-key server refuses to fulfil test orders.
+  - `c06a6e3` orders record Stripe's `amount_total`.
+  - `8a65839` a plate event triggers its own Event-mode recording and backfill. Found live: the first real cadence plate had no clip.
+  - `becf099` the Voice Call screen audio line follows the camera's talk capability.
+  - `dff84e7` Local ID licence core. Not enforced; the fingerprint must be computed on the host.
+- **LPR, real traffic:**
+  - The first independent-cadence plate event was Driveway Right 12:50:49Z, read `KPC6266` at 0.944. It matches the characters legible in its own crop.
+  - It was created between suppressed vehicle events (12:49:06 and 12:53:08), i.e. without a vehicle event.
+  - It reached the cloud 29 s later. It had no clip (fixed in `8a65839`; the fix is in the staged package).
+  - The passive observer runs until about 17:00 CDT and logs to `/tmp/lpr_obs/observations.jsonl` in the container.
+- **Front Door Voice Call physical test:** DEFERRED until the operator is available (one camera login only).
+- **Remote access:** software is complete through Phase C (mock gateway on staging). PENDING approval for:
+  - opening UDP 51820 on `sg-0a7cebe64d0e3d752`;
+  - a real gateway;
+  - `anyaicam-setup --wireguard-enroll` on the Ryzen (sudo).
+
