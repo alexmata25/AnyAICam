@@ -40111,6 +40111,8 @@ async def lifespan(app: FastAPI):
 
 
     supervisor_tasks = []
+    if RECORDING_MEDIA_CACHE_MAX_AGE_SECONDS > 0:
+        supervisor_tasks.append(asyncio.create_task(_recording_media_cache_sweeper()))
 
 
 
@@ -143125,6 +143127,15 @@ def _recording_media_cache_lock(recording_id: str) -> threading.Lock:
 
 RECORDING_MEDIA_CACHE_FOLDER = RECORDINGS_FOLDER / "_media_cache"
 RECORDING_MEDIA_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB soft cap -- oldest cached remuxes evicted first
+# Optional age limit for the cache above (2026-09-28). Off (0) unless the
+# deployment sets it -- staging uses 3 days so test playback can't fill its
+# disk. Only ever removes *.mp4 files directly inside RECORDING_MEDIA_CACHE_
+# FOLDER: re-creatable remuxes of S3 recordings, never the S3 originals, the
+# database, configuration, or anything outside that one folder.
+try:
+    RECORDING_MEDIA_CACHE_MAX_AGE_SECONDS = max(0.0, float(os.getenv("ANYAICAM_RECORDING_MEDIA_CACHE_MAX_AGE_DAYS", "0") or 0)) * 86400
+except ValueError:
+    RECORDING_MEDIA_CACHE_MAX_AGE_SECONDS = 0.0
 
 
 def _evict_recording_media_cache_if_full() -> None:
@@ -143132,6 +143143,18 @@ def _evict_recording_media_cache_if_full() -> None:
         entries = sorted(RECORDING_MEDIA_CACHE_FOLDER.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
     except FileNotFoundError:
         return
+    if RECORDING_MEDIA_CACHE_MAX_AGE_SECONDS > 0:
+        cutoff = time.time() - RECORDING_MEDIA_CACHE_MAX_AGE_SECONDS
+        kept = []
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.parent == RECORDING_MEDIA_CACHE_FOLDER and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+                    continue
+            except OSError:
+                pass
+            kept.append(entry)
+        entries = kept
     total = sum(p.stat().st_size for p in entries)
     i = 0
     while total > RECORDING_MEDIA_CACHE_MAX_BYTES and i < len(entries):
@@ -143141,6 +143164,18 @@ def _evict_recording_media_cache_if_full() -> None:
         except OSError:
             pass
         i += 1
+
+
+async def _recording_media_cache_sweeper() -> None:
+    """Hourly age-based sweep of the playback cache (only started when
+    ANYAICAM_RECORDING_MEDIA_CACHE_MAX_AGE_DAYS is set), so old cached
+    clips are removed even when nobody plays anything new."""
+    while True:
+        try:
+            await asyncio.to_thread(_evict_recording_media_cache_if_full)
+        except Exception as error:
+            application_logger.warning("recording_media_cache.sweep_failed error=%s", type(error).__name__)
+        await asyncio.sleep(3600)
 
 
 def _download_recording_object(s3_key: str, dest_path: Path) -> bool:
