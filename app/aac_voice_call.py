@@ -129,6 +129,57 @@ MAX_UTTERANCES_BEFORE_ESCALATION = 3
 # cloud as (analytics_sync.py -> POST /api/appliance/analytics/{camera_id}
 # /events -> ingest_edge_visitor_event()).
 EDGE_EVENT_TYPE = "aac_voice_call"
+# The visitor's answer, transcribed on the edge (aac_voice_call_listen.py)
+# and attached by the cloud to the session the trigger created.
+EDGE_UTTERANCE_EVENT_TYPE = "aac_voice_call_utterance"
+
+
+def _schedule_visitor_listening(greeting_result, camera_number, buffer_root, on_transcript) -> bool:
+    """Listen for the visitor's answer after a greeting that actually
+    played. Needs the camera's recording buffer (buffer_root) -- a caller
+    without one (tests, the simulate route) simply doesn't listen."""
+    if buffer_root is None or camera_number is None or not getattr(greeting_result, "delivered", False):
+        return False
+    try:
+        import aac_voice_call_listen
+
+        return aac_voice_call_listen.schedule_listen(
+            camera_number=camera_number,
+            greeting_seconds=float(getattr(greeting_result, "duration_seconds", None) or 0.0),
+            buffer_root=buffer_root,
+            on_transcript=on_transcript,
+        )
+    except Exception as error:
+        print(f"AAC Voice Call listening skipped (non-fatal) for camera {camera_number}: {error}")
+        return False
+
+
+def _record_local_transcript(customer_id: str, event_id: str, transcript) -> None:
+    try:
+        record_visitor_utterance(customer_id=customer_id, event_id=event_id, transcript_text=transcript.text,
+                                 actor={"email": "aac-voice-call-listener", "role": "system"})
+    except HTTPException as error:
+        print(f"AAC Voice Call transcript not recorded for {event_id}: {error.detail}")
+
+
+def ingest_edge_visitor_utterance(*, customer_id: str, camera_id: str, trigger_detection_event_id: str | None, transcript_text: str) -> dict:
+    """Cloud side of an edge transcript: attach it to the one session the
+    trigger created, through record_visitor_utterance() (intent,
+    escalation, and never any door action)."""
+    transcript_text = (transcript_text or "").strip()[:1000]
+    if not transcript_text:
+        return {"status": "skipped", "skipped_reason": "empty_transcript"}
+    if not trigger_detection_event_id:
+        return {"status": "skipped", "skipped_reason": "session_not_found"}
+    session = store.get_event_by_trigger_detection(customer_id=customer_id, detection_event_id=trigger_detection_event_id)
+    if not session or session.get("camera_id") != camera_id:
+        return {"status": "skipped", "skipped_reason": "session_not_found"}
+    try:
+        outcome = record_visitor_utterance(customer_id=customer_id, event_id=session["id"], transcript_text=transcript_text,
+                                           actor={"email": "edge-voice-call-listener", "role": "system"})
+    except HTTPException as error:
+        return {"status": "skipped", "skipped_reason": "not_listening", "event_id": session["id"], "detail": error.detail}
+    return {"status": "accepted", "event_id": session["id"], "outcome": outcome}
 
 # An edge trigger that reaches the cloud later than this (the edge was
 # offline and its queued event was only delivered once connectivity came
@@ -294,6 +345,8 @@ def handle_person_detected(
     cooldown_seconds: float = DEFAULT_GREETING_COOLDOWN_SECONDS,
     greeting_provider: object | None = None,
     actor: dict | None = None,
+    camera_number: int | None = None,
+    buffer_root=None,
 ) -> dict:
     """The real proactive trigger this phase adds: a person was detected
     on a camera -- either a genuine appliance detection (see main.py's
@@ -332,9 +385,10 @@ def handle_person_detected(
     )
 
     greeting_text = store.resolve_greeting_text(customer_id=customer_id, camera_id=camera_id, site_id=camera["site_id"])
+    greeting_result = None
     try:
         provider = greeting_provider or aac_voice_call_greeting.get_provider()
-        provider.speak(aac_voice_call_greeting.GreetingRequest(
+        greeting_result = provider.speak(aac_voice_call_greeting.GreetingRequest(
             camera_id=camera_id, customer_id=customer_id, event_id=event_id, text=greeting_text,
         ))
         # Only stamped on a successful dispatch -- an exception here
@@ -371,9 +425,14 @@ def handle_person_detected(
         store.mark_notified(event_id=event_id, customer_id=customer_id, notification_id=notification_id or "", actor=actor)
 
     store.open_listening_window(event_id=event_id, customer_id=customer_id, actor=actor)
+    listening = _schedule_visitor_listening(
+        greeting_result, camera_number, buffer_root,
+        lambda transcript: _record_local_transcript(customer_id, event_id, transcript),
+    )
 
     return {
         "triggered": True,
+        "listening": listening,
         "event_id": event_id,
         "greeting_text": greeting_text,
         "notifications_created": notifications_created,
@@ -403,6 +462,7 @@ def handle_edge_person_detected(
     cooldown_seconds: float = DEFAULT_GREETING_COOLDOWN_SECONDS,
     greeting_provider: object | None = None,
     now: datetime | None = None,
+    buffer_root=None,
 ) -> dict:
     """Edge half of the cloud/edge split (see this module's docstring):
     everything that must happen locally for a person at an entrance
@@ -430,6 +490,7 @@ def handle_edge_person_detected(
     local_event_id = f"aacvc-{uuid.uuid4().hex}"
     greeting_text = store.resolve_greeting_text(customer_id=customer_id, camera_id=camera_id, site_id=camera["site_id"])
     greeting_delivered = False
+    result = None
     try:
         provider = greeting_provider or aac_voice_call_greeting.get_provider()
         result = provider.speak(aac_voice_call_greeting.GreetingRequest(
@@ -453,8 +514,25 @@ def handle_edge_person_detected(
         "greeting_delivered": greeting_delivered,
         "mock": False,
     })
+
+    def _forward_transcript(transcript) -> None:
+        forward_event({
+            "id": f"{local_event_id}-reply",
+            "camera": camera_number,
+            "event_type": EDGE_UTTERANCE_EVENT_TYPE,
+            "timestamp": datetime.now().isoformat(),
+            "confidence": transcript.confidence,
+            "object_count": 1,
+            "voice_call_local_event_id": local_event_id,
+            "transcript_text": transcript.text,
+            "stt_engine": transcript.engine,
+            "mock": False,
+        })
+
+    listening = _schedule_visitor_listening(result, camera_number, buffer_root, _forward_transcript)
     return {
         "triggered": True,
+        "listening": listening,
         "local_event_id": local_event_id,
         "greeting_text": greeting_text,
         "greeting_delivered": greeting_delivered,

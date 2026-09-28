@@ -4168,3 +4168,42 @@ Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both d
 
 **Talkdown:** still pending, because the Ryzen has no microphone.
 
+## OVERNIGHT AUTONOMOUS SESSION 2026-09-27/28 -- resume point
+
+### State
+- **Golden** `reconcile/golden-foundation-20260911` = `5d02f25` (pushed). Work queued on top, NOT yet on golden: branch `feature/aac-vc-visitor-listening-20260928`, which contains `d8448b8` LPR independent cadence, `cbb7bd4` visitor listening/STT, `57fa39c` access-log redaction and `48f01ac` Caddy redaction.
+- **Staging**: `portal-5d02f25`. Gated cutover 2026-09-28 03:45Z, 246/246 outside polls returned 200. Rollback container: `portal-3fa8853-pre-5d02f25-20260928T034535Z-rollback`.
+- **Ryzen**: `5d02f25`, installed by the operator with `install.sh --repair`. Remote checks: code matches the commit byte for byte, container healthy with 0 restarts, cams 1-5 live, recording buffers writing, events created and reaching the cloud. Rollback image: `anyaicam-vms:rollback-aeb9414e1e1b`. The `validate.sh` output was never returned (PENDING USER ACTION).
+- **Samsung**: unchanged. Pinned image `anyaicam-vms:f5a6d87`, claimed appliance `9cf63b90...`, 0 cloud cameras. It needs its own controlled release later; do not deploy just because the Ryzen was updated.
+
+### Done tonight (verified)
+- **Notification deep links** (`1bffbd8`), validated on live staging:
+  - the detection email link opens the exact camera and event clip with autoplay;
+  - the Voice Call email link opens the Front Door live view with call controls;
+  - when logged out, `next` preserves the full destination;
+  - an already signed-in customer arriving from the mail client continues to `next`.
+- **ISAPI talk transport fix** (`3b92919`): a raw stream after `PUT audioData` with `Content-Length: 0`, instead of a chunked body. Tested against a socket-level fake camera. Physical confirmation is PENDING.
+- **LPR independent cadence** (`d8448b8`): 18 new tests; full suite had no new failures.
+- **Visitor answer capture and STT** (`cbb7bd4`): 14 new tests. Real Ryzen diagnostic (temporary, removed afterwards): an 8 kHz AAC phrase transcribed correctly (0.97); real Front Door ambient audio was captured and correctly produced no transcript.
+- **Access-log secret redaction** (`57fa39c`, `48f01ac`): closes "password-reset tokens logged in plaintext".
+
+### PENDING USER ACTION
+1. Paste the Ryzen `validate.sh` output for the 5d02f25 install (optional; the remote checks passed).
+2. **Front Door audio, one test after a Ryzen release that contains the transport fix (5d02f25 has it):** stand at the door; one greeting play with one login; report heard or nothing.
+3. Tap both links in any recent AnyAiCam email on a phone, as a final human confirmation of the deep links.
+4. Website publish method, when ready: cPanel upload or SFTP with an operator-added key. Nothing is published to Bluehost autonomously.
+5. `gh auth login` (only needed to publish GitHub Releases).
+6. **Decisions for the Build Your System to checkout link.** Today the public page only saves the plan in the browser. Decide:
+   - guest checkout vs account first;
+   - one Stripe session for hardware plus subscription (mixed one-time and recurring) vs separate sessions;
+   - shipping-address and tax collection;
+   - mapping of plan fields to price IDs (appliance tier, LOCAL/HYBRID camera tiers, analytics add-ons, relay modules);
+   - what happens after payment (account invite email, provisioning).
+7. **LPR physical validation after a release with the cadence fix:** use a passive observer on normal passing traffic, not an owner-driven drive-by. Record per vehicle: camera, time, vehicle detection, plate-region detection, OCR candidates, confidence, read agreement, confirmation, plate event, thumbnail/clip, cloud. Record failure causes (plate too small, angle, motion blur, headlights, IR overexposure, obstruction, resolution). No guessing or correcting characters. Precision over recall.
+
+### Known defects / limitations
+- **Driveway Right/Left main streams are 720p** (changed on the camera side). Night IR saturates reflective plates.
+- **The Bedroom 4K live-view transcode is heavy** (about 230% CPU). A substream is recommended; the decision is the operator's.
+- **Ryzen power loss/reboot at 21:07-21:20 CDT**, not investigated.
+- **`/ready` is false on edge appliances by design** (old item, still open).
+

@@ -38245,83 +38245,21 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         camera_number=camera_number,
                         confidence=max((float(item.get("confidence") or 0.0) for item in class_detections), default=None),
                         forward_event=_queue_voice_call_for_cloud,
+                        buffer_root=RECORDINGS_FOLDER,
                     )
                 elif vc_context:
                     aac_voice_call.handle_person_detected(
                         customer_id=vc_context["customer_id"],
                         camera_id=vc_context["id"],
                         thumbnail_s3_key=thumbnail_url,
+                        camera_number=camera_number,
+                        buffer_root=RECORDINGS_FOLDER,
                     )
             except Exception as error:
                 print(f"Camera {camera_number} AAC Voice Call proactive greeting skipped (non-fatal): {error}")
-        # 2026-09-16: same real per-camera RDM entitlement check as the
-        # PPE hook above, for the same reason -- lpr.is_camera_enabled()
-        # is deployment-pilot scope only, never entitlement-aware.
-        lpr_identity = recording_uploader._camera_identity(camera_number)
-        if class_name in lpr.LPR_VEHICLE_CLASSES and lpr.is_camera_enabled(camera_number) and bool(lpr_identity and lpr_identity.get("lpr_enabled")):
-            for vehicle_detection in class_detections:
-                try:
-                    vx, vy, vw, vh = (
-                        vehicle_detection["x"],
-                        vehicle_detection["y"],
-                        vehicle_detection["width"],
-                        vehicle_detection["height"],
-                    )
-                    vehicle_crop = frame[vy : vy + vh, vx : vx + vw]
-                    if not lpr.should_attempt(camera_number, (vx, vy, vw, vh)):
-                        continue  # parked vehicle already read (or tried) enough
-                    # A downscaled analytics frame (720p substream) is too
-                    # coarse for plates; read from the full-resolution
-                    # recording buffer when that adds pixels.
-                    full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
-                    full_crop = lpr.full_resolution_vehicle_crop(frame, (vx, vy, vw, vh), full_frame)
-                    plate_result = lpr.recognize_plate(full_crop, camera_number=camera_number) if full_crop is not None else None
-                    if plate_result is not None:
-                        vehicle_crop = full_crop  # plate region coordinates refer to this crop
-                    else:
-                        plate_result = lpr.recognize_plate(vehicle_crop, camera_number=camera_number)
-                    # Only corroborated reads become plate events (repeated
-                    # identical reads; a parked car is not re-reported).
-                    plate_result = lpr.confirm_plate(camera_number, plate_result)
-                    if plate_result is not None:
-                        lpr.mark_vehicle_read(camera_number, (vx, vy, vw, vh))
-                except Exception as error:
-                    plate_result = None
-                    print(f"Camera {camera_number} LPR skipped (non-fatal): {error}")
-                if not plate_result:
-                    continue
-                plate_crop_url = None
-                try:
-                    px, py, pw, ph = plate_result["region"]
-                    plate_crop_image = vehicle_crop[py : py + ph, px : px + pw]
-                    plate_filename = (
-                        f"camera{camera_number}_{now.strftime('%H-%M-%S')}_"
-                        f"plate_{uuid.uuid4().hex[:12]}.jpg"
-                    )
-                    plate_output_path = day_folder / plate_filename
-                    if cv2.imwrite(str(plate_output_path), plate_crop_image):
-                        plate_crop_url = (
-                            f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
-                            f"{quote(plate_filename)}"
-                        )
-                except Exception as error:
-                    print(f"Camera {camera_number} LPR plate-crop save skipped (non-fatal): {error}")
-                plate_event = AnalyticsEventModel(
-                    id=uuid.uuid4().hex[:12],
-                    camera=camera_number,
-                    site="home",
-                    rule_name=f"LPR ({class_name})",
-                    event_type="plate",
-                    timestamp=now,
-                    confidence=round(plate_result["confidence"] / 100, 4),
-                    plate_number=plate_result["plate_number"],
-                    plate_crop=plate_crop_url,
-                    thumbnail=thumbnail_url,
-                    linked_recording=linked_recording,
-                    mock=False,
-                ).model_dump(mode="json")
-                append_analytics_event(plate_event)
-                saved_events.append(plate_event)
+        # LPR no longer runs here (2026-09-28): it runs on its own cadence
+        # from the AI loop -- run_lpr_scan() -- so a plate is not only read
+        # when a vehicle event happens to be saved. See lpr.scan_frame().
         saved_events.append(event)
 
     # linked_recording backfill (2026-09-22): the SAME trigger condition
@@ -38391,6 +38329,73 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
+
+
+def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
+    """The independent LPR pass (see lpr.scan_frame): runs on every AI
+    detection pass for an LPR camera, whether or not that pass saved a
+    vehicle event, and turns each confirmed plate into a plate event with
+    its plate crop, a thumbnail and the camera's clip."""
+    frame = result.get("frame")
+    if frame is None or cv2 is None or not lpr.LPR_ENABLED or not lpr.is_camera_enabled(camera_number):
+        return []
+    identity = recording_uploader._camera_identity(camera_number)
+    if not (identity and identity.get("lpr_enabled")):
+        return []  # per-camera entitlement, same check the other analytics use
+    vehicles = [d for d in result.get("detections", []) if d.get("class_name") in lpr.LPR_VEHICLE_CLASSES]
+    boxes = [(d["x"], d["y"], d["width"], d["height"]) for d in vehicles]
+    full_frame = None
+    if lpr.LPR_FULL_RES_FRAMES:
+        full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
+    confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame)
+    events = []
+    for plate in confirmed:
+        now = datetime.now()
+        day_folder = AI_THUMBNAILS_FOLDER / now.strftime("%Y-%m-%d")
+        day_folder.mkdir(parents=True, exist_ok=True)
+        event_id = uuid.uuid4().hex[:12]
+        stamp = now.strftime("%H-%M-%S")
+        media_base = f"/recordings/media/ai/{now.strftime('%Y-%m-%d')}/"
+        plate_crop_url = thumbnail_url = None
+        try:
+            px, py, pw, ph = plate["region"]
+            plate_image = plate["crop"][py : py + ph, px : px + pw]
+            plate_filename = f"camera{camera_number}_{stamp}_plate_{event_id}.jpg"
+            if cv2.imwrite(str(day_folder / plate_filename), plate_image):
+                plate_crop_url = media_base + quote(plate_filename)
+            annotated = frame.copy()
+            if plate.get("vehicle_box"):
+                vx, vy, vw, vh = plate["vehicle_box"]
+                cv2.rectangle(annotated, (vx, vy), (vx + vw, vy + vh), (255, 177, 74), 2)
+                cv2.putText(annotated, plate["plate_number"], (vx, max(20, vy - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 177, 74), 2)
+            thumb_filename = f"camera{camera_number}_{stamp}_{event_id}.jpg"
+            if cv2.imwrite(str(day_folder / thumb_filename), annotated):
+                thumbnail_url = media_base + quote(thumb_filename)
+        except Exception as error:
+            print(f"Camera {camera_number} LPR image save skipped (non-fatal): {error}")
+        plate_event = AnalyticsEventModel(
+            id=event_id,
+            camera=camera_number,
+            site="home",
+            rule_name="LPR",
+            event_type="plate",
+            timestamp=now,
+            confidence=round(plate["confidence"] / 100, 4),
+            plate_number=plate["plate_number"],
+            plate_crop=plate_crop_url,
+            thumbnail=thumbnail_url,
+            linked_recording=linked_recording_for(camera_number, now),
+            mock=False,
+        ).model_dump(mode="json")
+        media_owner = _analytics_media_owner(camera_number, event_id, now)
+        event_media_sharing.link(plate_event, media_owner)
+        append_analytics_event(plate_event)
+        if media_owner == event_id:
+            _schedule_owned_analytics_clip(event_id, camera_number, now, thumbnail_url)
+        elif media_owner:
+            event_media_sharing.attach_child(media_owner, event_id, camera_number)
+        events.append(plate_event)
+    return events
 
 
 def _customer_people_counting_rule(camera_number: int) -> dict | None:
@@ -39050,6 +39055,12 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
+            if lpr.LPR_ENABLED and result.get("frame") is not None:
+                try:
+                    async with ai_inference_semaphore:
+                        await asyncio.to_thread(run_lpr_scan, camera_number, result)
+                except Exception as error:
+                    print(f"Camera {camera_number} LPR scan skipped (non-fatal): {error}")
             now_monotonic = time.monotonic()
             # Parked cars / people sitting still (2026-09-24): without this
             # every cooldown expiry re-reported the same unmoved objects as a
@@ -41025,6 +41036,10 @@ REQUEST_CONTEXT: ContextVar[Request | None] = ContextVar(
 
 
 app = FastAPI(title="AnyAiCam VMS", lifespan=lifespan)
+# One-time secrets in query strings (password-reset tokens) never reach the
+# access log in plain text (2026-09-28). See access_log_redaction.py.
+import access_log_redaction
+access_log_redaction.install()
 
 
 

@@ -1084,6 +1084,27 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # aac_voice_call is excluded here too: its homeowner notification
         # is sent by the Voice Call ingestion below, through the session
         # it belongs to -- a generic fan-out here would be a duplicate.
+        if event_type=='aac_voice_call_utterance':
+            # The visitor's answer, transcribed on the edge: attached to the
+            # session its trigger created (never a notification of its own;
+            # record_visitor_utterance() escalates when it should).
+            answer=detections[0] if isinstance(detections,list) and detections and isinstance(detections[0],dict) else {}
+            with connection() as db:
+                trigger=db.execute(
+                    "SELECT id FROM detection_events WHERE camera_id=? AND appliance_id=? AND local_event_id=? AND event_type='aac_voice_call'",
+                    (camera_id,appliance['id'],str(answer.get('voice_call_local_event_id') or '')),
+                ).fetchone()
+            try:
+                from aac_voice_call import ingest_edge_visitor_utterance
+                outcome=ingest_edge_visitor_utterance(
+                    customer_id=camera['customer_id'],camera_id=camera_id,
+                    trigger_detection_event_id=trigger['id'] if trigger else None,
+                    transcript_text=str(answer.get('transcript_text') or ''),
+                )
+            except Exception as error:
+                logger.exception('analytics_event.aac_voice_call_utterance_failed camera_id=%s',camera_id)
+                raise HTTPException(status_code=503,detail='Visitor answer could not be recorded yet; retry.') from error
+            return {'status':'accepted','event_id':event_id,'voice_call':outcome.get('status'),'voice_call_event_id':outcome.get('event_id')}
         if event_type!='aac_voice_call' and (event_type!='facial_recognition' or facial_notify_message):
             try:
                 fanout_appliance_event(

@@ -69,6 +69,7 @@ class GreetingResult:
     delivered: bool
     suppressed_reason: str | None = None
     at: float = field(default_factory=time.monotonic)
+    duration_seconds: float | None = None  # how long the spoken greeting lasts (listening starts after it)
 
 
 class GreetingAudioProvider(Protocol):
@@ -267,7 +268,7 @@ class IsapiTtsGreetingProvider:
                              name=f"aac-greeting-{request.camera_id}", daemon=True).start()
         else:
             self._play(request, camera, pcm, rate)
-        return GreetingResult(camera_id=request.camera_id, delivered=True)
+        return GreetingResult(camera_id=request.camera_id, delivered=True, duration_seconds=round(len(pcm) / 2.0 / rate, 2))
 
     def _play(self, request: GreetingRequest, camera: dict, pcm: bytes, rate: int) -> None:
         relay = None
