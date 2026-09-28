@@ -152,3 +152,20 @@ def test_catalog_amount_is_only_a_fallback_when_stripe_sends_no_amount(db_path, 
     _purchase(db_path, _event("evt_amt2", livemode=True, session_prefix="cs_live_"))
     con = sqlite3.connect(db_path)
     assert con.execute("SELECT amount_cents FROM hardware_orders").fetchone()[0] == 124999
+
+
+# ---------------------------------------------------------------- email links point at this environment's customer portal
+
+def test_setup_email_links_to_this_environments_customer_sign_up(db_path, tmp_path, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_PUBLIC_URL", "https://portal-staging.example")
+    subject, text, html = pn._setup_required_email("Local", 8)
+    assert "https://portal-staging.example/customer-register" in text and 'href="https://portal-staging.example/customer-register"' in html
+    assert "app.anyaicam.com" not in text + html
+
+
+def test_sign_in_links_follow_the_environment_and_fall_back_to_production(monkeypatch):
+    monkeypatch.setenv("ANYAICAM_PUBLIC_URL", "https://portal-staging.example/")
+    assert pn._sign_in_link() == "https://portal-staging.example/customer-login.html"
+    monkeypatch.delenv("ANYAICAM_PUBLIC_URL")
+    monkeypatch.delenv("ANYAICAM_PASSWORD_RESET_URL", raising=False)
+    assert pn._sign_in_link() == "https://app.anyaicam.com/customer-login.html"

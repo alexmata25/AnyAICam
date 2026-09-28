@@ -142548,7 +142548,7 @@ def _event_clips_overlapping_utc_range(camera_id: str, query_start: str, query_e
     from partner_db import connection
     with connection() as db:
         rows = db.execute(
-            "SELECT de.id AS event_id, de.event_type, dem.started_at, dem.ended_at "
+            "SELECT de.id AS event_id, de.event_type, de.parent_detection_event_id, dem.s3_key, dem.started_at, dem.ended_at "
             "FROM detection_event_media dem "
             "JOIN detection_events de ON de.id=dem.detection_event_id "
             "WHERE de.camera_id=? AND length(dem.s3_key)>0 "
@@ -142556,6 +142556,20 @@ def _event_clips_overlapping_utc_range(camera_id: str, query_start: str, query_e
             "ORDER BY dem.started_at ASC",
             (camera_id, query_end, query_start),
         ).fetchall()
+    # One card per CLIP, not per event (2026-09-28, reported as "duplicate
+    # recordings with the exact same timestamp"): analytics that reuse
+    # another event's clip -- PPE/facial recognition/people counting on a
+    # person event -- each have their own detection_event_media row with
+    # the same s3_key and started_at, so Playback listed the same clip two
+    # to four times (2,814 extra cards on the real Living Room). The clip's
+    # owning event (no parent) represents it; a child only stands in when
+    # its owner is outside the range.
+    by_clip: dict = {}
+    for row in rows:
+        key = (row["s3_key"], row["started_at"])
+        current = by_clip.get(key)
+        if current is None or (current["parent_detection_event_id"] and not row["parent_detection_event_id"]):
+            by_clip[key] = row
     return [
         {
             "id": row["event_id"],
@@ -142564,7 +142578,7 @@ def _event_clips_overlapping_utc_range(camera_id: str, query_start: str, query_e
             "name": f'{str(row["event_type"]).replace("_", " ").title()} event clip',
             "kind": "event_clip",
         }
-        for row in rows
+        for row in sorted(by_clip.values(), key=lambda r: r["started_at"])
     ]
 
 

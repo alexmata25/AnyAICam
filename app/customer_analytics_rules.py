@@ -284,6 +284,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
         camera_name = _camera_display_label(camera)
         start_url = f'/api/customer/cameras/{camera_id}/live/start'
         playlist_url = f'/api/customer/cameras/{camera_id}/live/playlist.m3u8'
+        still_url = f'/api/customer/cameras/{camera_id}/live/still.jpg'
 
         content = f'''
         <header class="topbar">
@@ -307,6 +308,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                 <button class="compact-button" id="capture-frame" type="button">Capture frame</button>
                 <button class="compact-button" id="clear-drawing" type="button">Clear drawing</button>
               </div>
+              <p class="health-detail" id="preview-status" role="status" style="margin-top:8px">Starting the live preview…</p>
               <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then click on the image to place points. A line needs 2 points; a zone needs at least 3. Zones to ignore are drawn in red.</p>
             </div>
             <div style="flex:1;min-width:260px;display:grid;gap:12px;align-content:start">
@@ -360,7 +362,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                    'const cameraId=' + json.dumps(camera_id) + ';'
                    'const canEdit=' + json.dumps(can_edit) + ';'
                    'const startUrl=' + json.dumps(start_url) + ';'
-                   'const playlistUrl=' + json.dumps(playlist_url) + ';' + '''
+                   'const playlistUrl=' + json.dumps(playlist_url) + ';'
+                   'const stillUrl=' + json.dumps(still_url) + ';' + '''
   const video=document.getElementById('rule-video');
   const canvas=document.getElementById('rule-canvas');
   const ctx=canvas.getContext('2d');
@@ -371,14 +374,85 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   const directionField=document.getElementById('direction-field');
   const bgCanvas=document.createElement('canvas');
   let hasFrame=false, points=[], editingRuleId=null, sessionId=null, hls=null, pollTimer=null, stopped=false;
+  let videoReady=false, stillTried=false;
+  const statusEl=document.getElementById('preview-status');
+  function setStatus(text){statusEl.textContent=text;}
 
+  // 2026-09-28: the canvas sits on top of the live video. Until a frame is
+  // captured it used to be painted solid black, hiding the preview, with no
+  // status -- so "Capture frame" looked broken. Now the live video shows
+  // through, the first frame is captured automatically, a black/failed
+  // browser capture falls back to a server-side still, and the status line
+  // says what is happening.
   function drawBackground(){
-    if(hasFrame){ctx.drawImage(bgCanvas,0,0,canvas.width,canvas.height);}
-    else{
+    if(hasFrame){ctx.drawImage(bgCanvas,0,0,canvas.width,canvas.height);return;}
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    if(!videoReady){
       ctx.fillStyle='#111';ctx.fillRect(0,0,canvas.width,canvas.height);
       ctx.fillStyle='#888';ctx.font='14px sans-serif';
-      ctx.fillText('Capture a frame to begin drawing',16,canvas.height/2);
+      ctx.fillText('Loading the camera image…',16,canvas.height/2);
     }
+  }
+
+  function frameIsBlank(){
+    try{
+      const d=bgCanvas.getContext('2d').getImageData(0,0,bgCanvas.width,bgCanvas.height).data;
+      let sum=0,n=0;
+      for(let i=0;i<d.length;i+=4*97){sum+=d[i]+d[i+1]+d[i+2];n++;}
+      return n===0||sum/(n*3)<6;
+    }catch(e){return true}
+  }
+
+  function useFrame(width,height,message){
+    canvas.width=width;canvas.height=height;
+    hasFrame=true;
+    setStatus(message);
+    redraw();
+  }
+
+  async function captureFromStill(){
+    setStatus('Getting a still image from the camera…');
+    try{
+      const response=await fetch(stillUrl,{cache:'no-store'});
+      if(!response.ok)throw new Error(String(response.status));
+      const blob=await response.blob();
+      const image=await new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=URL.createObjectURL(blob);});
+      bgCanvas.width=image.naturalWidth;bgCanvas.height=image.naturalHeight;
+      bgCanvas.getContext('2d').drawImage(image,0,0);
+      useFrame(bgCanvas.width,bgCanvas.height,'Frame captured. Pick a rule type and click on the image to place points.');
+      return true;
+    }catch(e){
+      setStatus('No camera image is available yet. Wait a few seconds and press Capture frame again.');
+      return false;
+    }
+  }
+
+  function captureFromVideo(){
+    if(!video.videoWidth)return false;
+    bgCanvas.width=video.videoWidth;bgCanvas.height=video.videoHeight;
+    bgCanvas.getContext('2d').drawImage(video,0,0);
+    if(frameIsBlank())return false;
+    useFrame(bgCanvas.width,bgCanvas.height,'Frame captured. Pick a rule type and click on the image to place points.');
+    return true;
+  }
+
+  async function captureFrame(){
+    if(videoReady&&captureFromVideo())return;
+    await captureFromStill();
+  }
+
+  function onPreviewReady(){
+    if(videoReady)return;
+    videoReady=true;
+    if(!hasFrame){setStatus('Live preview ready.');redraw();setTimeout(()=>{if(!hasFrame)captureFrame();},800);}
+  }
+  video.addEventListener('playing',onPreviewReady);
+  video.addEventListener('loadeddata',onPreviewReady);
+
+  function previewUnavailable(){
+    if(hasFrame||stillTried)return;
+    stillTried=true;
+    captureFromStill();
   }
 
   function redraw(){
@@ -417,14 +491,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   toggleDirectionField();
   ruleType.addEventListener('change',()=>{toggleDirectionField();points=[];redraw();});
 
-  document.getElementById('capture-frame').addEventListener('click',()=>{
-    if(!video.videoWidth){alert('Live preview is not ready yet.');return;}
-    bgCanvas.width=video.videoWidth;bgCanvas.height=video.videoHeight;
-    bgCanvas.getContext('2d').drawImage(video,0,0);
-    canvas.width=bgCanvas.width;canvas.height=bgCanvas.height;
-    hasFrame=true;
-    redraw();
-  });
+  document.getElementById('capture-frame').addEventListener('click',()=>{captureFrame();});
   document.getElementById('clear-drawing').addEventListener('click',()=>{points=[];redraw();});
 
   if(canEdit){
@@ -547,6 +614,7 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
       hls.loadSource(playlistUrl);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED,()=>{video.play().catch(()=>{})});
+      hls.on(Hls.Events.ERROR,(event,data)=>{if(data&&data.fatal)previewUnavailable();});
     }else if(video.canPlayType('application/vnd.apple.mpegurl')){
       video.src=playlistUrl;
       video.addEventListener('loadedmetadata',()=>{video.play().catch(()=>{})});
@@ -555,13 +623,14 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
 
   async function pollPlaylist(deadline){
     if(stopped)return;
-    if(Date.now()>deadline)return;
+    if(Date.now()>deadline){previewUnavailable();return;}
     let response=null;
     try{response=await fetch(playlistUrl,{cache:'no-store'})}catch(e){}
     if(response&&response.ok){
       const text=await response.text();
       if(text.includes('#EXTINF')){attachPlayer();return}
     }else if(response&&[403,404,409,503].includes(response.status)){
+      previewUnavailable();
       return;
     }
     pollTimer=setTimeout(()=>pollPlaylist(deadline),2000);
@@ -569,8 +638,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
 
   async function startPreview(){
     let response;
-    try{response=await fetch(startUrl,{method:'POST'})}catch(e){return}
-    if(!response.ok)return;
+    try{response=await fetch(startUrl,{method:'POST'})}catch(e){previewUnavailable();return}
+    if(!response.ok){previewUnavailable();return;}
     const body=await response.json();
     sessionId=body.session_id;
     pollPlaylist(Date.now()+45000);

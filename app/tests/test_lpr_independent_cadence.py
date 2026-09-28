@@ -224,3 +224,40 @@ def test_a_plate_event_on_an_event_mode_camera_triggers_its_own_recording_and_ba
         "vehicle_box": None, "source": "full_frame"}])
     assert len(main.run_lpr_scan(2, {"frame": frame, "detections": []})) == 1
     assert scheduled == ["persist_event_recording", "_backfill_ai_event_linked_recording"]
+
+
+# ---------------------------------------------------------------- precision over recall (real-traffic finding)
+
+def test_low_confidence_reads_never_create_a_plate_event():
+    for i in range(6):  # repeated agreeing but uncertain reads (both OCR passes disagreed -> ~69)
+        assert lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 69.0}, now=float(i)) is None
+
+
+def test_near_duplicate_misreads_after_a_confirmed_plate_are_suppressed():
+    assert lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 93.0}, now=0.0) is None
+    assert lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 93.0}, now=5.0) is not None
+    for i, variant in enumerate(("QRE4821", "QRE4B21")):  # 1 and 2 edits off, even at high confidence
+        lpr.confirm_plate(2, {"plate_number": variant, "confidence": 90.0}, now=100.0 + i * 10)
+        assert lpr.confirm_plate(2, {"plate_number": variant, "confidence": 90.0}, now=105.0 + i * 10) is None
+
+
+def test_a_genuinely_different_plate_is_still_confirmed():
+    lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 93.0}, now=0.0)
+    lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 93.0}, now=5.0)
+    lpr.confirm_plate(2, {"plate_number": "HTW9035", "confidence": 91.0}, now=30.0)
+    assert lpr.confirm_plate(2, {"plate_number": "HTW9035", "confidence": 91.0}, now=35.0) is not None
+
+
+def test_near_duplicate_suppression_ends_with_the_cooldown_and_is_per_camera():
+    lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 93.0}, now=0.0)
+    lpr.confirm_plate(2, {"plate_number": "QRS4821", "confidence": 93.0}, now=5.0)
+    lpr.confirm_plate(3, {"plate_number": "QRE4821", "confidence": 93.0}, now=10.0)
+    assert lpr.confirm_plate(3, {"plate_number": "QRE4821", "confidence": 93.0}, now=15.0) is not None  # other camera
+    later = 5.0 + lpr.LPR_REPEAT_COOLDOWN_SECONDS + 1
+    lpr.confirm_plate(2, {"plate_number": "QRE4821", "confidence": 93.0}, now=later)
+    assert lpr.confirm_plate(2, {"plate_number": "QRE4821", "confidence": 93.0}, now=later + 5) is not None
+
+
+def test_edit_distance():
+    assert lpr._edit_distance("KPC6266", "KPE6266") == 1 and lpr._edit_distance("KPC6266", "KPEG266") == 2
+    assert lpr._edit_distance("ABC1234", "ABC1234") == 0 and lpr._edit_distance("ABC", "XYZ123") == 6

@@ -33,7 +33,9 @@
             listen('error',()=>{if(current()){cleanup();message('Event clip is unavailable.');}});
             timer=later(()=>{if(current()){cleanup();message('Event clip is unavailable.');}},15000);
             loaded=true;video.load();onReady();
-            if(autoplay)Promise.resolve(video.play()).catch(()=>message('Event clip ready — press Play to start.'));
+            // Browsers refuse unmuted autoplay without a user gesture (e.g. arriving from an email link):
+            // retry muted, as the recordings player already does (2026-09-28).
+            if(autoplay)Promise.resolve(video.play()).catch(()=>{if(!current())return;video.muted=true;Promise.resolve(video.play()).then(()=>message('Playing event clip (muted — unmute with the player controls)')).catch(()=>message('Event clip ready — press Play to start.'));});
             return;
           }
           if(response.status!==404&&response.status<500){message('Event clip is unavailable.');return;}

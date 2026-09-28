@@ -86,6 +86,30 @@ from email_service import get_email_service
 CANCELLED_STATUSES = {"cancelled"}
 
 
+
+# Links in purchase emails point at THIS environment's customer portal
+# (2026-09-28): they were hard-coded to https://app.anyaicam.com, so a
+# staging purchase sent the customer to production, and the "complete your
+# setup" email did not link to the customer sign-up page at all. The base
+# comes from ANYAICAM_PUBLIC_URL (see notification_email.public_base_url);
+# the production host is only the fallback when nothing is configured.
+DEFAULT_PORTAL_URL = "https://app.anyaicam.com"
+CUSTOMER_REGISTER_PATH = "/customer-register"
+CUSTOMER_SIGN_IN_PATH = "/customer-login.html"
+
+
+def _portal_url(path: str = "") -> str:
+    try:
+        from notification_email import public_base_url
+        base = public_base_url() or DEFAULT_PORTAL_URL
+    except Exception:
+        base = DEFAULT_PORTAL_URL
+    return base.rstrip("/") + path
+
+
+def _sign_in_link() -> str:
+    return _portal_url(CUSTOMER_SIGN_IN_PATH)
+
 def _now() -> str:
     return datetime.now().isoformat()
 
@@ -207,7 +231,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"Your AnyAiCam purchase is confirmed and your service is ready.\n\n"
         f"Plan: {plan_label}\n"
         f"Camera capacity: {camera_slot_maximum}\n\n"
-        f"Sign in and connect/claim your AnyAiCam VMS or appliance: https://app.anyaicam.com\n\n"
+        f"Sign in and connect/claim your AnyAiCam VMS or appliance: {_sign_in_link()}\n\n"
         f"If you need help getting started, our support team is here for you.\n\n"
         f"— The AnyAiCam Team"
     )
@@ -216,7 +240,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"<p>Your AnyAiCam purchase is confirmed and your service is ready.</p>"
         f"<p><strong>Plan:</strong> {plan_label}<br><strong>Camera capacity:</strong> {camera_slot_maximum}</p>"
         f'<p>Sign in and connect/claim your AnyAiCam VMS or appliance: '
-        f'<a href="https://app.anyaicam.com">https://app.anyaicam.com</a></p>'
+        f'<a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
         f"<p>If you need help getting started, our support team is here for you.</p>"
         f"<p>— The AnyAiCam Team</p>"
     )
@@ -228,14 +252,14 @@ def _setup_required_email(plan_label: str, camera_slot_maximum: int) -> tuple[st
     text = (
         f"Hi there,\n\n"
         f"Your AnyAiCam purchase is confirmed ({plan_label}, {camera_slot_maximum} cameras).\n\n"
-        f"Complete your account setup to activate your service: https://app.anyaicam.com\n\n"
+        f"Complete your account setup to activate your service: {_portal_url(CUSTOMER_REGISTER_PATH)}\n\n"
         f"— The AnyAiCam Team"
     )
     html = (
         f"<p>Hi there,</p>"
         f"<p>Your AnyAiCam purchase is confirmed ({plan_label}, {camera_slot_maximum} cameras).</p>"
         f'<p>Complete your account setup to activate your service: '
-        f'<a href="https://app.anyaicam.com">https://app.anyaicam.com</a></p>'
+        f'<a href="{_portal_url(CUSTOMER_REGISTER_PATH)}">{_portal_url(CUSTOMER_REGISTER_PATH)}</a></p>'
         f"<p>— The AnyAiCam Team</p>"
     )
     return subject, text, html
@@ -246,13 +270,13 @@ def _plan_updated_email(first_name: str, plan_label: str, camera_slot_maximum: i
     text = (
         f"Hi {first_name},\n\n"
         f"Your AnyAiCam plan has been updated to {camera_slot_maximum} cameras ({plan_label}).\n\n"
-        f"Sign in at https://app.anyaicam.com to see your updated plan.\n\n"
+        f"Sign in at {_sign_in_link()} to see your updated plan.\n\n"
         f"— The AnyAiCam Team"
     )
     html = (
         f"<p>Hi {first_name},</p>"
         f"<p>Your AnyAiCam plan has been updated to <strong>{camera_slot_maximum} cameras</strong> ({plan_label}).</p>"
-        f'<p>Sign in at <a href="https://app.anyaicam.com">https://app.anyaicam.com</a> to see your updated plan.</p>'
+        f'<p>Sign in at <a href="{_sign_in_link()}">{_sign_in_link()}</a> to see your updated plan.</p>'
         f"<p>— The AnyAiCam Team</p>"
     )
     return subject, text, html
@@ -279,7 +303,6 @@ def _plan_cancelled_email(first_name: str, plan_label: str) -> tuple[str, str, s
 
 SUPPORT_EMAIL = "amata@anyaicam.com"
 SUPPORT_LINK = "https://anyaicam.com/support.html"
-SIGN_IN_LINK = "https://app.anyaicam.com"
 # Staging draft URLs -- these pages are NOT published live yet (see
 # website-pricing-review/staging/policies/); update once the real,
 # reviewed policy pages are published.
@@ -325,7 +348,7 @@ def _hardware_order_email(first_name: str, order: dict) -> tuple[str, str, str]:
         f"{PREPARATION_TIMEFRAME_TEXT}\n\n"
         f"Before shipment, AnyAiCam prepares, installs and configures the VMS software on your appliance, "
         f"and tests it -- this ensures it's ready to use the moment it arrives.\n\n"
-        f"Manage your account: {SIGN_IN_LINK}\n\n"
+        f"Manage your account: {_sign_in_link()}\n\n"
         f"Please note: purchasing hardware does not activate camera slots on your account. Camera-slot "
         f"service (Local or Hybrid plans) is purchased and managed separately.\n\n"
         f"Shipping, return, and refund terms: {SHIPPING_POLICY_LINK} / {RETURN_REFUND_POLICY_LINK}\n\n"
@@ -341,7 +364,7 @@ def _hardware_order_email(first_name: str, order: dict) -> tuple[str, str, str]:
         f"<p>{PREPARATION_TIMEFRAME_TEXT}</p>"
         f"<p>Before shipment, AnyAiCam prepares, installs and configures the VMS software on your appliance, "
         f"and tests it — this ensures it's ready to use the moment it arrives.</p>"
-        f'<p>Manage your account: <a href="{SIGN_IN_LINK}">{SIGN_IN_LINK}</a></p>'
+        f'<p>Manage your account: <a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
         f"<p>Please note: purchasing hardware does not activate camera slots on your account. Camera-slot "
         f"service (Local or Hybrid plans) is purchased and managed separately.</p>"
         f'<p>Shipping, return, and refund terms: <a href="{SHIPPING_POLICY_LINK}">Shipping Policy</a> / '
@@ -374,7 +397,7 @@ def _hardware_shipped_email(first_name: str, order: dict) -> tuple[str, str, str
         f"Your AnyAiCam order has shipped.\n\n"
         + "\n".join(lines_text) + "\n\n"
         f"When your appliance arrives, sign in to your AnyAiCam account to complete setup and connect your cameras.\n\n"
-        f"Sign in: {SIGN_IN_LINK}\n\n"
+        f"Sign in: {_sign_in_link()}\n\n"
         f"{_SUPPORT_FOOTER_TEXT}"
     )
     html = (
@@ -382,7 +405,7 @@ def _hardware_shipped_email(first_name: str, order: dict) -> tuple[str, str, str
         f"<p>Your AnyAiCam order has shipped.</p>"
         f"<p>{'<br>'.join(lines_html)}</p>"
         f"<p>When your appliance arrives, sign in to your AnyAiCam account to complete setup and connect your cameras.</p>"
-        f'<p>Sign in: <a href="{SIGN_IN_LINK}">{SIGN_IN_LINK}</a></p>'
+        f'<p>Sign in: <a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
         f"{_SUPPORT_FOOTER_HTML}"
     )
     return subject, text, html
@@ -526,7 +549,7 @@ def _getting_started_email(first_name: str, camera_slot_summary: Optional[tuple[
     text = (
         f"Hi {first_name},\n\n"
         f"Let's get your AnyAiCam system set up.\n\n"
-        f"1. Sign in: {SIGN_IN_LINK}\n"
+        f"1. Sign in: {_sign_in_link()}\n"
         f"2. Connect your appliance using the Cloud ID and activation code provided with your device.\n"
         f"3. Add and configure your cameras from the dashboard.\n\n"
         f"{capacity_text}"
@@ -535,7 +558,7 @@ def _getting_started_email(first_name: str, camera_slot_summary: Optional[tuple[
     html = (
         f"<p>Hi {first_name},</p>"
         f"<p>Let's get your AnyAiCam system set up.</p>"
-        f'<ol><li>Sign in: <a href="{SIGN_IN_LINK}">{SIGN_IN_LINK}</a></li>'
+        f'<ol><li>Sign in: <a href="{_sign_in_link()}">{_sign_in_link()}</a></li>'
         f"<li>Connect your appliance using the Cloud ID and activation code provided with your device.</li>"
         f"<li>Add and configure your cameras from the dashboard.</li></ol>"
         f"{capacity_html}"
