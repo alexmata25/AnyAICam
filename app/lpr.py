@@ -279,6 +279,10 @@ def reset_pipeline_state() -> None:
         _full_frame_cache.clear()
     with _tracks_lock:
         _tracks.clear()
+    try:
+        reset_scan_state()
+    except NameError:
+        pass
 
 
 def _get_plate_model():
@@ -583,3 +587,151 @@ def mark_vehicle_read(camera_number, box) -> None:
         for track in _tracks.get(camera_number, []):
             if _iou(track["box"], box) >= LPR_STATIONARY_IOU:
                 track["done"] = True
+
+
+# ---------------------------------------------------------------- independent LPR cadence (2026-09-28)
+# Found in the real night test: LPR used to run only inside
+# save_yolo_events(), i.e. only when a vehicle *event* was saved. Those
+# saves are at most one per AI_PERSON_COOLDOWN_SECONDS (30 s) and stop
+# entirely while a vehicle stands still (stationary suppression), but a
+# plate needs LPR_CONFIRM_READS identical reads inside
+# LPR_VOTE_WINDOW_SECONDS -- so even a clearly readable plate was often
+# never confirmed. scan_frame() is called from the AI loop on every
+# detection pass instead (main.run_lpr_scan), reusing the vehicle boxes
+# that pass already found:
+#  - at most once per LPR_SCAN_SECONDS per camera;
+#  - each vehicle position gets LPR_ATTEMPTS_PER_VEHICLE tries, then is
+#    left alone for LPR_STATIONARY_SKIP_SECONDS (should_attempt), and a
+#    confirmed vehicle is not re-read -- so a parked car costs nothing;
+#  - when the vehicle detector finds nothing (e.g. headlights shining into
+#    the camera washed the vehicle out while the plate stayed legible),
+#    the plate detector looks at the whole frame, no more often than
+#    LPR_FULL_FRAME_SECONDS;
+#  - confidence threshold, multi-read voting and the per-plate cooldown
+#    (confirm_plate) are unchanged, and each pass contributes at most one
+#    vote per vehicle, so one frame can never confirm a plate by itself.
+LPR_SCAN_SECONDS = max(0.0, float(os.environ.get("ANYAICAM_LPR_SCAN_SECONDS", "4")))
+LPR_FULL_FRAME_FALLBACK = os.environ.get("ANYAICAM_LPR_FULL_FRAME_FALLBACK", "true").strip().lower() == "true"
+LPR_FULL_FRAME_SECONDS = max(1.0, float(os.environ.get("ANYAICAM_LPR_FULL_FRAME_SECONDS", "15")))
+LPR_FULL_FRAME_IMGSZ = max(320, int(os.environ.get("ANYAICAM_LPR_FULL_FRAME_IMGSZ", "1280")))
+_scan_lock = threading.Lock()
+_last_scan: dict = {}
+_last_full_frame: dict = {}
+
+
+def reset_scan_state() -> None:
+    """Test-only: forget scan timing."""
+    with _scan_lock:
+        _last_scan.clear()
+        _last_full_frame.clear()
+
+
+def _due(table: dict, camera_number, interval: float, now: float) -> bool:
+    with _scan_lock:
+        if now - table.get(camera_number, float("-inf")) < interval:
+            return False
+        table[camera_number] = now
+        return True
+
+
+def read_detected_plate(plate_crop_bgr, detector_confidence: float):
+    """(text, combined confidence) for an already-located plate, or None
+    below LPR_MIN_CONFIDENCE -- the same read and scoring recognize_plate uses."""
+    if plate_crop_bgr is None or getattr(plate_crop_bgr, "size", 0) == 0:
+        return None
+    result = read_plate_glyphs(plate_crop_bgr) or read_plate_text(plate_crop_bgr)
+    if result is None:
+        return None
+    text, confidence = result
+    confidence = round(min(100.0, confidence + 20.0 * float(detector_confidence or 0.0)), 1)
+    return (text, confidence) if confidence >= LPR_MIN_CONFIDENCE else None
+
+
+def detect_plates_full_frame(frame_bgr) -> list:
+    """Every plate the model finds on a whole frame (no cascade here: on a
+    full scene it only produces noise). [] without the model."""
+    if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+        return []
+    model = _get_plate_model()
+    if model is None:
+        return []
+    try:
+        result = model(frame_bgr, verbose=False, conf=LPR_PLATE_MIN_DETECTOR_CONFIDENCE, imgsz=LPR_FULL_FRAME_IMGSZ)[0]
+        boxes = list(zip(result.boxes.xyxy.tolist(), result.boxes.conf.tolist()))
+    except Exception:
+        return []
+    h, w = frame_bgr.shape[:2]
+    plates = []
+    for (x1, y1, x2, y2), confidence in boxes:
+        pad = 6
+        x1, y1 = max(0, int(x1) - pad), max(0, int(y1) - pad)
+        x2, y2 = min(w, int(x2) + pad), min(h, int(y2) + pad)
+        if x2 - x1 >= 8 and y2 - y1 >= 4:
+            plates.append({"region": (x1, y1, x2 - x1, y2 - y1), "detector_confidence": float(confidence)})
+    return plates
+
+
+def _scaled_region(region, analytics_frame, full_frame):
+    """A region on the analytics frame mapped onto the full-resolution frame."""
+    ah, aw = analytics_frame.shape[:2]
+    fh, fw = full_frame.shape[:2]
+    sx, sy = fw / float(aw), fh / float(ah)
+    x, y, w, h = region
+    return int(x * sx), int(y * sy), max(1, int(w * sx)), max(1, int(h * sy))
+
+
+def scan_frame(camera_number, frame, vehicle_boxes, *, full_frame=None, now: float | None = None) -> list:
+    """One LPR pass over one analytics frame. vehicle_boxes are (x, y, w, h)
+    vehicle detections on that frame. Returns the plates confirmed by this
+    pass: dicts with plate_number, confidence, region (coordinates inside
+    `crop`), crop (the image the region refers to), vehicle_box, source."""
+    if not LPR_ENABLED or frame is None or not is_camera_enabled(camera_number):
+        return []
+    now = time.monotonic() if now is None else now
+    if not _due(_last_scan, camera_number, LPR_SCAN_SECONDS, now):
+        return []
+    confirmed = []
+    voted = set()  # one vote per plate text per pass: one frame never confirms a plate by itself
+    distinct = []
+    for box in sorted(vehicle_boxes, key=lambda b: b[2] * b[3], reverse=True):
+        if all(_iou(box, kept) < 0.5 for kept in distinct):
+            distinct.append(box)  # the same vehicle reported as both "car" and "truck" is read once
+    for box in distinct:
+        if not should_attempt(camera_number, box, now=now):
+            continue
+        x, y, w, h = box
+        analytics_crop = frame[y : y + h, x : x + w]
+        full_crop = full_resolution_vehicle_crop(frame, box, full_frame)
+        result = recognize_plate(full_crop, camera_number=camera_number) if full_crop is not None else None
+        crop = full_crop if result is not None else analytics_crop
+        if result is None:
+            result = recognize_plate(analytics_crop, camera_number=camera_number)
+        if result is not None and result["plate_number"] in voted:
+            continue
+        if result is not None:
+            voted.add(result["plate_number"])
+        result = confirm_plate(camera_number, result, now=now)
+        if result is not None:
+            mark_vehicle_read(camera_number, box)
+            confirmed.append(dict(result, crop=crop, vehicle_box=box, source="vehicle"))
+    if not vehicle_boxes and LPR_FULL_FRAME_FALLBACK and _due(_last_full_frame, camera_number, LPR_FULL_FRAME_SECONDS, now):
+        use_full = full_frame is not None and full_frame.shape[1] >= frame.shape[1] * 1.3
+        for plate in detect_plates_full_frame(frame):
+            px, py, pw, ph = plate["region"]
+            track_box = (max(0, px - pw), max(0, py - 2 * ph), 3 * pw, 4 * ph)  # stands in for the unseen vehicle
+            if not should_attempt(camera_number, track_box, now=now):
+                continue
+            source_image, region = (full_frame, _scaled_region(plate["region"], frame, full_frame)) if use_full else (frame, plate["region"])
+            rx, ry, rw, rh = region
+            read = read_detected_plate(source_image[ry : ry + rh, rx : rx + rw], plate["detector_confidence"])
+            if read is None or read[0] in voted:
+                continue
+            voted.add(read[0])
+            result = confirm_plate(camera_number, {
+                "plate_number": read[0], "confidence": read[1], "region": region,
+                "detector_confidence": round(plate["detector_confidence"], 3), "detector": "model-full-frame",
+            }, now=now)
+            if result is not None:
+                mark_vehicle_read(camera_number, track_box)
+                confirmed.append(dict(result, crop=source_image, vehicle_box=None, source="full_frame"))
+    return confirmed
