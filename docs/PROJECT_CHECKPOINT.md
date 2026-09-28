@@ -4171,8 +4171,19 @@ Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both d
 ## OVERNIGHT AUTONOMOUS SESSION 2026-09-27/28 -- resume point
 
 ### State
-- **Golden** `reconcile/golden-foundation-20260911` = `5d02f25` (pushed). Work queued on top, NOT yet on golden: branch `feature/aac-vc-visitor-listening-20260928`, which contains `d8448b8` LPR independent cadence, `cbb7bd4` visitor listening/STT, `57fa39c` access-log redaction and `48f01ac` Caddy redaction.
-- **Staging**: `portal-5d02f25`. Gated cutover 2026-09-28 03:45Z, 246/246 outside polls returned 200. Rollback container: `portal-3fa8853-pre-5d02f25-20260928T034535Z-rollback`.
+- **Golden** `reconcile/golden-foundation-20260911` = `1175932` (pushed). It contains:
+  - `d8448b8` LPR independent cadence;
+  - `cbb7bd4` visitor listening/STT;
+  - `57fa39c` access-log redaction and `48f01ac` Caddy redaction;
+  - checkpoints.
+
+  Full suite: 86 failed, all in the pre-existing baseline; no new failures.
+- **Staging** is now `portal-1175932`. Gated cutover 04:49Z, 293/293 polls returned 200. Rollback container: `portal-5d02f25-pre-1175932-20260928T044927Z-rollback`. Validated:
+  - deep links;
+  - reset token redacted in the live log (0 raw, 1 redacted);
+  - utterance ingest deployed.
+- **Ryzen next package staged, NOT installed:** `~/anyaicam-release-1175932`, tarball `anyaicam-appliance-installer-1.1.0-vms-117593236a12.tar.gz`, sha256 `21de75c3923a6d818298ce5dea6f42a3df547e38f992e20c9764859cc4632dfc`. Install tomorrow: `cd ~/anyaicam-release-1175932 && sudo ./install.sh --repair && sudo ./validate.sh`.
+- **Staging, earlier tonight**: `portal-5d02f25`. Gated cutover 2026-09-28 03:45Z, 246/246 outside polls returned 200. Rollback container: `portal-3fa8853-pre-5d02f25-20260928T034535Z-rollback`.
 - **Ryzen**: `5d02f25`, installed by the operator with `install.sh --repair`. Remote checks: code matches the commit byte for byte, container healthy with 0 restarts, cams 1-5 live, recording buffers writing, events created and reaching the cloud. Rollback image: `anyaicam-vms:rollback-aeb9414e1e1b`. The `validate.sh` output was never returned (PENDING USER ACTION).
 - **Samsung**: unchanged. Pinned image `anyaicam-vms:f5a6d87`, claimed appliance `9cf63b90...`, 0 cloud cameras. It needs its own controlled release later; do not deploy just because the Ryzen was updated.
 
