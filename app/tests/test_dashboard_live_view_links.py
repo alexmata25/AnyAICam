@@ -109,8 +109,10 @@ def test_camera_preview_cards_link_to_the_new_single_camera_page_not_the_old_one
     response = http_client.get("/dashboard", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     for n in range(1, 6):
-        assert f'href="/customer/cameras/cam-{n}/live" id="dashboard-camera-{n}"' in html
-        assert f'href="/camera/{n}" id="dashboard-camera-{n}"' not in html
+        card = html[html.index(f'id="dashboard-camera-{n}"'):]
+        card = card[:card.index("</article>")]
+        assert f'href="/customer/cameras/cam-{n}/live"' in card
+        assert f'href="/camera/{n}"' not in card
 
 
 def test_two_appliances_with_the_same_camera_number_never_link_to_the_wrong_camera(http_client, db_path):
@@ -137,7 +139,8 @@ def test_two_appliances_with_the_same_camera_number_never_link_to_the_wrong_came
     html = response.text
     assert "/customer/cameras/cam-1a/live" not in html
     assert "/customer/cameras/cam-1b/live" not in html
-    assert 'href="/customer-live" id="dashboard-camera-1"' in html
+    card = html[html.index('id="dashboard-camera-1"'):]
+    assert 'href="/customer-live"' in card[:card.index("</article>")]
 
 
 def test_a_customer_with_no_camera_id_resolved_falls_back_to_customer_live_not_a_broken_link(http_client, db_path):
