@@ -21,6 +21,20 @@
 
     log {
         output stdout
-        format console
+        # One-time secrets in query strings (password-reset tokens) are
+        # redacted before the access line is written (2026-09-28).
+        format filter {
+            wrap console
+            fields {
+                request>uri query {
+                    replace token REDACTED
+                    replace code REDACTED
+                    replace password REDACTED
+                    replace secret REDACTED
+                    replace key REDACTED
+                    replace signature REDACTED
+                }
+            }
+        }
     }
 }
