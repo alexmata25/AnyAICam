@@ -75762,7 +75762,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="section-head"><div><h2>Live cameras</h2><p>Click any camera to open its full live view.</p></div><span class="health-detail" id="dashboard-camera-summary">Checking cameras…</span><span class="dash-attention" id="dashboard-attention" role="status"></span></div>
+        <div class="section-head"><div><h2>Camera health</h2><p>Status, recording and the latest activity for each camera. Use the buttons to open Live, Playback, Events or Rules.</p></div><span class="health-detail" id="dashboard-camera-summary">Checking cameras…</span><span class="dash-attention" id="dashboard-attention" role="status"></span></div>
 
 
 

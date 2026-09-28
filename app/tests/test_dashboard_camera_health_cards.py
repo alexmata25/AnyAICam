@@ -103,3 +103,10 @@ def test_events_page_only_filters_on_load_when_opened_with_a_camera(http_client,
     cookie = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
     assert 'data-initial-filter="1"' in http_client.get("/events?camera=cam-1", cookies=cookie).text
     assert 'data-initial-filter="1"' not in http_client.get("/events", cookies=cookie).text
+
+
+def test_dashboard_section_heading_describes_health_cards_not_live_tiles():
+    import main
+    source = open(main.__file__, encoding="utf-8").read()
+    assert "<h2>Camera health</h2>" in source
+    assert "Click any camera to open its full live view." not in source
