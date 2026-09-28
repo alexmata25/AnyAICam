@@ -1,10 +1,14 @@
 # Local Recording device-bound licensing ("Local ID") — design (2026-09-19)
 
-**Status: design only. No installer or application code has been
-written for this yet** -- explicitly requested to be scoped and
-designed before any installer work begins, and added to the Local
-Recording roadmap rather than implemented now.
+**Status (2026-09-28): the cryptographic core is implemented and tested in
+`app/local_license.py` (`app/tests/test_local_license.py`, 19 tests):**
+- fingerprint (SHA-256; raw inputs never stored);
+- Ed25519 certificate issuance;
+- fully offline verification with the design's exact failure reasons.
 
+**Nothing enforces it yet, and nothing calls it at startup.** Wiring waits on the open decisions below: where the issuing service lives, and what the product does when verification fails.
+
+**Finding from the real Ryzen:** inside the VMS container there is no `/etc/machine-id`, the root is an overlay with no volume UUID, and there are no physical NICs. The fingerprint must therefore be computed on the HOST (appliance agent). `collect_fingerprint()` refuses to produce a weak, appliance_id-only fingerprint.
 ## What already exists, and why it isn't enough on its own
 
 `installer/09-identity.sh` already generates an `appliance_id` (a

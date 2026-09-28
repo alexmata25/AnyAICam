@@ -986,17 +986,21 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
         if not event:
             raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
-        camera = row("SELECT id,name FROM cameras WHERE id=? AND customer_id=?", (event["camera_id"], identity["customer_id"]))
+        camera = row("SELECT id,name,talk_down_supported FROM cameras WHERE id=? AND customer_id=?", (event["camera_id"], identity["customer_id"]))
         camera_name = (camera or {}).get("name") or "Entrance camera"
 
         import os
 
-        talk_audio_enabled = os.environ.get("ANYAICAM_TALK_AUDIO_ENABLED", "false").strip().lower() == "true"
-        audio_status = (
-            "Two-way audio transport is enabled on this deployment."
-            if talk_audio_enabled
-            else "Two-way audio transport is not enabled on this deployment yet -- the microphone button below captures audio in your browser, but it is not confirmed to reach the camera's speaker."
-        )
+        # Audio status from the camera's real talk capability (2026-09-28).
+        # Talk now goes through the appliance's local camera relay
+        # (talk_audio_relay._LocalIsapiTalkRelay); the old
+        # ANYAICAM_TALK_AUDIO_ENABLED flag only gates the legacy ONVIF
+        # client, so keying this line on it told every homeowner that
+        # audio was "not enabled" even on a talk-capable camera.
+        if (camera or {}).get("talk_down_supported") == 1:
+            audio_status = "Press and hold Talk in the live view to speak through the camera's speaker."
+        else:
+            audio_status = "This camera does not support two-way audio. You can still see and hear the visitor in the live view."
 
         # Never rendered for a camera that isn't a configured,
         # relay-assigned door, or for a viewer without a real can_unlock

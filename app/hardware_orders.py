@@ -365,6 +365,16 @@ def sync_hardware_order_from_stripe_event(event: dict) -> dict:
     stripe_checkout_session_id = str(session_obj.get("id") or "") or None
     payment_status = str(session_obj.get("payment_status") or "")
     status = "paid" if payment_status == "paid" else "pending"
+    # The amount recorded is what Stripe actually charged (the signed
+    # session's amount_total, after any discount/tax), not the catalog
+    # price (2026-09-28: a sandbox order charged $0.53 but was recorded
+    # and emailed as the $149.99 catalog price). The catalog amount is
+    # only a fallback for an event without amount_total.
+    try:
+        charged_cents = int(session_obj.get("amount_total")) if session_obj.get("amount_total") is not None else None
+    except (TypeError, ValueError):
+        charged_cents = None
+    amount_cents = charged_cents if charged_cents is not None and charged_cents >= 0 else hardware["amount_cents"] * quantity
 
     customer = None
     if authoritative_customer_id:
@@ -377,7 +387,7 @@ def sync_hardware_order_from_stripe_event(event: dict) -> dict:
             return {"status": "ignored", "reason": "no authoritative customer id and no email to reconcile against"}
         link = create_pending_link(
             email=email, stripe_price_id=price_id, sku=hardware["sku"], product_name=hardware["name"],
-            amount_cents=hardware["amount_cents"] * quantity, quantity=quantity,
+            amount_cents=amount_cents, quantity=quantity,
             stripe_customer_id=stripe_customer_id, stripe_checkout_session_id=stripe_checkout_session_id,
             raw_event=event,
         )
@@ -385,7 +395,7 @@ def sync_hardware_order_from_stripe_event(event: dict) -> dict:
 
     order = upsert_order(
         customer_id=customer["id"], sku=hardware["sku"], product_name=hardware["name"],
-        stripe_price_id=price_id, quantity=quantity, amount_cents=hardware["amount_cents"] * quantity,
+        stripe_price_id=price_id, quantity=quantity, amount_cents=amount_cents,
         stripe_checkout_session_id=stripe_checkout_session_id, stripe_customer_id=stripe_customer_id,
         status=status,
     )
