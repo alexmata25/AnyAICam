@@ -171,3 +171,14 @@ def test_intrusion_alarm_never_reaches_a_viewer_without_camera_access(ch):
     _seed(viewer_without_access=True)
     _event("intrusion_alarm", "front", 0)
     assert ch["email"].calls == [] and ch["in_app"].calls == []
+
+
+def test_quiet_hours_use_the_customers_local_time_not_the_hosts_utc_clock():
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+    chicago = ZoneInfo("America/Chicago")
+    evening_utc = datetime(2026, 9, 28, 22, 12, tzinfo=timezone.utc)  # 5:12 PM CDT
+    assert notification_engine._quiet_hours_clock(evening_utc, chicago) == "17:12"
+    assert not notification_engine._within_quiet_hours("17:12", "22:00", "07:00")
+    late_utc = datetime(2026, 9, 29, 4, 30, tzinfo=timezone.utc)  # 11:30 PM CDT
+    assert notification_engine._within_quiet_hours(notification_engine._quiet_hours_clock(late_utc, chicago), "22:00", "07:00")
