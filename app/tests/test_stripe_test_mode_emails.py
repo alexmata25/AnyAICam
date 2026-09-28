@@ -135,3 +135,20 @@ def test_staging_test_key_keeps_the_fulfillment_workflow_testable(db_path, test_
     order = _seed_order(db_path, "cs_test_staging1")
     with override_target(sqlite_path=db_path):
         assert hf.advance_fulfillment_status(order["id"], "preparing")["fulfillment_status"] == "preparing"
+
+
+# ---------------------------------------------------------------- amount recorded = amount Stripe charged
+
+def test_order_records_the_amount_stripe_actually_charged(db_path, tmp_path, _hardware_map, live_key):
+    event = _event("evt_amt1", livemode=True, session_prefix="cs_live_")
+    event["data"]["object"]["amount_total"] = 112499  # e.g. after a discount -- not the 124999 catalog price
+    _purchase(db_path, event)
+    con = sqlite3.connect(db_path)
+    assert con.execute("SELECT amount_cents FROM hardware_orders").fetchone()[0] == 112499
+    assert "$1,124.99" in _read_previews(tmp_path)[0]["text"]
+
+
+def test_catalog_amount_is_only_a_fallback_when_stripe_sends_no_amount(db_path, tmp_path, _hardware_map, live_key):
+    _purchase(db_path, _event("evt_amt2", livemode=True, session_prefix="cs_live_"))
+    con = sqlite3.connect(db_path)
+    assert con.execute("SELECT amount_cents FROM hardware_orders").fetchone()[0] == 124999
