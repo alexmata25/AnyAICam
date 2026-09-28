@@ -96,3 +96,10 @@ def test_events_page_opens_filtered_to_one_camera(http_client, db_path):
     assert 'checked data-camera="1"' in html and 'checked data-camera="2"' not in html
     html_all = http_client.get("/events?camera=someone-elses-camera", cookies=cookie).text  # unknown ids are ignored
     assert 'checked data-camera="1"' in html_all and 'checked data-camera="2"' in html_all
+
+
+def test_events_page_only_filters_on_load_when_opened_with_a_camera(http_client, db_path):
+    _seed_front_door(db_path)
+    cookie = {partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")}
+    assert 'data-initial-filter="1"' in http_client.get("/events?camera=cam-1", cookies=cookie).text
+    assert 'data-initial-filter="1"' not in http_client.get("/events", cookies=cookie).text

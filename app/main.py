@@ -121291,7 +121291,7 @@ def _render_customer_events(request: Request) -> str:
 <div><span class="pill event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div></header>
 <div class="playback-workspace">
 <aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
-<input class="picker-search" id="events-search" type="search" placeholder="Search" aria-label="Search cameras"><div id="events-camera-filters">{camera_options}</div></aside>
+<input class="picker-search" id="events-search" type="search" placeholder="Search" aria-label="Search cameras"><div id="events-camera-filters"{' data-initial-filter="1"' if requested_camera_id else ""}>{camera_options}</div></aside>
 <section class="work-area" style="min-width:0"><div class="panel-head"><h2>Recent activity</h2><span class="health-detail event-count-pill" data-count="{len(events_list)}">{len(events_list)} event(s)</span></div>
 <div style="overflow-x:auto;max-width:100%"><table class="data-table" id="events-table"><thead><tr><th>Time</th><th>Camera</th><th>Thumbnail</th><th>Type</th><th>Confidence</th><th>Action</th></tr></thead>
 <tbody>{event_body}</tbody></table></div></section></div>"""
@@ -121367,7 +121367,7 @@ def _render_customer_events(request: Request) -> str:
   }
   filters.addEventListener('change',apply);
   search.addEventListener('input',apply);
-  if(filters.querySelectorAll('input:checked').length!==filters.querySelectorAll('input').length)apply();
+  if(filters.dataset.initialFilter==='1')apply();  // opened with ?camera=<id>
 
   // Inline event-clip player -- see this row's own Python docstring
   // (the has_event_clip branch building .event-thumb-player) for why
