@@ -38387,6 +38387,21 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             linked_recording=linked_recording_for(camera_number, now),
             mock=False,
         ).model_dump(mode="json")
+        # An Event-mode camera only records when something triggers it. A
+        # plate confirmed while the vehicle-event cooldown/stationary
+        # suppression is active has no vehicle event to do that (found on
+        # the real Driveway Right: "no completed recordings cover camera 2
+        # event window"), so the plate event triggers the recording itself
+        # -- exactly what save_yolo_events() does for its events -- and the
+        # linked-recording backfill that points it at the finished clip.
+        if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    persist_event_recording(camera_number, now, now, detector="lpr", trigger_id=event_id),
+                    _ai_event_media_loop,
+                )
+            except RuntimeError as error:
+                print(f"LPR event {event_id}: could not schedule Event-mode recording persist: {error}")
         media_owner = _analytics_media_owner(camera_number, event_id, now)
         event_media_sharing.link(plate_event, media_owner)
         append_analytics_event(plate_event)
@@ -38394,6 +38409,14 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             _schedule_owned_analytics_clip(event_id, camera_number, now, thumbnail_url)
         elif media_owner:
             event_media_sharing.attach_child(media_owner, event_id, camera_number)
+        if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _backfill_ai_event_linked_recording(camera_number, [event_id], now),
+                    _ai_event_media_loop,
+                )
+            except RuntimeError as error:
+                print(f"LPR event {event_id}: could not schedule linked_recording backfill: {error}")
         events.append(plate_event)
     return events
 

@@ -195,3 +195,32 @@ def test_lpr_runs_from_the_ai_loop_not_from_vehicle_event_saving():
     assert "run_lpr_scan" in loop  # every detection pass, before the event-saving gate
     save = source[source.index("def save_yolo_events("): source.index("def run_lpr_scan(")]
     assert "lpr.recognize_plate" not in save and "lpr.confirm_plate" not in save
+
+
+def test_a_plate_event_on_an_event_mode_camera_triggers_its_own_recording_and_backfill(monkeypatch, tmp_path):
+    """Found on the real Driveway Right: a plate confirmed while vehicle
+    events were suppressed had no clip -- nothing triggered the Event-mode
+    recording. The plate event now triggers it, like save_yolo_events()."""
+    import main
+
+    scheduled = []
+
+    def fake_threadsafe(coroutine, loop):
+        scheduled.append(coroutine.cr_code.co_name)
+        coroutine.close()
+
+    monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
+    monkeypatch.setattr(main.recording_uploader, "_camera_identity", lambda n: {"lpr_enabled": True})
+    monkeypatch.setattr(main.lpr, "LPR_FULL_RES_FRAMES", False)
+    monkeypatch.setattr(main, "append_analytics_event", lambda e: None)
+    monkeypatch.setattr(main, "_analytics_media_owner", lambda cam, event_id, now: None)
+    monkeypatch.setattr(main, "linked_recording_for", lambda cam, now: None)
+    monkeypatch.setattr(main, "_local_recording_settings", lambda cam: {"mode": "event", "max_event_seconds": 60})
+    monkeypatch.setattr(main, "_ai_event_media_loop", object())
+    monkeypatch.setattr(main.asyncio, "run_coroutine_threadsafe", fake_threadsafe)
+    frame = np.full((720, 1280, 3), 90, np.uint8)
+    monkeypatch.setattr(main.lpr, "scan_frame", lambda cam, fr, boxes, full_frame=None: [{
+        "plate_number": "QRS4821", "confidence": 91.0, "region": (5, 5, 40, 15), "crop": fr[0:100, 0:200],
+        "vehicle_box": None, "source": "full_frame"}])
+    assert len(main.run_lpr_scan(2, {"frame": frame, "detections": []})) == 1
+    assert scheduled == ["persist_event_recording", "_backfill_ai_event_linked_recording"]
