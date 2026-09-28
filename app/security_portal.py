@@ -48,10 +48,30 @@ def _customer_site(db, customer_id: str, site_id: str | None) -> dict:
 
 
 def _site_cameras(db, customer_id: str, site_id: str) -> list[dict]:
-    return [dict(item) for item in db.execute(
-        'SELECT id,name,camera_number FROM cameras WHERE customer_id=? AND site_id=? ORDER BY camera_number,name',
+    """This site's installed cameras only. Purchased-but-undiscovered slot
+    placeholders (camera rows with no device yet, e.g. "Camera 6") are left
+    out -- they can't detect anything, so they don't belong in the armed
+    camera list -- using the same installed test as /customer-account
+    (camera_install_state.camera_is_installed). The placeholder rows
+    themselves are never touched."""
+    from camera_install_state import camera_is_installed
+    rows = db.execute(
+        'SELECT c.id,c.name,c.camera_number,c.status,c.device_key,'
+        'MAX(COALESCE(acs.online,0)) AS online,MAX(COALESCE(acs.recording,0)) AS recording,'
+        'EXISTS(SELECT 1 FROM recordings r WHERE r.camera_id=c.id) AS has_recording '
+        'FROM cameras c LEFT JOIN appliance_camera_status acs ON acs.camera_id=c.id '
+        'WHERE c.customer_id=? AND c.site_id=? GROUP BY c.id ORDER BY c.camera_number,c.name',
         (customer_id, site_id),
-    ).fetchall()]
+    ).fetchall()
+    return [
+        {'id': item['id'], 'name': item['name'], 'camera_number': item['camera_number']}
+        for item in rows
+        if camera_is_installed(
+            camera_status=item['status'], device_key=item['device_key'],
+            appliance_reported_online=bool(item['online']), appliance_reported_recording=bool(item['recording']),
+            has_cloud_recording=bool(item['has_recording']),
+        )
+    ]
 
 
 def security_overview(db, identity: dict, site_id: str | None = None) -> dict:

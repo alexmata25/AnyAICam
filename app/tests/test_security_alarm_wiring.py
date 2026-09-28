@@ -172,7 +172,8 @@ def _seed_customer(quiet_hours=True, event_types=("person",)):
         db.execute("INSERT INTO customers(id,partner_id,name,email,status,source,created_at) VALUES('cust-1','p1','C','c@example.test','active','real',?)", (now,))
         db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('site-1','cust-1','Home',?)", (now,))
         db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('appl-1','cust-1','site-1','AIC-1',?)", (now,))
-        db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,created_at) VALUES('yard','cust-1','site-1','appl-1','Yard',?)", (now,))
+        db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,device_key,created_at) "
+                   "VALUES('yard','cust-1','site-1','appl-1','Yard','configured','urn:uuid:yard',?)", (now,))
         db.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) "
                    "VALUES('owner-1','p1','owner@example.test','Owner','customer_owner','x',1,'cust-1',?)", (now,))
         db.execute(
@@ -298,3 +299,15 @@ def test_dashboard_panel_is_empty_for_non_customer_sessions(monkeypatch):
     import security_portal
     monkeypatch.setattr(security_portal, "partner_identity", lambda request: {"role": "partner_admin"})
     assert security_portal.dashboard_security_panel(object()) == ""
+
+
+def test_security_settings_list_only_installed_cameras_not_slot_placeholders(cloud_db):
+    import security_portal
+    _seed_customer()
+    with connection() as db:
+        db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,created_at) "
+                   "VALUES('slot-6','cust-1','site-1','appl-1','Camera 6','pending_installation','2026-09-12T00:00:00')")
+        overview = security_portal.security_overview(db, {"role": "customer_owner", "customer_id": "cust-1", "email": "owner@example.test"})
+        placeholder = db.execute("SELECT status, device_key FROM cameras WHERE id='slot-6'").fetchone()
+    assert [c["id"] for c in overview["cameras"]] == ["yard"]
+    assert tuple(placeholder) == ("pending_installation", None)  # the placeholder row itself is untouched
