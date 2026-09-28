@@ -84,6 +84,22 @@ def email_alert_allowed(event_type: str) -> bool:
     return allowed is None or event_type in allowed
 
 
+def _quiet_hours_clock(now: datetime, tz=None) -> str:
+    """HH:MM in the customer's local time zone (the same zone alert emails
+    display, notification_email._display_timezone()) for the quiet-hours
+    check (2026-09-28). The cloud host's clock runs on UTC, so comparing its
+    raw HH:MM against a customer's "22:00-07:00" enforced quiet hours five
+    hours early (17:00-02:00 Central). A naive `now` is this host's own
+    local time, which astimezone() converts correctly on any host."""
+    try:
+        if tz is None:
+            from notification_email import _display_timezone
+            tz = _display_timezone()
+        return now.astimezone(tz).strftime('%H:%M')
+    except Exception:
+        return now.strftime('%H:%M')
+
+
 def _within_quiet_hours(current_time: str, quiet_start: str, quiet_end: str) -> bool:
     """HH:MM string comparison, wrap-aware: quiet_start > quiet_end means
     the window crosses midnight (e.g. 22:00-07:00), matching notification_
@@ -196,7 +212,7 @@ def _security_sms_wanted(customer_id: str, site_id: str) -> bool:
 def fanout_appliance_event(appliance: dict,event: dict):
     customer_id=appliance.get('customer_id'); site_id=appliance.get('site_id'); camera_id=str(event.get('camera_id') or '') or None; event_type=str(event.get('event_type') or '')
     if not customer_id or event_type not in SUPPORTED: return 0
-    now=datetime.now(); current_time=now.strftime('%H:%M'); users=rows("SELECT id,email,role,camera_access_mode FROM partner_users WHERE customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')",(customer_id,)); created=0
+    now=datetime.now(); current_time=_quiet_hours_clock(now); users=rows("SELECT id,email,role,camera_access_mode FROM partner_users WHERE customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')",(customer_id,)); created=0
     for user in users:
         if user['role']=='customer_viewer' and camera_id:
             # Notifications Reliability Phase (2026-09-14): a customer_viewer
