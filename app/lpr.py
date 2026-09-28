@@ -427,16 +427,45 @@ def read_plate_glyphs(plate_crop_bgr):
     return text, round(confidence, 1)
 
 
+LPR_CONFIRM_MIN_CONFIDENCE = max(0.0, min(100.0, float(os.environ.get("ANYAICAM_LPR_CONFIRM_MIN_CONFIDENCE", "80"))))
+LPR_SIMILAR_SUPPRESS_EDITS = max(0, int(os.environ.get("ANYAICAM_LPR_SIMILAR_SUPPRESS_EDITS", "2")))
+
+
+def _edit_distance(a: str, b: str) -> int:
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        current = [i]
+        for j, cb in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+        previous = current
+    return previous[-1]
+
+
 def confirm_plate(camera_number, result, *, now: float | None = None):
     """Report a per-frame read only once it is corroborated: the same text
     read LPR_CONFIRM_READS times on this camera within
     LPR_VOTE_WINDOW_SECONDS, and not already reported for this camera
-    within LPR_REPEAT_COOLDOWN_SECONDS. Returns the result or None."""
+    within LPR_REPEAT_COOLDOWN_SECONDS. Returns the result or None.
+
+    Precision over recall (2026-09-28, found on real traffic: a correctly
+    read plate was followed minutes later by two confirmed misreads of the
+    same vehicle, each 1-2 characters off, at ~69 confidence -- the two OCR
+    passes disagreed -- versus ~93 for the correct reads):
+      - only reads of at least LPR_CONFIRM_MIN_CONFIDENCE can vote;
+      - a text within LPR_SIMILAR_SUPPRESS_EDITS edits of a plate already
+        confirmed on this camera inside the cooldown is treated as a
+        misread of it and never reported."""
     if not result:
         return None
     text = result.get("plate_number")
     if not text:
         return None
+    try:
+        confidence = float(result.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < LPR_CONFIRM_MIN_CONFIDENCE:
+        return None  # an uncertain read never counts toward a plate event
     now = time.monotonic() if now is None else now
     key = camera_number if camera_number is not None else "_"
     with _votes_lock:
@@ -449,6 +478,10 @@ def confirm_plate(camera_number, result, *, now: float | None = None):
         last = _emitted.get((key, text))
         if last is not None and now - last < LPR_REPEAT_COOLDOWN_SECONDS:
             return None
+        for (emitted_key, emitted_text), emitted_at in _emitted.items():
+            if (emitted_key == key and emitted_text != text and now - emitted_at < LPR_REPEAT_COOLDOWN_SECONDS
+                    and _edit_distance(emitted_text, text) <= LPR_SIMILAR_SUPPRESS_EDITS):
+                return None  # a near-duplicate of a plate just reported: the same vehicle misread
         _emitted[(key, text)] = now
     confirmed = dict(result)
     confirmed["confirmations"] = agreeing
