@@ -998,7 +998,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         # client, so keying this line on it told every homeowner that
         # audio was "not enabled" even on a talk-capable camera.
         if (camera or {}).get("talk_down_supported") == 1:
-            audio_status = "Press and hold Talk in the live view to speak through the camera's speaker."
+            audio_status = "Press and hold the microphone button under the video to speak through the camera's speaker."
         else:
             audio_status = "This camera does not support two-way audio. You can still see and hear the visitor in the live view."
 
@@ -1016,6 +1016,23 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
 
         from html import escape as esc
 
+        # One interface (2026-09-28): the camera's live panel -- video, talk
+        # mic and camera tools -- rendered directly into this page instead of
+        # an <iframe> of the whole Live page, which on a phone showed a
+        # second navigation bar, a second AACO assistant and a second bottom
+        # bar inside this one. Same video/talk code and the same per-camera
+        # live permission check as the Live page; this page keeps its own
+        # Unlock Door button, so the panel's unlock tool is left off.
+        import live_view_page
+        from partner_db import connection
+        live_panel_html, live_panel_scripts = "", ""
+        try:
+            with connection() as db:
+                live_camera = live_view_page._authorized_camera(db, event["camera_id"], identity)
+            live_panel_html, live_panel_scripts = live_view_page.camera_live_panel(live_camera, identity, show_unlock_tool=False)
+        except HTTPException:
+            live_panel_html = '<section class="panel"><p class="health-detail">You do not have live access to this camera.</p></section>'
+
         content = f'''<header class="topbar"><div><p class="eyebrow">AAC Voice Call</p><h1>Visitor at {esc(camera_name)}</h1></div>
 <a class="ghost-button" href="/alerts">Back to alerts</a></header>
 <section class="panel">
@@ -1024,16 +1041,14 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
   <p><strong>Call state:</strong> <span id="voice-call-state">{esc(event.get("state") or "triggered")}</span></p>
   <p class="health-detail">{esc(audio_status)}</p>
 </section>
-<section class="panel">
-  <iframe src="/customer/cameras/{esc(event["camera_id"], quote=True)}/live" style="width:100%;min-height:480px;border:0;border-radius:8px" title="Live camera"></iframe>
-</section>
+{live_panel_html}
 <section class="panel dialog-actions">
   <button class="action-button" id="voice-call-answer" type="button">Answer</button>
   <button class="ghost-button" id="voice-call-end" type="button">End call</button>
   {'<button class="ghost-button" id="voice-call-unlock" type="button">Unlock Door</button>' if show_unlock_button else ''}
 </section>
 {'<p id="voice-call-unlock-status" class="health-detail"></p>' if show_unlock_button else ''}'''
-        scripts = f'''<script>
+        scripts = live_panel_scripts + f'''<script>
 const eventId={event_id!r};
 document.getElementById('voice-call-answer').addEventListener('click', async () => {{
   const response = await fetch(`/api/customer/aac/voice-call/events/${{eventId}}/answer`, {{method: 'POST'}});

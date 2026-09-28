@@ -233,6 +233,15 @@ def test_full_vertical_slice_trigger_to_notification_to_call_screen(client, db_p
     assert f"/customer/cameras/{entrance_camera_id}/live" in html
     assert "Answer" in html
     assert "End call" in html
+    # One interface (2026-09-28): the camera's live panel is rendered into
+    # this page directly -- never an <iframe> of the whole Live page, which
+    # on a phone showed a second navigation bar, AACO assistant and bottom
+    # bar inside this one.
+    assert "<iframe" not in html
+    assert html.count("<html") == 1
+    assert html.count('id="live-view-video"') == 1
+    assert html.count('class="camera-tool talk-mic"') == 1
+    assert 'class="camera-tool unlock-door"' not in html  # the call screen's own Unlock Door button is the only unlock control
 
     # 5. Answer, then end the call.
     answer_response = client.post(f"/api/customer/aac/voice-call/events/{event_id}/answer", cookies=cookies)

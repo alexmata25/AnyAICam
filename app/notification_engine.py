@@ -114,11 +114,21 @@ def _external_channel_recently_notified(db,*,user_id: str,camera_id: str | None,
         return False
     cutoff=(now.timestamp()-NOTIFICATION_CHANNEL_COOLDOWN_SECONDS)
     cutoff_iso=datetime.fromtimestamp(cutoff).isoformat()
-    camera_clause="camera_id IS NULL" if camera_id is None else "camera_id=?"
+    # Bounded cooldown (2026-09-28): measured from the last time an email/
+    # SMS was actually attempted for this (user, camera, event type) -- not
+    # from the last notification. Counting every notification made the
+    # window slide forward with each new event, so a camera with steady
+    # activity (someone lingering, re-triggering every minute or two) never
+    # emailed again until it went quiet for the whole window. Now repeated
+    # activity yields at most one external alert per window, and the next
+    # event after the window always goes out.
+    camera_clause="n.camera_id IS NULL" if camera_id is None else "n.camera_id=?"
     params=[user_id,event_type,cutoff_iso,exclude_notification_id]
     if camera_id is not None:
         params.insert(1,camera_id)
-    query=f"SELECT 1 FROM notifications WHERE user_id=? AND {camera_clause} AND event_type=? AND created_at>=? AND id!=? LIMIT 1"
+    query=(f"SELECT 1 FROM notification_deliveries d JOIN notifications n ON n.id=d.notification_id "
+           f"WHERE n.user_id=? AND {camera_clause} AND n.event_type=? AND d.channel IN ('email','sms') "
+           f"AND d.created_at>=? AND n.id!=? LIMIT 1")
     return db.execute(query,tuple(params)).fetchone() is not None
 
 

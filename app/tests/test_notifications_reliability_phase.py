@@ -367,8 +367,8 @@ def test_alerts_page_converts_utc_timestamp_to_appliance_timezone(monkeypatch, d
         conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity())
         result = main._render_customer_alerts(object())
-    assert "06:00:00 PM" not in result  # the old, unconverted bug's raw-UTC output
-    assert "01:00:00 PM" in result
+    assert "6:00 PM" not in result  # the old, unconverted bug's raw-UTC output
+    assert "1:00 PM" in result
 
 
 def test_alerts_page_deep_links_to_the_specific_event_when_a_clip_exists(monkeypatch, db_path):
@@ -393,25 +393,28 @@ def test_alerts_page_deep_links_to_the_specific_event_when_a_clip_exists(monkeyp
     assert "camera=cam-1&event=evt-1&autoplay=event" in result
 
 
-def test_alerts_page_shows_mark_read_button_for_unread_only(monkeypatch, db_path):
+def test_alerts_inbox_hides_acknowledged_and_dismissed_alerts(monkeypatch, db_path):
+    """Smart Alerts is an attention inbox (2026-09-28): acknowledged or
+    dismissed alerts leave the default view; acknowledged ones are listed
+    under Handled. Read/unread is no longer the workflow."""
     with override_target(sqlite_path=db_path):
         initialize_database()
         conn = sqlite3.connect(db_path)
         _seed_tenant(conn)
         _seed_camera(conn, "cam-1")
         _seed_owner(conn)
-        _seed_notification(conn, "notif-unread", "owner-1", "cam-1", timestamp="2026-08-22T00:00:01")
-        _seed_notification(conn, "notif-read", "owner-1", "cam-1", timestamp="2026-08-22T00:00:02")
-        conn.execute("UPDATE notifications SET read_at='2026-08-22T01:00:00' WHERE id='notif-read'")
+        _seed_notification(conn, "notif-open", "owner-1", "cam-1", timestamp="2026-08-22T00:00:01")
+        _seed_notification(conn, "notif-acked", "owner-1", "cam-1", timestamp="2026-08-22T03:00:02")
+        _seed_notification(conn, "notif-dismissed", "owner-1", "cam-1", timestamp="2026-08-22T06:00:03")
+        conn.execute("UPDATE notifications SET acknowledged_at=datetime('now') WHERE id='notif-acked'")
+        conn.execute("UPDATE notifications SET dismissed_at=datetime('now') WHERE id='notif-dismissed'")
         conn.commit()
         monkeypatch.setattr(partner_portal, "partner_identity", lambda request: _owner_identity())
-        result = main._render_customer_alerts(object())
-    assert 'data-notification-id="notif-unread"' in result
-    assert 'data-notification-id="notif-read"' in result
-    assert result.count('data-notification-id="notif-unread"' ) >= 1
-    # Exactly one Mark-read button rendered (the unread one) -- find each
-    # card's own data-read attribute rather than counting button markup,
-    # which would also match the mark-all-read button's own id.
-    assert 'data-notification-id="notif-unread" data-read="0"' in result
-    assert 'data-notification-id="notif-read" data-read="1"' in result
-    assert "1 unread" in result
+        active = main._render_customer_alerts(object())
+
+        class _Handled:
+            query_params = {"view": "handled"}
+        handled = main._render_customer_alerts(_Handled())
+    assert "notif-open" in active and "notif-acked" not in active and "notif-dismissed" not in active
+    assert "notif-acked" in handled and "notif-open" not in handled
+    assert "Mark read" not in active
