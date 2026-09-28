@@ -198,3 +198,17 @@ def test_login_next_to_another_tenants_page_still_cannot_reach_it(http_client, t
     link = f"/aac/voice-call/{tenants['call_a']}"
     assert _destination(_login(http_client, "owner-b@example.test", PASSWORD_B, link)) == link  # next is only a path...
     assert http_client.get(link).status_code == 404  # ...the page itself still enforces the tenant
+
+
+# ---------------------------------------------------------------- call screen audio line follows the camera's real capability
+
+def test_call_screen_audio_line_reflects_the_cameras_talk_capability(http_client, tenants, db_path):  # noqa: F811
+    assert _login(http_client, "owner-a@example.test", PASSWORD_A).status_code in (200, 303)
+    page = http_client.get(f"/aac/voice-call/{tenants['call_a']}").text
+    assert "does not support two-way audio" in page and "not enabled on this deployment" not in page
+    con = sqlite3.connect(db_path)
+    con.execute("UPDATE cameras SET talk_down_supported=1 WHERE id=?", (tenants["cam_a"],))
+    con.commit()
+    con.close()
+    page = http_client.get(f"/aac/voice-call/{tenants['call_a']}").text
+    assert "Press and hold Talk" in page and "not confirmed to reach" not in page
