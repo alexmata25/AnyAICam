@@ -55034,7 +55034,7 @@ def customer_investigate_search_api(
     }
 
 
-def _customer_notifications(request: Request, *, camera_number: int | None = None, limit: int = 100) -> list[dict] | None:
+def _customer_notifications(request: Request, *, camera_number: int | None = None, limit: int = 100, inbox_view: str | None = None) -> list[dict] | None:
     """This portal customer's own real notifications rows for the
     customer-facing Smart Alerts page, or None when the caller isn't a
     portal customer_owner/customer_viewer identity at all -- same
@@ -55074,7 +55074,8 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
     from partner_db import connection
     select = (
         'SELECT n.id, n.event_type, n.severity, n.title, n.message, n.timestamp, n.thumbnail, '
-        'n.recording_id, n.event_id, n.camera_id, n.read_at, c.camera_number AS camera, c.name AS camera_display_name, '
+        'n.recording_id, n.event_id, n.camera_id, n.read_at, n.acknowledged_at, n.dismissed_at, n.bookmarked_at, '
+        'c.camera_number AS camera, c.name AS camera_display_name, '
         'CASE WHEN length(dem.s3_key) > 0 THEN 1 ELSE 0 END AS has_event_clip '
         'FROM notifications n '
         'LEFT JOIN cameras c ON c.id = n.camera_id '
@@ -55085,14 +55086,32 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
     if camera_number is not None:
         camera_filter = 'AND c.camera_number = ? '
         params.append(camera_number)
+    # Smart Alerts inbox (2026-09-28): the caller's OWN rows only (each
+    # recipient has their own notification row, and acknowledging is a
+    # per-person action), filtered to one inbox view.
+    inbox_filter = ''
+    if inbox_view == 'active':
+        inbox_filter = 'AND n.acknowledged_at IS NULL AND n.dismissed_at IS NULL '
+    elif inbox_view == 'saved':
+        inbox_filter = 'AND n.bookmarked_at IS NOT NULL '
+    elif inbox_view == 'handled':
+        inbox_filter = "AND n.acknowledged_at IS NOT NULL AND n.acknowledged_at >= datetime('now','-7 days') "
     with connection() as db:
-        if identity.get("role") == "customer_owner":
-            # Intentional account-wide visibility -- see this function's
-            # own docstring ("customer_owner sees every notification for
-            # their own customer_id"), not narrowed to n.user_id.
+        if identity.get("role") == "customer_owner" and inbox_view is None:
             rows = db.execute(
                 select + f'WHERE n.customer_id = ? {camera_filter}ORDER BY n.timestamp DESC LIMIT ?',
                 (*params, limit),
+            ).fetchall()
+        elif identity.get("role") == "customer_owner":
+            owner = db.execute(
+                'SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?',
+                (identity.get("email", ""), identity.get("customer_id")),
+            ).fetchone()
+            if not owner:
+                return []
+            rows = db.execute(
+                select + f'WHERE n.customer_id = ? {camera_filter}{inbox_filter}AND n.user_id = ? ORDER BY n.timestamp DESC LIMIT ?',
+                (*params, owner["id"], limit),
             ).fetchall()
         else:
             user = db.execute(
@@ -55122,7 +55141,7 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
             # own audit exists to find.
             rows = db.execute(
                 select + 'JOIN customer_camera_permissions p ON p.camera_id = n.camera_id AND p.user_id = ? AND p.can_alerts = 1 '
-                f'WHERE n.customer_id = ? {camera_filter}AND n.user_id = ? ORDER BY n.timestamp DESC LIMIT ?',
+                f'WHERE n.customer_id = ? {camera_filter}{inbox_filter}AND n.user_id = ? ORDER BY n.timestamp DESC LIMIT ?',
                 (user["id"], *params, user["id"], limit),
             ).fetchall()
     return [
@@ -55142,6 +55161,9 @@ def _customer_notifications(request: Request, *, camera_number: int | None = Non
             "has_event_clip": bool(row["has_event_clip"]),
             "read_at": row["read_at"],
             "read": row["read_at"] is not None,
+            "acknowledged_at": row["acknowledged_at"],
+            "dismissed_at": row["dismissed_at"],
+            "bookmarked_at": row["bookmarked_at"],
         }
         for row in rows
     ]
@@ -55206,6 +55228,56 @@ def mark_customer_notification_read(request: Request, notification_id: str) -> d
             # Already read -- idempotent success, not an error, so a
             # retried/duplicate click never surfaces as a failure.
     return {"status": "ok", "id": notification_id, "read_at": now}
+
+
+def _customer_notification_ids(payload: dict) -> list[str]:
+    ids = payload.get("ids") if isinstance(payload, dict) else None
+    if not isinstance(ids, list) or not ids or len(ids) > 500:
+        raise HTTPException(status_code=400, detail="ids must be a list of 1-500 notification ids.")
+    return [str(item) for item in ids if str(item).strip()]
+
+
+def _update_own_notifications(request: Request, payload: dict, assignments: str, values: tuple) -> dict:
+    """Smart Alerts actions (2026-09-28). Only ever touches the caller's
+    own notification rows for their own customer; other people's rows and
+    other customers' ids are silently left alone."""
+    resolved = _customer_notification_identity(request)
+    if not resolved:
+        raise HTTPException(status_code=403, detail="Customer portal access required.")
+    identity, user_id = resolved
+    ids = _customer_notification_ids(payload)
+    from partner_db import connection
+    placeholders = ",".join("?" for _ in ids)
+    with connection() as db:
+        cursor = db.execute(
+            f"UPDATE notifications SET {assignments} WHERE user_id=? AND customer_id=? AND id IN ({placeholders})",
+            (*values, user_id, identity["customer_id"], *ids),
+        )
+    return {"status": "ok", "updated": cursor.rowcount}
+
+
+@app.post("/api/customer/notifications/acknowledge")
+def acknowledge_customer_notifications(request: Request, payload: dict) -> dict:
+    now = datetime.now().isoformat()
+    return _update_own_notifications(request, payload, "acknowledged_at=COALESCE(acknowledged_at,?), read_at=COALESCE(read_at,?)", (now, now))
+
+
+@app.post("/api/customer/notifications/dismiss")
+def dismiss_customer_notifications(request: Request, payload: dict) -> dict:
+    """Hides alerts from the inbox. An INTRUSION ALARM can't be dismissed
+    unseen -- it has to be acknowledged."""
+    now = datetime.now().isoformat()
+    return _update_own_notifications(
+        request, payload,
+        "dismissed_at=CASE WHEN event_type='intrusion_alarm' THEN dismissed_at ELSE COALESCE(dismissed_at,?) END, read_at=COALESCE(read_at,?)",
+        (now, now),
+    )
+
+
+@app.post("/api/customer/notifications/bookmark")
+def bookmark_customer_notifications(request: Request, payload: dict) -> dict:
+    saved = bool((payload or {}).get("saved", True))
+    return _update_own_notifications(request, payload, "bookmarked_at=?", (datetime.now().isoformat() if saved else None,))
 
 
 @app.post("/api/customer/notifications/read-all")
@@ -121762,165 +121834,44 @@ def _customer_alert_text(notification: dict) -> tuple[str, str]:
 
 
 def _render_customer_alerts(request: Request) -> str:
-    """Real, tenant-scoped Smart Alerts page. Reuses _customer_notifications()
-    (real notifications rows, written by notification_engine.fanout_
-    appliance_event() on every real analytics event whose type is in
-    its own SUPPORTED set -- smart_motion, person, vehicle,
-    people_counting, lpr once a plate is actually read) -- creates no
-    alerts, duplicates no event. The "New alert" button is left exactly
-    as before (customer-created alert rules are a distinct, not-yet-
-    built feature this milestone does not touch). Falls back to the
-    exact original legacy alerts() body for any non-portal caller (see
-    alerts() below)."""
-    cameras = _customer_playback_cameras(request) or []
-    notifications_list = _customer_notifications(request) or []
+    """Smart Alerts: the customer's attention inbox (smart_alerts.py) --
+    grouped, filterable, with actions on each card and active INTRUSION
+    ALARMS pinned. Events stays the full history. Rows are the caller's
+    own notifications (_customer_notifications(inbox_view=...))."""
+    import smart_alerts
+    view = (getattr(request, "query_params", None) or {}).get("view") or "active"
+    if view not in smart_alerts.VIEWS:
+        view = "active"
+    notifications_list = _customer_notifications(request, limit=500, inbox_view=view) or []
+    groups = smart_alerts.group_alerts(notifications_list)
+    counts = {key: 0 for key in smart_alerts.CATEGORIES}
+    for group in groups:
+        counts["all"] += group["count"]
+        if group["category"] in counts:
+            counts[group["category"]] += group["count"]
+    talk_camera_ids = set()
+    camera_ids = {str(n["camera_id"]) for n in notifications_list if n.get("camera_id")}
+    if camera_ids:
+        from partner_db import connection
+        placeholders = ",".join("?" for _ in camera_ids)
+        with connection() as db:
+            talk_camera_ids = {
+                row["id"] for row in db.execute(
+                    f"SELECT id FROM cameras WHERE talk_down_supported=1 AND id IN ({placeholders})", tuple(camera_ids),
+                ).fetchall()
+            }
 
-    camera_options = "".join(
-        f'<label class="picker-camera"><input type="checkbox" checked data-camera="{escape(str(camera.get("camera_number") or ""), quote=True)}"> '
-        f'{escape(_camera_display_label(camera))}</label>'
-        for camera in cameras
-    )
-
-    cards = []
-    unread_count = 0
-    for notification in notifications_list[:100]:
-        raw_timestamp = str(notification.get("timestamp") or "")
-        try:
-            # Same fix, same root cause, as _render_customer_events()'s own
-            # "five-hour timestamp offset" fix (2026-09-02): this naive
-            # value is UTC (notification_engine.fanout_appliance_event()
-            # writes the source event's own event_timestamp/now.isoformat()
-            # verbatim, never localized), so it must be labeled UTC and
-            # converted to APPLIANCE_TIMEZONE exactly once for display --
-            # not formatted directly, which silently displayed raw UTC
-            # clock digits as if already local. This page had never
-            # received that fix; notifications' displayed times were off
-            # by the same several hours the Events table's already were.
-            occurred_at_utc = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
-            if occurred_at_utc.tzinfo is None:
-                occurred_at_utc = occurred_at_utc.replace(tzinfo=timezone.utc)
-            occurred_at = occurred_at_utc.astimezone(APPLIANCE_TIMEZONE)
-            timestamp_label = occurred_at.strftime("%b %d, %Y · %I:%M:%S %p")
-        except ValueError:
-            timestamp_label = raw_timestamp or "Unknown time"
-        thumbnail = (
-            f'<img src="{escape(notification["thumbnail"], quote=True)}" alt="Alert thumbnail" style="width:120px;aspect-ratio:16/9;object-fit:cover;border-radius:7px">'
-            if notification.get("thumbnail") else '<div class="feature-icon">♢</div>'
-        )
-        camera_label = notification.get("camera_name") or "System"
-        camera_number = notification.get("camera")
-        is_read = bool(notification.get("read"))
-        if not is_read:
-            unread_count += 1
-        # Deep link fix: previously called with only camera_id, so every
-        # card fell back to a generic, non-deep-linked Playback href even
-        # though the notification's own timestamp/event_id (now selected
-        # by _customer_notifications()) were available -- the exact same
-        # timestamp/event_id/has_event_clip shape _render_customer_events()
-        # already passes correctly for the identical action-button helper.
-        # AAC Voice Call (2026-09-23): "Answer" / "View camera" instead of
-        # the generic Playback/Snapshot action-links above -- this event_id
-        # is an aac_voice_call_events.id, not a detection_events.id, so
-        # _customer_event_actions()'s own event-clip lookup would find
-        # nothing for it (harmlessly, but uselessly). "Dismiss" for this
-        # first vertical slice is the existing "Mark read" action below;
-        # a dedicated dismiss action wired to aac_voice_call_events.
-        # mark_dismissed() is next-phase UI polish, not required for the
-        # notification to be genuinely actionable today.
-        if notification.get("event_type") == "aac_voice_call" and notification.get("event_id"):
-            voice_call_href = f'/aac/voice-call/{escape(str(notification["event_id"]), quote=True)}'
-            actions_html = f'<a class="action-button" href="{voice_call_href}">Answer</a> <a class="ghost-button" href="{voice_call_href}">View camera</a>'
-        else:
-            actions_html = _customer_event_actions(
-                notification.get("camera_id"), raw_timestamp, notification.get("event_id"), notification.get("has_event_clip")
+    def clip_href(notification: dict):
+        if notification.get("event_id") and notification.get("has_event_clip"):
+            return _customer_event_playback_href(
+                notification.get("camera_id"), notification.get("timestamp"), notification.get("event_id"), True,
             )
-        alert_title, alert_message = _customer_alert_text(notification)
-        mark_read_html = (
-            '' if is_read else
-            f'<button class="ghost-button mark-alert-read" type="button" data-notification-id="{escape(str(notification["id"]), quote=True)}">Mark read</button>'
-        )
-        cards.append(
-            f'<article class="feature-card{"" if is_read else " alert-unread"}" data-alert-camera="{escape(str(camera_number or ""), quote=True)}" data-notification-id="{escape(str(notification["id"]), quote=True)}" data-read="{"1" if is_read else "0"}">{thumbnail}'
-            f'<h2>{escape(alert_title)} · {escape(camera_label)}</h2>'
-            f'<p>{escape(alert_message)}</p>'
-            f'<p class="health-detail">{escape(timestamp_label)}</p>'
-            f'<div class="dashboard-event-actions">{actions_html}{mark_read_html}</div></article>'
-        )
-    alert_body = "".join(cards) or (
-        '<div class="empty-stage">No alerts yet.<br>Real alerts appear here as your cameras detect activity.</div>'
+        return None
+
+    content, scripts = smart_alerts.render_inbox(
+        groups, view=view, tz=APPLIANCE_TIMEZONE, alert_text=_customer_alert_text,
+        clip_href=clip_href, talk_camera_ids=talk_camera_ids, counts=counts,
     )
-
-    content = f"""<header class="topbar"><div><p class="eyebrow">Event center</p><h1>Smart alerts</h1></div>
-<div><button class="ghost-button" id="mark-all-alerts-read" type="button"{" hidden" if not unread_count else ""}>Mark all read</button> <a class="action-button" href="/settings/notifications" title="Choose which events alert you, on which cameras, and how">＋ New alert</a></div></header>
-<div class="playback-workspace">
-<aside class="camera-picker"><div class="picker-head">▣ Cameras ({len(cameras)})</div>
-<div id="alerts-camera-filters">{camera_options}</div></aside>
-<section class="work-area"><div class="panel-head"><h2>Recent alerts</h2><span class="pill" id="alerts-unread-pill">{unread_count} unread &middot; {len(notifications_list)} alert(s)</span></div>
-<div class="feature-grid" id="alerts-grid">{alert_body}</div></section></div>"""
-
-    scripts = """<script>
-(function(){
-  const filters=document.getElementById('alerts-camera-filters');
-  const cards=[...document.querySelectorAll('#alerts-grid [data-alert-camera]')];
-  if(filters){
-    filters.addEventListener('change',()=>{
-      const checked=new Set([...filters.querySelectorAll('input:checked')].map(box=>box.dataset.camera));
-      cards.forEach(card=>{
-        const camera=card.dataset.alertCamera;
-        card.hidden=Boolean(camera)&&!checked.has(camera);
-      });
-    });
-  }
-  const pill=document.getElementById('alerts-unread-pill');
-  const markAllButton=document.getElementById('mark-all-alerts-read');
-  function updatePill(){
-    const total=document.querySelectorAll('#alerts-grid [data-notification-id]').length;
-    const unread=document.querySelectorAll('#alerts-grid [data-read="0"]').length;
-    if(pill)pill.textContent=`${unread} unread · ${total} alert(s)`;
-    if(markAllButton)markAllButton.hidden=unread===0;
-  }
-  function markCardRead(card){
-    if(card.dataset.read==='1')return;
-    card.dataset.read='1';
-    card.classList.remove('alert-unread');
-    const button=card.querySelector('.mark-alert-read');
-    if(button)button.remove();
-    updatePill();
-  }
-  document.getElementById('alerts-grid')?.addEventListener('click',async event=>{
-    const button=event.target.closest('.mark-alert-read');
-    if(!button)return;
-    // The button itself also carries data-notification-id (so its id is
-    // readable without a card lookup) -- closest() checks the starting
-    // element first, so a bare '[data-notification-id]' selector matched
-    // the button itself, never its ancestor <article>. markCardRead()
-    // below silently updated/queried that wrong element (no data-read
-    // attribute, no .alert-unread class, no descendant .mark-alert-read
-    // to remove), so the POST succeeded server-side but the card's own
-    // read state, styling, and button never visibly changed. Scoping to
-    // the actual card element (not just any node with the attribute)
-    // fixes the ancestor lookup without touching the button's own
-    // attribute or the fetch below, which already read the correct id.
-    const card=button.closest('article[data-notification-id]');
-    const id=card?.dataset.notificationId;
-    if(!id)return;
-    button.disabled=true;
-    try{
-      const response=await fetch(`/api/customer/notifications/${encodeURIComponent(id)}/read`,{method:'POST'});
-      if(response.ok)markCardRead(card);
-      else button.disabled=false;
-    }catch(error){button.disabled=false;}
-  });
-  markAllButton?.addEventListener('click',async()=>{
-    markAllButton.disabled=true;
-    try{
-      const response=await fetch('/api/customer/notifications/read-all',{method:'POST'});
-      if(response.ok)cards.forEach(markCardRead);
-    }finally{markAllButton.disabled=false;}
-  });
-})();
-</script>"""
-
     return page_shell("Alerts", "alerts", content, scripts)
 
 

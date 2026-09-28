@@ -142,7 +142,7 @@ def test_alerts_page_shows_real_notifications_with_friendly_names(client, db_pat
 
 def test_alerts_page_new_alert_button_preserved(client):
     response = client.get("/alerts", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "New alert" in response.text
+    assert "Alert settings" in response.text  # Smart Alerts inbox (2026-09-28)
     # 2026-09-25: it opens the real per-camera alert program (Settings),
     # not a "ready for a future update" toast; the empty Setup guide is gone.
     assert 'href="/settings/notifications"' in response.text
@@ -151,7 +151,7 @@ def test_alerts_page_new_alert_button_preserved(client):
 
 def test_alerts_page_honest_empty_state(client):
     response = client.get("/alerts", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
-    assert "No alerts yet" in response.text
+    assert "Nothing needs your attention right now." in response.text
 
 
 def test_alerts_page_never_fabricates_an_alert_for_an_unrelated_customer(client, db_path):

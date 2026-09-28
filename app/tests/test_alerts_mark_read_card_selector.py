@@ -92,40 +92,89 @@ def _seeded_client(db_path, camera_id, camera_number, notif_id):
             yield test_client
 
 
-def test_alerts_page_js_resolves_the_ancestor_card_not_the_button_itself(db_path):
-    """The bug's own root cause, asserted directly: the click handler
-    must scope its ancestor lookup to the article card, not the bare
-    attribute the button also happens to carry."""
+def _add_notification(client_db_path, notif_id, *, user_id="user-owner", customer_id="cust-1", camera_id="cam-alert-x", event_type="motion", timestamp="2026-09-22T20:00:00"):
+    with override_target(sqlite_path=str(client_db_path)):
+        from partner_db import connection
+        with connection() as conn:
+            conn.execute(
+                "INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_type,severity,title,timestamp,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (notif_id, user_id, customer_id, "site-1", camera_id, event_type, "info", "Alert", timestamp, timestamp),
+            )
+
+
+def _state(client_db_path, notif_id):
+    with sqlite3.connect(client_db_path) as conn:
+        return conn.execute("SELECT acknowledged_at, dismissed_at, bookmarked_at FROM notifications WHERE id=?", (notif_id,)).fetchone()
+
+
+def test_smart_alerts_is_an_attention_inbox_not_a_read_unread_list(db_path):
+    """Smart Alerts (2026-09-28): Acknowledge / Dismiss / Save replace the
+    old Mark read workflow; the page links out to Events for history."""
     with _seeded_client(db_path, "cam-alert-x", 7, "notif-x") as client:
         response = client.get("/alerts", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert "button.closest('article[data-notification-id]')" in response.text
-    # The broken selector must be completely gone, not just supplemented.
-    assert "button.closest('[data-notification-id]')" not in response.text
+    text = response.text
+    assert "Mark read" not in text and "mark-alert-read" not in text
+    assert 'data-sa-action="acknowledge"' in text and 'data-sa-action="dismiss"' in text and 'data-sa-action="save"' in text
+    for label in ("All", "People", "Vehicles", "Security", "System"):
+        assert f'>{label} <span class="sa-filter-count">' in text
+    assert 'href="/events"' in text
 
 
 @pytest.mark.parametrize("camera_id,camera_number", CAMERA_CASES)
-def test_mark_read_round_trip_persists_and_renders_as_read(db_path, camera_id, camera_number):
-    """The backend half of "Mark read" was always correct -- proves that
-    end-to-end: POST the same route the fixed JS calls, then confirm a
-    fresh render of the page shows the card as read (no button, no
-    alert-unread class, data-read="1"), for cameras outside the 1-5
-    Ryzen pilot range."""
-    notif_id = f"notif-{camera_id}"
+def test_acknowledge_dismiss_and_save_round_trip(db_path, camera_id, camera_number):
     cookies = {partner_portal.SESSION_COOKIE: _owner_cookie()}
+    with _seeded_client(db_path, camera_id, camera_number, "notif-ack") as client:
+        _add_notification(db_path, "notif-dis", camera_id=camera_id, event_type="person", timestamp="2026-09-22T21:00:00")
+        _add_notification(db_path, "notif-save", camera_id=camera_id, event_type="car", timestamp="2026-09-22T22:00:00")
+        before = client.get("/alerts", cookies=cookies).text
+        assert all(n in before for n in ("notif-ack", "notif-dis", "notif-save"))
 
-    with _seeded_client(db_path, camera_id, camera_number, notif_id) as client:
-        before = client.get("/alerts", cookies=cookies)
-        assert f'data-notification-id="{notif_id}"' in before.text
-        assert f'<button class="ghost-button mark-alert-read" type="button" data-notification-id="{notif_id}">Mark read</button>' in before.text
-        assert f'data-read="0"' in before.text
+        assert client.post("/api/customer/notifications/acknowledge", json={"ids": ["notif-ack"]}, cookies=cookies).json()["updated"] == 1
+        assert client.post("/api/customer/notifications/dismiss", json={"ids": ["notif-dis"]}, cookies=cookies).json()["updated"] == 1
+        assert client.post("/api/customer/notifications/bookmark", json={"ids": ["notif-save"], "saved": True}, cookies=cookies).json()["updated"] == 1
 
-        read_response = client.post(f"/api/customer/notifications/{notif_id}/read", cookies=cookies)
-        assert read_response.status_code == 200
-        assert read_response.json()["id"] == notif_id
+        active = client.get("/alerts", cookies=cookies).text
+        handled = client.get("/alerts?view=handled", cookies=cookies).text
+        saved = client.get("/alerts?view=saved", cookies=cookies).text
+    assert "notif-ack" not in active and "notif-dis" not in active and "notif-save" in active
+    assert "notif-ack" in handled and "notif-dis" not in handled
+    assert "notif-save" in saved and "Saved ★" in saved
+    assert _state(db_path, "notif-ack")[0] and _state(db_path, "notif-dis")[1] and _state(db_path, "notif-save")[2]
 
-        after = client.get("/alerts", cookies=cookies)
-        assert f'data-notification-id="{notif_id}"' in after.text
-        assert f'data-notification-id="{notif_id}">Mark read</button>' not in after.text
-        assert f'data-read="1"' in after.text
-        assert "alert-unread" not in after.text.split(f'data-notification-id="{notif_id}"')[1].split("</article>")[0]
+
+def test_an_intrusion_alarm_cannot_be_dismissed_only_acknowledged(db_path):
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie()}
+    with _seeded_client(db_path, "cam-alert-x", 7, "notif-x") as client:
+        _add_notification(db_path, "alarm-1", event_type="intrusion_alarm", timestamp="2026-09-22T23:00:00")
+        page = client.get("/alerts", cookies=cookies).text
+        client.post("/api/customer/notifications/dismiss", json={"ids": ["alarm-1"]}, cookies=cookies)
+        assert _state(db_path, "alarm-1")[1] is None
+        still = client.get("/alerts", cookies=cookies).text
+        client.post("/api/customer/notifications/acknowledge", json={"ids": ["alarm-1"]}, cookies=cookies)
+        after = client.get("/alerts", cookies=cookies).text
+    assert 'class="sa-card sa-alarm"' in page and "INTRUSION ALARM" in page and 'href="tel:911"' in page
+    assert page.index("alarm-1") < page.index("notif-x")  # pinned above ordinary alerts
+    assert "alarm-1" in still and "alarm-1" not in after
+
+
+def test_actions_only_touch_the_callers_own_rows(db_path):
+    cookies = {partner_portal.SESSION_COOKIE: _owner_cookie()}
+    with _seeded_client(db_path, "cam-alert-x", 7, "notif-x") as client:
+        with override_target(sqlite_path=str(db_path)):
+            from partner_db import connection
+            with connection() as conn:
+                conn.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) "
+                             "VALUES('user-viewer','partner-1','viewer@example.test','Viewer','customer_viewer','x',1,'cust-1','2026-01-01')")
+                conn.execute("INSERT INTO customers(id,partner_id,name,email,status,created_at) VALUES('cust-2','partner-1','Other','o@example.test','active','2026-01-01')")
+                conn.execute("INSERT INTO partner_users(id,partner_id,email,name,role,password_hash,approved,customer_id,created_at) "
+                             "VALUES('user-other','partner-1','other@example.test','Other','customer_owner','x',1,'cust-2','2026-01-01')")
+        _add_notification(db_path, "someone-else", user_id="user-viewer")
+        _add_notification(db_path, "other-customer", user_id="user-other", customer_id="cust-2")
+        result = client.post("/api/customer/notifications/acknowledge", json={"ids": ["someone-else", "other-customer"]}, cookies=cookies)
+        bad = client.post("/api/customer/notifications/acknowledge", json={"ids": []}, cookies=cookies)
+        anonymous = client.post("/api/customer/notifications/acknowledge", json={"ids": ["notif-x"]})
+    assert result.json()["updated"] == 0
+    assert _state(db_path, "someone-else")[0] is None and _state(db_path, "other-customer")[0] is None
+    assert bad.status_code == 400 and anonymous.status_code in (401, 403, 303, 307)
