@@ -186,6 +186,70 @@ def register_live_playlist_routes(app: FastAPI, *, hls_folder=None, local_identi
         camera,number=local_context(request,camera_id)
         return FileResponse(segment_path(hls_folder,number,segment_name),media_type='video/mp2t',headers={'Cache-Control':'no-store'})
 
+    # One still frame from the camera's live stream (2026-09-28), for the
+    # Smart Rules drawing canvas. Capturing from the browser's <video> is
+    # fragile -- nothing until the relay's first segment decodes, and some
+    # browsers (Safari's native HLS) draw it black -- so the canvas can ask
+    # the server instead: the newest relay segment (cloud) or local HLS
+    # segment (appliance), decoded to one JPEG. Same tenant/permission
+    # check as the live playlist.
+    def _ts_to_jpeg(ts_bytes: bytes) -> bytes | None:
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "mpegts", "-i", "pipe:0", "-frames:v", "1",
+                 "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"],
+                input=ts_bytes, capture_output=True, timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout or None
+
+    @app.get('/api/customer/cameras/{camera_id}/live/still.jpg')
+    def live_still(request: Request, camera_id: str) -> Response:
+        camera, camera_number = authorized_camera(request, camera_id)
+        segment_bytes = None
+        rsa_signer = get_configured_signer()
+        key_id = os.environ.get(CLOUDFRONT_KEY_PAIR_ID_ENV, '').strip()
+        cloudfront_base_url = _cloudfront_base_url()
+        if rsa_signer is not None and key_id and cloudfront_base_url:
+            manifest = live_manifest_store.manifest_for(camera_id)
+            updated_at = manifest.get('updated_at')
+            if updated_at is not None and (time.time() - updated_at) <= STALE_MANIFEST_SECONDS:
+                playlist_text = render_playlist(
+                    manifest,
+                    expected_prefix=live_relay_s3_prefix(camera['customer_id'], camera['site_id'], camera['appliance_id'], camera_id),
+                    cloudfront_base_url=cloudfront_base_url, customer_id=camera['customer_id'], site_id=camera['site_id'],
+                    appliance_id=camera['appliance_id'], camera_id=camera_id, key_id=key_id, rsa_signer=rsa_signer,
+                )
+                urls = [line for line in playlist_text.splitlines() if line.startswith('http')]
+                if urls:
+                    import requests
+                    try:
+                        fetched = requests.get(urls[-1], timeout=10)
+                        if fetched.ok:
+                            segment_bytes = fetched.content
+                    except requests.RequestException:
+                        segment_bytes = None
+        else:
+            camera, camera_number = local_context(request, camera_id)
+            import re as _re
+            from pathlib import Path as _Path
+            folder = _Path(hls_folder)
+            pattern = _re.compile(rf'camera{int(camera_number)}_[0-9]+[.]ts')
+            segments = sorted((p for p in folder.glob(f'camera{int(camera_number)}_*.ts') if pattern.fullmatch(p.name)),
+                              key=lambda p: p.stat().st_mtime)
+            for candidate in reversed(segments[-3:-1] or segments[-1:]):  # a finished segment, not the one being written
+                try:
+                    segment_bytes = candidate.read_bytes()
+                    break
+                except OSError:
+                    continue
+        jpeg = _ts_to_jpeg(segment_bytes) if segment_bytes else None
+        if not jpeg:
+            raise HTTPException(status_code=503, detail='No live frame is available yet. Open the live view and try again in a few seconds.')
+        return Response(content=jpeg, media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
+
     @app.get('/api/customer/cameras/{camera_id}/live/playlist.m3u8')
     def live_playlist(request: Request, camera_id: str) -> Response:
         camera,camera_number=authorized_camera(request,camera_id)
