@@ -4137,3 +4137,26 @@ Samsung (`9cf63b90...`, self-contained image kit) is now part of the managed app
 ### State to resume from
 
 Staging `3fa8853`; Ryzen `f5a6d87`; Samsung `f5a6d87` (0 cameras). Next: a generalized per-release Samsung kit + Samsung update-path validation (after a Samsung camera exists); a Ryzen update to the current release (installer); then the physical tests.
+
+## Physical validation, night of 2026-09-27 (Ryzen `aeb9414`)
+
+Ryzen outage 21:07-21:20 CDT (power loss then reboot; Tailscale and cloud both dark). Not investigated yet.
+
+**LPR Case 1: Driveway Right, night/IR, 720p main stream (truck arrived 21:28-21:30).** Vehicle detection PASS (events with thumbnail and clip, reached cloud). Plate detection FAIL: under IR the reflective plate is a solid white rectangle. OCR, confirmation and plate event FAIL. No wrong plate saved.
+
+**LPR Case 2: Bedroom 4K, garage door open, garage light on (parked 22:05).** Vehicle FAIL: the app saved only motion events. Headlights shining into the camera washed out the truck, and the observer found no vehicle. Plate detection, OCR, confirmation and plate event FAIL, because LPR never ran. A read-only observer kept reading the neighbouring Civic (`VZV5092`, with misreads `V2V5092`/`VZV5082`).
+
+**Software defect found.** LPR only runs inside save_yolo_events, i.e. when a vehicle *event* is saved. Saves happen every 30-60 s at most and stop for a stationary vehicle. Confirmation needs two identical reads within 90 s, so it is starved. Fix: run LPR on its own cadence of a few seconds, and let the plate detector find plates on the frame directly.
+
+**Front Door spoken greeting (22:13).**
+- Person detected PASS (22:13:11).
+- Voice Call triggered PASS (22:13:18, greeting_delivered=True). The trigger was saved on the edge and forwarded.
+- Greeting audible FAIL: the operator heard nothing.
+- Observed test play 22:17:15-22:17:21: ISAPI `/open` returned 200, and all 6.1 s of audio was sent (62 chunks, G.711 μ-law).
+- Camera state: CMIP3342WI-28SDL fw V5.7.18, `audioOutputNums=1`, speakerVolume 50, codec μ-law. The camera settings look correct.
+- A second, fixed-length test got HTTP 403 on `/open`. Not retried (lockout safety). Probably the channel was still busy.
+- **Software defect to investigate (Dell):** `_LocalIsapiTalkRelay` uploads `audioData` with chunked transfer encoding (a requests generator). These cameras probably discard chunked bodies and need a fixed `Content-Length`. The Bedroom speaker was never confirmed audible either.
+- **Visitor-response processing is NOT IMPLEMENTED** (no speech-to-text of the camera microphone; only the simulate-visitor-utterance route). It is still required for AAC VC.
+
+**Talkdown:** still pending, because the Ryzen has no microphone.
+
