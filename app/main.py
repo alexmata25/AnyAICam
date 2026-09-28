@@ -41786,6 +41786,11 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     # way -- this only fixes which login PAGE an unauthenticated
     # browser is sent to first.
     "/aaco",
+    # The Voice Call screen an "Someone is at your door" email links to
+    # (aac_voice_call.voice_call_screen, the camera's live view plus call
+    # controls). Same bug, reported from a real email 2026-09-27: an
+    # unauthenticated click landed on the local emergency sign-in page.
+    "/aac/voice-call",
 )
 
 # The same shape bug as CLOUD_CUSTOMER_NAV_PATH_PREFIXES above, for the
@@ -42183,7 +42188,14 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
-    next_url = quote(path + (f"?{request.url.query}" if request.url.query else ""), safe="/?=&")
+    # The whole destination, query string included, is ONE encoded
+    # next= value (2026-09-27). With "?", "=" and "&" left unencoded, an
+    # email deep link such as /playback?camera=X&event=Y&autoplay=event
+    # became /customer-login.html?next=/playback?camera=X&event=Y&... --
+    # the login page read next=/playback?camera=X and event=/autoplay=
+    # were lost as the login page's own parameters, so after signing in
+    # the customer never reached the event the email was about.
+    next_url = quote(path + (f"?{request.url.query}" if request.url.query else ""), safe="/")
 
     # A request whose path belongs to the customer-facing surface
     # belongs on the customer-facing login page when unauthenticated,

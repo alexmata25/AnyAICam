@@ -227,7 +227,11 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         # practice, so a valid value is always exactly one of the
         # customer nav's own bare paths, never anything external.
         next_path=payload.get('next')
-        if not(isinstance(next_path,str) and next_path.startswith('/') and not next_path.startswith('//')):
+        # A backslash is treated as "/" by browsers ("/\\evil.example" is
+        # protocol-relative), and whitespace/control characters have no
+        # place in a same-origin path either.
+        if not(isinstance(next_path,str) and next_path.startswith('/') and not next_path.startswith('//')
+               and '\\' not in next_path and not any(ch.isspace() or ord(ch)<32 for ch in next_path)):
             next_path=None
         if user and user.get('must_change_password'):
             destination='/change-password'
