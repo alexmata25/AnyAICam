@@ -41036,6 +41036,10 @@ REQUEST_CONTEXT: ContextVar[Request | None] = ContextVar(
 
 
 app = FastAPI(title="AnyAiCam VMS", lifespan=lifespan)
+# One-time secrets in query strings (password-reset tokens) never reach the
+# access log in plain text (2026-09-28). See access_log_redaction.py.
+import access_log_redaction
+access_log_redaction.install()
 
 
 
