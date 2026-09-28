@@ -4283,3 +4283,31 @@ Design: `docs/vehicle-access-design.md`. It covers architecture, reused componen
   - Siren: no siren integration exists; the setting is shown as "coming soon".
   - Real-camera walk tests on the Ryzen (PENDING USER ACTION, after the next installer release).
 - **Tests:** `test_security_line_intrusion.py`, `test_security_modes.py`, `test_security_alarm_wiring.py`.
+
+## Next controlled Ryzen release: Event-mode "Recording problem: stopped" false alarm (documented 2026-09-28, NOT yet implemented)
+
+- **Symptom:** the Dashboard flags Event-mode cameras (for example Driveway Right and Front Door) as "Recording problem: stopped" whenever they have been quiet for about 6 minutes.
+- **Root cause, verified read-only on the Ryzen:**
+  - The appliance agent's camera heartbeat (`appliance-agent/anyaicam_agent/camera_binding.py`, the status builder around line 251) reports `recording = True` only if a `camera<N>*.mkv` file was modified within `recording_freshness_seconds` (360 s).
+  - Event-mode cameras only write files around events, so an idle but healthy camera reports `recording = False`.
+  - The cloud stores that value as `appliance_camera_status.recording`, and `main._customer_camera_status()` shows it as "stopped".
+  - At the time of the check, all streams were live, FFmpeg was running, every recent event had its clip, and the disk was 67% used.
+- **Proposed fix** (edge, so it needs a Ryzen installer release; test on the Ryzen first, then track Samsung separately):
+  - The agent reports a recording **state** per camera: `continuous_ok` / `event_armed` / `stopped`.
+  - For a camera in `local_recording_mode == 'event'`, it reports `event_armed` when the stream is live and recording is enabled, regardless of file age.
+  - It reports `stopped` only when the stream is down, or when recent detection events have no linked clip.
+  - Cloud side, which can ship first because it is backward compatible: `_customer_camera_status()` passes the camera's recording mode through, and the Dashboard shows "Event · waiting for activity" instead of a problem for Event-mode cameras with a fresh heartbeat. Only a missing clip for a recent event is treated as a problem.
+
+## Recommendation (not yet approved): /customer-account becomes Account & Devices; Dashboard becomes the sign-in landing page
+
+- **Keep the `/customer-account` route and its behaviour unchanged for now.** It is still:
+  - the post-sign-in destination (`customer_policy.role_destination`);
+  - the setup-completion destination;
+  - the owner setup gate (redirect to `/customer/setup` until an appliance is activated);
+  - the fallback for viewers without live permission.
+- **"5 of 8" explained:** 8 = the active Stripe entitlement (`camera_slots_local`, 8 slots, via `customer_entitlements.total_camera_slots`). The "Camera slot 6–8" cards are drawn from that number. The three `pending_installation` placeholder rows (Camera 6/7/8, created at onboarding) are consumed by appliance discovery (`appliance_cloud.py`, the placeholder-consumption block) and must not be deleted.
+- **Later:**
+  - make `/dashboard` the normal customer sign-in destination;
+  - turn `/customer-account` into Account & Devices (plan and slots used/available, appliances, subscription, camera management);
+  - drop only its duplicate "Your cameras" card grid;
+  - keep the setup gate, the placeholders and the licensing logic.
