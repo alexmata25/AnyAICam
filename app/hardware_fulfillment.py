@@ -59,6 +59,17 @@ def _now() -> str:
     return datetime.now().isoformat()
 
 
+def _refuse_test_order_on_live_server(order: dict) -> None:
+    """A Stripe TEST-mode order can never enter the real (live-key)
+    fulfillment workflow: nothing is prepared, shipped or cancelled for
+    it. On a test-key server (staging) the workflow stays usable so it
+    can itself be tested. See stripe_mode.py."""
+    import stripe_mode
+
+    if stripe_mode.server_key_is_test() is False and stripe_mode.is_test_mode(order=order):
+        raise ValueError("This is a Stripe test-mode order; it cannot enter live fulfillment.")
+
+
 def generate_order_number(order_id: str) -> str:
     """Human-friendly order number for customer-facing text -- derived
     deterministically from the order's own id, never a second random
@@ -74,6 +85,7 @@ def advance_fulfillment_status(order_id: str, new_status: str) -> dict:
     order = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
     if not order:
         raise ValueError(f"Unknown hardware order {order_id!r}")
+    _refuse_test_order_on_live_server(order)
     current = order["fulfillment_status"] or "paid"
 
     if new_status == "cancelled":
@@ -101,6 +113,9 @@ def mark_shipped(order_id: str, *, carrier: str, tracking_number: str, tracking_
     """Advances to 'shipped', records carrier/tracking, and sends the
     shipping email (send-once per order, see purchase_notifications.
     notify_hardware_shipped())."""
+    existing = row("SELECT * FROM hardware_orders WHERE id=?", (order_id,))
+    if existing:
+        _refuse_test_order_on_live_server(existing)
     now = _now()
     with connection() as db:
         db.execute(

@@ -70,6 +70,10 @@ produces a real outcome for that event.
 """
 from __future__ import annotations
 
+import contextvars
+
+import stripe_mode
+
 import json
 import uuid
 from datetime import datetime
@@ -150,9 +154,16 @@ def _mark_result(notification_id: str, *, status: str, error_detail: Optional[st
         )
 
 
+# Stripe test mode (2026-09-28): set per webhook event by
+# notify_from_stripe_event(); admin-triggered order emails pass it
+# explicitly from the order. See stripe_mode.py.
+_TEST_MODE: contextvars.ContextVar = contextvars.ContextVar("anyaicam_stripe_test_mode", default=None)
+
+
 def _send_once(
     *, event_id: str, notification_type: str, customer_id: Optional[str], recipient_email: str,
     subject: str, text: str, html: Optional[str] = None, metadata: Optional[dict] = None,
+    test_mode: Optional[bool] = None,
 ) -> dict:
     """The one place that actually calls the email backend for a
     provisioning notification. Idempotent per (event_id, notification_
@@ -162,6 +173,13 @@ def _send_once(
     must be able to keep processing/return 200 to Stripe regardless."""
     if not recipient_email:
         return {"status": "skipped", "reason": "no recipient email available"}
+    if test_mode is None:
+        test_mode = _TEST_MODE.get()
+    if test_mode is None:
+        test_mode = stripe_mode.server_key_is_test() is True
+    if test_mode:
+        subject, text, html = stripe_mode.decorate_email(subject, text, html)
+        metadata = dict(metadata or {}, stripe_test_mode=True)
     existing = _existing_notification(event_id, notification_type)
     if existing and existing["status"] == "sent":
         return {"status": "skipped", "reason": "already sent", "notification_id": existing["id"]}
@@ -569,7 +587,11 @@ def notify_from_stripe_event(event: dict) -> dict:
     returned dict / recorded in provisioning_notifications, never
     propagated to the webhook route."""
     try:
-        return _notify_from_stripe_event(event)
+        token = _TEST_MODE.set(stripe_mode.is_test_mode(event=event))
+        try:
+            return _notify_from_stripe_event(event)
+        finally:
+            _TEST_MODE.reset(token)
     except Exception as exc:
         return {"status": "error", "reason": str(exc)[:500]}
 
@@ -691,6 +713,7 @@ def notify_hardware_shipped(order_id: str) -> dict:
     recipient = (customer.get("email") if customer else None) or ""
     subject, text, html = _hardware_shipped_email(first_name, order)
     return _send_once(
+        test_mode=stripe_mode.is_test_mode(order=order),
         event_id=f"hardware-shipped:{order_id}", notification_type="hardware_shipped",
         customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"order_id": order_id},
@@ -706,6 +729,7 @@ def notify_hardware_cancellation(order_id: str) -> dict:
     recipient = (customer.get("email") if customer else None) or ""
     subject, text, html = _hardware_cancellation_email(first_name, order)
     return _send_once(
+        test_mode=stripe_mode.is_test_mode(order=order),
         event_id=f"hardware-cancelled:{order_id}", notification_type="hardware_cancellation",
         customer_id=order.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"order_id": order_id},
@@ -724,6 +748,7 @@ def notify_return_authorized(return_id: str) -> dict:
     recipient = (customer.get("email") if customer else None) or ""
     subject, text, html = _return_authorized_email(first_name, order, hardware_return)
     return _send_once(
+        test_mode=stripe_mode.is_test_mode(order=order),
         event_id=f"return-authorized:{return_id}", notification_type="return_authorized",
         customer_id=hardware_return.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"return_id": return_id, "order_id": order["id"]},
@@ -742,6 +767,7 @@ def notify_return_received(return_id: str) -> dict:
     recipient = (customer.get("email") if customer else None) or ""
     subject, text, html = _return_received_email(first_name, order)
     return _send_once(
+        test_mode=stripe_mode.is_test_mode(order=order),
         event_id=f"return-received:{return_id}", notification_type="return_received",
         customer_id=hardware_return.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"return_id": return_id, "order_id": order["id"]},
@@ -760,6 +786,7 @@ def notify_refund_processed(return_id: str) -> dict:
     recipient = (customer.get("email") if customer else None) or ""
     subject, text, html = _refund_processed_email(first_name, order, hardware_return)
     return _send_once(
+        test_mode=stripe_mode.is_test_mode(order=order),
         event_id=f"refund-processed:{return_id}", notification_type="refund_processed",
         customer_id=hardware_return.get("customer_id"), recipient_email=recipient, subject=subject, text=text, html=html,
         metadata={"return_id": return_id, "order_id": order["id"]},
