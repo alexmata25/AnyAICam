@@ -72,7 +72,7 @@ CUSTOMER_ANALYTICS_RULE_INTERVAL_SECONDS = max(0.5, float(os.environ.get("CUSTOM
 # The rule types this worker evaluates. The same table also stores People
 # Counting's own counting line ("people_counting"), which only
 # people_counting_worker() (main.py) reads.
-EVALUATED_RULE_TYPES = frozenset({"intrusion", "line_crossing"})
+EVALUATED_RULE_TYPES = frozenset({"intrusion", "line_crossing", "security_line"})
 
 
 def camera_rules_entitled(identity: dict | None) -> bool:
@@ -121,6 +121,75 @@ def load_rules_for_camera(camera_id: str) -> list[dict]:
     return rules
 
 
+def evaluate_security_lines(camera_number, camera_id, rules, tracked, frame_width, frame_height, *, now=None) -> list:
+    """security_line rules only raise an INTRUSION ALARM while this camera
+    is armed in the site's current mode (security_modes; the local copy
+    the cloud synced, so an outage never silently disarms). Disarmed or
+    not participating: evaluated not at all."""
+    security = [r for r in rules if r["analytic_type"] == "security_line"]
+    if not security:
+        return []
+    import security_modes
+    import security_rules
+    with connection() as db:
+        armed, state = security_modes.camera_armed_now(db, camera_id)
+    if not armed:
+        return []
+    cooldown = (state or {}).get("settings", {}).get("alarm_cooldown_seconds")
+    alarms = []
+    for rule in security:
+        alarms += security_rules.evaluate(
+            camera_number,
+            {"id": rule["id"], "rule_type": "security_line", "name": rule.get("name"), "geometry": rule["geometry"],
+             "direction": rule.get("direction"), "alarm_cooldown_seconds": cooldown},
+            tracked, frame_width, frame_height, time.monotonic() if now is None else now,
+        )
+    settings = (state or {}).get("settings", {})
+    for alarm in alarms:
+        alarm["security_mode"] = state["mode"]
+        alarm["customer_id"] = state.get("customer_id")
+        if settings.get("talkdown_on_alarm") and str(settings.get("talkdown_message") or "").strip():
+            alarm["talkdown_text"] = str(settings["talkdown_message"]).strip()
+    return alarms
+
+
+def speak_alarm_talkdowns(camera_id: str, fired: list, event_ids: list, *, provider=None) -> int:
+    """Automatic talk-down for an INTRUSION ALARM when the customer turned
+    it on in Security Settings: the warning is spoken through the camera's
+    own speaker by the same local provider the AAC Voice Call greeting
+    uses (TTS + ISAPI two-way audio; it skips cameras without talk-down,
+    a camera the customer is already talking through, or one already
+    speaking). Runs on a daemon thread so it never delays detection.
+    Returns how many were dispatched."""
+    import threading
+
+    jobs = [(alarm, event_id) for alarm, event_id in zip(fired, event_ids)
+            if alarm.get("analytic_type") == "intrusion_alarm" and alarm.get("talkdown_text")]
+    if not jobs:
+        return 0
+
+    def _speak(alarm, event_id):
+        try:
+            import aac_voice_call_greeting
+            chosen = provider or aac_voice_call_greeting.get_provider()
+            result = chosen.speak(aac_voice_call_greeting.GreetingRequest(
+                camera_id=camera_id, customer_id=str(alarm.get("customer_id") or ""), event_id=str(event_id),
+                text=alarm["talkdown_text"], reason="intrusion_alarm_talkdown",
+            ))
+            logger.info("intrusion_alarm.talkdown camera_id=%s delivered=%s reason=%s",
+                        camera_id, result.delivered, result.suppressed_reason)
+        except Exception as error:
+            logger.warning("intrusion_alarm.talkdown_failed camera_id=%s error=%s", camera_id, type(error).__name__)
+
+    # One warning per cycle is enough even if two lines fired together.
+    alarm, event_id = jobs[0]
+    if provider is not None:
+        _speak(alarm, event_id)
+    else:
+        threading.Thread(target=_speak, args=(alarm, event_id), name=f"alarm-talkdown-{camera_id}", daemon=True).start()
+    return 1
+
+
 def event_type_for(analytic_type: str) -> str:
     """A flat "line_crossing" (never suffixed by direction) -- this is
     not a new value invented here: main.py's own Investigate/analytics
@@ -137,6 +206,8 @@ def event_type_for(analytic_type: str) -> str:
     event_type would only reintroduce the exact ambiguity avoided by
     keeping this value flat and matching the pre-existing dropdown
     option exactly."""
+    if analytic_type == "intrusion_alarm":
+        return "intrusion_alarm"  # security_line, armed: never a plain line_crossing/intrusion
     return "line_crossing" if analytic_type == "line_crossing" else "intrusion"
 
 
@@ -175,7 +246,7 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
 
     analytic_type = fired["analytic_type"]
     direction = fired.get("direction")
-    label = "Line Crossing" if analytic_type == "line_crossing" else "Intrusion Zone"
+    label = {"line_crossing": "Line Crossing", "intrusion_alarm": "INTRUSION ALARM"}.get(analytic_type, "Intrusion Zone")
     record = AnalyticsEventModel(
         camera=camera_number,
         site="home",
@@ -189,6 +260,9 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
     ).model_dump(mode="json")
     record["rule_id"] = fired["rule_id"]
     record["track_id"] = fired.get("track_id")
+    if analytic_type == "intrusion_alarm":
+        record["severity"] = "critical"
+        record["security_mode"] = fired.get("security_mode")
     append_analytics_event(record)
     return record
 
@@ -218,9 +292,11 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
                     tracked = analytics_rules_engine.update_tracker(camera_number, raw_detections)
                     if frame is not None:
                         frame_height, frame_width = frame.shape[0], frame.shape[1]
+                        general_rules = [r for r in rules if r["analytic_type"] != "security_line"]
                         fired = analytics_rules_engine.evaluate_rules(
-                            camera_number, tracked, rules, frame_width, frame_height, now=time.monotonic()
-                        )
+                            camera_number, tracked, general_rules, frame_width, frame_height, now=time.monotonic()
+                        ) if general_rules else []
+                        fired += evaluate_security_lines(camera_number, camera_id, rules, tracked, frame_width, frame_height)
                         if fired:
                             now = datetime.now()
                             thumbnail_url = save_rule_event_thumbnail(camera_number, frame, now, "analytics_rule")
@@ -258,6 +334,7 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
                             ]
                             if in_event_mode and event_ids:
                                 asyncio.create_task(_backfill_ai_event_linked_recording(camera_number, event_ids, now))
+                            speak_alarm_talkdowns(camera_id, fired, event_ids)
         except asyncio.CancelledError:
             raise
         except Exception as error:

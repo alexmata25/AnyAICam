@@ -43,10 +43,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from partner_db import audit, connection
 from partner_portal import partner_identity
 
-RULE_TYPES = ("intrusion", "line_crossing", "people_counting", "exclusion")
+RULE_TYPES = ("intrusion", "line_crossing", "people_counting", "exclusion", "security_line")
 # Two-point line rules; "people_counting" is People Counting's counting
 # line (at most one per camera), "line_crossing" an alert rule.
-LINE_RULE_TYPES = ("line_crossing", "people_counting")
+LINE_RULE_TYPES = ("line_crossing", "people_counting", "security_line")
 # Polygon rules: "intrusion" detects activity inside the zone; "exclusion"
 # (2026-09-26) ignores it -- detections centred inside, and pixel motion
 # inside, never become events on that camera (detection_exclusion.py).
@@ -144,6 +144,10 @@ def _validate_geometry(rule_type: str, geometry, direction):
             raise HTTPException(status_code=400, detail='A line needs 2 different points.')
         if direction not in LINE_CROSSING_DIRECTIONS:
             raise HTTPException(status_code=400, detail=f'direction must be one of {list(LINE_CROSSING_DIRECTIONS)} for a line.')
+        if rule_type == 'security_line' and direction not in ('inbound', 'outbound'):
+            # An intrusion alarm needs a protected side; "both" would make
+            # every crossing in either direction an alarm.
+            raise HTTPException(status_code=400, detail='Choose which side of the security line is protected.')
         return points, direction
     if len(points) < MIN_POLYGON_POINTS:
         raise HTTPException(status_code=400, detail=f'A zone needs at least {MIN_POLYGON_POINTS} points.')
@@ -318,14 +322,17 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
                   <option value="line_crossing">Line crossing</option>
                   <option value="exclusion">Ignore detections in zone</option>
                   <option value="people_counting">People counting line</option>
+                  <option value="security_line">Security line (intrusion alarm when armed)</option>
                 </select>
               </label>
-              <label style="display:grid;gap:6px" id="direction-field">Direction
+              <label style="display:grid;gap:6px" id="direction-field"><span id="direction-label">Direction</span>
                 <select id="rule-direction" {"disabled" if not can_edit else ""}>
                   <option value="both">Either direction</option>
                   <option value="inbound">Inbound only</option>
                   <option value="outbound">Outbound only</option>
                 </select>
+                <span class="health-detail" id="security-line-hint" style="display:none">The shaded red side is protected. When the system is armed,
+                  a person who fully crosses from the other side into the shaded side raises an INTRUSION ALARM. Cars and animals never do.</span>
               </label>
               <label style="display:grid;gap:6px">Name
                 <input id="rule-name" type="text" maxlength="60" placeholder="e.g. Driveway entrance" {"disabled" if not can_edit else ""}>
@@ -368,9 +375,9 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   const canvas=document.getElementById('rule-canvas');
   const ctx=canvas.getContext('2d');
   const ruleType=document.getElementById('rule-type');
-  const isLine=t=>t==='line_crossing'||t==='people_counting';
+  const isLine=t=>t==='line_crossing'||t==='people_counting'||t==='security_line';
   const isZone=t=>t==='intrusion'||t==='exclusion';
-  const typeLabels={line_crossing:'Line crossing',intrusion:'Detect inside zone',exclusion:'Ignore detections in zone',people_counting:'People counting line'};
+  const typeLabels={line_crossing:'Line crossing',intrusion:'Detect inside zone',exclusion:'Ignore detections in zone',people_counting:'People counting line',security_line:'Security line'};
   const directionField=document.getElementById('direction-field');
   const bgCanvas=document.createElement('canvas');
   let hasFrame=false, points=[], editingRuleId=null, sessionId=null, hls=null, pollTimer=null, stopped=false;
@@ -455,10 +462,27 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     captureFromStill();
   }
 
+  // security_rules._signed_distance: "inbound" protects the side where
+  // (p-a)x(b-a) is negative, i.e. along the normal (-dy,dx) -- the right-
+  // hand side walking from the first point to the second (y grows down).
+  function shadeProtectedSide(){
+    const a={x:points[0].x*canvas.width,y:points[0].y*canvas.height}, b={x:points[1].x*canvas.width,y:points[1].y*canvas.height};
+    const dx=b.x-a.x, dy=b.y-a.y, len=Math.hypot(dx,dy); if(!len)return;
+    const sign=directionSelect.value==='outbound'?-1:1, far=(canvas.width+canvas.height)*2;
+    const nx=-dy/len*sign*far, ny=dx/len*sign*far, ux=dx/len*far, uy=dy/len*far;
+    ctx.save();ctx.globalAlpha=0.22;ctx.fillStyle='#ef4444';ctx.beginPath();
+    ctx.moveTo(a.x-ux,a.y-uy);ctx.lineTo(b.x+ux,b.y+uy);ctx.lineTo(b.x+ux+nx,b.y+uy+ny);ctx.lineTo(a.x-ux+nx,a.y-uy+ny);ctx.closePath();ctx.fill();
+    ctx.globalAlpha=1;ctx.font='bold 14px sans-serif';
+    const mx=(a.x+b.x)/2-dy/len*sign*28, my=(a.y+b.y)/2+dx/len*sign*28;
+    ctx.fillText('PROTECTED',Math.min(Math.max(mx-40,4),canvas.width-90),Math.min(Math.max(my,16),canvas.height-6));
+    ctx.restore();
+  }
+
   function redraw(){
     drawBackground();
     if(!points.length)return;
-    const color=ruleType.value==='exclusion'?'#ef4444':'#22c55e';
+    if(ruleType.value==='security_line'&&points.length===2)shadeProtectedSide();
+    const color=ruleType.value==='exclusion'||ruleType.value==='security_line'?'#ef4444':'#22c55e';
     ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;
     ctx.beginPath();
     points.forEach((p,i)=>{
@@ -485,11 +509,25 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     redraw();
   }
 
+  const directionSelect=document.getElementById('rule-direction');
+  const DIRECTION_TEXT={
+    normal:{label:'Direction',both:'Either direction',inbound:'Inbound only',outbound:'Outbound only'},
+    security:{label:'Protected side',inbound:'Right side (walking from the first point to the second)',outbound:'Left side (walking from the first point to the second)'}
+  };
   function toggleDirectionField(){
     directionField.style.display=isLine(ruleType.value)?'':'none';
+    // A security line always protects one side; "either direction" would
+    // make every crossing an alarm, and the server rejects it.
+    const security=ruleType.value==='security_line';
+    const text=DIRECTION_TEXT[security?'security':'normal'];
+    document.getElementById('direction-label').textContent=text.label;
+    document.getElementById('security-line-hint').style.display=security?'':'none';
+    [...directionSelect.options].forEach(o=>{o.textContent=text[o.value]||o.textContent;o.hidden=security&&o.value==='both';o.disabled=security&&o.value==='both';});
+    if(security&&directionSelect.value==='both')directionSelect.value='inbound';
   }
   toggleDirectionField();
   ruleType.addEventListener('change',()=>{toggleDirectionField();points=[];redraw();});
+  directionSelect.addEventListener('change',()=>redraw());
 
   document.getElementById('capture-frame').addEventListener('click',()=>{captureFrame();});
   document.getElementById('clear-drawing').addEventListener('click',()=>{points=[];redraw();});

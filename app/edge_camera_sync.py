@@ -183,6 +183,36 @@ def _reconcile_analytics_rules(db, appliance_id: str, cloud_rules: list, now: st
     return len(cloud_ids)
 
 
+def _reconcile_security(db, appliance_id: str, cloud_security: dict) -> int:
+    """Mirrors the cloud-owned Arm Stay/Away/Disarm state and security
+    settings (security_modes) for the sites THIS appliance has cameras at.
+    The rule worker reads only this local copy, so intrusion alarms keep
+    following the last armed state through an internet outage. A site the
+    cloud doesn't name, or one this appliance has no camera at, is never
+    touched."""
+    import security_modes
+    local_sites = {
+        (item["customer_id"], item["site_id"])
+        for item in db.execute("SELECT DISTINCT customer_id,site_id FROM cameras WHERE appliance_id=?", (appliance_id,)).fetchall()
+    }
+    synced = 0
+    sites = cloud_security.get("sites")
+    for item in sites if isinstance(sites, list) else []:
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("customer_id") or ""), str(item.get("site_id") or ""))
+        if key not in local_sites:
+            continue
+        try:
+            mode = security_modes.normalize_mode(item.get("mode"))
+        except ValueError:
+            continue
+        settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+        security_modes.store_synced_state(db, key[0], key[1], mode, settings, item.get("changed_at"))
+        synced += 1
+    return synced
+
+
 def _reconcile_aac_voice_call(db, appliance_id: str, cloud_config: dict, now: str) -> dict:
     """Mirrors the cloud-owned AAC Voice Call configuration for THIS
     appliance's own cameras into the local aac_voice_call_entrance_
@@ -285,6 +315,10 @@ def sync_provisioned_cameras() -> dict:
     # edge's local entrance-camera configuration.
     cloud_aac_voice_call = response.get("aac_voice_call")
     cloud_aac_voice_call = cloud_aac_voice_call if isinstance(cloud_aac_voice_call, dict) else None
+    # security (2026-09-28): same skip-if-missing posture -- an older
+    # control plane can never disarm the edge by omitting the field.
+    cloud_security = response.get("security")
+    cloud_security = cloud_security if isinstance(cloud_security, dict) else None
 
     # product_mode (2026-09-21): this appliance's real, entitlement-
     # derived Local/Hybrid mode, from the same already-polled response --
@@ -458,11 +492,14 @@ def sync_provisioned_cameras() -> dict:
             _reconcile_aac_voice_call(db, identity["appliance_id"], cloud_aac_voice_call, now)
             if cloud_aac_voice_call is not None else None
         )
+        security_synced = (
+            _reconcile_security(db, identity["appliance_id"], cloud_security) if cloud_security is not None else None
+        )
 
     result = {
         "status": "ok", "synced": synced, "credentials_moved": credentials_moved,
         "product_mode_restart_required": restart_required, "rules_synced": rules_synced,
-        "aac_voice_call_synced": aac_voice_call_synced,
+        "aac_voice_call_synced": aac_voice_call_synced, "security_synced": security_synced,
     }
     sync_state["last_run_at"] = now
     sync_state["last_error"] = None

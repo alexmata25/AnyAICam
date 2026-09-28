@@ -41,7 +41,7 @@ from customer_analytics_panel import event_type_label,event_type_message
 # silently create zero notifications (the same class of gap 'ppe'/
 # 'storage_problem'/'facial_recognition' above were each added to fix),
 # even though the in-app notification is the entire point of Phase 3.
-SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call'}
+SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm'}
 
 # Per-(user, camera, event_type) minimum spacing between EXTERNAL
 # (email/sms) delivery attempts -- "Prevent duplicate/spam notifications
@@ -69,7 +69,17 @@ def _email_alert_event_types() -> frozenset[str] | None:
     return types or None
 
 
+# Armed-security alarms (security_rules / security_modes) are emergencies:
+# they reach the customer's enabled email/SMS even during quiet hours,
+# without the 5-minute per-camera spacing (the alarm engine has its own
+# cooldown) and regardless of the operator's email allowlist -- but still
+# only on channels the customer turned on and cameras they may see.
+EMERGENCY_EVENT_TYPES = frozenset({'intrusion_alarm'})
+
+
 def email_alert_allowed(event_type: str) -> bool:
+    if event_type in EMERGENCY_EVENT_TYPES:
+        return True
     allowed = _email_alert_event_types()
     return allowed is None or event_type in allowed
 
@@ -143,7 +153,8 @@ def _external_channels(db,*,user,customer_id: str,camera_id: str | None,event_ty
     disabled={'email':False,'sms':False,'email_address':'','phone_number':''}
     if not prefs['email_enabled'] and not prefs['sms_enabled']:
         return disabled
-    if event_type not in prefs['event_types']:
+    emergency = event_type in EMERGENCY_EVENT_TYPES
+    if event_type not in prefs['event_types'] and not emergency:
         return disabled
     if camera_id is not None:
         from camera_access import authorized_camera_ids
@@ -151,9 +162,9 @@ def _external_channels(db,*,user,customer_id: str,camera_id: str | None,event_ty
         effective=set(resolve_effective_camera_ids(camera_scope=prefs['camera_scope'],camera_ids=prefs['camera_ids'],authorized_camera_ids=authorized))
         if camera_id not in effective:
             return disabled
-    if prefs['quiet_hours_enabled'] and _within_quiet_hours(current_time,prefs['quiet_start'],prefs['quiet_end']):
+    if not emergency and prefs['quiet_hours_enabled'] and _within_quiet_hours(current_time,prefs['quiet_start'],prefs['quiet_end']):
         return disabled
-    if _external_channel_recently_notified(db,user_id=user['id'],camera_id=camera_id,event_type=event_type,now=now,exclude_notification_id=notification_id):
+    if not emergency and _external_channel_recently_notified(db,user_id=user['id'],camera_id=camera_id,event_type=event_type,now=now,exclude_notification_id=notification_id):
         return disabled
     return {
         'email':bool(prefs['email_enabled'] and prefs['email_address'] and email_alert_allowed(event_type)),
@@ -161,6 +172,15 @@ def _external_channels(db,*,user,customer_id: str,camera_id: str | None,event_ty
         'email_address':prefs['email_address'],
         'phone_number':prefs['phone_number'],
     }
+
+
+def _security_sms_wanted(customer_id: str, site_id: str) -> bool:
+    try:
+        import security_modes
+        with connection() as db:
+            return bool(security_modes.get_state(db, customer_id, site_id)['settings'].get('notify_sms', True))
+    except Exception:
+        return True  # fail toward delivering an emergency alert
 
 
 def fanout_appliance_event(appliance: dict,event: dict):
@@ -195,10 +215,12 @@ def fanout_appliance_event(appliance: dict,event: dict):
         notification_id=secrets.token_hex(16); timestamp=str(event.get('timestamp') or now.isoformat()); title=event_type_label(event_type); message=str(event.get('message') or event_type_message(event_type))[:1000]
         notification={'id':notification_id,'title':title,'message':message}
         with connection() as db:
-            db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity','info'),title,message,timestamp,event.get('thumbnail'),now.isoformat()))
+            db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity') or ('critical' if event_type in EMERGENCY_EVENT_TYPES else 'info'),title,message,timestamp,event.get('thumbnail'),now.isoformat()))
             external=_external_channels(db,user=user,customer_id=customer_id,camera_id=camera_id,event_type=event_type,current_time=current_time,now=now,notification_id=notification_id)
         recipients={'in_app':'local','email':external['email_address'],'sms':external['phone_number']}
         channels={'in_app':True,'email':external['email'],'sms':external['sms']}
+        if event_type in EMERGENCY_EVENT_TYPES and channels['sms'] and site_id and not _security_sms_wanted(customer_id,site_id):
+            channels['sms']=False  # the customer turned off intrusion-alarm SMS in Security Settings
         for channel in ('in_app','email','sms'):
             if not channels.get(channel): continue
             if channel=='email':

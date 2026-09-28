@@ -48448,6 +48448,7 @@ from live_view_p2p import register_live_view_p2p_customer_routes, register_live_
 from talk_sessions import register_talk_session_routes
 from talk_audio_relay import register_talk_audio_relay_routes
 from door_access import register_door_access_routes
+from security_portal import dashboard_security_panel, register_security_routes
 from wireguard_remote import register_wireguard_remote_appliance_routes
 # 2026-09-16: edge-side counterpart to the cloud relay above -- ONVIF
 # backchannel transport, capability discovery, and the WebSocket relay
@@ -48619,6 +48620,7 @@ register_facial_recognition_routes(app, page_shell)
 register_aac_voice_call_routes(app, page_shell)
 register_platform_owner_routes(app, page_shell)
 register_door_access_routes(app)
+register_security_routes(app, page_shell)
 register_wireguard_remote_appliance_routes(app)
 
 
@@ -74818,6 +74820,8 @@ def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, f
 
 
 def dashboard(request: Request) -> str:
+    # Arm Stay / Arm Away / Disarm (security_portal); empty for non-customer sessions.
+    _dashboard_security_html = dashboard_security_panel(request)
     _customer_dashboard_cameras = _customer_playback_cameras(request)
     if _customer_dashboard_cameras is not None:
         # Customer-portal identity: only this customer's own camera
@@ -75539,7 +75543,7 @@ def dashboard(request: Request) -> str:
 
 
 
-    content = f"""<header class="topbar"><div><p class="eyebrow">System overview</p><h1>Dashboard</h1></div><a class="action-button" href="{_dashboard_live_view_href}">Open live view</a></header>
+    content = f"""<header class="topbar"><div><p class="eyebrow">System overview</p><h1>Dashboard</h1></div><a class="action-button" href="{_dashboard_live_view_href}">Open live view</a></header>{_dashboard_security_html}
 
 
 

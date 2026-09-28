@@ -319,12 +319,14 @@ EVENT_TYPE_LABELS = {
     "motion": "Motion", "smart_motion": "Smart Motion", "ppe": "PPE", "plate": "License plate", "lpr": "License plate",
     "people_counting": "People count", "people_counting_in": "Entry", "people_counting_out": "Exit",
     "facial_recognition": "Face", "aac_voice_call": "Voice call", "line_crossing": "Line crossing",
+    "intrusion_alarm": "INTRUSION ALARM",
 }
 
 
 EVENT_TYPE_MESSAGES = {
     "people_counting_in": "Person entered", "people_counting_out": "Person left",
     "plate": "License plate read", "lpr": "License plate read",
+    "intrusion_alarm": "INTRUSION ALARM: a person crossed into a protected area",
 }
 
 

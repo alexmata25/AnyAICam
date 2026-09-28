@@ -139,6 +139,35 @@ def authenticate_appliance(request: Request, *, limiter: "RateLimiter | None" = 
     return appliance
 
 
+def _security_config(appliance: dict) -> dict:
+    import security_modes
+    with connection() as db:
+        sites=[dict(item) for item in db.execute(
+            'SELECT DISTINCT customer_id,site_id FROM cameras WHERE appliance_id=? AND customer_id=? AND site_id IS NOT NULL ORDER BY site_id',
+            (appliance['id'],appliance['customer_id']),
+        ).fetchall()]
+        states=[security_modes.get_state(db,site['customer_id'],site['site_id']) for site in sites]
+    return {'sites':[{key:state[key] for key in ('customer_id','site_id','mode','changed_at','settings')} for state in states]}
+
+
+def _fanout_payload(camera: dict, event_id: str, camera_id: str, event_type: str, event_timestamp: str, message: str | None) -> dict:
+    """Notification payload for an ingested edge event. An armed-security
+    INTRUSION ALARM carries a critical severity and a message that names
+    the camera and links straight to its live view (which is what an SMS
+    shows)."""
+    payload = {'id': event_id, 'camera_id': camera_id, 'event_type': event_type, 'timestamp': event_timestamp, 'message': message}
+    if event_type == 'intrusion_alarm':
+        try:
+            from notification_email import public_base_url
+            base = public_base_url()
+        except Exception:
+            base = ''
+        name = (camera or {}).get('name') or 'your camera'
+        payload['severity'] = 'critical'
+        payload['message'] = f"INTRUSION ALARM at {name}. Open the live camera: {base}/customer/cameras/{camera_id}/live?alarm={event_id}"
+    return payload
+
+
 def _authorized_camera(appliance: dict,camera_id: str) -> dict:
     camera=row('SELECT * FROM cameras WHERE id=? AND appliance_id=?',(camera_id,appliance['id']))
     if not camera: raise HTTPException(status_code=403,detail='Camera is not assigned to this appliance.')
@@ -549,6 +578,12 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 (appliance['customer_id'],appliance['id'],appliance['customer_id']),
             ),
         }
+        # security (2026-09-28): the cloud-owned Arm Stay/Away/Disarm state
+        # and security settings for every site this appliance has cameras
+        # at. The edge mirrors it (edge_camera_sync._reconcile_security) and
+        # decides per detection from that local copy, so an outage never
+        # silently changes the site's armed state.
+        security_config=_security_config(appliance)
         for rule_item in analytics_rule_items:
             raw_geometry=rule_item.pop('geometry_json',None)
             try:
@@ -651,7 +686,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # docstring for the "database is locked" this avoids).
         if product_mode_audit:
             audit(product_mode_audit['actor'],product_mode_audit['action'],product_mode_audit['entity_type'],product_mode_audit['entity_id'],product_mode_audit['details'])
-        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config}
+        return {'configuration_version':max([item.get('status','') for item in camera_items],default='empty'),'cameras':camera_items,'camera_credentials_included':False,'cloud_policy':cloud_policy,'storage_policy':storage_policy,'identity':identity,'product_mode':product_mode_value,'analytics_rules':analytics_rule_items,'aac_voice_call':aac_voice_call_config,'security':security_config}
 
     def _sanitize_rtsp_uri(value: str) -> str | None:
         # Second, independent layer of defense against a credential-
@@ -1109,7 +1144,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             try:
                 fanout_appliance_event(
                     {'customer_id': camera['customer_id'], 'site_id': camera['site_id']},
-                    {'id': event_id, 'camera_id': camera_id, 'event_type': event_type, 'timestamp': event_timestamp, 'message': facial_notify_message},
+                    _fanout_payload(camera, event_id, camera_id, event_type, event_timestamp, facial_notify_message),
                 )
             except Exception:
                 logger.exception('analytics_event.fanout_failed event_id=%s camera_id=%s', event_id, camera_id)
