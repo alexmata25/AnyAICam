@@ -102,7 +102,8 @@ def _thumb(group: dict) -> str:
     camera_id, event_id = latest.get("camera_id"), latest.get("event_id")
     if latest.get("thumbnail"):
         src = str(latest["thumbnail"])
-    elif camera_id and event_id and group["event_type"] != "aac_voice_call":
+    elif camera_id and event_id and latest.get("has_event_clip") and group["event_type"] != "aac_voice_call":
+        # Only alerts with saved media have a thumbnail to fetch.
         src = f"/api/customer/events/{camera_id}/{event_id}/thumbnail?size=card"
     else:
         return '<div class="sa-thumb sa-thumb--empty" aria-hidden="true">♢</div>'
@@ -188,7 +189,7 @@ SMART_ALERTS_CSS = '''<style>
 .sa-views{display:flex;gap:8px;margin:0 0 12px;flex-wrap:wrap}
 .sa-view{padding:6px 12px;border-radius:999px;border:1px solid #334155;color:inherit;text-decoration:none;font-size:14px}
 .sa-view.active{background:#2dd4bf;color:#0b1220;border-color:#2dd4bf;font-weight:700}
-.sa-filters{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:12px;-webkit-overflow-scrolling:touch}
+.sa-filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 .sa-filter{flex:0 0 auto;min-height:40px;padding:6px 14px;border-radius:999px;border:1px solid #475467;background:transparent;color:inherit;font-weight:600;cursor:pointer}
 .sa-filter.active{background:#e5e7eb;color:#0b1220;border-color:#e5e7eb}
 .sa-filter-count{opacity:.7;font-weight:400;margin-left:2px}

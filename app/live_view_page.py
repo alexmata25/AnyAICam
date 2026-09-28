@@ -872,7 +872,7 @@ def _intrusion_alarm_banner(request: Request, camera_id: str, identity: dict) ->
     )
 
 
-def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = True) -> tuple[str, str]:
+def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = True, show_analytics: bool = True) -> tuple[str, str]:
     """The single-camera live panel -- video, talk mic and camera tools,
     plus the (initially hidden) analytics section -- and its scripts,
     without any page chrome. Rendered by the Live page and embedded
@@ -1451,7 +1451,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
   }}
 
   checkCameraStatusThenStart();
-  loadEnabledAnalytics();
+  {'loadEnabledAnalytics();' if show_analytics else '// analytics are not shown on this screen'}
 }})();
 </script>'''
 
