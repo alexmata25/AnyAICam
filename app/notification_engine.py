@@ -53,6 +53,11 @@ SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion
 # frame re-triggering Smart Motion every few seconds) events actually
 # become spam for a customer's inbox/phone.
 NOTIFICATION_CHANNEL_COOLDOWN_SECONDS=max(0,int(os.environ.get("ANYAICAM_NOTIFICATION_CHANNEL_COOLDOWN_SECONDS","300")))
+# Voice Calls keep their own spacing (2026-09-28): each call is a visitor at
+# the door, so lengthening the ordinary video-alert cooldown (staging runs
+# 15 minutes) must never hold back a second visitor's call email. Defaults
+# to the long-standing 5 minutes.
+VOICE_CALL_CHANNEL_COOLDOWN_SECONDS=max(0,int(os.environ.get("ANYAICAM_VOICE_CALL_CHANNEL_COOLDOWN_SECONDS","300")))
 
 
 def _email_alert_event_types() -> frozenset[str] | None:
@@ -126,9 +131,10 @@ def _external_channel_recently_notified(db,*,user_id: str,camera_id: str | None,
     notification's external delivery. camera_id IS NULL-safe: appliance-
     level event types (camera_id None) are grouped together by
     event_type alone, same as everything else."""
-    if NOTIFICATION_CHANNEL_COOLDOWN_SECONDS<=0:
+    cooldown=VOICE_CALL_CHANNEL_COOLDOWN_SECONDS if event_type=='aac_voice_call' else NOTIFICATION_CHANNEL_COOLDOWN_SECONDS
+    if cooldown<=0:
         return False
-    cutoff=(now.timestamp()-NOTIFICATION_CHANNEL_COOLDOWN_SECONDS)
+    cutoff=(now.timestamp()-cooldown)
     cutoff_iso=datetime.fromtimestamp(cutoff).isoformat()
     # Bounded cooldown (2026-09-28): measured from the last time an email/
     # SMS was actually attempted for this (user, camera, event type) -- not
