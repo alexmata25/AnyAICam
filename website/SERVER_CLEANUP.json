@@ -1,0 +1,22 @@
+{
+ "why": "Live on anyaicam.com but not part of the customer site: vendor 'Save page as' copies (broken, unlinked), an internal test checkout page/endpoints and a snippet. Remove them from public_html (move to a folder outside public_html if you want to keep them).",
+ "remove_from_public_html": [
+  "CMHT1722-28LS, 2MP HD-TVI.html",
+  "CMHT1752-28LS, 5 MP TVI.html",
+  "CMHT1782-28LF, Platinum Plus 8 MP TVI.html",
+  "CMIP3382WI-28SDL, Platinum Plus, 8MP.html",
+  "CMIP3C42WI-28SDL, Platinum Plus, 4 MP Color 247.html",
+  "CMIP3C82WI-28SDL, 8 MP Color 247.html",
+  "LTCMIP3743W2-DLZ, Platinum Plus 4 MP.html",
+  "LXIP1142W-28MA, Pro-X, 4MP, IP.html",
+  "LXIP7553W4-SZ12, Pro-X, IP, 4 Lens Panoramic Dome IP Camera.html",
+  "VSIP7552FW-SE, Pro-VS, Fisheye, IP, 5MP.html",
+  "VSPOE-SW1602, 16 Port PoE Switch.html",
+  "VSPOE-SW2402, Pro-VS, 24 Port PoE Switch.html",
+  "VSPOE-SW802, 8 PoE Port Switch with 2 Port Uplink.html",
+  "anyaicam-test-checkout.html",
+  "homepage-button-snippet.html",
+  "anyaicam-test-checkout.php",
+  "anyaicam-test-webhook.php"
+ ]
+}

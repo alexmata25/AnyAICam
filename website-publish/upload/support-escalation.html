@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Technical Support Escalation | ANY AI CAM</title>
+  <meta name="description" content="Continue an ANY AI CAM automated camera diagnostic with a live support agent.">
+  <meta name="robots" content="index,follow">
+  <link rel="canonical" href="https://anyaicam.com/support-escalation.html">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    body{background:#eef4f8;color:#071032}
+    .esc-hero{padding:4rem 1rem 2.75rem;background:linear-gradient(135deg,#071032,#19364a);color:#fff;text-align:center}
+    .esc-hero h1{color:#fff;margin:.45rem auto .8rem;font-size:clamp(2rem,5vw,3.2rem)}
+    .esc-hero p{max-width:720px;margin:auto;color:#d7e4ef;line-height:1.7}
+    .esc-shell{width:min(940px,calc(100% - 32px));margin:-1.25rem auto 4rem;background:#fff;border:1px solid #d7e3ee;border-radius:16px;box-shadow:0 20px 55px rgba(7,16,50,.14);padding:clamp(1.25rem,4vw,2.25rem)}
+    .status{padding:1rem;border-left:6px solid #5fc4d1;background:#f3fbfc;border-radius:10px;margin-bottom:1.25rem}
+    .summary{white-space:pre-wrap;background:#071032;color:#eaf4ff;padding:1.1rem;border-radius:10px;font-family:ui-monospace,monospace;font-size:.9rem;line-height:1.55;max-height:360px;overflow:auto}
+    .actions{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:1rem}
+    .actions button,.actions a{border:0;border-radius:9px;padding:.85rem 1.2rem;font-weight:900;text-decoration:none;cursor:pointer}
+    .primary{background:linear-gradient(90deg,#cc3b96,#5fc4d1);color:#fff}
+    .secondary{background:#eaf0f5;color:#071032}
+    .privacy{margin-top:1.25rem;color:#5b6879;font-size:.92rem;line-height:1.6}
+  </style>
+<link rel="stylesheet" href="header-standard.css">
+</head>
+<body>
+  
+  <header class="site-header">
+        <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+            <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+        </a>
+
+        <div class="header-controls">
+            <button class="mobile-menu-toggle" type="button" aria-expanded="false" aria-controls="primaryNav">Menu</button>
+            <div class="header-badges">
+                <a class="live-support-badge" href="support.html">&#9742; Connect with Live Support</a>
+            </div>
+        </div>
+                <nav class="site-nav" id="primaryNav" aria-label="Primary navigation">
+            <a href="index.html">Home</a>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="cloud-storage-pricing.html">Pricing</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="adapters.html">Adapters</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="support.html">Support</a>
+            <a href="contact.html">Contact</a>
+            <a href="cloud-setup-wizard.html">Get Started</a>
+            <div class="dropdown">
+              <a href="#" class="dropbtn">More</a>
+              <div class="dropdown-content">
+                <a href="nvr.html">NVR Setup</a>
+                <a href="software.html">Software</a>
+                <a href="partner.html">Partner Login</a>
+              </div>
+            </div>
+        </nav>
+    </header>
+  <main>
+    <section class="esc-hero">
+      <p class="eyebrow">Diagnostic Complete</p>
+      <h1>Your support summary is ready for LiveChat.</h1>
+      <p>The diagnostic details have been transferred automatically. Open the chat, review the prefilled message, and press Send when you are ready.</p>
+    </section>
+    <section class="esc-shell">
+      <div class="status" id="statusBox"><strong>Preparing LiveChat…</strong><br>The chat window should open automatically.</div>
+      <h2>Transferred diagnostic summary</h2>
+      <div class="summary" id="summaryBox">No diagnostic summary was found.</div>
+      <div class="actions">
+        <button class="primary" id="openChat">Open LiveChat</button>
+        <button class="secondary" id="copySummary">Copy Summary</button>
+        <a class="secondary" href="support-diagnostic.html">Run Diagnostic Again</a>
+      </div>
+      <p class="privacy">Do not add camera passwords, payment-card details, Cloud ID access links, or remote-desktop codes to the chat. A LiveChat message is prefilled but is not sent until the customer presses Send.</p>
+    </section>
+  </main>
+  <script src="script.js"></script>
+  <script>
+  (function(){
+    let summary = '';
+    try {
+      summary = sessionStorage.getItem('anyaicamSupportSummary') ||
+                localStorage.getItem('anyaicamSupportSummaryBackup') || '';
+    } catch (e) {}
+    let ticketId = '';
+    try { ticketId = sessionStorage.getItem('anyaicamSupportTicketId') || localStorage.getItem('anyaicamSupportTicketIdBackup') || ''; } catch (e) {}
+    const box = document.getElementById('summaryBox');
+    const status = document.getElementById('statusBox');
+    box.textContent = summary || 'No diagnostic summary was found. Please run the diagnostic again.';
+
+    function compact(value, max) {
+      value = String(value || '');
+      return value.length > max ? value.slice(0, max - 3) + '...' : value;
+    }
+
+    function parseLine(label) {
+      const line = summary.split('\n').find(function(row){ return row.indexOf(label + ': ') === 0; });
+      return line ? line.slice(label.length + 2) : 'Not provided';
+    }
+
+    function openWithSummary() {
+      if (!window.LiveChatWidget) {
+        status.innerHTML = '<strong>LiveChat is still loading.</strong><br>Please wait a moment and click Open LiveChat again.';
+        return;
+      }
+
+      try {
+        LiveChatWidget.call('set_session_variables', {
+          'Support source': 'Automated diagnostic',
+          'Support ticket': ticketId || 'Not assigned',
+          'Issue': compact(parseLine('Issue'), 180),
+          'System': compact(parseLine('System'), 180),
+          'Credentials': compact(parseLine('Credentials'), 180),
+          'Brand': compact(parseLine('Brand'), 120),
+          'Model': compact(parseLine('Model'), 120),
+          'Camera count': compact(parseLine('Camera count'), 50),
+          'Diagnostic summary': compact(summary, 1800)
+        });
+
+        LiveChatWidget.call('maximize', {
+          messageDraft: summary ?
+            'Hello, I completed the ANY AI CAM automated diagnostic.' + (ticketId ? '\nSupport Ticket: ' + ticketId : '') + '\n\n' + summary :
+            'Hello, I need technical support with my camera system.'
+        });
+
+        status.innerHTML = '<strong>LiveChat is ready.</strong><br>Your diagnostic is attached to the session and prefilled in the message box. Review it and press Send.';
+      } catch (e) {
+        status.innerHTML = '<strong>The chat opened, but the summary may need to be copied manually.</strong>';
+      }
+    }
+
+    document.getElementById('openChat').addEventListener('click', openWithSummary);
+    document.getElementById('copySummary').addEventListener('click', async function(){
+      try {
+        await navigator.clipboard.writeText(summary);
+        this.textContent = 'Copied';
+      } catch (e) {
+        this.textContent = 'Select and copy above';
+      }
+    });
+
+    if (window.LiveChatWidget) {
+      LiveChatWidget.on('ready', function(){ setTimeout(openWithSummary, 250); });
+    }
+  })();
+  </script>
+
+<footer class="site-footer" id="about">
+        <div>
+            <a class="brand footer-brand" href="index.html#home" aria-label="ANY AI CAM home">
+                <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+            </a>
+            <p>Cloud camera activation and onboarding support for compatible existing camera systems.</p>
+            <p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">&copy; 2026 ANY AI CAM. All rights reserved.</p>
+        </div>
+        <div>
+            <h3>Service</h3>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="index.html#services">Cloud Account Setup</a>
+            <a href="index.html#pricing">Pricing Calculator</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="/camera-compatibility-check.html">Camera Check</a>
+            <a href="adapters.html">Adapter Options</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+            
+            <a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+            <a href="partner.html">Partner Login</a>
+            <a href="support.html">Live Tech Support</a>
+        </div>
+        <div>
+            <h3>Contact &amp; Policies</h3>
+            <a href="contact.html">Contact Us</a>
+            <a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a>
+            <a href="tel:+18325108240">(832) 510-8240</a>
+            <a href="privacy-policy.html">Privacy Policy</a>
+            <a href="terms.html">Terms of Service</a>
+            <a href="shipping-returns.html">Shipping &amp; Returns</a>
+            <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        </div>
+    </footer>
+</body>
+</html>

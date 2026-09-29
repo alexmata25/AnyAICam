@@ -1,0 +1,14 @@
+User-agent: *
+Allow: /
+
+Disallow: /partner.html
+Disallow: /cloud-checkout.html
+Disallow: /adapter-payment.html
+Disallow: /thank-you.html
+Disallow: /404.html
+Disallow: /api.php
+Disallow: /stripe-webhook.php
+Disallow: /welcome-email.php
+Disallow: /shipping-email.php
+
+Sitemap: https://anyaicam.com/sitemap.xml
