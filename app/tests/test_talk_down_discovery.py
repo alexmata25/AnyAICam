@@ -410,3 +410,17 @@ def test_camera_credentials_falls_back_to_legacy_env_vars_when_not_provisioned(t
         initialize_database()
         result = discovery._camera_credentials(3)
     assert result == ("10.0.0.3", "admin", "legacy-pass")
+
+
+def test_discovery_is_on_by_default_with_an_explicit_opt_out(monkeypatch):
+    """A customer install needs no hidden flag: talkback is detected by
+    default so the Talk control can appear; =false still opts out."""
+    import importlib
+    for value, expected in ((None, True), ("true", True), ("false", False), ("FALSE", False)):
+        if value is None:
+            monkeypatch.delenv("ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED", value)
+        assert importlib.reload(discovery).TALK_DOWN_DISCOVERY_ENABLED is expected
+    monkeypatch.delenv("ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED", raising=False)
+    importlib.reload(discovery)

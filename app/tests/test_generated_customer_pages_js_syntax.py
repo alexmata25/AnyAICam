@@ -46,7 +46,36 @@ try:
 except ImportError:  # pragma: no cover - environment without the test-only JS parser
     esprima = None
 
-pytestmark = pytest.mark.skipif(esprima is None, reason="esprima not installed -- see requirements-test.txt")
+# Node (2026-09-29): esprima 4 stops at ES2017 and rejects `?.` / `??`,
+# which every current browser runs and these pages already use, so with
+# esprima installed this test failed on valid pages. `node --check` parses
+# exactly what a modern engine accepts; esprima remains the fallback.
+import shutil
+from pathlib import Path
+import subprocess
+import tempfile
+
+NODE = shutil.which("node")
+
+pytestmark = pytest.mark.skipif(esprima is None and NODE is None,
+                                reason="needs node or esprima -- see requirements-test.txt")
+
+
+def _syntax_error(script: str) -> str | None:
+    if NODE:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            done = subprocess.run([NODE, "--check", path], capture_output=True, text=True, timeout=60)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        return None if done.returncode == 0 else (done.stderr or done.stdout).strip()[:800]
+    try:
+        esprima.parseScript(script)
+    except Exception as error:  # esprima.Error and subclasses
+        return str(error)
+    return None
 
 _SCRIPT_BLOCK = re.compile(r"<script\b(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.DOTALL | re.IGNORECASE)
 
@@ -63,16 +92,15 @@ def _assert_all_scripts_parse(html: str, page_label: str) -> None:
     scripts = _extract_inline_scripts(html)
     assert scripts, f"{page_label}: expected at least one inline <script> block, found none"
     for index, script in enumerate(scripts):
-        try:
-            esprima.parseScript(script)
-        except Exception as error:  # esprima.Error and subclasses
+        error = _syntax_error(script)
+        if error:
             raise AssertionError(
                 f"{page_label}: inline <script> block #{index} is not valid JavaScript -- "
                 f"a browser would fail with a SyntaxError and the entire block (including "
                 f"unrelated handlers in the same tag) would silently stop working.\n"
                 f"Parser error: {error}\n"
                 f"Script (first 2000 chars):\n{script[:2000]}"
-            ) from error
+            )
 
 
 @pytest.fixture()

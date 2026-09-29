@@ -142,10 +142,11 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
             else:
                 base=customer_reset_url() if user['role'] in CUSTOMER_RESET_ROLES else settings.password_reset_url
                 link=base+'?token='+raw
-            message=get_email_service().send('password_reset',email,'Reset your AnyAiCam password',f'Use this one-hour password reset link:\n{link}',metadata={'expires_minutes':60})
+            import email_layout; subject,text,html_body=email_layout.password_reset_email(link)
+            message=get_email_service().send('password_reset',email,subject,text,html=html_body,metadata={'expires_minutes':60})
             with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',email,message['status'],settings.email_backend,json.dumps(email_error_fields(message)|{'expires_minutes':60}),datetime.now().isoformat()))
             audit({'email':email,'role':'account'},'password_reset.requested','partner_user',user['id'],{'provider':settings.email_backend})
-        return {'message':'If the account exists, a password-reset message has been prepared.'}
+        return {'message':'If an account exists for that email, we sent a link to reset your password. It expires in one hour.'}
 
     @app.post('/api/partner/customers/{customer_id}/accounts/{user_id}/unlock')
     def unlock_customer_account(request: Request,customer_id: str,user_id: str):
@@ -200,7 +201,8 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         else:
             # Always a customer account here (see the role filter above).
             link=customer_reset_url()+'?token='+raw
-        message=get_email_service().send('password_reset',user['email'],'Reset your AnyAiCam password',f'An administrator started a password reset for your account. Use this one-hour link to set a new password:\n{link}',metadata={'expires_minutes':60,'initiated_by':'admin'})
+        import email_layout; subject,text,html_body=email_layout.password_reset_email(link,initiated_by_admin=True)
+        message=get_email_service().send('password_reset',user['email'],subject,text,html=html_body,metadata={'expires_minutes':60,'initiated_by':'admin'})
         with connection() as db: db.execute('INSERT INTO email_messages(id,message_type,recipient,status,provider,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',(message.get('id',datetime.now().strftime('%Y%m%d%H%M%S%f')),'password_reset',user['email'],message['status'],settings.email_backend,json.dumps(email_error_fields(message)|{'expires_minutes':60,'initiated_by':'admin'}),datetime.now().isoformat()))
         audit(identity,'customer_account.password_reset_initiated','partner_user',user_id,{'customer_id':customer_id,'provider':settings.email_backend})
         return {'message':'Password-reset message sent to the account on file. The customer\'s current password remains unchanged until they complete the reset.'}
@@ -283,7 +285,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         # fleet's camera counts) and developer-only copy about an
         # email-preview folder. It is now a standalone page in the same
         # style as its customer twin below, and reports the result in place.
-        return HTMLResponse(_portal_auth_page('Forgot password', '<h2>Forgot your password?</h2><p>Enter the email for your administrator, partner or technician account. If it exists, we\'ll email a reset link that works for one hour.</p><form id="forgot-form"><label>Account email<input id="forgot-email" type="email" autocomplete="username" required></label><div id="message" class="message" role="status"></div><button class="submit">Send reset link</button></form>', "document.getElementById('forgot-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/request',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({email:document.getElementById('forgot-email').value})}),r=await response.json().catch(()=>({}));say(response.ok?(r.message||'If the account exists, a password-reset message has been prepared.'):(r.detail||'Request failed. Please try again.'),response.ok)});"), headers={'Cache-Control': 'no-cache'})
+        return HTMLResponse(_portal_auth_page('Forgot password', '<h2>Forgot your password?</h2><p>Enter the email for your administrator, partner or technician account. If it exists, we\'ll email a reset link that works for one hour.</p><form id="forgot-form"><label>Account email<input id="forgot-email" type="email" autocomplete="username" required></label><div id="message" class="message" role="status"></div><button class="submit">Send reset link</button></form>', "document.getElementById('forgot-form').addEventListener('submit',async e=>{e.preventDefault();const response=await fetch('/api/password-reset/request',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf()},body:JSON.stringify({email:document.getElementById('forgot-email').value})}),r=await response.json().catch(()=>({}));say(response.ok?(r.message||'If an account exists for that email, we sent a link to reset your password. It expires in one hour.'):(r.detail||'Request failed. Please try again.'),response.ok)});"), headers={'Cache-Control': 'no-cache'})
 
     @app.post('/api/password-reset/complete')
     def password_reset_complete(payload: dict,request: Request):
@@ -360,7 +362,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
         return HTMLResponse(f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Forgot password | ANY AI CAM</title><style>{_CUSTOMER_AUTH_STYLE}</style></head><body>
 <header class="head"><a class="brand" href="/customer-login.html"><img src="/static/brand-icon.png" alt="AnyAiCam">ANY AI CAM</a></header>
 <main class="auth-wrap"><section class="card"><h2>Forgot your password?</h2><p>Enter the email on your customer account and we'll prepare a reset link.</p><form id="forgot-form"><label>Email<input id="forgot-email" type="email" autocomplete="username" required></label><div id="message" class="message"></div><button class="submit">Send reset link</button></form><a class="back-link" href="/customer-login.html">Back to customer sign in</a></section></main>
-<script>const csrf=()=>{{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v}};document.getElementById('forgot-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/request',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':csrf()}},body:JSON.stringify({{email:document.getElementById('forgot-email').value}})}}),r=await response.json().catch(()=>({{}})),box=document.getElementById('message');box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed. Please try again.');box.style.display='block'}});</script>
+<script>const csrf=()=>{{const m=document.cookie.split('; ').find(x=>x.startsWith('anyaicam_csrf='));if(!m)return '';let v=decodeURIComponent(m.split('=').slice(1).join('='));return v.length>=2&&v[0]==='"'&&v[v.length-1]==='"'?v.slice(1,-1):v}};document.getElementById('forgot-form').addEventListener('submit',async e=>{{e.preventDefault();const response=await fetch('/api/password-reset/request',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':csrf()}},body:JSON.stringify({{email:document.getElementById('forgot-email').value}})}}),r=await response.json().catch(()=>({{}})),box=document.getElementById('message');box.textContent=response.ok?(r.message||'If an account exists for that email, we sent a link to reset your password. It expires in one hour.'):(r.detail||'Request failed. Please try again.');box.style.display='block'}});</script>
 </body></html>''')
 
     @app.get('/customer-reset-password',response_class=HTMLResponse)

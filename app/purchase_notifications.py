@@ -70,6 +70,8 @@ produces a real outcome for that event.
 """
 from __future__ import annotations
 
+import os
+
 import contextvars
 
 import stripe_mode
@@ -119,7 +121,9 @@ def _first_name(full_name: Optional[str]) -> str:
     first space, or the whole name if there's no space, or a generic
     greeting if there's nothing usable at all. Never raises, never
     invents a name that wasn't there."""
-    name = (full_name or "").strip()
+    # Names come from checkout and are placed into HTML emails: characters
+    # that could form markup are dropped (2026-09-29).
+    name = "".join(ch for ch in (full_name or "") if ch not in "<>&\"'").strip()
     if not name:
         return "there"
     return name.split(" ", 1)[0]
@@ -208,6 +212,9 @@ def _send_once(
     if existing and existing["status"] == "sent":
         return {"status": "skipped", "reason": "already sent", "notification_id": existing["id"]}
 
+    if html:
+        import email_layout
+        html = email_layout.wrap(html, preheader=subject)
     tracking = _record_attempt(
         event_id=event_id, notification_type=notification_type, customer_id=customer_id,
         recipient_email=recipient_email, subject=subject,
@@ -231,7 +238,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"Your AnyAiCam purchase is confirmed and your service is ready.\n\n"
         f"Plan: {plan_label}\n"
         f"Camera capacity: {camera_slot_maximum}\n\n"
-        f"Sign in and connect/claim your AnyAiCam VMS or appliance: {_sign_in_link()}\n\n"
+        f"Sign in to set up your AnyAiCam appliance and cameras: {_sign_in_link()}\n\n"
         f"If you need help getting started, our support team is here for you.\n\n"
         f"— The AnyAiCam Team"
     )
@@ -239,7 +246,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"<p>Hi {first_name},</p>"
         f"<p>Your AnyAiCam purchase is confirmed and your service is ready.</p>"
         f"<p><strong>Plan:</strong> {plan_label}<br><strong>Camera capacity:</strong> {camera_slot_maximum}</p>"
-        f'<p>Sign in and connect/claim your AnyAiCam VMS or appliance: '
+        f'<p>Sign in to set up your AnyAiCam appliance and cameras: '
         f'<a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
         f"<p>If you need help getting started, our support team is here for you.</p>"
         f"<p>— The AnyAiCam Team</p>"
@@ -303,12 +310,16 @@ def _plan_cancelled_email(first_name: str, plan_label: str) -> tuple[str, str, s
 
 SUPPORT_EMAIL = "amata@anyaicam.com"
 SUPPORT_LINK = "https://anyaicam.com/support.html"
-# Staging draft URLs -- these pages are NOT published live yet (see
-# website-pricing-review/staging/policies/); update once the real,
-# reviewed policy pages are published.
-SHIPPING_POLICY_LINK = "https://anyaicam.com/shipping-policy.html"
-RETURN_REFUND_POLICY_LINK = "https://anyaicam.com/hardware-return-refund-policy.html"
-CANCELLATION_POLICY_LINK = "https://anyaicam.com/cancellation-policy.html"
+# The dedicated policy pages (shipping-policy / hardware-return-refund-
+# policy / cancellation-policy.html) were never published, so these links
+# returned 404 in real order emails (checked live 2026-09-29). The live
+# "Shipping, Returns & Refunds" page covers shipping, returns, refunds and
+# cancellations; each link can be pointed at a dedicated page once one is
+# published, without a code change.
+_LIVE_POLICY_PAGE = "https://anyaicam.com/shipping-returns.html"
+SHIPPING_POLICY_LINK = os.environ.get("ANYAICAM_SHIPPING_POLICY_URL", _LIVE_POLICY_PAGE)
+RETURN_REFUND_POLICY_LINK = os.environ.get("ANYAICAM_RETURN_REFUND_POLICY_URL", _LIVE_POLICY_PAGE)
+CANCELLATION_POLICY_LINK = os.environ.get("ANYAICAM_CANCELLATION_POLICY_URL", _LIVE_POLICY_PAGE)
 
 _SUPPORT_FOOTER_TEXT = f"Questions? Contact us at {SUPPORT_EMAIL} or visit {SUPPORT_LINK}.\n\n— The AnyAiCam Team"
 _SUPPORT_FOOTER_HTML = f'<p>Questions? Contact us at <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> or visit <a href="{SUPPORT_LINK}">{SUPPORT_LINK}</a>.</p><p>— The AnyAiCam Team</p>'

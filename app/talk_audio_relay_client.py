@@ -89,6 +89,10 @@ _sessions: dict[str, dict] = {}  # session_id -> {"process": Popen, "transport":
 # open, or {"type": "error", "reason": ...} when it could not be, so the
 # customer sees why talk failed instead of speaking into nothing.
 # Reason keys match talk_audio_relay.TALK_ERROR_MESSAGES on the cloud.
+# Set by the worker for its current connection: re-fetches the camera map
+# (camera_id -> camera_number) so a camera the customer added after the
+# channel connected can Talk without waiting for a reconnect.
+_camera_map_refresher = None
 _last_start_error: dict[str, str] = {}  # session_id -> reason its start failed
 
 # A camera that rejects its login (RTSP 401/403) is not contacted again
@@ -397,6 +401,11 @@ async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=No
         if not isinstance(camera_id, str):
             return
         was_running = session_id in _sessions
+        if _camera_number_for(camera_id, camera_map) is None and _camera_map_refresher is not None:
+            fresh = await asyncio.to_thread(_camera_map_refresher)
+            if fresh:
+                camera_map.clear()
+                camera_map.update(fresh)
         # Off the event loop: connect() is a blocking RTSP exchange (up
         # to its own socket timeout), and it must not stall the channel
         # for every other session on this appliance meanwhile.
@@ -454,6 +463,8 @@ async def talk_audio_relay_client_worker() -> None:
             # slightly-stale map only matters for the rare case of a
             # camera added mid-connection.
             camera_map = await asyncio.to_thread(_fetch_camera_map, appliance_id, credential)
+            global _camera_map_refresher
+            _camera_map_refresher = lambda: _fetch_camera_map(appliance_id, credential)
 
             async with websockets.connect(channel_url, additional_headers=_control_plane_headers(appliance_id, credential)) as connection:
                 talk_audio_relay_state["channel_status"] = "connected"

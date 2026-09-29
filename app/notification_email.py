@@ -39,9 +39,19 @@ MEDIA_EVENT_TYPES = frozenset({"person", "vehicle", "smart_motion", "motion", "p
 MEDIA_WAIT_SECONDS = max(0, int(os.environ.get("ANYAICAM_ALERT_EMAIL_MEDIA_WAIT_SECONDS", "180")))
 THUMBNAIL_CID = "event-thumbnail"
 DEFAULT_DISPLAY_TIMEZONE = "America/Chicago"  # main.APPLIANCE_TIMEZONE
-# The customer's own alert settings page (/notifications is the admin
-# page and turns a customer away).
-MANAGE_ALERTS_PATH = "/customer-app-settings"
+# The customer's own alert email settings (/notifications is the admin
+# page and turns a customer away). /settings/notifications is the page that
+# actually holds email on/off, event types, cameras and quiet hours, and it
+# shows a sign-in prompt to a signed-out reader (2026-09-29).
+MANAGE_ALERTS_PATH = "/settings/notifications"
+
+# Alert categories (2026-09-29): the email's look and subject follow what
+# the alert means. An intrusion alarm is urgent and visibly distinct; a
+# visitor call asks to be answered now; a system problem needs attention;
+# ordinary camera activity is calm and never looks like an emergency.
+ALARM_EVENT_TYPES = frozenset({"intrusion_alarm"})
+CALL_EVENT_TYPES = frozenset({"aac_voice_call"})
+PROBLEM_EVENT_TYPES = frozenset({"camera_offline", "appliance_offline", "recording_stopped", "low_disk", "storage_problem", "high_cpu"})
 
 
 def waits_for_media(event_type: str, event_id: str | None) -> bool:
@@ -145,18 +155,71 @@ def thumbnail_bytes(context: dict) -> bytes | None:
         return None
 
 
+def _short_time(timestamp: str | None, tz=None) -> str:
+    """'1:57 PM' -- the subject line's compact time (the body has the date)."""
+    if not timestamp:
+        return ""
+    try:
+        moment = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    local = moment.astimezone(tz or _display_timezone())
+    return f"{local.strftime('%I').lstrip('0') or '12'}:{local.strftime('%M %p')}"
+
+
+def _category(event_type: str) -> str:
+    if event_type in ALARM_EVENT_TYPES:
+        return "alarm"
+    if event_type in CALL_EVENT_TYPES:
+        return "call"
+    if event_type in PROBLEM_EVENT_TYPES:
+        return "problem"
+    return "activity"
+
+
+def _headline(context: dict, category: str, camera: str) -> str:
+    """The one sentence a customer reads first (email heading and the
+    basis of the subject)."""
+    event_type = str(context.get("event_type") or "")
+    title = str(context.get("title") or "").strip()
+    if category == "alarm":
+        return "INTRUSION ALARM"
+    if category == "call":
+        return f"Someone is at {camera}" if camera else "Someone is at your door"
+    try:
+        from customer_analytics_panel import event_type_label, event_type_message
+    except Exception:
+        event_type_label = lambda value: title or "Camera alert"  # noqa: E731
+        event_type_message = lambda value: title or "Camera alert"  # noqa: E731
+    if category == "problem":
+        return event_type_label(event_type) if event_type else (title or "Needs attention")
+    if event_type == "facial_recognition" and str(context.get("message") or "").strip():
+        return str(context.get("message")).strip().rstrip(".")
+    if event_type:
+        return event_type_message(event_type)
+    return title or "Camera alert"
+
+
 def build_alert_email(context: dict, *, image: bytes | None = None, base_url: str | None = None, tz=None) -> dict:
     """{'subject', 'text', 'html', 'images'} for one alert."""
     base = public_base_url() if base_url is None else base_url
-    title = str(context.get("title") or "Camera alert")
+    event_type = str(context.get("event_type") or "")
+    category = _category(event_type)
     camera = str(context.get("camera_name") or "").strip()
-    when = local_time_label(context.get("timestamp") or context.get("created_at"), tz)
+    stamp = context.get("timestamp") or context.get("created_at")
+    when = local_time_label(stamp, tz)
+    short = _short_time(stamp, tz)
     message = str(context.get("message") or "").strip()
+    headline = _headline(context, category, camera)
+    if message.rstrip(".").lower() == headline.lower():
+        message = ""  # it only restates the heading
     path = event_path(context)
     link = base + path
     if path.startswith("/aac/voice-call/"):
         button = "Open the visitor call"
-    elif context.get("event_type") == "intrusion_alarm":
+    elif category == "alarm":
         button = "Open live camera"
     elif path.startswith(("/playback", "/events")):
         button = "View event video"
@@ -164,43 +227,82 @@ def build_alert_email(context: dict, *, image: bytes | None = None, base_url: st
         button = "View camera"
     else:
         button = "Open AnyAiCam"
-    subject = " · ".join(part for part in (title, camera, when) if part)
 
-    lines = [title]
-    if camera:
+    where = f" at {camera}" if camera and camera.lower() not in headline.lower() else ""
+    if category == "alarm":
+        subject = f"INTRUSION ALARM{where}" + (f" · {short}" if short else "")
+    elif category == "call":
+        subject = f"{headline} — answer the call"
+    elif category == "problem":
+        subject = f"{headline}: {camera}" if camera else headline
+        subject += f" · {short}" if short else ""
+    else:
+        subject = f"{headline}{where}" + (f" · {short}" if short else "")
+
+    preheader = {
+        "alarm": f"A protected area was entered{where}. Check the live camera now.",
+        "call": "Tap to see and talk to your visitor.",
+        "problem": "Your AnyAiCam system needs attention.",
+    }.get(category, f"{headline}{where}" + (f" on {when}" if when else "") + ".")
+
+    lines = [headline]
+    if category == "alarm" and camera:
+        lines.append(f"Camera: {camera}")
+    elif camera:
         lines.append(f"Camera: {camera}")
     if when:
         lines.append(f"Time: {when}")
-    if message and message != title:
+    if message and message not in (headline, context.get("title")):
         lines.append("")
         lines.append(message)
-    alarm = context.get("event_type") == "intrusion_alarm"
     lines += ["", f"{button}: {link}"]
-    if alarm:
+    if category == "alarm":
         # One tap to the phone dialer; AnyAiCam never calls 911 itself.
         lines += ["Emergency? Call 911: tel:911"]
     lines += ["", f"Manage alert emails: {base}{MANAGE_ALERTS_PATH}"]
     text = "\n".join(lines)
 
     esc = html.escape
+    accent = {"alarm": "#b42318", "call": "#0e7c7b", "problem": "#b54708"}.get(category, "#0e7c7b")
+    banner = {
+        "alarm": ('<div style="background:#b42318;color:#ffffff;font-weight:bold;font-size:18px;letter-spacing:.5px;'
+                  'padding:12px 16px;border-radius:8px;margin:0 0 14px">INTRUSION ALARM</div>'),
+        "call": ('<div style="background:#e6f4f3;color:#0b5f5e;font-weight:bold;padding:10px 14px;border-radius:8px;'
+                 'margin:0 0 14px">Visitor at your door — answer now</div>'),
+        "problem": ('<div style="background:#fef0c7;color:#93370d;font-weight:bold;padding:10px 14px;border-radius:8px;'
+                    'margin:0 0 14px">Needs your attention</div>'),
+    }.get(category, "")
+    heading = "" if category == "alarm" and not camera else (
+        f'<h2 style="margin:0 0 8px;font-size:20px;color:{accent if category == "alarm" else "#101828"}">'
+        f'{esc(camera if category == "alarm" else headline)}</h2>')
     details = "".join(
         f'<tr><td style="color:#667085;padding:2px 12px 2px 0">{esc(label)}</td><td style="color:#101828"><strong>{esc(value)}</strong></td></tr>'
         for label, value in (("Camera", camera), ("Time", when)) if value
     )
     image_html = (f'<img src="cid:{THUMBNAIL_CID}" alt="Event snapshot from {esc(camera or "the camera")}" '
-                  f'style="display:block;width:100%;max-width:560px;border-radius:8px;margin:12px 0">') if image else ""
-    message_html = f'<p style="color:#344054;margin:12px 0">{esc(message)}</p>' if message and message != title else ""
+                  f'style="display:block;width:100%;max-width:560px;height:auto;border-radius:8px;margin:12px 0">') if image else ""
+    message_html = (f'<p style="color:#344054;margin:12px 0">{esc(message)}</p>'
+                    if message and message not in (headline, context.get("title")) else "")
+    button_html = (
+        f'<a href="{esc(link, quote=True)}" style="background:{accent};color:#ffffff;padding:12px 18px;border-radius:6px;'
+        f'text-decoration:none;display:inline-block;font-weight:bold;margin:0 8px 8px 0">{esc(button)}</a>'
+        + ('<a href="tel:911" style="background:#ffffff;color:#b42318;border:2px solid #b42318;padding:10px 16px;border-radius:6px;'
+           'text-decoration:none;display:inline-block;font-weight:bold;margin:0 8px 8px 0">Call 911</a>' if category == "alarm" else '')
+    )
     html_body = (
-        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;padding:16px">'
-        f'<h2 style="margin:0 0 8px;color:{"#b42318" if alarm else "#101828"}">{esc(title)}</h2>'
+        '<div style="background:#f2f4f7;padding:16px 8px">'
+        f'<div style="display:none;max-height:0;overflow:hidden;opacity:0">{esc(preheader)}</div>'
+        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;background:#ffffff;'
+        'border-radius:10px;padding:20px 18px">'
+        '<div style="font-weight:bold;font-size:15px;color:#0e7c7b;letter-spacing:.3px;margin:0 0 14px">AnyAiCam</div>'
+        f"{banner}{heading}"
         f'<table style="border-collapse:collapse;font-size:14px">{details}</table>'
         f"{image_html}{message_html}"
-        f'<p style="margin:16px 0"><a href="{esc(link, quote=True)}" style="background:#0e7c7b;color:#ffffff;padding:10px 16px;'
-        f'border-radius:6px;text-decoration:none;display:inline-block">{esc(button)}</a>'
-        + ('<a href="tel:911" style="background:#b42318;color:#ffffff;padding:10px 16px;border-radius:6px;text-decoration:none;'
-           'display:inline-block;margin-left:8px">Call 911</a>' if alarm else '')
-        + '</p>'
-        f'<p style="color:#667085;font-size:12px">AnyAiCam alert. <a href="{esc(base + MANAGE_ALERTS_PATH, quote=True)}" style="color:#667085">Manage alert emails</a></p>'
+        f'<p style="margin:16px 0 4px">{button_html}</p>'
+        '</div>'
+        '<p style="font-family:Arial,Helvetica,sans-serif;color:#667085;font-size:12px;text-align:center;max-width:600px;'
+        'margin:12px auto 0;line-height:1.5">You are receiving this because alert emails are on for your AnyAiCam account.<br>'
+        f'<a href="{esc(base + MANAGE_ALERTS_PATH, quote=True)}" style="color:#667085">Manage alert emails</a></p>'
         "</div>"
     )
     images = [(THUMBNAIL_CID, image)] if image else []

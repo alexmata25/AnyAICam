@@ -421,3 +421,37 @@ def test_aaco_after_real_customer_login_reaches_the_workspace_not_the_login_page
     assert workspace.status_code == 200
     assert "Local emergency recovery sign-in" not in workspace.text
     assert "AACO" in workspace.text
+
+
+# ---------------------------------------------------------------- portal home (2026-09-29)
+
+def test_cloud_portal_home_sends_a_signed_out_visitor_to_customer_sign_in(http_client, monkeypatch):
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    response = http_client.get("/", follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/customer-login.html"
+
+
+def test_edge_home_still_uses_the_local_recovery_sign_in(http_client, monkeypatch):
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
+    response = http_client.get("/", follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"].startswith("/login")
+
+
+def test_recovery_login_itself_stays_reachable_on_the_cloud(http_client, monkeypatch):
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
+    assert http_client.get("/login", follow_redirects=False).status_code == 200
+
+
+def test_customer_sign_in_page_links_to_real_support_signup_and_legal_pages():
+    from pathlib import Path
+    html = (Path(main.__file__).parent / "customer-login.html").read_text(encoding="utf-8")
+    assert 'href="/support"' not in html  # /support is not a portal page
+    for link in ("https://anyaicam.com/vms-support.html", 'href="/customer-register"',
+                 "https://anyaicam.com/terms.html", "https://anyaicam.com/privacy-policy.html"):
+        assert link in html
+
+
+def test_registration_page_states_terms_and_plain_language_approval(http_client):
+    html = http_client.get("/customer-register").text
+    assert "Terms of Service" in html and "Privacy Policy" in html and "At least 10 characters." in html
+    assert "master administrator" not in html

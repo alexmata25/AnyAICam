@@ -53,7 +53,7 @@ def set_entrance_camera(*, customer_id: str, camera_id: str, enabled: bool, conf
 
 def list_entrance_cameras(customer_id: str) -> list[dict]:
     return rows(
-        "SELECT camera_id,enabled,configured_at,configured_by,greeting_text FROM aac_voice_call_entrance_cameras WHERE customer_id=? ORDER BY configured_at",
+        "SELECT camera_id,enabled,configured_at,configured_by,greeting_text,greeting_volume FROM aac_voice_call_entrance_cameras WHERE customer_id=? ORDER BY configured_at",
         (customer_id,),
     )
 
@@ -80,6 +80,42 @@ def set_camera_greeting_text(*, customer_id: str, camera_id: str, greeting_text:
             (greeting_text, now, configured_by, camera_id, customer_id),
         )
     audit(configured_by and {"email": configured_by} or {}, "aac_voice_call.camera_greeting_set", "camera", camera_id, {"greeting_text": greeting_text})
+
+
+GREETING_VOLUMES = ("low", "medium", "high")
+DEFAULT_GREETING_VOLUME = "medium"
+
+
+def normalize_greeting_volume(value) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in GREETING_VOLUMES else None
+
+
+def set_camera_greeting_volume(*, customer_id: str, camera_id: str, volume: str, configured_by: str | None = None) -> None:
+    """Greeting-only loudness for one enrolled entrance camera (never the
+    camera speaker, homeowner Talk, microphone or recording levels). Same
+    enrolled-only UPDATE discipline as set_camera_greeting_text()."""
+    level = normalize_greeting_volume(volume)
+    if level is None:
+        raise ValueError("greeting volume must be low, medium or high")
+    now = datetime.now().isoformat()
+    with connection() as db:
+        db.execute(
+            "UPDATE aac_voice_call_entrance_cameras SET greeting_volume=?,configured_at=?,configured_by=? WHERE camera_id=? AND customer_id=?",
+            (level, now, configured_by, camera_id, customer_id),
+        )
+    audit(configured_by and {"email": configured_by} or {}, "aac_voice_call.camera_greeting_volume_set", "camera", camera_id, {"greeting_volume": level})
+
+
+def resolve_greeting_volume(*, customer_id: str, camera_id: str) -> str:
+    try:
+        record = row(
+            "SELECT greeting_volume FROM aac_voice_call_entrance_cameras WHERE camera_id=? AND customer_id=?",
+            (camera_id, customer_id),
+        )
+    except Exception:
+        return DEFAULT_GREETING_VOLUME  # a database from before the column existed
+    return normalize_greeting_volume(record and record["greeting_volume"]) or DEFAULT_GREETING_VOLUME
 
 
 def set_site_default_greeting(*, customer_id: str, site_id: str, greeting_text: str, configured_by: str | None = None) -> None:

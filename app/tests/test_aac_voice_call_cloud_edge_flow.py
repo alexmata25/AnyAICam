@@ -194,7 +194,7 @@ def test_configuration_delivers_only_this_appliances_enabled_entrance_cameras_an
 
     assert response.status_code == 200
     config = response.json()["aac_voice_call"]
-    assert config["entrance_cameras"] == [{"camera_id": "cam-1", "greeting_text": "Hi from the front door"}]
+    assert config["entrance_cameras"] == [{"camera_id": "cam-1", "greeting_text": "Hi from the front door", "greeting_volume": None}]
     assert config["site_greetings"] == [{"site_id": "site-1", "greeting_text": "Welcome home"}]
 
 

@@ -98,7 +98,7 @@ from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import aac_voice_call_door
 import aac_voice_call_events as store
@@ -390,6 +390,7 @@ def handle_person_detected(
         provider = greeting_provider or aac_voice_call_greeting.get_provider()
         greeting_result = provider.speak(aac_voice_call_greeting.GreetingRequest(
             camera_id=camera_id, customer_id=customer_id, event_id=event_id, text=greeting_text,
+            volume=store.resolve_greeting_volume(customer_id=customer_id, camera_id=camera_id),
         ))
         # Only stamped on a successful dispatch -- an exception here
         # means the greeting was never actually sent anywhere, and
@@ -495,6 +496,7 @@ def handle_edge_person_detected(
         provider = greeting_provider or aac_voice_call_greeting.get_provider()
         result = provider.speak(aac_voice_call_greeting.GreetingRequest(
             camera_id=camera_id, customer_id=customer_id, event_id=local_event_id, text=greeting_text,
+            volume=store.resolve_greeting_volume(customer_id=customer_id, camera_id=camera_id),
         ))
         greeting_delivered = bool(getattr(result, "delivered", False))
     except Exception as error:
@@ -768,11 +770,15 @@ class VisitorUtterancePayload(BaseModel):
 
 
 class CameraGreetingPayload(BaseModel):
-    greeting_text: str | None = None
+    greeting_text: str | None = Field(default=None, max_length=500)
+
+
+class GreetingVolumePayload(BaseModel):
+    volume: str
 
 
 class SiteGreetingPayload(BaseModel):
-    greeting_text: str
+    greeting_text: str = Field(min_length=1, max_length=500)
 
 
 class AnswerPayload(BaseModel):
@@ -813,6 +819,21 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         camera = _authorized_camera(identity["customer_id"], camera_id)
         store.set_camera_greeting_text(customer_id=identity["customer_id"], camera_id=camera["id"], greeting_text=payload.greeting_text, configured_by=identity.get("email"))
         return {"message": f"Greeting updated for {camera['name'] or camera_id}.", "camera_id": camera_id, "greeting_text": payload.greeting_text}
+
+    @app.post("/api/customer/aac/voice-call/entrance-cameras/{camera_id}/greeting-volume")
+    def set_camera_greeting_volume(request: Request, camera_id: str, payload: GreetingVolumePayload) -> dict:
+        """customer_owner-only. Greeting-only loudness (low/medium/high),
+        applied on the appliance to the greeting audio alone -- never the
+        camera speaker volume, homeowner Talk, microphone or recordings."""
+        identity = _customer_identity(request)
+        if identity["role"] != "customer_owner":
+            raise HTTPException(status_code=403, detail="Only the account owner can configure entrance camera greetings.")
+        camera = _authorized_camera(identity["customer_id"], camera_id)
+        level = store.normalize_greeting_volume(payload.volume)
+        if level is None:
+            raise HTTPException(status_code=422, detail="Greeting volume must be Low, Medium or High.")
+        store.set_camera_greeting_volume(customer_id=identity["customer_id"], camera_id=camera["id"], volume=level, configured_by=identity.get("email"))
+        return {"message": f"Greeting volume for {camera['name'] or camera_id} set to {level.title()}.", "camera_id": camera_id, "greeting_volume": level}
 
     @app.post("/api/customer/aac/voice-call/sites/{site_id}/greeting")
     def set_site_greeting(request: Request, site_id: str, payload: SiteGreetingPayload) -> dict:
@@ -953,6 +974,15 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         return aac_voice_call_door.confirm_unlock(
             event_id=event_id, customer_id=identity["customer_id"], identity=identity, confirm_token=payload.confirm_token,
         )
+
+    @app.get("/customer/voice-call-settings", response_class=HTMLResponse)
+    def voice_call_settings(request: Request) -> str:
+        """Settings -> Visitor Voice Call: entrance cameras, greeting text
+        and greeting volume (aac_voice_call_settings_page.py)."""
+        import aac_voice_call_settings_page
+        identity = _customer_identity(request)
+        content, scripts = aac_voice_call_settings_page.render_settings(identity)
+        return shell("Visitor Voice Call", "settings", content, scripts)
 
     @app.get("/aac/voice-call/{event_id}", response_class=HTMLResponse)
     def voice_call_screen(request: Request, event_id: str) -> str:

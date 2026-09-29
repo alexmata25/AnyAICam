@@ -42260,6 +42260,12 @@ async def authentication_middleware(request: Request, call_next):
         path == prefix or path.startswith(prefix + "/") for prefix in CLOUD_CUSTOMER_NAV_PATH_PREFIXES
     ):
         return RedirectResponse(f"/customer-login.html?next={next_url}", status_code=303)
+    # The cloud portal's home page (2026-09-29): a signed-out visitor to
+    # https://portal.../ (or the logo link on the sign-in page) was shown
+    # the appliance's "Local emergency recovery sign-in". Customers go to
+    # the customer sign-in; /login itself stays reachable for recovery.
+    if RUNTIME_ROLE == "cloud" and path == "/":
+        return RedirectResponse("/customer-login.html", status_code=303)
 
     # Partner-Portal equivalent of the customer branch above -- see
     # CLOUD_PARTNER_NAV_PATH_PREFIXES's own comment.
@@ -43364,7 +43370,7 @@ def customer_register_page_html(error: str = "", message: str = "") -> str:
 
 
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register" id="customer-register-form"><input type="hidden" name="csrf_token" value=""><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required></label><button class="action-button" type="submit">Submit customer account request</button></form><script>document.getElementById('customer-register-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-login.html">Already approved? Sign in</a></div><div class="auth-footer">Your request remains pending until the master administrator approves it. After approval, signing in sends you directly to your customer VMS portal.</div></section></main></body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create customer account · AnyAiCam</title><style>{STYLES}</style></head><body><main class="auth-page"><section class="auth-card"><img class="auth-logo" src="/static/brand-icon.png" alt="AnyAiCam"><h1>Create customer account</h1><p class="auth-subtitle">Request secure access to your ANY AI CAM customer portal.</p>{safe_error}{safe_message}<form class="auth-form" method="post" action="/customer-register" id="customer-register-form"><input type="hidden" name="csrf_token" value=""><label>Full name<input name="display_name" minlength="2" maxlength="120" required autofocus></label><label>Email<input name="email" type="email" autocomplete="email" required></label><label>Create password<input name="password" type="password" minlength="10" autocomplete="new-password" required aria-describedby="password-hint"></label><div class="health-detail" id="password-hint" style="margin-top:-6px">At least 10 characters.</div><button class="action-button" type="submit">Submit customer account request</button><div class="auth-footer" style="margin-top:4px">By creating an account you agree to the AnyAiCam <a href="https://anyaicam.com/terms.html" target="_blank" rel="noopener">Terms of Service</a> and <a href="https://anyaicam.com/privacy-policy.html" target="_blank" rel="noopener">Privacy Policy</a>.</div></form><script>document.getElementById('customer-register-form').addEventListener('submit',function(){{var match=document.cookie.match(/(?:^|; )anyaicam_csrf=([^;]*)/);if(match)this.csrf_token.value=decodeURIComponent(match[1]);}});</script><div style="margin-top:16px;text-align:center"><a class="compact-button" href="/customer-login.html">Already approved? Sign in</a></div><div class="auth-footer">AnyAiCam reviews new account requests. Once yours is approved, sign in to reach your cameras and alerts. Questions? <a href="https://anyaicam.com/vms-support.html" target="_blank" rel="noopener">Contact support</a>.</div></section></main></body></html>"""
 
 
 
@@ -48458,8 +48464,10 @@ from wireguard_remote import register_wireguard_remote_appliance_routes
 # branch (real Camera 2 hardware validation) and ported onto the
 # current dynamic camera-provisioning/encrypted-credential model; see
 # talk_audio_relay_client.py's and talk_down_discovery.py's own module
-# docstrings. Both workers are inert by default (ANYAICAM_TALK_AUDIO_
-# ENABLED / ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED default false).
+# docstrings. Both workers run by default on edge/combined runtimes
+# (2026-09-28/29: two-way audio is a standard capability); each has an
+# explicit opt-out: ANYAICAM_TALK_AUDIO_ENABLED=false /
+# ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED=false.
 import talk_down_discovery
 import talk_audio_relay_client
 from facial_recognition_ui import register_facial_recognition_routes
@@ -52213,12 +52221,20 @@ def _customer_camera_status(customer_cameras: list[dict]) -> dict:
             ).fetchone()
             online = bool(status_row["online"]) if status_row else False
             recording_running = bool(status_row["recording"]) if status_row else False
+            # Event mode (2026-09-29): the appliance reports recording only
+            # while a recent file exists, so an idle, healthy Event-mode
+            # camera read as "Recording problem: stopped". Online + Event
+            # mode is "armed" (waiting for activity), not a problem.
+            mode_row = db.execute("SELECT local_recording_mode FROM cameras WHERE id=?", (camera["id"],)).fetchone()
+            event_mode = bool(mode_row) and mode_row["local_recording_mode"] == "event"
+            recording_state = "running" if recording_running else ("armed" if online and event_mode else "stopped")
             cameras.append(
                 {
                     "camera": camera_number,
                     "online": online,
                     "stream": "online" if online else "offline",
-                    "recording": "running" if recording_running else "stopped",
+                    "recording": recording_state,
+                    "recording_mode": "event" if event_mode else "continuous",
                     "last_stream_update_seconds": None,
                     "reconnects": 0,
                     "last_exit_code": None,
@@ -74318,7 +74334,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-          if(String(camera.recording).toLowerCase()==='running')recordingCount++;
+          if(['running','armed'].includes(String(camera.recording).toLowerCase()))recordingCount++;
 
 
 
@@ -74399,7 +74415,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-            camera.recording,
+            camera.recording==='armed'?'event_armed':camera.recording,
 
 
 
@@ -74408,7 +74424,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-            ['running','online']
+            ['running','online','event_armed']
 
 
 
@@ -76283,11 +76299,11 @@ async function updateDashboard(){
             const card=document.getElementById(`dashboard-camera-${camera.camera}`);
             if(!state||!rec||!warning||!card)return;
             if(camera.online)onlineCount++;
-            const recordingOk=camera.recording==='running';
+            const recordingOk=camera.recording==='running'||camera.recording==='armed';
             state.textContent=camera.online?'Online':'Offline';
             state.classList.remove('checking');state.classList.toggle('offline',!camera.online);
             rec.dataset.mode=rec.dataset.mode||rec.textContent;
-            rec.textContent=`${rec.dataset.mode} · ${recordingOk?'recording':'recording '+camera.recording}`;
+            rec.textContent=`${rec.dataset.mode} · ${camera.recording==='armed'?'waiting for activity':(recordingOk?'recording':'recording '+camera.recording)}`;
             rec.classList.toggle('problem',!recordingOk);
             const problem=!camera.online?`Camera offline (stream ${camera.stream}).`:(!recordingOk?`Recording problem: ${camera.recording}.`:'');
             warning.textContent=problem;warning.hidden=!problem;
@@ -104118,7 +104134,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         upgrade_panel = (
             f'<div id="upgrade-to-hybrid" class="panel" style="margin-top:14px">'
             f'<h3 style="margin-top:0">Upgrade to Hybrid</h3>'
-            f'<p class="health-detail">Get cloud identity, remote access, event-media upload, analytics sync, notifications, and relay/P2P live view -- {escape(upgrade_tier["tier_label"])} cameras for ${upgrade_tier["monthly_retail_usd"]}/mo. Your cameras, recordings, and analytics settings all carry over.</p>'
+            f'<p class="health-detail">Watch live and review events from anywhere, get email and phone alerts, and keep event clips in the cloud: {escape(upgrade_tier["tier_label"])} cameras for ${upgrade_tier["monthly_retail_usd"]}/mo. Your cameras, recordings, and analytics settings all carry over.</p>'
             f'<button class="action-button" id="subscription-upgrade-button" data-tier-label="{escape(upgrade_tier["tier_label"],quote=True)}">Upgrade to Hybrid</button>'
             f'<p id="subscription-upgrade-message" class="health-detail"></p>'
             f'</div>'
@@ -104127,11 +104143,11 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
     <p>{plan_summary}</p>
-    <p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p>
+    <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
-    <div class="health-row"><span><strong>Local</strong> &middot; one-time purchase</span><span>Local recording, playback, live view, analytics, and licensing -- no required cloud dependency for normal operation.</span></div>
-    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything Local has, plus cloud identity/services, remote access, event-media upload, analytics sync, notifications, and relay/P2P live view.</span></div>
+    <div class="health-row"><span><strong>Local</strong> &middot; one-time purchase</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance at home. Keeps working without an internet connection.</span></div>
+    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
     </section>
     {upgrade_panel}
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
@@ -121871,6 +121887,7 @@ def _render_customer_alerts(request: Request) -> str:
     content, scripts = smart_alerts.render_inbox(
         groups, view=view, tz=APPLIANCE_TIMEZONE, alert_text=_customer_alert_text,
         clip_href=clip_href, talk_camera_ids=talk_camera_ids, counts=counts,
+        capped_at=500 if len(notifications_list) >= 500 else None,
     )
     return page_shell("Alerts", "alerts", content, scripts)
 
@@ -131451,7 +131468,7 @@ def sites() -> str:
 
 
 
-                            ? `Stream active · recording ${camera.recording}`
+                            ? `Stream active · ${camera.recording==='armed'?'Event recording · waiting for activity':'recording '+camera.recording}`
 
 
 

@@ -243,12 +243,15 @@ def _reconcile_aac_voice_call(db, appliance_id: str, cloud_config: dict, now: st
         if not camera:
             continue
         greeting_text = str(item.get("greeting_text") or "").strip() or None
+        greeting_volume = str(item.get("greeting_volume") or "").strip().lower()
+        greeting_volume = greeting_volume if greeting_volume in ("low", "medium", "high") else None
         wanted_cameras.add(camera_id)
         db.execute(
-            "INSERT INTO aac_voice_call_entrance_cameras(camera_id,customer_id,enabled,configured_at,configured_by,greeting_text) "
-            "VALUES(?,?,1,?,?,?) "
-            "ON CONFLICT(camera_id) DO UPDATE SET customer_id=excluded.customer_id,enabled=1,greeting_text=excluded.greeting_text",
-            (camera_id, camera["customer_id"], now, "cloud-sync", greeting_text),
+            "INSERT INTO aac_voice_call_entrance_cameras(camera_id,customer_id,enabled,configured_at,configured_by,greeting_text,greeting_volume) "
+            "VALUES(?,?,1,?,?,?,?) "
+            "ON CONFLICT(camera_id) DO UPDATE SET customer_id=excluded.customer_id,enabled=1,greeting_text=excluded.greeting_text,"
+            "greeting_volume=excluded.greeting_volume",
+            (camera_id, camera["customer_id"], now, "cloud-sync", greeting_text, greeting_volume),
         )
     for camera_id in local_cameras:
         if camera_id not in wanted_cameras:

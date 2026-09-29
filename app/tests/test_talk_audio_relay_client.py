@@ -600,3 +600,39 @@ def test_client_never_touches_recording_analytics_yolo_hls():
             referenced.add(node.attr)
     overlap = referenced & forbidden
     assert not overlap, f"talk_audio_relay_client.py unexpectedly references {overlap}"
+
+
+def test_camera_added_after_the_channel_connected_refreshes_the_map_once(monkeypatch):
+    """A customer adds a talkback camera while the channel is connected:
+    the first Talk start for it re-fetches the camera map instead of
+    failing with unknown_camera until the next reconnect."""
+    calls, fetches = [], []
+    monkeypatch.setattr(client.subprocess, "Popen", lambda *a, **k: calls.append(1) or _FakeProcess())
+    monkeypatch.setattr(client, "_camera_transport_credentials", lambda n: ("10.0.0.9", 554, "/", "user", "pass"))
+    monkeypatch.setattr(client, "_build_transport", lambda *a, **k: _FakeTransport())
+    monkeypatch.setattr(client, "_camera_map_refresher", lambda: fetches.append(1) or {9: {"camera_id": "cam-new"}})
+    camera_map = dict(CAMERA_MAP)
+    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-new", "camera_id": "cam-new", "metadata": {}, "sample_rate": 48000}), camera_map))
+    try:
+        assert fetches == [1]
+        assert camera_map == {9: {"camera_id": "cam-new"}}
+        assert calls == [1] and "sess-new" in client._sessions
+    finally:
+        client._stop_session("sess-new")
+
+
+def test_known_camera_never_refetches_the_map(monkeypatch):
+    fetches = []
+    monkeypatch.setattr(client, "_camera_map_refresher", lambda: fetches.append(1) or {})
+    monkeypatch.setattr(client, "_start_session", lambda *a: False)
+    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-k", "camera_id": "cam-1", "metadata": {}, "sample_rate": 48000}), dict(CAMERA_MAP)))
+    assert fetches == []
+
+
+def test_unknown_camera_still_refused_when_the_refresh_does_not_know_it(monkeypatch):
+    replies = []
+    async def send(text): replies.append(json.loads(text))
+    monkeypatch.setattr(client, "_camera_map_refresher", lambda: {})
+    asyncio.run(client._handle_message(json.dumps({"type": "start", "session_id": "sess-u", "camera_id": "cam-nowhere", "metadata": {}, "sample_rate": 48000}), dict(CAMERA_MAP), send))
+    assert "sess-u" not in client._sessions
+    assert replies and replies[-1]["type"] == "error" and replies[-1]["reason"] == "unknown_camera"

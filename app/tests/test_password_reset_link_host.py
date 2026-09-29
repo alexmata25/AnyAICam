@@ -91,7 +91,7 @@ def _seed_customer(db_path, email="customer@example.test", must_change_password=
 def _request_and_extract_token(http_client, capturing, email):
     http_client.post("/api/password-reset/request", json={"email": email})
     text = capturing.sent[-1]["text"]
-    return text.split("token=")[1].strip()
+    return text.split("token=")[1].split()[0]
 
 
 def _edge_production():
