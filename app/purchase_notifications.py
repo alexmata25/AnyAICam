@@ -119,7 +119,9 @@ def _first_name(full_name: Optional[str]) -> str:
     first space, or the whole name if there's no space, or a generic
     greeting if there's nothing usable at all. Never raises, never
     invents a name that wasn't there."""
-    name = (full_name or "").strip()
+    # Names come from checkout and are placed into HTML emails: characters
+    # that could form markup are dropped (2026-09-29).
+    name = "".join(ch for ch in (full_name or "") if ch not in "<>&\"'").strip()
     if not name:
         return "there"
     return name.split(" ", 1)[0]
@@ -208,6 +210,9 @@ def _send_once(
     if existing and existing["status"] == "sent":
         return {"status": "skipped", "reason": "already sent", "notification_id": existing["id"]}
 
+    if html:
+        import email_layout
+        html = email_layout.wrap(html, preheader=subject)
     tracking = _record_attempt(
         event_id=event_id, notification_type=notification_type, customer_id=customer_id,
         recipient_email=recipient_email, subject=subject,
@@ -231,7 +236,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"Your AnyAiCam purchase is confirmed and your service is ready.\n\n"
         f"Plan: {plan_label}\n"
         f"Camera capacity: {camera_slot_maximum}\n\n"
-        f"Sign in and connect/claim your AnyAiCam VMS or appliance: {_sign_in_link()}\n\n"
+        f"Sign in to set up your AnyAiCam appliance and cameras: {_sign_in_link()}\n\n"
         f"If you need help getting started, our support team is here for you.\n\n"
         f"— The AnyAiCam Team"
     )
@@ -239,7 +244,7 @@ def _account_ready_email(first_name: str, plan_label: str, camera_slot_maximum: 
         f"<p>Hi {first_name},</p>"
         f"<p>Your AnyAiCam purchase is confirmed and your service is ready.</p>"
         f"<p><strong>Plan:</strong> {plan_label}<br><strong>Camera capacity:</strong> {camera_slot_maximum}</p>"
-        f'<p>Sign in and connect/claim your AnyAiCam VMS or appliance: '
+        f'<p>Sign in to set up your AnyAiCam appliance and cameras: '
         f'<a href="{_sign_in_link()}">{_sign_in_link()}</a></p>'
         f"<p>If you need help getting started, our support team is here for you.</p>"
         f"<p>— The AnyAiCam Team</p>"
