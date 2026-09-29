@@ -155111,7 +155111,7 @@ class _ClassicAacoBoundary:
         matches = _aaco_fuzzy_camera_matches(cameras, camera_token.removeprefix("camera-name:"))
         if len(matches) > 1:
             names = ", ".join(_camera_display_label(camera) for camera in matches)
-            return Clarification(f"More than one authorized camera matches that -- did you mean {names}?")
+            return Clarification(f"More than one camera matches that. Did you mean {names}?")
         return None
 
     def _live_camera(self, identity: dict, camera_token: str) -> dict | None:
@@ -155168,10 +155168,10 @@ class _ClassicAacoBoundary:
         recordings = _customer_recording_rows(camera["id"], limit=10, near=start.isoformat())
         timestamp = start.isoformat()
         message = (
-            f"Found {len(recordings)} existing recording metadata result(s) near {timestamp}. "
-            "Open Classic Playback to select authorized media."
+            f"Found {len(recordings)} recording{'s' if len(recordings) != 1 else ''} near that time. "
+            "Open the recording to play it."
             if recordings else
-            f"Playback media is currently unavailable near {timestamp}. Classic Playback remains the authorized destination when recordings are available."
+            "No recording is available near that time yet."
         )
         return {
             "kind": "playback",
@@ -155224,9 +155224,9 @@ class _ClassicAacoBoundary:
             if len(matches) >= cap:
                 break
         if limit == 1:
-            message = "Latest authorized event." if matches else "No authorized event matches that yet."
+            message = "Latest event." if matches else "No matching events yet."
         else:
-            message = f"{len(matches)} authorized event result(s)."
+            message = f"{len(matches)} event{'s' if len(matches) != 1 else ''} found."
         return {"kind": "events", "message": message, "events": matches, "context": matches[0]["context"] if matches else None}
 
     def previous_event(self, identity: dict, camera_id: str, before: datetime) -> dict:
@@ -155245,12 +155245,12 @@ class _ClassicAacoBoundary:
             if occurred < before:
                 prior.append((occurred, event))
         if not prior:
-            return {"kind": "events", "message": "No earlier authorized event is available for this camera.", "events": []}
+            return {"kind": "events", "message": "No earlier event for this camera.", "events": []}
         occurred, event = max(prior, key=lambda item: item[0])
         context = {"camera_id": camera_id, "event_at": occurred.isoformat()}
         return {
             "kind": "events",
-            "message": "Previous authorized event.",
+            "message": "Previous event.",
             "events": [{
                 "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
                 "timestamp": str(event.get("timestamp")),
@@ -155366,7 +155366,7 @@ class _ClassicAacoBoundary:
             doors = door_access.customer_door_cameras(db, identity["customer_id"])
         matches = self._door_matches(doors, door_id)
         if len(matches) > 1:
-            return Clarification("More than one authorized door matches that name -- try a camera number instead.")
+            return Clarification("More than one door matches that name. Try the camera name or number instead.")
         if not matches:
             raise PermissionError("Door is unavailable.")
         door = matches[0]

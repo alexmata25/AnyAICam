@@ -9,7 +9,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from aaco import Clarification, DeterministicLanguageAdapter, execute
+from aaco import AacoCommand, Clarification, DeterministicLanguageAdapter, execute
 
 CUSTOMER_ROLES = {"customer_owner", "customer_viewer"}
 MAX_COMMAND_LENGTH = 500
@@ -51,7 +51,7 @@ def _result_payload(result: object) -> dict[str, Any]:
 
 _AACO_CLIENT_CORE_JS = """
 window.aacoSubmitCommand=function(commandText,context,onSuccess,onError){
-return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:commandText,context:context||null})})
+return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:commandText,context:context||null,tz:(function(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||null}catch(e){return null}})()})})
 .then(function(response){return response.json().then(function(body){return {ok:response.ok,status:response.status,body:body}}).catch(function(){return {ok:false,status:response.status,body:{detail:'AACO returned an unreadable response.'}}})})
 .then(function(result){if(result.ok){onSuccess(result.body)}else{onError(result.body||{detail:'AACO could not complete that command.'})}})
 .catch(function(){onError({detail:'AACO could not reach the authorized VMS service.'})})
@@ -371,22 +371,66 @@ def _workspace() -> str:
     # markup's own CSS is full of literal {}, which would otherwise
     # need escaping throughout just to insert one shared JS constant.
     return """
-<header class="topbar"><div><p class="eyebrow">AnyAiCam Operator</p><h1>AACO</h1></div><a class="ghost-button" href="/customer-account">Classic workspace</a></header>
+<header class="topbar"><div><p class="eyebrow">AnyAiCam Operator</p><h1>AACO</h1></div><a class="ghost-button" href="/dashboard">Dashboard</a></header>
 <style>
 .aaco-layout{display:grid;grid-template-columns:minmax(240px,.72fr) minmax(0,2fr);gap:16px}.aaco-panel{border:1px solid rgba(170,196,207,.18);border-radius:14px;background:rgba(24,33,50,.92);padding:18px}.aaco-panel h2{margin:0 0 6px}.aaco-muted{color:var(--muted);font-size:12px;line-height:1.5}.aaco-examples{display:grid;gap:8px;margin-top:14px}.aaco-example{width:100%;text-align:left;padding:10px;border:1px solid var(--line);border-radius:9px;background:#111827;color:#dce7ee;font:inherit;font-size:12px;cursor:pointer}.aaco-example:hover{border-color:var(--brand)}.aaco-command-row{display:flex;gap:8px}.aaco-command-row input{min-width:0;flex:1}.aaco-conversation{display:grid;gap:12px;min-height:350px}.aaco-turn{max-width:min(92%,700px);padding:12px 14px;border-radius:12px;line-height:1.45}.aaco-turn.customer{justify-self:end;background:#285d5a}.aaco-turn.operator{background:#111827;border:1px solid rgba(170,196,207,.15)}.aaco-turn .eyebrow{margin:0 0 5px;font-size:10px}.aaco-result-list{display:grid;gap:8px;margin-top:10px}.aaco-result-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border:1px solid rgba(170,196,207,.15);border-radius:9px}.aaco-result-row span{color:var(--muted);font-size:11px}.aaco-context{margin-top:12px;padding:9px 11px;border-left:3px solid var(--brand);color:#b9cfda;font-size:11px}.aaco-loading{opacity:.7}@media(max-width:760px){.aaco-layout{grid-template-columns:1fr}.aaco-command-row{flex-direction:column}.aaco-command-row button{width:100%}.aaco-conversation{min-height:260px}}
 .aaco-mic-listening{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}@keyframes aaco-mic-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 </style>
 <main class="aaco-layout" aria-label="AACO operator workspace">
- <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO loads VMS data only after a command. Search shows metadata; it never creates a clip.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
+ <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO opens only the cameras, recordings and events your account can see, and never changes or deletes anything.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
  <section class="aaco-panel"><form id="aaco-command-form"><label class="eyebrow" for="aaco-command">Command</label><div class="aaco-command-row"><input id="aaco-command" name="command" maxlength="500" autocomplete="off" required placeholder="What would you like to see?"><button type="button" class="camera-tool aaco-mic-button" id="aaco-mic" title="Voice commands are not supported in this browser" aria-label="Voice commands are not supported in this browser" aria-pressed="false" disabled>🎤</button><button class="action-button">Run command</button></div></form><p id="aaco-status" class="aaco-muted" role="status" aria-live="polite">Ready. No historical media is loaded until you ask.</p><div id="aaco-conversation" class="aaco-conversation" aria-live="polite"><div class="aaco-turn operator"><p class="eyebrow">AACO</p>What would you like to see?</div></div><div id="aaco-context" class="aaco-context" hidden></div></section>
 </main>
 <script>%%AACO_CORE_JS%%
 (()=>{const form=document.getElementById('aaco-command-form'),input=document.getElementById('aaco-command'),status=document.getElementById('aaco-status'),conversation=document.getElementById('aaco-conversation'),contextLine=document.getElementById('aaco-context');let operatorContext=null;const node=(tag,value)=>{const el=document.createElement(tag);el.append(document.createTextNode(String(value??'')));return el};const turn=(who)=>{const el=document.createElement('div');el.className='aaco-turn '+who;const label=node('p',who==='customer'?'You':'AACO');label.className='eyebrow';el.append(label);conversation.append(el);return el};const link=(label,href)=>{const a=node('a',label);a.className='download';a.href=href;return a};function updateContext(value){operatorContext=value||null;if(!operatorContext){contextLine.hidden=true;return}contextLine.hidden=false;contextLine.textContent='Current context: '+operatorContext.camera_id+(operatorContext.playback_at?' · playback selected':'')+(operatorContext.event_at?' · event selected':'')}
 const KIND_LABELS={live:'Live view',playback:'Playback',events:'Requested events',door_unlock:'Door',status:'Camera status'};
-function render(body){const box=turn('operator');if(body.kind==='clarification'){box.append(node('div',body.message));return}box.append(node('strong',KIND_LABELS[body.kind]||'Camera status'));box.append(node('p',body.message));if(body.kind==='live'||body.kind==='playback'){box.append(link(body.kind==='live'?'Open authorized Live':'Open authorized Playback',body.href));updateContext(body.context||operatorContext);return}if(body.kind==='door_unlock'){if(body.context)updateContext(body.context);return}const list=document.createElement('div');list.className='aaco-result-list';const rows=body.kind==='events'?body.events||[]:body.cameras||[];if(!rows.length)box.append(node('p',body.kind==='events'?'No authorized events matched this request.':'No authorized cameras are available.'));rows.forEach(row=>{const item=document.createElement('div');item.className='aaco-result-row';const copy=document.createElement('div');copy.append(node('strong',row.label));copy.append(node('span',row.timestamp||row.state||''));item.append(copy);if(row.href)item.append(link('Open in Classic',row.href));if(row.context){const pick=node('button','Use context');pick.type='button';pick.className='ghost-button';pick.addEventListener('click',()=>updateContext(row.context));item.append(pick)}list.append(item)});box.append(list);if(body.context)updateContext(body.context)}
+function friendlyTime(value){if(!value||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/.test(value))return value||'';const d=new Date(/[zZ]|[+-][0-9]{2}:?[0-9]{2}$/.test(value)?value:value+'Z');return isNaN(d)?value:' · '+d.toLocaleString([], {weekday:'short',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}function render(body){const box=turn('operator');if(body.kind==='clarification'){box.append(node('div',body.message));return}box.append(node('strong',KIND_LABELS[body.kind]||'Camera status'));box.append(node('p',body.message));if(body.kind==='live'||body.kind==='playback'){box.append(link(body.kind==='live'?'Open live view':'Open recording',body.href));updateContext(body.context||operatorContext);return}if(body.kind==='door_unlock'){if(body.context)updateContext(body.context);return}const list=document.createElement('div');list.className='aaco-result-list';const rows=body.kind==='events'?body.events||[]:body.cameras||[];if(!rows.length)box.append(node('p',body.kind==='events'?'No events matched this request.':'No cameras are available.'));rows.forEach(row=>{const item=document.createElement('div');item.className='aaco-result-row';const copy=document.createElement('div');copy.append(node('strong',row.label));copy.append(node('span',friendlyTime(row.timestamp)||row.state||''));item.append(copy);if(row.href)item.append(link('Open',row.href));if(row.context){const pick=node('button','Ask about this');pick.type='button';pick.className='ghost-button';pick.addEventListener('click',()=>updateContext(row.context));item.append(pick)}list.append(item)});box.append(list);if(body.context)updateContext(body.context)}
 window.aacoAttachVoice(form,input,status,document.getElementById('aaco-mic'));document.querySelectorAll('.aaco-example').forEach(button=>button.addEventListener('click',()=>{input.value=button.textContent.trim();input.focus()}));form.addEventListener('submit',event=>{event.preventDefault();const command=input.value.trim();if(!command)return;turn('customer').append(node('div',command));status.textContent='Working with your authorized VMS…';conversation.classList.add('aaco-loading');window.aacoSubmitCommand(command,operatorContext,body=>{status.textContent=body.message||'Completed.';render(body);conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()},error=>{const box=turn('operator');box.append(node('div',error.detail||'AACO could not complete that command.'));status.textContent='Command was not completed.';conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()})})})();
 </script>
 """.replace("%%AACO_CORE_JS%%", _AACO_CLIENT_CORE_JS)
+
+
+# Viewer-local time phrases (2026-09-29). Stored times (events, recordings)
+# and the server clock are UTC without an offset, so "today" or "at 3:15 PM"
+# used to mean the UTC day / 3:15 PM UTC: "play the driveway at 3:15 PM
+# yesterday" opened 10:15 AM for a viewer in Texas. The page now sends the
+# browser's IANA time zone; phrases are read in that zone and the resulting
+# window is converted back to UTC before the (unchanged) search. Requests
+# without a zone keep the previous behaviour.
+_TZ_NAME = re.compile(r"^[A-Za-z]+(?:/[A-Za-z0-9_+-]+){0,2}$")
+
+
+def _viewer_timezone(value):
+    if not isinstance(value, str) or len(value) > 64 or not _TZ_NAME.match(value):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(value)
+    except Exception:
+        return None
+
+
+def _local_now(utc_now: datetime, tz):
+    if tz is None:
+        return utc_now
+    from datetime import timezone
+    return utc_now.replace(tzinfo=timezone.utc).astimezone(tz).replace(tzinfo=None)
+
+
+def _phrase_times_to_utc(parsed, tz):
+    """Only commands whose window comes from the typed phrase (playback at a
+    time, event searches) are converted; navigation from an earlier result
+    keeps that result's exact UTC times."""
+    if tz is None or not isinstance(parsed, AacoCommand) or parsed.operation not in ("playback", "event_search"):
+        return parsed
+    import dataclasses
+    from datetime import timezone
+
+    def to_utc(value):
+        if value is None:
+            return None
+        return value.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+    return dataclasses.replace(parsed, start=to_utc(parsed.start), end=to_utc(parsed.end))
 
 
 def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identity_provider: Callable[[Request], dict | None], vms_factory: Callable[[Request], object], now: Callable[[], datetime] = datetime.now, language_adapter_factory: Callable[[], object] = DeterministicLanguageAdapter) -> None:
@@ -419,7 +463,7 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
             payload = await request.json()
         except Exception as error:
             raise HTTPException(status_code=400, detail="Command must be valid JSON.") from error
-        if not isinstance(payload, dict) or set(payload) - {"command", "context"}:
+        if not isinstance(payload, dict) or set(payload) - {"command", "context", "tz"}:
             raise HTTPException(status_code=400, detail="Malformed AACO command.")
         command_text = payload.get("command")
         if not isinstance(command_text, str) or not command_text.strip() or len(command_text) > MAX_COMMAND_LENGTH:
@@ -435,7 +479,9 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
                 context["camera_names"] = list(camera_names(identity))
             except Exception:
                 log.warning("aaco.camera_names_unavailable")
-        parsed = language_adapter.parse(command_text, now=now(), context=context)
+        viewer_tz = _viewer_timezone(payload.get("tz"))
+        parsed = language_adapter.parse(command_text, now=_local_now(now(), viewer_tz), context=context)
+        parsed = _phrase_times_to_utc(parsed, viewer_tz)
         if isinstance(parsed, Clarification):
             log.info("aaco.command_clarification")
             return {"kind": "clarification", "message": parsed.message}
