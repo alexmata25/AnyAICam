@@ -388,6 +388,9 @@
             // Simple obfuscation: (answer XOR 0x5A) * 7 + 13
             var hash = (answer ^ 90) * 7 + 13;
 
+            // The CAPTCHA fields are not in the form; without this guard the
+            // script threw here on every page load (behaviour otherwise unchanged).
+            if (!document.getElementById('captchaQuestion')) return;
             document.getElementById('captchaQuestion').textContent = num1 + ' + ' + num2;
             document.getElementById('captchaHash').value = hash;
 

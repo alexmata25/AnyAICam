@@ -357,11 +357,7 @@
     document.getElementById('emailSupportSummary').addEventListener('click', function () {
       const summary = document.getElementById('summaryBox').textContent;
       const subject = 'ANY AI CAM Diagnostic Support Request';
-      const body = 'Hello ANY AI CAM Support,
-
-I completed the automated diagnostic.
-
-' + summary;
+      const body = 'Hello ANY AI CAM Support,\n\nI completed the automated diagnostic.\n\n' + summary;
       window.location.href =
         'mailto:support@anyaicam.com?subject=' + encodeURIComponent(subject) +
         '&body=' + encodeURIComponent(body);

@@ -1244,7 +1244,9 @@
     });
 
     document.getElementById('printQuote').addEventListener('click', () => window.print());
-    document.getElementById('resetCalculatorSelections').addEventListener('click', () => {
+    // The reset button is not on every version of this page; a missing
+    // button used to throw here and stop calculate() and draft restore below.
+    document.getElementById('resetCalculatorSelections')?.addEventListener('click', () => {
       localStorage.removeItem(PARTNER_CALCULATOR_STATE_KEY);
       if (window.AnyAICamCart) AnyAICamCart.setCameraQuantity(0);
       window.location.reload();
