@@ -89,7 +89,7 @@ def _cloud_production():
 def _request_and_extract_token(http_client, capturing, email):
     http_client.post("/api/password-reset/request", json={"email": email})
     text = capturing.sent[-1]["text"]
-    return text.split("token=")[1].strip()
+    return text.split("token=")[1].split()[0]
 
 
 # --------------------------------------------------------------- real token expiry
@@ -376,8 +376,8 @@ def test_forgot_password_pages_surface_the_real_error_instead_of_fake_success():
     # {}), and the fallbacks read clearly -- still never a fake success.
     # 2026-09-26: /forgot-password is a standalone page now and reports in
     # place via say(text, ok) instead of a toast -- same no-fake-success rule.
-    assert "r=await response.json().catch(()=>({}));say(response.ok?(r.message||'If the account exists, a password-reset message has been prepared.'):(r.detail||'Request failed. Please try again.'),response.ok)" in source
-    assert "box.textContent=response.ok?(r.message||'If the account exists, a reset message has been prepared.'):(r.detail||'Request failed. Please try again.')" in source
+    assert "r=await response.json().catch(()=>({}));say(response.ok?(r.message||'If an account exists for that email, we sent a link to reset your password. It expires in one hour.'):(r.detail||'Request failed. Please try again.'),response.ok)" in source
+    assert "box.textContent=response.ok?(r.message||'If an account exists for that email, we sent a link to reset your password. It expires in one hour.'):(r.detail||'Request failed. Please try again.')" in source
 
 
 def test_forgot_password_request_shows_the_real_csrf_failure_not_generic_success(db_path, monkeypatch):
@@ -426,7 +426,7 @@ def test_reset_password_completes_with_real_csrf_middleware_enforced(db_path, mo
                 json={"email": "admin-like@example.test"},
                 headers={"X-CSRF-Token": request_csrf},
             )
-            token = capturing.sent[-1]["text"].split("token=")[1].strip()
+            token = capturing.sent[-1]["text"].split("token=")[1].split()[0]
 
             client.get(f"/reset-password?token={token}")
             csrf_cookie = client.cookies.get("anyaicam_csrf")
@@ -467,7 +467,7 @@ def test_reset_password_without_the_csrf_header_is_the_confirmed_live_failure(db
                 json={"email": "admin-like@example.test"},
                 headers={"X-CSRF-Token": request_csrf},
             )
-            token = capturing.sent[-1]["text"].split("token=")[1].strip()
+            token = capturing.sent[-1]["text"].split("token=")[1].split()[0]
             client.get(f"/reset-password?token={token}")
 
             complete = client.post(

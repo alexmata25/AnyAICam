@@ -213,7 +213,7 @@ def test_an_unknown_email_gets_the_same_generic_response(db_path, client, monkey
     monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
     response = client.post("/api/password-reset/request", json={"email": "nobody@example.test"})
     assert response.status_code == 200
-    assert response.json()["message"].startswith("If the account exists")
+    assert response.json()["message"].startswith("If an account exists")
     assert capturing.sent == []
 
 
@@ -223,7 +223,7 @@ def test_the_emailed_customer_link_completes_end_to_end(db_path, client, monkeyp
     monkeypatch.setattr(cloud_features, "get_email_service", lambda: capturing)
     monkeypatch.setattr(cloud_features, "settings", _cloud_settings())
     client.post("/api/password-reset/request", json={"email": "owner@example.test"})
-    token = capturing.sent[0]["text"].split("token=")[1].strip()
+    token = capturing.sent[0]["text"].split("token=")[1].split()[0]
     response = client.post("/api/password-reset/complete", json={"token": token, "password": "brand-new-password-1"})
     assert response.status_code == 200
     assert response.json()["destination"] == "/customer-login.html"

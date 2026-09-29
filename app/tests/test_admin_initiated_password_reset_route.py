@@ -111,7 +111,7 @@ def test_admin_initiated_reset_token_is_a_real_usable_reset_token(monkeypatch, d
 
     class _CapturingLink:
         def send(self, message_type, to, subject, text, html=None, metadata=None):
-            captured_link["token"] = text.split("token=")[1].strip()
+            captured_link["token"] = text.split("token=")[1].split()[0]
             return {"id": "test-message-id", "status": "preview"}
 
     with override_target(sqlite_path=db_path):
