@@ -186,3 +186,58 @@ def test_held_person_email_is_skipped_at_send_time_once_the_call_exists(cloud, m
     _voice_call("entrance", datetime.now().isoformat())  # the call is created a moment later (the real race)
     stats = notification_retry_worker.send_pending_media_emails(now=datetime.now() + timedelta(seconds=40))
     assert stats["skipped"] == 1 and cloud["email"].calls == []
+
+
+def _entrance(camera_id, enabled=1):
+    with connection() as db:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(aac_voice_call_entrance_cameras)").fetchall()}
+        values = {"camera_id": camera_id, "customer_id": "cust-1", "enabled": enabled, "configured_at": "2026-09-28T00:00:00",
+                  "configured_by": "owner-1", "greeting_text": "Hello"}
+        use = {k: v for k, v in values.items() if k in cols}
+        db.execute(f"INSERT INTO aac_voice_call_entrance_cameras({','.join(use)}) VALUES({','.join('?' for _ in use)})", tuple(use.values()))
+
+
+def _held_person(camera_id, event_id):
+    notification_engine.fanout_appliance_event(
+        {"customer_id": "cust-1", "site_id": "site-1"},
+        {"id": event_id, "camera_id": camera_id, "event_type": "person", "timestamp": datetime.now().isoformat()},
+    )
+
+
+def test_entrance_email_waits_for_the_voice_call_even_when_the_thumbnail_is_early(cloud, monkeypatch):
+    """The race: thumbnail ready at +5 s, Voice Call created at ~+7 s. The
+    entrance camera's Person email must not go out in between."""
+    import notification_retry_worker
+    monkeypatch.setattr(notification_email, "MEDIA_WAIT_SECONDS", 180)
+    monkeypatch.setattr(notification_email, "media_ready", lambda context: True)
+    monkeypatch.setattr(notification_retry_worker, "CHANNELS", cloud)
+    _entrance("entrance")
+    _held_person("entrance", "det-a")
+    early = notification_retry_worker.send_pending_media_emails(now=datetime.now() + timedelta(seconds=5))
+    assert early["held"] == 1 and cloud["email"].calls == []
+    _voice_call("entrance", datetime.now().isoformat())
+    later = notification_retry_worker.send_pending_media_emails(now=datetime.now() + timedelta(seconds=35))
+    assert later["skipped"] == 1 and cloud["email"].calls == []
+
+
+def test_entrance_email_is_sent_after_the_grace_when_no_call_happened(cloud, monkeypatch):
+    import notification_retry_worker
+    monkeypatch.setattr(notification_email, "MEDIA_WAIT_SECONDS", 180)
+    monkeypatch.setattr(notification_email, "media_ready", lambda context: True)
+    monkeypatch.setattr(notification_retry_worker, "CHANNELS", cloud)
+    _entrance("entrance")
+    _held_person("entrance", "det-b")
+    stats = notification_retry_worker.send_pending_media_emails(now=datetime.now() + timedelta(seconds=35))
+    assert stats["sent"] == 1 and len(cloud["email"].calls) == 1
+
+
+def test_non_entrance_and_disabled_entrance_cameras_are_never_delayed(cloud, monkeypatch):
+    import notification_retry_worker
+    monkeypatch.setattr(notification_email, "MEDIA_WAIT_SECONDS", 180)
+    monkeypatch.setattr(notification_email, "media_ready", lambda context: True)
+    monkeypatch.setattr(notification_retry_worker, "CHANNELS", cloud)
+    _entrance("entrance", enabled=0)
+    _held_person("yard", "det-c")
+    _held_person("entrance", "det-d")
+    stats = notification_retry_worker.send_pending_media_emails(now=datetime.now() + timedelta(seconds=3))
+    assert stats["sent"] == 2 and len(cloud["email"].calls) == 2

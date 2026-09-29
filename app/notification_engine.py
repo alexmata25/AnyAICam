@@ -230,6 +230,29 @@ def voice_call_supersedes_email(db, *, camera_id: str | None, event_type: str, a
     return row is not None
 
 
+# The Voice Call record is created a few seconds after the person detection
+# (greeting, then the call; ~7 s in the 2026-09-28 Front Door test), while a
+# held detection email is released as soon as its thumbnail arrives -- which
+# can be sooner. At an enabled AAC entrance camera, detection emails stay held
+# at least this long so the Voice Call can supersede them. Other cameras are
+# never delayed.
+VOICE_CALL_ENTRANCE_GRACE_SECONDS = max(0, int(os.environ.get("ANYAICAM_VOICE_CALL_ENTRANCE_GRACE_SECONDS", "30")))
+
+
+def awaits_possible_voice_call(db, *, camera_id: str | None, event_type: str) -> bool:
+    """True for a detection type a Voice Call supersedes, at a camera that
+    is an enabled AAC Voice Call entrance camera."""
+    if not camera_id or event_type not in VOICE_CALL_SUPERSEDES_EVENT_TYPES or VOICE_CALL_ENTRANCE_GRACE_SECONDS <= 0:
+        return False
+    try:
+        row = db.execute(
+            "SELECT 1 FROM aac_voice_call_entrance_cameras WHERE camera_id=? AND enabled=1 LIMIT 1", (camera_id,),
+        ).fetchone()
+    except Exception:
+        return False  # no Voice Call feature/table here: never delay
+    return row is not None
+
+
 def _security_sms_wanted(customer_id: str, site_id: str) -> bool:
     try:
         import security_modes
