@@ -192,6 +192,7 @@ def register_customer_platform_routes(
           <div class="panel-head"><div><h2>Customer controls</h2><div class="health-detail">Manage paid camera analytics and notification preferences separately for each camera.</div></div></div>
           <div class="settings-list">
             <a class="setting-link" href="/customer-app-settings"><div><strong>Camera analytics and alerts</strong><div class="health-detail">Enable paid analytics, email alerts, push alerts, schedules, and quiet hours.</div></div><span>Open →</span></a>
+            <a class="setting-link" href="/customer/voice-call-settings"><div><strong>Visitor Voice Call</strong><div class="health-detail">Greet visitors at your door and get a call you can answer live.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/playback"><div><strong>Playback</strong><div class="health-detail">Review authorized recordings and event footage.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/subscription-portal"><div><strong>Subscription</strong><div class="health-detail">Review billing and plan access.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/mobile-app"><div><strong>Install phone app</strong><div class="health-detail">Install ANY AI CAM on Android or iPhone.</div></div><span>Install →</span></a>
@@ -243,6 +244,11 @@ def register_customer_platform_routes(
           <section class="panel" id="alert-program">
             <div class="panel-head"><div><h2>Alerts</h2><div class="health-detail">Choose which events alert you, for which cameras, by email or text, and quiet hours.</div></div></div>
             <a class="action-button" href="/settings/notifications">Open notification settings</a>
+            <div class="push-status" style="margin-top:16px">
+              <strong>Visitor Voice Call</strong>
+              <p class="health-detail">Choose entrance cameras, their greeting and greeting volume.</p>
+              <a class="ghost-button" href="/customer/voice-call-settings">Voice Call settings</a>
+            </div>
             <div class="push-status" style="margin-top:16px">
               <strong>Phone alerts</strong>
               <p class="health-detail">Pair your phone with the AnyAiCam app to get push alerts, or pause alerts for a paired device.</p>

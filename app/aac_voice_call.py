@@ -98,7 +98,7 @@ from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import aac_voice_call_door
 import aac_voice_call_events as store
@@ -770,7 +770,7 @@ class VisitorUtterancePayload(BaseModel):
 
 
 class CameraGreetingPayload(BaseModel):
-    greeting_text: str | None = None
+    greeting_text: str | None = Field(default=None, max_length=500)
 
 
 class GreetingVolumePayload(BaseModel):
@@ -778,7 +778,7 @@ class GreetingVolumePayload(BaseModel):
 
 
 class SiteGreetingPayload(BaseModel):
-    greeting_text: str
+    greeting_text: str = Field(min_length=1, max_length=500)
 
 
 class AnswerPayload(BaseModel):
@@ -974,6 +974,15 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         return aac_voice_call_door.confirm_unlock(
             event_id=event_id, customer_id=identity["customer_id"], identity=identity, confirm_token=payload.confirm_token,
         )
+
+    @app.get("/customer/voice-call-settings", response_class=HTMLResponse)
+    def voice_call_settings(request: Request) -> str:
+        """Settings -> Visitor Voice Call: entrance cameras, greeting text
+        and greeting volume (aac_voice_call_settings_page.py)."""
+        import aac_voice_call_settings_page
+        identity = _customer_identity(request)
+        content, scripts = aac_voice_call_settings_page.render_settings(identity)
+        return shell("Visitor Voice Call", "settings", content, scripts)
 
     @app.get("/aac/voice-call/{event_id}", response_class=HTMLResponse)
     def voice_call_screen(request: Request, event_id: str) -> str:
