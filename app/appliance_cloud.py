@@ -568,7 +568,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # entrance-camera check, and the greeting keep working offline.
         aac_voice_call_config={
             'entrance_cameras':rows(
-                'SELECT e.camera_id,e.greeting_text FROM aac_voice_call_entrance_cameras e JOIN cameras c ON c.id=e.camera_id '
+                'SELECT e.camera_id,e.greeting_text,e.greeting_volume FROM aac_voice_call_entrance_cameras e JOIN cameras c ON c.id=e.camera_id '
                 'WHERE c.appliance_id=? AND e.customer_id=c.customer_id AND e.enabled=1 ORDER BY e.camera_id',
                 (appliance['id'],),
             ),

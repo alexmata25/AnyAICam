@@ -51,6 +51,7 @@ class GreetingRequest:
     event_id: str
     text: str
     reason: str = "aac_voice_call_greeting"
+    volume: str = "medium"  # greeting-only loudness; see GREETING_VOLUME_LEVELS
 
     def __post_init__(self) -> None:
         if not self.text or not self.text.strip():
@@ -173,6 +174,42 @@ GREETING_VOICE = os.environ.get("ANYAICAM_GREETING_TTS_VOICE", "en-us")
 GREETING_WORDS_PER_MINUTE = int(os.environ.get("ANYAICAM_GREETING_TTS_WPM", "150"))
 GREETING_CHUNK_SECONDS = 0.1
 
+# Greeting-only loudness (2026-09-29). eSpeak's raw greeting measured on the
+# Ryzen at about -19 dBFS speech RMS (peaks -3 dBFS) and nothing adjusted
+# it, so the only control was the camera's speaker volume -- shared with
+# homeowner Talk. The greeting PCM is now levelled here, inside the greeting
+# provider, before the shared relay: normalised to a speech-RMS target per
+# level with a peak limit. Homeowner Talk, the camera speaker/microphone
+# settings and recordings are never touched. "medium" (the default) is
+# ~9 dB quieter than before.
+GREETING_VOLUME_LEVELS = {"low": -34.0, "medium": -28.0, "high": -22.0}
+DEFAULT_GREETING_VOLUME = "medium"
+GREETING_PEAK_LIMIT_DBFS = -3.0
+_SPEECH_GATE = 300  # samples below this are silence/breath, not speech, for the RMS
+
+
+def level_greeting_pcm(pcm: bytes, volume: str | None = DEFAULT_GREETING_VOLUME) -> bytes:
+    """PCM16 mono -> the same audio scaled so its speech RMS hits the
+    level's target, never letting a peak exceed GREETING_PEAK_LIMIT_DBFS.
+    Silent/empty input is returned unchanged."""
+    import array
+    import math
+    if len(pcm) < 2:
+        return pcm
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    speech = [value for value in samples if abs(value) > _SPEECH_GATE]
+    if not speech:
+        return pcm
+    speech_rms = math.sqrt(sum(value * value for value in speech) / len(speech))
+    target = GREETING_VOLUME_LEVELS.get(str(volume or "").lower(), GREETING_VOLUME_LEVELS[DEFAULT_GREETING_VOLUME])
+    gain = (32768 * 10 ** (target / 20)) / speech_rms
+    peak = max(abs(value) for value in samples)
+    peak_ceiling = 32767 * 10 ** (GREETING_PEAK_LIMIT_DBFS / 20)
+    if peak * gain > peak_ceiling:
+        gain = peak_ceiling / peak
+    return array.array("h", (max(-32768, min(32767, int(round(value * gain)))) for value in samples)).tobytes()
+
 
 def synthesize_speech(text: str, *, voice: str = GREETING_VOICE, words_per_minute: int = GREETING_WORDS_PER_MINUTE) -> tuple[bytes, int]:
     """Text -> (PCM16 mono bytes, sample rate) with espeak-ng. The text is
@@ -258,6 +295,7 @@ class IsapiTtsGreetingProvider:
             self._speaking.add(request.camera_id)
         try:
             pcm, rate = self._synthesize(request.text)
+            pcm = level_greeting_pcm(pcm, request.volume)
         except Exception as error:
             with self._lock:
                 self._speaking.discard(request.camera_id)

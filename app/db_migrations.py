@@ -1153,6 +1153,12 @@ CREATE TABLE IF NOT EXISTS camera_capabilities(
     probed_at TEXT NOT NULL
 );
 '''),
+    # Greeting-only volume per AAC entrance camera (2026-09-29): low /
+    # medium / high, NULL = medium. Synced to the edge with the rest of
+    # the aac_voice_call configuration so it works offline.
+    ('20260929_aac_greeting_volume','''
+ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_volume TEXT;
+'''),
 ]
 
 
