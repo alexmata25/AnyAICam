@@ -74328,7 +74328,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-          if(String(camera.recording).toLowerCase()==='running')recordingCount++;
+          if(['running','armed'].includes(String(camera.recording).toLowerCase()))recordingCount++;
 
 
 
@@ -74409,7 +74409,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-            camera.recording,
+            camera.recording==='armed'?'event_armed':camera.recording,
 
 
 
@@ -74418,7 +74418,7 @@ def camera_health_page(request: Request) -> str:
 
 
 
-            ['running','online']
+            ['running','online','event_armed']
 
 
 
@@ -131461,7 +131461,7 @@ def sites() -> str:
 
 
 
-                            ? `Stream active · recording ${camera.recording}`
+                            ? `Stream active · ${camera.recording==='armed'?'Event recording · waiting for activity':'recording '+camera.recording}`
 
 
 
