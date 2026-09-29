@@ -110,6 +110,11 @@
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
    "sha256": "b23321e47b48986d81639d0c651a0d0c9922a4990c7e90d024f61d703435f0d3"
   },
+  "/customer-login.html": {
+   "bytes": 2139,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "06ce61d794ac61e853bee2a3eded9219a7fb65f1ec097c4bf976b79fcc232387"
+  },
   "/customer-setup.html": {
    "bytes": 15854,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
@@ -194,6 +199,11 @@
    "bytes": 21852,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
    "sha256": "ef8833181719a53f910380cc109d4bbacfa4cb89e843c6e2de9d9230b3547e84"
+  },
+  "/partner-assisted-setup.html": {
+   "bytes": 29138,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "64e108c3130253c88e206aa1a41315c259c293bbb6e7d29b18ffd53d8c91d83d"
   },
   "/partner-icon-180.png": {
    "bytes": 11442,
@@ -304,6 +314,11 @@
    "bytes": 603,
    "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
    "sha256": "3f41949664bb24d577e71d1fb4ac37476f2271fc67bd4609aa3bd8937b81150e"
+  },
+  "/videoloft-partner-referral-wizard.html": {
+   "bytes": 99848,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "3727d3527d7128e6da3f022ba8ed2895c76f202076433b64b09c7ae88310b49c"
   },
   "/videoloft-partner-sales-calculator.html": {
    "bytes": 65549,
