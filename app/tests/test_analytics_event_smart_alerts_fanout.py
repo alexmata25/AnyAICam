@@ -237,3 +237,16 @@ def test_a_fanout_exception_still_leaves_the_event_accepted_and_stored(client, d
     assert response.status_code == 200
     assert response.json()["status"] == "accepted"
     assert _detection_event_row(db_path, "cam-1", "local-evt-abc123") is not None
+
+
+def test_inbox_says_when_it_shows_only_the_latest_alerts():
+    """The inbox loads at most 500 notifications; the count then read like a
+    total ("All 500"). It now says it is showing the latest 500 (2026-09-29)."""
+    import smart_alerts
+    from zoneinfo import ZoneInfo
+    kwargs = dict(view="active", tz=ZoneInfo("America/Chicago"), alert_text=lambda n: ("", ""),
+                  clip_href=lambda n: None, talk_camera_ids=set(), counts={})
+    capped, _ = smart_alerts.render_inbox([], capped_at=500, **kwargs)
+    assert "Showing your latest 500 alerts" in capped
+    uncapped, _ = smart_alerts.render_inbox([], **kwargs)
+    assert "Showing your latest" not in uncapped

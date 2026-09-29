@@ -104134,7 +104134,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         upgrade_panel = (
             f'<div id="upgrade-to-hybrid" class="panel" style="margin-top:14px">'
             f'<h3 style="margin-top:0">Upgrade to Hybrid</h3>'
-            f'<p class="health-detail">Get cloud identity, remote access, event-media upload, analytics sync, notifications, and relay/P2P live view -- {escape(upgrade_tier["tier_label"])} cameras for ${upgrade_tier["monthly_retail_usd"]}/mo. Your cameras, recordings, and analytics settings all carry over.</p>'
+            f'<p class="health-detail">Watch live and review events from anywhere, get email and phone alerts, and keep event clips in the cloud: {escape(upgrade_tier["tier_label"])} cameras for ${upgrade_tier["monthly_retail_usd"]}/mo. Your cameras, recordings, and analytics settings all carry over.</p>'
             f'<button class="action-button" id="subscription-upgrade-button" data-tier-label="{escape(upgrade_tier["tier_label"],quote=True)}">Upgrade to Hybrid</button>'
             f'<p id="subscription-upgrade-message" class="health-detail"></p>'
             f'</div>'
@@ -104143,11 +104143,11 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
     <p>{plan_summary}</p>
-    <p class="health-detail">This reflects what Stripe has verified for your account. Billing itself is managed entirely through Stripe, not this page.</p>
+    <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
-    <div class="health-row"><span><strong>Local</strong> &middot; one-time purchase</span><span>Local recording, playback, live view, analytics, and licensing -- no required cloud dependency for normal operation.</span></div>
-    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything Local has, plus cloud identity/services, remote access, event-media upload, analytics sync, notifications, and relay/P2P live view.</span></div>
+    <div class="health-row"><span><strong>Local</strong> &middot; one-time purchase</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance at home. Keeps working without an internet connection.</span></div>
+    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
     </section>
     {upgrade_panel}
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
@@ -121887,6 +121887,7 @@ def _render_customer_alerts(request: Request) -> str:
     content, scripts = smart_alerts.render_inbox(
         groups, view=view, tz=APPLIANCE_TIMEZONE, alert_text=_customer_alert_text,
         clip_href=clip_href, talk_camera_ids=talk_camera_ids, counts=counts,
+        capped_at=500 if len(notifications_list) >= 500 else None,
     )
     return page_shell("Alerts", "alerts", content, scripts)
 

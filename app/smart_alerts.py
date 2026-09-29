@@ -116,7 +116,7 @@ def _ids(group: dict) -> str:
 
 
 def render_inbox(groups: list[dict], *, view: str, tz, alert_text: Callable[[dict], tuple[str, str]],
-                 clip_href: Callable[[dict], str | None], talk_camera_ids: set, counts: dict) -> tuple[str, str]:
+                 clip_href: Callable[[dict], str | None], talk_camera_ids: set, counts: dict, capped_at: int | None = None) -> tuple[str, str]:
     """(content, scripts) for the Smart Alerts page."""
     cards = []
     for group in groups:
@@ -180,6 +180,7 @@ def render_inbox(groups: list[dict], *, view: str, tz, alert_text: Callable[[dic
 <div class="sa-top-links"><a class="ghost-button" href="/events">Full history in Events</a> <a class="ghost-button" href="/settings/notifications">Alert settings</a></div></header>
 <nav class="sa-views" aria-label="Alert views">{views}</nav>
 <div class="sa-filters" role="toolbar" aria-label="Filter alerts">{filters}</div>
+{f'<p class="health-detail" id="sa-capped">Showing your latest {capped_at} alerts. Older ones are in <a href="/events">Events</a>.</p>' if capped_at else ''}
 <section class="sa-list" id="sa-list">{"".join(cards) or f'<div class="empty-stage" id="sa-empty">{empty}</div>'}</section>
 <div class="empty-stage" id="sa-filter-empty" hidden>No alerts in this category.</div>'''
     return content, SMART_ALERTS_SCRIPT
