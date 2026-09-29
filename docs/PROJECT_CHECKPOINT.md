@@ -4408,3 +4408,16 @@ The Front Door, Living Room and Bedroom cameras are the regression/physical vali
 - record camera **audio-input (microphone) capability** during discovery alongside talkback (today only talkback, `talk_down_supported`, is recorded);
 - hide the listen control on cameras without audio;
 - include audio-capability detection in installer and onboarding validation.
+
+## 2026-09-29 — staging a7eb8fe: universal two-way audio (cloud side) deployed and validated
+
+- Full suite on e7f9ed4: 86 failed / 4479 passed, no failures outside the known-failure baseline.
+- Staging live: `a7eb8fe1d8195a89e0854295c46b4c4970c1fe9d` (container portal-a7eb8fe). Rollback: stopped `portal-c481ed6-pre-a7eb8fe-20260929T020556Z-rollback`. Outside poll during cutover: 121/121 HTTP 200.
+- Cutover tooling fix (b625ab0): Cloudflare's long-lived HTTP/2 connections pin Caddy's pooled upstream connections to the live container, so the candidate may get zero public traffic before the stop (two aborted attempts; a `caddy reload` did not help and left an old Caddy server in eternal-grace). If the public route hasn't shown the candidate in 30 s, /health and /version are verified from inside Caddy's container by candidate name with the public Host header (build ID must match); then the old container is stopped and the public route must show the build or the automatic rollback runs.
+- Browser-validated on staging (headless Chromium, fake mic, desktop and iPhone viewport):
+  - Talk button present on Front Door, Living Room, Bedroom (talk_down_supported=1); absent on Driveway Left/Right (0).
+  - Phone: label "Tap to talk, tap again to stop"; tap -> talk/start; desktop press-and-hold -> talk/start.
+  - Cloud Talk start returns 503 "Camera talk channel offline..." (Ryzen has no appliance talk channel yet) and the UI shows it.
+  - Voice Call Answer: video unmuted and playing, getUserMedia called exactly once, Talk afterwards reuses it (count stays 1). Mic denied: "Microphone blocked: open this page in Safari or Chrome..." (test answered stale call 82a79b80...).
+  - Cooldowns in the running container: ordinary 900 s, Voice Call 300 s; supersede window 120 s for person/smart_motion/motion/ppe.
+- NOT validated, blocked on the Ryzen: at ~01:11-01:16 UTC (before the deploy) the Ryzen stopped polling /api/appliance/live/p2p/pending, uploading live segments, and sending detection events; heartbeat continued. So P2P live video/audio, relay live view, audio on cameras without talkback, and one-email-per-visit are unverified. No Ryzen or Samsung changes made.
