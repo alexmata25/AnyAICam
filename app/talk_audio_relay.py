@@ -231,6 +231,11 @@ def open_isapi_audio_upload(host: str, path: str, username: str, password: str, 
 
 
 _appliance_channels: dict[str, WebSocket] = {}  # appliance_id -> its single open control WebSocket
+
+
+def appliance_talk_channel_connected(appliance_id: str | None) -> bool:
+    """Is this appliance's talk channel open to this cloud process?"""
+    return bool(appliance_id) and appliance_id in _appliance_channels
 _active_relays: dict[str, dict] = {}  # session_id -> {"camera_id","appliance_id","customer_id","created_at"}
 
 

@@ -240,7 +240,7 @@ def test_full_vertical_slice_trigger_to_notification_to_call_screen(client, db_p
     assert "<iframe" not in html
     assert html.count("<html") == 1
     assert html.count('id="live-view-video"') == 1
-    assert html.count('class="camera-tool talk-mic"') == 1
+    assert html.count('class="camera-tool talk-mic"') == 0  # seeded cameras have no verified talkback
     assert 'class="camera-tool unlock-door"' not in html  # the call screen's own Unlock Door button is the only unlock control
 
     # 5. Answer, then end the call.

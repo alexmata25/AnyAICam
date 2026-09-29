@@ -206,12 +206,13 @@ def test_call_screen_audio_line_reflects_the_cameras_talk_capability(http_client
     assert _login(http_client, "owner-a@example.test", PASSWORD_A).status_code in (200, 303)
     page = http_client.get(f"/aac/voice-call/{tenants['call_a']}").text
     assert "does not support two-way audio" in page and "not enabled on this deployment" not in page
+    assert 'class="camera-tool talk-mic"' not in page  # no Talk control on a camera without talkback
     con = sqlite3.connect(db_path)
     con.execute("UPDATE cameras SET talk_down_supported=1 WHERE id=?", (tenants["cam_a"],))
     con.commit()
     con.close()
     page = http_client.get(f"/aac/voice-call/{tenants['call_a']}").text
-    assert "Press and hold the microphone button" in page and "not confirmed to reach" not in page
+    assert "Tap Answer to hear the visitor" in page and "not confirmed to reach" not in page
     # One interface on the full real page shell: no nested Live page.
     assert "<iframe" not in page and page.count("<html") == 1
     assert page.count('id="live-view-video"') == 1 and page.count('class="camera-tool talk-mic"') == 1

@@ -206,6 +206,30 @@ def _external_channels(db,*,user,customer_id: str,camera_id: str | None,event_ty
     }
 
 
+# One notification per visit (2026-09-28): a person at an AAC Voice Call
+# entrance camera produces both the Voice Call and an ordinary detection
+# alert. The Voice Call email is the one to act on (it opens the live call),
+# so ordinary detection emails for that camera are skipped when a Voice
+# Call exists within this window. Smart Alerts still lists them.
+VOICE_CALL_SUPERSEDES_EVENT_TYPES = frozenset({'person', 'smart_motion', 'motion', 'ppe'})
+VOICE_CALL_SUPERSEDE_WINDOW_SECONDS = 120
+
+
+def voice_call_supersedes_email(db, *, camera_id: str | None, event_type: str, at: datetime) -> bool:
+    if not camera_id or event_type not in VOICE_CALL_SUPERSEDES_EVENT_TYPES:
+        return False
+    from datetime import timedelta
+    window = timedelta(seconds=VOICE_CALL_SUPERSEDE_WINDOW_SECONDS)
+    try:
+        row = db.execute(
+            "SELECT 1 FROM aac_voice_call_events WHERE camera_id=? AND created_at BETWEEN ? AND ? LIMIT 1",
+            (camera_id, (at - window).isoformat(), (at + window).isoformat()),
+        ).fetchone()
+    except Exception:
+        return False  # no Voice Call table/feature here: never suppress
+    return row is not None
+
+
 def _security_sms_wanted(customer_id: str, site_id: str) -> bool:
     try:
         import security_modes
@@ -257,6 +281,10 @@ def fanout_appliance_event(appliance: dict,event: dict):
             if not channels.get(channel): continue
             if channel=='email':
                 import notification_email
+                with connection() as db: superseded=voice_call_supersedes_email(db,camera_id=camera_id,event_type=event_type,at=now)
+                if superseded:
+                    with connection() as db: db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,'email','skipped_voice_call','configured_email',None,recipients['email'],0,now.isoformat()))
+                    continue
                 if notification_email.waits_for_media(event_type,event.get('id')):
                     # Held until the thumbnail/clip reach the cloud (or a short
                     # deadline): notification_retry_worker.send_pending_media_emails().

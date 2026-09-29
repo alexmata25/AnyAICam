@@ -116,7 +116,10 @@ _P2P_JS = """
     const config = await getP2PConfig();
     if (!config.enabled) throw new Error('p2p_disabled');
 
-    const pc = new RTCPeerConnection({iceServers: config.ice_servers || []});
+    // max-bundle: video and audio share one transport, so every ICE
+    // candidate belongs to the first (video) m-line -- the appliance's
+    // trickle-ICE forwarder labels candidates for that line.
+    const pc = new RTCPeerConnection({iceServers: config.ice_servers || [], bundlePolicy: 'max-bundle'});
     let settled = false, trackArrived = false;
     const timeoutMs = config.timeout_ms || 15000;
     const failClosed = () => { try { pc.close(); } catch (e) {} };
@@ -126,10 +129,14 @@ _P2P_JS = """
       // relay keeps playing (the caller claims the tile only on resolve).
       // A track that never produces a frame before timeoutMs rejects as
       // 'no_frames', so the viewer simply stays on the relay.
+      // Audio + video (2026-09-28): every arriving track (video and the
+      // camera's audio) goes into ONE stream the <video> element plays, so
+      // live view carries the camera microphone, not just pictures.
+      const stream = new MediaStream();
       pc.ontrack = (event) => {
+        if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
         if (settled || trackArrived) return;
         trackArrived = true;
-        const stream = event.streams[0];
         const waitForFrame = async () => {
           while (!settled) {
             if (await videoFramesDecoded(pc) > 0) {
@@ -158,6 +165,7 @@ _P2P_JS = """
     });
 
     pc.addTransceiver('video', {direction: 'recvonly'});
+    pc.addTransceiver('audio', {direction: 'recvonly'});  // the camera microphone (G.711 via the appliance)
     // Trickle ICE (2026-09-17): load-bearing, not best-effort -- the
     // offer below is sent before gathering finishes, so every candidate
     // discovered here (including the one that ultimately succeeds) is
@@ -298,6 +306,15 @@ _P2P_JS = """
 
 _TALK_MIC_JS = """
 function wireTalkMic(button, cameraId) {
+  // Phones (coarse pointer): tap once to start talking, tap again to stop
+  // (2026-09-28). Press-and-hold failed on a phone: the microphone
+  // permission prompt and touch gestures cancel the hold, ending the
+  // session before any audio was sent. Desktop keeps press-and-hold.
+  const toggleMode = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  if (toggleMode) {
+    button.title = 'Tap to talk, tap again to stop';
+    button.setAttribute('aria-label', 'Tap to talk, tap again to stop');
+  }
   // Press-and-hold state, keyed by a monotonically increasing generation
   // token (pressId) rather than a single boolean -- this is what makes
   // the async pointer lifecycle race-free. start() is async and awaits
@@ -344,7 +361,7 @@ function wireTalkMic(button, cameraId) {
     const name = error && error.name;
     if (name === 'NotFoundError' || name === 'OverconstrainedError') return 'No microphone was found on this device.';
     if (name === 'NotReadableError') return 'The microphone is in use by another application.';
-    return 'Microphone permission denied or unavailable.';
+    return 'Microphone blocked. Open this page in Safari or Chrome and allow the microphone for this site.';
   }
 
   function cleanupOrphanSession(sid) {
@@ -461,7 +478,12 @@ function wireTalkMic(button, cameraId) {
 
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Reuse the microphone the Voice Call screen already opened at
+      // Answer (a clone, so ending this talk never closes the call's mic).
+      const callMic = window.aacCallMicStream;
+      stream = (callMic && callMic.getAudioTracks().some(track => track.readyState === 'live'))
+        ? callMic.clone()
+        : await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
       if (myPress === pressId) { held = false; sessionId = null; }
       talkToast(microphoneFailureMessage(e));
@@ -538,10 +560,18 @@ function wireTalkMic(button, cameraId) {
     silentGain.connect(audioCtx.destination);
   }
 
-  button.addEventListener('pointerdown', start);
-  button.addEventListener('pointerup', (event) => stop(event));
-  button.addEventListener('pointercancel', (event) => stop(event));
-  button.addEventListener('pointerleave', (event) => stop(event));
+  if (toggleMode) {
+    button.addEventListener('pointerdown', (event) => {
+      try { event.preventDefault(); } catch (e) {}
+      try { event.stopPropagation(); } catch (e) {}
+      if (held) stop(); else start();
+    });
+  } else {
+    button.addEventListener('pointerdown', start);
+    button.addEventListener('pointerup', (event) => stop(event));
+    button.addEventListener('pointercancel', (event) => stop(event));
+    button.addEventListener('pointerleave', (event) => stop(event));
+  }
   window.addEventListener('pagehide', () => stop());
 }
 """
@@ -912,9 +942,12 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
         f'<small>This can take a few seconds.</small></div></div>'
         f'<div class="camera-tools" style="justify-content:center">'
         f'<button class="camera-tool" id="live-view-mute" title="Mute" aria-label="Mute">♪</button>'
-        f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
-        f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}" '
-        f'{"" if talk_state["enabled"] else "disabled"}>🎤</button>'
+        # Talk only on cameras whose talkback capability was detected
+        # (2026-09-28): an unsupported or unverified camera shows no Talk
+        # control at all, rather than a dead one.
+        + (f'<button class="camera-tool talk-mic" id="talk-mic-{escape(camera_id, quote=True)}" '
+           f'title="{escape(talk_tooltip)}" aria-label="{escape(talk_tooltip)}">🎤</button>'
+           if talk_state["enabled"] else '') +
         f'<button class="camera-tool" id="live-view-snapshot" title="Snapshot" aria-label="Snapshot">◉</button>'
         # 2026-09-25: only controls that work. Download/Share/Bookmark were
         # placeholders ("coming soon" / "use Playback") and are gone;
@@ -1195,7 +1228,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
   // authorization or capability has changed since the page loaded --
   // never assumes render-time state still holds.
   const talkButton=document.getElementById({json.dumps('talk-mic-' + camera_id)});
-  wireTalkMic(talkButton, {json.dumps(camera_id)});
+  if (talkButton) wireTalkMic(talkButton, {json.dumps(camera_id)});
 
   // Unlock Door: the button only exists in the DOM at all when this
   // camera is door-enabled (see live_view_page()'s own unlock_tool_button
@@ -1515,11 +1548,10 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 </div>
                 <div class="tile-name-overlay">{escape(_camera_display_label(camera))}</div>
                 <div class="tile-controls-overlay">
-                  <button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
+                  {f'''<button class="camera-tool talk-mic" id="talk-mic-{escape(camera['id'], quote=True)}"
                     data-camera-id="{escape(camera['id'], quote=True)}"
                     title="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                    aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}"
-                    {'' if camera['enabled'] else 'disabled'}>🎤</button>
+                    aria-label="{escape(camera['tooltip'] or 'Press and hold to talk')}">🎤</button>''' if camera['enabled'] else ''}
                   <a class="camera-tool" href="/customer/cameras/{escape(camera['id'], quote=True)}/live"
                     title="Camera tools (mute, snapshot, fullscreen, playback, analytics, stop)"
                     aria-label="Open camera tools">⚙</a>
