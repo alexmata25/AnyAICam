@@ -1,0 +1,2440 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>Cloud Storage &amp; Adapter Setup Wizard | ANY AI CAM</title>
+<meta content="Complete the cloud storage and adapter setup wizard for your security camera system. Select recording days, camera resolution, and billing preferences." name="description"/>
+<meta content="cloud setup wizard, cloud storage setup, camera adapter setup, cloud recording configuration, ANY AI CAM setup" name="keywords"/>
+<link href="https://anyaicam.com/cloud-setup-wizard.html" rel="canonical"/>
+<meta content="website" property="og:type"/>
+<meta content="Cloud Storage &amp; Adapter Setup Wizard | ANY AI CAM" property="og:title"/>
+<meta content="Set up cloud recording and adapter configuration for your security cameras with ANY AI CAM." property="og:description"/>
+<meta content="https://anyaicam.com/cloud-setup-wizard.html" property="og:url"/>
+<meta content="https://anyaicam.com/Virtual-Cloud-Adapter.webp" property="og:image"/>
+<meta content="summary_large_image" name="twitter:card"/>
+<link href="styles.css" rel="stylesheet"/>
+<style>
+        .wizard-container {
+            max-width: 800px;
+            margin: 2rem auto;
+            padding: 2rem;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+
+        .step-indicator {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 2rem;
+            position: relative;
+            gap: 0.5rem;
+        }
+
+            .step-indicator::before {
+                content: '';
+                position: absolute;
+                top: 20px;
+                left: 0;
+                right: 0;
+                height: 2px;
+                background: #e0e6ec;
+                z-index: 1;
+            }
+
+        .step {
+            text-align: center;
+            z-index: 2;
+            position: relative;
+            flex: 1;
+        }
+
+            .step.active .step-number {
+                background: #0b2b4f;
+                color: #fff;
+            }
+
+            .step.active .step-label {
+                color: #0b2b4f;
+                font-weight: 600;
+            }
+
+        .step-number {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: #e0e6ec;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 10px;
+            font-weight: bold;
+        }
+
+        .step-label {
+            font-size: 0.9rem;
+            color: #666;
+        }
+
+        .form-section {
+            margin-bottom: 2rem;
+        }
+
+            .form-section h2 {
+                color: #0b2b4f;
+                margin-bottom: 1rem;
+            }
+
+        .product-section {
+            margin-bottom: 2rem;
+        }
+
+            .product-section h3 {
+                margin-top: 0;
+                color: #0b2b4f;
+            }
+
+        .camera-config-grid,
+        .adapter-grid,
+        .duration-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .duration-grid {
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        }
+
+        .camera-option,
+        .adapter-option,
+        .duration-option {
+            border: 2px solid #e0e6ec;
+            border-radius: 8px;
+            padding: 1.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: #fff;
+        }
+
+            .camera-option:hover,
+            .adapter-option:hover,
+            .duration-option:hover {
+                border-color: #0b2b4f;
+            }
+
+            .camera-option.selected,
+            .adapter-option.selected,
+            .duration-option.selected {
+                border-color: #0b2b4f;
+                background: #f0f7ff;
+            }
+
+            .camera-option h3,
+            .adapter-option h3,
+            .duration-option h3 {
+                margin: 0 0 0.5rem;
+                color: #0b2b4f;
+            }
+
+            .camera-option .price,
+            .adapter-option .price,
+            .duration-option .price {
+                font-size: 1.1rem;
+                font-weight: bold;
+                color: #1677c8;
+            }
+
+            .camera-option .mp {
+                font-size: 0.9rem;
+                color: #666;
+            }
+
+        .quantity-input {
+            width: 90px;
+            padding: 0.5rem;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            text-align: center;
+            margin-top: 0.75rem;
+        }
+
+        .billing-cycle-wrap {
+            margin: 1.5rem 0;
+        }
+
+            .billing-cycle-wrap label {
+                display: block;
+                font-weight: 600;
+                color: #0b2b4f;
+                margin-bottom: 0.5rem;
+            }
+
+        .billing-cycle-select {
+            width: 100%;
+            max-width: 320px;
+            padding: 0.8rem;
+            border: 1px solid #cfd8e3;
+            border-radius: 6px;
+            background: #fff;
+            color: #333;
+            font-size: 1rem;
+        }
+        .billing-cycle-select option {
+            background: #fff;
+            color: #333;
+        }
+
+        .billing-note {
+            margin-top: 0.5rem;
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .btn-group {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            margin-top: 2rem;
+            flex-wrap: wrap;
+        }
+
+            .btn-group button,
+            .btn-next {
+                padding: 0.8rem 1.5rem;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                font-weight: 600;
+            }
+
+        .btn-prev {
+            background: #f0f0f0;
+            color: #333;
+        }
+
+        .btn-next {
+            background: #0b2b4f;
+            color: white;
+        }
+
+        .btn-prev:hover {
+            background: #e0e0e0;
+        }
+
+        .btn-next:hover {
+            background: #091f3a;
+        }
+
+        .btn-next:disabled {
+            background: #9aa8b6;
+            cursor: not-allowed;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .price-breakdown,
+        .selection-summary {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-top: 1rem;
+        }
+
+        .selection-summary {
+            background: #f0f7ff;
+        }
+
+            .price-breakdown p,
+            .selection-summary p {
+                margin: 0.35rem 0;
+            }
+
+        .total-price {
+            font-weight: bold;
+            font-size: 1.2rem;
+            color: #0b2b4f;
+            margin-top: 0.75rem;
+        }
+
+        .section-total {
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid #d7e0ea;
+        }
+
+            .section-total strong {
+                color: #0b2b4f;
+            }
+
+        .subheading {
+            margin: 1.5rem 0 1rem;
+            color: #0b2b4f;
+        }
+
+        .info-note {
+            background: #fff8e8;
+            border: 1px solid #f1d389;
+            color: #6b5200;
+            padding: 0.9rem 1rem;
+            border-radius: 8px;
+            margin-top: 1rem;
+            font-size: 0.95rem;
+        }
+
+
+        .owned-adapter-callout {
+            background: #eaf8f2;
+            border: 1px solid #9ed8bd;
+            color: #134c35;
+            padding: 0.9rem 1rem;
+            border-radius: 8px;
+            margin-top: 1rem;
+            font-size: 0.95rem;
+        }
+
+        .review-contact-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .review-contact-grid label {
+            display: block;
+            font-weight: 600;
+            color: #0b2b4f;
+            margin-bottom: 0.35rem;
+        }
+
+        .review-contact-grid input,
+        .review-contact-grid textarea {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 0.75rem;
+            border: 1px solid #cfd8e3;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-family: inherit;
+        }
+
+        .review-contact-grid textarea {
+            min-height: 92px;
+            resize: vertical;
+        }
+
+        @media (max-width: 640px) {
+            .wizard-container {
+                margin: 1rem;
+                padding: 1rem;
+            }
+
+            .step-label {
+                font-size: 0.75rem;
+            }
+
+            .step-number {
+                width: 34px;
+                height: 34px;
+            }
+        }
+    </style>
+<style id="anyaicam-real-compact-ui">
+:root{
+  --aac-navy:#09102f;
+  --aac-panel:#14243c;
+  --aac-panel2:#1b3149;
+  --aac-cyan:#5fc4d1;
+  --aac-pink:#cc3b96;
+  --aac-white:#f8fbff;
+  --aac-muted:#b8c9d9;
+}
+body{
+  background:linear-gradient(180deg,#0b1830 0%,#19364a 60%,#243d50 100%)!important;
+  color:var(--aac-white);
+}
+main{padding:24px 14px 70px}
+.wizard-container{
+  max-width:1120px!important;
+  margin:0 auto!important;
+  padding:28px!important;
+  background:rgba(9,16,47,.48)!important;
+  border:1px solid rgba(255,255,255,.15);
+  border-radius:18px!important;
+  box-shadow:0 24px 60px rgba(0,0,0,.25)!important;
+}
+.wizard-container>h1{color:#fff!important}
+.step-indicator::before{background:rgba(255,255,255,.25)!important}
+.step-number{background:#dce8ed!important;color:#15283a!important}
+.step.active .step-number{background:linear-gradient(135deg,var(--aac-pink),var(--aac-cyan))!important;color:#fff!important}
+.step-label{color:var(--aac-muted)!important}
+.step.active .step-label{color:#fff!important}
+.form-section h2,.product-section h3,.subheading{color:#fff!important}
+.form-section>p,.billing-note{color:var(--aac-muted)!important}
+.compact-list{display:grid;gap:0;margin:1rem 0 1.5rem}
+.compact-head,.compact-row{
+  display:grid;
+  grid-template-columns:minmax(230px,1fr) minmax(150px,.42fr) minmax(120px,.28fr);
+  gap:16px;
+  align-items:center;
+}
+.compact-head{
+  padding:8px 14px;
+  color:var(--aac-muted);
+  font-size:.8rem;
+  font-weight:900;
+  text-transform:uppercase;
+}
+.compact-row{
+  padding:15px 14px;
+  border-top:1px solid rgba(255,255,255,.13);
+  background:rgba(255,255,255,.025);
+  cursor:pointer;
+}
+.compact-row:last-child{border-bottom:1px solid rgba(255,255,255,.13)}
+.compact-row.selected{
+  background:linear-gradient(90deg,rgba(204,59,150,.13),rgba(95,196,209,.12));
+  box-shadow:inset 4px 0 var(--aac-cyan);
+}
+.compact-title strong{display:block;color:#fff;font-size:1.04rem}
+.compact-title span{display:block;color:var(--aac-muted);font-size:.86rem;margin-top:4px}
+.compact-price{color:var(--aac-cyan);font-weight:900;text-align:right}
+.qty-control{display:flex;justify-content:center;align-items:center;gap:8px}
+.qty-control button{
+  width:31px;height:31px;padding:0;border:0;border-radius:50%;
+  background:#dbe6eb;color:#14283a;font-weight:900;font-size:1.1rem;cursor:pointer;
+}
+.qty-control input{
+  width:72px!important;min-height:43px;padding:7px!important;
+  background:rgba(255,255,255,.12)!important;color:#fff!important;
+  border:1px solid rgba(255,255,255,.72)!important;border-radius:7px!important;
+  text-align:center;margin:0!important;font-size:1rem;
+}
+.camera-quantity-table .compact-head,
+.camera-quantity-table .compact-row{
+  grid-template-columns:minmax(210px,1fr) minmax(155px,.55fr);
+}
+.recording-row{
+  display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:1rem 0 1.5rem;
+}
+.recording-choice,.duration-option{
+  padding:14px!important;border:2px solid rgba(255,255,255,.25)!important;
+  border-radius:10px!important;background:rgba(255,255,255,.04)!important;
+  text-align:center;cursor:pointer;
+}
+.recording-choice.selected,.duration-option.selected{
+  border-color:var(--aac-cyan)!important;
+  background:linear-gradient(135deg,rgba(204,59,150,.13),rgba(95,196,209,.13))!important;
+}
+.recording-choice h3,.duration-option h3{color:#fff!important;margin:.1rem 0!important}
+.recording-choice p,.duration-option .price{color:var(--aac-muted)!important}
+.duration-grid{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:10px!important}
+.price-breakdown,.selection-summary{
+  background:rgba(255,255,255,.07)!important;color:#fff!important;
+  border:1px solid rgba(255,255,255,.14);
+}
+.billing-cycle-select,input,select,textarea{
+  background:#fff!important;color:#12263a!important
+}
+.btn-next{
+  background:linear-gradient(90deg,var(--aac-pink),var(--aac-cyan))!important;
+  color:#fff!important;border-radius:999px!important;
+}
+.btn-prev{
+  background:transparent!important;color:#fff!important;
+  border:1px solid rgba(255,255,255,.55)!important;border-radius:999px!important;
+}
+@media(max-width:720px){
+  .compact-head{display:none}
+  .compact-row,.camera-quantity-table .compact-row{
+    grid-template-columns:1fr;gap:10px;
+  }
+  .qty-control{justify-content:flex-start}
+  .compact-price{text-align:left}
+  .duration-grid{grid-template-columns:repeat(2,1fr)!important}
+}
+.quote-review-promo {
+    max-width: 760px;
+    margin: 1.5rem auto;
+    padding: 1rem;
+    background: #f7faff;
+    border: 1px solid #dce6f5;
+    border-radius: 14px;
+}
+.quote-review-promo h3 {
+    margin: 0 0 .85rem;
+    text-align: center;
+    color: #0b1332;
+}
+.quote-review-video {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    overflow: hidden;
+    border-radius: 10px;
+    background: #070d25;
+}
+.quote-review-video iframe {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+}
+</style>
+<style id="anyaicam-review-contrast-fix">
+  .selection-summary,
+  .price-breakdown,
+  .summary,
+  .review-summary,
+  .order-summary,
+  .summary-card {
+    color:#f8fbff !important;
+  }
+
+  .selection-summary p,
+  .price-breakdown p,
+  .summary p,
+  .review-summary p,
+  .order-summary p,
+  .summary-card p,
+  .selection-summary span,
+  .price-breakdown span,
+  .summary span,
+  .review-summary span,
+  .order-summary span,
+  .summary-card span {
+    color:#f8fbff !important;
+  }
+
+  .selection-summary strong,
+  .price-breakdown strong,
+  .summary strong,
+  .review-summary strong,
+  .order-summary strong,
+  .summary-card strong {
+    color:#5fc4d1 !important;
+  }
+
+  .selection-summary h2,
+  .selection-summary h3,
+  .price-breakdown h2,
+  .price-breakdown h3,
+  .summary h2,
+  .summary h3,
+  .review-summary h2,
+  .review-summary h3,
+  .order-summary h2,
+  .order-summary h3,
+  .summary-card h2,
+  .summary-card h3 {
+    color:#ffffff !important;
+  }
+
+  .total-price,
+  .section-total,
+  #review-total,
+  #estimated-cloud-total {
+    color:#5fc4d1 !important;
+    font-weight:900 !important;
+  }
+
+  .selection-summary hr,
+  .price-breakdown hr,
+  .summary hr,
+  .review-summary hr,
+  .order-summary hr,
+  .summary-card hr {
+    border-color:rgba(255,255,255,.35) !important;
+  }
+
+  .selection-summary .muted,
+  .price-breakdown .muted,
+  .summary .muted,
+  .review-summary .muted,
+  .order-summary .muted,
+  .summary-card .muted {
+    color:#c4d2dc !important;
+  }
+</style>
+<style id="anyaicam-public-review-and-software-fix">
+  #price-breakdown,
+  #price-breakdown p,
+  #price-breakdown li,
+  #analytics-breakdown,
+  #analytics-breakdown p,
+  #analytics-breakdown li,
+  #review-summary,
+  #review-summary p,
+  #review-summary li,
+  .selection-summary,
+  .selection-summary p,
+  .section-total,
+  .section-total p {
+    color:#f4f8ff !important;
+  }
+
+  #price-breakdown strong,
+  #analytics-breakdown strong,
+  #review-summary strong,
+  .selection-summary strong,
+  .section-total strong,
+  .total-price {
+    color:#7dd6df !important;
+  }
+
+  #price-breakdown h2,
+  #price-breakdown h3,
+  #analytics-breakdown h2,
+  #analytics-breakdown h3,
+  #review-summary h2,
+  #review-summary h3,
+  .selection-summary h2,
+  .selection-summary h3 {
+    color:#ffffff !important;
+  }
+
+  .info-note {
+    background:#fff5d9 !important;
+    color:#6b5200 !important;
+    border:1px solid #e5cb7c !important;
+  }
+
+  .info-note * {
+    color:#6b5200 !important;
+  }
+
+  .adapter-option[data-adapter="software"] {
+    background:linear-gradient(135deg,rgba(204,59,150,.18),rgba(95,196,209,.16)) !important;
+    border-color:#5fc4d1 !important;
+  }
+
+  .adapter-option[data-adapter="software"] .compact-title strong,
+  .adapter-option[data-adapter="software"] h3 {
+    color:#ffffff !important;
+  }
+
+  .adapter-option[data-adapter="software"] .compact-title span,
+  .adapter-option[data-adapter="software"] p {
+    color:#d7e4ef !important;
+  }
+
+  .adapter-option[data-adapter="software"] .compact-price,
+  .adapter-option[data-adapter="software"] .price {
+    color:#7dd6df !important;
+    font-weight:900 !important;
+  }
+</style>
+
+<style id="anyaicam-videoloft-bright-refresh">
+:root{
+  --aic-navy:#071032;
+  --aic-blue:#0b2b4f;
+  --aic-cyan:#23c7d5;
+  --aic-pink:#cc3b96;
+  --aic-line:#d9e4f2;
+  --aic-muted:#5d6b82;
+  --aic-soft:#f4f8fc;
+  --aic-soft-blue:#eef8fb;
+  --aic-white:#ffffff;
+}
+html{scroll-behavior:smooth}
+body{
+  background:linear-gradient(180deg,#f7fbff 0%,#f2f7fb 58%,#eef4f9 100%)!important;
+  color:var(--aic-navy)!important;
+}
+.trial-banner{
+  background:linear-gradient(90deg,#0b2b4f,#0e4962)!important;
+  color:#fff!important;
+  border-bottom:1px solid rgba(255,255,255,.18)!important;
+}
+.site-header{
+  background:var(--aic-navy)!important;
+  border-bottom:1px solid rgba(255,255,255,.14)!important;
+  box-shadow:0 8px 24px rgba(7,16,50,.18)!important;
+}
+.site-nav > a,.site-nav > .dropdown > .dropbtn{color:#fff!important}
+.site-nav > a:hover,.site-nav > a:focus-visible,.site-nav > .dropdown > .dropbtn:hover,.site-nav > .dropdown > .dropbtn:focus-visible{color:var(--aic-cyan)!important}
+.dropdown-content a{color:var(--aic-blue)!important}
+.mobile-menu-toggle{border-color:var(--aic-cyan)!important;color:#fff!important;background:transparent!important}
+.site-header.menu-open .site-nav{background:var(--aic-navy)!important}
+main{padding:36px 14px 72px!important}
+.wizard-container{
+  max-width:1180px!important;
+  margin:0 auto!important;
+  padding:0!important;
+  background:#fff!important;
+  color:var(--aic-navy)!important;
+  border:1px solid var(--aic-line)!important;
+  border-radius:20px!important;
+  box-shadow:0 18px 46px rgba(7,16,50,.09)!important;
+  overflow:hidden!important;
+}
+.wizard-layout{display:block!important}
+.wizard-main{display:block!important;padding:28px 30px 34px!important}
+.wizard-container h1{
+  margin:.15rem 0 1rem!important;
+  color:var(--aic-navy)!important;
+  font-size:clamp(2rem,4vw,3.15rem)!important;
+  line-height:1.05!important;
+  letter-spacing:-.025em!important;
+}
+.wizard-container h1::before{
+  content:'Videoloft Cloud Setup Wizard';
+  display:block;
+  margin-bottom:.6rem;
+  color:#16778b;
+  font-size:.78rem;
+  font-weight:900;
+  letter-spacing:.09em;
+  text-transform:uppercase;
+}
+.info-note{
+  background:#f7fbff!important;
+  color:#34415d!important;
+  border:1px solid #d8e7f1!important;
+  border-left:5px solid var(--aic-cyan)!important;
+  border-radius:12px!important;
+  box-shadow:none!important;
+}
+.info-note *{color:inherit!important}
+.step-indicator{
+  display:grid!important;
+  grid-template-columns:repeat(5,minmax(0,1fr))!important;
+  gap:0!important;
+  margin:1.5rem 0 2rem!important;
+  padding:0!important;
+  background:#f0f5fa!important;
+  border:1px solid var(--aic-line)!important;
+  border-radius:14px!important;
+  overflow:hidden!important;
+}
+.step-indicator::before{display:none!important}
+.step{
+  min-width:0!important;
+  padding:.75rem .35rem .65rem!important;
+  background:transparent!important;
+  border-right:1px solid var(--aic-line)!important;
+}
+.step:last-child{border-right:0!important}
+.step-number{
+  width:32px!important;height:32px!important;
+  margin:0 auto .35rem!important;
+  background:#dfe8f1!important;
+  color:#53647b!important;
+  border:0!important;
+  box-shadow:none!important;
+  font-size:.86rem!important;
+}
+.step-label{color:#6b7890!important;font-size:.78rem!important;font-weight:800!important}
+.step.active{background:#fff!important;box-shadow:inset 0 -3px 0 var(--aic-cyan)!important}
+.step.active .step-number{background:linear-gradient(135deg,var(--aic-pink),var(--aic-cyan))!important;color:#fff!important}
+.step.active .step-label{color:var(--aic-navy)!important}
+.form-section h2,.product-section h3,.subheading{
+  color:var(--aic-navy)!important;
+}
+.form-section h2{font-size:clamp(1.45rem,2.4vw,2rem)!important;margin:.2rem 0 .45rem!important}
+.form-section>p,.billing-note{color:var(--aic-muted)!important;line-height:1.65!important}
+.compact-list{gap:.65rem!important}
+.compact-head{
+  color:#66768c!important;
+  background:#f7f9fc!important;
+  border:1px solid var(--aic-line)!important;
+  border-radius:10px!important;
+}
+.compact-row{
+  margin-top:0!important;
+  padding:15px 14px!important;
+  border:2px solid var(--aic-line)!important;
+  border-radius:14px!important;
+  background:#fff!important;
+  color:var(--aic-navy)!important;
+  box-shadow:none!important;
+}
+.compact-row:hover{border-color:#9bdfe5!important;box-shadow:0 8px 20px rgba(7,16,50,.05)!important}
+.compact-row.selected{
+  border-color:var(--aic-cyan)!important;
+  background:#f0fdff!important;
+  box-shadow:0 0 0 2px rgba(35,199,213,.08)!important;
+}
+.compact-title strong{color:var(--aic-navy)!important}
+.compact-title span{color:var(--aic-muted)!important}
+.compact-price{color:#1677c8!important}
+.qty-control button{
+  background:#eef4f8!important;color:var(--aic-blue)!important;
+  border:1px solid #c9d8e6!important;
+}
+.qty-control button:hover{background:#dff5f7!important;border-color:var(--aic-cyan)!important}
+.qty-control input,
+.billing-cycle-select,input,select,textarea{
+  background:#fff!important;color:#12263a!important;
+  border:1px solid #aebed0!important;
+  border-radius:10px!important;
+}
+.qty-control input:focus,.billing-cycle-select:focus,input:focus,select:focus,textarea:focus{
+  outline:3px solid rgba(35,199,213,.18)!important;
+  border-color:var(--aic-cyan)!important;
+}
+.recording-row{gap:.8rem!important}
+.recording-choice,.duration-option{
+  background:#fff!important;
+  border:2px solid var(--aic-line)!important;
+  border-radius:14px!important;
+  color:var(--aic-navy)!important;
+}
+.recording-choice:hover,.duration-option:hover{border-color:#9bdfe5!important}
+.recording-choice.selected,.duration-option.selected{
+  border-color:var(--aic-cyan)!important;
+  background:#f0fdff!important;
+  box-shadow:0 0 0 2px rgba(35,199,213,.08)!important;
+}
+.recording-choice h3,.duration-option h3{color:var(--aic-navy)!important}
+.recording-choice p,.duration-option .price{color:var(--aic-muted)!important}
+.price-breakdown,.selection-summary,#review-summary{
+  background:#f7fbff!important;
+  color:#2f3f58!important;
+  border:1px solid var(--aic-line)!important;
+  border-radius:14px!important;
+}
+.price-breakdown p,.selection-summary p,#review-summary p,
+.price-breakdown span,.selection-summary span,#review-summary span,
+.price-breakdown li,.selection-summary li,#review-summary li{color:#2f3f58!important}
+.price-breakdown strong,.selection-summary strong,#review-summary strong{color:var(--aic-blue)!important}
+.price-breakdown h2,.price-breakdown h3,.selection-summary h2,.selection-summary h3,#review-summary h2,#review-summary h3{color:var(--aic-navy)!important}
+.total-price,.section-total,#review-total,#estimated-cloud-total{color:#16778b!important}
+.adapter-option[data-adapter="software"]{
+  background:#f7fbff!important;
+  border-color:#9bdfe5!important;
+}
+.adapter-option[data-adapter="software"] .compact-title strong,
+.adapter-option[data-adapter="software"] h3{color:var(--aic-navy)!important}
+.adapter-option[data-adapter="software"] .compact-title span,
+.adapter-option[data-adapter="software"] p{color:var(--aic-muted)!important}
+.adapter-option[data-adapter="software"] .compact-price,
+.adapter-option[data-adapter="software"] .price{color:#16778b!important}
+.btn-group{padding-top:.35rem!important}
+.btn-group button,.btn-next,.btn-prev{
+  min-height:46px!important;
+  padding:.75rem 1.25rem!important;
+  border-radius:999px!important;
+  font-weight:900!important;
+}
+.btn-next{
+  background:linear-gradient(90deg,var(--aic-pink),var(--aic-cyan))!important;
+  color:#fff!important;
+  border:0!important;
+  box-shadow:0 8px 18px rgba(35,199,213,.16)!important;
+}
+.btn-next:hover{filter:brightness(.98)!important;transform:translateY(-1px)!important}
+.btn-prev{
+  background:#fff!important;color:var(--aic-blue)!important;
+  border:1px solid var(--aic-blue)!important;
+}
+.quote-review-promo{
+  background:#fff!important;
+  border:1px solid var(--aic-line)!important;
+  box-shadow:0 10px 28px rgba(7,16,50,.06)!important;
+}
+.quote-review-promo h3{color:var(--aic-navy)!important}
+.review-contact-grid label{color:var(--aic-blue)!important}
+#partner-assisted-banner{color:var(--aic-navy)!important}
+.site-footer{
+  background:#071032!important;
+  color:#d5dff8!important;
+  border-top:1px solid rgba(255,255,255,.1)!important;
+}
+.site-footer h3{color:#fff!important}
+.site-footer a{color:#d5dff8!important}
+.site-footer a:hover{color:#6be4ed!important}
+@media(max-width:800px){
+  .wizard-main{padding:22px 18px 28px!important}
+  .step-indicator{grid-template-columns:repeat(3,1fr)!important}
+  .step:nth-child(n+4){border-top:1px solid var(--aic-line)!important}
+  .duration-grid{grid-template-columns:repeat(2,1fr)!important}
+}
+@media(max-width:560px){
+  main{padding:20px 8px 48px!important}
+  .wizard-main{padding:18px 14px 24px!important}
+  .step-indicator{grid-template-columns:repeat(2,1fr)!important}
+  .step:nth-child(3){border-top:1px solid var(--aic-line)!important}
+  .recording-row{grid-template-columns:1fr!important}
+  .btn-group{display:grid!important;grid-template-columns:1fr!important}
+  .btn-group button{width:100%!important}
+}
+</style>
+
+
+<style id="anyaicam-unified-footer-layout">
+.site-footer{display:grid!important;grid-template-columns:1.35fr repeat(4,minmax(0,1fr))!important;gap:2rem!important;padding:2.4rem max(1rem,calc((100vw - 1220px)/2))!important;align-items:start!important}
+.site-footer>div{min-width:0}.site-footer h3{margin:0 0 .8rem!important;font-size:1rem!important}.site-footer a,.site-footer span,.site-footer p{display:block!important;line-height:1.55!important;margin:.3rem 0!important;text-decoration:none!important}.site-footer .brand-logo{max-width:170px!important;height:auto!important}
+@media(max-width:1000px){.site-footer{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:580px){.site-footer{grid-template-columns:1fr!important;gap:1.3rem!important;padding:2rem 1rem!important}}
+</style>
+
+<link rel="stylesheet" href="header-standard.css">
+</head>
+<body>
+
+<header class="site-header">
+<a aria-label="ANY AI CAM home" class="brand" href="index.html">
+<img alt="ANY AI CAM AI Cloud Protection" class="brand-logo" loading="lazy" src="full-logo-transparent.png"/>
+</a>
+<div class="header-controls">
+<button aria-controls="primaryNav" aria-expanded="false" class="mobile-menu-toggle" type="button">Menu</button>
+<div class="header-badges">
+<a class="live-support-badge" href="support.html">☎ Connect with Live Support</a>
+</div>
+</div>
+<nav aria-label="Primary navigation" class="site-nav" id="primaryNav">
+<a href="index.html">Home</a>
+<a href="how-it-works.html">How It Works</a>
+<a href="cloud-storage-pricing.html">Pricing</a>
+<a href="camera-compatibility-check.html">Camera Readiness</a>
+<a href="adapters.html">Adapters</a>
+<a href="cameras.html">Cameras</a>
+<a href="support.html">Support</a>
+<a href="contact.html">Contact</a>
+<a href="cloud-setup-wizard.html">Get Started</a>
+<div class="dropdown">
+<a class="dropbtn" href="#">More</a>
+<div class="dropdown-content">
+<a href="nvr.html">NVR Setup</a>
+<a href="software.html">Software</a>
+<a href="videoloft-partner.html">Videoloft Partner Login</a>
+</div>
+</div>
+</nav>
+</header>
+<main>
+<div class="wizard-container">
+<div class="wizard-layout"><section class="wizard-main">
+<h1>Build Your AI Cloud Camera Plan</h1><div class="info-note" style="margin-bottom:1.25rem;">
+<strong>Start with the cameras you already own.</strong> Build your cloud recording and AI plan first. Optional adapters, new cameras, and PoE equipment appear only when you need them. Physical installation is DIY or completed by a local technician.
+</div>
+<div class="owned-adapter-callout hidden" id="partner-assisted-banner"></div>
+<div class="step-indicator">
+<div class="step active" id="step1">
+<div class="step-number">1</div>
+<div class="step-label">Cameras</div>
+</div>
+<div class="step" id="step2">
+<div class="step-number">2</div>
+<div class="step-label">Storage</div>
+</div>
+<div class="step" id="step3">
+<div class="step-number">3</div>
+<div class="step-label">AI Features</div>
+</div>
+<div class="step" id="step4">
+<div class="step-number">4</div>
+<div class="step-label">Connection</div>
+</div>
+<div class="step" id="step5">
+<div class="step-number">5</div>
+<div class="step-label">Review</div>
+</div>
+</div>
+<!-- Step 1 -->
+<div class="form-section" id="step1-content">
+<h2>How Many Existing Cameras Do You Want on the Cloud?</h2>
+<p>Select the resolution and quantity for the cameras you already own. You can mix resolutions.</p>
+<div id="cloud-toggle" class="camera-option selected hidden" data-product="cloud" aria-hidden="true">
+<input id="cloud-service-qty" type="number" value="1" readonly />
+</div>
+<div class="compact-list camera-quantity-table">
+<div class="compact-head"><div>Camera resolution</div><div>Quantity</div></div>
+<div class="camera-option compact-row" data-resolution="2mp">
+<div class="compact-title"><strong>2MP / 1080p</strong><span>Most common resolution</span></div>
+<div class="qty-control"><button class="qty-minus" data-target="quantity-2mp" type="button">−</button><input class="quantity-input" id="quantity-2mp" max="64" min="0" type="number" value="0"/><button class="qty-plus" data-target="quantity-2mp" type="button">+</button></div>
+</div>
+<div class="camera-option compact-row" data-resolution="4mp">
+<div class="compact-title"><strong>4MP / 2K</strong><span>Higher image detail</span></div>
+<div class="qty-control"><button class="qty-minus" data-target="quantity-4mp" type="button">−</button><input class="quantity-input" id="quantity-4mp" max="64" min="0" type="number" value="0"/><button class="qty-plus" data-target="quantity-4mp" type="button">+</button></div>
+</div>
+<div class="camera-option compact-row" data-resolution="8mp">
+<div class="compact-title"><strong>8MP / 4K</strong><span>Maximum image detail</span></div>
+<div class="qty-control"><button class="qty-minus" data-target="quantity-8mp" type="button">−</button><input class="quantity-input" id="quantity-8mp" max="64" min="0" type="number" value="0"/><button class="qty-plus" data-target="quantity-8mp" type="button">+</button></div>
+</div>
+</div>
+<div class="info-note"><strong>Not sure what resolution you have?</strong> Choose the closest option for an estimate. We can confirm it before activation.</div>
+<div class="btn-group"><button class="btn-next" id="step1-next" onclick="goToStep(2)">Next: Storage</button></div>
+</div>
+<!-- Step 2 -->
+<div class="form-section hidden" id="step2-content">
+<h2>Choose Recording and Cloud Storage</h2>
+<p>Select how your cameras record and how long you want footage retained.</p>
+<h3 class="subheading">Recording Type</h3>
+<div class="recording-row">
+<div class="camera-option recording-choice" data-type="motion"><h3>Motion Triggered</h3><p>Records when activity is detected</p></div>
+<div class="camera-option recording-choice" data-type="continuous"><h3>24/7 Continuous</h3><p>Records continuously</p></div>
+</div>
+<h3 class="subheading">Storage Duration</h3>
+<div class="duration-grid">
+<div class="duration-option" data-duration="2"><h3>2 Days</h3><div class="price">Lowest monthly cost</div></div>
+<div class="duration-option" data-duration="7"><h3>7 Days</h3><div class="price">Popular</div></div>
+<div class="duration-option" data-duration="14"><h3>14 Days</h3><div class="price">Balanced</div></div>
+<div class="duration-option" data-duration="30"><h3>30 Days</h3><div class="price">Longest retention</div></div>
+</div>
+<div class="billing-cycle-wrap"><label for="billing-cycle">Future Videoloft Billing Preference</label><select class="billing-cycle-select" id="billing-cycle"><option value="monthly">Monthly Billing</option><option value="annual">Annual Billing (10% Off)</option></select><p class="billing-note">New activations include a 30-day trial. Hardware charges, if selected later, are separate.</p></div>
+<div class="price-breakdown" id="price-breakdown"></div>
+<div class="btn-group"><button class="btn-prev" onclick="goToStep(1)">Previous</button><button class="btn-next" onclick="goToStep(3)">Next: AI Features</button></div>
+</div>
+<!-- Step 3 -->
+<div class="form-section hidden" id="step3-content">
+<h2>Choose Optional AI Features</h2>
+<p>Smart Motion is the basic AI alert option. Add other analytics only to the cameras that need them. You may also continue without add-ons.</p>
+<div class="compact-list">
+<div class="compact-head"><div>Analytics feature</div><div>Quantity</div><div>Monthly price</div></div>
+<div class="camera-option compact-row" data-analytics="smart-motion" data-price="1.79"><div class="compact-title"><strong>Smart Motion</strong><span>People, vehicle, and animal event detection</span></div><div class="qty-control"><button class="qty-minus" data-target="analytics-qty-smart-motion" type="button">−</button><input class="analytics-quantity" id="analytics-qty-smart-motion" max="999" min="0" type="number" value="0"/><button class="qty-plus" data-target="analytics-qty-smart-motion" type="button">+</button></div><div class="compact-price">$1.79 / camera</div></div>
+<div class="camera-option compact-row" data-analytics="people-counting" data-price="10.99"><div class="compact-title"><strong>People Counting</strong><span>Occupancy and foot-traffic analytics</span></div><div class="qty-control"><button class="qty-minus" data-target="analytics-qty-people-counting" type="button">−</button><input class="analytics-quantity" id="analytics-qty-people-counting" max="999" min="0" type="number" value="0"/><button class="qty-plus" data-target="analytics-qty-people-counting" type="button">+</button></div><div class="compact-price">$10.99 / camera</div></div>
+<div class="camera-option compact-row" data-analytics="lpr" data-price="18.99"><div class="compact-title"><strong>License Plate Recognition</strong><span>Plate capture and searchable vehicle events</span></div><div class="qty-control"><button class="qty-minus" data-target="analytics-qty-lpr" type="button">−</button><input class="analytics-quantity" id="analytics-qty-lpr" max="999" min="0" type="number" value="0"/><button class="qty-plus" data-target="analytics-qty-lpr" type="button">+</button></div><div class="compact-price">$18.99 / camera</div></div>
+<div class="camera-option compact-row" data-analytics="ppe" data-price="17.99"><div class="compact-title"><strong>Construction PPE Monitoring</strong><span>Hard-hat, vest, and safety-equipment detection</span></div><div class="qty-control"><button class="qty-minus" data-target="analytics-qty-ppe" type="button">−</button><input class="analytics-quantity" id="analytics-qty-ppe" max="999" min="0" type="number" value="0"/><button class="qty-plus" data-target="analytics-qty-ppe" type="button">+</button></div><div class="compact-price">$17.99 / camera</div></div>
+</div>
+<div class="btn-group"><button class="btn-prev" onclick="goToStep(2)">Previous</button><button class="btn-next" onclick="goToStep(4)">Next: Connection</button></div>
+</div>
+<!-- Step 4 -->
+<div class="form-section hidden" id="step4-content">
+<h2>How Will Your Cameras Connect to the Cloud?</h2>
+<p>Choose one connection method. The software option uses an always-on Windows PC or server. A dedicated adapter works independently of a customer computer.</p>
+<h3>Connection method</h3>
+<div class="compact-list">
+<div class="compact-head"><div>Adapter</div><div>Quantity</div><div>One-time price</div></div>
+<div class="adapter-option compact-row" data-adapter="8channel">
+<div class="compact-title"><strong>Cloud Adapter Mini — 8 channels</strong><span>Connects up to 8 cameras or recorder channels</span></div>
+<div class="qty-control">
+<button class="adapter-minus" type="button">−</button>
+<input class="adapter-quantity" max="99" min="0" readonly="" type="number" value="0"/>
+<button class="adapter-plus" type="button">+</button>
+</div>
+<div class="compact-price">$349 each</div>
+</div>
+<div class="adapter-option compact-row" data-adapter="16channel">
+<div class="compact-title"><strong>Cloud Adapter — 16 channels</strong><span>Connects up to 16 cameras or recorder channels</span></div>
+<div class="qty-control">
+<button class="adapter-minus" type="button">−</button>
+<input class="adapter-quantity" max="99" min="0" readonly="" type="number" value="0"/>
+<button class="adapter-plus" type="button">+</button>
+</div>
+<div class="compact-price">$399 each</div>
+</div>
+<div class="adapter-option compact-row" data-adapter="32channel">
+<div class="compact-title"><strong>Cloud Adapter Enterprise — 32 channels</strong><span>Connects up to 32 cameras or recorder channels</span></div>
+<div class="qty-control">
+<button class="adapter-minus" type="button">−</button>
+<input class="adapter-quantity" max="99" min="0" readonly="" type="number" value="0"/>
+<button class="adapter-plus" type="button">+</button>
+</div>
+<div class="compact-price">$2,149 each</div>
+</div>
+<div class="adapter-option compact-row" data-adapter="64channel">
+<div class="compact-title"><strong>Cloud Adapter Enterprise — 64 channels</strong><span>Connects up to 64 cameras or recorder channels</span></div>
+<div class="qty-control">
+<button class="adapter-minus" type="button">−</button>
+<input class="adapter-quantity" max="99" min="0" readonly="" type="number" value="0"/>
+<button class="adapter-plus" type="button">+</button>
+</div>
+<div class="compact-price">$2,689 each</div>
+</div>
+<div class="adapter-option compact-row" data-adapter="software">
+<div class="compact-title">
+<strong>Free Downloadable Virtual Cloud Adapter</strong>
+<span>Software-only connection using an existing Windows PC or server</span>
+</div>
+<div class="qty-control">
+<button class="adapter-minus" type="button">−</button>
+<input class="adapter-quantity" max="1" min="0" readonly="" type="number" value="0"/>
+<button class="adapter-plus" type="button">+</button>
+</div>
+<div class="compact-price">$0 today</div>
+</div>
+<div class="adapter-option compact-row" data-adapter="ownedadapter" data-owned-channel="8channel">
+<div class="compact-title"><strong>I already own a Videoloft adapter</strong><span>Use existing hardware for cloud activation</span></div>
+<div class="qty-control">
+<button class="adapter-minus" type="button">−</button>
+<input class="adapter-quantity" max="1" min="0" readonly="" type="number" value="0"/>
+<button class="adapter-plus" type="button">+</button>
+</div>
+<div class="compact-price">$0 today</div>
+</div>
+</div>
+
+<div class="owned-adapter-callout hidden" id="owned-adapter-confirmation"><strong>Existing Videoloft adapter selected.</strong><p>No new adapter hardware will be charged today.</p></div>
+<div id="adapter-limit-warning" style="display:none;background:#fff3cd;color:#856404;border:1px solid #ffc107;border-radius:8px;padding:12px 16px;margin-top:1rem;"><strong>Camera Limit Exceeded</strong><br/><span id="adapter-limit-warning-text">Your selected adapter supports a maximum of <span id="max-channels-display">8</span> cameras.</span></div>
+<div class="hardware-question" style="margin-top:2rem;padding:1.25rem;border:1px solid rgba(255,255,255,.18);border-radius:14px;background:rgba(255,255,255,.05);">
+<h3 style="margin-top:0;">Do you also need new cameras or a PoE switch?</h3>
+<p style="color:var(--aac-muted);">Most customers using existing compatible cameras can choose No and go directly to review.</p>
+<div style="display:flex;gap:.75rem;flex-wrap:wrap;"><button class="btn-next" type="button" id="hardware-no">No, review my cloud setup</button><button class="btn-prev" type="button" id="hardware-yes">Yes, show optional hardware</button></div>
+</div>
+<div id="optional-hardware" class="hidden" style="margin-top:1.5rem;">
+<h3>Optional Camera Hardware</h3><div class="compact-list">
+<div class="aic-hardware-group-label">LTS IP and HD-TVI Cameras</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-LXIP1142">
+<div class="compact-title"><strong>LTS LXIP1142W-28MA — Pro-X 4MP Starlight Turret IP Camera</strong><span>4MP · 2.8 mm lens · built-in microphone · PoE · IP67</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS LXIP1142W-28MA — Pro-X 4MP Starlight Turret IP Camera">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS LXIP1142W-28MA — Pro-X 4MP Starlight Turret IP Camera">+</button></div>
+<div class="compact-price">$114.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-CMIP3382">
+<div class="compact-title"><strong>LTS CMIP3382WI-28SDL — Platinum Plus 8MP Active-Deterrence Turret</strong><span>8MP / 4K · active deterrence · smart detection · PoE</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS CMIP3382WI-28SDL — Platinum Plus 8MP Active-Deterrence Turret">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS CMIP3382WI-28SDL — Platinum Plus 8MP Active-Deterrence Turret">+</button></div>
+<div class="compact-price">$249.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-CMIP3C42">
+<div class="compact-title"><strong>LTS CMIP3C42WI-28SDL — 4MP Color 24/7 Active-Deterrence Turret</strong><span>4MP Color 24/7 · hybrid illumination · active deterrence · PoE</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS CMIP3C42WI-28SDL — 4MP Color 24/7 Active-Deterrence Turret">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS CMIP3C42WI-28SDL — 4MP Color 24/7 Active-Deterrence Turret">+</button></div>
+<div class="compact-price">$299.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-CMIP3C82">
+<div class="compact-title"><strong>LTS CMIP3C82WI-28SDL — 8MP Color 24/7 Active-Deterrence Turret</strong><span>8MP / 4K Color 24/7 · hybrid illumination · red/blue strobes · PoE</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS CMIP3C82WI-28SDL — 8MP Color 24/7 Active-Deterrence Turret">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS CMIP3C82WI-28SDL — 8MP Color 24/7 Active-Deterrence Turret">+</button></div>
+<div class="compact-price">$409.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-CMHT1722">
+<div class="compact-title"><strong>LTS CMHT1722-28LS — 2MP HD-TVI Active-Deterrence Turret</strong><span>2MP analog HD-TVI · dual light · audio over coax · DVR required</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS CMHT1722-28LS — 2MP HD-TVI Active-Deterrence Turret">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS CMHT1722-28LS — 2MP HD-TVI Active-Deterrence Turret">+</button></div>
+<div class="compact-price">$114.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-CMHT1752">
+<div class="compact-title"><strong>LTS CMHT1752-28LS — 5MP HD-TVI Dual-Light Turret</strong><span>5MP analog HD-TVI · dual light · 2.8 mm lens · DVR required</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS CMHT1752-28LS — 5MP HD-TVI Dual-Light Turret">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS CMHT1752-28LS — 5MP HD-TVI Dual-Light Turret">+</button></div>
+<div class="compact-price">$129.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-CAM-LTS-CMHT1782">
+<div class="compact-title"><strong>LTS CMHT1782-28LF — Platinum Plus 8MP HD-TVI Turret</strong><span>8MP analog HD-TVI · 2.8 mm lens · DVR required</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS CMHT1782-28LF — Platinum Plus 8MP HD-TVI Turret">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS CMHT1782-28LF — Platinum Plus 8MP HD-TVI Turret">+</button></div>
+<div class="compact-price">$149.99 each</div>
+</div>
+<div class="aic-hardware-group-label">VIVOTEK IP Cameras</div>
+<div class="compact-head"><div>Camera</div><div>Quantity</div><div>One-time price</div></div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-CAM-5MP-DOME-001">
+<div class="compact-title"><strong>VIVOTEK FD9380-HTV-V2 — 5MP Outdoor Dome AI Camera</strong><span>Wide fixed-lens dome · PoE · Smart IR · outdoor rated</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$349.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-CAM-BULLET-IB9380">
+<div class="compact-title"><strong>VIVOTEK IB9380-HTV-V2 — 5MP Outdoor Bullet AI Camera</strong><span>Motorized varifocal bullet · PoE · Smart IR · outdoor rated</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$349.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-CAM-FISHEYE-FE9380">
+<div class="compact-title"><strong>VIVOTEK FE9380-HV — 5MP Fisheye Panoramic Camera</strong><span>180° panoramic view · PoE · dewarped viewing modes</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$649.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-CAM-DUAL-MA9312">
+<div class="compact-title"><strong>VIVOTEK MA9312-EHTV — Dual-Directional 4K AI Camera</strong><span>Two adjustable 4K lenses · PoE+ · premium panoramic coverage</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$1,799.99 each</div>
+</div>
+</div>
+
+<h3 style="margin-top:1.25rem;">Optional PoE Switch Hardware</h3><div class="compact-list">
+<div class="aic-hardware-group-label">LTS PoE Switches</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-POE-LTS-8">
+<div class="compact-title"><strong>LTS VSPOE-SW802 — 8-Port PoE Switch with 2 Uplink Ports</strong><span>8 powered PoE ports · 2 uplink ports</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS VSPOE-SW802 — 8-Port PoE Switch with 2 Uplink Ports">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS VSPOE-SW802 — 8-Port PoE Switch with 2 Uplink Ports">+</button></div>
+<div class="compact-price">$159.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-POE-LTS-16">
+<div class="compact-title"><strong>LTS VSPOE-SW1602 — 16-Port PoE Switch with 2 Combo Ports</strong><span>16 powered PoE ports · 2 combo uplink ports</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS VSPOE-SW1602 — 16-Port PoE Switch with 2 Combo Ports">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS VSPOE-SW1602 — 16-Port PoE Switch with 2 Combo Ports">+</button></div>
+<div class="compact-price">$329.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row aic-lts-hardware" data-hardware-sku="AIC-POE-LTS-24">
+<div class="compact-title"><strong>LTS VSPOE-SW2402 — Pro-VS 24-Port PoE Switch with 2 Combo Ports</strong><span>24 powered PoE ports · 2 combo uplink ports</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button" aria-label="Remove one LTS VSPOE-SW2402 — Pro-VS 24-Port PoE Switch with 2 Combo Ports">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button" aria-label="Add one LTS VSPOE-SW2402 — Pro-VS 24-Port PoE Switch with 2 Combo Ports">+</button></div>
+<div class="compact-price">$429.99 each</div>
+</div>
+<div class="aic-hardware-group-label">MokerLink PoE Switches</div>
+<div class="compact-head"><div>PoE switch</div><div>Quantity</div><div>One-time price</div></div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-POE-MOKER-8">
+<div class="compact-title"><strong>MokerLink POE-F082G — 8-Port PoE Switch with 2 Gigabit Uplinks</strong><span>8 powered camera ports · 120W PoE budget · 2 uplinks</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$79.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-POE-MOKER-16">
+<div class="compact-title"><strong>MokerLink POE-G162G — 16-Port Gigabit PoE+ Switch with 2 Gigabit Uplinks</strong><span>16 powered camera ports · 250W PoE budget · rack mount</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$174.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-POE-MOKER-24">
+<div class="compact-title"><strong>MokerLink POE-G244GS — 24-Port Gigabit PoE+ Switch with 2 Ethernet and 2 SFP Uplinks</strong><span>24 powered camera ports · 400W PoE budget · rack mount</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$229.99 each</div>
+</div>
+<div class="aic-hardware-option compact-row" data-hardware-sku="AIC-POE-MOKER-48">
+<div class="compact-title"><strong>MokerLink POE-G482GS — 48-Port Gigabit PoE Switch with 2 SFP Uplinks</strong><span>48 powered camera ports · 400W shared budget · rack mount</span></div>
+<div class="qty-control"><button class="aic-hardware-minus" type="button">−</button><input class="aic-hardware-quantity" max="64" min="0" readonly="" type="number" value="0"/><button class="aic-hardware-plus" type="button">+</button></div>
+<div class="compact-price">$429.99 each</div>
+</div>
+</div>
+
+<div class="info-note">Physical camera installation, new cable runs, and onsite labor are not included. Customers install equipment themselves or hire a local technician.</div>
+</div>
+<div class="btn-group"><button class="btn-prev" onclick="goToStep(3)">Previous</button><button class="btn-next" id="connection-review-button" onclick="goToStep(5)">Review Order</button></div>
+</div>
+<!-- Step 5 -->
+<div class="form-section hidden" id="step5-content">
+<h2>Review Your Selection</h2>
+<div id="review-summary"></div>
+<section aria-labelledby="quotePromoHeading" class="quote-review-promo">
+<h3 id="quotePromoHeading">See how AnyAIcam and Videoloft work.</h3>
+<div class="quote-review-video">
+<iframe allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen="" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" src="https://www.youtube.com/embed/Xa0Od-JFnYs?rel=0" title="See how AnyAIcam and Videoloft work"></iframe>
+</div>
+
+</section>
+<div class="selection-summary" style="margin-top:1rem;">
+<h3>Customer Contact Information</h3>
+<p>This information is used for the order summary email sent to ANY AI CAM and the customer.</p>
+<div class="review-contact-grid">
+<div>
+<label for="customer-name">Customer Name</label>
+<input autocomplete="name" id="customer-name" placeholder="Customer name" type="text"/>
+</div>
+<div>
+<label for="customer-email">Customer Email</label>
+<input autocomplete="email" id="customer-email" placeholder="customer@email.com" type="email"/>
+</div>
+<div>
+<label for="customer-phone">Customer Phone</label>
+<input autocomplete="tel" id="customer-phone" placeholder="Phone number" type="tel"/>
+</div>
+<div>
+<label for="customer-address">Street Address</label>
+<input autocomplete="street-address" id="customer-address" placeholder="Street address" type="text"/>
+</div>
+<div>
+<label for="customer-city">City</label>
+<input autocomplete="address-level2" id="customer-city" placeholder="City" type="text"/>
+</div>
+<div>
+<label for="customer-state">State</label>
+<input autocomplete="address-level1" id="customer-state" placeholder="State" type="text"/>
+</div>
+<div>
+<label for="customer-zip">ZIP Code</label>
+<input autocomplete="postal-code" id="customer-zip" placeholder="ZIP code" type="text"/>
+</div>
+<div>
+<label for="site-name">Site / Business Name</label>
+<input id="site-name" placeholder="Business or site name" type="text"/>
+</div>
+<div style="grid-column:1 / -1;padding:1rem;background:#f7f9fc;border:1px solid #dce6f5;border-radius:8px;">
+<label for="salesperson-code">Were you referred by a salesperson?</label>
+<p style="margin:.35rem 0 .75rem;color:#63708a;font-size:.9rem;">Enter the salesperson's partner code. Leave blank if you came directly to the website.</p>
+<div style="display:flex;gap:.65rem;flex-wrap:wrap;">
+<input id="salesperson-code" placeholder="Example: P-ABC1234567" style="flex:1;min-width:220px;text-transform:uppercase;" type="text"/>
+<button class="btn-next" id="verify-salesperson-code" style="padding:.75rem 1rem;" type="button">Verify Code</button>
+</div>
+<p aria-live="polite" id="salesperson-code-status" role="status" style="margin:.65rem 0 0;font-weight:600;"></p>
+</div>
+<div style="grid-column:1 / -1;">
+<label for="customer-notes">Notes</label>
+<textarea id="customer-notes" placeholder="Adapter Cloud ID, site details, camera notes, or special instructions"></textarea>
+</div>
+</div>
+</div>
+<div class="btn-group">
+<button class="btn-prev" id="review-prev-btn" onclick="goBackFromReview()">Previous</button>
+<button class="btn-next" id="checkout-button" onclick="checkout()">Proceed to Checkout</button>
+</div>
+</div>
+</section>
+</div>
+</div>
+</main>
+<script>
+        const pricingTable = {
+            "2mp": 7.99,
+            "4mp": 8.19,
+            "8mp": 8.49,
+
+            "2mp-2days-motion": 7.99,
+            "2mp-7days-motion": 8.09,
+            "2mp-14days-motion": 8.39,
+            "2mp-30days-motion": 8.99,
+
+            "2mp-2days-continuous": 8.99,
+            "2mp-7days-continuous": 9.79,
+            "2mp-14days-continuous": 10.89,
+            "2mp-30days-continuous": 11.99,
+
+            "4mp-2days-motion": 8.19,
+            "4mp-7days-motion": 8.59,
+            "4mp-14days-motion": 9.19,
+            "4mp-30days-motion": 10.09,
+
+            "4mp-2days-continuous": 9.49,
+            "4mp-7days-continuous": 11.09,
+            "4mp-14days-continuous": 13.29,
+            "4mp-30days-continuous": 14.79,
+
+            "8mp-2days-motion": 8.49,
+            "8mp-7days-motion": 9.09,
+            "8mp-14days-motion": 9.89,
+            "8mp-30days-motion": 11.29,
+
+            "8mp-2days-continuous": 9.99,
+            "8mp-7days-continuous": 12.39,
+            "8mp-14days-continuous": 15.69,
+            "8mp-30days-continuous": 17.59,
+
+            "smart-motion": 1.79,
+            "people-counting": 10.99,
+            "lpr": 18.99,
+            "ppe": 17.99,
+
+            "8channel": 349,
+            "16channel": 399,
+            "32channel": 2149,
+            "64channel": 2689,
+            "ownedadapter": 0,
+            "software": 0
+        };
+
+        let selectedValues = {
+            includeCloud: true,
+            adapterType: null,
+            adapterQty: 1,
+            ownedAdapterChannel: null,
+            resolutions: {},
+            totalCameras: 0,
+            recordingType: null,
+            duration: null,
+            billingCycle: 'monthly',
+            analytics: [],
+            customer: {}
+        };
+
+        let reviewPreviousStep = 4;
+        let verifiedReferralPartner = null;
+
+        function normalizePartnerCode(value) {
+            return String(value || '').trim().toUpperCase();
+        }
+
+        async function verifySalespersonCode(showBlankMessage = true) {
+            const input = document.getElementById('salesperson-code');
+            const status = document.getElementById('salesperson-code-status');
+            const button = document.getElementById('verify-salesperson-code');
+            const code = normalizePartnerCode(input ? input.value : '');
+
+            if (!code) {
+                verifiedReferralPartner = null;
+                localStorage.removeItem('anyaicamReferralPartnerId');
+                if (status) {
+                    status.textContent = showBlankMessage ? 'No salesperson code entered. This will be treated as a direct website order.' : '';
+                    status.style.color = '#63708a';
+                }
+                return null;
+            }
+
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Checking...';
+            }
+            if (status) {
+                status.textContent = 'Checking salesperson code...';
+                status.style.color = '#63708a';
+            }
+
+            try {
+                const response = await fetch(`api.php?action=lookup_partner&code=${encodeURIComponent(code)}`, {
+                    credentials: 'same-origin',
+                    cache: 'no-store'
+                });
+                const result = await response.json();
+                if (!response.ok || !result.ok || !result.partner) {
+                    throw new Error(result.error || 'Salesperson code was not found.');
+                }
+
+                verifiedReferralPartner = result.partner;
+                localStorage.setItem('anyaicamReferralPartnerId', result.partner.id);
+                if (input) input.value = result.partner.id;
+                if (status) {
+                    status.textContent = `Referral verified: ${result.partner.name} (${result.partner.id})`;
+                    status.style.color = '#137a4d';
+                }
+                return result.partner;
+            } catch (error) {
+                verifiedReferralPartner = null;
+                localStorage.removeItem('anyaicamReferralPartnerId');
+                if (status) {
+                    status.textContent = error.message || 'Salesperson code was not found.';
+                    status.style.color = '#a12a2a';
+                }
+                return null;
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.textContent = 'Verify Code';
+                }
+            }
+        }
+
+        function isOwnedAdapterCloudStorageOnly() {
+            return selectedValues.adapterType === 'ownedadapter' && selectedValues.includeCloud;
+        }
+
+        function setCloudStorageSelected(isSelected) {
+            const cloudToggle = document.getElementById('cloud-toggle');
+            selectedValues.includeCloud = isSelected;
+
+            if (cloudToggle) {
+                cloudToggle.classList.toggle('selected', isSelected);
+            }
+
+            if (!isSelected) {
+                resetCameraSelections();
+                resetStorageSelections();
+                clearAnalyticsSelections();
+            }
+        }
+
+        function syncCustomerInfo() {
+            const nameEl = document.getElementById('customer-name');
+            const emailEl = document.getElementById('customer-email');
+            const phoneEl = document.getElementById('customer-phone');
+            const siteEl = document.getElementById('site-name');
+            const addressEl = document.getElementById('customer-address');
+            const cityEl = document.getElementById('customer-city');
+            const stateEl = document.getElementById('customer-state');
+            const zipEl = document.getElementById('customer-zip');
+            const notesEl = document.getElementById('customer-notes');
+
+            selectedValues.customer = {
+                name: nameEl ? nameEl.value.trim() : '',
+                email: emailEl ? emailEl.value.trim() : '',
+                phone: phoneEl ? phoneEl.value.trim() : '',
+                siteName: siteEl ? siteEl.value.trim() : '',
+                notes: notesEl ? notesEl.value.trim() : '',
+                address: addressEl ? addressEl.value.trim() : '',
+                city: cityEl ? cityEl.value.trim() : '',
+                state: stateEl ? stateEl.value.trim() : '',
+                zip: zipEl ? zipEl.value.trim() : '',
+            };
+
+            return selectedValues.customer;
+        }
+
+        function buildPlainTextOrderSummary(pricing) {
+            const lines = [];
+
+            lines.push('ANY AI CAM Order Summary');
+            lines.push('------------------------');
+
+            if (selectedValues.customer) {
+                lines.push(`Customer: ${selectedValues.customer.name || 'Not provided'}`);
+                lines.push(`Email: ${selectedValues.customer.email || 'Not provided'}`);
+                lines.push(`Phone: ${selectedValues.customer.phone || 'Not provided'}`);
+                lines.push(`Address: ${selectedValues.customer.address || 'Not provided'}`);
+                lines.push(`City: ${selectedValues.customer.city || 'Not provided'}`);
+                lines.push(`State: ${selectedValues.customer.state || 'Not provided'}`);
+                lines.push(`ZIP: ${selectedValues.customer.zip || 'Not provided'}`);
+                lines.push(`Site / Business: ${selectedValues.customer.siteName || 'Not provided'}`);
+            }
+
+            const referralIdForSummary = verifiedReferralPartner?.id || normalizePartnerCode(new URLSearchParams(window.location.search).get('partner') || '') || localStorage.getItem('anyaicamReferralPartnerId') || '';
+            lines.push(`Referral Source: ${referralIdForSummary ? (verifiedReferralPartner?.name ? verifiedReferralPartner.name + ' (' + referralIdForSummary + ')' : referralIdForSummary) : 'Direct website'}`);
+
+            lines.push('');
+            lines.push(`Adapter Selection: ${selectedValues.adapterType ? getAdapterReviewLine() : 'No hardware adapter selected'}`);
+
+            if (selectedValues.adapterType === 'ownedadapter' && selectedValues.ownedAdapterChannel) {
+                lines.push(`Existing Adapter Type: ${formatOwnedAdapterChannel(selectedValues.ownedAdapterChannel)} Videoloft Adapter`);
+            }
+
+            if (selectedValues.adapterType === 'ownedadapter') {
+                lines.push('Adapter Purchase Required: No');
+                lines.push('Order Type: Customer already has a Videoloft adapter and only needs cloud storage activation.');
+            } else if (selectedValues.adapterType === 'software') {
+                lines.push('Adapter Purchase Required: No');
+                lines.push('Order Type: Software Bridge / no hardware adapter purchase.');
+            } else if (selectedValues.adapterType) {
+                lines.push('Adapter Purchase Required: Yes');
+            }
+
+            lines.push('');
+            lines.push('Camera and PoE Hardware');
+            (window.AICHardware ? AICHardware.textLines() : ['No camera or PoE hardware selected']).forEach(line => lines.push(line));
+            lines.push(`Due Today: ${formatMoney(pricing.dueTodayTotal)}`);
+
+            if (selectedValues.includeCloud) {
+                lines.push('');
+                lines.push('Cloud Storage Request');
+                lines.push(`Total Cameras: ${selectedValues.totalCameras || 0}`);
+
+                const resParts = [];
+                for (const [res, qty] of Object.entries(selectedValues.resolutions)) {
+                    if (qty > 0) resParts.push(`${qty} x ${res.toUpperCase()}`);
+                }
+
+                lines.push(`Camera Resolution / Quantity: ${resParts.length ? resParts.join(', ') : 'Not selected'}`);
+                lines.push(`Recording Type: ${selectedValues.recordingType === 'motion' ? 'Motion Only' : selectedValues.recordingType === 'continuous' ? '24/7 Continuous' : 'Not selected'}`);
+                lines.push(`Storage Duration: ${selectedValues.duration ? selectedValues.duration + ' days' : 'Not selected'}`);
+                lines.push(`Billing Preference: ${selectedValues.billingCycle === 'annual' ? 'Annual Billing (10% Off)' : 'Monthly Billing'}`);
+                lines.push(`Estimated Cloud Monthly Total After Trial: ${formatMoney(pricing.futureCloudMonthlyTotal)}`);
+
+                if (selectedValues.billingCycle === 'annual') {
+                    lines.push(`Estimated Annual Total After Discount: ${formatMoney(pricing.futureCloudAnnualDiscountedTotal)}`);
+                }
+
+                if (selectedValues.analytics.length > 0) {
+                    lines.push(`Analytics: ${selectedValues.analytics.map(a => formatAnalyticsLabel(a.name) + ' x' + (a.quantity || 1)).join(', ')}`);
+                } else {
+                    lines.push('Analytics: None selected');
+                }
+            }
+
+            if (selectedValues.customer && selectedValues.customer.notes) {
+                lines.push('');
+                lines.push('Customer Notes');
+                lines.push(selectedValues.customer.notes);
+            }
+
+            return lines.join('\n');
+        }
+
+
+        function formatOwnedAdapterChannel(channel) {
+            if (channel === '8channel') return '8-Channel';
+            if (channel === '16channel') return '16-Channel';
+            if (channel === '32channel') return '32-Channel';
+            if (channel === '64channel') return '64-Channel';
+            return 'Videoloft';
+        }
+
+        function formatAdapterLabel(adapterType) {
+            if (adapterType === 'software') return 'Software Bridge';
+            if (adapterType === 'ownedadapter') {
+                return selectedValues.ownedAdapterChannel
+                    ? `Already Owns ${formatOwnedAdapterChannel(selectedValues.ownedAdapterChannel)} Videoloft Cloud Adapter`
+                    : 'Already Owns Videoloft Cloud Adapter';
+            }
+            return adapterType.replace('channel', '-Channel');
+        }
+
+        function getAdapterReviewLine() {
+            if (selectedValues.adapterType === 'ownedadapter') {
+                return selectedValues.ownedAdapterChannel
+                    ? `Already owns ${formatOwnedAdapterChannel(selectedValues.ownedAdapterChannel)} Videoloft Cloud Adapter`
+                    : 'Already owns Videoloft Cloud Adapter';
+            }
+            if (selectedValues.adapterType === 'software') return 'Software Bridge';
+            return `${formatAdapterLabel(selectedValues.adapterType)} Adapter`;
+        }
+
+        function getAdapterPaymentLine() {
+            if (selectedValues.adapterType === 'ownedadapter') {
+                const ownedLabel = selectedValues.ownedAdapterChannel
+                    ? `${formatOwnedAdapterChannel(selectedValues.ownedAdapterChannel)} Videoloft Cloud Adapter`
+                    : 'Videoloft Cloud Adapter';
+                return `Already owns ${ownedLabel}: $0.00 today`;
+            }
+            if (selectedValues.adapterType === 'software') return 'Software Bridge: $0.00 today';
+            return `${formatAdapterLabel(selectedValues.adapterType)} Adapter: ${formatMoney(getDueTodayTotal())}`;
+        }
+
+        function formatMoney(amount) {
+            return `$${amount.toFixed(2)}`;
+        }
+
+        function formatAnalyticsLabel(name) {
+            var labels = {
+                'smart-motion': 'Smart Motion',
+                'people-counting': 'People Counting',
+                'ppe': 'PPE Detection',
+                'lpr': 'License Plate Recognition'
+            };
+            return labels[name] || name.replaceAll('-', ' ');
+        }
+
+        function getCloudBaseMonthlySubtotal() {
+            if (!selectedValues.includeCloud || !selectedValues.duration || !selectedValues.recordingType) {
+                return 0;
+            }
+
+            let total = 0;
+            for (const [res, qty] of Object.entries(selectedValues.resolutions)) {
+                if (qty > 0) {
+                    const key = `${res}-${selectedValues.duration}days-${selectedValues.recordingType}`;
+                    const basePrice = pricingTable[key] || 0;
+                    total += basePrice * qty;
+                }
+            }
+            return total;
+        }
+
+        function getAnalyticsMonthlySubtotal() {
+            let total = 0;
+
+            if (selectedValues.analytics) {
+                selectedValues.analytics.forEach(analytic => {
+                    total += analytic.price * (analytic.quantity || 1);
+                });
+            }
+
+            return total;
+        }
+
+        function getFutureCloudMonthlyTotal() {
+            return getCloudBaseMonthlySubtotal() + getAnalyticsMonthlySubtotal();
+        }
+
+        function getFutureCloudAnnualFullTotal() {
+            return getFutureCloudMonthlyTotal() * 12;
+        }
+
+        function getFutureCloudAnnualDiscountedTotal() {
+            return getFutureCloudAnnualFullTotal() * 0.90;
+        }
+
+        function getAnnualDiscountAmount() {
+            return getFutureCloudAnnualFullTotal() - getFutureCloudAnnualDiscountedTotal();
+        }
+
+        function getDueTodayTotal() {
+            const adapter = selectedValues.adapterType ? (pricingTable[selectedValues.adapterType] || 0) * Math.max(1, Number(selectedValues.adapterQty || 1)) : 0;
+            const extraHardware = window.AICHardware ? AICHardware.subtotal() : 0;
+            return adapter + extraHardware;
+        }
+
+        function getPricingSummary() {
+            return {
+                adapterTotal: selectedValues.adapterType ? (pricingTable[selectedValues.adapterType] || 0) * Math.max(1, Number(selectedValues.adapterQty || 1)) : 0,
+                cameraAndPoeHardwareTotal: window.AICHardware ? AICHardware.subtotal() : 0,
+                cloudBaseMonthlySubtotal: getCloudBaseMonthlySubtotal(),
+                analyticsMonthlySubtotal: getAnalyticsMonthlySubtotal(),
+                futureCloudMonthlyTotal: getFutureCloudMonthlyTotal(),
+                futureCloudAnnualFullTotal: getFutureCloudAnnualFullTotal(),
+                futureCloudAnnualDiscountedTotal: getFutureCloudAnnualDiscountedTotal(),
+                annualDiscountAmount: getAnnualDiscountAmount(),
+                dueTodayTotal: getDueTodayTotal()
+            };
+        }
+
+        function updateStep1NextButton() {
+            const hasCloud = selectedValues.includeCloud;
+            const hasAdapter = !!selectedValues.adapterType;
+            document.getElementById('step1-next').disabled = !(hasCloud || hasAdapter);
+        }
+
+        function getAdapterMaxChannels() {
+            const adapterType = selectedValues.adapterType;
+            const ownedChannel = selectedValues.ownedAdapterChannel;
+            const channelMap = {
+                "8channel": 8,
+                "16channel": 16,
+                "32channel": 32,
+                "64channel": 64
+            };
+            if (adapterType === "ownedadapter" && ownedChannel) {
+                return channelMap[ownedChannel] || null;
+            }
+            if (adapterType && channelMap[adapterType]) {
+                return channelMap[adapterType];
+            }
+            return null;
+        }
+
+        function showAdapterLimitWarning(totalCameras, maxChannels) {
+            const warningEl = document.getElementById("adapter-limit-warning");
+            const textEl = document.getElementById("adapter-limit-warning-text");
+            const maxDisplay = document.getElementById("max-channels-display");
+            if (warningEl && textEl && maxDisplay && maxChannels !== null && totalCameras > maxChannels) {
+                maxDisplay.textContent = maxChannels;
+                textEl.innerHTML = 'Your selected adapter supports a maximum of <strong>' + maxChannels + '</strong> cameras, but you have selected <strong>' + totalCameras + '</strong>. Please reduce the camera quantity or select a higher-channel adapter.';
+                warningEl.style.display = "block";
+                return true;
+            }
+            if (warningEl) warningEl.style.display = "none";
+            return false;
+        }
+
+
+        function resetCameraSelections() {
+            document.querySelectorAll('.quantity-input').forEach(input => {
+                input.value = 0;
+            });
+
+            selectedValues.resolutions = {};
+            selectedValues.totalCameras = 0;
+        }
+
+        function resetStorageSelections() {
+            document.querySelectorAll('.camera-option[data-type]').forEach(opt => {
+                opt.classList.remove('selected');
+            });
+
+            document.querySelectorAll('.duration-option').forEach(opt => {
+                opt.classList.remove('selected');
+            });
+
+            selectedValues.recordingType = null;
+            selectedValues.duration = null;
+            selectedValues.billingCycle = 'monthly';
+
+            const billingCycleSelect = document.getElementById('billing-cycle');
+            if (billingCycleSelect) {
+                billingCycleSelect.value = 'monthly';
+            }
+        }
+
+        function clearAnalyticsSelections() {
+            document.querySelectorAll('.camera-option[data-analytics]').forEach(opt => {
+                opt.classList.remove('selected');
+            });
+            document.querySelectorAll('.analytics-quantity').forEach(input => {
+                input.value = 0;
+            });
+            selectedValues.analytics = [];
+        }
+
+        function showStep(step) {
+            document.querySelectorAll('[id$="-content"]').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+
+            document.getElementById(`step${step}-content`).classList.remove('hidden');
+            document.getElementById(`step${step}`).classList.add('active');
+
+            if (step >= 3) {
+                updateBreakdown();
+            }
+            if (step === 5) {
+                updateReviewSummary();
+            }
+
+            // Scroll to top of wizard
+            var wizardEl = document.querySelector('.wizard-container');
+            if (wizardEl) {
+                wizardEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+        }
+
+        function goToStep(step) {
+            if (step === 2 && selectedValues.totalCameras < 1) {
+                alert('Please select at least one camera and quantity.');
+                return;
+            }
+
+            if (step === 3 && (!selectedValues.recordingType || !selectedValues.duration)) {
+                alert('Please select recording type and storage duration.');
+                return;
+            }
+
+            if (step === 5) {
+                if (!selectedValues.adapterType) {
+                    alert('Please choose how your cameras will connect to the cloud.');
+                    return;
+                }
+                var maxCh = getAdapterMaxChannels();
+                if (maxCh !== null && selectedValues.totalCameras > maxCh) {
+                    showAdapterLimitWarning(selectedValues.totalCameras, maxCh);
+                    return;
+                }
+                reviewPreviousStep = 4;
+            }
+
+            showStep(step);
+        }
+
+        function goBackFromReview() {
+            showStep(reviewPreviousStep);
+        }
+
+        document.querySelectorAll('.camera-option[data-product]').forEach(option => {
+            option.addEventListener('click', function () {
+                setCloudStorageSelected(!selectedValues.includeCloud);
+
+                updateStep1NextButton();
+                updateBreakdown();
+            });
+        });
+
+        document.querySelectorAll('.adapter-option').forEach(option => {
+            option.addEventListener('click', function () {
+                const alreadySelected = this.classList.contains('selected');
+
+                document.querySelectorAll('.adapter-option').forEach(opt => opt.classList.remove('selected'));
+
+                if (alreadySelected) {
+                    selectedValues.adapterType = null;
+                    selectedValues.ownedAdapterChannel = null;
+                } else {
+                    this.classList.add('selected');
+                    selectedValues.adapterType = this.dataset.adapter;
+                    selectedValues.ownedAdapterChannel = this.dataset.adapter === 'ownedadapter'
+                        ? (this.dataset.ownedChannel || null)
+                        : null;
+
+                    if (selectedValues.adapterType === 'ownedadapter') {
+                        setCloudStorageSelected(true);
+                    }
+                }
+
+                updateStep1NextButton();
+                updateBreakdown();
+            });
+        });
+
+        document.querySelectorAll('.quantity-input, .analytics-quantity').forEach(input => {
+            ['click', 'mousedown', 'pointerdown', 'touchstart'].forEach(eventName => {
+                input.addEventListener(eventName, function(event) {
+                    event.stopPropagation();
+                });
+            });
+        });
+
+        document.querySelectorAll('.camera-option[data-resolution]').forEach(option => {
+            option.addEventListener('click', function () {
+                document.querySelectorAll('.camera-option[data-resolution]').forEach(opt => opt.classList.remove('selected'));
+                this.classList.add('selected');
+
+                const resolution = this.dataset.resolution;
+                const qtyInput = document.getElementById(`quantity-${resolution}`);
+                let qty = parseInt(qtyInput.value) || 0;
+
+                if (qty < 1) {
+                    qty = 1;
+                    qtyInput.value = 1;
+                }
+
+                selectedValues.resolutions = {};
+                document.querySelectorAll('.quantity-input').forEach(input => {
+                    const inputValue = Math.max(0, parseInt(input.value) || 0);
+                    const inputResolution = input.id.replace('quantity-', '');
+                    if (inputValue > 0) {
+                        selectedValues.resolutions[inputResolution] = inputValue;
+                        document.querySelector(`.camera-option[data-resolution="${inputResolution}"]`)?.classList.add('selected');
+                    } else {
+                        document.querySelector(`.camera-option[data-resolution="${inputResolution}"]`)?.classList.remove('selected');
+                    }
+                });
+                selectedValues.totalCameras = Object.values(selectedValues.resolutions).reduce((a, b) => a + b, 0);
+                updateBreakdown();
+            });
+        });
+
+        document.querySelectorAll('.quantity-input').forEach(input => {
+            const updateCameraQuantity = function (event) {
+                if (event) event.stopPropagation();
+                let value = parseInt(this.value) || 0;
+                if (value < 0) value = 0;
+                this.value = value;
+
+                const resolution = this.id.replace('quantity-', '');
+
+                if (value > 0) {
+                    const selectedOption = document.querySelector(`.camera-option[data-resolution="${resolution}"]`);
+                    if (selectedOption) selectedOption.classList.add('selected');
+
+                    selectedValues.resolutions[resolution] = value;
+                    selectedValues.totalCameras = Object.values(selectedValues.resolutions).reduce((a, b) => a + b, 0);
+                    /* Validate camera count against adapter channel limit */
+                    var maxCh = getAdapterMaxChannels();
+                    if (maxCh !== null && selectedValues.totalCameras > maxCh) {
+                        // Keep the entered quantity so customers can build systems up to 64 cameras.
+                        // The warning remains visible and Next stays blocked until a suitable adapter is selected.
+                        showAdapterLimitWarning(selectedValues.totalCameras, maxCh);
+                    } else {
+                        document.getElementById("adapter-limit-warning").style.display = "none";
+                    }
+                } else {
+                    delete selectedValues.resolutions[resolution];
+                    selectedValues.totalCameras = Object.values(selectedValues.resolutions).reduce((a, b) => a + b, 0);
+                    const selectedOption = document.querySelector(`.camera-option[data-resolution="${resolution}"]`);
+                    if (selectedOption) selectedOption.classList.remove('selected');
+                }
+
+                updateBreakdown();
+            };
+            input.addEventListener('input', updateCameraQuantity);
+            input.addEventListener('change', updateCameraQuantity);
+        });
+
+        document.querySelectorAll('.camera-option[data-type]').forEach(option => {
+            option.addEventListener('click', function () {
+                document.querySelectorAll('.camera-option[data-type]').forEach(opt => opt.classList.remove('selected'));
+                this.classList.add('selected');
+                selectedValues.recordingType = this.dataset.type;
+                updateBreakdown();
+            });
+        });
+
+        document.querySelectorAll('.duration-option').forEach(option => {
+            option.addEventListener('click', function () {
+                document.querySelectorAll('.duration-option').forEach(opt => opt.classList.remove('selected'));
+                this.classList.add('selected');
+                selectedValues.duration = this.dataset.duration;
+                updateBreakdown();
+            });
+        });
+
+        document.getElementById('billing-cycle').addEventListener('change', function () {
+            selectedValues.billingCycle = this.value;
+            updateBreakdown();
+        });
+
+        document.querySelectorAll('.analytics-quantity').forEach(input => {
+            input.addEventListener('change', function () {
+                if (!selectedValues.includeCloud) return;
+
+                let value = parseInt(this.value) || 0;
+                if (value < 0) value = 0;
+                
+                var totalCams = selectedValues.totalCameras || 0;
+                
+                if (value > totalCams && totalCams > 0) {
+                    alert('You only selected ' + totalCams + ' camera(s). The quantity for each analytics feature cannot exceed ' + totalCams + '.');
+                    value = totalCams;
+                }
+                
+                this.value = value;
+
+                // Find the parent analytics option
+                var parent = this.closest('[data-analytics]');
+                var analytics = parent ? parent.dataset.analytics : '';
+                var price = parent ? parseFloat(parent.dataset.price) : 0;
+
+                // Remove existing entry for this analytics type
+                selectedValues.analytics = selectedValues.analytics.filter(function(a) { return a.name !== analytics; });
+
+                if (value > 0) {
+                    selectedValues.analytics.push({ name: analytics, price: price, quantity: value });
+                    if (parent) parent.classList.add('selected');
+                } else {
+                    if (parent) parent.classList.remove('selected');
+                }
+
+                updateBreakdown();
+            });
+        });
+
+        function buildFutureBillingHtml(pricing) {
+            let html = '';
+
+            const hasResolutions = Object.values(selectedValues.resolutions).some(q => q > 0);
+            if (selectedValues.includeCloud && hasResolutions && selectedValues.duration && selectedValues.recordingType) {
+                const totalCameras = selectedValues.totalCameras || 0;
+                html += `<p><strong>Cameras:</strong> `;
+                const resParts = [];
+                for (const [res, qty] of Object.entries(selectedValues.resolutions)) {
+                    if (qty > 0) {
+                        resParts.push(`${qty} × ${res.toUpperCase()}`);
+                    }
+                }
+                html += resParts.join(', ');
+                html += `</p>
+                            <p><strong>Recording Type:</strong> ${selectedValues.recordingType === 'motion' ? 'Motion Only' : '24/7 Continuous'}</p>
+                            <p><strong>Storage Duration:</strong> ${selectedValues.duration} days</p>
+                            <p><strong>Billing Preference:</strong> ${selectedValues.billingCycle === 'annual' ? 'Annual Billing (10% Off)' : 'Monthly Billing'}</p>
+                            <p>Cloud Base Estimate: ${formatMoney(pricing.cloudBaseMonthlySubtotal)} / month</p>
+                        `;
+
+                    if (selectedValues.analytics.length > 0) {
+                        selectedValues.analytics.forEach(analytic => {
+                            const itemTotal = analytic.price * totalCameras;
+                            html += `<p>+ ${formatAnalyticsLabel(analytic.name)}: ${formatMoney(itemTotal)} / month</p>`;
+                        });
+                    }
+
+                    html += `<p><strong>Total Estimated Cloud Billing:</strong> ${formatMoney(pricing.futureCloudMonthlyTotal)} / month</p>`;
+
+                    if (selectedValues.billingCycle === 'annual') {
+                        html += `
+                                <p><strong>Estimated Annual Total Before Discount:</strong> ${formatMoney(pricing.futureCloudAnnualFullTotal)} / year</p>
+                                <p><strong>Estimated Annual Discount:</strong> -${formatMoney(pricing.annualDiscountAmount)}</p>
+                                <p><strong>Estimated Annual Total After Discount:</strong> ${formatMoney(pricing.futureCloudAnnualDiscountedTotal)} / year</p>
+                            `;
+                    }
+
+                    html += `
+                            <div class="info-note">
+                                Cloud storage and analytics are billed directly by Videoloft after activation.
+                                Your first 30 days are free. These cloud charges are not charged today in Stripe.
+                            </div>
+                        `;
+            } else if (selectedValues.includeCloud) {
+                html += `<p>Please complete your cloud storage selections to see future billing estimates.</p>`;
+            }
+
+            return html;
+        }
+
+        function updateBreakdown() {
+            const breakdownEl = document.getElementById('price-breakdown');
+            const analyticsBreakdownEl = document.getElementById('analytics-breakdown');
+            const pricing = getPricingSummary();
+            const hasCloud = selectedValues.includeCloud;
+            const hasAdapter = !!selectedValues.adapterType;
+
+            let html = '';
+
+            if (hasAdapter) {
+                html += `
+                        <p><strong>Payment Due Today (Stripe)</strong></p>
+                        <p>${getAdapterPaymentLine()}</p>
+                    `;
+            } else {
+                html += `
+                        <p><strong>Payment Due Today (Stripe)</strong></p>
+                        <p>${formatMoney(0)} today</p>
+                    `;
+            }
+
+            html += `<p class="total-price">Due Today: ${formatMoney(pricing.dueTodayTotal)}</p>`;
+
+            if (isOwnedAdapterCloudStorageOnly()) {
+                html += `
+                        <div class="owned-adapter-callout">
+                            Customer already has a Videoloft adapter. No adapter hardware purchase is needed.
+                            This order is for cloud storage activation only.
+                        </div>
+                    `;
+            }
+
+            if (hasCloud) {
+                html += `<div class="section-total">${buildFutureBillingHtml(pricing)}</div>`;
+            }
+
+            if (!hasCloud && !hasAdapter) {
+                html = `<p>Please select cloud storage, an adapter, or both.</p>`;
+            }
+
+            if (breakdownEl) breakdownEl.innerHTML = html;
+            if (analyticsBreakdownEl && selectedValues.analytics.length > 0) {
+                var analyticsHtml = '<h3 style="color:#0b2b4f;margin:1rem 0 0.5rem;font-size:1rem;">Analytics Add-Ons (Monthly)</h3>';
+                selectedValues.analytics.forEach(function(a) {
+                    var label = formatAnalyticsLabel(a.name);
+                    var qty = a.quantity || 1;
+                    analyticsHtml += '<div class="summary-item" style="padding:0.5rem 0;border-bottom:1px solid #eee;">';
+                    analyticsHtml += '<div class="summary-item-title">' + label + ' x' + qty + '</div>';
+                    analyticsHtml += '<div class="summary-item-description">' + formatMoney(a.price * qty) + '/month</div>';
+                    analyticsHtml += '</div>';
+                });
+                analyticsBreakdownEl.innerHTML = analyticsHtml;
+            } else if (analyticsBreakdownEl) {
+                analyticsBreakdownEl.innerHTML = '<p style="color:#888;font-size:0.9rem;margin-top:1rem;">No analytics add-ons selected.</p>';
+            }
+        }
+
+        function updateReviewSummary() {
+            const summaryEl = document.getElementById('review-summary');
+            const pricing = getPricingSummary();
+            const hasCloud = selectedValues.includeCloud;
+            const hasAdapter = !!selectedValues.adapterType;
+
+            let html = '<div class="selection-summary">';
+
+            html += `<h3>Payment Due Today</h3>`;
+            if (hasAdapter) {
+                html += `
+                        <p>${getAdapterReviewLine()}</p>
+                        ${selectedValues.adapterType === 'ownedadapter' && selectedValues.ownedAdapterChannel ? `<p><strong>Existing Adapter Type:</strong> ${formatOwnedAdapterChannel(selectedValues.ownedAdapterChannel)} Videoloft Adapter</p>` : ''}
+                        <p><strong>Due Today in Stripe:</strong> ${formatMoney(pricing.adapterTotal)}</p>
+                    `;
+            } else {
+                html += `
+                        <p>No hardware adapter selected.</p>
+                        <p><strong>Due Today in Stripe:</strong> ${formatMoney(0)}</p>
+                    `;
+            }
+
+            if (isOwnedAdapterCloudStorageOnly()) {
+                html += `
+                    <div class="owned-adapter-callout">
+                        Customer already has a Videoloft adapter and does not need to buy hardware.
+                        This order is for cloud storage setup only. The order summary will be prepared for ANY AI CAM and the customer.
+                    </div>
+                `;
+            }
+
+            if (window.AICHardware && AICHardware.items().length) {
+                html += `<h3 style="margin-top:1.25rem;">Cameras and PoE Hardware</h3>`;
+                html += AICHardware.items().map(item => `<p><strong>${item.quantity} × ${item.name}</strong><br>${formatMoney(item.price)} each · ${formatMoney(item.subtotal)}</p>`).join('');
+            }
+
+            if (hasCloud) {
+                html += `<h3 style="margin-top:1.25rem;">Future Videoloft Billing After Trial</h3>`;
+                html += buildFutureBillingHtml(pricing);
+            }
+
+            html += `
+                    <h3 style="margin-top:1.25rem;"><strong>Total Due Today: ${formatMoney(pricing.dueTodayTotal)}</strong></h3>
+                `;
+            html += '</div>';
+
+            summaryEl.innerHTML = html;
+
+            const checkoutButton = document.getElementById('checkout-button');
+            if (checkoutButton) {
+                checkoutButton.textContent = pricing.dueTodayTotal > 0 ? 'Proceed to Checkout' : 'Submit Cloud Storage Request';
+            }
+        }
+
+        function calculateTotal() {
+            return getDueTodayTotal();
+        }
+
+        function buildProductList() {
+            const items = [];
+
+            if (selectedValues.adapterType && !['ownedadapter', 'software'].includes(selectedValues.adapterType)) {
+                items.push({
+                    name: formatAdapterLabel(selectedValues.adapterType) + ' Adapter',
+                    price: pricingTable[selectedValues.adapterType] || 0,
+                    quantity: Math.max(1, Number(selectedValues.adapterQty || 1)),
+                    type: 'adapter',
+                    description: 'One-time hardware purchase'
+                });
+            }
+
+            if (window.AICHardware) items.push(...AICHardware.products());
+            return items;
+        }
+
+
+        const hardwareYesButton = document.getElementById('hardware-yes');
+        const hardwareNoButton = document.getElementById('hardware-no');
+        const optionalHardware = document.getElementById('optional-hardware');
+        if (hardwareYesButton && optionalHardware) {
+            hardwareYesButton.addEventListener('click', function () {
+                optionalHardware.classList.remove('hidden');
+                optionalHardware.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+        }
+        if (hardwareNoButton) {
+            hardwareNoButton.addEventListener('click', function () {
+                goToStep(5);
+            });
+        }
+        async function checkout() {
+            const customer = syncCustomerInfo();
+
+            const salespersonInput = document.getElementById('salesperson-code');
+            const enteredSalespersonCode = normalizePartnerCode(salespersonInput ? salespersonInput.value : '');
+            if (enteredSalespersonCode) {
+                const verified = await verifySalespersonCode(false);
+                if (!verified) {
+                    alert('Please enter a valid salesperson code or leave the field blank.');
+                    return;
+                }
+            } else {
+                verifiedReferralPartner = null;
+                localStorage.removeItem('anyaicamReferralPartnerId');
+            }
+
+            if (!customer.email) {
+                alert('Please enter the customer email so the order summary can be sent to the customer.');
+                return;
+            }
+
+            updateReviewSummary();
+
+            const pricing = getPricingSummary();
+            const orderSummaryText = buildPlainTextOrderSummary(pricing);
+            const orderType = isOwnedAdapterCloudStorageOnly()
+                ? 'owned-adapter-cloud-storage-only'
+                : selectedValues.adapterType === 'software'
+                    ? 'software-bridge-cloud-storage'
+                    : selectedValues.adapterType
+                        ? 'adapter-purchase'
+                        : 'cloud-storage-only';
+
+            const assistedQuote = JSON.parse(localStorage.getItem('anyaicamPartnerAssistedQuote') || 'null');
+            const urlPartnerId = normalizePartnerCode(new URLSearchParams(window.location.search).get('partner') || '');
+            const referralPartnerId = verifiedReferralPartner?.id || urlPartnerId || localStorage.getItem('anyaicamReferralPartnerId') || '';
+            if (referralPartnerId) localStorage.setItem('anyaicamReferralPartnerId', referralPartnerId);
+
+            const checkoutData = {
+                ...selectedValues,
+                partnerAssisted: !!assistedQuote,
+                referralPartnerId: referralPartnerId || null,
+                partnerQuote: assistedQuote,
+                orderType: orderType,
+                customerAlreadyHasVideoloftAdapter: selectedValues.adapterType === 'ownedadapter',
+                ownedAdapterChannel: selectedValues.ownedAdapterChannel,
+                ownedAdapterChannelLabel: selectedValues.ownedAdapterChannel ? formatOwnedAdapterChannel(selectedValues.ownedAdapterChannel) : '',
+                requiresAdapterPurchase: !!selectedValues.adapterType && !['ownedadapter', 'software'].includes(selectedValues.adapterType),
+                cloudStorageOnlyRequest: selectedValues.includeCloud && (!selectedValues.adapterType || selectedValues.adapterType === 'ownedadapter' || selectedValues.adapterType === 'software'),
+                total: pricing.dueTodayTotal,
+                dueTodayTotal: pricing.dueTodayTotal,
+                futureCloudBillingMonthly: pricing.futureCloudMonthlyTotal,
+                futureCloudBillingAnnual: pricing.futureCloudAnnualDiscountedTotal,
+                futureCloudBillingAnnualBeforeDiscount: pricing.futureCloudAnnualFullTotal,
+                futureCloudBillingAnnualDiscount: pricing.annualDiscountAmount,
+                products: buildProductList(),
+                hardwareItems: window.AICHardware ? AICHardware.items() : [],
+                cameraAndPoeHardwareSubtotal: window.AICHardware ? AICHardware.subtotal() : 0,
+                // Compatibility fields for older checkout pages. Canonical pricing remains hardwareItems.
+                cameraHardwareQty: window.AICHardware ? AICHardware.items().filter(item => item.kind === 'camera').reduce((sum, item) => sum + item.quantity, 0) : 0,
+                poeHardwareQty: window.AICHardware ? AICHardware.items().filter(item => item.kind === 'poe').reduce((sum, item) => sum + item.quantity, 0) : 0,
+                orderSummaryText: orderSummaryText,
+                emailSummary: {
+                    businessEmail: 'amata@anyaicam.com',
+                    customerEmail: customer.email,
+                    subject: isOwnedAdapterCloudStorageOnly()
+                        ? 'Cloud Storage Request - Customer Already Has Videoloft Adapter'
+                        : 'ANY AI CAM Order Summary',
+                    body: orderSummaryText
+                }
+            };
+
+            // Save customer info for checkout page pre-fill
+            var customerInfo = {
+                name: customer.name || "",
+                email: customer.email || "",
+                phone: customer.phone || "",
+                address: customer.address || "",
+                city: customer.city || "",
+                state: customer.state || "",
+                zip: customer.zip || "",
+                siteName: customer.siteName || "",
+                notes: customer.notes || ""
+            };
+            localStorage.setItem("cloudWizardCustomer", JSON.stringify(customerInfo));
+
+            localStorage.setItem('cloudWizardData', JSON.stringify(checkoutData));
+            localStorage.setItem('cloudWizardEmailSummary', JSON.stringify(checkoutData.emailSummary));
+            window.location.href = 'cloud-checkout.html';
+        }
+
+        document.getElementById('verify-salesperson-code')?.addEventListener('click', () => verifySalespersonCode(true));
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const input = document.getElementById('salesperson-code');
+            const urlCode = normalizePartnerCode(new URLSearchParams(window.location.search).get('partner') || '');
+            const storedCode = normalizePartnerCode(localStorage.getItem('anyaicamReferralPartnerId') || '');
+            const initialCode = urlCode || storedCode;
+            if (input && initialCode) {
+                input.value = initialCode;
+                await verifySalespersonCode(false);
+            }
+        });
+
+        function applyPartnerAssistedQuote() {
+            const params = new URLSearchParams(window.location.search);
+            if (params.get('partnerQuote') !== '1') return false;
+
+            const quote = JSON.parse(localStorage.getItem('anyaicamPartnerAssistedQuote') || 'null');
+            if (!quote) return false;
+
+            const banner = document.getElementById('partner-assisted-banner');
+            if (banner) {
+                const partnerName = quote.partner?.name || 'your ANY AI CAM sales partner';
+                banner.classList.remove('hidden');
+                banner.innerHTML = `<strong>Partner-assisted order</strong><br>This setup was prepared by ${partnerName}. Your approved ${quote.serviceName || 'service'} price will be used. You will enter your own contact and payment information.`;
+            }
+
+            setCloudStorageSelected((quote.cameraCount || 0) > 0);
+            selectedValues.resolutions = {};
+            if (quote.cameraCount > 0 && quote.resolution) {
+                selectedValues.resolutions[quote.resolution] = Number(quote.cameraCount);
+                selectedValues.totalCameras = Number(quote.cameraCount);
+                const qty = document.getElementById(`quantity-${quote.resolution}`);
+                if (qty) qty.value = quote.cameraCount;
+            }
+
+            selectedValues.recordingType = quote.mode || 'motion';
+            selectedValues.duration = String(quote.duration || '2');
+            selectedValues.billingCycle = quote.billing || 'monthly';
+
+            document.querySelectorAll('.camera-option[data-type]').forEach(el => {
+                el.classList.toggle('selected', el.dataset.type === selectedValues.recordingType);
+            });
+            document.querySelectorAll('.duration-option').forEach(el => {
+                el.classList.toggle('selected', el.dataset.duration === selectedValues.duration);
+            });
+            const billing = document.getElementById('billing-cycle');
+            if (billing) billing.value = selectedValues.billingCycle;
+
+            const adapterMap = { adapter8: '8channel', adapter16: '16channel', adapter32: '32channel', adapter64: '64channel' };
+            if (quote.adapter && quote.adapter !== 'none') {
+                selectedValues.adapterType = adapterMap[quote.adapter] || null;
+                document.querySelectorAll('.adapter-option').forEach(el => {
+                    el.classList.toggle('selected', el.dataset.adapter === selectedValues.adapterType);
+                });
+            }
+
+            if (quote.resolution && quote.duration && quote.mode && quote.cameraCount > 0) {
+                const unitCustomer = quote.billing === 'annual'
+                    ? (quote.customerTotal / Math.max(1, quote.cameraCount))
+                    : null;
+                if (quote.billing === 'monthly') {
+                    const storageOnly = quote.rows?.find?.(r => String(r.label).includes('cloud storage'));
+                    const key = `${quote.resolution}-${quote.duration}days-${quote.mode}`;
+                    if (storageOnly) pricingTable[key] = storageOnly.customer / quote.cameraCount;
+                }
+            }
+
+            selectedValues.partnerQuote = quote;
+            updateStep1NextButton();
+            updateBreakdown();
+            showStep(5);
+            return true;
+        }
+
+        updateStep1NextButton();
+        setCloudStorageSelected(true);
+        updateStep1NextButton();
+        if (!applyPartnerAssistedQuote()) showStep(1);
+
+        // Mobile menu toggle
+        document.addEventListener('DOMContentLoaded', function () {
+            var toggle = document.querySelector('.mobile-menu-toggle');
+            var nav = document.querySelector('.site-nav');
+            var header = document.querySelector('.site-header');
+            if (toggle && nav) {
+                toggle.addEventListener('click', function () {
+                    nav.classList.toggle('active');
+                    header.classList.toggle('menu-open');
+                });
+            }
+        });
+    
+        // Record a partner referral visit in the server database.
+        (function trackPartnerReferral() {
+            const partnerCode = new URLSearchParams(location.search).get('partner');
+            if (!partnerCode) return;
+            localStorage.setItem('anyaicamReferralPartner', partnerCode);
+            fetch('api.php?action=track_referral', {
+                method: 'POST', credentials: 'same-origin', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({partner: partnerCode, page: location.pathname + location.search})
+            }).catch(() => {});
+        })();
+</script>
+<footer class="site-footer" id="about">
+<div>
+<a aria-label="ANY AI CAM home" class="brand footer-brand" href="index.html"><img alt="ANY AI CAM AI Cloud Protection" class="brand-logo" loading="lazy" src="full-logo-transparent.png"/></a>
+<p>Videoloft cloud recording, AnyAiCam video solutions, camera readiness and remote onboarding support.</p>
+<p style="margin-top:1rem;color:#d5dff8;font-size:.84rem;">© 2026 ANY AI CAM. All rights reserved.</p>
+</div>
+<div><h3>Videoloft Cloud</h3><a href="cloud-setup-wizard.html">Cloud Setup Wizard</a><a href="cloud-storage-pricing.html">Cloud Storage Pricing</a><a href="adapters.html">Cloud Adapters</a><a href="software.html">Windows Software Bridge</a><a href="how-it-works.html">How It Works</a></div>
+<div><h3>Camera System</h3><a href="camera-compatibility-check.html">Camera Readiness</a><a href="cameras.html">Cameras</a><a href="nvr.html">NVR Setup</a><a href="troubleshooting.html">Troubleshooting</a><a href="support.html">Live Tech Support</a></div>
+<div><h3>ANY AI CAM</h3><a href="index.html">Home</a><a href="contact.html">Contact Us</a><a href="videoloft-partner.html">Videoloft Partner Login</a><a href="privacy-policy.html">Privacy Policy</a><a href="terms.html">Terms of Service</a><a href="shipping-returns.html">Shipping &amp; Returns</a></div>
+<div><h3>Contact</h3><a href="/cdn-cgi/l/email-protection#23424e42574263424d5a424a40424e0d404c4e"><span class="__cf_email__" data-cfemail="b6d7dbd7c2d7f6d7d8cfd7dfd5d7db98d5d9db">[email&#160;protected]</span></a><a href="tel:+13465544699">(346) 554-4699</a><span>Serving customers nationwide</span></div>
+</footer>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script id="anyaicam-compact-quantity-behavior">
+(function(){
+  function stop(e){e.preventDefault();e.stopPropagation();e.stopImmediatePropagation();}
+  function setValue(input,value){
+    input.value=Math.max(Number(input.min||0),Math.min(Number(input.max||999),value));
+    input.dispatchEvent(new Event("input",{bubbles:true}));
+    input.dispatchEvent(new Event("change",{bubbles:true}));
+  }
+
+  document.addEventListener("click",function(e){
+    const plus=e.target.closest(".qty-plus");
+    const minus=e.target.closest(".qty-minus");
+    if(plus||minus){
+      stop(e);
+      const input=document.getElementById((plus||minus).dataset.target);
+      if(input)setValue(input,Number(input.value||0)+(plus?1:-1));
+      return;
+    }
+
+    const cloudPlus=e.target.closest(".cloud-plus");
+    const cloudMinus=e.target.closest(".cloud-minus");
+    if(cloudPlus||cloudMinus){
+      stop(e);
+      const input=document.getElementById("cloud-service-qty");
+      const next=cloudPlus?1:0;
+      input.value=next;
+      if(typeof setCloudStorageSelected==="function")setCloudStorageSelected(!!next);
+      const row=document.getElementById("cloud-toggle");
+      row&&row.classList.toggle("selected",!!next);
+      if(typeof updateStep1NextButton==="function")updateStep1NextButton();
+      if(typeof updateBreakdown==="function")updateBreakdown();
+      return;
+    }
+
+    const aPlus=e.target.closest(".adapter-plus");
+    const aMinus=e.target.closest(".adapter-minus");
+    if(aPlus||aMinus){
+      stop(e);
+      const row=(aPlus||aMinus).closest(".adapter-option");
+      const input=row.querySelector(".adapter-quantity");
+      const current=Number(input.value||0);
+      const next=Math.max(0,current+(aPlus?1:-1));
+
+      document.querySelectorAll(".adapter-option").forEach(other=>{
+        if(other!==row){
+          other.classList.remove("selected");
+          const otherInput=other.querySelector(".adapter-quantity");
+          if(otherInput)otherInput.value=0;
+        }
+      });
+
+      input.value=next;
+      row.classList.toggle("selected",next>0);
+
+      if(next>0){
+        selectedValues.adapterType=row.dataset.adapter;
+        selectedValues.adapterQty=next;
+        selectedValues.ownedAdapterChannel=row.dataset.adapter==="ownedadapter"
+          ?(row.dataset.ownedChannel||"8channel"):null;
+        if(selectedValues.adapterType==="ownedadapter"&&typeof setCloudStorageSelected==="function"){
+          setCloudStorageSelected(true);
+          const cloudQty=document.getElementById("cloud-service-qty");
+          if(cloudQty)cloudQty.value=1;
+        }
+      }else{
+        selectedValues.adapterType=null;
+        selectedValues.adapterQty=1;
+        selectedValues.ownedAdapterChannel=null;
+      }
+      if(typeof updateStep1NextButton==="function")updateStep1NextButton();
+      if(typeof updateBreakdown==="function")updateBreakdown();
+    }
+  },true);
+
+  document.addEventListener("DOMContentLoaded",function(){
+    const cloud=document.getElementById("cloud-service-qty");
+    if(cloud)cloud.value=selectedValues.includeCloud?1:0;
+  });
+})();
+</script>
+<script id="aic-multi-hardware-cart">
+(function(){
+ const KEY='anyaicamHardwareCartV3'; const PRODUCTS=[{"sku":"AIC-CAM-5MP-DOME-001","kind":"camera","name":"VIVOTEK FD9380-HTV-V2 \u2014 5MP Outdoor Dome AI Camera","short":"Motorized varifocal dome \u00b7 PoE \u00b7 Smart IR \u00b7 outdoor rated","price":349.99},{"sku":"AIC-CAM-BULLET-IB9380","kind":"camera","name":"VIVOTEK IB9380-HTV-V2 \u2014 5MP Outdoor Bullet AI Camera","short":"Motorized varifocal bullet \u00b7 PoE \u00b7 Smart IR \u00b7 outdoor rated","price":349.99},{"sku":"AIC-CAM-FISHEYE-FE9380","kind":"camera","name":"VIVOTEK FE9380-HV \u2014 5MP Fisheye Panoramic Camera","short":"180\u00b0 panoramic view \u00b7 PoE \u00b7 dewarped viewing modes","price":649.99},{"sku":"AIC-CAM-DUAL-MA9312","kind":"camera","name":"VIVOTEK MA9312-EHTV \u2014 Dual-Directional 4K AI Camera","short":"Two adjustable 4K lenses \u00b7 PoE+ \u00b7 premium panoramic coverage","price":1799.99},{"sku":"AIC-POE-MOKER-8","kind":"poe","name":"MokerLink POE-F082G \u2014 8-Port PoE Switch with 2 Gigabit Uplinks","short":"8 powered 10/100 PoE ports \u00b7 120W PoE budget \u00b7 2 Gigabit uplinks","price":79.99},{"sku":"AIC-POE-MOKER-16","kind":"poe","name":"MokerLink POE-G162G \u2014 16-Port Gigabit PoE+ Switch with 2 Gigabit Uplinks","short":"16 powered Gigabit PoE+ ports \u00b7 250W PoE budget \u00b7 2 Gigabit uplinks","price":174.99},{"sku":"AIC-POE-MOKER-24","kind":"poe","name":"MokerLink POE-G244GS \u2014 24-Port Gigabit PoE+ Switch with 2 Ethernet and 2 SFP Uplinks","short":"24 powered Gigabit PoE+ ports \u00b7 400W PoE budget \u00b7 2 Ethernet and 2 SFP uplinks","price":229.99},{"sku":"AIC-POE-MOKER-48","kind":"poe","name":"MokerLink POE-G482GS \u2014 48-Port Gigabit PoE Switch with 2 SFP Uplinks","short":"48 powered Gigabit PoE ports \u00b7 400W shared budget \u00b7 2 SFP uplinks","price":429.99},{"sku":"AIC-CAM-LTS-LXIP1142","kind":"camera","name":"LTS LXIP1142W-28MA \u2014 Pro-X 4MP Starlight Turret IP Camera","short":"4MP \u00b7 2.8 mm lens \u00b7 built-in microphone \u00b7 PoE \u00b7 IP67","price":114.99},{"sku":"AIC-CAM-LTS-CMIP3382","kind":"camera","name":"LTS CMIP3382WI-28SDL \u2014 Platinum Plus 8MP Active-Deterrence Turret","short":"8MP / 4K \u00b7 active deterrence \u00b7 smart detection \u00b7 PoE","price":249.99},{"sku":"AIC-CAM-LTS-CMIP3C42","kind":"camera","name":"LTS CMIP3C42WI-28SDL \u2014 4MP Color 24/7 Active-Deterrence Turret","short":"4MP Color 24/7 \u00b7 hybrid illumination \u00b7 active deterrence \u00b7 PoE","price":299.99},{"sku":"AIC-CAM-LTS-CMIP3C82","kind":"camera","name":"LTS CMIP3C82WI-28SDL \u2014 8MP Color 24/7 Active-Deterrence Turret","short":"8MP / 4K Color 24/7 \u00b7 hybrid illumination \u00b7 red/blue strobes \u00b7 PoE","price":409.99},{"sku":"AIC-CAM-LTS-CMHT1722","kind":"camera","name":"LTS CMHT1722-28LS \u2014 2MP HD-TVI Active-Deterrence Turret","short":"2MP analog HD-TVI \u00b7 dual light \u00b7 audio over coax \u00b7 DVR required","price":114.99},{"sku":"AIC-CAM-LTS-CMHT1752","kind":"camera","name":"LTS CMHT1752-28LS \u2014 5MP HD-TVI Dual-Light Turret","short":"5MP analog HD-TVI \u00b7 dual light \u00b7 2.8 mm lens \u00b7 DVR required","price":129.99},{"sku":"AIC-CAM-LTS-CMHT1782","kind":"camera","name":"LTS CMHT1782-28LF \u2014 Platinum Plus 8MP HD-TVI Turret","short":"8MP analog HD-TVI \u00b7 2.8 mm lens \u00b7 DVR required","price":149.99},{"sku":"AIC-POE-LTS-8","kind":"poe","name":"LTS VSPOE-SW802 \u2014 8-Port PoE Switch with 2 Uplink Ports","short":"8 powered PoE ports \u00b7 2 uplink ports","price":159.99},{"sku":"AIC-POE-LTS-16","kind":"poe","name":"LTS VSPOE-SW1602 \u2014 16-Port PoE Switch with 2 Combo Ports","short":"16 powered PoE ports \u00b7 2 combo uplink ports","price":329.99},{"sku":"AIC-POE-LTS-24","kind":"poe","name":"LTS VSPOE-SW2402 \u2014 Pro-VS 24-Port PoE Switch with 2 Combo Ports","short":"24 powered PoE ports \u00b7 2 combo uplink ports","price":429.99}];
+ const bySku=Object.fromEntries(PRODUCTS.map(p=>[p.sku,p]));
+ function load(){
+  try{
+   const current=JSON.parse(localStorage.getItem(KEY)||'{}');
+   if(current&&typeof current==='object'&&Object.keys(current).length)return current;
+   const legacy=JSON.parse(localStorage.getItem('anyaicamUnifiedCartV1')||'{}');
+   const migrated={};
+   if(legacy&&Array.isArray(legacy.hardwareItems)) legacy.hardwareItems.forEach(item=>{if(item&&item.sku)migrated[item.sku]=Math.max(0,Number(item.quantity||0));});
+   if(Object.keys(migrated).length)localStorage.setItem(KEY,JSON.stringify(migrated));
+   return migrated;
+  }catch(e){return {};}
+ }
+ function save(x){
+  localStorage.setItem(KEY,JSON.stringify(x));
+  const hardwareItems=PRODUCTS.map(p=>({sku:p.sku,kind:p.kind,name:p.name,quantity:Math.max(0,Number(x[p.sku]||0)),unitPrice:p.price,price:p.price,subtotal:Math.max(0,Number(x[p.sku]||0))*p.price})).filter(p=>p.quantity>0);
+  localStorage.setItem('anyaicamUnifiedCartV1',JSON.stringify({hardwareItems}));
+  window.dispatchEvent(new CustomEvent('aic-hardware-updated'));
+ }
+ function items(){const q=load();return PRODUCTS.map(p=>({...p,quantity:Math.max(0,Number(q[p.sku]||0))})).filter(p=>p.quantity>0).map(p=>({...p,subtotal:p.quantity*p.price}));}
+ function subtotal(){return items().reduce((s,p)=>s+p.subtotal,0);}
+ function money(v){return Number(v||0).toLocaleString('en-US',{style:'currency',currency:'USD'});}
+ function reviewHtml(){const a=items();if(!a.length)return '<p><strong>Camera and PoE hardware:</strong> None selected.</p>';return '<h3 style="margin-top:1.25rem;">Camera and PoE Hardware</h3>'+a.map(p=>'<p><strong>'+p.quantity+' × '+p.name+'</strong><br>'+money(p.price)+' each · '+money(p.subtotal)+'</p>').join('')+'<p><strong>Camera and PoE subtotal: '+money(subtotal())+'</strong></p>';}
+ function textLines(){const a=items();return a.length?a.map(p=>p.quantity+' x '+p.name+' @ '+money(p.price)+' = '+money(p.subtotal)):['No camera or PoE hardware selected'];}
+ function products(){return items().map(p=>({name:p.name,price:p.price,quantity:p.quantity,type:p.kind,sku:p.sku,description:'One-time hardware purchase'}));}
+ function syncRows(){const q=load();document.querySelectorAll('[data-hardware-sku]').forEach(r=>{const n=Math.max(0,Number(q[r.dataset.hardwareSku]||0));const i=r.querySelector('.aic-hardware-quantity');if(i)i.value=n;r.classList.toggle('selected',n>0);});}
+ document.addEventListener('click',e=>{const b=e.target.closest('.aic-hardware-plus,.aic-hardware-minus');if(!b)return;const r=b.closest('[data-hardware-sku]');if(!r)return;e.preventDefault();e.stopPropagation();const q=load(),sku=r.dataset.hardwareSku,now=Math.max(0,Number(q[sku]||0));q[sku]=Math.max(0,Math.min(64,now+(b.classList.contains('aic-hardware-plus')?1:-1)));save(q);syncRows();setTimeout(()=>{if(typeof updateBreakdown==='function')updateBreakdown();if(typeof updateReviewSummary==='function')updateReviewSummary();if(typeof updateLiveBasket==='function')updateLiveBasket();},0);});
+ document.addEventListener('DOMContentLoaded',syncRows);window.addEventListener('aic-hardware-updated',syncRows);
+ window.AICHardware={PRODUCTS,load,save,items,subtotal,money,reviewHtml,textLines,products,syncRows};
+})();
+</script>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>

@@ -1,0 +1,435 @@
+{
+ "files": {
+  "/": {
+   "bytes": 61685,
+   "last_modified": "Tue, 08 Sep 2026 03:59:16 GMT",
+   "sha256": "3b2e726c36a291b0cf4cd9ee1abd0ec0bda6dd091eee79e13d8a9010e6754620"
+  },
+  "/IconOnly_Transparent.png": {
+   "bytes": 29020,
+   "last_modified": "Tue, 08 Sep 2026 02:40:08 GMT",
+   "sha256": "87d61d5578818cdaf3b33c64d092988199ddb22dc703946d42f446bc13cb5e63"
+  },
+  "/Smart-Motion-1.webp": {
+   "bytes": 97142,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "731bfa638d7a6fad0312f79e9052ef69e1fbcb955b6183bb281c29f37030d268"
+  },
+  "/Videoloft App Logo.jpg": {
+   "bytes": 3633,
+   "last_modified": null,
+   "sha256": "40dfe89db413a1a0d708a4116dc44ef4ebeebb1a65eef6007622b03903cf3465"
+  },
+  "/Virtual-Cloud-Adapter.webp": {
+   "bytes": 33336,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "5274f78411482199578e4a20343922c67bfaafda0802491c59941e74aab2e059"
+  },
+  "/aac-ai-access-edge.webp": {
+   "bytes": 6548,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "8574454e449170d9a8db4fd5713b1ffb29446c6d7d023897bcdd357d85288dac"
+  },
+  "/aac-standalone-relay.png": {
+   "bytes": 959322,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "6b0484fab1c994f26a991f81ff5ffbed2b6929728d689d16643c4165cabd651c"
+  },
+  "/aac-vms-edge-x1-255-ryzen7.jpg": {
+   "bytes": 46092,
+   "last_modified": "Tue, 08 Sep 2026 02:40:08 GMT",
+   "sha256": "4fa04c8d0480176a5f4ae6cff4546e8736bb08557b718a7cd2521e97588d3318"
+  },
+  "/aac-vms-edge-x1-ryzen9.jpg": {
+   "bytes": 46037,
+   "last_modified": "Tue, 08 Sep 2026 02:40:08 GMT",
+   "sha256": "7681991fb645d5b84c41dc0c84db409753bf4078b1086ed4f066a15e56258ae9"
+  },
+  "/adapters.html": {
+   "bytes": 24631,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "1ef7367423a3dad0e23aec25a844cd48ebbefe106e11cc357d35e2929815eb21"
+  },
+  "/analytics.html": {
+   "bytes": 4572,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "d8cbeeb3fe3c4f75ee7a58c02d309a89f9c2c355947b843ba8ff0ad531ea557f"
+  },
+  "/basket.html": {
+   "bytes": 22466,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "830e1e9392de770214777da70d4bb7d048628f81ab83ec4b22a5f0f296c043cd"
+  },
+  "/build-your-system.html": {
+   "bytes": 33296,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "a3e1a7fdb79dea0a025844c2dd950daea5c76d5dbd3c751965e6c11fd1ca9048"
+  },
+  "/camera-compatibility-check.html": {
+   "bytes": 26136,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "262d36ce02fb6588685ace5dc96dfc60e181b4931125f2bcc5cb867030af7eaf"
+  },
+  "/camera-compatibility-check.js": {
+   "bytes": 4984,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "78e7130ff1707fab27ce5b905d7c6379216fc7cb729f8897ab2bdd9fddad4236"
+  },
+  "/camera-straight-to-cloud-setup.webp": {
+   "bytes": 11774,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "dbd70d058f7c0660cd76763e5c8da50c92f112bee8042f37bef157965b8bef28"
+  },
+  "/cameras.html": {
+   "bytes": 64175,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "a49e7331fb9877dc5b9a18d47ed8895573f0d11f3b9c7997c01ff9eb190840e4"
+  },
+  "/cloud-adapter-enterprise.png": {
+   "bytes": 750791,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "2997693171eb8aea4d32e4bae12509b6ecda09f8644691865591bf986ad348ed"
+  },
+  "/cloud-checkout.html": {
+   "bytes": 36460,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "917362d5161d416fd2dbfdee70a887fee250d4b21dfd93b7cf6f4725c6fb348c"
+  },
+  "/cloud-setup-wizard.html": {
+   "bytes": 120494,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "7061b7b8b8c3121953f402bb9fe034ff4bcf6b2a6a933281328b06d2e9957011"
+  },
+  "/cloud-storage-pricing.html": {
+   "bytes": 50694,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "5b4c8fcd0118dac5e936f423b540c94ac9e07382f5a26357f59712d81698f425"
+  },
+  "/compatibility.html": {
+   "bytes": 1079,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "cde769b5120cd67b07a603c58457f28105632545638fbaf427e9cf172a0a6d5d"
+  },
+  "/contact.html": {
+   "bytes": 8604,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "b23321e47b48986d81639d0c651a0d0c9922a4990c7e90d024f61d703435f0d3"
+  },
+  "/customer-login.html": {
+   "bytes": 2139,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "06ce61d794ac61e853bee2a3eded9219a7fb65f1ec097c4bf976b79fcc232387"
+  },
+  "/customer-setup.html": {
+   "bytes": 15854,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "9cec5aac44c23ef3d8a0e9c81b631d63ee006f1eed8ee57bbe9bc14ed21233b8"
+  },
+  "/edge-appliance.html": {
+   "bytes": 18955,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "2c411b26f458104ae0bf2dda49533602952f821898d5967ff2b898dd9291b307"
+  },
+  "/face-access.html": {
+   "bytes": 24460,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "e8b10ad7ab887e15214cb972f4a83234c473def1017753e683fdb8625dbd835a"
+  },
+  "/favicon.png": {
+   "bytes": 976,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "2410355e0331917be55134ddb220c6624b4c9b621865f166c15c5ee9671caf94"
+  },
+  "/full-logo-transparent.png": {
+   "bytes": 48913,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "313006509c5b3ee3a910c6cca773c2f2dc1a57c8aa97c285d60736e5a230ea5e"
+  },
+  "/hardware-catalog.css": {
+   "bytes": 2041,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "c4aacd69370133e901b7d5442be3fd6196d809bbc083ea5d00a637bc018a7555"
+  },
+  "/hardware-catalog.js": {
+   "bytes": 9180,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "5d12cfc93995ce27411d6572ee164baa709041ab6d1563136a7d82ce7f874cb9"
+  },
+  "/hardware.html": {
+   "bytes": 18576,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "41be31e7f30d707095f4263703285a1d80bcde8d73b149c1b2a59dfdbe23e960"
+  },
+  "/header-standard.css": {
+   "bytes": 5235,
+   "last_modified": "Tue, 08 Sep 2026 03:31:42 GMT",
+   "sha256": "843c9a7be8a8626498da9ce3a26ab980e7ce4e1da0a99e3a015065e9ba8afb58"
+  },
+  "/how-it-works.html": {
+   "bytes": 36458,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "abae5feb3bd2a756a0b2098a97ee003bec1fd0e287dbeee8c9836f368b62dcd4"
+  },
+  "/index.html": {
+   "bytes": 61685,
+   "last_modified": "Tue, 08 Sep 2026 03:59:16 GMT",
+   "sha256": "95c2170eaa54182f691d5f401baf3cf7641629c086961b8584759d3e85c6cbaf"
+  },
+  "/mokerlink-16-port-poe.jpg": {
+   "bytes": 48297,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "fbc267cc511e609e0ad62a90b09578819563674cf5605df76b8173963b3319f3"
+  },
+  "/mokerlink-24-port-poe.jpg": {
+   "bytes": 35608,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "d0e177be4f3a5edbde1148a31dc1bfb5675954bc0fed4bbb63e5090c5984c666"
+  },
+  "/mokerlink-48-port-poe.jpg": {
+   "bytes": 45864,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "e160602bd4a77c5a194511029ff2298d8fcab7824021ef241c820aef6c063f99"
+  },
+  "/mokerlink-8-port-poe.jpg": {
+   "bytes": 61560,
+   "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
+   "sha256": "effdb28c8fb89778da041c3c47a7d1bdf55445bef4eca92c879309390fe2f544"
+  },
+  "/nvr-cloud-recorder-setup.webp": {
+   "bytes": 19072,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "728b21c983949aa31df4c326ab17fa3efa1bd197d2d50bf77d317bd01c8a8928"
+  },
+  "/nvr.html": {
+   "bytes": 21852,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "ef8833181719a53f910380cc109d4bbacfa4cb89e843c6e2de9d9230b3547e84"
+  },
+  "/partner-assisted-setup.html": {
+   "bytes": 29138,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "64e108c3130253c88e206aa1a41315c259c293bbb6e7d29b18ffd53d8c91d83d"
+  },
+  "/partner-icon-180.png": {
+   "bytes": 11442,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "ae49cca772b74c266227b20d2def39ca1f975c6819d92d289c1f6fa59049c7e6"
+  },
+  "/partner-icon-192.png": {
+   "bytes": 12411,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "8c694a214efa3889e24b67eab45dc41f3a8485439852bc1ac6b4d672d0110f61"
+  },
+  "/partner.html": {
+   "bytes": 863,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "7a86b5afc67f879b5e96c8cbc1986cc75db1e5ee857233dc1ff484e845517e97"
+  },
+  "/plans.html": {
+   "bytes": 4373,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "508edca6d446e3c5f33d0c21aa91e48d48f7bfbfbfe25129909695f568da565b"
+  },
+  "/pricing.html": {
+   "bytes": 50683,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "42a0fed96d3719a39522aa0914d0d431fbd81bcecd533a638aa019762ba37cf8"
+  },
+  "/privacy-policy.html": {
+   "bytes": 9713,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "c0699b00b74f0ccd49c70710875462ed536dbbe7a9403d9e4177e58d06cac7a6"
+  },
+  "/sales-partner-login.html": {
+   "bytes": 8269,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "4ac43631816688660bf9f3e1d266227a67ce70701300b929447dda14fbf6b3e1"
+  },
+  "/script.js": {
+   "bytes": 8108,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "ee5e2ee1cf7e31adae827a4341a5c7baab4dfa2fcfc9072b2d7ace1d42491c3e"
+  },
+  "/security-cloud-hero.png": {
+   "bytes": 1802390,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "b9dcfac668b55a714f98ab141f271d704b69c56e5f4c6446da0f146e68495141"
+  },
+  "/shipping-returns.html": {
+   "bytes": 9818,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "96a1c71cfd39e0b0047daefb7c2ef46c133d624c1a869a0c8b25e1aff6282d9c"
+  },
+  "/signin.html": {
+   "bytes": 4067,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "53cd6a6311ab1136db01c4ab8dc9f50249e19eb139e7945f6289678bfdb43a64"
+  },
+  "/software-trial-wizard.html": {
+   "bytes": 5139,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "dd9c7852fc560235d0ca8e0b65a4f97a042d8ae4d35057194ec1d1655b756317"
+  },
+  "/software-trial.html": {
+   "bytes": 4827,
+   "last_modified": "Tue, 08 Sep 2026 02:40:12 GMT",
+   "sha256": "f8253cc2156bea66f74c3df667fb54acd5ec1e65f5c633df588e440b6034fd93"
+  },
+  "/software.html": {
+   "bytes": 16358,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "f62c7b9b854c976ef26922c33e2884f317f148be4c10cf1b1888c9f9089f2221"
+  },
+  "/starter-camera-trial.html": {
+   "bytes": 17593,
+   "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
+   "sha256": "05c272440db3670f586dc3b298e511d234719817e41df7283e178a9493a92497"
+  },
+  "/styles.css": {
+   "bytes": 53109,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "40c75e4db1be2f74d6657e010b4b1d205fe02b2f7ad097dfca822a6a9486dfb2"
+  },
+  "/support-diagnostic.html": {
+   "bytes": 24265,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "d89706aa20e32790b7294b76ac94132c25f8f4efe0f143c128a97f00fa0e0dff"
+  },
+  "/support.html": {
+   "bytes": 19806,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "4c9cc3fd329086640152ccd0a916d281c0caabef2c9a45218e05e057766fc971"
+  },
+  "/terms.html": {
+   "bytes": 10095,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "3136d8405442b1aed8b22c5a292ce3c373f5152444f02d1cfa4292f3051d4215"
+  },
+  "/troubleshooting.html": {
+   "bytes": 13717,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "7fa5a7b3bfb417feb703045a0e78bdaf36db15af0741bad9c9cbc2d9f9000318"
+  },
+  "/videoloft adapter.jpg": {
+   "bytes": 8447,
+   "last_modified": null,
+   "sha256": "8555d4766ddbf4d40e4f1a36fd9302edb7131038c73ba4062dffe3349f0bad41"
+  },
+  "/videoloft provision.png": {
+   "bytes": 21302,
+   "last_modified": null,
+   "sha256": "2384c17916968407eeba2c01f74d8ba4a2f8438769473a2e72d66f151ad772f2"
+  },
+  "/videoloft-partner-manifest.webmanifest": {
+   "bytes": 603,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "3f41949664bb24d577e71d1fb4ac37476f2271fc67bd4609aa3bd8937b81150e"
+  },
+  "/videoloft-partner-referral-wizard.html": {
+   "bytes": 99848,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "3727d3527d7128e6da3f022ba8ed2895c76f202076433b64b09c7ae88310b49c"
+  },
+  "/videoloft-partner-sales-calculator.html": {
+   "bytes": 65549,
+   "last_modified": "Tue, 08 Sep 2026 02:40:14 GMT",
+   "sha256": "458b2811d80612a7e9a75735400acfb082873ad378eacd66b163f33e5f506528"
+  },
+  "/videoloft-partner-software-trial.html": {
+   "bytes": 4255,
+   "last_modified": "Tue, 08 Sep 2026 02:40:14 GMT",
+   "sha256": "7239c877c376b93653c84234b21b1fa59e9e6ea1234568b809ac0defb4aa19a0"
+  },
+  "/videoloft-partner.html": {
+   "bytes": 76424,
+   "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
+   "sha256": "1d27845af3aa9e898d2fa75177a390d6fd57e457db4b87c8f1d743ee8d38605b"
+  },
+  "/vivotek-fd9380-hv-v2.png": {
+   "bytes": 130858,
+   "last_modified": "Tue, 08 Sep 2026 02:40:14 GMT",
+   "sha256": "7c670e5dca68d1970b497ab752e4d0d1e5fb1e42133eb8f96974d357d43ab8fe"
+  },
+  "/vivotek-fe9380-hv.png": {
+   "bytes": 133398,
+   "last_modified": "Tue, 08 Sep 2026 02:40:14 GMT",
+   "sha256": "011c55214686e40ae4ce2115169d9645d8a1a176dbfe474b6d5e0fcf316b212a"
+  },
+  "/vivotek-ib9380-htv-v2.png": {
+   "bytes": 87476,
+   "last_modified": "Tue, 08 Sep 2026 02:40:14 GMT",
+   "sha256": "769b258fcff894fb4cc15247c4ef7a580d9060760f27ab45b3b2439f10c4d9bd"
+  },
+  "/vivotek-ma9312-ehtv.png": {
+   "bytes": 145152,
+   "last_modified": "Tue, 08 Sep 2026 02:40:14 GMT",
+   "sha256": "d5c54c67eb61d557a9396e31f4dd21bf172dce960213457bd2edca8a1905ba94"
+  },
+  "/vms-cloud-video-surveillance.webp": {
+   "bytes": 292624,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "2c160c8b397ff004e54b2f292d69a0bc4cafe8d10773821817571f2d807f9d49"
+  },
+  "/vms-contact.html": {
+   "bytes": 7359,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "eda277afd054d5dafd9fb1ca41b7309c047364d8181522677f729ff038e83879"
+  },
+  "/vms-features.html": {
+   "bytes": 14332,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "aa604a3b51a0bf2c373917199cdbd7d08051c15b6eba71c1e4dc1cd086fe2c25"
+  },
+  "/vms-footer.js": {
+   "bytes": 1959,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "a7b9ecb87aa63c9a1156baa39b5f039b06228a806b1992be143cbeb59e348952"
+  },
+  "/vms-pages.css": {
+   "bytes": 3404,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "968dbe86bd5815993814f43d5ba7bb3cfc78fcf98360c31eb76f05df8bdfefe0"
+  },
+  "/vms-partner-admin.html": {
+   "bytes": 7567,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "f27eb233509b6e0cd79a6e788220abd53421262b49ab8063e687f0ee2d39f8ef"
+  },
+  "/vms-partner-apply.html": {
+   "bytes": 6509,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "e1b91182831ce230507dc5fdb94547a8c6c9d0fa2f287dc5f29e56c6c6cec892"
+  },
+  "/vms-partner-sales.html": {
+   "bytes": 8079,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "9b6c0b369719aad502c8afe1f44f3cedd349db47b2501f6c66d46b3264996fd6"
+  },
+  "/vms-product.css": {
+   "bytes": 7447,
+   "last_modified": "Tue, 08 Sep 2026 02:30:44 GMT",
+   "sha256": "f132e5d387b453ed3457b54727e79708ab58fbed3b94bd590037915c0b265c02"
+  },
+  "/vms-support.html": {
+   "bytes": 18468,
+   "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
+   "sha256": "be86657491ff98ae96a9097d043347906b1afa60751eeefcc22f552bda916b2f"
+  },
+  "/vms.html": {
+   "bytes": 21318,
+   "last_modified": "Wed, 09 Sep 2026 00:15:53 GMT",
+   "sha256": "56dd1da18f446ddcccb71a5d8c2cc8f8018a5f4805590683fdf6386204b72059"
+  }
+ },
+ "mirrored_at_utc": "2026-09-29T12:44:48Z",
+ "missing_referenced": {
+  "/${dataUrl}": 404,
+  "/${product.image}": 404,
+  "/`partner-assisted-setup.html": 404,
+  "/cart.html": 404,
+  "/image/png": 404,
+  "/staging-footer.css": 404
+ },
+ "server_side_referenced_not_mirrorable": [],
+ "source": "https://anyaicam.com/"
+}

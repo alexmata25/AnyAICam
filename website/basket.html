@@ -1,0 +1,512 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order Basket | ANY AI CAM</title><style>
+      .learn-hub {
+        padding: 4rem 1rem;
+        background:
+          radial-gradient(circle at top left, rgba(95,196,209,.14), transparent 34%),
+          linear-gradient(180deg, #f7fbff 0%, #eef4fb 100%);
+      }
+      .learn-hub-inner {
+        width: min(1220px, 100%);
+        margin: 0 auto;
+      }
+      .learn-hub-head {
+        max-width: 760px;
+        margin: 0 auto 2rem;
+        text-align: center;
+      }
+      .learn-hub-head h2 {
+        margin: .45rem 0 .8rem;
+        color: #0b1332;
+        font-size: clamp(2rem, 4vw, 3rem);
+      }
+      .learn-hub-head p {
+        margin: 0;
+        color: #52627a;
+        font-size: 1.05rem;
+        line-height: 1.7;
+      }
+      .learn-category {
+        margin-top: 2rem;
+      }
+      .learn-category-title {
+        display: flex;
+        align-items: center;
+        gap: .8rem;
+        margin-bottom: 1rem;
+      }
+      .learn-category-title span {
+        display: inline-grid;
+        place-items: center;
+        width: 2.2rem;
+        height: 2.2rem;
+        border-radius: 999px;
+        color: #fff;
+        background: linear-gradient(135deg, #cc3b96, #5fc4d1);
+        font-weight: 900;
+      }
+      .learn-category-title h3 {
+        margin: 0;
+        color: #0b1332;
+        font-size: 1.45rem;
+      }
+      .learn-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 1rem;
+      }
+      .learn-card {
+        display: flex;
+        flex-direction: column;
+        min-height: 245px;
+        padding: 1.3rem;
+        background: #fff;
+        border: 1px solid #d9e6f4;
+        border-radius: 16px;
+        box-shadow: 0 16px 38px rgba(13,39,75,.08);
+      }
+      .learn-card-icon {
+        display: grid;
+        place-items: center;
+        width: 3rem;
+        height: 3rem;
+        margin-bottom: 1rem;
+        border-radius: 13px;
+        background: #eef7fb;
+        color: #0b2b4f;
+        font-size: 1.45rem;
+      }
+      .learn-card h4 {
+        margin: 0 0 .55rem;
+        color: #0b1332;
+        font-size: 1.1rem;
+      }
+      .learn-card p {
+        margin: 0 0 1rem;
+        color: #5d6b82;
+        line-height: 1.55;
+        font-size: .94rem;
+      }
+      .learn-card .learn-action {
+        margin-top: auto;
+        align-self: flex-start;
+        color: #0b2b4f;
+        font-weight: 800;
+        text-decoration: none;
+      }
+      .learn-card .learn-action:hover {
+        text-decoration: underline;
+      }
+      .learn-card.video-placeholder {
+        border-style: dashed;
+        background: linear-gradient(180deg, #fff, #fbfdff);
+      }
+      .phase-two-tag {
+        display: inline-block;
+        width: fit-content;
+        margin-bottom: .75rem;
+        padding: .25rem .55rem;
+        border-radius: 999px;
+        background: #f4e8f1;
+        color: #8c286c;
+        font-size: .72rem;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: .04em;
+      }
+      .learn-hub-cta {
+        display: flex;
+        justify-content: center;
+        gap: .75rem;
+        flex-wrap: wrap;
+        margin-top: 2.25rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid #d9e6f4;
+      }
+      @media (max-width: 980px) {
+        .learn-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 620px) {
+        .learn-hub { padding: 3rem 1rem; }
+        .learn-grid { grid-template-columns: 1fr; }
+        .learn-card { min-height: 0; }
+      }
+    </style><style id="aic-mobile-readiness-style">
+      .aic-readiness-mobile-copy { display: none; }
+      @media (max-width: 700px) {
+        .aic-readiness-wrap {
+          margin-top: .75rem !important;
+          padding: 0 .75rem !important;
+        }
+        .aic-readiness-banner {
+          grid-template-columns: 1fr !important;
+          gap: .8rem !important;
+          padding: 1rem !important;
+          border-left-width: 5px !important;
+        }
+        .aic-readiness-banner .eyebrow {
+          font-size: .76rem !important;
+          margin-bottom: .2rem !important;
+        }
+        .aic-readiness-title {
+          font-size: 1.08rem !important;
+          line-height: 1.3 !important;
+          margin-bottom: .35rem !important;
+        }
+        .aic-readiness-desktop-copy { display: none; }
+        .aic-readiness-mobile-copy {
+          display: block;
+          margin: 0;
+          color: #4d5872;
+          font-size: .92rem;
+          line-height: 1.45;
+        }
+        .aic-readiness-button {
+          display: flex !important;
+          width: 100% !important;
+          min-height: 48px;
+          justify-content: center !important;
+          text-align: center;
+          padding: .75rem 1rem !important;
+          margin: 0 !important;
+        }
+      }
+    </style><style>
+.basket-main{max-width:980px;margin:auto;padding:46px 20px 74px}.basket-card{background:#fff;border-radius:20px;padding:28px;box-shadow:0 14px 38px rgba(16,42,67,.12)}
+.basket-row{display:grid;grid-template-columns:1fr auto;gap:20px;padding:15px 0;border-bottom:1px solid #dde6ef}.basket-total{font-size:1.35rem;font-weight:900}
+</style><link rel="stylesheet" href="header-standard.css">
+</head><body><header class="site-header">
+        <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+            <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+        </a>
+
+        <div class="header-controls">
+            <button class="mobile-menu-toggle" type="button" aria-expanded="false" aria-controls="primaryNav">Menu</button>
+            <div class="header-badges">
+                <a class="live-support-badge" href="contact.html">&#9742; Contact Support</a>
+            </div>
+        </div>
+                <nav class="site-nav" id="primaryNav" aria-label="Primary navigation">
+            <a href="index.html">Home</a>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="cloud-storage-pricing.html">Pricing</a><a href="cameras.html">Cameras</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="adapters.html">Adapters</a>
+            <a href="support.html">Support</a>
+            <a href="contact.html">Contact</a>
+            <a href="cloud-setup-wizard.html">Get Started</a>
+            <div class="dropdown">
+              <a href="#" class="dropbtn">More</a>
+              <div class="dropdown-content">
+                <a href="nvr.html">NVR Setup</a>
+                <a href="software.html">Software</a>
+                <a href="partner.html">Partner Login</a>
+              </div>
+            </div>
+        </nav>
+    </header><main class="basket-main"><section class="basket-card"><h1>Your ANY AI CAM Basket</h1>
+<p>Hardware due today is separated from cloud service charges that begin after the free trial.</p>
+<div class="basket-row"><span>Cloud adapter</span><strong>Selected in Setup Wizard</strong></div>
+<div id="cameraBasket"></div>
+<div class="basket-row basket-total"><span>Hardware subtotal shown here</span><strong id="cameraTotal">$0.00</strong></div>
+<div class="basket-row"><span>Cloud storage</span><strong>Begins after free trial</strong></div>
+<p><a href="cloud-setup-wizard.html">Continue building your order</a></p></section></main><footer class="site-footer" id="about">
+        <div>
+            <a class="brand footer-brand" href="#home" aria-label="ANY AI CAM home">
+                <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+            </a>
+            <p>Cloud camera activation and onboarding support for compatible existing camera systems.</p>
+            <p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">&copy; 2026 ANY AI CAM. All rights reserved.</p>
+        </div>
+        <div>
+            <h3>Service</h3>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="#services">Cloud Account Setup</a>
+            <a href="index.html#pricing">Pricing Calculator</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="/camera-compatibility-check.html">Camera Check</a>
+            <a href="adapters.html">Adapter Options</a>
+            <a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+            
+            <a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+            <a href="partner.html">Partner Login</a>
+            <a href="support.html">Live Tech Support</a>
+        </div>
+        <div>
+            <h3>Contact &amp; Policies</h3>
+            <a href="contact.html">Contact Us</a>
+            <a href="/cdn-cgi/l/email-protection#f99894988d98b998978098909a9894d79a9694"><span class="__cf_email__" data-cfemail="e0818d819481a0818e99818983818dce838f8d">[email&#160;protected]</span></a>
+            <a href="tel:+18325108240">(832) 510-8240</a>
+            <a href="privacy-policy.html">Privacy Policy</a>
+            <a href="terms.html">Terms of Service</a>
+            <a href="shipping-returns.html">Shipping &amp; Returns</a>
+            <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        </div>
+    </footer>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script id="anyaicam-unified-cart">
+(function(){
+  const CART_KEY='anyaicamUnifiedCartV1';
+  const CAMERA_PRICE=199;
+  const CAMERA_SKU='VIVOTEK-FD9380-HV-V2';
+
+  function normalizeCart(cart){
+    cart=cart&&typeof cart==='object'?cart:{};
+    cart.camera=cart.camera&&typeof cart.camera==='object'?cart.camera:{};
+    cart.camera.sku=CART_KEY&&CAMERA_SKU;
+    cart.camera.name='ANY AI CAM 5MP Outdoor Fixed Dome AI Camera';
+    cart.camera.model='VIVOTEK FD9380-HTV-V2';
+    cart.camera.unitPrice=CAMERA_PRICE;
+    cart.camera.quantity=Math.max(0,Math.min(64,Number(cart.camera.quantity)||0));
+    return cart;
+  }
+  function loadCart(){
+    try{return normalizeCart(JSON.parse(localStorage.getItem(CART_KEY)||'{}'));}catch(e){return normalizeCart({});}
+  }
+  function saveCart(cart){
+    cart=normalizeCart(cart);
+    localStorage.setItem(CART_KEY,JSON.stringify(cart));
+    window.dispatchEvent(new CustomEvent('anyaicam-cart-updated',{detail:cart}));
+    return cart;
+  }
+  function setCameraQuantity(quantity){
+    const cart=loadCart();
+    cart.camera.quantity=Math.max(0,Math.min(64,Number(quantity)||0));
+    return saveCart(cart);
+  }
+  function cameraSubtotal(cart){
+    cart=normalizeCart(cart||loadCart());
+    return cart.camera.quantity*cart.camera.unitPrice;
+  }
+  function money(v){
+    return Number(v||0).toLocaleString('en-US',{style:'currency',currency:'USD'});
+  }
+  function renderCameraSummary(container){
+    if(!container)return;
+    const cart=loadCart(), qty=cart.camera.quantity, subtotal=cameraSubtotal(cart);
+    container.innerHTML=qty>0
+      ? `<div class="aic-cart-row"><span>ANY AI CAM 5MP Dome Camera</span><strong>${qty} × ${money(CAMERA_PRICE)} = ${money(subtotal)}</strong></div>`
+      : `<div class="aic-cart-row"><span>ANY AI CAM 5MP Dome Camera</span><strong>None selected</strong></div>`;
+  }
+  window.AnyAICamCart={load:loadCart,save:saveCart,setCameraQuantity,cameraSubtotal,money,renderCameraSummary,CAMERA_PRICE,CAMERA_SKU};
+})();
+</script>
+
+<script>document.addEventListener('DOMContentLoaded',function(){AnyAICamCart.renderCameraSummary(document.getElementById('cameraBasket'));document.getElementById('cameraTotal').textContent=AnyAICamCart.money(AnyAICamCart.cameraSubtotal());});</script><script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "ProfessionalService",
+          "name": "ANY AI CAM",
+          "url": "https://anyaicam.com/",
+          "email": "amata@anyaicam.com",
+          "areaServed": "United States",
+          "description": "Cloud camera activation and onboarding support for compatible existing security camera systems.",
+          "serviceType": [
+            "Cloud camera activation",
+            "Cloud video recording",
+            "Remote camera viewing",
+            "Camera compatibility review",
+            "Smart Motion video analytics"
+          ],
+          "brand": {
+            "@type": "Brand",
+            "name": "ANY AI CAM AI Cloud Protection"
+          }
+        }
+    </script>
+<script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@graph": [
+            {
+              "@type": "VideoObject",
+              "name": "Videoloft Demo: The All-In-One Cloud VMS for Any Security System",
+              "description": "See how ANY AI CAM connects existing security cameras to cloud recording with Videoloft cloud VMS.",
+              "thumbnailUrl": "https://anyaicam.com/vms-cloud-video-surveillance.webp",
+              "embedUrl": "https://www.youtube.com/embed/Xa0Od-JFnYs",
+              "contentUrl": "https://www.youtube.com/watch?v=Xa0Od-JFnYs",
+              "uploadDate": "2026-01-01"
+            },
+            {
+              "@type": "VideoObject",
+              "name": "Smart Motion Video Analytics Demo",
+              "description": "Watch Smart Motion AI detection and alerts in action for security cameras.",
+              "thumbnailUrl": "https://anyaicam.com/Smart-Motion-1.webp",
+              "embedUrl": "https://www.youtube.com/embed/aTBdazIvs40",
+              "contentUrl": "https://www.youtube.com/watch?v=aTBdazIvs40",
+              "uploadDate": "2026-01-01"
+            },
+            {
+              "@type": "VideoObject",
+              "name": "People Counting Video Analytics Demo",
+              "description": "See how AI people counting works for retail and business security cameras.",
+              "thumbnailUrl": "https://anyaicam.com/Smart-Motion-1.webp",
+              "embedUrl": "https://www.youtube.com/embed/KzRgPfao3Ao",
+              "contentUrl": "https://www.youtube.com/watch?v=KzRgPfao3Ao",
+              "uploadDate": "2026-01-01"
+            },
+            {
+              "@type": "VideoObject",
+              "name": "License Plate Recognition (LPR) Demo",
+              "description": "Watch AI license plate recognition in action for security camera systems.",
+              "thumbnailUrl": "https://anyaicam.com/Smart-Motion-1.webp",
+              "embedUrl": "https://www.youtube.com/embed/ojrcFBDryzY",
+              "contentUrl": "https://www.youtube.com/watch?v=ojrcFBDryzY",
+              "uploadDate": "2026-01-01"
+            }
+          ]
+        }
+    </script>
+<script>
+      (function () {
+        const params = new URLSearchParams(window.location.search);
+        const partnerCode = String(params.get("partner") || "").trim().toUpperCase();
+
+        if (/^P-[A-Z0-9]{6,20}$/.test(partnerCode)) {
+          localStorage.setItem("anyaicamReferralPartnerId", partnerCode);
+          localStorage.setItem("anyaicamReferralLandingTime", String(Date.now()));
+
+          const banner = document.getElementById("referralWelcomeBanner");
+          if (banner) banner.style.display = "block";
+
+          params.delete("partner");
+          const cleanQuery = params.toString();
+          const cleanUrl = window.location.pathname + (cleanQuery ? "?" + cleanQuery : "") + window.location.hash;
+          window.history.replaceState({}, document.title, cleanUrl);
+        } else if (localStorage.getItem("anyaicamReferralPartnerId")) {
+          const banner = document.getElementById("referralWelcomeBanner");
+          if (banner) banner.style.display = "block";
+        }
+      })();
+    </script>
+<script src="script.js"></script>
+<script>
+
+        (function () {
+            var cloudPrices = {
+                "2mp": {
+                    motion: { "2": 7.99, "7": 8.09, "14": 8.39, "30": 8.99 },
+                    continuous: { "2": 8.99, "7": 9.79, "14": 10.89, "30": 11.99 },
+                    label: "2MP / 1080p"
+                },
+                "4mp": {
+                    motion: { "2": 8.19, "7": 8.59, "14": 9.19, "30": 10.09 },
+                    continuous: { "2": 9.49, "7": 11.09, "14": 13.29, "30": 14.79 },
+                    label: "4MP"
+                },
+                "8mp": {
+                    motion: { "2": 8.49, "7": 9.09, "14": 9.89, "30": 11.29 },
+                    continuous: { "2": 9.99, "7": 12.39, "14": 15.69, "30": 17.59 },
+                    label: "8MP / 4K"
+                }
+            };
+
+            function money(value) {
+                return "$" + value.toFixed(2);
+            }
+
+            function getCount() {
+                var input = document.getElementById("indexCameraCountInput");
+                if (!input) return 1;
+                var value = parseInt(input.value, 10);
+                if (!Number.isFinite(value) || value < 1) value = 1;
+                if (value > 128) value = 128;
+                input.value = value;
+                return value;
+            }
+
+            function getSelectValue(id, fallback) {
+                var el = document.getElementById(id);
+                return el ? el.value : fallback;
+            }
+
+            function getAddonTotal() {
+                var total = 0;
+                document.querySelectorAll(".index-ai-addon").forEach(function (addon) {
+                    if (addon.checked) total += Number(addon.dataset.price || 0);
+                });
+                return total;
+            }
+
+            function updateCalculator() {
+                var resolution = getSelectValue("indexResolutionSelect", "2mp");
+                var recording = getSelectValue("indexRecordingSelect", "motion");
+                var retention = getSelectValue("indexRetentionSelect", "2");
+                var count = getCount();
+                var plan = cloudPrices[resolution];
+                var basePrice = plan[recording][retention];
+                var addonTotal = getAddonTotal();
+                var perCamera = basePrice + addonTotal;
+                var monthly = perCamera * count;
+                var recordingLabel = recording === "continuous" ? "continuous" : "motion";
+
+                var planEl = document.getElementById("indexSummaryPlan");
+                var priceEl = document.getElementById("indexSummaryPrice");
+                var addonEl = document.getElementById("indexSummaryAddons");
+                var perCameraEl = document.getElementById("indexSummaryPerCamera");
+                var countEl = document.getElementById("indexSummaryCount");
+                var totalEl = document.getElementById("indexSummaryTotal");
+
+                if (planEl) planEl.textContent = plan.label + " " + recordingLabel + " - " + retention + " days";
+                if (priceEl) priceEl.textContent = money(basePrice);
+                if (addonEl) addonEl.textContent = money(addonTotal);
+                if (perCameraEl) perCameraEl.textContent = money(perCamera);
+                if (countEl) countEl.textContent = String(count);
+                if (totalEl) totalEl.textContent = money(monthly);
+            }
+
+            ["indexResolutionSelect", "indexRecordingSelect", "indexRetentionSelect"].forEach(function (id) {
+                var el = document.getElementById(id);
+                if (el) el.addEventListener("change", updateCalculator);
+            });
+
+            document.querySelectorAll(".index-ai-addon").forEach(function (addon) {
+                addon.addEventListener("change", updateCalculator);
+            });
+
+            document.querySelectorAll(".index-calc-step").forEach(function (button) {
+                button.addEventListener("click", function () {
+                    var input = document.getElementById("indexCameraCountInput");
+                    if (!input) return;
+                    input.value = getCount() + Number(button.dataset.step || 0);
+                    updateCalculator();
+                });
+            });
+
+            var countInput = document.getElementById("indexCameraCountInput");
+            if (countInput) countInput.addEventListener("input", updateCalculator);
+            updateCalculator();
+        })();
+        function setupFeatureVideoButton(buttonId, containerId, iframeId) {
+            var button = document.getElementById(buttonId);
+            var container = document.getElementById(containerId);
+            var iframe = document.getElementById(iframeId);
+            if (!button || !container) return;
+            button.addEventListener('click', function () {
+                var isHidden = container.style.display === 'none' || container.style.display === '';
+                container.style.display = isHidden ? 'block' : 'none';
+                button.textContent = isHidden ? 'Hide Video' : button.getAttribute('data-original-text');
+                if (isHidden && iframe && iframe.src.indexOf('autoplay=1') === -1) {
+                    iframe.src += (iframe.src.indexOf('?') === -1 ? '?' : '&') + 'autoplay=1';
+                }
+            });
+            button.setAttribute('data-original-text', button.textContent);
+        }
+
+        setupFeatureVideoButton('smartMotionVideoBtn', 'smartMotionVideoContainer', 'smartMotionIframe');
+        setupFeatureVideoButton('peopleCountingVideoBtn', 'peopleCountingVideoContainer', 'peopleCountingIframe');
+        setupFeatureVideoButton('licensePlateVideoBtn', 'licensePlateVideoContainer', 'licensePlateIframe');
+
+        function switchRes(btn) {
+            document.querySelectorAll('.res-btn').forEach(function(b) {
+                b.style.background = '#fff';
+                b.style.color = '#0b2b4f';
+            });
+            btn.style.background = '#0b2b4f';
+            btn.style.color = '#fff';
+            document.querySelectorAll('.res-table').forEach(function(t) {
+                t.style.display = 'none';
+            });
+            document.getElementById('table-' + btn.getAttribute('data-res')).style.display = 'table';
+        }
+    </script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body></html>

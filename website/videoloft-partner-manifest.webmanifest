@@ -1,0 +1,27 @@
+{
+  "name": "ANY AI CAM Videoloft Sales Partner Portal",
+  "short_name": "Videoloft Partner",
+  "start_url": "./videoloft-partner.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f8fc",
+  "theme_color": "#071032",
+  "icons": [
+    {
+      "src": "partner-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "partner-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "partner-icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,1241 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b1332">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="ANY AI CAM">
+    <link rel="manifest" href="videoloft-partner-manifest.webmanifest">
+    <link rel="apple-touch-icon" href="partner-icon-180.png">
+    <link rel="icon" type="image/png" href="/favicon.png">
+    <title>Videoloft Partner Portal | ANY AI CAM Sales</title>
+    <meta name="description" content="ANY AI CAM partner portal: submit cloud camera activation leads, track commissions, and manage partner accounts securely. Earn quarterly commissions for referrals.">
+    <meta name="keywords" content="camera partner portal, sales partner program, cloud camera affiliate, videoloft partner, security camera reseller, camera activation referral">
+    <meta name="robots" content="noindex,follow">
+    <link rel="canonical" href="https://anyaicam.com/videoloft-partner.html">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Videoloft Partner Portal | ANY AI CAM Sales">
+    <meta property="og:description" content="Submit customer activation leads as a ANY AI CAM partner. Earn quarterly commissions when customers purchase cloud camera recording plans. Secure portal for partner registration and lead tracking.">
+    <meta property="og:url" content="https://anyaicam.com/videoloft-partner.html">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="Videoloft Partner Portal | ANY AI CAM Sales">
+    <meta name="twitter:description" content="Earn commissions by referring customers to ANY AI CAM's cloud camera activation service. Submit leads, track status, and receive quarterly commissions.">
+    <link rel="stylesheet" href="styles.css">
+    <style>
+      .partner-calculator-panel { margin: 1.5rem 0 2rem; }
+      .partner-calculator-panel h3 { margin-bottom: .45rem; }
+      .partner-calculator-panel > p { margin-top: 0; }
+      .calculator-frame {
+        width: 100%;
+        min-height: 1680px;
+        border: 1px solid rgba(99,112,138,.25);
+        border-radius: 18px;
+        background: #eef4fb;
+      }
+      @media (max-width: 960px) { .calculator-frame { min-height: 2450px; } }
+      @media (max-width: 640px) { .calculator-frame { min-height: 3050px; border-radius: 12px; } }
+
+    
+      .referral-qr-wrap {
+        display:grid;
+        grid-template-columns:minmax(220px,300px) 1fr;
+        gap:1.25rem;
+        align-items:center;
+        margin-top:1.25rem;
+        padding:1.25rem;
+        background:#f7fbff;
+        border:1px solid #d9e6f4;
+        border-radius:12px;
+      }
+      .referral-qr-box {
+        background:#fff;
+        padding:1rem;
+        border-radius:12px;
+        border:1px solid #dfe5f4;
+        text-align:center;
+      }
+      #partnerReferralQr canvas,
+      #partnerReferralQr img {
+        max-width:100%;
+        height:auto;
+      }
+      @media (max-width:700px) {
+        .referral-qr-wrap { grid-template-columns:1fr; }
+      }
+      .pwa-launch-screen {
+        position:fixed; inset:0; z-index:99999; display:grid; place-items:center;
+        background:linear-gradient(145deg,#070d25,#111b43); color:#fff;
+        transition:opacity .25s ease, visibility .25s ease;
+      }
+      .pwa-launch-screen.is-hidden { opacity:0; visibility:hidden; pointer-events:none; }
+      .pwa-launch-inner { text-align:center; padding:2rem; }
+      .pwa-launch-inner img { width:104px; height:104px; object-fit:contain; margin-bottom:1rem; }
+      .pwa-spinner { width:34px; height:34px; margin:1.25rem auto 0; border:4px solid rgba(255,255,255,.24); border-top-color:#62d8e5; border-radius:50%; animation:pwaSpin .8s linear infinite; }
+      @keyframes pwaSpin { to { transform:rotate(360deg); } }
+      .pwa-quick-actions { margin:1.2rem 0 1.5rem; padding:1.2rem; background:#f7fbff; border:1px solid #d9e6f4; border-radius:14px; }
+      .pwa-quick-actions h3 { margin:.1rem 0 .8rem; }
+      .pwa-action-grid { display:grid; grid-template-columns:repeat(5,minmax(130px,1fr)); gap:.7rem; }
+      .pwa-action-grid .button { min-height:50px; display:flex; align-items:center; justify-content:center; text-align:center; padding:.7rem .8rem; }
+      .analytics-list { display:flex; flex-wrap:wrap; gap:.4rem; margin-top:.45rem; }
+      .analytics-pill { display:inline-flex; align-items:center; padding:.28rem .55rem; border-radius:999px; background:#eaf8fb; color:#0b4151; border:1px solid #b9e5eb; font-size:.82rem; font-weight:800; line-height:1.25; }
+      .analytics-empty { color:#63708a; font-size:.86rem; }
+      .row-actions { display:flex; flex-wrap:wrap; gap:.4rem; }
+      .row-action { min-height:34px; padding:.35rem .6rem; border-radius:7px; font-size:.78rem; font-weight:800; }
+      .row-action.danger { border-color:#b42318; color:#b42318; background:#fff7f6; }
+      .row-action.danger:hover, .row-action.danger:focus-visible { background:#ffe7e3; }
+      .quote-share-backdrop { position:fixed; inset:0; z-index:100000; display:grid; place-items:center; padding:1rem; background:rgba(7,13,37,.62); }
+      .quote-share-backdrop.hidden { display:none; }
+      .quote-share-dialog { width:min(100%,420px); padding:1.25rem; border-radius:16px; background:#fff; box-shadow:0 24px 70px rgba(7,13,37,.28); color:#0b1332; }
+      .quote-share-dialog h2 { margin:.1rem 0 .45rem; font-size:1.35rem; }
+      .quote-share-dialog p { margin:.2rem 0 1rem; color:#536179; }
+      .quote-share-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.65rem; }
+      .quote-share-actions a,
+      .quote-share-actions button { display:flex; align-items:center; justify-content:center; min-height:44px; padding:.7rem .85rem; border-radius:10px; border:1px solid #cfd8e3; background:#fff; color:#0b1332; font:inherit; font-weight:800; text-align:center; text-decoration:none; cursor:pointer; }
+      .quote-share-actions .primary { border:0; color:#fff; background:linear-gradient(90deg,#cc3b96,#5fc4d1); }
+      .quote-share-close { width:100%; margin-top:.75rem; min-height:42px; padding:.65rem .85rem; border-radius:10px; border:0; background:#eef4fb; color:#0b1332; font-weight:800; cursor:pointer; }
+      .record-details td { background:#f7fbff; padding:1rem !important; }
+      .record-detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:.65rem 1rem; }
+      .record-detail-grid div { min-width:0; }
+      .record-detail-grid span { display:block; color:#63708a; font-size:.78rem; font-weight:700; text-transform:uppercase; letter-spacing:.03em; }
+      .record-detail-grid strong { display:block; margin-top:.15rem; overflow-wrap:anywhere; }
+      @media (max-width:720px) {
+        .lead-table-wrap { overflow:visible; }
+        .lead-table, .lead-table tbody, .lead-table tr, .lead-table td { display:block; width:100%; min-width:0; }
+        .lead-table thead { display:none; }
+        .lead-table tr:not(.record-details) { margin:0 0 1rem; padding:.35rem .7rem; border:1px solid #d9e6f4; border-radius:12px; background:#fff; }
+        .lead-table td { display:grid; grid-template-columns:112px minmax(0,1fr); gap:.65rem; padding:.55rem .2rem !important; border:0; }
+        .lead-table td::before { content:attr(data-label); color:#63708a; font-size:.76rem; font-weight:800; text-transform:uppercase; }
+        .lead-table .record-details { margin:-.75rem 0 1rem; }
+        .lead-table .record-details td { display:block; padding:1rem !important; }
+        .lead-table .record-details td::before { display:none; }
+        .analytics-list { min-width:0; }
+        .analytics-pill { white-space:normal; }
+        .row-actions { min-width:150px; flex-direction:column; }
+        .row-action { width:100%; }
+        .quote-share-actions { grid-template-columns:1fr; }
+        .record-detail-grid { grid-template-columns:1fr; }
+      }
+      .pwa-install-note { margin:.7rem 0 0; color:#63708a; font-size:.9rem; }
+      #installPartnerApp[hidden] { display:none !important; }
+      .pwa-offline-banner { display:none; position:sticky; top:0; z-index:9990; padding:.65rem 1rem; text-align:center; color:#fff; background:#9b3b73; font-weight:800; }
+      .pwa-offline-banner.is-visible { display:block; }
+      @media (max-width:900px) { .pwa-action-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+      @media (max-width:480px) { .pwa-action-grid { grid-template-columns:1fr; } }
+      @media (display-mode:standalone) {
+        .site-header, .trial-banner, .site-footer, .aic-policy-footer, .aic-utility-contact { display:none !important; }
+        body.portal-page { padding-top:0; }
+        main { padding-top:max(12px, env(safe-area-inset-top)); }
+      }
+    </style>
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      "name": "Videoloft Partner Portal | ANY AI CAM Sales",
+      "description": "ANY AI CAM sales partner program for cloud camera solutions.",
+      "url": "https://anyaicam.com/videoloft-partner.html",
+      "provider": { "@type": "Organization", "name": "ANY AI CAM" }
+    }
+    </script>
+    <!-- Start of ChatBot (www.chatbot.com) code -->
+    <script>
+      window.__ow = window.__ow || {};
+      window.__ow.organizationId = "b95d9349-c5fc-4180-8305-c4dfea978596";
+      window.__ow.template_id = "5b599996-80d4-48ac-b60d-b5ff2224669a";
+      window.__ow.integration_name = "manual_settings";
+      window.__ow.product_name = "chatbot";
+    </script>
+    <script src="https://cdn.openwidget.com/openwidget.js"></script>
+    <!-- End of ChatBot code -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<link rel="stylesheet" href="header-standard.css">
+</head>
+<body class="portal-page">
+    <div class="pwa-launch-screen" id="pwaLaunchScreen" role="status" aria-live="polite">
+      <div class="pwa-launch-inner">
+        <img src="partner-icon-192.png" alt="ANY AI CAM">
+        <h1>ANY AI CAM Videoloft Partner Portal</h1>
+        <p>Loading your secure dashboard...</p>
+        <div class="pwa-spinner" aria-hidden="true"></div>
+      </div>
+    </div>
+    <div class="pwa-offline-banner" id="pwaOfflineBanner">You are offline. Saved account and payment data are not cached. Reconnect to refresh the dashboard.</div>
+    
+    <header class="site-header">
+        <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+            <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+        </a>
+
+        <div class="header-controls">
+            <button class="mobile-menu-toggle" type="button" aria-expanded="false" aria-controls="primaryNav">Menu</button>
+            <div class="header-badges">
+                <a class="live-support-badge" href="support.html">&#9742; Connect with Live Support</a>
+            </div>
+        </div>
+                <nav class="site-nav" id="primaryNav" aria-label="Primary navigation">
+            <a href="index.html">Home</a>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="cloud-storage-pricing.html">Pricing</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="adapters.html">Adapters</a>
+            <a href="support.html">Support</a>
+            <a href="contact.html">Contact</a>
+            <a href="cloud-setup-wizard.html">Get Started</a>
+            <div class="dropdown">
+              <a href="#" class="dropbtn">More</a>
+              <div class="dropdown-content">
+                <a href="nvr.html">NVR Setup</a>
+                <a href="software.html">Software</a>
+                <a href="sales-partner-login.html">Sales Partner Home</a>
+              </div>
+            </div>
+        </nav>
+    </header>
+
+    <main>
+        <section class="portal-hero">
+            <div>
+                <p class="eyebrow">Videoloft Sales Partner Portal</p>
+                <h1>Sell Videoloft cloud recording under your ANY AI CAM salesperson account.</h1>
+                <p>Partners register, log in, and submit customer cloud activation leads. Each lead stays tied to the partner for commission tracking.</p>
+                <p>Videoloft bills the customer after ANY AI CAM creates the account in the Videoloft partner portal. Partner commissions are paid quarterly.</p>
+            </div>
+        </section>
+
+        <section class="portal-shell">
+            <div class="portal-panel" id="register">
+                <p class="eyebrow">Step 1</p>
+                <h2>Salesperson Application</h2>
+                <p class="muted">Apply to become an ANY AI CAM Videoloft salesperson. Your account will remain pending until ANY AI CAM approves it.</p>
+                <form class="portal-form" id="partnerRegisterForm">
+                    <label>
+                        Partner Name
+                        <input name="partnerName" autocomplete="name" required>
+                    </label>
+                    <label>
+                        Partner Email
+                        <input name="partnerEmail" type="email" autocomplete="email" required>
+                    </label>
+                    <label>
+                        Create Password
+                        <input name="partnerPassword" type="password" autocomplete="new-password" required>
+                    </label>
+                    <button class="button primary" type="submit">Submit Salesperson Application</button>
+                    <p class="form-status" id="registerStatus" role="status" aria-live="polite"></p>
+                </form>
+            </div>
+
+            <div class="portal-panel" id="login">
+                <p class="eyebrow">Step 2</p>
+                <h2>Videoloft Partner Login</h2>
+                <form class="portal-form" id="partnerLoginForm">
+                    <label>
+                        Partner Email
+                        <input name="loginEmail" type="email" autocomplete="email" required>
+                    </label>
+                    <label>
+                        Password
+                        <input name="loginPassword" type="password" autocomplete="current-password" required>
+                    </label>
+                    <button class="button primary" type="submit">Log In</button>
+                    <p class="form-status" id="loginStatus" role="status" aria-live="polite"></p>
+                </form>
+            </div>
+        </section>
+
+        <section class="dashboard-section" id="dashboard">
+            <div class="section-heading">
+                <p class="eyebrow">Step 3</p>
+                <h2>Partner Quote and Customer Activation</h2>
+                <p>Build the customer quote using ANY AI CAM's universal cloud pricing, then continue to the customer setup wizard. Direct, referral, and partner-assisted orders use the same customer pricing, while the partner ID remains attached for commission tracking.</p>
+            </div>
+
+            <div class="dashboard-card">
+                <div class="partner-summary">
+                    <div>
+                        <strong id="activePartnerName">No partner logged in</strong>
+                        <span id="activePartnerId">Register or log in to use the partner dashboard.</span>
+                    </div>
+                    <button class="button" type="button" id="partnerLogout" style="display:none;">Log Out</button>
+                </div>
+
+                <section class="pwa-quick-actions" aria-labelledby="pwaQuickActionsTitle">
+                    <p class="eyebrow" style="margin-top:0;">Partner App</p>
+                    <h3 id="pwaQuickActionsTitle">Quick Actions</h3>
+                    <div class="pwa-action-grid">
+                        <a class="button primary" href="videoloft-partner-software-trial.html">Software Trial</a>
+                        <button class="button primary" type="button" id="pwaNewQuote">New Quote</button>
+                        <button class="button" type="button" id="pwaShowQr">Show My QR</button>
+                        <button class="button" type="button" id="pwaShareReferral">Share Referral</button>
+                        <button class="button" type="button" id="pwaCopyReferral">Copy Referral</button>
+                        <a class="button primary" id="pwaContinueSetup" href="#">Continue Customer Setup</a>
+                    </div>
+                    <button class="button" type="button" id="installPartnerApp" hidden style="margin-top:.8rem;">Install Partner App</button>
+                    <p class="pwa-install-note" id="pwaInstallNote">Install this portal from your browser menu for one-tap access from your phone.</p>
+                </section>
+
+
+                <section class="dashboard-card" id="adminSalesPanel" hidden style="padding:1.4rem;margin:1.25rem 0 2rem;border-left:5px solid #cc3b96;">
+                    <p class="eyebrow" style="margin-top:0;">Administrator</p>
+                    <h3 style="margin:.25rem 0 .5rem;">Salespeople and Completed Customer Orders</h3>
+                    <p style="margin-top:0;">Approve salesperson applications and review every completed order before creating the customer account in the Videoloft partner portal.</p>
+                    <div class="partner-metrics" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin:1rem 0 1.5rem;">
+                        <div class="dashboard-card" style="padding:1rem;"><span>Pending Applications</span><strong id="adminPendingCount" style="font-size:1.65rem;">0</strong></div>
+                        <div class="dashboard-card" style="padding:1rem;"><span>Active Salespeople</span><strong id="adminActiveCount" style="font-size:1.65rem;">0</strong></div>
+                        <div class="dashboard-card" style="padding:1rem;"><span>Completed Orders</span><strong id="adminCompletedCount" style="font-size:1.65rem;">0</strong></div>
+                    </div>
+                    <div class="lead-table-wrap">
+                        <h3>All Salespeople</h3>
+                        <table class="lead-table">
+                            <thead><tr><th>Salesperson</th><th>ID</th><th>Status</th><th>Quotes</th><th>Orders</th><th>Completed</th><th>Commission</th><th>Actions</th></tr></thead>
+                            <tbody id="adminSalespeopleTableBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="lead-table-wrap" style="margin-top:1.5rem;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+                            <h3 style="margin-bottom:.5rem;">All Completed Orders for Videoloft Setup</h3>
+                            <button class="row-action danger" id="adminArchiveAllOrders" type="button">Archive All Completed</button>
+                        </div>
+                        <p class="muted" style="margin-top:0;">Archive an order after you finish creating the customer in Videoloft. Nothing is deleted, and archived orders can be restored.</p>
+                        <table class="lead-table">
+                            <thead><tr><th>Order</th><th>Salesperson</th><th>Customer</th><th>Paid</th><th>Plan</th><th>Commission</th><th>Actions</th></tr></thead>
+                            <tbody id="adminCompletedOrdersTableBody"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="lead-table-wrap" style="margin-top:1.5rem;">
+                        <button class="row-action" id="adminToggleArchivedOrders" type="button" aria-expanded="false">Show Archived Orders</button>
+                        <div id="adminArchivedOrdersSection" hidden style="margin-top:1rem;">
+                            <h3>Archived Completed Orders</h3>
+                            <table class="lead-table">
+                                <thead><tr><th>Order</th><th>Salesperson</th><th>Customer</th><th>Archived</th><th>Plan</th><th>Commission</th><th>Actions</th></tr></thead>
+                                <tbody id="adminArchivedOrdersTableBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <p class="form-status" id="adminSalesStatus" role="status" aria-live="polite"></p>
+                </section>
+
+                <section class="partner-calculator-panel" aria-labelledby="partnerCalculatorTitle">
+                    <p class="eyebrow">Step 3A</p>
+                    <h3 id="partnerCalculatorTitle">Build the Customer Quote</h3>
+                    <p>Build the customer quote using ANY AI CAM's standard customer pricing. Direct, referral, and partner-assisted orders use the same rates.</p>
+                    <iframe
+                        class="calculator-frame"
+                        src="videoloft-partner-sales-calculator.html?v=lts-hardware-v2"
+                        title="ANY AI CAM partner sales calculator"
+                        loading="lazy">
+                    </iframe>
+                </section>
+
+
+                <section class="partner-tools" id="partnerTools" aria-labelledby="partnerToolsTitle" style="margin-top:2rem;">
+                    <div class="section-heading">
+                        <p class="eyebrow">Partner Tools</p>
+                        <h3 id="partnerToolsTitle">Quotes, Orders, and Referrals</h3>
+                        <p>Your quotes, started orders, and estimated commissions are securely loaded from the partner database.</p>
+                    </div>
+
+                    <div class="partner-metrics" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin:1rem 0 1.5rem;">
+                        <div class="dashboard-card" style="padding:1rem;"><span style="display:block;color:#63708a;font-weight:700;">Saved Quotes</span><strong id="savedQuoteCount" style="font-size:1.75rem;">0</strong></div>
+                        <div class="dashboard-card" style="padding:1rem;"><span style="display:block;color:#63708a;font-weight:700;">Orders Started</span><strong id="startedOrderCount" style="font-size:1.75rem;">0</strong></div>
+                        <div class="dashboard-card" style="padding:1rem;"><span style="display:block;color:#63708a;font-weight:700;">Estimated Commission</span><strong id="estimatedCommission" style="font-size:1.75rem;">$0.00</strong></div>
+                        <div class="dashboard-card" style="padding:1rem;"><span style="display:block;color:#63708a;font-weight:700;">Analytics in Saved Quotes</span><strong id="savedAnalyticsRevenue" style="font-size:1.75rem;">$0.00</strong></div>
+                        <div class="dashboard-card" style="padding:1rem;"><span style="display:block;color:#63708a;font-weight:700;">Analytics in Orders</span><strong id="orderAnalyticsRevenue" style="font-size:1.75rem;">$0.00</strong></div>
+                    </div>
+
+                    <div class="dashboard-card" style="padding:1.25rem;margin-bottom:1.5rem;">
+                        <h3>My Referral Link</h3>
+                        <p>Use this link for a partner-referred customer. It opens the ANY AI CAM homepage first, saves your Partner ID, and keeps the referral attached when the customer starts the setup wizard.</p>
+                        <div style="display:flex;gap:.75rem;flex-wrap:wrap;">
+                            <input id="partnerReferralLink" readonly style="flex:1;min-width:260px;padding:.8rem;border:1px solid #cfd8e3;border-radius:8px;">
+                            <button class="button primary" type="button" id="copyReferralLink">Copy Link</button>
+                            <a class="button" id="openReferralLink" target="_blank" rel="noopener">Open Link</a>
+                        </div>
+                        <p class="form-status" id="referralStatus" role="status" aria-live="polite"></p>
+
+                        <div class="referral-qr-wrap">
+                            <div class="referral-qr-box">
+                                <div id="partnerReferralQr" aria-label="Salesperson referral QR code"></div>
+                            </div>
+                            <div>
+                                <h3 style="margin-top:0;">My Salesperson Referral QR</h3>
+                                <p>Customers who scan this QR code first see the ANY AI CAM website. Your Partner ID is saved and remains attached when they later start the setup wizard.</p>
+                                <div style="display:flex;gap:.75rem;flex-wrap:wrap;">
+                                    <button class="button primary" type="button" id="downloadReferralQr">Download My QR</button>
+                                    <button class="button" type="button" id="printReferralQr">Print QR</button>
+                                </div>
+                                <p style="margin:.75rem 0 0;color:#63708a;font-size:.9rem;">Use the downloaded PNG on flyers, business cards, postcards, or digital ads.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="lead-table-wrap">
+                        <h3>My Saved Quotes</h3>
+                        <table class="lead-table">
+                            <thead><tr><th>Quote</th><th>Plan and Analytics</th><th>Customer Total</th><th>Commission</th><th>Date</th><th>Actions</th></tr></thead>
+                            <tbody id="partnerQuoteTableBody"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="lead-table-wrap" style="margin-top:1.5rem;">
+                        <h3>My Orders Started</h3>
+                        <table class="lead-table">
+                            <thead><tr><th>Order</th><th>Customer</th><th>Plan and Analytics</th><th>Status</th><th>Date</th><th>Actions</th></tr></thead>
+                            <tbody id="partnerOrderTableBody"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="lead-table-wrap" style="margin-top:1.5rem;">
+                        <h3>Completed Orders</h3>
+                        <table class="lead-table">
+                            <thead><tr><th>Order</th><th>Customer</th><th>Payment Date</th><th>Amount Paid</th><th>Quote / Partner</th><th>Commission</th><th>Actions</th></tr></thead>
+                            <tbody id="partnerCompletedOrderTableBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+
+            <p class="process-note">Commission example: customer payments received in January, February, and March are included in the commission payment made at the end of April.</p>
+            <p class="process-note">Partner accounts, quotes, orders, and commission estimates are stored securely in the server database.</p>
+        </section>
+    </main>
+
+    <!-- FOOTER -->
+    <footer class="site-footer" id="about">
+        <div>
+            <a class="brand footer-brand" href="index.html#home" aria-label="ANY AI CAM home">
+                <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+            </a>
+            <p>Cloud camera activation and onboarding support for compatible existing camera systems.</p>
+            <p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">&copy; 2026 ANY AI CAM. All rights reserved.</p>
+        </div>
+        <div>
+            <h3>Service</h3>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="index.html#services">Cloud Account Setup</a>
+            <a href="index.html#pricing">Pricing Calculator</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="/camera-compatibility-check.html">Camera Check</a>
+            <a href="adapters.html">Adapter Options</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+            
+            <a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+            <a href="sales-partner-login.html">Sales Partner Home</a>
+            <a href="support.html">Live Tech Support</a>
+        </div>
+        <div>
+            <h3>Contact &amp; Policies</h3>
+            <a href="contact.html">Contact Us</a>
+            <a href="/cdn-cgi/l/email-protection#096864687d684968677068606a6864276a6664"><span class="__cf_email__" data-cfemail="dcbdb1bda8bd9cbdb2a5bdb5bfbdb1f2bfb3b1">[email&#160;protected]</span></a>
+            <a href="tel:+18325108240">(832) 510-8240</a>
+            <a href="privacy-policy.html">Privacy Policy</a>
+            <a href="terms.html">Terms of Service</a>
+            <a href="shipping-returns.html">Shipping &amp; Returns</a>
+            <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        </div>
+    </footer>
+
+
+    <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+    (() => {
+      const registerForm = document.querySelector("#partnerRegisterForm");
+      const loginForm = document.querySelector("#partnerLoginForm");
+      const registerStatus = document.querySelector("#registerStatus");
+      const loginStatus = document.querySelector("#loginStatus");
+      const activePartnerName = document.querySelector("#activePartnerName");
+      const activePartnerId = document.querySelector("#activePartnerId");
+      const dashboard = document.querySelector("#dashboard");
+      const logoutButton = document.querySelector("#partnerLogout");
+      const launchScreen = document.querySelector("#pwaLaunchScreen");
+      const offlineBanner = document.querySelector("#pwaOfflineBanner");
+      let deferredInstallPrompt = null;
+
+      function finishPwaLaunch() {
+        window.setTimeout(() => launchScreen?.classList.add("is-hidden"), 120);
+      }
+
+      function updateConnectionStatus() {
+        offlineBanner?.classList.toggle("is-visible", !navigator.onLine);
+      }
+
+      document.querySelectorAll(".mobile-menu-toggle").forEach((button) => {
+        const header = button.closest(".site-header");
+        const nav = header?.querySelector(".site-nav");
+        button.addEventListener("click", () => {
+          const isOpen = header?.classList.toggle("menu-open") || false;
+          button.setAttribute("aria-expanded", String(isOpen));
+        });
+        nav?.querySelectorAll("a").forEach((link) => {
+          link.addEventListener("click", () => {
+            header?.classList.remove("menu-open");
+            button.setAttribute("aria-expanded", "false");
+          });
+        });
+      });
+
+      const money = (value) => Number(value || 0).toLocaleString("en-US", {
+        style: "currency",
+        currency: "USD"
+      });
+      const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[character]));
+      let currentDashboardData = {quotes: [], orders: [], completedOrders: []};
+      let activeQuoteShare = null;
+
+      function analyticsMarkup(items) {
+        const selected = (Array.isArray(items) ? items : []).filter((item) => Number(item?.quantity) > 0);
+        if (!selected.length) return '<span class="analytics-empty">No AI add-ons</span>';
+        return `<div class="analytics-list">${selected.map((item) => {
+          const quantity = Number(item.quantity);
+          return `<span class="analytics-pill">${escapeHtml(item.name || item.key || "AI add-on")} â€” ${quantity} camera${quantity === 1 ? "" : "s"}</span>`;
+        }).join("")}</div>`;
+      }
+
+      async function copyText(value, successMessage) {
+        try {
+          await navigator.clipboard.writeText(value);
+          alert(successMessage);
+        } catch {
+          window.prompt("Copy this secure link:", value);
+        }
+      }
+
+      function quoteShareMessage() {
+        return "Your ANY AI CAM camera cloud setup quote is ready. Review your approved setup here:";
+      }
+
+      function ensureQuoteShareDialog() {
+        let dialog = document.querySelector("#quoteShareDialog");
+        if (dialog) return dialog;
+        dialog = document.createElement("div");
+        dialog.id = "quoteShareDialog";
+        dialog.className = "quote-share-backdrop hidden";
+        dialog.setAttribute("role", "presentation");
+        dialog.innerHTML = `
+          <div class="quote-share-dialog" role="dialog" aria-modal="true" aria-labelledby="quoteShareTitle">
+            <h2 id="quoteShareTitle">Share Quote</h2>
+            <p>Send the locked customer quote link by email, text message, or copy it for another app.</p>
+            <div class="quote-share-actions">
+              <a id="quoteShareEmail" class="primary" href="#">Email Quote</a>
+              <a id="quoteShareText" href="#">Text Quote</a>
+              <button id="quoteShareCopy" type="button">Copy Link</button>
+              <a id="quoteShareOpen" href="#" target="_blank" rel="noopener">Open Customer View</a>
+            </div>
+            <button class="quote-share-close" id="quoteShareClose" type="button">Close</button>
+          </div>`;
+        document.body.appendChild(dialog);
+        dialog.addEventListener("click", (event) => {
+          if (event.target === dialog || event.target.closest("#quoteShareClose")) {
+            closeQuoteShareDialog();
+          }
+        });
+        dialog.querySelector("#quoteShareCopy")?.addEventListener("click", async () => {
+          if (!activeQuoteShare?.url) return;
+          await copyText(activeQuoteShare.url, "Secure customer quote link copied.");
+          closeQuoteShareDialog();
+        });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && !dialog.classList.contains("hidden")) closeQuoteShareDialog();
+        });
+        return dialog;
+      }
+
+      function closeQuoteShareDialog() {
+        document.querySelector("#quoteShareDialog")?.classList.add("hidden");
+      }
+
+      function showQuoteShareDialog(url, message) {
+        const dialog = ensureQuoteShareDialog();
+        const shareText = `${message} ${url}`;
+        activeQuoteShare = {url, message};
+        dialog.querySelector("#quoteShareEmail").href =
+          `mailto:?subject=${encodeURIComponent("ANY AI CAM customer quote")}&body=${encodeURIComponent(shareText)}`;
+        dialog.querySelector("#quoteShareText").href =
+          `sms:?&body=${encodeURIComponent(shareText)}`;
+        dialog.querySelector("#quoteShareOpen").href = url;
+        dialog.classList.remove("hidden");
+        dialog.querySelector("#quoteShareEmail")?.focus();
+      }
+
+      async function shareCustomerQuote(url) {
+        if (!url) return;
+        const message = quoteShareMessage();
+        const shareData = {title: "ANY AI CAM customer quote", text: message, url};
+        if (navigator.share && (!navigator.canShare || navigator.canShare(shareData))) {
+          try {
+            await navigator.share(shareData);
+            return;
+          } catch (error) {
+            if (error?.name === "AbortError") return;
+          }
+        }
+        showQuoteShareDialog(url, message);
+      }
+
+      function openQuoteInCalculator(quote, duplicate = false) {
+        if (!quote?.quoteData) return;
+        localStorage.setItem("anyaicamCalculatorDraft", JSON.stringify({...quote.quoteData, sourceQuoteId: quote.quoteId, duplicate}));
+        const frame = document.querySelector(".calculator-frame");
+        if (frame) {
+          frame.src = `videoloft-partner-sales-calculator.html?v=lts-hardware-${Date.now()}`;
+          frame.scrollIntoView({behavior:"smooth", block:"start"});
+        }
+      }
+
+      let referralQrInstance = null;
+
+      function renderReferralQr(url, partnerId) {
+        const container = document.querySelector("#partnerReferralQr");
+        if (!container || typeof QRCode === "undefined") return;
+        container.innerHTML = "";
+        referralQrInstance = new QRCode(container, {
+          text: url,
+          width: 260,
+          height: 260,
+          correctLevel: QRCode.CorrectLevel.H
+        });
+        container.dataset.partnerId = partnerId || "partner";
+      }
+
+      function getReferralQrDataUrl() {
+        const container = document.querySelector("#partnerReferralQr");
+        const canvas = container?.querySelector("canvas");
+        if (canvas) return canvas.toDataURL("image/png");
+        const image = container?.querySelector("img");
+        return image?.src || "";
+      }
+
+      async function api(action, options = {}) {
+        const response = await fetch(`api.php?action=${encodeURIComponent(action)}`, {
+          credentials: "same-origin",
+          headers: {"Content-Type": "application/json", ...(options.headers || {})},
+          ...options
+        });
+        const responseText = await response.text();
+        let result;
+        try {
+          result = JSON.parse(responseText);
+        } catch {
+          const statusText = response.status ? `HTTP ${response.status}` : "no HTTP status";
+          throw new Error(`The server returned an unreadable response (${statusText}). The API may have a PHP error or missing config.php.`);
+        }
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || "The request could not be completed.");
+        }
+        return result;
+      }
+
+      async function deletePartnerRecord(recordType, recordId, request) {
+        const label = recordType === "quote" ? "saved quote" : "order";
+        if (!recordId) {
+          alert(`This ${label} cannot be deleted because it is missing an ID.`);
+          return;
+        }
+        const confirmed = confirm(`Delete this ${label}?\n\n${recordId}\n\nThis will remove it from your partner portal.`);
+        if (!confirmed) return;
+        try {
+          await request();
+          await loadDashboard();
+          alert(`Deleted ${label}: ${recordId}`);
+        } catch (error) {
+          alert(`Could not delete this ${label}. ${error.message || "Please try again."}`);
+        }
+      }
+
+      function showStatus(element, message, isError = false) {
+        if (!element) return;
+        element.textContent = message;
+        element.className = `form-status ${isError ? "error" : "success"}`;
+        element.style.display = "block";
+      }
+
+      function setLoggedOut() {
+        localStorage.removeItem("anyaicamActivePartner");
+        activePartnerName.textContent = "No partner logged in";
+        activePartnerId.textContent = "Register or log in to use the partner dashboard.";
+        dashboard.style.display = "none";
+        document.querySelector(".portal-shell").style.display = "";
+        logoutButton.style.display = "none";
+      }
+
+      function setLoggedIn(partner) {
+        localStorage.setItem("anyaicamActivePartner", JSON.stringify(partner));
+        const calculatorFrame = document.querySelector(".calculator-frame");
+        if (calculatorFrame && !calculatorFrame.dataset.partnerReady) {
+          calculatorFrame.dataset.partnerReady = "1";
+          calculatorFrame.addEventListener("load", () => {
+            try {
+              const embeddedDocument = calculatorFrame.contentDocument || calculatorFrame.contentWindow.document;
+              embeddedDocument
+                .querySelectorAll(".site-header, .site-footer, .aic-policy-footer, .aic-utility-contact")
+                .forEach((element) => { element.style.display = "none"; });
+            } catch (error) {
+              console.warn("Unable to clean embedded calculator chrome.", error);
+            }
+          });
+          calculatorFrame.src = "videoloft-partner-sales-calculator.html?v=lts-hardware-v2";
+        }
+        activePartnerName.textContent = partner.name;
+        activePartnerId.textContent = `Partner ID: ${partner.id} | ${partner.email}`;
+        dashboard.style.display = "block";
+        document.querySelector(".portal-shell").style.display = "none";
+        logoutButton.style.display = "";
+      }
+
+      function isPaidOrder(order) {
+        const status = String(order?.status || "").toLowerCase();
+        return status === "paid" || status === "completed";
+      }
+
+      function orderPaidDate(order) {
+        return order?.paidAt || order?.paid_at || order?.paymentDate || order?.payment_date || order?.stripe?.paid_at || "";
+      }
+
+      function orderPaidAmount(order) {
+        if (order?.amountPaidToday) return order.amountPaidToday;
+        if (order?.amountPaid) return order.amountPaid;
+        if (Number(order?.amountPaidCents) > 0) return money(Number(order.amountPaidCents) / 100);
+        if (Number(order?.stripe?.amount_total) > 0) return money(Number(order.stripe.amount_total) / 100);
+        return "Paid";
+      }
+
+      function displayDate(value) {
+        if (!value) return "Pending";
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleDateString();
+      }
+
+      function renderDashboard(data) {
+        const partner = data.partner;
+        setLoggedIn(partner);
+
+        const quotes = Array.isArray(data.quotes) ? data.quotes : Object.values(data.quotes || {});
+        const orders = Array.isArray(data.orders) ? data.orders : Object.values(data.orders || {});
+        const startedOrders = orders.filter((order) => !isPaidOrder(order));
+        const completedOrders = orders.filter(isPaidOrder);
+        currentDashboardData = {quotes, orders: startedOrders, completedOrders};
+
+        document.querySelector("#savedQuoteCount").textContent = quotes.length;
+        document.querySelector("#startedOrderCount").textContent = startedOrders.length;
+        document.querySelector("#estimatedCommission").textContent = money(data.estimatedCommission);
+        document.querySelector("#savedAnalyticsRevenue").textContent = money(data.savedAnalyticsRevenue);
+        document.querySelector("#orderAnalyticsRevenue").textContent = money(data.orderAnalyticsRevenue);
+
+        const quoteBody = document.querySelector("#partnerQuoteTableBody");
+        quoteBody.innerHTML = quotes.length
+          ? quotes.map((q, index) => `<tr>
+              <td data-label="Quote">${escapeHtml(q.quoteId)}</td>
+              <td data-label="Plan and analytics">${escapeHtml(String(q.resolution || "").toUpperCase())}, ${escapeHtml(q.duration)}-day ${q.mode === "continuous" ? "24/7" : "motion"}${analyticsMarkup(q.analytics)}</td>
+              <td data-label="Customer total">${money(q.customerTotal)}</td>
+              <td data-label="Commission">${money(q.repCommission)}</td>
+              <td data-label="Date">${new Date(q.createdAt).toLocaleDateString()}</td>
+              <td data-label="Actions"><div class="row-actions"><button class="row-action" type="button" data-quote-action="details" data-index="${index}">Details</button><button class="row-action" type="button" data-quote-action="reopen" data-index="${index}">Reopen</button><button class="row-action" type="button" data-quote-action="duplicate" data-index="${index}">Duplicate</button><button class="row-action" type="button" data-quote-action="continue" data-index="${index}">Continue Setup</button><button class="row-action" type="button" data-quote-action="share" data-index="${index}">Share Quote</button><button class="row-action danger" type="button" data-quote-action="delete" data-index="${index}">Delete</button></div></td>
+            </tr><tr class="record-details" id="quote-details-${index}" hidden><td colspan="6"><div class="record-detail-grid"><div><span>Total cameras</span><strong>${Number(q.cameraCount)||0}</strong></div><div><span>Adapter</span><strong>${escapeHtml(q.adapter||"none")} × ${Number(q.adapterQty)||0}</strong></div><div><span>Camera hardware</span><strong>VIVOTEK FD9380-HTV-V2 × ${Number(q.cameraHardwareQty)||0}</strong></div><div><span>Camera cost</span><strong>${money((Number(q.cameraHardwareQty)||0)*190)}</strong></div><div><span>Camera margin</span><strong>${money((Number(q.cameraHardwareQty)||0)*9)}</strong></div><div><span>Hardware paid today</span><strong>${money((Number(q.cameraHardwareSubtotal)||0) + ((Number(q.adapterQty)||0) * ({adapter8:349,adapter16:399,adapter32:2149,adapter64:2689,webhookTest:.5}[q.adapter]||0)))}</strong></div><div><span>Analytics revenue</span><strong>${money(q.analyticsRevenue)}</strong></div><div><span>Analytics margin</span><strong>${money(q.analyticsMargin)}</strong></div><div><span>Selected analytics quantities</span>${analyticsMarkup(q.analytics)}</div><div><span>Quote status</span><strong>${escapeHtml(q.status||"saved")}</strong></div></div></td></tr>`).join("")
+          : '<tr><td colspan="6">No saved quotes yet.</td></tr>';
+
+        const orderBody = document.querySelector("#partnerOrderTableBody");
+        orderBody.innerHTML = startedOrders.length
+          ? startedOrders.map((o, index) => `<tr>
+              <td data-label="Order">${escapeHtml(o.orderId)}</td>
+              <td data-label="Customer">${escapeHtml(o.customerName || "Pending")}</td>
+              <td data-label="Plan and analytics">${escapeHtml(String(o.resolution || "").toUpperCase())}, ${escapeHtml(o.duration)}-day ${o.mode === "continuous" ? "24/7" : "motion"}${analyticsMarkup(o.analytics)}</td>
+              <td data-label="Status">${String(o.status || "checkout_started").replaceAll("_", " ")}</td>
+              <td data-label="Date">${displayDate(o.createdAt)}</td>
+              <td data-label="Actions"><div class="row-actions"><button class="row-action" type="button" data-order-action="details" data-index="${index}">Details</button>${o.checkoutUrl?`<button class="row-action" type="button" data-order-action="share" data-index="${index}">Share Quote</button>`:""}<button class="row-action danger" type="button" data-order-action="delete" data-index="${index}">Delete</button></div></td>
+            </tr><tr class="record-details" id="order-details-${index}" hidden><td colspan="6"><div class="record-detail-grid"><div><span>Customer</span><strong>${escapeHtml(o.customerName||"Pending")}<br>${escapeHtml(o.customerEmail||"")}</strong></div><div><span>Adapter</span><strong>${escapeHtml(o.adapter||"not listed")} × ${Number(o.adapterQty)||0}</strong></div><div><span>Camera hardware</span><strong>VIVOTEK FD9380-HTV-V2 × ${Number(o.cameraHardwareQty)||0}</strong></div><div><span>Camera cost</span><strong>${money((Number(o.cameraHardwareQty)||0)*190)}</strong></div><div><span>Camera margin</span><strong>${money((Number(o.cameraHardwareQty)||0)*9)}</strong></div><div><span>Hardware total</span><strong>${money(Number(o.hardwarePaidToday||o.dueTodayTotal||0))}</strong></div><div><span>Total cameras</span><strong>${Number(o.cameraCount)||0}</strong></div><div><span>Customer total</span><strong>${money(o.customerTotal)}</strong></div><div><span>Analytics revenue</span><strong>${money(o.analyticsRevenue)}</strong></div><div><span>Analytics margin</span><strong>${money(o.analyticsMargin)}</strong></div><div><span>Selected analytics quantities</span>${analyticsMarkup(o.analytics)}</div><div><span>Commission</span><strong>${money(o.repCommission)}</strong></div></div></td></tr>`).join("")
+          : '<tr><td colspan="6">No orders started yet.</td></tr>';
+
+        const completedBody = document.querySelector("#partnerCompletedOrderTableBody");
+        completedBody.innerHTML = completedOrders.length
+          ? completedOrders.map((o, index) => `<tr>
+              <td data-label="Order">${escapeHtml(o.orderId)}</td>
+              <td data-label="Customer">${escapeHtml(o.customerName || "Customer")}</td>
+              <td data-label="Payment Date">${escapeHtml(displayDate(orderPaidDate(o)))}</td>
+              <td data-label="Amount Paid">${escapeHtml(orderPaidAmount(o))}</td>
+              <td data-label="Quote / Partner"><strong>${escapeHtml(o.quoteId || o.quote_id || "Not available")}</strong><br>${escapeHtml(o.partnerId || o.partner_id || partner.id || "Not available")}</td>
+              <td data-label="Commission">${money(o.repCommission)}</td>
+              <td data-label="Actions"><div class="row-actions"><button class="row-action" type="button" data-completed-order-action="details" data-index="${index}">Details</button><button class="row-action danger" type="button" data-completed-order-action="delete" data-index="${index}">Delete</button></div></td>
+            </tr><tr class="record-details" id="completed-order-details-${index}" hidden><td colspan="7"><div class="record-detail-grid"><div><span>Customer</span><strong>${escapeHtml(o.customerName||"Customer")}<br>${escapeHtml(o.customerEmail||"")}</strong></div><div><span>Adapter</span><strong>${escapeHtml(o.adapter||"not listed")} × ${Number(o.adapterQty)||0}</strong></div><div><span>Camera hardware</span><strong>VIVOTEK FD9380-HTV-V2 × ${Number(o.cameraHardwareQty)||0}</strong></div><div><span>Hardware total</span><strong>${money(Number(o.hardwarePaidToday||o.dueTodayTotal||0))}</strong></div><div><span>Total cameras</span><strong>${Number(o.cameraCount)||0}</strong></div><div><span>Plan</span><strong>${escapeHtml(String(o.resolution || "").toUpperCase())}, ${escapeHtml(o.duration)}-day ${o.mode === "continuous" ? "24/7" : "motion"}</strong></div><div><span>Selected analytics quantities</span>${analyticsMarkup(o.analytics)}</div><div><span>Amount paid</span><strong>${escapeHtml(orderPaidAmount(o))}</strong></div><div><span>Commission</span><strong>${money(o.repCommission)}</strong></div></div></td></tr>`).join("")
+          : '<tr><td colspan="7">No completed orders yet.</td></tr>';
+
+        const referralUrl = new URL("index.html", location.href);
+        referralUrl.searchParams.set("partner", partner.id);
+        document.querySelector("#partnerReferralLink").value = referralUrl.href;
+        document.querySelector("#openReferralLink").href = referralUrl.href;
+        renderReferralQr(referralUrl.href, partner.id);
+        const setupUrl = `videoloft-partner-referral-wizard.html?v=camera-hardware-v11&partner=${encodeURIComponent(partner.id)}`;
+        const continueSetup = document.querySelector("#pwaContinueSetup");
+        if (continueSetup) continueSetup.href = setupUrl;
+
+        const adminPanel = document.querySelector("#adminSalesPanel");
+        if (data.isAdmin) {
+          loadAdminDashboard().catch(error => {
+            const status = document.querySelector("#adminSalesStatus");
+            showStatus(status, error.message, true);
+          });
+        } else if (adminPanel) {
+          adminPanel.hidden = true;
+        }
+      }
+
+
+      let adminDashboardData = {salespeople: [], completedOrders: [], archivedOrders: []};
+
+      function adminMoney(value) {
+        return Number(value || 0).toLocaleString("en-US", {style:"currency",currency:"USD"});
+      }
+      function adminPaidAmount(order) {
+        if (Number(order.amountPaidCents) > 0) return adminMoney(Number(order.amountPaidCents) / 100);
+        return adminMoney(order.customerTotal || 0);
+      }
+      function renderAdminDashboard(data) {
+        adminDashboardData = {
+          salespeople: Array.isArray(data.salespeople) ? data.salespeople : [],
+          completedOrders: Array.isArray(data.completedOrders) ? data.completedOrders : [],
+          archivedOrders: Array.isArray(data.archivedOrders) ? data.archivedOrders : []
+        };
+        const panel = document.querySelector("#adminSalesPanel");
+        if (panel) panel.hidden = false;
+        document.querySelector("#adminPendingCount").textContent = adminDashboardData.salespeople.filter(p => p.status === "pending").length;
+        document.querySelector("#adminActiveCount").textContent = adminDashboardData.salespeople.filter(p => p.status === "active").length;
+        document.querySelector("#adminCompletedCount").textContent = adminDashboardData.completedOrders.length;
+
+        const salesBody = document.querySelector("#adminSalespeopleTableBody");
+        salesBody.innerHTML = adminDashboardData.salespeople.length
+          ? adminDashboardData.salespeople.map((p, index) => `<tr>
+              <td data-label="Salesperson"><strong>${escapeHtml(p.name)}</strong><br>${escapeHtml(p.email)}</td>
+              <td data-label="ID">${escapeHtml(p.partnerId)}</td>
+              <td data-label="Status"><strong>${escapeHtml(p.status)}</strong></td>
+              <td data-label="Quotes">${Number(p.quoteCount)||0}</td>
+              <td data-label="Orders">${Number(p.orderCount)||0}</td>
+              <td data-label="Completed">${Number(p.completedCount)||0}</td>
+              <td data-label="Commission">${adminMoney(p.earnedCommission)}</td>
+              <td data-label="Actions"><div class="row-actions">
+                ${p.status !== "active" ? `<button class="row-action" type="button" data-admin-partner-action="active" data-index="${index}">Approve</button>` : ""}
+                ${p.status !== "suspended" ? `<button class="row-action danger" type="button" data-admin-partner-action="suspended" data-index="${index}">Suspend</button>` : ""}
+                ${p.status !== "pending" ? `<button class="row-action" type="button" data-admin-partner-action="pending" data-index="${index}">Set Pending</button>` : ""}
+              </div></td>
+            </tr>`).join("")
+          : '<tr><td colspan="8">No salesperson applications yet.</td></tr>';
+
+        const ordersBody = document.querySelector("#adminCompletedOrdersTableBody");
+        ordersBody.innerHTML = adminDashboardData.completedOrders.length
+          ? adminDashboardData.completedOrders.map((o, index) => `<tr>
+              <td data-label="Order"><strong>${escapeHtml(o.orderId)}</strong><br>${escapeHtml(o.quoteId || "")}</td>
+              <td data-label="Salesperson"><strong>${escapeHtml(o.partnerName)}</strong><br>${escapeHtml(o.partnerId)}<br>${escapeHtml(o.partnerEmail)}</td>
+              <td data-label="Customer"><strong>${escapeHtml(o.customerName)}</strong><br>${escapeHtml(o.customerEmail)}</td>
+              <td data-label="Paid">${escapeHtml(adminPaidAmount(o))}<br>${escapeHtml(displayDate(o.paidAt))}</td>
+              <td data-label="Plan">${escapeHtml(String(o.resolution || "").toUpperCase())}, ${escapeHtml(o.duration)}-day ${o.mode === "continuous" ? "24/7" : "motion"}<br>${escapeHtml(o.adapter || "none")} × ${Number(o.adapterQty)||0}</td>
+              <td data-label="Commission">${adminMoney(o.repCommission)}</td>
+              <td data-label="Actions"><div class="row-actions">
+                <button class="row-action" type="button" data-admin-order-details="${index}">Videoloft Details</button>
+                <button class="row-action danger" type="button" data-admin-order-archive="${index}">Archive</button>
+              </div></td>
+            </tr>
+            <tr class="record-details" id="admin-order-details-${index}" hidden><td colspan="7">
+              <div class="record-detail-grid">
+                <div><span>Customer</span><strong>${escapeHtml(o.customerName)}<br>${escapeHtml(o.customerEmail)}<br>${escapeHtml(o.customerPhone || "")}</strong></div>
+                <div><span>Site</span><strong>${escapeHtml(o.siteName || "")}<br>${escapeHtml([o.address,o.city,o.state,o.zip].filter(Boolean).join(", "))}</strong></div>
+                <div><span>Salesperson</span><strong>${escapeHtml(o.partnerName)}<br>${escapeHtml(o.partnerId)}<br>${escapeHtml(o.partnerEmail)}</strong></div>
+                <div><span>Cloud plan</span><strong>${Number(o.cameraCount)||0} camera(s)<br>${escapeHtml(String(o.resolution || "").toUpperCase())}, ${escapeHtml(o.duration)}-day ${o.mode === "continuous" ? "24/7" : "motion"}<br>${escapeHtml(o.billing || "")}</strong></div>
+                <div><span>Adapter</span><strong>${escapeHtml(o.adapter || "none")} × ${Number(o.adapterQty)||0}</strong></div>
+                <div><span>Analytics</span>${analyticsMarkup(o.analytics)}</div>
+                <div><span>Payment</span><strong>${escapeHtml(adminPaidAmount(o))}<br>${escapeHtml(displayDate(o.paidAt))}</strong></div>
+                <div><span>Commission</span><strong>${adminMoney(o.repCommission)}</strong></div>
+              </div>
+            </td></tr>`).join("")
+          : '<tr><td colspan="7">No completed salesperson orders yet.</td></tr>';
+
+        const archivedBody = document.querySelector("#adminArchivedOrdersTableBody");
+        archivedBody.innerHTML = adminDashboardData.archivedOrders.length
+          ? adminDashboardData.archivedOrders.map((o, index) => `<tr>
+              <td data-label="Order"><strong>${escapeHtml(o.orderId)}</strong><br>${escapeHtml(o.quoteId || "")}</td>
+              <td data-label="Salesperson"><strong>${escapeHtml(o.partnerName)}</strong><br>${escapeHtml(o.partnerId)}<br>${escapeHtml(o.partnerEmail)}</td>
+              <td data-label="Customer"><strong>${escapeHtml(o.customerName)}</strong><br>${escapeHtml(o.customerEmail)}</td>
+              <td data-label="Archived">${escapeHtml(displayDate(o.archivedAt))}</td>
+              <td data-label="Plan">${escapeHtml(String(o.resolution || "").toUpperCase())}, ${escapeHtml(o.duration)}-day ${o.mode === "continuous" ? "24/7" : "motion"}<br>${escapeHtml(o.adapter || "none")} × ${Number(o.adapterQty)||0}</td>
+              <td data-label="Commission">${adminMoney(o.repCommission)}</td>
+              <td data-label="Actions"><button class="row-action" type="button" data-admin-order-restore="${index}">Restore</button></td>
+            </tr>`).join("")
+          : '<tr><td colspan="7">No archived orders.</td></tr>';
+      }
+      async function loadAdminDashboard() {
+        const result = await api("admin_dashboard");
+        renderAdminDashboard(result);
+      }
+      document.querySelector("#adminSalespeopleTableBody")?.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-admin-partner-action]");
+        if (!button) return;
+        const salesperson = adminDashboardData.salespeople[Number(button.dataset.index)];
+        if (!salesperson) return;
+        const status = button.dataset.adminPartnerAction;
+        if (!confirm(`Change ${salesperson.name} (${salesperson.partnerId}) to ${status}?`)) return;
+        const statusBox = document.querySelector("#adminSalesStatus");
+        try {
+          await api("admin_update_partner_status", {
+            method: "POST",
+            body: JSON.stringify({partnerId: salesperson.partnerId, status})
+          });
+          showStatus(statusBox, `${salesperson.name} is now ${status}.`);
+          await loadAdminDashboard();
+        } catch (error) {
+          showStatus(statusBox, error.message, true);
+        }
+      });
+      document.querySelector("#adminCompletedOrdersTableBody")?.addEventListener("click", async (event) => {
+        const detailsButton = event.target.closest("[data-admin-order-details]");
+        if (detailsButton) {
+          const row = document.querySelector(`#admin-order-details-${detailsButton.dataset.adminOrderDetails}`);
+          if (row) row.hidden = !row.hidden;
+          return;
+        }
+
+        const archiveButton = event.target.closest("[data-admin-order-archive]");
+        if (!archiveButton) return;
+
+        const order = adminDashboardData.completedOrders[Number(archiveButton.dataset.adminOrderArchive)];
+        if (!order) return;
+        if (!confirm(`Archive order ${order.orderId}? It will remain saved and can be restored.`)) return;
+
+        const statusBox = document.querySelector("#adminSalesStatus");
+        try {
+          await api("admin_archive_order", {
+            method: "POST",
+            body: JSON.stringify({orderId: order.orderId})
+          });
+          showStatus(statusBox, `Order ${order.orderId} was archived.`);
+          await loadAdminDashboard();
+        } catch (error) {
+          showStatus(statusBox, error.message, true);
+        }
+      });
+
+      document.querySelector("#adminArchivedOrdersTableBody")?.addEventListener("click", async (event) => {
+        const restoreButton = event.target.closest("[data-admin-order-restore]");
+        if (!restoreButton) return;
+
+        const order = adminDashboardData.archivedOrders[Number(restoreButton.dataset.adminOrderRestore)];
+        if (!order) return;
+
+        const statusBox = document.querySelector("#adminSalesStatus");
+        try {
+          await api("admin_restore_order", {
+            method: "POST",
+            body: JSON.stringify({orderId: order.orderId})
+          });
+          showStatus(statusBox, `Order ${order.orderId} was restored.`);
+          await loadAdminDashboard();
+        } catch (error) {
+          showStatus(statusBox, error.message, true);
+        }
+      });
+
+      document.querySelector("#adminArchiveAllOrders")?.addEventListener("click", async () => {
+        const count = adminDashboardData.completedOrders.length;
+        if (!count) return;
+
+        if (!confirm(`Archive all ${count} completed orders? They will remain saved and can be restored.`)) return;
+
+        const statusBox = document.querySelector("#adminSalesStatus");
+        try {
+          const result = await api("admin_archive_all_completed", {
+            method: "POST",
+            body: JSON.stringify({})
+          });
+          showStatus(statusBox, `${Number(result.archivedCount) || 0} completed order(s) archived.`);
+          await loadAdminDashboard();
+        } catch (error) {
+          showStatus(statusBox, error.message, true);
+        }
+      });
+
+      document.querySelector("#adminToggleArchivedOrders")?.addEventListener("click", (event) => {
+        const section = document.querySelector("#adminArchivedOrdersSection");
+        const opening = section.hidden;
+        section.hidden = !opening;
+        event.currentTarget.textContent = opening ? "Hide Archived Orders" : "Show Archived Orders";
+        event.currentTarget.setAttribute("aria-expanded", opening ? "true" : "false");
+      });
+
+      async function loadDashboard() {
+        try {
+          const result = await api("dashboard");
+          renderDashboard(result);
+        } catch (error) {
+          if (/log in/i.test(error.message)) {
+            setLoggedOut();
+          } else {
+            console.error(error);
+          }
+        } finally {
+          finishPwaLaunch();
+        }
+      }
+
+      document.querySelector("#partnerQuoteTableBody")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-quote-action]");
+        if (!button) return;
+        const index = Number(button.dataset.index);
+        const quote = currentDashboardData.quotes[index];
+        if (!quote) return;
+        const action = button.dataset.quoteAction;
+        if (action === "details") {
+          const row = document.querySelector(`#quote-details-${index}`);
+          if (row) row.hidden = !row.hidden;
+        }
+        if (action === "reopen") openQuoteInCalculator(quote, false);
+        if (action === "duplicate") openQuoteInCalculator(quote, true);
+        if (action === "continue" && quote.quoteUrl) location.href = quote.quoteUrl;
+        if (action === "share" && quote.quoteUrl) shareCustomerQuote(quote.quoteUrl);
+        if (action === "delete") {
+          deletePartnerRecord("quote", quote.quoteId, () => api("delete_quote", {
+            method: "POST",
+            body: JSON.stringify({quoteId: quote.quoteId})
+          }));
+        }
+      });
+
+      document.querySelector("#partnerOrderTableBody")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-order-action]");
+        if (!button) return;
+        const index = Number(button.dataset.index);
+        const order = currentDashboardData.orders[index];
+        if (!order) return;
+        const action = button.dataset.orderAction;
+        if (action === "details") {
+          const row = document.querySelector(`#order-details-${index}`);
+          if (row) row.hidden = !row.hidden;
+        }
+        if (action === "share" && order.checkoutUrl) shareCustomerQuote(order.checkoutUrl);
+        if (action === "delete") {
+          deletePartnerRecord("order", order.orderId, () => api("delete_order", {
+            method: "POST",
+            body: JSON.stringify({orderId: order.orderId})
+          }));
+        }
+      });
+
+      document.querySelector("#partnerCompletedOrderTableBody")?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-completed-order-action]");
+        if (!button) return;
+        const index = Number(button.dataset.index);
+        const order = currentDashboardData.completedOrders[index];
+        if (!order) return;
+        const action = button.dataset.completedOrderAction;
+        if (action === "details") {
+          const row = document.querySelector(`#completed-order-details-${index}`);
+          if (row) row.hidden = !row.hidden;
+        }
+        if (action === "delete") {
+          deletePartnerRecord("order", order.orderId, () => api("delete_order", {
+            method: "POST",
+            body: JSON.stringify({orderId: order.orderId})
+          }));
+        }
+      });
+
+      registerForm?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = new FormData(registerForm);
+        try {
+          const result = await api("register", {
+            method: "POST",
+            body: JSON.stringify({
+              name: String(form.get("partnerName") || "").trim(),
+              email: String(form.get("partnerEmail") || "").trim(),
+              password: String(form.get("partnerPassword") || "")
+            })
+          });
+          showStatus(registerStatus, result.message || "Application received. Wait for ANY AI CAM approval before logging in.");
+          registerForm.reset();
+        } catch (error) {
+          showStatus(registerStatus, error.message, true);
+        }
+      });
+
+      loginForm?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = new FormData(loginForm);
+        try {
+          await api("login", {
+            method: "POST",
+            body: JSON.stringify({
+              email: String(form.get("loginEmail") || "").trim(),
+              password: String(form.get("loginPassword") || "")
+            })
+          });
+          showStatus(loginStatus, "Logged in successfully.");
+          loginForm.reset();
+          await loadDashboard();
+        } catch (error) {
+          showStatus(loginStatus, error.message, true);
+        }
+      });
+
+      logoutButton?.addEventListener("click", async () => {
+        try {
+          await api("logout", {method: "POST", body: "{}"});
+        } catch (error) {
+          console.error(error);
+        }
+        setLoggedOut();
+      });
+
+      document.querySelector("#copyReferralLink")?.addEventListener("click", async () => {
+        const input = document.querySelector("#partnerReferralLink");
+        const status = document.querySelector("#referralStatus");
+        try {
+          await navigator.clipboard.writeText(input.value);
+          showStatus(status, "Referral link copied.");
+        } catch {
+          input.select();
+          document.execCommand("copy");
+          showStatus(status, "Referral link copied.");
+        }
+      });
+
+      document.querySelector("#pwaCopyReferral")?.addEventListener("click", () => {
+        document.querySelector("#copyReferralLink")?.click();
+      });
+
+      document.querySelector("#pwaNewQuote")?.addEventListener("click", () => {
+        document.querySelector(".partner-calculator-panel")?.scrollIntoView({behavior:"smooth", block:"start"});
+      });
+
+      document.querySelector("#pwaShowQr")?.addEventListener("click", () => {
+        document.querySelector(".referral-qr-wrap")?.scrollIntoView({behavior:"smooth", block:"center"});
+      });
+
+      document.querySelector("#pwaShareReferral")?.addEventListener("click", async () => {
+        const url = document.querySelector("#partnerReferralLink")?.value || "";
+        const status = document.querySelector("#referralStatus");
+        if (!url) return showStatus(status, "Your referral link is still loading.", true);
+        if (navigator.share) {
+          try {
+            await navigator.share({title:"ANY AI CAM", text:"Start your ANY AI CAM cloud camera setup with my referral link.", url});
+            return showStatus(status, "Referral link shared.");
+          } catch (error) {
+            if (error?.name === "AbortError") return;
+          }
+        }
+        document.querySelector("#copyReferralLink")?.click();
+      });
+
+      window.addEventListener("beforeinstallprompt", (event) => {
+        event.preventDefault();
+        deferredInstallPrompt = event;
+        document.querySelector("#installPartnerApp")?.removeAttribute("hidden");
+      });
+
+      document.querySelector("#installPartnerApp")?.addEventListener("click", async () => {
+        if (!deferredInstallPrompt) return;
+        deferredInstallPrompt.prompt();
+        await deferredInstallPrompt.userChoice;
+        deferredInstallPrompt = null;
+        document.querySelector("#installPartnerApp")?.setAttribute("hidden", "");
+      });
+
+      window.addEventListener("appinstalled", () => {
+        document.querySelector("#installPartnerApp")?.setAttribute("hidden", "");
+        const note = document.querySelector("#pwaInstallNote");
+        if (note) note.textContent = "Partner app installed. Open it from your home screen.";
+      });
+
+      document.querySelector("#downloadReferralQr")?.addEventListener("click", () => {
+        const dataUrl = getReferralQrDataUrl();
+        const container = document.querySelector("#partnerReferralQr");
+        if (!dataUrl) return;
+        const link = document.createElement("a");
+        link.href = dataUrl;
+        link.download = `ANY-AI-CAM-Referral-QR-${container?.dataset.partnerId || "Partner"}.png`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      });
+
+      document.querySelector("#printReferralQr")?.addEventListener("click", () => {
+        const dataUrl = getReferralQrDataUrl();
+        const referralUrl = document.querySelector("#partnerReferralLink")?.value || "";
+        if (!dataUrl) return;
+        const printWindow = window.open("", "_blank", "width=700,height=850");
+        if (!printWindow) return;
+        printWindow.document.write(`
+          <!doctype html>
+          <html><head><title>ANY AI CAM Referral QR</title>
+          <style>
+            body{font-family:Arial,sans-serif;text-align:center;padding:40px;color:#0b1332}
+            img{width:360px;max-width:90%;height:auto}
+            p{word-break:break-all;color:#4b5870}
+          </style></head>
+          <body>
+            <h1>ANY AI CAM</h1>
+            <h2>Scan to Visit ANY AI CAM</h2>
+            <img src="${dataUrl}" alt="Referral QR">
+            <p>${referralUrl}</p>
+          </body></html>
+        `);
+        printWindow.document.close();
+        printWindow.focus();
+        setTimeout(() => printWindow.print(), 300);
+      });
+
+      window.addEventListener("message", (event) => {
+        if (event.origin === location.origin && event.data?.type === "ANYAICAM_ACTIVITY_UPDATED") {
+          loadDashboard();
+        }
+      });
+
+      window.addEventListener("focus", loadDashboard);
+      window.addEventListener("online", updateConnectionStatus);
+      window.addEventListener("offline", updateConnectionStatus);
+
+      document.addEventListener("DOMContentLoaded", () => {
+        dashboard.style.display = "none";
+        updateConnectionStatus();
+        loadDashboard();
+        if ("serviceWorker" in navigator) {
+          navigator.serviceWorker.register("videoloft-partner-service-worker.js", {scope:"./"}).catch(console.error);
+        }
+        const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+        const isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone;
+        if (isIos && !isStandalone) {
+          const note = document.querySelector("#pwaInstallNote");
+          if (note) note.textContent = "On iPhone: tap Share, then Add to Home Screen.";
+        }
+        const action = new URLSearchParams(location.search).get("action");
+        if (action) {
+          window.setTimeout(() => {
+            if (action === "new-quote") document.querySelector("#pwaNewQuote")?.click();
+            if (action === "qr") document.querySelector("#pwaShowQr")?.click();
+          }, 900);
+        }
+      });
+    })();
+    </script>
+
+
+
+<script id="partner-hardware-picker-script">
+(function(){
+ const KEY='anyaicamHardwareCartV3', PRODUCTS=[{"sku":"AIC-CAM-5MP-DOME-001","price":349.99},{"sku":"AIC-CAM-BULLET-IB9380","price":349.99},{"sku":"AIC-CAM-FISHEYE-FE9380","price":649.99},{"sku":"AIC-CAM-DUAL-MA9312","price":1799.99},{"sku":"AIC-LTS-LXIP1142W-28MA","price":114.99},{"sku":"AIC-LTS-CMIP3382WI-28SDL","price":249.99},{"sku":"AIC-LTS-CMIP3C42WI-28SDL","price":299.99},{"sku":"AIC-LTS-CMIP3C82WI-28SDL","price":409.99},{"sku":"AIC-LTS-CMHT1722-28LS","price":114.99},{"sku":"AIC-LTS-CMHT1752-28LS","price":129.99},{"sku":"AIC-LTS-CMHT1782-28LF","price":149.99},{"sku":"AIC-LTS-VSPOE-SW802","price":159.99},{"sku":"AIC-LTS-VSPOE-SW1602","price":329.99},{"sku":"AIC-LTS-VSPOE-SW2402","price":429.99},{"sku":"AIC-POE-MOKER-8","price":79.99},{"sku":"AIC-POE-MOKER-16","price":174.99},{"sku":"AIC-POE-MOKER-24","price":229.99},{"sku":"AIC-POE-MOKER-48","price":429.99}];
+ const bySku=Object.fromEntries(PRODUCTS.map(p=>[p.sku,p]));
+ const money=v=>Number(v||0).toLocaleString('en-US',{style:'currency',currency:'USD'});
+ function load(){try{const x=JSON.parse(localStorage.getItem(KEY)||'{}');return x&&typeof x==='object'?x:{};}catch(e){return {};}}
+ function subtotal(cart){return Object.entries(cart).reduce((sum,[sku,qty])=>sum+(bySku[sku]?.price||0)*Math.max(0,Number(qty)||0),0);}
+ function sync(){const cart=load();document.querySelectorAll('[data-partner-hardware-sku]').forEach(row=>{const qty=Math.max(0,Number(cart[row.dataset.partnerHardwareSku]||0));const input=row.querySelector('.partner-hardware-input');if(input)input.value=qty;row.classList.toggle('selected',qty>0);});const total=document.getElementById('partnerHardwareSubtotal');if(total)total.textContent=money(subtotal(cart));}
+ function notifyCalculator(){const frame=document.querySelector('.calculator-frame');if(!frame||!frame.contentWindow)return;try{frame.contentWindow.dispatchEvent(new CustomEvent('aic-hardware-updated'));if(frame.contentWindow.AICHardware?.syncRows)frame.contentWindow.AICHardware.syncRows();if(typeof frame.contentWindow.calculate==='function')frame.contentWindow.calculate();}catch(e){}}
+ function save(cart){localStorage.setItem(KEY,JSON.stringify(cart));sync();notifyCalculator();}
+ document.addEventListener('click',e=>{const b=e.target.closest('.partner-hardware-plus,.partner-hardware-minus');if(!b)return;const row=b.closest('[data-partner-hardware-sku]');if(!row)return;const cart=load(),sku=row.dataset.partnerHardwareSku,current=Math.max(0,Number(cart[sku]||0));cart[sku]=Math.max(0,Math.min(64,current+(b.classList.contains('partner-hardware-plus')?1:-1)));save(cart);});
+ document.addEventListener('change',e=>{const input=e.target.closest('.partner-hardware-input');if(!input)return;const row=input.closest('[data-partner-hardware-sku]'),cart=load();cart[row.dataset.partnerHardwareSku]=Math.max(0,Math.min(64,Math.floor(Number(input.value)||0)));save(cart);});
+ window.addEventListener('storage',sync);document.addEventListener('DOMContentLoaded',sync);const frame=document.querySelector('.calculator-frame');if(frame)frame.addEventListener('load',()=>{sync();notifyCalculator();});
+})();
+</script>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>
