@@ -302,3 +302,30 @@ def test_license_count_fix_is_unaffected_by_this_change(db_path):
         conn.close()
         assert main.get_camera_count(customer_id="cust-a") == 5
         assert main.get_camera_count(customer_id="cust-b") == 5
+
+
+def test_idle_event_mode_camera_is_armed_not_a_recording_problem(http_client, db_path):
+    """2026-09-29: an online Event-mode camera with no recent file was shown
+    as "Recording problem: stopped". It is armed (waiting for activity);
+    Continuous mode without recording, and an offline camera, stay stopped."""
+    conn = sqlite3.connect(db_path)
+    _seed_two_customers_five_cameras_each(conn)
+    ids = [r[0] for r in conn.execute(
+        "SELECT c.id FROM cameras c JOIN appliance_camera_status s ON s.camera_id=c.id "
+        "WHERE c.customer_id='cust-a' ORDER BY c.camera_number")]
+    conn.execute("UPDATE appliance_camera_status SET online=1, recording=0 WHERE camera_id IN (?,?)", (ids[0], ids[1]))
+    conn.execute("UPDATE appliance_camera_status SET online=0, recording=0 WHERE camera_id=?", (ids[2],))
+    conn.execute("UPDATE cameras SET local_recording_mode='event' WHERE id IN (?,?)", (ids[0], ids[2]))
+    conn.commit()
+    conn.close()
+    data = http_client.get("/api/cameras/status", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")}).json()
+    by_number = {c["camera"]: c for c in data["cameras"]}
+    assert by_number[1]["recording"] == "armed" and by_number[1]["recording_mode"] == "event"      # idle Event mode
+    assert by_number[2]["recording"] == "stopped" and by_number[2]["recording_mode"] == "continuous"  # real problem
+    assert by_number[3]["recording"] == "stopped"                                                  # offline stays a problem
+
+
+def test_dashboard_treats_armed_as_healthy():
+    text = open(main.__file__, encoding="utf-8").read()
+    assert "const recordingOk=camera.recording==='running'||camera.recording==='armed';" in text
+    assert "waiting for activity" in text

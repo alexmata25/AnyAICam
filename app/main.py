@@ -52215,12 +52215,20 @@ def _customer_camera_status(customer_cameras: list[dict]) -> dict:
             ).fetchone()
             online = bool(status_row["online"]) if status_row else False
             recording_running = bool(status_row["recording"]) if status_row else False
+            # Event mode (2026-09-29): the appliance reports recording only
+            # while a recent file exists, so an idle, healthy Event-mode
+            # camera read as "Recording problem: stopped". Online + Event
+            # mode is "armed" (waiting for activity), not a problem.
+            mode_row = db.execute("SELECT local_recording_mode FROM cameras WHERE id=?", (camera["id"],)).fetchone()
+            event_mode = bool(mode_row) and mode_row["local_recording_mode"] == "event"
+            recording_state = "running" if recording_running else ("armed" if online and event_mode else "stopped")
             cameras.append(
                 {
                     "camera": camera_number,
                     "online": online,
                     "stream": "online" if online else "offline",
-                    "recording": "running" if recording_running else "stopped",
+                    "recording": recording_state,
+                    "recording_mode": "event" if event_mode else "continuous",
                     "last_stream_update_seconds": None,
                     "reconnects": 0,
                     "last_exit_code": None,
@@ -76285,11 +76293,11 @@ async function updateDashboard(){
             const card=document.getElementById(`dashboard-camera-${camera.camera}`);
             if(!state||!rec||!warning||!card)return;
             if(camera.online)onlineCount++;
-            const recordingOk=camera.recording==='running';
+            const recordingOk=camera.recording==='running'||camera.recording==='armed';
             state.textContent=camera.online?'Online':'Offline';
             state.classList.remove('checking');state.classList.toggle('offline',!camera.online);
             rec.dataset.mode=rec.dataset.mode||rec.textContent;
-            rec.textContent=`${rec.dataset.mode} · ${recordingOk?'recording':'recording '+camera.recording}`;
+            rec.textContent=`${rec.dataset.mode} · ${camera.recording==='armed'?'waiting for activity':(recordingOk?'recording':'recording '+camera.recording)}`;
             rec.classList.toggle('problem',!recordingOk);
             const problem=!camera.online?`Camera offline (stream ${camera.stream}).`:(!recordingOk?`Recording problem: ${camera.recording}.`:'');
             warning.textContent=problem;warning.hidden=!problem;
