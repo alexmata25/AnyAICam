@@ -4421,3 +4421,11 @@ The Front Door, Living Room and Bedroom cameras are the regression/physical vali
   - Voice Call Answer: video unmuted and playing, getUserMedia called exactly once, Talk afterwards reuses it (count stays 1). Mic denied: "Microphone blocked: open this page in Safari or Chrome..." (test answered stale call 82a79b80...).
   - Cooldowns in the running container: ordinary 900 s, Voice Call 300 s; supersede window 120 s for person/smart_motion/motion/ppe.
 - NOT validated, blocked on the Ryzen: at ~01:11-01:16 UTC (before the deploy) the Ryzen stopped polling /api/appliance/live/p2p/pending, uploading live segments, and sending detection events; heartbeat continued. So P2P live video/audio, relay live view, audio on cameras without talkback, and one-email-per-visit are unverified. No Ryzen or Samsung changes made.
+
+## 2026-09-29 — Ryzen outage root cause (IP conflict) and resumed staging validation
+
+- Root cause (Ryzen journal, read-only): at 01:13:17 UTC NetworkManager reported "conflict detected for IP address 192.168.0.228 with host E8:25:87:02:DB:B0" (vendor: Shenzhen Chilink IoT) and dropped the Ryzen's LAN address/route; Tailscale, DNS and every cloud channel failed together. The host kept running (no crash, no OOM). The 02:47:45 renewal hit the same conflict. Recovered only by the 03:08 UTC reboot (ACD passed; same address .228). `.204` in the Dell's SSH config is stale; the Ryzen has held .228 by DHCP since at least 21:32 UTC.
+- Bedroom was not shown to be causal: its wired MAC is 14:2f:fd:a0:83:60, not the conflicting host; other cameras kept posting events after Bedroom's last activity.
+- After reboot (no changes made): anyaicam-vms came back healthy by itself; P2P polling, live segments (all five cameras) and detection events resumed. Bedroom rediscovered by device identity at 192.168.0.145 (camera record holds only the ONVIF urn:uuid; MediaMTX source regenerated).
+- Staging a7eb8fe browser checks now passed: P2P live video + camera audio (PCMU, bytes flowing) on Front Door, Living Room, Driveway Left/Right, desktop and phone; Driveway Left/Right (no talkback) play video + audio with no Talk button. Bedroom's Profile_2 stream is H.265 with no audio track, so it plays through the relay (expected).
+- Still open: one email per visit needs a real Front Door visit (no Voice Call since the deploy).
