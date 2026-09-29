@@ -1,0 +1,16 @@
+# ANYAICAM.com - .htaccess
+
+# Set default index file
+DirectoryIndex index.html index.php
+
+# Block .htaccess files from web access
+<FilesMatch "^\.ht">
+  Require all denied
+</FilesMatch>
+
+# MIME types
+AddType image/webp .webp
+AddType image/jpeg .jpg .jpeg
+
+# Default charset
+AddDefaultCharset UTF-8

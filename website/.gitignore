@@ -1,2 +1,12 @@
 config.php
+mail_config.php
+mail_config.example.php
+stripe-config.php
+activation.php
+api.php
+support.php
 *.env
+*.log
+checkout-leads.txt
+submissions-support.txt
+email-log.txt

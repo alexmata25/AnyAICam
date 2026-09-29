@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<title>Review Free Software Trial Request | ANY AI CAM</title>
+<meta name="description" content="Review and submit the ANY AI CAM free software trial request.">
+
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.png" type="image/png">
+<link rel="stylesheet" href="styles.css">
+<style>
+  body{background:#f4f8fc;color:#0b1332}
+  .flow-shell{max-width:900px;margin:0 auto;padding:2rem 1rem 4rem}
+  .flow-card{background:#fff;border:1px solid #d9e6f4;border-radius:18px;padding:clamp(1.25rem,4vw,2.4rem);box-shadow:0 18px 48px rgba(13,39,75,.09)}
+  .progress{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin:0 0 1.5rem}
+  .progress span{padding:.65rem .5rem;text-align:center;border-radius:999px;background:#e9eef7;color:#66738a;font-weight:800;font-size:.86rem}
+  .progress .active{background:#071032;color:#fff}
+  .field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+  label{display:grid;gap:.4rem;font-weight:800;color:#0b1332}
+  input,select,textarea{width:100%;min-height:48px;border:1px solid #cfd9ea;border-radius:10px;padding:.75rem;font:inherit;background:#fff;color:#071032;box-sizing:border-box}
+  textarea{min-height:110px;resize:vertical}
+  .choice-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.85rem}
+  .choice{display:flex;gap:.7rem;align-items:flex-start;border:1px solid #d9e6f4;border-radius:12px;padding:1rem;background:#f8fbff;font-weight:700}
+  .choice input{width:1.25rem;min-height:auto;height:1.25rem;margin-top:.15rem}
+  .actions{display:flex;justify-content:space-between;gap:.75rem;flex-wrap:wrap;margin-top:1.5rem}
+  .note{padding:1rem;border-left:5px solid #23c7d5;background:#f0fbfd;border-radius:10px;color:#39516a;line-height:1.6}
+  .error{display:none;margin-top:1rem;padding:.85rem;border-radius:10px;background:#fff0f0;color:#8b1e1e;font-weight:700}
+  @media(max-width:700px){.field-grid,.choice-grid{grid-template-columns:1fr}.actions .button{width:100%;justify-content:center}}
+</style>
+<link rel="stylesheet" href="header-standard.css">
+</head><body>
+
+
+<header class="site-header">
+  <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+    <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection">
+  </a>
+  <nav class="site-nav" aria-label="Primary navigation">
+    <a href="index.html">Home</a>
+    <a href="software.html">Software</a>
+    <a href="camera-compatibility-check.html">Camera Readiness</a>
+    <a href="contact.html">Contact</a>
+  </nav>
+</header>
+
+<main class="flow-shell">
+  <section class="flow-card">
+    <div class="progress"><span>1. Contact</span><span>2. Camera readiness</span><span class="active">3. Review</span></div>
+    <p class="eyebrow">Final Step</p>
+    <h1>Review and submit your request.</h1>
+    <div id="summary" style="display:grid;gap:.65rem;margin:1.2rem 0"></div>
+    <div class="note">
+      After submission, ANY AI CAM receives your request and you will be sent to Videoloft’s official Virtual Cloud Adapter page.
+      The software alone does not bypass camera credentials—you still need an administrator login for the camera or recorder.
+    </div>
+    <form id="finalForm" action="submit-software-free-trial.php" method="post">
+      <input type="hidden" name="payload" id="payload">
+      <label class="choice" style="margin-top:1rem"><input type="checkbox" required name="consent" value="yes"><span>I understand that my Windows computer must remain powered on and that compatible camera credentials are required during installation.</span></label>
+      <div class="actions">
+        <a class="button secondary" href="software-free-trial-camera.html">Back</a>
+        <button class="button primary" type="submit">Submit & Continue to Videoloft</button>
+      </div>
+      <div class="error" id="error">Your saved request could not be found. Please restart the form.</div>
+    </form>
+  </section>
+</main>
+
+<footer class="site-footer">
+  <div><strong>ANY AI CAM</strong><p>Cloud camera activation and onboarding support for compatible camera systems.</p></div>
+  <div><a href="privacy-policy.html">Privacy Policy</a><a href="terms.html">Terms of Service</a></div>
+  <div><a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a><a href="tel:+18325108240">(832) 510-8240</a></div>
+</footer>
+
+<script>
+const key='anyaicamSoftwareTrial';
+const data=JSON.parse(localStorage.getItem(key)||'{}');
+const required=['name','email','phone','brand','cameraCount','windowsComputer','hasLogin'];
+const missing=required.some(k=>!String(data[k]||'').trim());
+if(missing) document.getElementById('error').style.display='block';
+const fields=[
+ ['Name',data.name],['Email',data.email],['Phone',data.phone],['Site',data.siteName||'Not provided'],
+ ['Brand',data.brand],['Model',data.model||'Not provided'],['Camera count',data.cameraCount],
+ ['Windows computer',data.windowsComputer],['Camera login known',data.hasLogin],['Notes',data.notes||'None']
+];
+document.getElementById('summary').innerHTML=fields.map(([a,b])=>'<div style="display:flex;justify-content:space-between;gap:1rem;border-bottom:1px solid #e5ebf4;padding:.65rem 0"><span>'+a+'</span><strong style="text-align:right">'+String(b).replace(/[<>&]/g,'')+'</strong></div>').join('');
+document.getElementById('payload').value=JSON.stringify(data);
+document.getElementById('finalForm').addEventListener('submit',e=>{if(missing)e.preventDefault();});
+</script></body></html>

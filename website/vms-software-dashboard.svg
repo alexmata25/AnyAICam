@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+  <title id="title">ANYAICAM VMS software dashboard</title>
+  <desc id="desc">A visual mockup showing VMS software connecting existing cameras, camera discovery, Cloud ID, and cloud recording.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#07102f"/>
+      <stop offset="0.58" stop-color="#111a4d"/>
+      <stop offset="1" stop-color="#3b1559"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1">
+      <stop offset="0" stop-color="#e42b93"/>
+      <stop offset="1" stop-color="#28c9d9"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#16215d"/>
+      <stop offset="1" stop-color="#080d2b"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#00051a" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="760" rx="34" fill="#eef4ff"/>
+  <rect x="44" y="44" width="1112" height="672" rx="28" fill="url(#bg)" filter="url(#shadow)"/>
+
+  <g transform="translate(78 78)">
+    <rect width="1044" height="604" rx="22" fill="#07102f" stroke="#41517f" stroke-width="2"/>
+    <rect width="1044" height="70" rx="22" fill="#0b1238"/>
+    <rect y="48" width="1044" height="22" fill="#0b1238"/>
+    <circle cx="34" cy="35" r="8" fill="#e42b93"/>
+    <circle cx="60" cy="35" r="8" fill="#8b62ff"/>
+    <circle cx="86" cy="35" r="8" fill="#28c9d9"/>
+    <text x="126" y="44" fill="#ffffff" font-family="Arial, sans-serif" font-size="24" font-weight="700">ANYAICAM VMS Software</text>
+    <rect x="808" y="19" width="194" height="32" rx="16" fill="rgba(40,201,217,0.16)" stroke="#28c9d9"/>
+    <text x="832" y="42" fill="#aef7ff" font-family="Arial, sans-serif" font-size="15" font-weight="700">Cloud ID Connected</text>
+
+    <g transform="translate(24 94)">
+      <rect width="188" height="486" rx="18" fill="#0c153e" stroke="#27366f"/>
+      <text x="22" y="38" fill="#ffffff" font-family="Arial, sans-serif" font-size="18" font-weight="700">Setup Flow</text>
+      <g fill="#dfe8ff" font-family="Arial, sans-serif" font-size="15">
+        <rect x="18" y="66" width="152" height="40" rx="10" fill="url(#accent)"/>
+        <text x="42" y="92" fill="#ffffff" font-weight="700">Camera Scan</text>
+        <text x="22" y="144">Cloud ID</text>
+        <text x="22" y="190">Credentials</text>
+        <text x="22" y="236">Recording Plan</text>
+        <text x="22" y="282">Mobile Access</text>
+        <text x="22" y="328">Alerts</text>
+      </g>
+      <rect x="22" y="392" width="144" height="62" rx="12" fill="#101b4e" stroke="#33447d"/>
+      <text x="44" y="418" fill="#28c9d9" font-family="Arial, sans-serif" font-size="15" font-weight="700">Status</text>
+      <text x="44" y="440" fill="#ffffff" font-family="Arial, sans-serif" font-size="13">Review required</text>
+    </g>
+
+    <g transform="translate(244 104)">
+      <text x="0" y="20" fill="#ffffff" font-family="Arial, sans-serif" font-size="28" font-weight="800">Camera Discovery</text>
+      <text x="0" y="48" fill="#b9c8ff" font-family="Arial, sans-serif" font-size="16">VMS software checks compatible cameras, credentials, and cloud access.</text>
+      <g transform="translate(0 80)">
+        <rect width="240" height="142" rx="18" fill="url(#panel)" stroke="#314179"/>
+        <rect x="18" y="18" width="204" height="82" rx="12" fill="#162563"/>
+        <circle cx="76" cy="59" r="26" fill="none" stroke="#28c9d9" stroke-width="8"/>
+        <rect x="120" y="38" width="58" height="42" rx="8" fill="#263782"/>
+        <text x="22" y="124" fill="#ffffff" font-family="Arial, sans-serif" font-size="16" font-weight="700">Camera 01</text>
+        <circle cx="208" cy="118" r="8" fill="#27d9a3"/>
+      </g>
+      <g transform="translate(270 80)">
+        <rect width="240" height="142" rx="18" fill="url(#panel)" stroke="#314179"/>
+        <rect x="18" y="18" width="204" height="82" rx="12" fill="#1a275b"/>
+        <path d="M48 80 L92 44 L128 68 L168 34 L202 84 Z" fill="#28c9d9" opacity="0.65"/>
+        <text x="22" y="124" fill="#ffffff" font-family="Arial, sans-serif" font-size="16" font-weight="700">Camera 02</text>
+        <circle cx="208" cy="118" r="8" fill="#27d9a3"/>
+      </g>
+      <g transform="translate(540 80)">
+        <rect width="240" height="142" rx="18" fill="url(#panel)" stroke="#314179"/>
+        <rect x="18" y="18" width="204" height="82" rx="12" fill="#132052"/>
+        <rect x="44" y="36" width="60" height="50" rx="8" fill="#e42b93" opacity="0.8"/>
+        <rect x="124" y="30" width="54" height="64" rx="8" fill="#28c9d9" opacity="0.75"/>
+        <text x="22" y="124" fill="#ffffff" font-family="Arial, sans-serif" font-size="16" font-weight="700">Camera 03</text>
+        <circle cx="208" cy="118" r="8" fill="#f7b955"/>
+      </g>
+
+      <g transform="translate(0 258)">
+        <rect width="780" height="178" rx="20" fill="#0d1642" stroke="#314179"/>
+        <text x="28" y="42" fill="#ffffff" font-family="Arial, sans-serif" font-size="22" font-weight="800">How the VMS software helps</text>
+        <g fill="#dfe8ff" font-family="Arial, sans-serif" font-size="16">
+          <circle cx="38" cy="80" r="6" fill="#28c9d9"/>
+          <text x="58" y="86">Receives the Cloud ID during account setup</text>
+          <circle cx="38" cy="118" r="6" fill="#28c9d9"/>
+          <text x="58" y="124">Attempts camera discovery on compatible networks</text>
+          <circle cx="38" cy="156" r="6" fill="#28c9d9"/>
+          <text x="58" y="162">Connects approved cameras to cloud recording and mobile access</text>
+        </g>
+        <g transform="translate(520 42)">
+          <rect width="220" height="100" rx="16" fill="rgba(228,43,147,0.12)" stroke="#e42b93"/>
+          <text x="24" y="36" fill="#ffffff" font-family="Arial, sans-serif" font-size="16" font-weight="700">Beta software</text>
+          <text x="24" y="62" fill="#f5d8eb" font-family="Arial, sans-serif" font-size="13">Provided directly by</text>
+          <text x="24" y="82" fill="#f5d8eb" font-family="Arial, sans-serif" font-size="13">ANYAICAM after review</text>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>
