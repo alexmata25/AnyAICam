@@ -48458,8 +48458,10 @@ from wireguard_remote import register_wireguard_remote_appliance_routes
 # branch (real Camera 2 hardware validation) and ported onto the
 # current dynamic camera-provisioning/encrypted-credential model; see
 # talk_audio_relay_client.py's and talk_down_discovery.py's own module
-# docstrings. Both workers are inert by default (ANYAICAM_TALK_AUDIO_
-# ENABLED / ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED default false).
+# docstrings. Both workers run by default on edge/combined runtimes
+# (2026-09-28/29: two-way audio is a standard capability); each has an
+# explicit opt-out: ANYAICAM_TALK_AUDIO_ENABLED=false /
+# ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED=false.
 import talk_down_discovery
 import talk_audio_relay_client
 from facial_recognition_ui import register_facial_recognition_routes

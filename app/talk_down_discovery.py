@@ -69,7 +69,11 @@ from xml.etree import ElementTree as ET
 logger = logging.getLogger("anyaicam.talk_down_discovery")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-TALK_DOWN_DISCOVERY_ENABLED = os.environ.get("ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED", "false").strip().lower() == "true"
+# On by default (2026-09-29): a customer who adds a talkback camera must get
+# Talk without enabling anything -- the Talk control is shown only for
+# cameras whose talkback was detected here. Read-only ONVIF probing on a
+# background cadence; ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED=false opts out.
+TALK_DOWN_DISCOVERY_ENABLED = os.environ.get("ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED", "true").strip().lower() != "false"
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 STATE_DIR_DEFAULT = "/var/lib/anyaicam"
 CREDENTIAL_FILE = os.environ.get("ANYAICAM_CREDENTIAL_FILE", f"{os.environ.get('ANYAICAM_STATE_DIR', STATE_DIR_DEFAULT)}/credential.json")
