@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<link href="/favicon.png" rel="icon" type="image/png"/>
+<title>ANY AI CAM | Cloud Adapter Options - Mini, Enterprise</title>
+<meta content="Compare Videoloft Cloud Adapter hardware: Mini (8ch), Enterprise (32/64ch), and Software Bridge. One-time purchase via ANY AI CAM." name="description"/>
+<meta content="Videoloft Cloud Adapter, cloud camera adapter, 8ch adapter, 32ch adapter, 64ch adapter, software bridge, virtual cloud adapter, ANY AI CAM hardware, ONVIF cloud bridge" name="keywords"/>
+<link href="https://anyaicam.com/adapters.html" rel="canonical"/>
+<meta content="website" property="og:type"/>
+<meta content="ANY AI CAM | Cloud Adapter Options - Mini, Enterprise" property="og:title"/>
+<meta content="Choose the right Videoloft Cloud Adapter: Mini, Enterprise, or Software Bridge for Windows. Hardware order via ANY AI CAM." property="og:description"/>
+<meta content="https://anyaicam.com/adapters.html" property="og:url"/>
+<meta content="https://anyaicam.com/Videoloft%20Cloud%20adapter.jpg" property="og:image"/>
+<meta content="Videoloft Cloud Adapter Mini and Enterprise side-by-side with NVR and cloud connection diagram" property="og:image:alt"/>
+<meta content="summary_large_image" name="twitter:card"/>
+<meta content="ANY AI CAM | Cloud Adapter Options - Mini, Enterprise &amp; Software Bridge" name="twitter:title"/>
+<meta content="Compare 8-channel, 32/64-channel Cloud Adapters and Software Bridge. Hardware purchased from ANY AI CAM. Cloud recording billed directly by Videoloft." name="twitter:description"/>
+<script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "ProductCollection",
+          "name": "Videoloft Cloud Adapter Options",
+          "description": "Hardware options for connecting existing camera systems to cloud recording via ANY AI CAM.",
+          "publisher": {
+            "@type": "Organization",
+            "name": "ANY AI CAM",
+            "url": "https://anyaicam.com"
+          },
+          "hasOfferCatalog": {
+            "@type": "OfferCatalog",
+            "name": "Cloud Adapter Products",
+            "itemListElement": [
+              {
+                "@type": "OfferCatalog",
+                "name": "Cloud Adapter Mini",
+                "itemListElement": [
+                  {
+                    "@type": "Product",
+                    "name": "Videoloft Cloud Adapter Mini",
+                    "sku": "VCA-MINI",
+                    "description": "8-channel hardware adapter for small NVR systems. 32GB onboard storage.",
+                    "offers": {
+                      "@type": "Offer",
+                      "price": "349.00",
+                      "priceCurrency": "USD",
+                      "availability": "https://schema.org/InStock",
+                      "seller": {
+                        "@type": "Organization",
+                        "name": "ANY AI CAM"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "@type": "OfferCatalog",
+                "name": "Cloud Adapter Enterprise",
+                "itemListElement": [
+                  {
+                    "@type": "Product",
+                    "name": "Videoloft Cloud Adapter Enterprise (32ch)",
+                    "sku": "VCA-ENT-32",
+                    "description": "32-channel enterprise-grade adapter with 1TB storage and dual network ports.",
+                    "offers": {
+                      "@type": "Offer",
+                      "price": "2149.00",
+                      "priceCurrency": "USD",
+                      "availability": "https://schema.org/InStock",
+                      "seller": {
+                        "@type": "Organization",
+                        "name": "ANY AI CAM"
+                      }
+                    }
+                  },
+                  {
+                    "@type": "Product",
+                    "name": "Videoloft Cloud Adapter Enterprise (64ch)",
+                    "sku": "VCA-ENT-64",
+                    "description": "64-channel enterprise-grade adapter with 1TB storage and dual network ports.",
+                    "offers": {
+                      "@type": "Offer",
+                      "price": "2689.00",
+                      "priceCurrency": "USD",
+                      "availability": "https://schema.org/InStock",
+                      "seller": {
+                        "@type": "Organization",
+                        "name": "ANY AI CAM"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+    </script>
+<link href="styles.css" rel="stylesheet"/>
+<style>
+        .adapter-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+
+        .adapter-card {
+            background: #fff;
+            border: 1px solid #e0e6ec;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.05);
+            text-align: center;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+            .adapter-card:hover {
+                transform: translateY(-4px);
+                box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+            }
+
+        .adapter-product-image {
+            width: 100%;
+            height: auto;
+            display: block;
+            padding: 1.5rem;
+            max-height: 220px;
+            object-fit: contain;
+            background: #f9fafb;
+        }
+
+        .adapter-product-image-wide {
+            max-height: 200px;
+            object-fit: contain;
+        }
+
+        .adapter-logo-image {
+            max-height: 100px;
+            padding: 1.5rem;
+            background: white;
+            object-fit: contain;
+            /* filter removed for new image */
+        }
+
+        .adapter-card h3 {
+            margin: 1.5rem 0 0.75rem;
+            color: #0b2b4f;
+            font-size: 1.4rem;
+        }
+
+        .adapter-price {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #1677c8;
+            margin: 0.75rem 0;
+        }
+
+        .pricing-note {
+            font-size: 0.85rem;
+            color: #666;
+            margin: 0 1rem 1.5rem;
+            padding: 0.5rem;
+            background: #f7f9fc;
+            border-left: 3px solid #0b2b4f;
+        }
+
+        .adapter-card ul {
+            text-align: left;
+            padding: 0 1.25rem 1.25rem;
+            margin: 0;
+            line-height: 1.6;
+        }
+
+            .adapter-card ul li {
+                margin-bottom: 0.5rem;
+                color: #333;
+            }
+
+        .beta-badge {
+            display: inline-block;
+            background: #ff6b35;
+            color: white;
+            font-size: 0.7rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 4px;
+            margin-left: 0.5rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .adapter-order-button {
+            display: block;
+            margin: 3rem auto;
+            padding: 1rem 2rem;
+            font-size: 1.1rem;
+        }
+
+        @media (max-width: 768px) {
+            .adapter-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .adapter-price {
+                font-size: 1.2rem;
+            }
+
+            .pricing-note {
+                font-size: 0.8rem;
+            }
+        }
+    
+
+        /* Mobile menu fix for pages using portal-header */
+        @media (max-width: 768px) {
+            .site-header,
+            .portal-header {
+                position: relative;
+                z-index: 1000;
+            }
+
+            .mobile-menu-toggle {
+                display: inline-flex !important;
+                align-items: center;
+                justify-content: center;
+                min-height: 42px;
+                padding: 0.65rem 1rem;
+                border: 1px solid rgba(255,255,255,0.35);
+                border-radius: 999px;
+                background: rgba(255,255,255,0.08);
+                color: #fff;
+                font-weight: 700;
+                cursor: pointer;
+                z-index: 1002;
+            }
+
+            .site-nav {
+                display: none !important;
+                position: absolute;
+                top: 100%;
+                left: 1rem;
+                right: 1rem;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0;
+                padding: 0.75rem;
+                background: #10172d;
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 14px;
+                box-shadow: 0 18px 40px rgba(0,0,0,0.35);
+                z-index: 1001;
+            }
+
+            .site-nav.active,
+            .site-nav.open,
+            .site-header.menu-open .site-nav,
+            .portal-header.menu-open .site-nav {
+                display: flex !important;
+            }
+
+            .site-nav a,
+            .site-nav .dropbtn {
+                width: 100%;
+                display: block;
+                padding: 0.85rem 1rem;
+                color: #fff !important;
+                text-decoration: none;
+                border-radius: 10px;
+            }
+
+            .site-nav a:hover,
+            .site-nav .dropbtn:hover {
+                background: rgba(255,255,255,0.08);
+            }
+
+            .site-nav .dropdown {
+                width: 100%;
+                position: static;
+            }
+
+            .site-nav .dropdown-content {
+                display: none;
+                position: static;
+                width: 100%;
+                min-width: 0;
+                margin: 0.2rem 0 0.4rem;
+                padding: 0.25rem 0 0.25rem 0.75rem;
+                background: rgba(255,255,255,0.06);
+                border-radius: 10px;
+                box-shadow: none;
+            }
+
+            .site-nav .dropdown.open .dropdown-content,
+            .site-nav .dropdown:focus-within .dropdown-content {
+                display: block;
+            }
+        }
+    </style>
+<style id="more-menu-link-visibility-fix">
+/* Keep the More dropdown readable on dark navigation backgrounds */
+.dropdown-content a,
+.site-nav .dropdown-content a {
+  color: #ffffff !important;
+  background: #071032 !important;
+  text-decoration: none !important;
+}
+
+.dropdown-content a:visited,
+.site-nav .dropdown-content a:visited {
+  color: #ffffff !important;
+}
+
+.dropdown-content a:hover,
+.dropdown-content a:focus,
+.site-nav .dropdown-content a:hover,
+.site-nav .dropdown-content a:focus {
+  color: #071032 !important;
+  background: #23c7d5 !important;
+}
+
+.dropbtn,
+.site-nav .dropbtn {
+  color: #ffffff !important;
+}
+</style><link rel="stylesheet" href="header-standard.css">
+</head>
+<body class="portal-page">
+
+<header class="site-header">
+<a aria-label="ANY AI CAM home" class="brand" href="index.html">
+<img alt="ANY AI CAM AI Cloud Protection" class="brand-logo" loading="lazy" src="full-logo-transparent.png"/>
+</a>
+<div class="header-controls">
+<button aria-controls="primaryNav" aria-expanded="false" class="mobile-menu-toggle" type="button">Menu</button>
+<div class="header-badges">
+<a class="live-support-badge" href="support.html">☎ Connect with Live Support</a>
+</div>
+</div>
+<nav aria-label="Primary navigation" class="site-nav" id="primaryNav">
+<a href="index.html">Home</a>
+<a href="how-it-works.html">How It Works</a>
+<a href="cloud-storage-pricing.html">Pricing</a>
+<a href="camera-compatibility-check.html">Camera Readiness</a>
+<a href="cameras.html">Cameras</a>
+<a href="adapters.html">Adapters</a>
+<a href="support.html">Support</a>
+<a href="contact.html">Contact</a>
+<a href="cloud-setup-wizard.html">Get Started</a>
+<div class="dropdown">
+<a class="dropbtn" href="#">More</a>
+<div class="dropdown-content">
+<a href="nvr.html">NVR Setup</a>
+<a href="software.html">Software</a>
+<a href="partner.html">Partner Login</a>
+</div>
+</div>
+</nav>
+</header>
+<main>
+<section class="portal-hero support-hero troubleshooting-hero">
+<div>
+<p class="eyebrow">Adapter Options</p>
+<h1>Videoloft Cloud Adapter Options</h1>
+<p>Choose the right hardware to bridge your existing NVR or camera system to the Videoloft cloud. Adapter hardware ordered through ANY AI CAM. Cloud recording billing handled by Videoloft directly.</p>
+</div>
+</section>
+<section class="path-section" id="activation-paths">
+<div class="section-heading">
+<p class="eyebrow">Customer Choice</p>
+<h2>Choose the activation path that fits your site.</h2>
+<p>The Videoloft Cloud Adapter hardware is handled exclusively by ANY AI CAM. Cloud recording is configured during your request and billed directly by Videoloft after activation.</p>
+</div>
+<div class="path-grid">
+<article class="path-card">
+<span class="path-number">1</span>
+<h3>Videoloft Cloud Adapter Path</h3>
+<p>The adapter path is for customers who prefer dedicated, always-on hardware without relying on a running computer. Orders include both adapter hardware and cloud setup in one request.</p>
+<ul>
+<li>Ideal for Mac users or environments without a dedicated Windows PC</li>
+<li>Ensures cloud recording continues even if a computer shuts down</li>
+<li>Perfect for setups requiring network bridge hardware (e.g., legacy NVRs, hybrid systems)</li>
+<li>Adapter selection based on your camera count and network layout</li>
+<li>Hardware purchased through ANY AI CAM; cloud billing begins after 30-day trial</li>
+<li>Final setup instructions sent after billing confirmation</li>
+</ul>
+</article>
+<article class="path-card">
+<span class="path-number">2</span>
+<h3>Software / Cloud Direct Path</h3>
+<p>For customers who already have a compatible NVR or PC that can run the cloud bridge software. No additional hardware purchase needed.</p>
+<ul>
+<li>Ideal for existing Windows-based NVR systems</li>
+<li>No hardware adapter required - uses your existing computer</li>
+<li>Camera connects directly to cloud via software bridge</li>
+<li>May require a dedicated PC or server running 24/7</li>
+<li>Recommended for IT-proficient users</li>
+</ul>
+</article>
+</div>
+</section>
+<section class="adapter-section" id="adapters">
+<div class="section-heading">
+<p class="eyebrow">Hardware and Software Options</p>
+<h2>Cloud adapter choices for compatible systems.</h2>
+<p>Choose your adapter hardware through ANY AI CAM. Your cloud recording plan is configured simultaneously - making order and activation seamless.</p>
+</div>
+<div class="adapter-grid">
+<article class="adapter-card">
+<img alt="Videoloft Cloud Adapter Mini - 8 Channel" class="adapter-product-image" src="videoloft adapter.jpg"/>
+<h3>Cloud Adapter Mini</h3>
+<p class="adapter-price">8-channel adapter <strong>$349</strong></p>
+<p class="pricing-note">Adapter hardware ordered through ANY AI CAM. Cloud recording billing managed directly by Videoloft after activation.</p>
+<ul>
+<li>Perfect for small systems up to 8 cameras</li>
+<li>32GB onboard storage for temporary buffering</li>
+<li>Plug-and-play</li>
+<li>Low power consumption - runs 24/7 unattended</li>
+<li>Compatible with nearly all ONVIF-compliant NVRs</li>
+</ul>
+<a class="button primary" href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+</article>
+<article class="adapter-card">
+<img alt="Cloud Adapter Enterprise - 32/64 Channel" class="adapter-product-image adapter-product-image-wide" src="cloud-adapter-enterprise.png"/>
+<h3>Cloud Adapter Enterprise</h3>
+<p class="adapter-price">From <strong>$2,149</strong> (32ch) · <strong>$2,689</strong> (64ch)</p>
+<p class="pricing-note">Adapter hardware ordered through ANY AI CAM. Cloud recording billing managed directly by Videoloft after activation.</p>
+<ul>
+<li>Supports 32 or 64 camera channels</li>
+<li>1TB onboard storage for seamless buffer and failover</li>
+<li>Dual Gigabit Ethernet ports for network redundancy</li>
+<li>Enhanced PoE+ support for enterprise-grade deployments</li>
+<li>Remote firmware updates and centralized management</li>
+<li>Dedicated support tier included</li>
+</ul>
+<a class="button primary" href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+</article>
+<article class="adapter-card">
+<img alt="ANY AI CAM Software Bridge" class="adapter-product-image" src="IconOnly_Transparent.png"/>
+<h3>Software Bridge / Virtual Adapter</h3>
+<p class="adapter-price"><strong>Free - No Hardware Needed</strong></p>
+<ul>
+<li>Software-based cloud bridge - no physical hardware needed</li>
+<li>Requires a dedicated PC or server running 24/7</li>
+<li>Available after cloud storage order is confirmed through the Setup Wizard</li>
+<li>Fully downloadable - setup link sent after order confirmation</li>
+<li>Designed for enterprise IT teams familiar with virtualized environments</li>
+<li>Our team helps install and configure the software remotely</li>
+</ul>
+<p style="padding: 1rem; background: #f0f7ff; border: 1px dashed #cce5ff; border-radius: 8px; margin-top: 1rem; font-size: 0.9rem;">
+<strong>Ready to use the Software Bridge?</strong> Use our <a href="cloud-setup-wizard.html" style="color: #1677c8;">Cloud Setup Wizard</a> to submit your order and select the software path.
+                    </p>
+<p style="margin-top: 0.75rem; text-align: center;">
+<a class="button primary" href="software.html" style="font-size:0.9rem; padding:0.6rem 1.5rem;">Learn About Software Bridge</a>
+</p>
+</article>
+</div>
+<p class="pricing-note" style="max-width: 800px; margin: 2.5rem auto; text-align: center;">
+                Customers can choose an adapter now and submit their cloud plan details in the same request. <strong>Adapter hardware is ordered through ANY AI CAM</strong> - your cloud storage subscription begins after activation with Videoloft, only after the 30-day trial period ends.
+            </p>
+<a class="button primary adapter-order-button" href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+</section>
+<section class="preorder-compatibility-banner" style="max-width:1100px; margin:2.5rem auto; padding:1.5rem; border:1px solid #d9e6f4; border-radius:8px; background:#f7fbff; text-align:center; box-shadow:0 12px 28px rgba(24,29,64,0.06);">
+<p class="eyebrow" style="margin-bottom:0.45rem;">Before You Order</p>
+<h2 style="margin:0 0 0.6rem; color:#071032;">Not sure if your cameras will work?</h2>
+<p style="max-width:680px; margin:0 auto 1rem; color:#4d5872;">Check whether your system uses compatible IP/network cameras first, then continue to the cloud setup wizard when it looks likely compatible.</p>
+<a class="button primary" href="/camera-compatibility-check.html">Check My Camera Compatibility</a>
+</section>
+</main>
+<footer class="site-footer" id="about">
+<div>
+<a aria-label="ANY AI CAM home" class="brand footer-brand" href="index.html#home">
+<img alt="ANY AI CAM AI Cloud Protection" class="brand-logo" loading="lazy" src="full-logo-transparent.png"/>
+</a>
+<p>Cloud camera activation and onboarding support for compatible existing camera systems.</p>
+<p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">© 2026 ANY AI CAM. All rights reserved.</p>
+</div>
+<div>
+<h3>Service</h3>
+<a href="how-it-works.html">How It Works</a>
+<a href="index.html#services">Cloud Account Setup</a>
+<a href="index.html#pricing">Pricing Calculator</a>
+<a href="camera-compatibility-check.html">Camera Readiness</a>
+<a href="/camera-compatibility-check.html">Camera Check</a>
+<a href="adapters.html">Adapter Options</a>
+<a href="cameras.html">Cameras</a>
+<a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+<a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+<a href="partner.html">Partner Login</a>
+<a href="support.html">Live Tech Support</a>
+</div>
+<div>
+<h3>Contact &amp; Policies</h3>
+<a href="contact.html">Contact Us</a>
+<a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a>
+<a href="tel:+18325108240">(832) 510-8240</a>
+<a href="privacy-policy.html">Privacy Policy</a>
+<a href="terms.html">Terms of Service</a>
+<a href="shipping-returns.html">Shipping &amp; Returns</a>
+<span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+</div>
+</footer>
+<script src="script.js"></script>
+<script id="mobile-menu-fix-script">
+        document.addEventListener('DOMContentLoaded', function () {
+            document.querySelectorAll('.mobile-menu-toggle').forEach(function (toggle) {
+                const navId = toggle.getAttribute('aria-controls');
+                const header = toggle.closest('.site-header') || document.querySelector('.site-header');
+                const nav = navId ? document.getElementById(navId) : (header ? header.querySelector('.site-nav') : document.querySelector('.site-nav'));
+
+                if (!nav || toggle.dataset.menuReady === 'true') return;
+                toggle.dataset.menuReady = 'true';
+
+                toggle.addEventListener('click', function (event) {
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    const isOpen = !nav.classList.contains('active');
+                    nav.classList.toggle('active', isOpen);
+                    nav.classList.toggle('open', isOpen);
+                    if (header) header.classList.toggle('menu-open', isOpen);
+                    toggle.setAttribute('aria-expanded', String(isOpen));
+                });
+            });
+
+            document.querySelectorAll('.site-nav .dropbtn').forEach(function (button) {
+                button.addEventListener('click', function (event) {
+                    if (window.innerWidth <= 768) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const dropdown = button.closest('.dropdown');
+                        if (dropdown) dropdown.classList.toggle('open');
+                    }
+                });
+            });
+
+            document.addEventListener('click', function (event) {
+                document.querySelectorAll('.site-header.menu-open, .portal-header.menu-open').forEach(function (header) {
+                    if (header.contains(event.target)) return;
+                    const nav = header.querySelector('.site-nav');
+                    const toggle = header.querySelector('.mobile-menu-toggle');
+                    if (nav) {
+                        nav.classList.remove('active', 'open');
+                        nav.querySelectorAll('.dropdown.open').forEach(function (dropdown) {
+                            dropdown.classList.remove('open');
+                        });
+                    }
+                    header.classList.remove('menu-open');
+                    if (toggle) toggle.setAttribute('aria-expanded', 'false');
+                });
+            });
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,284 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AAC Facial Recognition | AnyAiCam Face Access</title><meta name="description" content="AAC Facial Recognition / Face Access is a planned premium AnyAiCam module combining local face recognition, a higher-performance Edge appliance and supported access-control APIs for authorized door unlock workflows."><link rel="icon" href="favicon.png"><link rel="stylesheet" href="vms-product.css">
+<style id="aic-unified-sticky-footer-v1">
+/* AnyAiCam unified navigation/footer enhancement - public VMS pages */
+.stage-header{
+  position:sticky;
+  top:0;
+  z-index:1000;
+  box-shadow:0 12px 28px rgba(2,8,29,.20);
+}
+.site-header{
+  z-index:1000 !important;
+}
+.aic-footer-actions{
+  padding:2rem 1rem;
+  background:#f4f8fc;
+  border-top:1px solid #d9e4f2;
+}
+.aic-footer-actions-inner{
+  width:min(1120px,100%);
+  margin:0 auto;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:1.25rem;
+  flex-wrap:wrap;
+}
+.aic-footer-actions-copy h2{
+  margin:0 0 .35rem;
+  color:#071032;
+  font-size:clamp(1.35rem,3vw,1.9rem);
+}
+.aic-footer-actions-copy p{
+  margin:0;
+  color:#52627a;
+  line-height:1.6;
+}
+.aic-footer-actions-buttons{
+  display:flex;
+  gap:.65rem;
+  flex-wrap:wrap;
+}
+.aic-quick-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-height:44px;
+  padding:.72rem 1rem;
+  border-radius:999px;
+  text-decoration:none !important;
+  font-weight:850;
+  border:1px solid #0b2b4f;
+  background:#fff;
+  color:#0b2b4f !important;
+}
+.aic-quick-btn.primary{
+  border:0;
+  color:#fff !important;
+  background:linear-gradient(90deg,#cc3b96,#23c7d5);
+}
+.aic-unified-footer{
+  background:#071032;
+  color:#dce6ff;
+  padding:3rem 1rem 1.4rem;
+}
+.aic-unified-footer a{
+  color:#dce6ff;
+  text-decoration:none;
+}
+.aic-unified-footer a:hover,
+.aic-unified-footer a:focus-visible{
+  color:#68d7df;
+  text-decoration:underline;
+}
+.aic-footer-grid{
+  width:min(1180px,100%);
+  margin:0 auto;
+  display:grid;
+  grid-template-columns:1.35fr 1fr 1fr 1fr;
+  gap:2rem;
+}
+.aic-footer-brand img{
+  display:block;
+  width:min(210px,100%);
+  height:auto;
+  margin-bottom:1rem;
+}
+.aic-footer-brand p{
+  margin:.45rem 0;
+  color:#c8d5ee;
+  line-height:1.6;
+}
+.aic-unified-footer h3{
+  margin:.15rem 0 .8rem;
+  color:#fff;
+  font-size:1rem;
+}
+.aic-footer-links{
+  display:grid;
+  gap:.5rem;
+}
+.aic-footer-contact{
+  margin-top:1rem;
+  display:grid;
+  gap:.35rem;
+  font-size:.92rem;
+}
+.aic-footer-bottom{
+  width:min(1180px,100%);
+  margin:2rem auto 0;
+  padding-top:1rem;
+  border-top:1px solid rgba(255,255,255,.13);
+  display:flex;
+  justify-content:space-between;
+  gap:1rem;
+  flex-wrap:wrap;
+  color:#9fb0cf;
+  font-size:.86rem;
+}
+.aic-footer-policies{
+  display:flex;
+  gap:1rem;
+  flex-wrap:wrap;
+}
+@media(max-width:900px){
+  .aic-footer-grid{grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media(max-width:620px){
+  .aic-footer-grid{grid-template-columns:1fr;}
+  .aic-footer-actions-buttons{width:100%;display:grid;grid-template-columns:1fr;}
+  .aic-quick-btn{width:100%;}
+}
+</style>
+
+
+<style id="aic-product-visuals-r1">
+.aic-product-media{margin:0 0 1rem;border:1px solid #d9e4f2;border-radius:16px;overflow:hidden;background:#fff;box-shadow:0 12px 30px rgba(7,16,50,.08)}
+.aic-product-media img{display:block;width:100%;height:280px;object-fit:contain;background:#fff;padding:1rem;box-sizing:border-box}
+.aic-product-caption{padding:.75rem 1rem;border-top:1px solid #e4ebf5;color:#52627a;font-size:.82rem;line-height:1.45}
+.aic-trust-video{padding:3.5rem 1rem;background:#071032;color:#fff}
+.aic-trust-video .aic-trust-inner{width:min(1120px,100%);margin:0 auto;display:grid;grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr);gap:2rem;align-items:center}
+.aic-trust-video h2{margin:.35rem 0 .8rem;color:#fff;font-size:clamp(2rem,4vw,3rem)}
+.aic-trust-video p{color:#cbd8ef;line-height:1.7}
+.aic-video-frame{position:relative;width:100%;padding-top:56.25%;border-radius:18px;overflow:hidden;background:#02091f;box-shadow:0 22px 48px rgba(0,0,0,.28)}
+.aic-video-frame iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.aic-third-party-note{margin-top:.8rem;color:#9fb0cf!important;font-size:.84rem;line-height:1.5!important}
+.aic-home-access{padding:3.7rem 1rem;background:#fff;border-bottom:1px solid #d9e6f4}
+.aic-home-access-inner{width:min(1120px,100%);margin:0 auto}
+.aic-home-access-head{text-align:center;max-width:800px;margin:0 auto 1.8rem}
+.aic-home-access-head h2{margin:.35rem 0 .75rem;color:#071032;font-size:clamp(2rem,4vw,3rem)}
+.aic-home-access-head p{margin:0;color:#52627a;line-height:1.7;font-size:1.03rem}
+.aic-access-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1.2rem;margin-bottom:1.4rem}
+.aic-access-card{border:1px solid #d9e4f2;border-radius:18px;background:#f8fbff;overflow:hidden;box-shadow:0 14px 34px rgba(11,43,79,.08)}
+.aic-access-card img{display:block;width:100%;height:300px;object-fit:contain;background:#fff;padding:1rem;box-sizing:border-box}
+.aic-access-card-body{padding:1.25rem}
+.aic-access-card-body h3{margin:0 0 .45rem;color:#071032;font-size:1.3rem}
+.aic-access-card-body p{margin:0;color:#52627a;line-height:1.6}
+.aic-home-video{max-width:900px;margin:1.8rem auto 0}
+@media(max-width:820px){.aic-trust-video .aic-trust-inner{grid-template-columns:1fr}.aic-access-grid{grid-template-columns:1fr}.aic-product-media img,.aic-access-card img{height:auto;max-height:360px}}
+</style>
+
+<link rel="stylesheet" href="header-standard.css">
+
+<style id="aic-stage-nav-no-underline-final">
+header.stage-header nav.stage-nav a,
+header.stage-header nav.stage-nav a:link,
+header.stage-header nav.stage-nav a:visited,
+header.stage-header nav.stage-nav a:hover,
+header.stage-header nav.stage-nav a:active,
+header.stage-header nav.stage-nav a:focus {
+  text-decoration: none !important;
+  text-decoration-line: none !important;
+  border-bottom: 0 !important;
+}
+</style>
+
+</head><body>
+
+<header class="stage-header"><div class="stage-header-inner"><a href="index.html"><img src="full-logo-transparent.png" alt="ANY AI CAM"></a><nav class="stage-nav" aria-label="Primary"><a href="index.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Home</a><a href="vms.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">VMS</a><a href="vms-features.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Features</a><a href="edge-appliance.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Edge Appliance</a><a href="face-access.html" aria-current="page" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">AAC Face Access</a><a href="aac-features.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">AAC Features</a><a href="customer-setup.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Setup</a><a href="hardware.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Hardware</a><a href="build-your-system.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Build System</a><a href="sales-partner-login.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Sales Partners</a><a href="vms-support.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Support</a><a href="vms-contact.html" style="text-decoration:none!important;text-decoration-line:none!important;border-bottom:0!important">Contact</a></nav></div></header>
+<main>
+<section class="hero"><div class="wrap hero-grid"><div><div class="eyebrow">AAC Facial Recognition</div><h1>See the person. Check the policy. Unlock the right door.</h1><p>AAC Face Access is the planned AnyAiCam premium access module for entrance cameras. The AI Access Edge performs local face recognition, checks whether the enrolled person is authorized for that door and time, then requests an unlock through a supported access-control provider API. Standalone relay access is a separate local product path and is not the normal AAC Face Access appliance workflow.</p><div class="button-row"><a class="button primary" href="build-your-system.html">Configure an AI Access System</a><a class="button light" href="#how-it-works">See How It Works</a></div></div><aside class="camera-demo" aria-label="Example entrance camera card"><div class="camera-preview"><span class="status-chip">Face Access Active</span><span style="position:relative;z-index:1;font-weight:900">Front Entrance</span></div><div class="camera-meta"><div><strong style="display:block">Front Entrance</strong><span style="color:#b8c9e8;font-size:.88rem">Linked door: Main Lobby</span></div><button class="door-button" type="button" aria-label="Example door unlock control" title="Example authorized unlock control">🔓</button></div><p style="margin:.75rem 0 0;color:#cbd8ef;font-size:.88rem">The unlock icon is shown only on cameras linked to a door and only to users with the required access permission. This preview does not perform a real unlock.</p></aside></div></section>
+
+<section class="section white" id="how-it-works"><div class="wrap"><div class="eyebrow" style="color:#16778b">Local recognition + access policy</div><h2>One controlled path from camera to door</h2><p class="lead">The face match itself is only one part of the decision. AnyAiCam should also verify enrollment, confidence, liveness, door assignment, schedule and access policy before an unlock request is sent.</p><div class="face-flow"><div class="node">Entrance Camera</div><div class="arrow">→</div><div class="node">Face Detection + Liveness</div><div class="arrow">→</div><div class="node">Encrypted Face Template Match</div><div class="arrow">→</div><div class="node">Access Policy</div></div><div class="face-flow" style="margin-top:.55rem"><div class="node">Authorized Person</div><div class="arrow">→</div><div class="node">AnyAiCam Access Adapter</div><div class="arrow">→</div><div class="node">Supported Provider API</div><div class="arrow">→</div><div class="node">Door Unlock + Audit Log</div></div></div></section>
+
+
+<section class="aic-trust-video" aria-labelledby="face-access-demo-title">
+  <div class="aic-trust-inner">
+    <div>
+      <div class="eyebrow" style="color:#68d7df">INDUSTRY FACE-ACCESS DEMONSTRATION</div>
+      <h2 id="face-access-demo-title">See a person use facial recognition at an intercom.</h2>
+      <p>This third-party Akuvox intercom demonstration shows the customer experience AnyAiCam is designing toward: a person approaches the entrance, facial recognition verifies identity, and an authorized access workflow can release the door.</p>
+      <p class="aic-third-party-note"><strong>Example only:</strong> this video demonstrates an industry face-recognition intercom. It is not an AnyAiCam product demo and does not represent a validated AnyAiCam hardware integration.</p>
+    </div>
+    <div>
+      <div class="aic-video-frame">
+        <iframe src="https://www.youtube.com/embed/cFOttiff1fQ" title="Akuvox E16 face recognition access control and SIP intercom demonstration" loading="lazy" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
+      </div>
+    </div>
+  </div>
+</section>
+<section class="section"><div class="wrap"><div class="eyebrow" style="color:#16778b">Higher-end Edge appliance</div><h2>Integrated Face Access uses the higher-performance AI Access Edge</h2><p class="lead">The planned AI Access Edge tier provides additional processing headroom for local facial recognition and liveness checks while the appliance continues normal VMS, recording and camera workloads. This integrated path is intended for supported access-control provider APIs.</p><div class="grid"><article class="card"><span class="pill future">Required for Face Access</span><h3>AI Access Edge</h3><p>A higher-performance appliance tier selected in the system wizard when AAC Face Access is purchased.</p></article><article class="card"><span class="pill">Local-first</span><h3>Recognition on the appliance</h3><p>Entrance-camera frames can be evaluated locally so routine face matching does not depend on a public website or continuous cloud round trips.</p></article><article class="card"><span class="pill">Modular</span><h3>Licensed by site / door / camera</h3><p>Face Access should be an independent premium entitlement so only the entrances that need it consume the feature.</p></article></div></div></section>
+
+<section class="section white"><div class="wrap"><div class="eyebrow" style="color:#16778b">Access-control integration</div><h2>Connect to access-control platforms that expose a supported API</h2><p class="lead">AnyAiCam does not need to replace the customer's access-control platform. Instead, a provider adapter can translate an approved AnyAiCam unlock decision into that vendor's documented unlock-door API call. Platforms such as Brivo, Avigilon and other enterprise systems would only be offered after the specific API/integration is validated; brand names here are examples, not a compatibility claim.</p><div class="grid"><article class="card"><h3>Customer connects the provider</h3><p>An authorized administrator enters the provider/API credential in a protected AnyAiCam setup screen after purchase. The credential should never be embedded in public HTML, JavaScript or an activation code.</p></article><article class="card"><h3>AnyAiCam maps doors</h3><p>The administrator links a camera and an access-control door, for example <strong>Front Entrance Camera → Main Lobby Door</strong>.</p></article><article class="card"><h3>Adapter performs the unlock</h3><p>When policy passes, AnyAiCam calls the supported provider adapter with the minimum information required to unlock that specific door.</p></article></div><div class="api-note" style="margin-top:1.2rem">Camera → local face match → access policy → provider adapter → provider API → unlock door</div><div class="notice" style="margin-top:1.2rem"><strong>Provider support is integration-specific:</strong> API authentication methods, door identifiers, rate limits, cloud/local availability and certification requirements differ by access-control company. AnyAiCam should publish a tested provider compatibility list before production sales.</div></div></section>
+
+<section class="section"><div class="wrap"><div class="eyebrow" style="color:#16778b">Camera-card experience</div><h2>The door belongs on the camera card</h2><p class="lead">For an entrance camera linked to a door, the customer should not have to jump between unrelated screens. The camera card can surface door status and the actions the signed-in user is permitted to perform.</p><div class="grid"><article class="card"><h3>Unlock icon</h3><p>A door-unlock icon appears on the camera card only when that camera has a configured door relationship and the signed-in user has manual-unlock permission.</p></article><article class="card"><h3>Facial recognition state</h3><p>The card can show whether Face Access is active, paused or unavailable for that entrance without exposing biometric details.</p></article><article class="card"><h3>One audit trail</h3><p>Manual unlocks and recognition-based unlocks should record who/what triggered the action, which door was requested, the provider response and the timestamp.</p></article></div></div></section>
+
+<section class="section white"><div class="wrap"><div class="eyebrow" style="color:#16778b">Enrollment and privacy</div><h2>Recognition must be permissioned and fail secure</h2><div class="security-list"><div class="security-item"><strong>Consent-based enrollment</strong><span>Enroll only people the customer is authorized to enroll, with clear retention and removal controls.</span></div><div class="security-item"><strong>Encrypted templates</strong><span>Prefer encrypted face embeddings/templates over using raw face photos as the normal matching record.</span></div><div class="security-item"><strong>Liveness / anti-spoofing</strong><span>Use anti-spoofing controls appropriate to the deployment before granting automatic access.</span></div><div class="security-item"><strong>Confidence threshold</strong><span>A weak or ambiguous match must not unlock the door. It should remain locked and optionally request another verification method.</span></div><div class="security-item"><strong>Fail-secure behavior</strong><span>If recognition, policy evaluation, network connectivity or the provider API fails, the access request fails closed rather than assuming access is allowed.</span></div><div class="security-item"><strong>Least-privilege API credentials</strong><span>Use a provider credential restricted to only the doors/actions required for the site, with rotation and revocation support.</span></div></div></div></section>
+
+<section class="section"><div class="wrap"><div class="eyebrow" style="color:#16778b">Customer setup</div><h2>What the customer does after the AI Access Edge arrives</h2><div class="timeline"><div class="step"><strong>01</strong><h3>Connect</h3><p>Connect the AI Access Edge and discover/commission cameras.</p></div><div class="step"><strong>02</strong><h3>Connect access provider</h3><p>Authorize a supported access-control API integration.</p></div><div class="step"><strong>03</strong><h3>Map entrance</h3><p>Link the entrance camera to the correct provider door.</p></div><div class="step"><strong>04</strong><h3>Enroll people</h3><p>Create authorized face templates and access schedules.</p></div><div class="step"><strong>05</strong><h3>Commission</h3><p>Test liveness, policy, manual unlock and automatic recognition before enabling live use.</p></div></div></div></section>
+
+<section class="section white" id="standalone-access"><div class="wrap"><div class="eyebrow" style="color:#16778b">Two access-control paths</div><h2>Integrated AAC Face Access or separate standalone relay control</h2><div class="notice" style="margin-bottom:1.2rem"><strong>Do not mix the roles:</strong> the AI Access Edge is the integrated AAC Face Access appliance for supported provider APIs. The Numato three-channel relay is intended for standalone door/gate control and is not required by the AI Access Edge or either VMS Edge appliance.</div><div class="grid two"><article class="card"><div class="aic-product-media"><img src="aac-ai-access-edge.webp" alt="MINISFORUM mini PC candidate for AnyAiCam AI Access Edge" loading="lazy"><div class="aic-product-caption">Candidate hardware image — final AnyAiCam production appliance remains subject to validation.</div></div><span class="pill future">Integrated Face Access</span><h3>AnyAiCam AI Access Edge — AAC Face Access</h3><p>The dedicated AAC appliance runs the local face-detection/matching pipeline and access-policy decision, then talks to a validated access-control provider API. Final supported recognition-camera count will be based on AnyAiCam production benchmarks.</p></article><article class="card"><div class="aic-product-media"><img src="aac-standalone-relay.png" alt="Numato Lab three-channel Ethernet relay module candidate for standalone door control" loading="lazy"><div class="aic-product-caption">Standalone relay candidate — a separate local access-control path, not the VMS/AI Edge appliance.</div></div><span class="pill">Standalone access only</span><h3>Numato Lab 3 Channel Ethernet Relay Module</h3><p>A candidate local interface for standalone access-control designs that need dry-contact door/gate trigger outputs. It is not the normal accessory for the AI Access Edge and does not require either VMS Edge appliance. A compatible reader/intercom/controller and appropriate access-control power/lock hardware remain part of the standalone design.</p></article></div><div class="notice" style="margin-top:1rem"><strong>Door icon behavior:</strong> the 🔓 control appears only for a camera linked to a configured door and a user authorized to operate it. Face recognition uses the same door policy; a successful face match alone is never sufficient.</div></div></section><section class="cta"><div class="wrap"><div><h2>Plan a VMS that is ready for future Face Access.</h2><p>The system planner distinguishes the two VMS Edge appliances from the integrated AI Access Edge and keeps the standalone relay path separate.</p></div><div class="button-row"><a class="button primary" href="build-your-system.html">Open System Wizard</a><a class="button light" href="customer-setup.html">See Customer Setup</a></div></div></section>
+</main>
+<section class="aic-footer-actions" aria-label="Quick actions">
+  <div class="aic-footer-actions-inner">
+    <div class="aic-footer-actions-copy">
+      <h2>Ready for the next step?</h2>
+      <p>Go straight to system planning, VMS features, Face Access, or support without scrolling back to the top.</p>
+    </div>
+    <div class="aic-footer-actions-buttons">
+      <a class="aic-quick-btn primary" href="build-your-system.html">Start Setup Wizard</a>
+      <a class="aic-quick-btn" href="vms-features.html">Explore VMS Features</a>
+      <a class="aic-quick-btn" href="face-access.html">AAC Face Access</a>
+      <a class="aic-quick-btn" href="vms-support.html">Contact Support</a>
+    </div>
+  </div>
+</section>
+
+
+<footer class="aic-unified-footer" id="about">
+  <div class="aic-footer-grid">
+    <div class="aic-footer-brand">
+      <a href="index.html" aria-label="ANY AI CAM home"><img src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection"></a>
+      <p>Local-first video, optional hybrid cloud services, modular AI analytics, and AAC Face Access for compatible security systems.</p>
+      <div class="aic-footer-contact">
+        <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        <a href="tel:+13465544699">(346) 554-4699</a>
+        <a href="mailto:amata@anyaicam.com">amata@anyaicam.com</a>
+      </div>
+    </div>
+    <div>
+      <h3>AnyAiCam VMS</h3>
+      <div class="aic-footer-links">
+        <a href="vms.html">VMS Overview</a>
+        <a href="vms-features.html">VMS Features</a>
+        <a href="edge-appliance.html">Edge Appliance</a>
+        <a href="build-your-system.html">Build Your System</a>
+        <a href="customer-setup.html">Customer Setup</a>
+      </div>
+    </div>
+    <div>
+      <h3>AI Access & Hardware</h3>
+      <div class="aic-footer-links">
+        <a href="face-access.html">AAC Face Access</a>
+        <a href="aaco.html">AACO — AnyAiCam Operator</a>
+        <a href="visitor-call.html">AAC VC — Visitor Call</a>
+        <a href="secure-edge.html">AAC Secure Edge</a>
+        <a href="edge-appliance.html">AI Edge Appliance</a>
+        <a href="hardware.html">Hardware Selector</a>
+        <a href="analytics.html">Analytics Catalog</a>
+        <a href="/camera-compatibility-check.html">Camera Readiness</a>
+      </div>
+    </div>
+    <div>
+      <h3>Cloud, Account & Support</h3>
+      <div class="aic-footer-links">
+        <a href="/cloud-setup-wizard.html">Videoloft Cloud Setup</a>
+        <a href="signin.html">Account Dashboard</a>
+        <a href="sales-partner-login.html">Sales Partner Login</a>
+        <a href="vms-partner-apply.html">Become a VMS / AAC Sales Partner</a>
+        <a href="vms-support.html">Live Tech Support</a>
+        <a href="vms-contact.html">Contact Us</a>
+        <a href="plans.html">Plan Explainer</a>
+      </div>
+    </div>
+  </div>
+  <div class="aic-footer-bottom">
+    <span>© 2026 ANY AI CAM. All rights reserved.</span>
+    <div class="aic-footer-policies">
+      <a href="/privacy-policy.html">Privacy Policy</a>
+      <a href="/terms.html">Terms of Service</a>
+      <a href="/shipping-returns.html">Shipping &amp; Returns</a>
+    </div>
+  </div>
+</footer>
+</body></html>
