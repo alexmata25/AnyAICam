@@ -570,7 +570,7 @@ def register_partner_workspace_routes(app: FastAPI, shell: Callable) -> None:
             <div class="panel-head">
                 <div>
                     <h2>Your cameras</h2>
-                    <div class="health-detail">{configured_count} of {licensed_slots} camera{'s' if licensed_slots!=1 else ''} configured &middot; Live video is delivered through the AnyAiCam cloud relay.</div>
+                    <div class="health-detail">{configured_count} of {licensed_slots} camera{'s' if licensed_slots!=1 else ''} configured &middot; Live video streams securely from your AnyAiCam appliance.</div>
                 </div>
             </div>
             <div class="feature-grid">{camera_cards}</div>

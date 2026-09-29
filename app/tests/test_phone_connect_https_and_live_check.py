@@ -130,7 +130,7 @@ def test_camera_stream_check_no_longer_names_the_dead_static_hls_path(http_clien
     response = http_client.get("/phone-connect", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "<span>Camera stream</span><strong>/static/hls</strong>" not in html
-    assert "<span>Camera stream</span><strong>Live relay session</strong>" in html
+    assert "<span>Live video</span><strong>Streams securely</strong>" in html
 
 
 def test_other_connection_check_rows_are_unaffected(http_client, db_path, monkeypatch):
@@ -140,7 +140,7 @@ def test_other_connection_check_rows_are_unaffected(http_client, db_path, monkey
     _seeded(db_path)
     response = http_client.get("/phone-connect", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert "<span>Session cookie</span><strong>Secure</strong>" in html
+    assert "<span>Connection</span><strong>Encrypted</strong>" in html
     # Customer wording since 2026-09-25 (was "Needs VAPID keys").
-    assert "<span>Push server</span><strong>Not set up yet</strong>" in html
+    assert "<span>Phone alerts</span><strong>Not available yet</strong>" in html
     assert "VAPID" not in html and "Samsung laptop" not in html

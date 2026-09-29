@@ -230,7 +230,7 @@ def register_customer_platform_routes(
           <label style="display:grid;gap:7px;max-width:360px">Camera<select id="camera-select">{camera_options}</select></label>{no_cameras_notice}
         </section>
         <section class="panel" style="margin-top:16px">
-          <div class="panel-head"><div><h2>Camera name</h2><div class="health-detail">Give this camera a name your household or team will recognize, like "Front Door" or "Driveway Right." This changes the display name only -- the camera's stream, recording, and analytics are unaffected. Leave blank to use the default "Camera N" label.</div></div></div>
+          <div class="panel-head"><div><h2>Camera name</h2><div class="health-detail">Give this camera a name your household or team will recognize, like "Front Door" or "Driveway Right." This changes the display name only; the camera's video, recordings and analytics are not affected. Leave blank to use the default "Camera N" label.</div></div></div>
           <label style="display:grid;gap:7px;max-width:360px">Display name
             <input id="camera-name-input" type="text" maxlength="60" placeholder="Camera name">
           </label>

@@ -132375,7 +132375,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-        <h2>Connection checks</h2>
+        <h2>Your phone access</h2>
 
 
 
@@ -132393,7 +132393,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Login</span><strong>Existing secure login</strong></div>
+          <div class="phone-status-row"><span>Sign-in</span><strong>Uses your AnyAiCam account</strong></div>
 
 
 
@@ -132402,7 +132402,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Camera stream</span><strong>Live relay session</strong></div>
+          <div class="phone-status-row"><span>Live video</span><strong>Streams securely</strong></div>
 
 
 
@@ -132411,7 +132411,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Session cookie</span><strong>{'Secure' if SECURE_COOKIES else 'Local HTTP mode'}</strong></div>
+          <div class="phone-status-row"><span>Connection</span><strong>{'Encrypted' if SECURE_COOKIES else 'Home network only'}</strong></div>
 
 
 
@@ -132420,7 +132420,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Push server</span><strong>{'Ready' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Not set up yet'}</strong></div>
+          <div class="phone-status-row"><span>Phone alerts</span><strong>{'Available' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Not available yet'}</strong></div>
 
 
 
@@ -132429,7 +132429,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Public URL</span><strong>{'Configured' if PUBLIC_BASE_URL else 'Local/Tailscale only'}</strong></div>
+          <div class="phone-status-row"><span>Away from home</span><strong>{'Available' if PUBLIC_BASE_URL else 'Home network only'}</strong></div>
 
 
 
