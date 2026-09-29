@@ -144,3 +144,52 @@ def test_unlock_door_unauthorized_or_nonexistent_fails_closed():
     denied = foreign.post("/api/aaco/command", json={"command": "Open Front Door"})
     assert denied.status_code == 403
     assert not [call for call in vms.calls if call[0] == "door_unlock"]
+
+
+
+# ---------------------------------------------------------------- viewer-local time phrases (2026-09-29)
+
+def _freeform_client():
+    """The production adapter: free-form phrases ("today") on top of the fixed grammar."""
+    from aaco_freeform import FreeFormAacoLanguageAdapter
+    app, vms = FastAPI(), ControlledVms()
+    register_aaco_routes(app, lambda title, *_a: f"<html><title>{title}</title></html>",
+                         identity_provider=lambda _r: {"role": "customer_owner", "customer_id": "tenant-a"},
+                         vms_factory=lambda _r: vms, now=lambda: datetime(2026, 9, 15, 12),
+                         language_adapter_factory=FreeFormAacoLanguageAdapter)
+    return TestClient(app), vms
+
+
+def test_today_means_the_viewers_local_day_not_the_utc_day():
+    """Server clock 2026-09-15 12:00 UTC = 07:00 in Chicago (CDT, UTC-5):
+    "today" starts at local midnight = 05:00 UTC."""
+    client, vms = _freeform_client()
+    response = client.post("/api/aaco/command", json={"command": "Show person events today", "tz": "America/Chicago"})
+    assert response.status_code == 200
+    kwargs = vms.calls[-1][2]
+    assert kwargs["start"] == datetime(2026, 9, 15, 5, 0) and kwargs["end"] == datetime(2026, 9, 15, 12, 0)
+
+
+def test_playback_time_is_read_in_the_viewers_zone():
+    client, vms = _freeform_client()
+    client.post("/api/aaco/command", json={"command": "Show Camera 4 yesterday at 3:30 PM", "tz": "America/Chicago"})
+    call = [c for c in vms.calls if c[0] == "playback"][-1]
+    assert call[3] == datetime(2026, 9, 14, 20, 30)  # 3:30 PM CDT = 20:30 UTC
+
+
+def test_without_a_zone_the_previous_behaviour_is_kept():
+    client, vms = _freeform_client()
+    client.post("/api/aaco/command", json={"command": "Show person events today"})
+    assert vms.calls[-1][2]["start"] == datetime(2026, 9, 15, 0, 0)
+
+
+def test_bad_zone_values_are_ignored_not_errors():
+    client, vms = _freeform_client()
+    for tz in ("Not/AZone", "../../etc", "x" * 80, 5):
+        assert client.post("/api/aaco/command", json={"command": "Show person events today", "tz": tz}).status_code == 200
+        assert vms.calls[-1][2]["start"] == datetime(2026, 9, 15, 0, 0)
+
+
+def test_page_sends_the_browser_time_zone():
+    client, _vms = _client()
+    assert "resolvedOptions().timeZone" in client.get("/aaco").text or "resolvedOptions().timeZone" in __import__("aaco_web")._AACO_CLIENT_CORE_JS

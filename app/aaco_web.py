@@ -9,7 +9,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from aaco import Clarification, DeterministicLanguageAdapter, execute
+from aaco import AacoCommand, Clarification, DeterministicLanguageAdapter, execute
 
 CUSTOMER_ROLES = {"customer_owner", "customer_viewer"}
 MAX_COMMAND_LENGTH = 500
@@ -51,7 +51,7 @@ def _result_payload(result: object) -> dict[str, Any]:
 
 _AACO_CLIENT_CORE_JS = """
 window.aacoSubmitCommand=function(commandText,context,onSuccess,onError){
-return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:commandText,context:context||null})})
+return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:commandText,context:context||null,tz:(function(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||null}catch(e){return null}})()})})
 .then(function(response){return response.json().then(function(body){return {ok:response.ok,status:response.status,body:body}}).catch(function(){return {ok:false,status:response.status,body:{detail:'AACO returned an unreadable response.'}}})})
 .then(function(result){if(result.ok){onSuccess(result.body)}else{onError(result.body||{detail:'AACO could not complete that command.'})}})
 .catch(function(){onError({detail:'AACO could not reach the authorized VMS service.'})})
@@ -377,7 +377,7 @@ def _workspace() -> str:
 .aaco-mic-listening{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}@keyframes aaco-mic-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 </style>
 <main class="aaco-layout" aria-label="AACO operator workspace">
- <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO opens only the cameras, recordings and events your account can see, and never changes or deletes anything. Search shows metadata; it never creates a clip.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
+ <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO opens only the cameras, recordings and events your account can see, and never changes or deletes anything.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
  <section class="aaco-panel"><form id="aaco-command-form"><label class="eyebrow" for="aaco-command">Command</label><div class="aaco-command-row"><input id="aaco-command" name="command" maxlength="500" autocomplete="off" required placeholder="What would you like to see?"><button type="button" class="camera-tool aaco-mic-button" id="aaco-mic" title="Voice commands are not supported in this browser" aria-label="Voice commands are not supported in this browser" aria-pressed="false" disabled>🎤</button><button class="action-button">Run command</button></div></form><p id="aaco-status" class="aaco-muted" role="status" aria-live="polite">Ready. No historical media is loaded until you ask.</p><div id="aaco-conversation" class="aaco-conversation" aria-live="polite"><div class="aaco-turn operator"><p class="eyebrow">AACO</p>What would you like to see?</div></div><div id="aaco-context" class="aaco-context" hidden></div></section>
 </main>
 <script>%%AACO_CORE_JS%%
@@ -387,6 +387,50 @@ function friendlyTime(value){if(!value||!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/.test(val
 window.aacoAttachVoice(form,input,status,document.getElementById('aaco-mic'));document.querySelectorAll('.aaco-example').forEach(button=>button.addEventListener('click',()=>{input.value=button.textContent.trim();input.focus()}));form.addEventListener('submit',event=>{event.preventDefault();const command=input.value.trim();if(!command)return;turn('customer').append(node('div',command));status.textContent='Working with your authorized VMS…';conversation.classList.add('aaco-loading');window.aacoSubmitCommand(command,operatorContext,body=>{status.textContent=body.message||'Completed.';render(body);conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()},error=>{const box=turn('operator');box.append(node('div',error.detail||'AACO could not complete that command.'));status.textContent='Command was not completed.';conversation.classList.remove('aaco-loading');conversation.lastElementChild?.scrollIntoView({block:'nearest'});input.focus()})})})();
 </script>
 """.replace("%%AACO_CORE_JS%%", _AACO_CLIENT_CORE_JS)
+
+
+# Viewer-local time phrases (2026-09-29). Stored times (events, recordings)
+# and the server clock are UTC without an offset, so "today" or "at 3:15 PM"
+# used to mean the UTC day / 3:15 PM UTC: "play the driveway at 3:15 PM
+# yesterday" opened 10:15 AM for a viewer in Texas. The page now sends the
+# browser's IANA time zone; phrases are read in that zone and the resulting
+# window is converted back to UTC before the (unchanged) search. Requests
+# without a zone keep the previous behaviour.
+_TZ_NAME = re.compile(r"^[A-Za-z]+(?:/[A-Za-z0-9_+-]+){0,2}$")
+
+
+def _viewer_timezone(value):
+    if not isinstance(value, str) or len(value) > 64 or not _TZ_NAME.match(value):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(value)
+    except Exception:
+        return None
+
+
+def _local_now(utc_now: datetime, tz):
+    if tz is None:
+        return utc_now
+    from datetime import timezone
+    return utc_now.replace(tzinfo=timezone.utc).astimezone(tz).replace(tzinfo=None)
+
+
+def _phrase_times_to_utc(parsed, tz):
+    """Only commands whose window comes from the typed phrase (playback at a
+    time, event searches) are converted; navigation from an earlier result
+    keeps that result's exact UTC times."""
+    if tz is None or not isinstance(parsed, AacoCommand) or parsed.operation not in ("playback", "event_search"):
+        return parsed
+    import dataclasses
+    from datetime import timezone
+
+    def to_utc(value):
+        if value is None:
+            return None
+        return value.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+    return dataclasses.replace(parsed, start=to_utc(parsed.start), end=to_utc(parsed.end))
 
 
 def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identity_provider: Callable[[Request], dict | None], vms_factory: Callable[[Request], object], now: Callable[[], datetime] = datetime.now, language_adapter_factory: Callable[[], object] = DeterministicLanguageAdapter) -> None:
@@ -419,7 +463,7 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
             payload = await request.json()
         except Exception as error:
             raise HTTPException(status_code=400, detail="Command must be valid JSON.") from error
-        if not isinstance(payload, dict) or set(payload) - {"command", "context"}:
+        if not isinstance(payload, dict) or set(payload) - {"command", "context", "tz"}:
             raise HTTPException(status_code=400, detail="Malformed AACO command.")
         command_text = payload.get("command")
         if not isinstance(command_text, str) or not command_text.strip() or len(command_text) > MAX_COMMAND_LENGTH:
@@ -435,7 +479,9 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
                 context["camera_names"] = list(camera_names(identity))
             except Exception:
                 log.warning("aaco.camera_names_unavailable")
-        parsed = language_adapter.parse(command_text, now=now(), context=context)
+        viewer_tz = _viewer_timezone(payload.get("tz"))
+        parsed = language_adapter.parse(command_text, now=_local_now(now(), viewer_tz), context=context)
+        parsed = _phrase_times_to_utc(parsed, viewer_tz)
         if isinstance(parsed, Clarification):
             log.info("aaco.command_clarification")
             return {"kind": "clarification", "message": parsed.message}
