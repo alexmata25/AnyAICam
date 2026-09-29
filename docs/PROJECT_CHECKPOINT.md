@@ -4429,3 +4429,46 @@ The Front Door, Living Room and Bedroom cameras are the regression/physical vali
 - After reboot (no changes made): anyaicam-vms came back healthy by itself; P2P polling, live segments (all five cameras) and detection events resumed. Bedroom rediscovered by device identity at 192.168.0.145 (camera record holds only the ONVIF urn:uuid; MediaMTX source regenerated).
 - Staging a7eb8fe browser checks now passed: P2P live video + camera audio (PCMU, bytes flowing) on Front Door, Living Room, Driveway Left/Right, desktop and phone; Driveway Left/Right (no talkback) play video + audio with no Talk button. Bedroom's Profile_2 stream is H.265 with no audio track, so it plays through the relay (expected).
 - Still open: one email per visit needs a real Front Door visit (no Voice Call since the deploy).
+
+## 2026-09-29 overnight: Ryzen-release readiness, customer emails, website/portal launch pass
+
+Branch `fix/overnight-release-readiness-20260929`, merged as `c577910` after two full suites matched the baseline. The only other failure was one timing flake (`test_semaphore_releases_after_cancellation`), which passed 5/5 in isolation; clip code is untouched.
+
+**Staging deploy:** `c577910fa63589aa6c1c2cc1f7ff9dfcaa214981` is live (outside poll 132/132 HTTP 200). Rollback container: `portal-a7eb8fe-pre-c577910-20260929T051626Z-rollback`. Browser-validated on desktop and phone:
+- signed-out `/` goes to customer sign-in, with its new links;
+- registration shows Terms/Privacy and the password hint;
+- Dashboard: "1 needs attention" (only Bedroom, which is really offline); idle Event cameras read "Event · waiting for activity";
+- Voice Call settings shows each camera's speaker capability, and a save round-trip returned 200 (Front Door's current greeting and Medium, the default, re-saved, so nothing changed);
+- Smart Alerts shows the latest-500 note;
+- the new subscription copy is in place.
+
+The JS syntax test now uses `node --check`, and all generated customer pages pass (`5473c57`). No Ryzen, Samsung or production changes; no physical validation performed or claimed.
+
+**Pending Ryzen release (edge code committed, NOT installed):**
+- Talk channel: a camera added after the channel connected no longer fails with unknown_camera until a reconnect; the map is re-fetched once (`6461c95`).
+- Talkback discovery default-on (`ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED=false` opts out). It was off by default and only set by the Samsung deploy script, so a fresh customer install would never show Talk (`f554876`). The Ryzen has it set explicitly; its talk-audio flag is unset (off in its installed version).
+- Greeting-only volume Low/Medium/High (`2400a56`). The edge levels the greeting PCM before the shared relay: speech RMS -34/-28/-22 dBFS, -3 dBFS peak limit. The raw eSpeak greeting measured on the Ryzen is -18.9 dBFS speech / -3.1 peak, so the Medium default is 9.1 dB quieter. Talk, speaker/microphone settings and recordings are untouched. Cloud column, owner API, config sync and edge mirror are included; an older cloud means Medium.
+- Natural greeting voice: still needs the owner's choice (Kokoro-82M vs Piper samples); not implemented.
+- LPR precision (`a7cb05b`) and plate clip linkage (`8a65839`) reviewed: no camera, IP or customer hard-coding.
+
+**Cloud (ships with the next staging deploy):**
+- One email per visit, race fixed (`ccfe17f`). A held Person email could be released by an early thumbnail before the Voice Call existed (~7 s after detection). Entrance-camera detection emails now wait `ANYAICAM_VOICE_CALL_ENTRANCE_GRACE_SECONDS` (30).
+- Event-mode false "Recording problem: stopped" (`524c12b`, `b25602b`). An online Event-mode camera now reports recording "armed" and the Dashboard, Camera health and Sites pages show "Event · waiting for activity". The agent-side recording state stays a Ryzen item.
+- Settings → Visitor Voice Call page (`d01396c`): entrance cameras, greeting text, greeting volume. There was no customer UI before.
+- Alert emails (`b90fcb1`): clear subjects, distinct INTRUSION ALARM / Voice Call / problem styling, calm activity emails, branding, preview text; "Manage alert emails" now opens /settings/notifications.
+- Password reset email branded with a button (`69a7e2e`); purchase emails branded, with names sanitised (`f17eea9`); order-email policy links repaired (they 404'd) (`a88c3a2`).
+- Portal (`bd48d11`): cloud `/` goes to customer sign-in, not the appliance recovery page. Customer sign-in: Support link fixed, "Create an account" added, Terms/Privacy/Contact added. Registration: Terms/Privacy agreement, password hint, plain approval wording.
+
+**Found, not changed (needs the owner or physical work):**
+- Front Door (camera 5) motion detector has not fired since 00:41 UTC although its feed is live and the detector consumes ~1 fps; the walk-up produced no detection. Needs a watched walk-up (score sampling) before any threshold change.
+- Bedroom camera left the LAN at ~03:46 UTC ("No route to host" from the Ryzen; its MAC is absent from the LAN). The Dashboard "Offline" is correct.
+- Ryzen outage cause: IP conflict on 192.168.0.228 with MAC E8:25:87:02:DB:B0 (Shenzhen Chilink IoT). Needs a DHCP reservation / identification of that device.
+- Production website anyaicam.com (source not in this repo):
+  - plans.html and analytics.html show a staging footer ("Staging only: Stripe Test Mode, $1/year test pricing, and mock provisioning"), a "Test Pricing" link, a cart.html 404 and a missing staging-footer.css;
+  - the LiveChat widget throws "License expired" on 5 pages;
+  - JS errors on support.html, videoloft-partner.html and support-diagnostic.html;
+  - the dedicated policy pages are unpublished.
+- Staging storefront: its only link (logo → /staging/vms.html) is a 404.
+- Add-ons with no description/price before checkout (Talk Down, AI Essentials/Professional, Vehicle Intelligence, Cloud Overflow).
+- Invitation emails include temporary passwords in plain text.
+- Email times use one fixed display timezone (America/Chicago); correct and labelled, but not local for other regions. A per-customer timezone is a follow-up.
