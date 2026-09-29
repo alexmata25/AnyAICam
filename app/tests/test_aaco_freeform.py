@@ -332,7 +332,7 @@ def test_real_boundary_filters_by_the_named_camera_and_returns_the_latest(tmp_pa
         assert [e["timestamp"] for e in result["events"]] == ["2026-09-26T10:30:00", "2026-09-26T09:00:00"]  # cam-1 only
         latest = adapter.parse("who was the last person at the front entrance", now=NOW, context=context)
         result = execute(latest, identity=identity, vms=boundary)
-        assert result["message"] == "Latest authorized event." and [e["timestamp"] for e in result["events"]] == ["2026-09-26T10:30:00"]
+        assert result["message"] == "Latest event." and [e["timestamp"] for e in result["events"]] == ["2026-09-26T10:30:00"]
         everywhere = execute(adapter.parse("show me the latest event", now=NOW, context=context), identity=identity, vms=boundary)
         assert [e["timestamp"] for e in everywhere["events"]] == ["2026-09-26T10:30:00"]  # not cust-2's 10:45
         with pytest.raises(PermissionError):

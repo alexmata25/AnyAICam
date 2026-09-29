@@ -89,5 +89,5 @@ def test_unauthenticated_request_still_redirects_exactly_as_before(client):
 def test_standalone_aaco_workspace_still_reachable_and_unchanged(client):
     response = client.get("/aaco", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert "AACO loads VMS data only after a command" in response.text
+    assert "AACO opens only the cameras, recordings and events your account can see" in response.text
     assert "Show the front entrance" in response.text

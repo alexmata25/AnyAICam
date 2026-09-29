@@ -177,6 +177,7 @@ SECURITY_CONTROL_CSS = '''
 .sec-mode.active{background:#2dd4bf;color:#0b1220;border-color:#2dd4bf}
 .sec-mode[data-security-mode="disarmed"].active{background:#e5e7eb;border-color:#e5e7eb}
 .sec-mode:disabled{opacity:.55;cursor:not-allowed}
+.sec-field{box-sizing:border-box;min-height:40px;padding:8px 11px;border:1px solid rgba(170,196,207,.3);border-radius:9px;background:#111827;color:#fff;font:inherit;font-size:15px}
 .sec-cams{width:100%;border-collapse:collapse}.sec-cams td,.sec-cams th{padding:8px;border-bottom:1px solid #334155;text-align:left}
 </style>
 '''
@@ -217,7 +218,11 @@ def security_page_content(overview: dict) -> str:
         'data-security-control', f'data-security-control data-site-id="{html.escape(site["id"])}"', 1)
     changed = ''
     if overview.get('changed_at'):
-        changed = f'<div class="health-detail">Last changed {html.escape(str(overview["changed_at"])[:16].replace("T", " "))} by {html.escape(str(overview.get("changed_by") or ""))}</div>'
+        changed = (f'<div class="health-detail">Last changed <span data-utc-time="{html.escape(str(overview["changed_at"]))}">'
+                   f'{html.escape(str(overview["changed_at"])[:16].replace("T", " "))}</span> by {html.escape(str(overview.get("changed_by") or ""))}</div>'
+                   '<script>document.querySelectorAll("[data-utc-time]").forEach(function(el){var v=el.dataset.utcTime;'
+                   'var d=new Date(/[zZ]|[+-][0-9]{2}:?[0-9]{2}$/.test(v)?v:v+"Z");if(!isNaN(d))el.textContent=d.toLocaleString([],'
+                   '{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});});</script>')
     settings_html = ''
     if overview['can_change']:
         s = overview['settings']
@@ -235,12 +240,12 @@ def security_page_content(overview: dict) -> str:
           <table class="sec-cams"><thead><tr><th>Camera</th><th>Armed in Stay</th><th>Armed in Away</th></tr></thead><tbody>{rows}</tbody></table>
           <p><label><input type="checkbox" id="sec-sms"{" checked" if s.get("notify_sms") else ""}> Send an SMS for intrusion alarms (when SMS alerts are on for your account)</label></p>
           <p><label><input type="checkbox" id="sec-talkdown"{" checked" if s.get("talkdown_on_alarm") else ""}> Speak a warning through the camera speaker when an alarm fires</label></p>
-          <p><label>Warning message<br><input type="text" id="sec-talkdown-message" maxlength="300" style="width:100%" value="{html.escape(s.get("talkdown_message") or "")}"></label></p>
+          <p><label>Warning message<br><input type="text" id="sec-talkdown-message" class="sec-field" maxlength="300" style="width:100%" value="{html.escape(s.get("talkdown_message") or "")}"></label></p>
           <p><label><input type="checkbox" id="sec-siren" disabled> Sound a siren automatically when an alarm fires</label>
             <span class="health-detail">Coming soon: no siren is connected to AnyAiCam yet.</span></p>
           <p><label>Minimum time between alarms on the same line (seconds)
-            <input type="number" id="sec-cooldown" min="10" max="3600" value="{int(s.get("alarm_cooldown_seconds") or 60)}"></label></p>
-          <button type="button" class="primary-button" id="sec-save" data-site-id="{html.escape(site["id"])}">Save security settings</button>
+            <input type="number" id="sec-cooldown" class="sec-field" style="width:110px" min="10" max="3600" value="{int(s.get("alarm_cooldown_seconds") or 60)}"></label></p>
+          <button type="button" class="action-button" id="sec-save" data-site-id="{html.escape(site["id"])}">Save security settings</button>
           <span class="health-detail" id="sec-save-message"></span>
         </section>'''
     return SECURITY_CONTROL_CSS + f'''

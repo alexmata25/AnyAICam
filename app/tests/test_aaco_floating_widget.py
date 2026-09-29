@@ -180,7 +180,7 @@ def test_standalone_aaco_workspace_never_also_gets_a_second_floating_widget(clie
     customer never sees two AACO surfaces stacked on the same page."""
     response = client.get("/aaco", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert "AACO loads VMS data only after a command" in response.text
+    assert "AACO opens only the cameras, recordings and events your account can see" in response.text
     assert 'data-aaco-embed="aaco-float"' not in response.text
 
 

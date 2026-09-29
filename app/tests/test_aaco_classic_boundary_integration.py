@@ -133,7 +133,7 @@ def test_playback_reports_no_media_honestly_when_no_recording_exists(owner_seede
     now = datetime.now(timezone.utc)
     result = boundary.playback(_owner_identity(), "camera-1", now - timedelta(minutes=5), now)
     assert result["kind"] == "playback"
-    assert "currently unavailable" in result["message"]
+    assert "No recording is available" in result["message"]
     assert result["context"]["camera_id"] == "camera-1"
 
 
@@ -146,7 +146,7 @@ def test_playback_finds_existing_recording_metadata_near_the_requested_time(owne
     conn.commit()
     boundary = main._ClassicAacoBoundary(_request())
     result = boundary.playback(_owner_identity(), "camera-1", datetime(2026, 9, 16, 10, 2), datetime(2026, 9, 16, 10, 2))
-    assert "1 existing recording" in result["message"]
+    assert "Found 1 recording" in result["message"]
 
 
 def test_search_events_scopes_to_the_tenant_and_the_requested_window(owner_seeded):

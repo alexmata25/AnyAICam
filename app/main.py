@@ -155168,10 +155168,10 @@ class _ClassicAacoBoundary:
         recordings = _customer_recording_rows(camera["id"], limit=10, near=start.isoformat())
         timestamp = start.isoformat()
         message = (
-            f"Found {len(recordings)} existing recording metadata result(s) near {timestamp}. "
-            "Open Classic Playback to select authorized media."
+            f"Found {len(recordings)} recording{'s' if len(recordings) != 1 else ''} near that time. "
+            "Open the recording to play it."
             if recordings else
-            f"Playback media is currently unavailable near {timestamp}. Classic Playback remains the authorized destination when recordings are available."
+            "No recording is available near that time yet."
         )
         return {
             "kind": "playback",
@@ -155224,9 +155224,9 @@ class _ClassicAacoBoundary:
             if len(matches) >= cap:
                 break
         if limit == 1:
-            message = "Latest authorized event." if matches else "No authorized event matches that yet."
+            message = "Latest event." if matches else "No matching events yet."
         else:
-            message = f"{len(matches)} authorized event result(s)."
+            message = f"{len(matches)} event{'s' if len(matches) != 1 else ''} found."
         return {"kind": "events", "message": message, "events": matches, "context": matches[0]["context"] if matches else None}
 
     def previous_event(self, identity: dict, camera_id: str, before: datetime) -> dict:
@@ -155245,12 +155245,12 @@ class _ClassicAacoBoundary:
             if occurred < before:
                 prior.append((occurred, event))
         if not prior:
-            return {"kind": "events", "message": "No earlier authorized event is available for this camera.", "events": []}
+            return {"kind": "events", "message": "No earlier event for this camera.", "events": []}
         occurred, event = max(prior, key=lambda item: item[0])
         context = {"camera_id": camera_id, "event_at": occurred.isoformat()}
         return {
             "kind": "events",
-            "message": "Previous authorized event.",
+            "message": "Previous event.",
             "events": [{
                 "label": f'{event.get("camera_name") or "Camera"}: {str(event.get("event_type") or "event").replace("_", " ").title()}',
                 "timestamp": str(event.get("timestamp")),

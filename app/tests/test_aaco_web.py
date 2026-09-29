@@ -66,7 +66,7 @@ def test_page_is_shell_only_and_does_not_call_vms():
     client, vms = _client()
     response = client.get("/aaco")
     assert response.status_code == 200
-    assert "AACO loads VMS data only after a command" in response.text
+    assert "AACO opens only the cameras, recordings and events your account can see" in response.text
     assert "/api/aaco/command" in response.text
     assert "Show the front entrance" in response.text
     assert vms.calls == []
