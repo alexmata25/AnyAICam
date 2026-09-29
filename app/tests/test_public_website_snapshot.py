@@ -93,3 +93,55 @@ def test_website_customer_login_opens_the_customer_sign_in():
 
 def test_config_php_is_never_committed():
     assert "config.php" in _text(SITE / ".gitignore") and not (SITE / "config.php").exists()
+
+
+# ---------------------------------------------------------------- AAC product pages (2026-09-29)
+
+PRODUCT_PAGES = ["aac-features.html", "aaco.html", "visitor-call.html", "secure-edge.html"]
+
+
+@pytest.mark.parametrize("name", PRODUCT_PAGES)
+def test_product_page_exists_with_title_description_and_canonical(name):
+    html = _text(SITE / name)
+    assert re.search(r"<title>[^<]{10,}</title>", html)
+    assert re.search(r'<meta name="description" content="[^"]{40,}"', html)
+    assert f'<link rel="canonical" href="https://anyaicam.com/{name}"' in html
+    assert 'href="aac-features.html" aria-current="page"' in html  # nav shows where you are
+
+
+@pytest.mark.parametrize("name", PRODUCT_PAGES)
+def test_product_page_screenshots_exist_are_described_and_sized(name):
+    html = _text(SITE / name)
+    images = re.findall(r'<img src="(app-screens/[^"]+)" alt="([^"]*)" width="(\d+)" height="(\d+)"', html)
+    assert images, "each product page shows at least one real app screenshot"
+    for src, alt, width, height in images:
+        assert (SITE / src).exists(), src
+        assert len(alt) > 20 and int(width) > 0 and int(height) > 0
+
+
+def test_product_pages_are_reachable_from_nav_footer_vms_page_and_sitemap():
+    nav_pages = [p for p in PAGES if 'class="stage-nav"' in _text(p)]
+    assert nav_pages and all('href="aac-features.html"' in _text(p) for p in nav_pages)
+    footers = [p for p in PAGES if "<h3>AI Access" in _text(p)]
+    assert footers and all(all(f'href="{x}"' in _text(p) for x in ("aaco.html", "visitor-call.html", "secure-edge.html")) for p in footers)
+    vms = _text(SITE / "vms.html")
+    assert all(f'href="{x}"' in vms for x in ("aaco.html", "visitor-call.html", "secure-edge.html", "aac-features.html"))
+    sitemap = _text(SITE / "sitemap.xml")
+    assert all(f"https://anyaicam.com/{x}" in sitemap for x in PRODUCT_PAGES)
+
+
+@pytest.mark.parametrize("name", PRODUCT_PAGES)
+def test_product_pages_make_no_pricing_certification_or_monitoring_claims(name):
+    text = re.sub(r"<[^>]+>", " ", _text(SITE / name))
+    assert not re.search(r"\$\s?\d", text), "no prices on product pages"
+    assert not re.search(r"(?i)\b(certified|certification|UL[- ]listed|24/7 monitor|guarantee|warranty|police dispatch)\b", text)
+    assert "Available with AnyAiCam VMS" in text or "In final testing" in text or "Coming soon" in text
+
+
+def test_secure_edge_says_it_is_not_a_monitoring_service_and_never_calls_911():
+    text = _text(SITE / "secure-edge.html")
+    assert "does not call 911" in text and "not a professionally monitored alarm service" in text
+
+
+def test_screenshots_contain_no_staging_markers_in_file_names():
+    assert not [p.name for p in (SITE / "app-screens").iterdir() if re.search(r"(?i)stag|test|debug", p.name)]
