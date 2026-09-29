@@ -26,11 +26,14 @@ class World:
     containers hold the aliases (each request picks one, as Caddy's DNS
     lookup of the alias does), 503 when none do."""
 
-    def __init__(self, *, gate="CUTOVER_OK", candidate_healthy=True, public_broken_after_stop=0, caddy_reaches_candidate=True):
+    def __init__(self, *, gate="CUTOVER_OK", candidate_healthy=True, public_broken_after_stop=0, caddy_reaches_candidate=True,
+                 caddy_pinned=False, reload_ok=True):
         self.containers = {"portal-old": {"running": True, "attached": True, "aliases": True, "build": OLD}}
         self.events, self.gate, self.candidate_healthy = [], gate, candidate_healthy
         self.public_broken_after_stop = public_broken_after_stop  # seconds of 503 after the live container stops
         self.caddy_reaches_candidate = caddy_reaches_candidate
+        # Caddy's pooled connections all go to the live container until a reload.
+        self.caddy_pinned, self.reload_ok = caddy_pinned, reload_ok
         self.now, self.stopped_live_at, self.pick = 0.0, None, random.Random(7)
 
     # docker / scripts
@@ -46,6 +49,12 @@ class World:
             name = rest[rest.index("--name") + 1]
             self.containers[name] = {"running": True, "attached": True, "aliases": False, "build": NEW}
             self.events.append(("run", name))
+        elif verb == "exec" and "reload" in rest:
+            self.events.append(("caddy-reload", rest[0], "--force" in rest))
+            if self.reload_ok:
+                self.caddy_pinned = False
+                return 0, ""
+            return 1, "admin endpoint unreachable"
         elif verb == "exec":
             return (0, '{"status":"ok"}') if self.candidate_healthy else (1, "")
         elif verb == "network":
@@ -78,7 +87,7 @@ class World:
         if self.stopped_live_at is not None and self.now - self.stopped_live_at < self.public_broken_after_stop:
             return 503, ""
         serving = [b for n, b in self.containers.items() if b["running"] and b["aliases"]
-                   and (self.caddy_reaches_candidate or b["build"] != NEW)]
+                   and ((self.caddy_reaches_candidate and not self.caddy_pinned) or b["build"] != NEW)]
         if not serving:
             return 503, ""
         box = self.pick.choice(serving)
@@ -231,3 +240,29 @@ def test_public_proof_allows_for_a_small_share_of_traffic_reaching_the_candidate
     per endpoint at that rate."""
     job = cut.Cutover(live="l", candidate="c", image="i", build_id=NEW)
     assert job.public_timeout >= 180 and job.public_successes == 3
+
+
+def test_caddy_pinned_to_the_live_container_is_reloaded_then_the_cutover_completes():
+    """2026-09-29: under steady traffic Caddy's keep-alive connections all
+    stayed on the live container and not one request reached the candidate
+    in 180 s. A graceful reload (fresh connections) lets the proof pass."""
+    world = World(caddy_pinned=True)
+    assert _cutover(world).execute() == 0
+    reload_at = _index(world.events, ("caddy-reload", "anyaicam-staging-caddy", True))
+    assert _index(world.events, ("connect", "portal-new")) < reload_at < _index(world.events, ("stop", "portal-old", True))
+    assert world.containers["portal-new"]["running"]
+
+
+def test_no_caddy_reload_when_the_candidate_is_reached_on_its_own():
+    world = World()
+    assert _cutover(world).execute() == 0
+    assert not any(e[0] == "caddy-reload" for e in world.events)
+
+
+def test_failed_caddy_reload_still_aborts_safely_with_live_untouched():
+    world = World(caddy_pinned=True, reload_ok=False)
+    assert _cutover(world, public_timeout=60).execute() == 1
+    assert sum(e[0] == "caddy-reload" for e in world.events) == 1  # once, not a loop
+    live = world.containers["portal-old"]
+    assert live["running"] and live["aliases"]
+    assert not any(e[:2] == ("stop", "portal-old") for e in world.events)
