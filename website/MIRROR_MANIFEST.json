@@ -3,7 +3,7 @@
   "/": {
    "bytes": 61685,
    "last_modified": "Tue, 08 Sep 2026 03:59:16 GMT",
-   "sha256": "52052f57d454a2f0398848f7e213a1d82d77a6f499bd8b4f3b90ba578c4b48a8"
+   "sha256": "3b2e726c36a291b0cf4cd9ee1abd0ec0bda6dd091eee79e13d8a9010e6754620"
   },
   "/IconOnly_Transparent.png": {
    "bytes": 29020,
@@ -43,7 +43,7 @@
   "/adapters.html": {
    "bytes": 24631,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "166eb4206352411fadc971efd67b98cb3db97b1eecbe3b675b3a8e5f96801862"
+   "sha256": "1ef7367423a3dad0e23aec25a844cd48ebbefe106e11cc357d35e2929815eb21"
   },
   "/analytics.html": {
    "bytes": 4572,
@@ -53,17 +53,17 @@
   "/basket.html": {
    "bytes": 22466,
    "last_modified": "Tue, 08 Sep 2026 02:40:10 GMT",
-   "sha256": "9c687a89287f459b2b3393f2ba77b3889711f8a43775d249ac01e5e7d9ccc928"
+   "sha256": "830e1e9392de770214777da70d4bb7d048628f81ab83ec4b22a5f0f296c043cd"
   },
   "/build-your-system.html": {
    "bytes": 33296,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "623ffdc4c88b22c935e54e32ac2ffe12df5fd67565c066a0fc28964e60e848f1"
+   "sha256": "a3e1a7fdb79dea0a025844c2dd950daea5c76d5dbd3c751965e6c11fd1ca9048"
   },
   "/camera-compatibility-check.html": {
    "bytes": 26136,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "088672518065b4dbd5f8d67efc839c00f6a36f1e68d858f024e989797cb5dd89"
+   "sha256": "262d36ce02fb6588685ace5dc96dfc60e181b4931125f2bcc5cb867030af7eaf"
   },
   "/camera-compatibility-check.js": {
    "bytes": 4984,
@@ -78,7 +78,7 @@
   "/cameras.html": {
    "bytes": 64175,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "a3d2b93978bc1ba6050e5415157b29da1a24c174c4681e29ecba4b29a98a4eb2"
+   "sha256": "a49e7331fb9877dc5b9a18d47ed8895573f0d11f3b9c7997c01ff9eb190840e4"
   },
   "/cloud-adapter-enterprise.png": {
    "bytes": 750791,
@@ -88,17 +88,17 @@
   "/cloud-checkout.html": {
    "bytes": 36460,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "cad60c37c6f599e81c0a5191c513aab9cf63e0c004b17037255d008f1f666e4a"
+   "sha256": "917362d5161d416fd2dbfdee70a887fee250d4b21dfd93b7cf6f4725c6fb348c"
   },
   "/cloud-setup-wizard.html": {
    "bytes": 120494,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "18eef1a88de5846ac216541d7e2f290cd7574bc44270d9d6b9637052cebc0fb0"
+   "sha256": "7061b7b8b8c3121953f402bb9fe034ff4bcf6b2a6a933281328b06d2e9957011"
   },
   "/cloud-storage-pricing.html": {
    "bytes": 50694,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "669b1c586b48620cafc31a87ecb5f6f73c23f47ae617d17b6c4b9ee01c4d4907"
+   "sha256": "5b4c8fcd0118dac5e936f423b540c94ac9e07382f5a26357f59712d81698f425"
   },
   "/compatibility.html": {
    "bytes": 1079,
@@ -108,22 +108,22 @@
   "/contact.html": {
    "bytes": 8604,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "4b2bd67d280ea0d57e729a955acc0795f7c7e93fa017fe75f722f2f582ed72d5"
+   "sha256": "b23321e47b48986d81639d0c651a0d0c9922a4990c7e90d024f61d703435f0d3"
   },
   "/customer-setup.html": {
    "bytes": 15854,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "34c39b3ca633a371663293390ba87e2e6f04d2605a5040e2121b24c403b555d0"
+   "sha256": "9cec5aac44c23ef3d8a0e9c81b631d63ee006f1eed8ee57bbe9bc14ed21233b8"
   },
   "/edge-appliance.html": {
    "bytes": 18955,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "7af9d68cb1ac348acc52c11dad275b22c8d0fd958e267bad82f7823d9e5d67b2"
+   "sha256": "2c411b26f458104ae0bf2dda49533602952f821898d5967ff2b898dd9291b307"
   },
   "/face-access.html": {
    "bytes": 24460,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "3b82e890d3d6b73496f3c2fc1752c73b62285f7e75feee6fc06c795bfd7e0919"
+   "sha256": "e8b10ad7ab887e15214cb972f4a83234c473def1017753e683fdb8625dbd835a"
   },
   "/favicon.png": {
    "bytes": 976,
@@ -148,7 +148,7 @@
   "/hardware.html": {
    "bytes": 18576,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "493b07fa41c18e4e2e3333bbe3d64d72d2b8835062748b772e23f751b658f596"
+   "sha256": "41be31e7f30d707095f4263703285a1d80bcde8d73b149c1b2a59dfdbe23e960"
   },
   "/header-standard.css": {
    "bytes": 5235,
@@ -158,12 +158,12 @@
   "/how-it-works.html": {
    "bytes": 36458,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "9e9e3d5b3eb116d59fa4cb1b4d6eae777da3d2b578d2875fc9a8dda4fc8303f5"
+   "sha256": "abae5feb3bd2a756a0b2098a97ee003bec1fd0e287dbeee8c9836f368b62dcd4"
   },
   "/index.html": {
    "bytes": 61685,
    "last_modified": "Tue, 08 Sep 2026 03:59:16 GMT",
-   "sha256": "f771f61d947729dab9ae6c20881cdc5703fe1f0998a0ca5ca7d823c75bb382e4"
+   "sha256": "95c2170eaa54182f691d5f401baf3cf7641629c086961b8584759d3e85c6cbaf"
   },
   "/mokerlink-16-port-poe.jpg": {
    "bytes": 48297,
@@ -193,7 +193,7 @@
   "/nvr.html": {
    "bytes": 21852,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "76f72373a2ea14d009c19e29775f5b702dbe94ea805f67cfe9cb01745e7abd1f"
+   "sha256": "ef8833181719a53f910380cc109d4bbacfa4cb89e843c6e2de9d9230b3547e84"
   },
   "/partner-icon-180.png": {
    "bytes": 11442,
@@ -218,17 +218,17 @@
   "/pricing.html": {
    "bytes": 50683,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "e9edce00e856252bb86885353dfd393eb2c36b1be9839f52c584be5fb4fbf9c1"
+   "sha256": "42a0fed96d3719a39522aa0914d0d431fbd81bcecd533a638aa019762ba37cf8"
   },
   "/privacy-policy.html": {
    "bytes": 9713,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "f9ce9c8724d1be7d26999cd5c0229d06963254b2e1ce7f0de8b3239208e1d3aa"
+   "sha256": "c0699b00b74f0ccd49c70710875462ed536dbbe7a9403d9e4177e58d06cac7a6"
   },
   "/sales-partner-login.html": {
    "bytes": 8269,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "60e8c6813e59c03b946e10a4a8bd58508e4ba0d483b3b8b056eabaef6d17c8f2"
+   "sha256": "4ac43631816688660bf9f3e1d266227a67ce70701300b929447dda14fbf6b3e1"
   },
   "/script.js": {
    "bytes": 8108,
@@ -238,7 +238,7 @@
   "/shipping-returns.html": {
    "bytes": 9818,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "f6a01d6e0a95edb9f0753acde467ed64ffee754509afec1627c6a28aa362c240"
+   "sha256": "96a1c71cfd39e0b0047daefb7c2ef46c133d624c1a869a0c8b25e1aff6282d9c"
   },
   "/signin.html": {
    "bytes": 4067,
@@ -258,12 +258,12 @@
   "/software.html": {
    "bytes": 16358,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "e70c3baaa8ed6eb63a160091001dc8849d8869801952cb03539d60e8049cd7f8"
+   "sha256": "f62c7b9b854c976ef26922c33e2884f317f148be4c10cf1b1888c9f9089f2221"
   },
   "/starter-camera-trial.html": {
    "bytes": 17593,
    "last_modified": "Tue, 08 Sep 2026 03:12:52 GMT",
-   "sha256": "4f71d2105313dfc4013bab14eb0edeea152218b8c3f5a7a5a2714222257a7202"
+   "sha256": "05c272440db3670f586dc3b298e511d234719817e41df7283e178a9493a92497"
   },
   "/styles.css": {
    "bytes": 53109,
@@ -273,22 +273,22 @@
   "/support-diagnostic.html": {
    "bytes": 24265,
    "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
-   "sha256": "832e41ab29abdc5d4eaf9426a2da6aaf691396c1a0be929c1a093f1a868df68c"
+   "sha256": "d89706aa20e32790b7294b76ac94132c25f8f4efe0f143c128a97f00fa0e0dff"
   },
   "/support.html": {
    "bytes": 19806,
    "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
-   "sha256": "0d94f628d77c9bd3a72bafbb0cf8d21439b017234f892c6a7853d6dfcea53425"
+   "sha256": "4c9cc3fd329086640152ccd0a916d281c0caabef2c9a45218e05e057766fc971"
   },
   "/terms.html": {
    "bytes": 10095,
    "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
-   "sha256": "ee6f55d976d91cc39cede086ae718b4391a0950a3bb18d397744a9059ccd9fe7"
+   "sha256": "3136d8405442b1aed8b22c5a292ce3c373f5152444f02d1cfa4292f3051d4215"
   },
   "/troubleshooting.html": {
    "bytes": 13717,
    "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
-   "sha256": "e839bf70e193a6c6004ad3796bb550fa67fbf8499a19d888625ec73971ab953d"
+   "sha256": "7fa5a7b3bfb417feb703045a0e78bdaf36db15af0741bad9c9cbc2d9f9000318"
   },
   "/videoloft adapter.jpg": {
    "bytes": 8447,
@@ -318,7 +318,7 @@
   "/videoloft-partner.html": {
    "bytes": 76424,
    "last_modified": "Tue, 08 Sep 2026 03:12:54 GMT",
-   "sha256": "dcfe36b24d823b6dfc56d396e70174687725cdd6a7503ec82a9f0f4833b9dc65"
+   "sha256": "1d27845af3aa9e898d2fa75177a390d6fd57e457db4b87c8f1d743ee8d38605b"
   },
   "/vivotek-fd9380-hv-v2.png": {
    "bytes": 130858,
@@ -348,12 +348,12 @@
   "/vms-contact.html": {
    "bytes": 7359,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "faac4909a0c6c66397107918b8552d788f07d652d5a57c685abb322310d77f7a"
+   "sha256": "eda277afd054d5dafd9fb1ca41b7309c047364d8181522677f729ff038e83879"
   },
   "/vms-features.html": {
    "bytes": 14332,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "0a66e2b0b1c6b23a05ee3d17a9ee08096a2d392dc205e1530c386a57754f0e7c"
+   "sha256": "aa604a3b51a0bf2c373917199cdbd7d08051c15b6eba71c1e4dc1cd086fe2c25"
   },
   "/vms-footer.js": {
    "bytes": 1959,
@@ -368,17 +368,17 @@
   "/vms-partner-admin.html": {
    "bytes": 7567,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "b2e512d3da892890da3d1f6b1c930febe6129614acc2c7bf74e3badfa5514290"
+   "sha256": "f27eb233509b6e0cd79a6e788220abd53421262b49ab8063e687f0ee2d39f8ef"
   },
   "/vms-partner-apply.html": {
    "bytes": 6509,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "b85eae4618fa99277e34ea06edb2b12122a9a37a78676e5f162dc02160d47a60"
+   "sha256": "e1b91182831ce230507dc5fdb94547a8c6c9d0fa2f287dc5f29e56c6c6cec892"
   },
   "/vms-partner-sales.html": {
    "bytes": 8079,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "0b3f9e2ae69fb0f09aab5260797604759f1e866b7dfff5e51badbd2ac3da85d7"
+   "sha256": "9b6c0b369719aad502c8afe1f44f3cedd349db47b2501f6c66d46b3264996fd6"
   },
   "/vms-product.css": {
    "bytes": 7447,
@@ -388,15 +388,15 @@
   "/vms-support.html": {
    "bytes": 18468,
    "last_modified": "Tue, 08 Sep 2026 03:59:18 GMT",
-   "sha256": "77f187a639d16c254d303242d13d248601b4f92888c648c51ce256edfe3d1ba9"
+   "sha256": "be86657491ff98ae96a9097d043347906b1afa60751eeefcc22f552bda916b2f"
   },
   "/vms.html": {
    "bytes": 21318,
    "last_modified": "Wed, 09 Sep 2026 00:15:53 GMT",
-   "sha256": "dfb3cff85243d7b02b0d1476c14680956143ae5644012b4a2c6e06843731752d"
+   "sha256": "56dd1da18f446ddcccb71a5d8c2cc8f8018a5f4805590683fdf6386204b72059"
   }
  },
- "mirrored_at_utc": "2026-09-29T12:43:02Z",
+ "mirrored_at_utc": "2026-09-29T12:44:48Z",
  "missing_referenced": {
   "/${dataUrl}": 404,
   "/${product.image}": 404,
