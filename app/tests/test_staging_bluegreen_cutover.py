@@ -27,13 +27,14 @@ class World:
     lookup of the alias does), 503 when none do."""
 
     def __init__(self, *, gate="CUTOVER_OK", candidate_healthy=True, public_broken_after_stop=0, caddy_reaches_candidate=True,
-                 caddy_pinned=False, reload_ok=True):
+                 caddy_pinned=False):
         self.containers = {"portal-old": {"running": True, "attached": True, "aliases": True, "build": OLD}}
         self.events, self.gate, self.candidate_healthy = [], gate, candidate_healthy
         self.public_broken_after_stop = public_broken_after_stop  # seconds of 503 after the live container stops
         self.caddy_reaches_candidate = caddy_reaches_candidate
-        # Caddy's pooled connections all go to the live container until a reload.
-        self.caddy_pinned, self.reload_ok = caddy_pinned, reload_ok
+        # Cloudflare's long-lived connections keep Caddy's pooled upstream
+        # connections on the live container until that container closes them.
+        self.caddy_pinned = caddy_pinned
         self.now, self.stopped_live_at, self.pick = 0.0, None, random.Random(7)
 
     # docker / scripts
@@ -49,12 +50,13 @@ class World:
             name = rest[rest.index("--name") + 1]
             self.containers[name] = {"running": True, "attached": True, "aliases": False, "build": NEW}
             self.events.append(("run", name))
-        elif verb == "exec" and "reload" in rest:
-            self.events.append(("caddy-reload", rest[0], "--force" in rest))
-            if self.reload_ok:
-                self.caddy_pinned = False
-                return 0, ""
-            return 1, "admin endpoint unreachable"
+        elif verb == "exec" and "wget" in rest:
+            name = rest[-1].split("//")[1].split(":")[0]
+            self.events.append(("caddy-probe", rest[0], name, "Host: portal-staging.anyaicam.com" in rest))
+            box = self.containers.get(name)
+            if not (self.caddy_reaches_candidate and box and box["running"] and box["attached"]):
+                return 1, "wget: bad address"
+            return 0, json.dumps({"status": "ok", "build_id": box["build"]})
         elif verb == "exec":
             return (0, '{"status":"ok"}') if self.candidate_healthy else (1, "")
         elif verb == "network":
@@ -74,6 +76,7 @@ class World:
             self.containers[name]["running"] = verb == "start"
             if verb == "stop" and name == "portal-old":
                 self.stopped_live_at = self.now
+                self.caddy_pinned = False  # its connections close; Caddy redials the alias
             self.events.append((verb, name, self.containers[name]["attached"]))
         elif verb == "rename":
             if rest[0] not in self.containers:
@@ -242,27 +245,39 @@ def test_public_proof_allows_for_a_small_share_of_traffic_reaching_the_candidate
     assert job.public_timeout >= 180 and job.public_successes == 3
 
 
-def test_caddy_pinned_to_the_live_container_is_reloaded_then_the_cutover_completes():
-    """2026-09-29: under steady traffic Caddy's keep-alive connections all
-    stayed on the live container and not one request reached the candidate
-    in 180 s. A graceful reload (fresh connections) lets the proof pass."""
+def test_public_route_pinned_to_the_live_container_is_proven_from_inside_caddy_then_completes():
+    """2026-09-29: Cloudflare's long-lived connections kept Caddy's upstream
+    connections on the live container; zero requests reached the candidate
+    in 180 s (a caddy reload did not change that). The candidate is proven
+    from inside Caddy's container, and the public route after the stop."""
     world = World(caddy_pinned=True)
-    assert _cutover(world).execute() == 0
-    reload_at = _index(world.events, ("caddy-reload", "anyaicam-staging-caddy", True))
-    assert _index(world.events, ("connect", "portal-new")) < reload_at < _index(world.events, ("stop", "portal-old", True))
-    assert world.containers["portal-new"]["running"]
+    answers = []
+    job = _cutover(world)
+    job.http_get = lambda url: answers.append(world.http_get(url)) or answers[-1]
+    assert job.execute() == 0
+    probe = _index(world.events, ("caddy-probe", "anyaicam-staging-caddy", "portal-new", True))
+    assert _index(world.events, ("connect", "portal-new")) < probe < _index(world.events, ("stop", "portal-old", True))
+    assert {code for code, _ in answers} == {200}
+    assert json.loads(answers[-1][1])["build_id"] == NEW  # public route proven on the new build after the stop
 
 
-def test_no_caddy_reload_when_the_candidate_is_reached_on_its_own():
+def test_no_inside_probe_when_the_public_route_reaches_the_candidate():
     world = World()
     assert _cutover(world).execute() == 0
-    assert not any(e[0] == "caddy-reload" for e in world.events)
+    assert not any(e[0] == "caddy-probe" for e in world.events)
 
 
-def test_failed_caddy_reload_still_aborts_safely_with_live_untouched():
-    world = World(caddy_pinned=True, reload_ok=False)
+def test_pinned_and_unreachable_from_caddy_still_aborts_with_live_untouched():
+    world = World(caddy_pinned=True, caddy_reaches_candidate=False)
     assert _cutover(world, public_timeout=60).execute() == 1
-    assert sum(e[0] == "caddy-reload" for e in world.events) == 1  # once, not a loop
     live = world.containers["portal-old"]
     assert live["running"] and live["aliases"]
     assert not any(e[:2] == ("stop", "portal-old") for e in world.events)
+    assert not world.containers["portal-new-unreachable"]["running"]
+
+
+def test_inside_probe_rejects_a_wrong_build_non_json_or_failure():
+    job = _cutover(World())
+    for answer in ((0, json.dumps({"build_id": OLD})), (0, "<html>"), (1, "")):
+        job.run = lambda args, answer=answer: answer
+        assert job.caddy_reaches_candidate() is False

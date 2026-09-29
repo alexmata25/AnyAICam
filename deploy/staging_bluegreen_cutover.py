@@ -25,13 +25,18 @@ new one is proven through the real public route:
    the candidate's build id. Until that happens the live container keeps
    running; if it never happens the candidate is taken back out and the
    live container is left exactly as it was.
-   Caddy resolves the alias only when it dials, and under steady traffic its
-   pooled keep-alive connections to the live container never go idle, so it
-   may never dial the candidate (2026-09-29: zero requests reached it in
-   180 s and the cutover aborted). If the candidate is not seen within
-   `nudge_after` seconds, Caddy is gracefully reloaded (`caddy reload
-   --force`: same Caddyfile, fresh upstream connections; in-flight requests
-   finish on the old config), once, and the proof continues.
+   The public route can stay pinned to the live container: Cloudflare keeps
+   long-lived HTTP/2 connections to Caddy, and requests on them reuse
+   Caddy's pooled upstream connections, which only redial (resolving the
+   alias again) when the live container closes them. On 2026-09-29 zero
+   requests reached the candidate in 180 s, and a graceful `caddy reload`
+   did not help (the old server keeps those client connections with an
+   eternal grace period). So if the public route has not shown the
+   candidate within `pinned_after` seconds, the candidate is proven from
+   inside Caddy's container instead: /health and /version by container
+   name, with the public Host header, must return the candidate build. The
+   public route is then proven in step 6, after the stop has closed the
+   pinned connections, with the automatic rollback behind it.
 5. Only then stop the previous container WHILE IT IS STILL ATTACHED, so its
    connections close cleanly (Caddy's idle connections get a FIN instead of
    hanging), then detach it and keep it, stopped, as the rollback container.
@@ -86,14 +91,14 @@ class Cutover:
                  mounts: tuple[str, ...] = STAGING_MOUNTS,
                  candidate_timeout: float = 120, public_timeout: float = 180, public_successes: int = 3,
                  watch_seconds: float = 45, outage_grace: float = 70, poll: float = 2,
-                 caddy_container: str = "anyaicam-staging-caddy", nudge_after: float = 30,
+                 caddy_container: str = "anyaicam-staging-caddy", pinned_after: float = 30,
                  run=None, http_get=None, sleep=time.sleep, clock=time.monotonic, log=print):
         self.live, self.candidate, self.image, self.build_id = live, candidate, image, build_id
         self.public_url, self.host_header = public_url.rstrip("/"), host_header
         self.network, self.aliases, self.env_file, self.mounts = network, aliases, env_file, mounts
         self.candidate_timeout, self.public_timeout, self.public_successes = candidate_timeout, public_timeout, public_successes
         self.watch_seconds, self.outage_grace, self.poll = watch_seconds, outage_grace, poll
-        self.caddy_container, self.nudge_after = caddy_container, nudge_after
+        self.caddy_container, self.pinned_after = caddy_container, pinned_after
         self.run = run or self._run
         self.http_get = http_get or self._http_get
         self.sleep, self.clock, self.log = sleep, clock, log
@@ -170,15 +175,20 @@ class Cutover:
         self.docker("network", "disconnect", self.network, name, check=False)
         self.docker("rename", name, new_name)
 
-    def reload_caddy(self) -> bool:
-        """Graceful reload with the unchanged Caddyfile: Caddy builds fresh
-        upstream connections (resolving the alias again, now to both
-        containers) and lets in-flight requests finish on the old config."""
-        code, output = self.run(["docker", "exec", self.caddy_container, "caddy", "reload",
-                                 "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile",
-                                 "--address", "127.0.0.1:2019", "--force"])
-        self.log(f"caddy reload (fresh upstream connections): {'ok' if code == 0 else 'FAILED ' + output.strip()[:200]}")
-        return code == 0
+    def caddy_reaches_candidate(self) -> bool:
+        """/health and /version fetched from inside Caddy's container, by the
+        candidate's container name, with the public Host header: exit 0 and
+        the candidate build on both."""
+        for path in ("/health", "/version"):
+            code, output = self.run(["docker", "exec", self.caddy_container, "wget", "-q", "-O", "-", "-T", "5",
+                                     "--header", f"Host: {self.host_header}",
+                                     f"http://{self.candidate}:8000{path}"])
+            try:
+                if code != 0 or json.loads(output).get("build_id") != self.build_id:
+                    return False
+            except (ValueError, AttributeError):
+                return False
+        return True
 
     def abort(self, reason: str, suffix: str, *, attached: bool = False) -> int:
         self.log(f"CUTOVER_ABORTED: {reason} -- live container {self.live} left serving, untouched.")
@@ -217,15 +227,16 @@ class Cutover:
                 seen[path] += build == self.build_id
             return min(seen.values()) >= self.public_successes
 
-        proven = self.wait(public_serves_candidate, min(self.nudge_after, self.public_timeout))
-        if not proven:
-            self.log(f"candidate not reached through Caddy after {self.nudge_after:.0f}s -- reloading Caddy")
-            self.reload_caddy()
-            proven = self.wait(public_serves_candidate, max(self.public_timeout - self.nudge_after, 0))
-        if not proven:
+        if self.wait(public_serves_candidate, min(self.pinned_after, self.public_timeout)):
+            self.log(f"public /health and /version serve {self.build_id[:12]} through Caddy")
+        elif self.caddy_reaches_candidate():
+            self.log(f"public route still pinned to {self.live} after {self.pinned_after:.0f}s; candidate proven from "
+                     f"inside Caddy's container ({self.build_id[:12]}) -- public proof follows the stop")
+        elif self.wait(public_serves_candidate, max(self.public_timeout - self.pinned_after, 0)):
+            self.log(f"public /health and /version serve {self.build_id[:12]} through Caddy")
+        else:
             return self.abort(f"public route never served build {self.build_id[:12]} with /health and /version 200",
                               "unreachable", attached=True)
-        self.log(f"public /health and /version serve {self.build_id[:12]} through Caddy")
 
         # 5. retire the previous container, kept as the rollback
         self.retire(self.live, self.rollback_name)
