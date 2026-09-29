@@ -4472,3 +4472,69 @@ The JS syntax test now uses `node --check`, and all generated customer pages pas
 - Add-ons with no description/price before checkout (Talk Down, AI Essentials/Professional, Vehicle Intelligence, Cloud Overflow).
 - Invitation emails include temporary passwords in plain text.
 - Email times use one fixed display timezone (America/Chicago); correct and labelled, but not local for other regions. A per-customer timezone is a follow-up.
+
+## 2026-09-29 day: anyaicam.com brought under version control; website, portal and email launch fixes
+
+Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, price, Stripe or policy changes were made, and nothing was uploaded to the live website.
+
+**Where the live site lives.** anyaicam.com is served by Bluehost shared hosting behind Cloudflare (the response header `host-header` decodes to `shared.bluehost.com`). It is published by hand through cPanel or SFTP; there was no version-controlled source.
+- `website/` now holds a byte-exact read-only mirror (sha256 per file in `MIRROR_MANIFEST.json`; `.gitattributes -text`), then reviewable fixes.
+- Server-side files can't be mirrored over HTTP and must be downloaded from cPanel by the owner: `api.php`, `contact-submit.php`, `save-checkout-lead.php`, `stripe-checkout.php`, `submit-software-trial-wizard.php`, `support.php`, and `config.php`. `config.php` must never be committed; it is git-ignored.
+- `website/README.md` has the adoption steps.
+
+**Website fixes, ready in `website-publish/`** (upload list, sha256, post-upload checks, byte-exact rollback originals):
+- the staging footer ("Staging only: Stripe Test Mode, $1/year test pricing", Test Cart → 404, staging-footer.css 404) removed from plans/analytics/hardware via `vms-footer.js`;
+- the expired LiveChat snippet removed from 5 pages;
+- support-diagnostic.html: a syntax error meant the tool never ran; fixed;
+- partner sales calculator: showed no totals on load; fixed;
+- support.html: CAPTCHA script error stopped. The form has no working CAPTCHA; review it together with support.php.
+- website customer-login.html sent customers to the portal's /login recovery page; now /customer-login.html.
+
+**Regression tests:** `app/tests/test_public_website_snapshot.py`, 153 checks: no staging/test wording, local references exist, all JS passes `node --check`, no LiveChat snippet, login target correct, config.php never committed. They fail on the original snapshot and pass on the fixed one.
+
+**Portal:**
+- Phone access checks in plain language; "cloud relay" wording removed; camera-name help text tidied.
+- All email deep links verified signed in and signed out on staging.
+
+**Needs the owner:**
+1. `app.anyaicam.com`, the portal address the website links to, is served by the STAGING stack (`/version` reports environment "staging", same container as portal-staging). Signed-in customers see "STAGING ENVIRONMENT · Test data and services only", and payments run in Stripe test mode. A production portal environment has to be stood up before launch.
+2. Web push (VAPID) is not configured, so phone alerts show "Not available yet".
+3. Two phone numbers across the site: (346) 554-4699 on the VMS pages; (832) 510-8240 on the older cloud-adapter/Videoloft pages and on Privacy, Terms and Shipping & Returns. Decide which is current.
+4. The site mixes the current VMS product with the older Videoloft cloud-adapter line (adapters, cloud-storage-pricing, nvr, starter-camera-trial, videoloft-partner…). Decide what stays public.
+5. The Videoloft referral wizard redirects to referral-entry.html, which does not exist (404).
+6. The support form (support.php) has no working CAPTCHA.
+7. Upload `website-publish/` when ready, then purge the Cloudflare cache.
+8. Appliance-local user invitation email is still plain text (low priority).
+
+### Afternoon: real website source, AAC product pages, screenshots, AACO fixes
+
+**Website source of truth**
+- The owner's Bluehost `public_html` export was imported into `website/` (`040664b`, 197 files).
+- Kept out of git: 7 PHP files that contain credentials, 80 internal notes/logs/archives, and 12 non-site folders.
+- The Cloudflare-rewritten mirror was replaced; it must not be uploaded.
+- Launch fixes were re-applied to the source. 17 orphan, test and vendor-copy files are listed in `SERVER_CLEANUP.json`.
+
+**Security findings on the live host (owner action):**
+- `checkout-leads.txt`, `submissions-support.txt`, `email-log.txt` and the trial logs are publicly downloadable (HTTP 200) and contain names and email addresses.
+- `AnyAiCam_Login_and_Terminal_Reference.zip` is public. It holds emails, IP addresses, AWS instance references and SSH commands, but no passwords.
+- Suggested fix: an `.htaccess` rule denying .txt/.log/.md/.zip/.sql/.json/.csv/.bak/.py (robots.txt and security.txt excepted), plus moving the two archives out of public_html.
+- `support.php` has no CAPTCHA and no rate limit.
+- `api.php`, `activation.php` and `support.php` hard-code credentials; move them to config.
+
+**New pages** (`95ae8b6`): `aac-features.html`, `aaco.html`, `visitor-call.html`, `secure-edge.html`.
+- Built from the site's own template; claims follow the implemented code.
+- Status labels: Available / In final testing / Coming soon.
+- Seven real app screenshots in `website/app-screens/`, with staging chrome and account details removed.
+- "AAC Features" added to the nav on 20 pages and to the footer on 14; a new section on vms.html; sitemap updated.
+- 300 website regression tests.
+- Review page (private): https://claude.ai/artifact/8jDhKgh3yH9hEX9dUPavfv
+- Publish package: `website-publish/` (44 uploads, 17 removals, rollback originals). Not uploaded.
+
+**Portal fixes** on `fix/aaco-customer-copy-20260929`, not deployed because AWS login expired:
+- AACO result times shown in the viewer's local time, and plain wording ("12 events found", Open, Ask about this, Dashboard).
+- AACO time phrases now use the viewer's time zone. "at 3:15 PM yesterday" previously meant UTC, which opened the wrong recording.
+- Security page controls styled; "Last changed" shown in local time.
+
+**Blocked:**
+- The Ryzen is offline since ~05:50 CDT (Tailscale offline; no ping or SSH), so there are no Live, Playback or security-line screenshots yet.
+- The AWS login expired, so there is no staging deploy of the portal fixes (the AACO screenshot shows the committed UI, applied in the capture browser).
