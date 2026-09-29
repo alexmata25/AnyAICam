@@ -320,6 +320,9 @@ EVENT_TYPE_LABELS = {
     "people_counting": "People count", "people_counting_in": "Entry", "people_counting_out": "Exit",
     "facial_recognition": "Face", "aac_voice_call": "Voice call", "line_crossing": "Line crossing",
     "intrusion_alarm": "INTRUSION ALARM",
+    "camera_offline": "Camera offline", "appliance_offline": "AnyAiCam appliance offline",
+    "recording_stopped": "Recording stopped", "low_disk": "Storage almost full", "storage_problem": "Storage problem",
+    "high_cpu": "AnyAiCam appliance overloaded", "software_update": "Software update", "occupancy": "Occupancy",
 }
 
 

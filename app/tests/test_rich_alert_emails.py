@@ -40,7 +40,7 @@ def test_detection_email_has_camera_time_thumbnail_and_video_link(monkeypatch):
     import main
     monkeypatch.setattr(main, "_customer_event_playback_href", lambda cam, ts, ev, clip: f"/playback?camera={cam}&event={ev}&clip={int(clip)}")
     content = notification_email.build_alert_email(_context(), image=JPEG, base_url="https://portal.example", tz=CHICAGO)
-    assert content["subject"] == "Person detected · Front Door · Sun, Sep 27 at 1:57 PM CDT"
+    assert content["subject"] == "Person detected at Front Door · 1:57 PM"
     for part in ("Camera: Front Door", "Time: Sun, Sep 27 at 1:57 PM CDT", "View event video: https://portal.example/playback?camera=cam-1&event=ev-1&clip=1"):
         assert part in content["text"]
     assert 'src="cid:event-thumbnail"' in content["html"] and "https://portal.example/playback?camera=cam-1&amp;event=ev-1&amp;clip=1" in content["html"]
@@ -63,7 +63,7 @@ def test_problem_alerts_link_to_the_camera_and_never_to_the_admin_page():
     content = notification_email.build_alert_email(_context(event_type="storage_problem", event_id=None, camera_id=None, title="Storage"), base_url="https://p", tz=CHICAGO)
     assert "Open AnyAiCam: https://p/dashboard" in content["text"]
     assert "https://p/notifications" not in content["text"]
-    assert "Manage alert emails: https://p/customer-app-settings" in content["text"]
+    assert "Manage alert emails: https://p/settings/notifications" in content["text"]
 
 
 def test_camera_names_are_escaped_in_html():
@@ -199,3 +199,44 @@ def test_email_channel_sends_rich_content_and_falls_back_to_plain(monkeypatch):
     monkeypatch.setattr(notification_service, "_rich_alert_content", lambda n: None)
     notification_service.EmailChannel().send({"id": "n1", "title": "Person detected", "message": "m"}, "to@example.test")
     assert sent == [("Rich", True, [("event-thumbnail", JPEG)]), ("Person detected", False, None)]
+
+
+# ---------------------------------------------------------------- categories (2026-09-29)
+
+def test_intrusion_alarm_is_urgent_and_distinct():
+    content = notification_email.build_alert_email(_context(event_type="intrusion_alarm", title="INTRUSION ALARM", camera_id="yard",
+                                                            camera_name="Yard"), base_url="https://p", tz=CHICAGO)
+    assert content["subject"] == "INTRUSION ALARM at Yard · 1:57 PM"
+    assert ">INTRUSION ALARM</div>" in content["html"] and "#b42318" in content["html"] and 'href="tel:911"' in content["html"]
+
+
+def test_visitor_call_subject_asks_to_answer_now():
+    content = notification_email.build_alert_email(_context(event_type="aac_voice_call", event_id="call-1", title="Voice call",
+                                                            message="Someone is at Front Door."), base_url="https://p", tz=CHICAGO)
+    assert content["subject"] == "Someone is at Front Door — answer the call"
+    assert "Visitor at your door" in content["html"] and "911" not in content["html"]
+
+
+def test_problem_alerts_say_needs_attention_with_friendly_labels():
+    content = notification_email.build_alert_email(_context(event_type="camera_offline", event_id=None, title="Camera Offline"),
+                                                   base_url="https://p", tz=CHICAGO)
+    assert content["subject"] == "Camera offline: Front Door · 1:57 PM" and "Needs your attention" in content["html"]
+    storage = notification_email.build_alert_email(_context(event_type="storage_problem", event_id=None, camera_id=None, camera_name=None,
+                                                            title="Storage", message="Local recording storage is critically low."),
+                                                   base_url="https://p", tz=CHICAGO)
+    assert storage["subject"] == "Storage problem · 1:57 PM" and "critically low" in storage["text"]
+
+
+def test_ordinary_activity_never_looks_like_an_emergency():
+    for event_type in ("person", "motion", "smart_motion", "ppe", "vehicle", "lpr"):
+        content = notification_email.build_alert_email(_context(event_type=event_type), base_url="https://p", tz=CHICAGO)
+        html = content["html"]
+        assert "INTRUSION" not in html and "911" not in html and "Needs your attention" not in html and "#b42318" not in html
+        assert "INTRUSION" not in content["subject"].upper()
+
+
+def test_every_email_is_branded_and_has_a_preheader_and_settings_link():
+    content = notification_email.build_alert_email(_context(), base_url="https://p", tz=CHICAGO)
+    assert ">AnyAiCam</div>" in content["html"]
+    assert "display:none" in content["html"]  # preview text shown in the inbox list
+    assert 'href="https://p/settings/notifications"' in content["html"]
