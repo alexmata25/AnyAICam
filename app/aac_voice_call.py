@@ -998,7 +998,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         # client, so keying this line on it told every homeowner that
         # audio was "not enabled" even on a talk-capable camera.
         if (camera or {}).get("talk_down_supported") == 1:
-            audio_status = "Press and hold the microphone button under the video to speak through the camera's speaker."
+            audio_status = "Tap Answer to hear the visitor, then use the microphone button under the video to speak through the camera's speaker."
         else:
             audio_status = "This camera does not support two-way audio. You can still see and hear the visitor in the live view."
 
@@ -1050,18 +1050,47 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
 {'<p id="voice-call-unlock-status" class="health-detail"></p>' if show_unlock_button else ''}'''
         scripts = live_panel_scripts + f'''<script>
 const eventId={event_id!r};
+// Answer (2026-09-28): turn the live audio on inside this tap (a phone
+// only plays sound after a user gesture), record the answer, then ask for
+// the microphone once so Talk works without a second prompt.
 document.getElementById('voice-call-answer').addEventListener('click', async () => {{
+  const video = document.getElementById('live-view-video');
+  if (video) {{
+    video.muted = false;
+    try {{ video.play(); }} catch (e) {{}}
+    const muteButton = document.getElementById('live-view-mute');
+    if (muteButton) muteButton.textContent = '♫';
+  }}
   const response = await fetch(`/api/customer/aac/voice-call/events/${{eventId}}/answer`, {{method: 'POST'}});
   const data = await response.json();
   if (!response.ok) {{ showToast(data.detail || 'Could not answer this call.'); return; }}
   document.getElementById('voice-call-state').textContent = 'answered';
-  showToast('Call answered.');
+  let micMessage = '';
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {{
+    try {{
+      window.aacCallMicStream = await navigator.mediaDevices.getUserMedia({{audio: true}});
+      micMessage = ' Tap the microphone under the video to talk.';
+    }} catch (e) {{
+      micMessage = ' Microphone blocked: open this page in Safari or Chrome and allow the microphone to talk.';
+    }}
+  }} else {{
+    micMessage = ' This browser cannot use the microphone here: open the page in Safari or Chrome to talk.';
+  }}
+  showToast('Call answered.' + micMessage);
 }});
+function releaseCallMicrophone() {{
+  if (window.aacCallMicStream) {{
+    window.aacCallMicStream.getTracks().forEach(track => track.stop());
+    window.aacCallMicStream = null;
+  }}
+}}
+window.addEventListener('pagehide', releaseCallMicrophone);
 document.getElementById('voice-call-end').addEventListener('click', async () => {{
   const response = await fetch(`/api/customer/aac/voice-call/events/${{eventId}}/end`, {{method: 'POST'}});
   const data = await response.json();
   if (!response.ok) {{ showToast(data.detail || 'Could not end this call.'); return; }}
   document.getElementById('voice-call-state').textContent = 'ended';
+  releaseCallMicrophone();
   showToast('Call ended.');
 }});
 {'''const unlockButton=document.getElementById('voice-call-unlock');

@@ -150,7 +150,7 @@ def send_pending_media_emails(*, now: datetime | None = None) -> dict:
     normal retry path above. The email allowlist is re-checked, so a
     narrowed allowlist also covers already-held emails."""
     import notification_email
-    from notification_engine import email_alert_allowed
+    from notification_engine import email_alert_allowed, voice_call_supersedes_email
     now = now or datetime.now()
     sent = held = skipped = 0
     with connection() as db:
@@ -167,8 +167,20 @@ def send_pending_media_emails(*, now: datetime | None = None) -> dict:
             age = (now - datetime.fromisoformat(delivery["created_at"])).total_seconds()
         except (TypeError, ValueError):
             age = notification_email.MEDIA_WAIT_SECONDS
+        try:
+            held_since = datetime.fromisoformat(delivery["created_at"])
+        except (TypeError, ValueError):
+            held_since = now
+        with connection() as db:
+            superseded = voice_call_supersedes_email(
+                db, camera_id=context.get("camera_id"), event_type=str(context.get("event_type") or ""), at=held_since,
+            )
         if not email_alert_allowed(str(context.get("event_type") or "")):
             status, result = "skipped_allowlist", {"provider": "configured_email", "error": None}
+            skipped += 1
+        elif superseded:
+            # The same visit already produced an AAC Voice Call email.
+            status, result = "skipped_voice_call", {"provider": "configured_email", "error": None}
             skipped += 1
         elif notification_email.media_ready(context) or age >= notification_email.MEDIA_WAIT_SECONDS:
             try:

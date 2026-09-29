@@ -4368,3 +4368,43 @@ Ship as one controlled edge release: validate on the Ryzen first, then track Sam
 5. **End Call**, and the Voice Call card in Smart Alerts after a completed call, were not yet physically confirmed. Retest after fixes 1 and 2.
 
 **Staging note:** the 15-minute normal email cooldown (golden `29551b6`, which also keeps Voice Call on its own 5-minute cooldown; intrusion alarms exempt) is committed but **not yet deployed**. `ANYAICAM_NOTIFICATION_CHANNEL_COOLDOWN_SECONDS=900` is already in the staging env file (with a backup) and takes effect only on the next staging deploy.
+
+## Two-way audio as a universal product capability: root causes confirmed and cloud fix (2026-09-28)
+
+**Requirement (owner):** a customer installs AnyAiCam, adds a compatible audio/talkback camera, the VMS recognises its capabilities, and live listening and two-way Talk work automatically. The design must be capability-driven:
+- no camera names, IPs or hardware special cases;
+- cameras without audio or talkback keep working normally, with no audio controls or errors;
+- no hidden environment variable to enable.
+
+The Front Door, Living Room and Bedroom cameras are the regression/physical validation devices, not the scope.
+
+**Root causes confirmed on the Front Door test.** The camera hardware is fine: the microphone is audible in recordings, and the speaker played the greeting.
+
+1. **Camera to phone live audio was silent.**
+   - The browser's P2P offer only requested video (`live_view_page.py`, P2P JS: `addTransceiver('video', ...)` only).
+   - The appliance's MediaMTX path already carries the camera audio (G.711 for the Front Door; H264 + G711 tracks).
+   - The HLS relay fallback has audio, but it is replaced once P2P connects.
+2. **Phone to camera Talk: two blockers.**
+   1. **Edge:** the appliance talk channel client (`talk_audio_relay_client_worker`, WebSocket `/api/appliance/talk/channel`) exits unless `ANYAICAM_TALK_AUDIO_ENABLED=true`, and the Ryzen does not set it. So the cloud never had a channel to deliver homeowner audio. The greeting works only because it plays locally.
+   2. **Browser:** every press ended before the audio WebSocket opened. The causes were the microphone being refused by the mail app's in-app browser, or the permission prompt cancelling press-and-hold.
+   - The cloud also reported Talk start as successful (200) with no channel. From the cloud, the fallback `_LocalIsapiTalkRelay` cannot reach a camera on the customer LAN.
+
+**Cloud/staging fix (this change, universal, no per-camera code):**
+- **Live audio:** the P2P offer requests audio (`recvonly`) as well as video, with `bundlePolicy: 'max-bundle'` so all ICE candidates belong to the first m-line (the appliance's trickle-ICE forwarder labels them `m=video`). Every arriving track is played from one MediaStream. A camera without audio simply has no audio track.
+- **Answer:** turns live audio on inside the tap, records the answer, and requests microphone permission once. The stream is reused (cloned) by Talk. End call and page exit release the microphone.
+- **Talk on phones** (coarse pointer): tap to start, tap again to stop. Desktop keeps press-and-hold.
+- **Clear microphone-blocked message:** "Open this page in Safari or Chrome and allow the microphone for this site."
+- **Talk controls appear only on cameras with detected talkback** (`talk_down_supported == 1`), on the grid, the single-camera page and the Voice Call screen. Unsupported or unverified cameras show no Talk control. The cloud still refuses Talk (409) for them.
+- **Cloud Talk start** returns **503 "Camera talk channel offline…"** when the camera's appliance talk channel is not connected, instead of reporting success.
+- **Edge code default:** the appliance talk channel is **on by default** (`ANYAICAM_TALK_AUDIO_ENABLED=false` is an explicit opt-out), so a new installation needs no hidden variable. Audio is still only delivered for a customer Talk session on a talkback-capable camera.
+- **One notification per visit:** ordinary Person/Smart-Motion/Motion/PPE emails for a camera are skipped (`skipped_voice_call`) when an AAC Voice Call exists for that camera within ±120 s. This applies both at send time for media-held emails and immediately. Smart Alerts still lists them.
+
+**Pending Ryzen step (needs separate owner approval; not done):**
+- The Ryzen's installed release predates the default-on talk channel. Either set `ANYAICAM_TALK_AUDIO_ENABLED=true` in the Ryzen app environment and restart the app, or install the next release containing this default.
+- Then confirm the appliance talk channel shows as connected before the physical two-way-audio test.
+- Samsung is tracked separately.
+
+**Still to build for the universal goal** (next steps, not in this change):
+- record camera **audio-input (microphone) capability** during discovery alongside talkback (today only talkback, `talk_down_supported`, is recorded);
+- hide the listen control on cameras without audio;
+- include audio-capability detection in installer and onboarding validation.

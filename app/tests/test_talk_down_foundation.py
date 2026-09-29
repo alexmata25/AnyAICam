@@ -408,7 +408,9 @@ def test_customer_live_cameras_capability_is_independent_per_camera(db_path):
     assert by_id["cam-3"]["enabled"] is False and by_id["cam-3"]["tooltip"] == "Talk-down capability not verified"
 
 
-def test_grid_page_renders_disabled_mic_for_unsupported_camera(customer_client, db_path):
+def test_grid_page_shows_no_talk_control_for_unsupported_camera(customer_client, db_path):
+    """Universal capability rule (2026-09-28): Talk appears only on cameras
+    whose talkback capability was detected -- never as a dead control."""
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed_tenant(db)
@@ -416,9 +418,8 @@ def test_grid_page_renders_disabled_mic_for_unsupported_camera(customer_client, 
 
     response = customer_client.get("/customer-live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert 'id="talk-mic-cam-1"' in response.text
-    assert "disabled" in response.text
-    assert "Talk-down not supported by this camera" in response.text
+    assert 'id="talk-mic-cam-1"' not in response.text
+    assert 'id="live-grid-video-cam-1"' in response.text  # the camera itself still works normally
 
 
 def test_grid_page_renders_enabled_mic_for_supported_camera(customer_client, db_path):
@@ -434,7 +435,7 @@ def test_grid_page_renders_enabled_mic_for_supported_camera(customer_client, db_
     assert "disabled" not in tile_fragment.split(">")[0] + tile_fragment.split(">")[1]
 
 
-def test_single_camera_page_renders_capability_state(customer_client, db_path):
+def test_single_camera_page_hides_talk_until_capability_is_verified(customer_client, db_path):
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:
             _seed_tenant(db)
@@ -442,8 +443,9 @@ def test_single_camera_page_renders_capability_state(customer_client, db_path):
 
     response = customer_client.get("/customer/cameras/cam-1/live", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert 'id="talk-mic-cam-1"' in response.text
-    assert "Talk-down capability not verified" in response.text
+    assert 'id="talk-mic-cam-1"' not in response.text
+    assert 'id="live-view-video"' in response.text
+    assert "if (talkButton) wireTalkMic(" in response.text
 
 
 # --------------------------------------------------------- talk-mic icon stays a mic, never becomes a speaker icon

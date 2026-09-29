@@ -49,13 +49,15 @@ except ImportError:
 logger = logging.getLogger("anyaicam.talk_audio_relay_client")
 
 RUNTIME_ROLE = os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower()
-# Deliberately its own flag, independent of ANYAICAM_TALK_DOWN_DISCOVERY_ENABLED:
-# discovery only ever reads capability, never touches a camera's audio
-# input at all. This flag gates something materially different -- an
-# appliance that will actually attempt to deliver real audio once a
-# customer presses a mic button -- so it gets its own explicit,
-# default-false opt-in rather than inheriting discovery's.
-TALK_AUDIO_ENABLED = os.environ.get("ANYAICAM_TALK_AUDIO_ENABLED", "false").strip().lower() == "true"
+# Two-way audio is a standard product capability (2026-09-28): an installed
+# appliance opens its talk channel by default, so a customer who adds a
+# talkback-capable camera can Talk without enabling anything by hand. Audio
+# is only ever delivered for a customer's own Talk session on a camera whose
+# talkback capability was detected (talk_down_supported == 1, checked in
+# the cloud before a session starts). ANYAICAM_TALK_AUDIO_ENABLED=false
+# remains an explicit opt-out. Separate from ANYAICAM_TALK_DOWN_DISCOVERY_
+# ENABLED, which only reads capability.
+TALK_AUDIO_ENABLED = os.environ.get("ANYAICAM_TALK_AUDIO_ENABLED", "true").strip().lower() != "false"
 CLOUD_URL = os.environ.get("ANYAICAM_CLOUD_URL", "").strip().rstrip("/")
 CREDENTIAL_FILE = os.environ.get("ANYAICAM_CREDENTIAL_FILE", f"{os.environ.get('ANYAICAM_STATE_DIR', '/var/lib/anyaicam')}/credential.json")
 RECONNECT_DELAY_SECONDS = max(1, int(os.environ.get("ANYAICAM_TALK_AUDIO_RECONNECT_SECONDS", "5")))
