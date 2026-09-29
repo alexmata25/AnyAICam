@@ -70,6 +70,8 @@ produces a real outcome for that event.
 """
 from __future__ import annotations
 
+import os
+
 import contextvars
 
 import stripe_mode
@@ -308,12 +310,16 @@ def _plan_cancelled_email(first_name: str, plan_label: str) -> tuple[str, str, s
 
 SUPPORT_EMAIL = "amata@anyaicam.com"
 SUPPORT_LINK = "https://anyaicam.com/support.html"
-# Staging draft URLs -- these pages are NOT published live yet (see
-# website-pricing-review/staging/policies/); update once the real,
-# reviewed policy pages are published.
-SHIPPING_POLICY_LINK = "https://anyaicam.com/shipping-policy.html"
-RETURN_REFUND_POLICY_LINK = "https://anyaicam.com/hardware-return-refund-policy.html"
-CANCELLATION_POLICY_LINK = "https://anyaicam.com/cancellation-policy.html"
+# The dedicated policy pages (shipping-policy / hardware-return-refund-
+# policy / cancellation-policy.html) were never published, so these links
+# returned 404 in real order emails (checked live 2026-09-29). The live
+# "Shipping, Returns & Refunds" page covers shipping, returns, refunds and
+# cancellations; each link can be pointed at a dedicated page once one is
+# published, without a code change.
+_LIVE_POLICY_PAGE = "https://anyaicam.com/shipping-returns.html"
+SHIPPING_POLICY_LINK = os.environ.get("ANYAICAM_SHIPPING_POLICY_URL", _LIVE_POLICY_PAGE)
+RETURN_REFUND_POLICY_LINK = os.environ.get("ANYAICAM_RETURN_REFUND_POLICY_URL", _LIVE_POLICY_PAGE)
+CANCELLATION_POLICY_LINK = os.environ.get("ANYAICAM_CANCELLATION_POLICY_URL", _LIVE_POLICY_PAGE)
 
 _SUPPORT_FOOTER_TEXT = f"Questions? Contact us at {SUPPORT_EMAIL} or visit {SUPPORT_LINK}.\n\n— The AnyAiCam Team"
 _SUPPORT_FOOTER_HTML = f'<p>Questions? Contact us at <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> or visit <a href="{SUPPORT_LINK}">{SUPPORT_LINK}</a>.</p><p>— The AnyAiCam Team</p>'
