@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Automated Camera Tech Support | ANY AI CAM</title>
+  <meta name="description" content="Use the ANY AI CAM automated diagnostic wizard to identify camera credentials, network discovery, NVR, Cloud Adapter, app, activation, and billing issues before contacting support.">
+  <meta name="robots" content="index,follow">
+  <link rel="canonical" href="https://anyaicam.com/support-diagnostic.html">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="styles.css">
+<style>
+    body{background:#eef4f8;color:#071032}
+    .diag-hero{padding:4.5rem 1rem 3rem;background:linear-gradient(135deg,#071032,#19364a);color:#fff;text-align:center}
+    .diag-hero h1{color:#fff;margin:.5rem auto 1rem;max-width:850px;font-size:clamp(2rem,5vw,3.4rem)}
+    .diag-hero p{max-width:760px;margin:auto;color:#d7e4ef;line-height:1.7}
+    .diag-shell{width:min(980px,calc(100% - 32px));margin:-1.5rem auto 4rem;background:#fff;border:1px solid #d7e3ee;border-radius:18px;box-shadow:0 20px 55px rgba(7,16,50,.14);overflow:hidden}
+    .diag-progress{height:8px;background:#e7edf3}
+    .diag-progress span{display:block;height:100%;width:14%;background:linear-gradient(90deg,#cc3b96,#5fc4d1);transition:.25s}
+    .diag-body{padding:clamp(1.25rem,4vw,2.5rem)}
+    .diag-step{display:none}
+    .diag-step.active{display:block}
+    .diag-step h2{color:#071032;margin:0 0 .5rem}
+    .diag-help{color:#5d6b7b;margin:0 0 1.5rem;line-height:1.6}
+    .choices{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1rem}
+    .choice{border:2px solid #d8e2ec;border-radius:13px;padding:1.1rem;background:#fff;text-align:left;cursor:pointer;color:#071032;font:inherit}
+    .choice:hover,.choice.selected{border-color:#5fc4d1;background:#f1fbfc;box-shadow:0 0 0 3px rgba(95,196,209,.12)}
+    .choice strong{display:block;margin-bottom:.35rem}
+    .choice span{color:#627083;font-size:.92rem;line-height:1.45}
+    .field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:1rem}
+    label{display:grid;gap:.4rem;font-weight:800;color:#071032}
+    input,select,textarea{width:100%;box-sizing:border-box;border:1px solid #c9d5e0;border-radius:9px;padding:.85rem;font:inherit;background:#fff;color:#071032}
+    textarea{min-height:110px;resize:vertical}
+    .diag-actions{display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap;margin-top:2rem}
+    .diag-actions button{border:0;border-radius:9px;padding:.85rem 1.35rem;font-weight:900;cursor:pointer}
+    .prev{background:#edf2f6;color:#071032}
+    .next{background:linear-gradient(90deg,#cc3b96,#5fc4d1);color:#fff;margin-left:auto}
+    .next:disabled{opacity:.45;cursor:not-allowed}
+    .result-card{border-left:6px solid #5fc4d1;background:#f5fbfc;padding:1.25rem;border-radius:10px;margin:1rem 0}
+    .result-card h3{margin:0 0 .5rem;color:#071032}
+    .result-card ul{line-height:1.7;color:#36475a}
+    .warning{border-left-color:#f59e0b;background:#fff8e8}
+    .danger{border-left-color:#d64545;background:#fff2f2}
+    .summary-box{white-space:pre-wrap;background:#071032;color:#eaf4ff;padding:1rem;border-radius:10px;font-family:ui-monospace,monospace;font-size:.9rem;line-height:1.55}
+    .result-buttons{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:1rem}
+    .result-buttons button,.result-buttons a{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:0;border-radius:9px;padding:.8rem 1.1rem;font-weight:900;cursor:pointer}
+    .primary-action{background:linear-gradient(90deg,#cc3b96,#5fc4d1);color:#fff}
+    .secondary-action{background:#eaf0f5;color:#071032}
+    .safety-note{margin-top:1.5rem;padding:1rem;border:1px solid #f0cf82;background:#fff8e5;border-radius:10px;color:#664b00}
+    @media(max-width:600px){.diag-body{padding:1.2rem}.diag-actions button{width:100%}.next{margin-left:0}}
+  </style>
+<link rel="stylesheet" href="header-standard.css">
+</head>
+<body>
+  
+  <header class="site-header">
+        <a class="brand" href="index.html" aria-label="ANY AI CAM home">
+            <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+        </a>
+
+        <div class="header-controls">
+            <button class="mobile-menu-toggle" type="button" aria-expanded="false" aria-controls="primaryNav">Menu</button>
+            <div class="header-badges">
+                <a class="live-support-badge" href="contact.html">&#9742; Contact Support</a>
+            </div>
+        </div>
+                <nav class="site-nav" id="primaryNav" aria-label="Primary navigation">
+            <a href="index.html">Home</a>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="cloud-storage-pricing.html">Pricing</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="adapters.html">Adapters</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="support.html">Support</a>
+            <a href="contact.html">Contact</a>
+            <a href="cloud-setup-wizard.html">Get Started</a>
+            <div class="dropdown">
+              <a href="#" class="dropbtn">More</a>
+              <div class="dropdown-content">
+                <a href="nvr.html">NVR Setup</a>
+                <a href="software.html">Software</a>
+                <a href="partner.html">Partner Login</a>
+              </div>
+            </div>
+        </nav>
+    </header>
+
+  <main>
+    <section class="diag-hero">
+      <p class="eyebrow">Automated Tech Support</p>
+      <h1>Let’s identify what is stopping your camera system.</h1>
+      <p>This guided check does not change camera settings. It identifies the likely problem, gives safe next steps, and prepares a clean summary that you can email to a support technician.</p>
+    </section>
+
+    <section class="diag-shell">
+      <div class="diag-progress"><span id="progressBar"></span></div>
+      <div class="diag-body">
+        <div class="diag-step active" data-step="1">
+          <h2>What are you having trouble with?</h2>
+          <p class="diag-help">Choose the closest match. You can explain more at the end.</p>
+          <div class="choices" data-key="issue">
+            <button class="choice" data-value="credentials"><strong>Username or password</strong><span>I do not know the camera or recorder administrator login.</span></button>
+            <button class="choice" data-value="discovery"><strong>Cameras are not found</strong><span>The app, adapter, or scanner cannot discover cameras.</span></button>
+            <button class="choice" data-value="adapter"><strong>Cloud Adapter offline</strong><span>The adapter is powered but does not appear connected.</span></button>
+            <button class="choice" data-value="app"><strong>App or Cloud ID problem</strong><span>CCTV Connect login, Cloud ID, live view, or playback issue.</span></button>
+            <button class="choice" data-value="activation"><strong>Activation or billing</strong><span>Trial, subscription, payment, order, or activation status.</span></button>
+            <button class="choice" data-value="other"><strong>Something else</strong><span>I need help identifying the problem.</span></button>
+          </div>
+        </div>
+
+        <div class="diag-step" data-step="2">
+          <h2>What kind of system do you have?</h2>
+          <p class="diag-help">This helps separate IP/network systems from analog/coax systems.</p>
+          <div class="choices" data-key="system">
+            <button class="choice" data-value="ip-camera"><strong>IP cameras without an NVR</strong><span>Cameras connect to a network switch or router.</span></button>
+            <button class="choice" data-value="ip-nvr"><strong>IP cameras with an NVR</strong><span>Network cameras record to an NVR.</span></button>
+            <button class="choice" data-value="analog-dvr"><strong>Coax/analog cameras with a DVR</strong><span>BNC/coax camera cables connect to a DVR.</span></button>
+            <button class="choice" data-value="mixed"><strong>Mixed or hybrid system</strong><span>A combination of IP and analog equipment.</span></button>
+            <button class="choice" data-value="unknown"><strong>I am not sure</strong><span>The wizard will flag this for equipment identification.</span></button>
+          </div>
+        </div>
+
+        <div class="diag-step" data-step="3">
+          <h2>Do you have administrator credentials?</h2>
+          <p class="diag-help">Videoloft generally needs the administrator username and password once during connection.</p>
+          <div class="choices" data-key="credentials">
+            <button class="choice" data-value="yes"><strong>Yes</strong><span>I know the administrator username and password.</span></button>
+            <button class="choice" data-value="maybe"><strong>I have a login, but I am not sure</strong><span>It may be an app login or viewer account.</span></button>
+            <button class="choice" data-value="no"><strong>No</strong><span>I do not have the administrator credentials.</span></button>
+          </div>
+        </div>
+
+        <div class="diag-step" data-step="4">
+          <h2>Check the local network basics</h2>
+          <p class="diag-help">Answer based on what you can safely confirm without changing settings.</p>
+          <div class="field-grid">
+            <label>Are cameras/NVR currently visible locally?
+              <select id="localVisible"><option value="">Choose</option><option>Yes</option><option>No</option><option>Not sure</option></select>
+            </label>
+            <label>Is the Cloud Adapter powered?
+              <select id="adapterPowered"><option value="">Choose</option><option>Yes</option><option>No</option><option>No adapter used</option><option>Not sure</option></select>
+            </label>
+            <label>Is the adapter connected by Ethernet?
+              <select id="ethernet"><option value="">Choose</option><option>Yes</option><option>No</option><option>No adapter used</option><option>Not sure</option></select>
+            </label>
+            <label>Are the adapter and cameras/NVR on the same router/network?
+              <select id="sameNetwork"><option value="">Choose</option><option>Yes</option><option>No</option><option>Not sure</option></select>
+            </label>
+          </div>
+        </div>
+
+        <div class="diag-step" data-step="5">
+          <h2>Equipment information</h2>
+          <p class="diag-help">Use labels printed on the recorder or camera. Do not enter passwords here.</p>
+          <div class="field-grid">
+            <label>Your name<input id="customerName" autocomplete="name" placeholder="Full name"></label>
+            <label>Email address<input id="customerEmail" type="email" autocomplete="email" placeholder="name@example.com"></label>
+            <label>Phone number<input id="customerPhone" type="tel" autocomplete="tel" placeholder="Optional"></label>
+            <label>Camera or recorder brand<input id="brand" placeholder="Example: Hikvision, Dahua, Lorex"></label>
+            <label>Model number<input id="model" placeholder="Model printed on equipment"></label>
+            <label>Approximate number of cameras<input id="cameraCount" type="number" min="1" max="256" placeholder="Example: 8"></label>
+            <label>Internet provider or router brand<input id="router" placeholder="Optional"></label>
+          </div>
+        </div>
+
+        <div class="diag-step" data-step="6">
+          <h2>Describe what you see</h2>
+          <p class="diag-help">Include error messages, light colors, and what happened immediately before the problem.</p>
+          <textarea id="notes" placeholder="Example: Adapter power light is on, Ethernet light flashes, but CCTV Connect finds zero cameras."></textarea>
+          <div class="safety-note"><strong>Safety:</strong> Do not paste camera passwords, card numbers, Cloud ID access links, or remote-desktop codes into this form.</div>
+        </div>
+
+        <div class="diag-step" data-step="7">
+          <h2>Your diagnostic result</h2>
+          <p class="diag-help">This is a preliminary result, not a guarantee of compatibility.</p>
+          <div id="diagnosis"></div>
+          <div id="ticketStatus" class="result-card" style="display:none;"></div>
+          <h3>Support summary</h3>
+          <div class="summary-box" id="summaryBox"></div>
+          <div class="result-buttons">
+            <button class="primary-action" id="copySummary">Copy Support Summary</button>
+            <button class="primary-action" id="emailSupportSummary">Email Support Summary</button>
+            <a class="secondary-action" href="support.html#book-session">Book Remote Support</a>
+            <button class="secondary-action" id="restart">Start Over</button>
+          </div>
+        </div>
+
+        <div class="diag-actions" id="navActions">
+          <button class="prev" id="prevBtn" type="button">Back</button>
+          <button class="next" id="nextBtn" type="button" disabled>Next</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="script.js"></script>
+  <script>
+  (function(){
+    let step=1;
+    const total=7;
+    const answers={};
+    const steps=[...document.querySelectorAll('.diag-step')];
+    const next=document.getElementById('nextBtn');
+    const prev=document.getElementById('prevBtn');
+    const nav=document.getElementById('navActions');
+    const progress=document.getElementById('progressBar');
+
+    function selectChoice(btn){
+      const group=btn.closest('.choices');
+      group.querySelectorAll('.choice').forEach(x=>x.classList.remove('selected'));
+      btn.classList.add('selected');
+      answers[group.dataset.key]=btn.dataset.value;
+      next.disabled=false;
+    }
+    document.querySelectorAll('.choice').forEach(btn=>btn.addEventListener('click',()=>selectChoice(btn)));
+
+    function show(){
+      steps.forEach(s=>s.classList.toggle('active',Number(s.dataset.step)===step));
+      progress.style.width=(step/total*100)+'%';
+      prev.style.visibility=step===1?'hidden':'visible';
+      nav.style.display=step===total?'none':'flex';
+      if(step<=3) next.disabled=!steps[step-1].querySelector('.choice.selected');
+      else if(step===4) next.disabled=false;
+      else next.disabled=false;
+      if(step===total) buildResult();
+    }
+    next.addEventListener('click',()=>{if(step<total){step++;show();}});
+    prev.addEventListener('click',()=>{if(step>1){step--;show();}});
+
+    function val(id){return document.getElementById(id)?.value.trim()||'Not provided';}
+    function label(map,key){return map[key]||key||'Not provided';}
+    function buildResult(){
+      const issueMap={credentials:'Credentials / administrator access',discovery:'Camera discovery',adapter:'Cloud Adapter connection',app:'CCTV Connect / Cloud ID / viewing',activation:'Activation or billing',other:'Unidentified support issue'};
+      const systemMap={'ip-camera':'IP cameras without NVR','ip-nvr':'IP cameras with NVR','analog-dvr':'Analog/coax cameras with DVR',mixed:'Mixed/hybrid system',unknown:'Unknown system type'};
+      const credMap={yes:'Administrator credentials available',maybe:'Login available but administrator access uncertain',no:'Administrator credentials unavailable'};
+      const findings=[];
+      let cls='result-card';
+
+      if(answers.system==='analog-dvr'){
+        findings.push('This appears to be an analog/coax DVR system. Analog cameras are not directly discovered as network cameras. A manual compatibility review or IP upgrade path may be required.');
+        cls+=' warning';
+      }
+      if(answers.credentials==='no'){
+        findings.push('Administrator credentials are the primary blocker. Contact the original installer, recorder owner, or manufacturer-approved recovery process before cloud activation.');
+        cls+=' warning';
+      } else if(answers.credentials==='maybe'){
+        findings.push('Confirm that the login opens the camera or recorder administration settings. Mobile-app or viewer-only credentials may not be sufficient.');
+      }
+      if(val('adapterPowered')==='No'){
+        findings.push('Restore adapter power before further troubleshooting. Confirm the approved power supply and outlet.');
+      }
+      if(val('ethernet')==='No'){
+        findings.push('Connect the Cloud Adapter to the router or network switch using Ethernet.');
+      }
+      if(val('sameNetwork')==='No'){
+        findings.push('The adapter and camera/NVR must be reachable on the same local network or a correctly routed network.');
+      }
+      if(answers.issue==='discovery' && val('localVisible')==='Yes'){
+        findings.push('Because the cameras work locally, the likely issue is credentials, ONVIF access, network segmentation, or discovery permissions rather than camera power.');
+      }
+      if(answers.issue==='app'){
+        findings.push('Confirm the Cloud ID from the physical adapter label, the correct customer account, and that activation has completed. Never request a Cloud ID by email.');
+      }
+      if(answers.issue==='activation'){
+        findings.push('Check the order and activation status. Adapter hardware is charged through ANY AI CAM; recurring cloud service is handled by Videoloft after the trial.');
+      }
+      if(!findings.length){
+        findings.push('The information does not reveal one single blocker. Email the support summary or schedule a remote discovery session.');
+      }
+
+      document.getElementById('diagnosis').innerHTML='<div class="'+cls+'"><h3>Likely next step</h3><ul>'+findings.map(x=>'<li>'+x+'</li>').join('')+'</ul></div>';
+
+      const summary=[
+        'ANY AI CAM AUTOMATED SUPPORT SUMMARY',
+        'Issue: '+label(issueMap,answers.issue),
+        'System: '+label(systemMap,answers.system),
+        'Credentials: '+label(credMap,answers.credentials),
+        'Visible locally: '+val('localVisible'),
+        'Adapter powered: '+val('adapterPowered'),
+        'Ethernet connected: '+val('ethernet'),
+        'Same network: '+val('sameNetwork'),
+        'Customer name: '+val('customerName'),
+        'Customer email: '+val('customerEmail'),
+        'Customer phone: '+val('customerPhone'),
+        'Brand: '+val('brand'),
+        'Model: '+val('model'),
+        'Camera count: '+val('cameraCount'),
+        'Router/ISP: '+val('router'),
+        'Customer notes: '+val('notes'),
+        '',
+        'Do not include passwords, card details, Cloud ID links, or remote access codes.'
+      ].join('\n');
+      document.getElementById('summaryBox').textContent=summary;
+      createSupportTicket();
+    }
+
+
+    async function createSupportTicket() {
+      const statusBox = document.getElementById('ticketStatus');
+      const summary = document.getElementById('summaryBox').textContent;
+      statusBox.style.display = 'block';
+      statusBox.innerHTML = '<h3>Creating support ticket…</h3><p>Please wait while the diagnostic is saved.</p>';
+
+      try {
+        const response = await fetch('support-ticket.php', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            name: val('customerName'),
+            email: val('customerEmail'),
+            phone: val('customerPhone'),
+            issue: answers.issue || '',
+            system: answers.system || '',
+            credential_status: answers.credentials || '',
+            brand: val('brand'),
+            model: val('model'),
+            camera_count: val('cameraCount'),
+            router: val('router'),
+            local_visible: val('localVisible'),
+            adapter_powered: val('adapterPowered'),
+            ethernet: val('ethernet'),
+            same_network: val('sameNetwork'),
+            notes: val('notes'),
+            summary: summary
+          })
+        });
+
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || 'Ticket creation failed');
+
+        try {
+          sessionStorage.setItem('anyaicamSupportTicketId', result.ticket_id);
+          localStorage.setItem('anyaicamSupportTicketIdBackup', result.ticket_id);
+        } catch (e) {}
+
+        const updatedSummary = 'Support Ticket: ' + result.ticket_id + '\n' + summary;
+        document.getElementById('summaryBox').textContent = updatedSummary;
+
+        statusBox.innerHTML =
+          '<h3>Support ticket created: ' + result.ticket_id + '</h3>' +
+          '<p>Your diagnostic was saved and sent to support@anyaicam.com.</p>';
+
+        return result.ticket_id;
+      } catch (error) {
+        statusBox.classList.add('warning');
+        statusBox.innerHTML =
+          '<h3>Ticket could not be saved automatically.</h3>' +
+          '<p>You can still copy the summary or continue to LiveChat.</p>';
+        return '';
+      }
+    }
+
+    document.getElementById('copySummary').addEventListener('click',async function(){
+      try{await navigator.clipboard.writeText(document.getElementById('summaryBox').textContent);this.textContent='Copied';}
+      catch(e){this.textContent='Select and copy the summary';}
+    });
+    document.getElementById('emailSupportSummary').addEventListener('click', function () {
+      const summary = document.getElementById('summaryBox').textContent;
+      const subject = 'ANY AI CAM Diagnostic Support Request';
+      const body = 'Hello ANY AI CAM Support,
+
+I completed the automated diagnostic.
+
+' + summary;
+      window.location.href =
+        'mailto:support@anyaicam.com?subject=' + encodeURIComponent(subject) +
+        '&body=' + encodeURIComponent(body);
+    });
+    document.getElementById('restart').addEventListener('click',()=>location.reload());
+    show();
+  })();
+  </script>
+
+<footer class="site-footer" id="about">
+        <div>
+            <a class="brand footer-brand" href="index.html#home" aria-label="ANY AI CAM home">
+                <img class="brand-logo" src="full-logo-transparent.png" alt="ANY AI CAM AI Cloud Protection" loading="lazy">
+            </a>
+            <p>Cloud camera activation and onboarding support for compatible existing camera systems.</p>
+            <p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">&copy; 2026 ANY AI CAM. All rights reserved.</p>
+        </div>
+        <div>
+            <h3>Service</h3>
+            <a href="how-it-works.html">How It Works</a>
+            <a href="index.html#services">Cloud Account Setup</a>
+            <a href="index.html#pricing">Pricing Calculator</a>
+            <a href="camera-compatibility-check.html">Camera Readiness</a>
+            <a href="/camera-compatibility-check.html">Camera Check</a>
+            <a href="adapters.html">Adapter Options</a>
+            <a href="cameras.html">Cameras</a>
+            <a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+            
+            <a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+            <a href="partner.html">Partner Login</a>
+            <a href="support.html">Live Tech Support</a>
+        </div>
+        <div>
+            <h3>Contact &amp; Policies</h3>
+            <a href="contact.html">Contact Us</a>
+            <a href="/cdn-cgi/l/email-protection#c3a2aea2b7a283a2adbaa2aaa0a2aeeda0acae"><span class="__cf_email__" data-cfemail="05646864716445646b7c646c6664682b666a68">[email&#160;protected]</span></a>
+            <a href="tel:+18325108240">(832) 510-8240</a>
+            <a href="privacy-policy.html">Privacy Policy</a>
+            <a href="terms.html">Terms of Service</a>
+            <a href="shipping-returns.html">Shipping &amp; Returns</a>
+            <span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+        </div>
+    </footer>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>

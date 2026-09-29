@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>Camera Compatibility &amp; Readiness Check | ANY AI CAM</title>
+<meta content="Request a free system assessment for an existing analog, IP, or hybrid camera system and determine the best path to AI cloud recording." name="description"/>
+<link href="https://anyaicam.com/camera-compatibility-check.html" rel="canonical"/>
+<link href="/favicon.png" rel="icon" type="image/png"/>
+<meta content="website" property="og:type"/>
+<meta content="Camera Compatibility &amp; Readiness Check | ANY AI CAM" property="og:title"/>
+<meta content="Use the interactive readiness checker, connection diagrams, ONVIF guidance, and supported-brand examples before ordering cloud activation." property="og:description"/>
+<meta content="https://anyaicam.com/camera-compatibility-check.html" property="og:url"/>
+<link href="/styles.css" rel="stylesheet"/>
+<style>
+      .camera-check-shell,
+      .camera-check-shell * {
+        box-sizing: border-box;
+      }
+
+      .camera-check-shell {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 48px 0 64px;
+      }
+
+      .camera-check-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr);
+        gap: 24px;
+        align-items: stretch;
+      }
+
+      .camera-check-tool,
+      .camera-check-help {
+        border: 1px solid #d9e2ef;
+        border-radius: 8px;
+        background: #fff;
+        box-shadow: 0 12px 28px rgba(24, 29, 64, 0.08);
+        padding: 24px;
+      }
+
+      .camera-check-help {
+        background: #f7faff;
+      }
+
+      .camera-check-intro h2,
+      .camera-check-help h2,
+      .camera-results-heading h2 {
+        margin: 0 0 10px;
+        color: #071032;
+      }
+
+      .camera-check-intro p,
+      .camera-check-help li {
+        color: #4d5872;
+      }
+
+      .camera-check-form {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+        margin-top: 24px;
+      }
+
+      .camera-check-form label {
+        display: grid;
+        gap: 8px;
+        color: #071032;
+        font-weight: 800;
+      }
+
+      .camera-check-form input,
+      .camera-check-form select {
+        width: 100%;
+        min-height: 52px;
+        border: 1px solid #cfd8e6;
+        border-radius: 8px;
+        background: #fff !important;
+        color: #071032 !important;
+        font: inherit;
+        padding: 12px 14px;
+      }
+
+      .camera-check-actions {
+        display: flex;
+        grid-column: 1 / -1;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .camera-check-help ul {
+        margin: 0 0 24px;
+        padding-left: 22px;
+      }
+
+      .camera-chat-message,
+      .camera-results,
+      .camera-next-actions {
+        margin-top: 24px;
+      }
+
+      .camera-next-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .camera-next-actions [hidden],
+      .camera-check-shell [hidden] {
+        display: none !important;
+      }
+
+      .camera-check-shell .button.secondary.dark {
+        border: 1px solid #071032 !important;
+        background: #071032 !important;
+        color: #fff !important;
+      }
+
+      .camera-check-shell .button.secondary.dark:hover,
+      .camera-check-shell .button.secondary.dark:focus {
+        background: #18254c !important;
+        color: #fff !important;
+      }
+
+      .camera-check-shell .button.primary {
+        color: #fff !important;
+      }
+
+      .camera-check-help-note {
+        margin: 18px 0 0;
+        color: #4d5872;
+        font-size: 0.94rem;
+      }
+
+      .recorder-connector-guide {
+        margin: 24px 0 0;
+        border: 1px solid #d9e6f4;
+        border-radius: 8px;
+        background: #f7fbff;
+        padding: 20px;
+      }
+
+      .recorder-connector-guide h3 {
+        margin: 0 0 8px;
+        color: #071032;
+      }
+
+      .recorder-connector-guide p {
+        margin: 0 0 16px;
+        color: #4d5872;
+      }
+
+      .recorder-connector-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .recorder-example {
+        border: 1px solid #d9e2ef;
+        border-radius: 8px;
+        background: #fff;
+        padding: 16px;
+      }
+
+      .recorder-example strong {
+        display: block;
+        margin: 12px 0 6px;
+        color: #071032;
+      }
+
+      .recorder-example span {
+        display: block;
+        color: #4d5872;
+        font-size: 0.92rem;
+        line-height: 1.45;
+      }
+
+      .recorder-illustration {
+        border: 1px solid #cfd8e6;
+        border-radius: 8px;
+        background: #101936;
+        padding: 16px;
+      }
+
+      .recorder-back {
+        min-height: 108px;
+        border-radius: 6px;
+        background: linear-gradient(180deg, #24304f, #121a35);
+        padding: 18px;
+      }
+
+      .ethernet-ports,
+      .bnc-ports {
+        display: grid;
+        gap: 10px;
+      }
+
+      .ethernet-ports {
+        grid-template-columns: repeat(4, 1fr);
+      }
+
+      .ethernet-port {
+        aspect-ratio: 1.2;
+        border: 2px solid #7bd9e7;
+        border-radius: 4px;
+        background: #071032;
+        box-shadow: inset 0 -8px 0 rgba(123,217,231,0.2);
+      }
+
+      .bnc-ports {
+        grid-template-columns: repeat(4, 1fr);
+      }
+
+      .bnc-port {
+        aspect-ratio: 1;
+        border: 4px solid #c6cfdb;
+        border-radius: 50%;
+        background: radial-gradient(circle, #071032 0 32%, #8c96a8 34% 43%, #202942 45%);
+      }
+
+      .connector-label {
+        display: block;
+        margin-top: 10px;
+        color: #dbeafe;
+        font-size: 0.78rem;
+        font-weight: 800;
+        text-align: center;
+      }
+
+      @media (max-width: 900px) {
+        .camera-check-layout,
+        .camera-check-form,
+        .recorder-connector-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 640px) {
+        .camera-check-shell {
+          width: min(100% - 20px, 1120px);
+          padding: 32px 0 48px;
+        }
+
+        .camera-check-tool,
+        .camera-check-help {
+          padding: 18px;
+        }
+
+        .camera-check-actions,
+        .camera-next-actions {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .camera-check-actions .button,
+        .camera-next-actions .button,
+        .camera-check-help .button {
+          width: 100%;
+        }
+      }
+    
+      .camera-education {
+        width:min(1120px, calc(100% - 32px));
+        margin:0 auto;
+        padding:16px 0 64px;
+      }
+
+      .camera-education > .section-heading {
+        text-align:center;
+        margin-bottom:28px;
+      }
+
+      .camera-education .cloud-flow-section,
+      .camera-education .recorder-flow-section,
+      .camera-education .onvif-section {
+        margin:24px 0;
+        padding:28px;
+        border:1px solid #d9e2ef;
+        border-radius:12px;
+        background:#fff;
+        box-shadow:0 12px 28px rgba(24,29,64,.07);
+      }
+
+      .camera-education .cloud-flow-layout {
+        display:grid;
+        grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+        gap:24px;
+        align-items:center;
+      }
+
+      .camera-education figure {
+        margin:0;
+      }
+
+      .camera-education img {
+        display:block;
+        max-width:100%;
+        height:auto;
+        margin:0 auto;
+      }
+
+      .camera-education .compatibility-brand-grid,
+      .camera-education .onvif-brand-list {
+        display:grid;
+        grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+        gap:10px;
+        margin-top:18px;
+      }
+
+      .camera-education .compatibility-brand-grid span,
+      .camera-education .onvif-brand-list span {
+        display:block;
+        padding:12px 14px;
+        border:1px solid #d9e2ef;
+        border-radius:8px;
+        background:#f7fbff;
+        color:#071032;
+        font-weight:800;
+        text-align:center;
+      }
+
+      .camera-education .onvif-logo {
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        min-width:120px;
+        min-height:52px;
+        padding:8px 18px;
+        border-radius:8px;
+        background:#071032;
+        color:#fff;
+        font-weight:900;
+        letter-spacing:.08em;
+        margin:8px 0 12px;
+      }
+
+      .camera-education .direct-compatibility {
+        color:#071032;
+        margin-top:20px;
+      }
+
+      .camera-education .cloud-flow-copy p,
+      .camera-education .onvif-note,
+      .camera-education .section-heading p {
+        color:#4d5872;
+      }
+
+      @media (max-width:800px) {
+        .camera-education .cloud-flow-layout {
+          grid-template-columns:1fr;
+        }
+      }
+
+</style>
+<style id="anyaicam-readiness-contrast-fix">
+  .aic-readiness-scope,
+  .aic-readiness-scope strong,
+  .aic-readiness-scope p {
+    color: #0b2b4f !important;
+  }
+
+  .aic-readiness-scope p {
+    opacity: 1 !important;
+    font-weight: 600;
+    line-height: 1.55;
+  }
+</style>
+<style id="assessment-service-styles">
+.assessment-overview{padding:3.5rem 1rem;background:#f4f8fc;border-bottom:1px solid #dce7f3}
+.assessment-overview-inner,.assessment-trust-inner{max-width:1120px;margin:0 auto}
+.assessment-overview-inner>div:first-child{max-width:760px;margin:0 auto 1.6rem;text-align:center}
+.assessment-overview h2,.assessment-trust h2{color:#071032;font-size:clamp(1.75rem,3vw,2.45rem);line-height:1.15;margin:.25rem 0 .8rem}
+.assessment-overview p,.assessment-trust p{color:#4d5872;line-height:1.7}
+.assessment-steps{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;counter-reset:assessment}
+.assessment-steps li{counter-increment:assessment;background:#fff;border:1px solid #d9e4f2;border-radius:16px;padding:1.25rem;box-shadow:0 10px 26px rgba(11,43,79,.06)}
+.assessment-steps li:before{content:counter(assessment);display:grid;place-items:center;width:2rem;height:2rem;border-radius:50%;background:#071032;color:#fff;font-weight:800;margin-bottom:.8rem}
+.assessment-steps strong{display:block;color:#071032;font-size:1.1rem;margin-bottom:.4rem}.assessment-steps span{color:#4d5872;line-height:1.55;font-size:.95rem}
+.assessment-trust{padding:4rem 1rem;background:#fff}
+.assessment-trust-head{text-align:center;max-width:790px;margin:0 auto 1.8rem}
+.assessment-trust-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}
+.assessment-trust-grid article{border:1px solid #d9e4f2;border-radius:16px;padding:1.4rem;background:#f9fbfe}
+.assessment-trust-grid h3{margin:0 0 .5rem;color:#071032}
+.assessment-trust-grid p{margin:0}
+.assessment-trust-cta{margin-top:1.4rem;padding:1.35rem 1.5rem;border-radius:16px;background:#fff7fc;border:1px solid #f1cde5;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.assessment-trust-cta strong,.assessment-trust-cta span{display:block}.assessment-trust-cta strong{color:#071032;margin-bottom:.3rem}.assessment-trust-cta span{color:#4d5872;line-height:1.5;max-width:720px}
+@media(max-width:900px){.assessment-steps{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:650px){.assessment-steps,.assessment-trust-grid{grid-template-columns:1fr}.assessment-overview,.assessment-trust{padding:2.6rem 1rem}.assessment-trust-cta{align-items:stretch;flex-direction:column}.assessment-trust-cta .button{width:100%;justify-content:center}}
+</style>
+<style id="aic-support-hero-color-fix">
+  .camera-readiness-hero.portal-hero.support-hero {
+    background:
+      radial-gradient(circle at 20% 80%, rgba(35, 199, 213, 0.15), transparent 20rem),
+      radial-gradient(circle at 80% 20%, rgba(116, 61, 211, 0.5), transparent 22rem),
+      linear-gradient(135deg, #030821, #0a1045 55%, #141130) !important;
+    color: #fff !important;
+  }
+  .camera-readiness-hero.portal-hero.support-hero h1,
+  .camera-readiness-hero.portal-hero.support-hero > div > p {
+    color: #fff !important;
+  }
+</style><link rel="stylesheet" href="header-standard.css">
+</head>
+<body class="portal-page">
+
+<header class="site-header">
+<a aria-label="ANY AI CAM home" class="brand" href="index.html">
+<img alt="ANY AI CAM AI Cloud Protection" class="brand-logo" loading="lazy" src="full-logo-transparent.png"/>
+</a>
+<div class="header-controls">
+<button aria-controls="primaryNav" aria-expanded="false" class="mobile-menu-toggle" type="button">Menu</button>
+<div class="header-badges">
+<a class="live-support-badge" href="contact.html">☎ Contact Support</a>
+</div>
+</div>
+<nav aria-label="Primary navigation" class="site-nav" id="primaryNav">
+<a href="index.html">Home</a>
+<a href="how-it-works.html">How It Works</a>
+<a href="pricing.html">Pricing</a>
+<a href="camera-compatibility-check.html">Camera Readiness</a>
+<a href="cameras.html">Cameras</a>
+<a href="adapters.html">Adapters</a>
+<a href="support.html">Support</a>
+<a href="contact.html">Contact</a>
+<a href="cloud-setup-wizard.html">Get Started</a>
+<div class="dropdown">
+<a class="dropbtn" href="#">More</a>
+<div class="dropdown-content">
+<a href="nvr.html">NVR Setup</a>
+<a href="software.html">Software</a>
+<a href="partner.html">Partner Login</a>
+</div>
+</div>
+</nav>
+</header>
+<main>
+<section class="portal-hero support-hero camera-readiness-hero">
+<div>
+<p class="eyebrow">FREE SYSTEM ASSESSMENT</p>
+<h1>Connect your existing analog, IP, or hybrid camera system to AI cloud recording.</h1>
+<p>Tell us what you already have. ANY AI CAM will help identify your analog, IP, or hybrid system and determine the best path to AI cloud recording—without pushing unnecessary replacement equipment.</p>
+<div class="aic-readiness-scope" style="margin-top:1rem;padding:1rem;border-left:5px solid #5fc4d1;background:#eefaff;border-radius:8px;color:#0b2b4f;">
+<strong>This check does not reset or bypass camera passwords.</strong>
+<p style="margin:.45rem 0 0;">Videoloft normally requires valid administrator credentials. When credentials are missing, use the manufacturer-approved recovery process or hire a local technician for any required physical reset.</p>
+</div></div>
+</section>
+<section aria-labelledby="assessment-overview-title" class="assessment-overview">
+<div class="assessment-overview-inner">
+<div>
+<p class="eyebrow">HOW THE ASSESSMENT WORKS</p>
+<h2 id="assessment-overview-title">A clear answer before you commit to new equipment.</h2>
+<p>Many camera systems are still useful, but customers are often told to replace everything before anyone carefully reviews what they own. ANY AI CAM takes a different approach.</p>
+</div>
+<ol class="assessment-steps">
+<li><strong>Identify</strong><span>Tell us the camera, NVR, or DVR brand and model—or ask for help locating it.</span></li>
+<li><strong>Evaluate</strong><span>We determine whether the system is IP, analog, ONVIF-capable, and likely cloud-compatible.</span></li>
+<li><strong>Recommend</strong><span>We explain what can stay, what may need replacing, and whether local installation work is required.</span></li>
+<li><strong>Connect</strong><span>For supported systems, we help activate and verify Videoloft cloud viewing and recording.</span></li>
+</ol>
+</div>
+</section><section aria-labelledby="checkHeading" class="camera-check-shell">
+<div class="camera-check-layout">
+<article class="camera-check-tool">
+<div class="camera-check-intro">
+<div>
+<p class="eyebrow">Quick Brand Check</p>
+<h2 id="checkHeading">Tell us about your existing system.</h2>
+<p>No download is required. This page does not scan your network, ask for camera passwords, or store camera credentials.</p>
+<p><strong>Analog, IP, and hybrid systems are supported.</strong> Compatibility and connection method can depend on the recorder brand and model, so we review the system before activation.</p>
+</div>
+</div>
+<form class="camera-check-form" id="compatibilityForm">
+<label>
+<span>Camera system type</span>
+<select id="cameraType" required="">
+<option value="">Choose system type</option>
+<option value="ip">IP / network cameras</option>
+<option value="nvr">NVR with IP cameras</option>
+<option value="analog">Analog / coax DVR cameras</option>
+<option value="unknown">I am not sure</option>
+</select>
+</label>
+<label>
+<span>Camera, DVR, or NVR brand</span>
+<select id="cameraBrand" required="">
+<option value="">Choose a brand</option>
+<option value="Hikvision">Hikvision</option>
+<option value="Dahua">Dahua</option>
+<option value="LTS">LTS</option>
+<option value="Lorex">Lorex</option>
+<option value="Axis">Axis</option>
+<option value="Reolink">Reolink</option>
+<option value="Uniview">Uniview</option>
+<option value="TVT">TVT</option>
+<option value="Vivotek">Vivotek</option>
+<option value="ONVIF">ONVIF / ONVIF compatible</option>
+<option value="Unknown">I am not sure</option>
+<option value="Other">Other brand</option>
+</select>
+</label>
+<label>
+<span>Model number <small>(optional)</small></span>
+<input id="cameraModel" placeholder="Example: DS-7608, NVR-104, RLC-811A" type="text"/>
+</label>
+<label>
+<span>Does it support ONVIF?</span>
+<select id="onvifStatus">
+<option value="unknown">Not sure</option>
+<option value="yes">Yes</option>
+<option value="no">No</option>
+</select>
+</label>
+<label>
+<span>How many cameras?</span>
+<input id="cameraCount" max="128" min="1" type="number" value="1"/>
+</label>
+<div class="camera-check-actions">
+<button class="button primary" type="submit">Check Compatibility</button>
+<a class="button secondary dark" href="support.html">Get Compatibility Help</a>
+</div>
+</form>
+</article>
+<aside aria-label="Compatibility help" class="camera-check-help">
+<p class="eyebrow">Where to Look</p>
+<h2>Not sure what brand you have?</h2>
+<ul>
+<li>Check the camera or NVR label.</li>
+<li>Open the camera app and look under device info.</li>
+<li>Look for ONVIF in the camera or recorder settings.</li>
+<li>Use the Support page if you want help before ordering.</li>
+</ul>
+<a class="button secondary dark" href="support.html">Open Support Options</a>
+<p class="camera-check-help-note">Use the Support page and we can review the camera brand manually.</p>
+</aside>
+</div>
+<div aria-live="polite" class="camera-chat-message" hidden="" id="compatibilityMessage">
+<span aria-hidden="true" class="camera-chat-mark">AI</span>
+<p id="compatibilityMessageText"></p>
+</div>
+<section aria-labelledby="resultsHeading" class="camera-results" hidden="" id="compatibilityResults">
+<div class="camera-results-heading">
+<div>
+<p class="eyebrow">Compatibility Result</p>
+<h2 id="resultsHeading">Your camera check</h2>
+</div>
+</div>
+<div class="camera-results-table-wrap">
+<table class="camera-results-table">
+<thead>
+<tr>
+<th scope="col">System type</th>
+<th scope="col">Brand</th>
+<th scope="col">Model</th>
+<th scope="col">ONVIF</th>
+<th scope="col">Cameras</th>
+<th scope="col">Videoloft compatibility</th>
+</tr>
+</thead>
+<tbody id="compatibilityResultsBody"></tbody>
+</table>
+</div>
+</section>
+<div class="camera-next-actions">
+<a class="button primary" hidden="" href="/cloud-setup-wizard.html" id="continueOrderButton">Continue to Order</a>
+<button class="button secondary dark" hidden="" id="manualReviewButton" type="button">Request Manual Review</button>
+</div>
+</section><section aria-labelledby="assessment-trust-title" class="assessment-trust">
+<div class="assessment-trust-inner">
+<div class="assessment-trust-head">
+<p class="eyebrow">WHY ANY AI CAM</p>
+<h2 id="assessment-trust-title">We evaluate first. We do not replace equipment by default.</h2>
+<p>Our role is remote camera-to-cloud guidance and activation—not nationwide physical installation. That lets us focus on helping you understand the system you already have.</p>
+</div>
+<div class="assessment-trust-grid">
+<article><h3>Keep working equipment</h3><p>Working analog cameras, IP cameras, DVRs, and NVRs may be able to stay in service instead of being replaced.</p></article>
+<article><h3>Plain-language recommendations</h3><p>We explain why a device is compatible, uncertain, or unsuitable so you can make an informed decision.</p></article>
+<article><h3>Local installation when needed</h3><p>If new wiring, ladders, or physical camera work is required, hire a qualified installer in your city for that portion.</p></article>
+<article><h3>Remote cloud activation</h3><p>Once the system and valid administrator access are available, we help connect and verify the cloud service.</p></article>
+</div>
+<div class="assessment-trust-cta">
+<div><strong>Not sure what is connected to your network?</strong><span>Ask about an authorized remote review performed with your permission. We never bypass passwords or access equipment without authorization.</span></div>
+<a class="button primary" href="support.html">Request Personal Assistance</a>
+</div>
+</div>
+</section>
+<section aria-labelledby="compatibilityGuideHeading" class="camera-education">
+<div class="section-heading">
+<p class="eyebrow">Compatibility Guide</p>
+<h2 id="compatibilityGuideHeading">See how existing camera systems connect.</h2>
+<p>Use the visual guides and brand examples below, then complete the interactive readiness check above.</p>
+</div>
+<section class="cloud-flow-section" id="direct-camera">
+<div class="section-heading">
+<p class="eyebrow">Video Compatibility</p>
+<h2>Camera straight to the cloud.</h2>
+</div>
+<div class="cloud-flow-layout">
+<figure aria-label="Cameras connect through adapter, PoE switch, and router to cloud" class="">
+<img alt="Camera straight to cloud setup with cameras, cloud adapter, PoE switch, router, and Videoloft Cloud" src="videoloft provision.png" style="max-width:100%; height:auto; max-height:300px; width:auto;"/>
+</figure>
+<div class="cloud-flow-copy">
+<p>Connect supported analog, IP, or hybrid camera systems to cloud recording using the appropriate recorder or adapter path.</p>
+<p>Simplify the installation, save space onsite, and reduce the risk of recorder theft or failure.</p>
+</div>
+</div>
+<h3 class="direct-compatibility">Direct camera compatibility.</h3>
+<div aria-label="Compatible camera brand examples" class="compatibility-brand-grid">
+<span>Axis</span>
+<span>Dahua</span>
+<span>Lorex</span>
+<span>LTS</span>
+<span>Hikvision</span>
+<span>Reolink</span>
+<span>TVT</span>
+<span>Uniview</span>
+<span>Vivotek</span>
+<span>Hanwha Vision</span>
+<span>Digital Watchdog</span>
+<span>ONVIF Compatible</span>
+</div>
+</section>
+<section class="recorder-flow-section">
+<div class="section-heading">
+<p class="eyebrow">Cloud Backup Option</p>
+<h2>Cloud + recorder.</h2>
+</div>
+<div class="cloud-flow-layout">
+<figure aria-label="Cameras connect through DVR/NVR and cloud adapter to cloud backup" class="">
+<img alt="Cloud plus DVR NVR recorder setup with cameras, router, cloud adapter, and Videoloft Cloud" src="nvr-cloud-recorder-setup.webp" style="max-width:100%; height:auto; max-height:300px; width:auto;"/>
+</figure>
+<div class="cloud-flow-copy">
+<p>You may still want local recording. But what if you need to keep video longer than the recorder can store, or want protection against recorder theft or damage?</p>
+<p>Add <span class="text-link">cloud backup to your local recorder</span> to get the best of both worlds.</p>
+</div>
+</div>
+<h3 class="direct-compatibility">Direct recorder compatibility.</h3>
+</section>
+<section class="onvif-section">
+<div class="section-heading">
+<p class="eyebrow">ONVIF Compatibility</p>
+<div aria-label="ONVIF" class="onvif-logo">ONVIF</div>
+<p>Many camera brands work through ONVIF. Specific results can vary because different brands implement ONVIF standards differently.</p>
+</div>
+<div class="onvif-brand-list">
+<span>Amcrest</span>
+<span>Avigilon</span>
+<span>Bosch</span>
+<span>H.VIEW</span>
+<span>i-PRO</span>
+<span>ONWOTE</span>
+<span>Panasonic</span>
+<span>Sony</span>
+<span>Wisenet</span>
+</div>
+<p class="onvif-note">ANY AI CAM supports devices with ONVIF profiles S and T, but compatibility should be confirmed before activation.</p>
+</section>
+</section>
+</main>
+<footer class="site-footer" id="about">
+<div>
+<a aria-label="ANY AI CAM home" class="brand footer-brand" href="index.html#home">
+<img alt="ANY AI CAM AI Cloud Protection" class="brand-logo" loading="lazy" src="full-logo-transparent.png"/>
+</a>
+<p>Cloud camera activation and onboarding support for existing analog, IP, and hybrid camera systems.</p>
+<p style="margin-top: 1rem; color: #d5dff8; font-size: 0.84rem;">© 2026 ANY AI CAM. All rights reserved.</p>
+</div>
+<div>
+<h3>Service</h3>
+<a href="how-it-works.html">How It Works</a>
+<a href="index.html#services">Cloud Account Setup</a>
+<a href="index.html#pricing">Pricing Calculator</a>
+<a href="camera-compatibility-check.html">Camera Readiness</a>
+<a href="/camera-compatibility-check.html">Camera Readiness</a>
+<a href="adapters.html">Adapter Options</a>
+<a href="cameras.html">Cameras</a>
+<a href="cloud-setup-wizard.html">Order Adapter Hardware</a>
+<a href="troubleshooting.html">Troubleshooting Camera Scan</a>
+<a href="partner.html">Partner Login</a>
+<a href="support.html">Live Tech Support</a>
+</div>
+<div>
+<h3>Contact &amp; Policies</h3>
+<a href="contact.html">Contact Us</a>
+<a href="/cdn-cgi/l/email-protection#70111d11041130111e09111913111d5e131f1d"><span class="__cf_email__" data-cfemail="74151915001534151a0d151d1715195a171b19">[email&#160;protected]</span></a>
+<a href="tel:+18325108240">(832) 510-8240</a>
+<a href="privacy-policy.html">Privacy Policy</a>
+<a href="terms.html">Terms of Service</a>
+<a href="shipping-returns.html">Shipping &amp; Returns</a>
+<span>6218 Arcadia Sound Lane, Porter, Texas 77365</span>
+</div>
+</footer>
+<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script src="/script.js"></script>
+<script src="/camera-compatibility-check.js"></script>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>

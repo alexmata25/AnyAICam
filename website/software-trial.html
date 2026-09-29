@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Start Your Free Software Trial | ANY AI CAM</title>
+  <meta name="description" content="Request a free 30-day ANY AI CAM software trial using your existing security cameras and Windows computer.">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <style>
+    body{margin:0;background:#f4f8fc;color:#10294a;font-family:Arial,sans-serif}
+    .trial-wrap{max-width:820px;margin:2rem auto;padding:0 1rem}
+    .trial-card{overflow:hidden;background:#fff;border:1px solid #d9e6f4;border-radius:18px;box-shadow:0 18px 45px rgba(13,39,75,.1)}
+    .trial-head{padding:2rem;background:linear-gradient(145deg,#071032,#17113f);color:#fff}
+    .trial-head h1{margin:.45rem 0;font-size:clamp(2rem,5vw,3.2rem);line-height:1.05}
+    .trial-head p{max-width:680px;margin:.8rem 0 0;color:#dcecff;line-height:1.6}
+    .eyebrow{font-weight:900;letter-spacing:.12em;color:#71d3dc}
+    .trial-body{padding:2rem}
+    .notice{margin-bottom:1.4rem;padding:1rem;border-left:5px solid #5fc4d1;background:#eefaff;border-radius:8px;line-height:1.55}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+    .full{grid-column:1/-1}
+    label{display:block;font-weight:800}
+    input{width:100%;box-sizing:border-box;margin-top:.4rem;padding:.85rem;border:1px solid #bdcada;border-radius:9px;font:inherit}
+    input:focus{outline:3px solid rgba(95,196,209,.25);border-color:#2e9eae}
+    .submit{width:100%;margin-top:1.25rem;border:0;border-radius:10px;padding:1rem 1.25rem;color:#fff;background:linear-gradient(90deg,#cc3b96,#5fc4d1);font-size:1rem;font-weight:900;cursor:pointer}
+    .fine-print{margin:.9rem 0 0;color:#68758b;font-size:.9rem;line-height:1.5}
+    .back{display:inline-block;margin-top:1.25rem;color:#244e7a;font-weight:700}
+    @media(max-width:650px){.grid{grid-template-columns:1fr}.full{grid-column:auto}.trial-head,.trial-body{padding:1.35rem}.trial-wrap{margin:1rem auto}}
+  </style>
+</head>
+<body>
+  <main class="trial-wrap">
+    <section class="trial-card">
+      <header class="trial-head">
+        <div class="eyebrow">30-DAY SOFTWARE TRIAL</div>
+        <h1>Turn your existing cameras into cloud-connected AI cameras.</h1>
+        <p>Request the software-only path. No adapter or camera purchase is required to begin your trial.</p>
+      </header>
+      <div class="trial-body">
+        <div class="notice"><strong>Simple start:</strong> Send the information needed to create your trial account. ANY AI CAM will email your download link, unique temporary password, and next steps.</div>
+        <form action="submit-software-trial.php" method="post">
+          <div class="grid">
+            <label>Full name
+              <input name="full_name" autocomplete="name" required>
+            </label>
+            <label>Email address
+              <input type="email" name="email" autocomplete="email" required>
+            </label>
+            <label>Phone number
+              <input type="tel" name="phone" autocomplete="tel" required>
+            </label>
+            <label>How many cameras?
+              <input type="number" name="camera_count" min="1" max="64" step="1" inputmode="numeric" required>
+            </label>
+            <label class="full">Street address
+              <input name="street_address" autocomplete="street-address" required>
+            </label>
+            <label>City
+              <input name="city" autocomplete="address-level2" required>
+            </label>
+            <label>State
+              <input name="state" autocomplete="address-level1" required>
+            </label>
+            <label>ZIP code
+              <input name="zip" autocomplete="postal-code" required>
+            </label>
+          </div>
+          <input type="text" name="website" tabindex="-1" autocomplete="off" style="position:absolute;left:-9999px" aria-hidden="true">
+          <button class="submit" type="submit">Email Me My Free 30-Day AI Software Trial</button>
+          <p class="fine-print">Do not enter camera usernames or passwords here. The software creates its own Cloud ID during setup. Your Windows computer must remain powered on for continuous cloud connection.</p>
+        </form>
+        <a class="back" href="software.html">&larr; Back to software information</a>
+      </div>
+    </section>
+  </main>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"8098974d0c71433f86ea09ed0459d5a8","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>
