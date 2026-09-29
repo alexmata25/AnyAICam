@@ -4311,3 +4311,60 @@ Design: `docs/vehicle-access-design.md`. It covers architecture, reused componen
   - turn `/customer-account` into Account & Devices (plan and slots used/available, appliances, subscription, camera management);
   - drop only its duplicate "Your cameras" card grid;
   - keep the setup gate, the placeholders and the licensing logic.
+
+## Next controlled Ryzen release: requirements (documented 2026-09-28; NOT implemented, NOT installed)
+
+Ship as one controlled edge release: validate on the Ryzen first, then track Samsung separately. The earlier installer package (`0a4dc69`) already contains items 1 and 2 but has not been installed.
+
+1. **LPR precision fix** (`a7cb05b`): `LPR_CONFIRM_MIN_CONFIDENCE=80`, near-duplicate suppression by edit distance, precision over recall. Today's validation: the white Ram was read twice correctly as KPC6266 (0.944 and 0.941); the silver sedan correctly produced no read, since its plate is out of view. The morning misreads (KPE6266 / KPEG266, about 0.69) are what this fix rejects.
+2. **Plate events trigger Event-mode recording and link the clip** (`8a65839`). On the installed version, a plate event gets a plate crop and thumbnail but no clip; only the neighbouring car event has one (confirmed at 23:00:14 UTC today).
+3. **False Event-mode "Recording problem: stopped"**: see the section above ("Event-mode recording stopped false alarm"). The agent reports `event_armed` for Event-mode cameras with a live stream; the Dashboard only flags missing clips for recent events.
+4. **Natural greeting voice replacing eSpeak NG.** The greeting currently comes from `aac_voice_call_greeting.synthesize_speech`, which runs eSpeak NG 1.52 with voice `en-us` at 150 wpm and sounds robotic.
+   - Replace it with a local neural voice, **Kokoro-82M** (Apache-2.0) or **Piper** (MIT), so it stays offline-capable with no recurring cost.
+   - Pre-render each greeting when its text changes and cache the audio on the edge, so playback is instant and works offline.
+   - A cloud voice (e.g. Amazon Polly Neural) is an option only as rendered-once-then-cached.
+   - **The voice is still to be chosen by the owner** from sample recordings.
+   - The camera speaker path is 8 kHz G.711, so fidelity is telephone-grade whichever voice is chosen.
+5. **Greeting-only audio levelling and a lower default volume.**
+   - Today there is no software gain anywhere: eSpeak default amplitude, then `talk_audio_relay.send_pcm16`, then 8 kHz μ-law, with loudness set only by the camera's own two-way-audio speaker volume, which is shared with homeowner Talk.
+   - Required: normalise the greeting PCM to a fixed loudness target with a peak limit, then apply a greeting gain **inside the greeting provider only**, before the shared relay.
+   - Default about 8–10 dB quieter than today; tune at the door.
+   - Must **not** change the camera speaker volume, homeowner Talk audio, the camera microphone or input gain, or recording audio.
+6. **Configurable greeting volume per entrance camera.** A "Greeting volume" setting (Low / Medium / High or a percentage) stored with the entrance-camera greeting config in the cloud and synced to the edge with the existing `aac_voice_call` configuration, so it keeps working offline. Independent of homeowner Talk volume.
+
+## AAC Voice Call physical test at the Front Door, 2026-09-28 (staging `c481ed6`, Ryzen as installed)
+
+**Validated end to end (keep working):**
+- Front Door person detection (23:32:46 and 23:50:26 UTC) triggered the call.
+- The greeting played through the camera speaker (local ISAPI relay, open/close 200).
+- The visitor's speech was transcribed ("i'm here to leave package") and classified as **delivery**.
+- The cloud created the authoritative Voice Call event.
+- The Voice Call email was sent within 1 second.
+- The email link opened the correct Visitor at Front Door page (after sign-in).
+- The live P2P session negotiated with the Ryzen.
+- **Answer** recorded (state `answered`).
+- The camera microphone works: recorded playback contains audio (AAC).
+
+**Cloud/staging issues found (to fix in cloud code; test on staging):**
+1. **Live camera-to-phone audio silent.**
+   - Root cause (confirmed read-only): the browser's P2P offer only requests video (`live_view_page.py`, `pc.addTransceiver('video', {direction: 'recvonly'})`).
+   - The Ryzen's MediaMTX path for the Front Door carries H264 **and G.711 audio**, which browsers support over WebRTC. The HLS relay fallback carries audio but is replaced once P2P connects.
+   - Fix: add an audio `recvonly` transceiver to the P2P offer; unmute on Answer, where the user gesture allows audible playback.
+2. **Phone-to-camera Talk did not work.**
+   - `POST /api/customer/cameras/{id}/talk/start` returned 200 each time, but the session stopped within a second, before the browser opened the audio WebSocket.
+   - The Ryzen never received a homeowner talk session, while its local ISAPI relay to the Front Door speaker works (both greetings played).
+   - Ruled out: the server `Permissions-Policy` allows the microphone (`microphone=(self)`).
+   - Remaining causes are all client-side: `getUserMedia` refused (likely in the mail app's in-app browser; repeated sign-ins show the link opened there), the permission prompt cancelling the press, or a too-short press.
+   - Follow-up: WebSocket connects are not visible in staging logs at all (not even `/api/appliance/talk/channel`). Confirm the appliance talk channel is connected once a browser press passes the microphone step.
+   - Investigate microphone permission and browser behaviour: regular Safari/Chrome vs in-app browsers, per-site microphone permission.
+   - **Prefer requesting microphone permission when Answer is pressed.**
+   - **Evaluate tap-to-start / tap-to-stop Talk instead of press-and-hold on mobile.**
+   - Show an actionable message when the microphone is unavailable ("Open this page in Safari/Chrome and allow the microphone").
+3. **Duplicate email for one visit.**
+   - The same person detection produced the Voice Call email (23:32:53) and an ordinary "Person" email (23:33:10, after media) whose button opens Playback with the recorded clip. Opening that one looked like "the call page shows recorded video".
+   - Visible since the staging email allowlist was removed today.
+   - Fix: when a person detection at an entrance camera has created an AAC Voice Call, suppress the ordinary Person/Smart-Motion email for that camera within the call window. The in-app Smart Alerts entry remains.
+4. Opening the email in the mail app's in-app browser required signing in each time. Consider an "Open in your browser" hint on the call page.
+5. **End Call**, and the Voice Call card in Smart Alerts after a completed call, were not yet physically confirmed. Retest after fixes 1 and 2.
+
+**Staging note:** the 15-minute normal email cooldown (golden `29551b6`, which also keeps Voice Call on its own 5-minute cooldown; intrusion alarms exempt) is committed but **not yet deployed**. `ANYAICAM_NOTIFICATION_CHANNEL_COOLDOWN_SECONDS=900` is already in the staging env file (with a backup) and takes effect only on the next staging deploy.
