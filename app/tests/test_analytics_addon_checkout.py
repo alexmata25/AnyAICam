@@ -34,7 +34,7 @@ def db_path(tmp_path):
 
 
 @pytest.fixture()
-def client(db_path, tmp_path, monkeypatch):
+def client(db_path, tmp_path, monkeypatch, fake_stripe_prices):
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
         initialize_database()
@@ -98,7 +98,8 @@ def test_advanced_analytics_creates_one_recurring_session_for_the_bundle(client,
     assert body["status"] == "complete"
     assert body["checkout_url"] == "https://checkout.stripe.test/cs_test_analytics_1"
     assert body["addon_key"] == "advanced_analytics"
-    assert set(body["analytic_keys"]) == {"smart_motion", "people_counting", "lpr", "ppe"}
+    # 2026-09-30: Smart Motion is included with every plan, not sold.
+    assert set(body["analytic_keys"]) == {"people_counting", "lpr", "ppe"}
     assert body["billing_type"] == "recurring"
 
     fields = _fields_dict(captured["fields"])
@@ -115,9 +116,10 @@ def test_advanced_analytics_creates_one_recurring_session_for_the_bundle(client,
     assert fields["customer_email"] == "owner@example.test"
 
 
-def test_face_access_resolves_to_its_own_price_not_advanced_analytics(client, db_path):
-    """Cross-add-on tampering guard: Face Access must never resolve to
-    the Advanced Analytics price, and must grant only facial_recognition."""
+def test_old_single_price_face_access_sku_is_no_longer_sold(client, db_path):
+    """2026-09-30: Face Access is sold per door by size (enrolled people).
+    The old single-price SKU still resolves for existing subscriptions
+    (see the webhook test below) but can't start a new checkout."""
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
     response = test_client.post(
@@ -125,12 +127,9 @@ def test_face_access_resolves_to_its_own_price_not_advanced_analytics(client, db
         json={"addon_key": "facial_recognition"},
         cookies={"anyaicam_partner_session": _owner_cookie(email="owner@example.test")},
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["analytic_keys"] == ["facial_recognition"]
-    fields = _fields_dict(captured["fields"])
-    assert fields["line_items[0][price]"] == "price_test_facial_recognition"
-    assert fields["metadata[anyaicam_addon_key]"] == "facial_recognition"
+    assert response.status_code == 400
+    assert "per door" in response.json()["detail"]
+    assert "fields" not in captured
 
 
 # --------------------------------------------------------- ownership gate
@@ -221,7 +220,7 @@ def test_a_submitted_price_id_field_is_ignored_server_side_resolution_wins(clien
 # --------------------------------------------- webhook-to-entitlement path
 
 
-def test_webhook_grants_all_four_advanced_analytics_keys_from_one_purchase(client, db_path, monkeypatch):
+def test_webhook_grants_every_advanced_analytics_key_from_one_purchase(client, db_path, monkeypatch):
     """Integration proof that this endpoint's single-Price-ID checkout
     fans out into four independent analytics_subscriptions rows via the
     existing, unmodified webhook handler -- not just visually similar."""
@@ -253,12 +252,12 @@ def test_webhook_grants_all_four_advanced_analytics_keys_from_one_purchase(clien
         }
         result = ae.sync_analytics_from_stripe_event(event)
         assert result["status"] == "analytics_subscription_updated"
-        assert set(result["analytic_keys"]) == {"smart_motion", "people_counting", "lpr", "ppe"}
-        assert len(result["subscription_ids"]) == 4
-        assert ae.get_active_analytics_for_customer("cust-1") == ["lpr", "people_counting", "ppe", "smart_motion"]
+        assert set(result["analytic_keys"]) == {"people_counting", "lpr", "ppe"}
+        assert len(result["subscription_ids"]) == 3
+        assert ae.get_active_analytics_for_customer("cust-1") == ["lpr", "people_counting", "ppe"]
 
 
-def test_cancelling_advanced_analytics_cancels_all_four_keys_together(client, db_path, monkeypatch):
+def test_cancelling_advanced_analytics_cancels_all_its_keys_together(client, db_path, monkeypatch):
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
     response = test_client.post(
@@ -282,7 +281,7 @@ def test_cancelling_advanced_analytics_cancels_all_four_keys_together(client, db
             }},
         }
         ae.sync_analytics_from_stripe_event(checkout_event)
-        assert len(ae.get_active_analytics_for_customer("cust-1")) == 4
+        assert len(ae.get_active_analytics_for_customer("cust-1")) == 3
 
         cancel_event = {
             "id": "evt_cancel", "type": "customer.subscription.deleted",
@@ -294,19 +293,17 @@ def test_cancelling_advanced_analytics_cancels_all_four_keys_together(client, db
         }
         result = ae.sync_analytics_from_stripe_event(cancel_event)
         assert result["status"] == "analytics_subscription_updated"
-        assert len(result["analytic_keys"]) == 4
+        assert len(result["analytic_keys"]) == 3
         assert ae.get_active_analytics_for_customer("cust-1") == []
 
 
 def test_face_access_purchase_does_not_touch_advanced_analytics_keys(client, db_path, monkeypatch):
+    """An existing Face Access subscription (old single-price SKU) still
+    resolves on its webhook and grants only facial_recognition."""
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
-    response = test_client.post(
-        "/api/customer/analytics/checkout",
-        json={"addon_key": "facial_recognition"},
-        cookies={"anyaicam_partner_session": _owner_cookie(email="owner@example.test")},
-    )
-    fields = _fields_dict(captured["fields"])
+    fields = {"metadata[anyaicam_stripe_price_id]": "price_test_facial_recognition",
+              "metadata[anyaicam_customer_id]": "cust-1"}
 
     with override_target(sqlite_path=str(db_path)):
         import analytics_entitlements as ae

@@ -134,14 +134,14 @@ walk_journey([
 ], 'sandbox-hybrid-only@example.test', $secretKey, 'Hybrid only');
 
 walk_journey([
-    ['kind' => 'analytics', 'key' => 'smart_motion', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'ai_essentials', 'expected_mode' => 'subscription'],
 ], 'sandbox-analytics-only@example.test', $secretKey, 'One analytics only');
 
 walk_journey([
     ['kind' => 'hardware', 'key' => 'AIC-APPLIANCE-RYZEN-STARTER', 'expected_mode' => 'payment'],
     ['kind' => 'camera_plan', 'key' => 'local_1_8', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'smart_motion', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'people_counting', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'ai_essentials', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'vehicle_intelligence', 'expected_mode' => 'subscription'],
     ['kind' => 'analytics', 'key' => 'talk_down', 'expected_mode' => 'subscription'],
 ], 'sandbox-hw-local-3analytics@example.test', $secretKey, 'Hardware + Local + 3 analytics');
 
@@ -149,8 +149,8 @@ walk_journey([
     ['kind' => 'hardware', 'key' => 'AIC-APPLIANCE-RYZEN-ENTERPRISE', 'expected_mode' => 'payment'],
     ['kind' => 'hardware', 'key' => 'AIC-RELAY-NUMATO-3CH', 'expected_mode' => 'payment'],
     ['kind' => 'camera_plan', 'key' => 'hybrid_9_16', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'lpr', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'facial_recognition', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'ai_professional', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'talk_down', 'expected_mode' => 'subscription'],
 ], 'sandbox-hw-hybrid-analytics@example.test', $secretKey, 'Hardware + relay + Hybrid + 2 analytics');
 
 // -------------------------------------------------------- fail-closed
@@ -160,6 +160,9 @@ check($unknownResult['status'] >= 400, 'unknown analytics key fails closed (non-
 
 $unknownCameraResult = call_endpoint(['customer_email' => 'x@example.test', 'legs' => [['kind' => 'camera_plan', 'key' => 'local_1_9000']]]);
 check($unknownCameraResult['status'] >= 400, 'unknown camera plan key fails closed (non-200)');
+
+$licenseResult = call_endpoint(['customer_email' => 'x@example.test', 'legs' => [['kind' => 'vms_license', 'key' => '8']]]);
+check($licenseResult['status'] >= 400, 'VMS license leg fails closed until its TEST Price ID exists (non-200)');
 
 echo "\n" . ($failures === 0 ? "ALL PASSED" : "{$failures} FAILURE(S)") . "\n";
 exit($failures === 0 ? 0 : 1);

@@ -78,23 +78,31 @@ from partner_db import connection, row, rows
 from stripe_checkout_payment import CHECKOUT_GRANT_EVENT_TYPES, awaiting_payment, awaiting_payment_result
 
 # addon_key (the customer-billed SKU), display label, the tuple of
-# internal analytic_key feature flags this SKU grants when purchased
-# (see customer_analytics_panel.ANALYTIC_LABELS for what each analytic_
-# key actually gates per-camera -- unchanged by this catalog), Stripe
-# TEST Price ID env var. "advanced_analytics" is the one row with more
-# than one analytic_key -- see the module docstring's 2026-09-21
-# correction. Every other row's addon_key equals its sole analytic_key,
-# same as before the correction.
-ANALYTICS_CATALOG = [
-    ("advanced_analytics", "Advanced Analytics", ("smart_motion", "people_counting", "lpr", "ppe"), "ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS"),
-    ("facial_recognition", "Face Access", ("facial_recognition",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION"),
-    ("talk_down", "Talk Down", ("talk_down",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_TALK_DOWN"),
-    ("ai_essentials", "AnyAiCam AI Essentials", ("ai_essentials",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS"),
-    ("ai_professional", "AnyAiCam AI Professional", ("ai_professional",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_PROFESSIONAL"),
-    ("vehicle_intelligence", "Vehicle Intelligence", ("vehicle_intelligence",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_VEHICLE_INTELLIGENCE"),
-    ("cloud_overflow", "Cloud Overflow", ("cloud_overflow",), "ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW"),
-]
+# internal feature keys this SKU grants when purchased, Stripe Price ID
+# env var. 2026-09-30: built from pricing_catalog (the one authoritative
+# catalog) instead of being maintained here:
+# - the four analytics packages grant real per-camera analytics (owner-
+#   approved mapping): AI Essentials -> people_counting; AI Professional
+#   -> people_counting + ppe; Vehicle Intelligence -> lpr; Advanced
+#   Analytics -> people_counting + lpr + ppe. Smart Motion is no longer
+#   sold: it is included with every paid Local/Hybrid plan
+#   (pricing_catalog.INCLUDED_FEATURES, see included_feature_active()).
+#   Existing smart_motion rows from earlier Advanced purchases are left
+#   untouched -- nothing a customer already has is removed.
+# - Talk Down grants talk_down AND voice_call (Voice Call is included).
+# - Face Access is sold per door in three sizes; the original single
+#   facial_recognition SKU stays mapped so existing purchases still
+#   resolve on renewal/cancellation.
+# Packages can overlap (people_counting is in three), so which packages a
+# customer holds is tracked per addon_key in addon_subscriptions, and a
+# feature is only switched off when no remaining active package grants it.
+import pricing_catalog as _catalog
 
+ANALYTICS_CATALOG = (
+    [(a["addon_key"], a["label"], tuple(a["grants"]), a["price_env_var"]) for a in _catalog.addons()]
+    + [(f"face_access_{t['size']}", t["label"], tuple(t["grants"]), t["price_env_var"]) for t in _catalog.face_access_tiers()]
+    + [("facial_recognition", "Face Access", tuple(_catalog.FACE_ACCESS_GRANTS), "ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION")]
+)
 ADDON_KEYS = tuple(item[0] for item in ANALYTICS_CATALOG)
 
 # Every internal analytic_key feature flag granted by ANY catalog entry,
@@ -119,7 +127,10 @@ def aaco_product_status() -> dict:
         "key": "aaco",
         "label": "AACO",
         "sellable": False,
-        "reason": "Pricing, scope, and dependency on Face Access are not finalized -- business decision required before any catalog entry, Price ID, or checkout path is built.",
+        # 2026-09-30: AACO is included with every paid Local/Hybrid plan
+        # (pricing_catalog.INCLUDED_FEATURES) -- never sold on its own.
+        "included_with_plans": True,
+        "reason": "AACO is included with every paid Local and Hybrid plan; it is not sold separately.",
     }
 
 
@@ -209,6 +220,108 @@ def upsert_analytics_subscription(
     return row("SELECT * FROM analytics_subscriptions WHERE id=?", (subscription_id,))
 
 
+def checkout_item(addon_key: str, customer_id: Optional[str] = None) -> dict:
+    """Whether this SKU can be bought right now, how it is counted and which
+    Friends & Family discount class it belongs to -- all from
+    pricing_catalog. The original single-price Face Access SKU is kept for
+    existing subscriptions but is no longer sold; Face Access is sold per
+    door in the size that matches the customer's enrolled people."""
+    addon = _catalog.find_addon(addon_key)
+    if addon:
+        return {"sellable": addon["sellable"], "unavailable_reason": addon["unavailable_reason"],
+                "unit": addon["unit"], "discount_class": addon["discount_class"]}
+    tier = next((t for t in _catalog.face_access_tiers() if f"face_access_{t['size']}" == addon_key), None)
+    if tier:
+        result = {"sellable": tier["sellable"], "unavailable_reason": tier["unavailable_reason"],
+                  "unit": "per_door", "discount_class": "face_access"}
+        if tier["sellable"] and customer_id:
+            size = face_access_size_for_customer(customer_id)
+            if size == _catalog.FACE_ACCESS_ENTERPRISE:
+                result.update(sellable=False, unavailable_reason="More than 500 enrolled people needs Face Access Enterprise pricing. Contact AnyAiCam.")
+            elif size != tier["size"]:
+                result.update(sellable=False, unavailable_reason=f"Your account needs Face Access {size.title()} for the people enrolled.")
+        return result
+    return {"sellable": False, "unavailable_reason": "Face Access is now sold per door by size.",
+            "unit": "per_account", "discount_class": "face_access"}
+
+
+def face_access_size_for_customer(customer_id: str) -> str:
+    enrolled = row("SELECT COUNT(*) AS n FROM facial_people WHERE customer_id=? AND status='active'", (customer_id,))
+    return _catalog.face_access_size_for(int((enrolled or {}).get("n") or 0))
+
+
+def door_count_for_customer(customer_id: str) -> int:
+    """Doors for per-door Face Access billing: cameras set up with a door."""
+    doors = row("SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND door_access_enabled=1", (customer_id,))
+    return int((doors or {}).get("n") or 0)
+
+
+def _grants_for(addon_key: str) -> tuple:
+    return next((item[2] for item in ANALYTICS_CATALOG if item[0] == addon_key), ())
+
+
+def upsert_addon_subscription(
+    *, customer_id: str, addon_key: str, status: str, quantity: Optional[int] = None,
+    stripe_customer_id: Optional[str] = None, stripe_subscription_id: Optional[str] = None,
+    stripe_price_id: Optional[str] = None,
+) -> dict:
+    """Package-level state, one row per (customer_id, addon_key). This is
+    what makes overlapping packages safe: a feature row is only cancelled
+    when no remaining active package grants it (see _cancel_features())."""
+    existing = row("SELECT * FROM addon_subscriptions WHERE customer_id=? AND addon_key=?", (customer_id, addon_key))
+    now = datetime.now().isoformat()
+    with connection() as db:
+        if existing:
+            db.execute(
+                "UPDATE addon_subscriptions SET status=?,quantity=COALESCE(?,quantity),"
+                "stripe_customer_id=COALESCE(?,stripe_customer_id),stripe_subscription_id=COALESCE(?,stripe_subscription_id),"
+                "stripe_price_id=COALESCE(?,stripe_price_id),updated_at=? WHERE id=?",
+                (status, quantity, stripe_customer_id, stripe_subscription_id, stripe_price_id, now, existing["id"]),
+            )
+            record_id = existing["id"]
+        else:
+            record_id = uuid.uuid4().hex
+            db.execute(
+                "INSERT INTO addon_subscriptions(id,customer_id,addon_key,status,quantity,stripe_customer_id,"
+                "stripe_subscription_id,stripe_price_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (record_id, customer_id, addon_key, status, quantity or 1, stripe_customer_id,
+                 stripe_subscription_id, stripe_price_id, now, now),
+            )
+    return row("SELECT * FROM addon_subscriptions WHERE id=?", (record_id,))
+
+
+def active_addon_keys(customer_id: str) -> list[str]:
+    return [item["addon_key"] for item in rows(
+        "SELECT addon_key FROM addon_subscriptions WHERE customer_id=? AND status='active' ORDER BY addon_key", (customer_id,))]
+
+
+def feature_granted_by_other_addon(customer_id: str, feature_key: str, *, excluding: str) -> bool:
+    return any(feature_key in _grants_for(key) for key in active_addon_keys(customer_id) if key != excluding)
+
+
+def account_wide_feature_active(db, customer_id: str, feature_key: str) -> bool:
+    """True when this feature covers every camera on the account: an
+    INCLUDED feature (Smart Motion, ...) while the customer holds an
+    active paid Local/Hybrid plan, or a feature granted by an active flat
+    package (packages are never per camera). Takes the caller's open
+    connection so it can run inside customer_analytics_panel's own
+    transaction."""
+    if feature_key in _catalog.INCLUDED_FEATURE_KEYS:
+        plan = db.execute(
+            "SELECT 1 FROM customer_entitlements WHERE customer_id=? AND status='active' AND camera_slot_quantity>0 "
+            "AND product IN ('camera_slots_local','camera_slots_hybrid') LIMIT 1",
+            (customer_id,),
+        ).fetchone()
+        if plan:
+            return True
+    for item in db.execute(
+        "SELECT addon_key FROM addon_subscriptions WHERE customer_id=? AND status='active'", (customer_id,)
+    ).fetchall():
+        if feature_key in _grants_for(item["addon_key"]):
+            return True
+    return False
+
+
 def get_analytics_subscriptions_for_customer(customer_id: str) -> list[dict]:
     return rows(
         "SELECT * FROM analytics_subscriptions WHERE customer_id=? AND site_id IS NULL ORDER BY created_at",
@@ -260,6 +373,12 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list[str
                 (datetime.now().isoformat(), customer_id, link["id"]),
             )
         resolved_ids.append(link["id"])
+        addon = resolve_addon(link["stripe_price_id"])
+        if addon:
+            upsert_addon_subscription(
+                customer_id=customer_id, addon_key=addon["addon_key"], status="active",
+                stripe_customer_id=link["stripe_customer_id"], stripe_price_id=link["stripe_price_id"],
+            )
     return resolved_ids
 
 
@@ -285,6 +404,14 @@ def _extract_checkout_fields(session_obj: dict) -> dict:
         "authoritative_customer_id": str(metadata.get("anyaicam_customer_id") or "") or None,
         "stripe_customer_id": str(session_obj.get("customer") or "") or None,
     }
+
+
+def _positive_int(value) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _sync_checkout_completed(event: dict) -> dict:
@@ -322,6 +449,11 @@ def _sync_checkout_completed(event: dict) -> dict:
             link_ids.append(link["id"])
         return {"status": "pending_link_created", "pending_link_ids": link_ids, "addon_key": addon["addon_key"], "analytic_keys": list(addon["analytic_keys"])}
 
+    upsert_addon_subscription(
+        customer_id=customer["id"], addon_key=addon["addon_key"], status="active",
+        quantity=_positive_int((session_obj.get("metadata") or {}).get("anyaicam_quantity")),
+        stripe_customer_id=fields["stripe_customer_id"], stripe_price_id=fields["price_id"],
+    )
     subscription_ids = []
     for analytic_key in addon["analytic_keys"]:
         subscription = upsert_analytics_subscription(
@@ -360,8 +492,11 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         return {"status": "ignored", "reason": "no verified analytics mapping for this stripe price id", "price_id": price_id}
 
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
+    items = ((subscription_obj.get("items") or {}).get("data") or [])
+    quantity = _positive_int(items[0].get("quantity")) if items and isinstance(items[0], dict) else None
     subscription_ids = []
     granted_keys = []
+    package_customer_id = None
     # One subscription can cover several analytic_keys ("advanced_
     # analytics" covers four) -- update/cancel every one of them
     # together from this one event, each still its own independent row,
@@ -382,8 +517,20 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
             customer_id = metadata_customer_id
         if not customer_id:
             continue
+        if package_customer_id is None:
+            package_customer_id = customer_id
+            upsert_addon_subscription(
+                customer_id=customer_id, addon_key=addon["addon_key"], status=new_status, quantity=quantity,
+                stripe_customer_id=stripe_customer_id, stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
+                stripe_price_id=price_id,
+            )
+        # Overlapping packages: a feature another active package still
+        # grants stays active when this package is cancelled.
+        feature_status = new_status
+        if new_status == "cancelled" and feature_granted_by_other_addon(customer_id, analytic_key, excluding=addon["addon_key"]):
+            feature_status = "active"
         subscription = upsert_analytics_subscription(
-            customer_id=customer_id, analytic_key=analytic_key, status=new_status,
+            customer_id=customer_id, analytic_key=analytic_key, status=feature_status,
             stripe_customer_id=stripe_customer_id, stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
             stripe_price_id=price_id,
         )

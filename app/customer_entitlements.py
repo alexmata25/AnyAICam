@@ -232,11 +232,38 @@ def total_camera_slots(customer_id: str) -> int:
     wizard, a future installer) must call to learn camera-slot capacity.
     Sums every *active* entitlement's camera_slot_quantity -- never a
     hard-coded constant, never a partner-typed `plans.camera_quantity`."""
+    # The one-time VMS software license (product "vms_license", 2026-09-30)
+    # is a licence of the software, not additional camera slots -- counting
+    # it here would double a customer's capacity.
     return sum(
         (item["camera_slot_quantity"] or 0)
         for item in get_entitlements_for_customer(customer_id)
-        if item["status"] == "active"
+        if item["status"] == "active" and item["product"] != VMS_LICENSE_PRODUCT
     )
+
+
+def appliance_includes_vms_license(customer_id: str) -> bool:
+    """An AnyAiCam appliance purchase includes the VMS software license, so
+    such a customer is never charged for it separately."""
+    return row(
+        "SELECT id FROM hardware_orders WHERE customer_id=? AND sku LIKE 'AIC-APPLIANCE-%' "
+        "AND status='paid' LIMIT 1",
+        (customer_id,),
+    ) is not None
+
+
+def vms_license_capacity(customer_id: str) -> int:
+    """Camera capacity of this customer's VMS software license: a purchased
+    (DIY) license, or -- for an appliance customer -- the capacity of their
+    current Local/Hybrid plan, which the appliance's included license
+    follows. 0 means no license on record."""
+    entitlements = [e for e in get_entitlements_for_customer(customer_id) if e["status"] == "active"]
+    purchased = max((int(e["camera_slot_quantity"] or 0) for e in entitlements if e["product"] == VMS_LICENSE_PRODUCT), default=0)
+    included = 0
+    if appliance_includes_vms_license(customer_id):
+        included = max((int(e["camera_slot_quantity"] or 0) for e in entitlements
+                        if e["product"] in ("camera_slots_local", "camera_slots_hybrid")), default=0)
+    return max(purchased, included)
 
 
 # ----------------------------------------------------------- pending links
@@ -308,65 +335,32 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list:
 # as of Phase 2 -- see module docstring. Each function here remains
 # independently callable/testable against a synthetic Stripe event dict.
 
-# Verified planning reference: AnyAiCam_AWS_Cost_Model_2026-09.xlsx,
-# "Local" and "Hybrid" sheets, column G ("Retail/site $"), read directly
-# from the workbook (not retyped from memory) -- confirmed identical
-# across every resolution row within each camera tier. This is a
-# PLANNING reference, not proof any Stripe product/Price ID exists for
-# these tiers -- see stripe_price_id below and the Phase 3/4 report for
-# the audit that found none of these 8 price points anywhere in existing
-# Stripe or website configuration.
-#
 # Local and Hybrid are deliberately separate service lines even where
 # their camera_slot_maximum coincides (both top out at 64) -- `product`
 # encodes which one, so a customer's Local and Hybrid entitlements (if
 # they somehow held both) never collide or overwrite each other, and an
 # upgrade within one line (e.g. Local 1-8 -> Local 9-16) never touches
-# the other. Each tier's real Stripe Price ID -- when one is created and
-# verified -- goes in its own env var; unset (the default for all eight
-# today) means that tier is not purchasable/grantable yet, not a guess.
+# the other. Each tier's Stripe Price ID goes in its own env var; unset
+# means that tier is not purchasable/grantable yet, never a guess.
+# create_camera_slot_checkout() in main.py branches Stripe Checkout
+# `mode` off billing_type alone, never off a plan_type string.
 #
-# Business decision confirmed 2026-09-21: Local is a one-time purchase
-# (billing_type="one_time" -> Stripe Checkout mode="payment"), Hybrid
-# remains a recurring subscription (billing_type="recurring" -> mode=
-# "subscription") -- see create_camera_slot_checkout() in main.py, which
-# branches Stripe Checkout `mode` off this field alone, never off a
-# hardcoded plan_type string, so a future third plan_type only needs an
-# entry here, not a new branch at every call site.
-#
-# IMPORTANT -- monthly_retail_usd for the four "local" rows below is a
-# CARRIED-OVER PLACEHOLDER from the pre-2026-09-21 monthly-subscription
-# model, not a confirmed one-time price. A monthly recurring price and a
-# fair one-time price are not the same number by any straightforward
-# conversion (they trade off against different customer lifetime-value
-# assumptions), so these four figures must not be read as "the" Local
-# price -- they exist only so the website pricing table has a non-empty
-# placeholder to render until a real one-time price is chosen. The four
-# "hybrid" rows are unaffected by this change and keep their verified
-# monthly figures from the AWS cost model.
-#
-# ALSO IMPORTANT -- test_local_hybrid_pricing_tiers.py's LIVE_PRICE_IDS
-# documents 8 real, live-mode Stripe Price IDs already created for this
-# table (not yet deployed). Those 4 "hybrid" Price IDs remain valid.
-# The 4 "local" Price IDs do NOT: they were created as recurring-monthly
-# Price objects, and a Stripe Price's recurring/one-time nature is fixed
-# permanently at creation time -- it cannot be edited into a one-time
-# price after the fact. Using mode="payment" (now correct for Local)
-# against one of those old recurring Price IDs will make Stripe reject
-# the Checkout Session outright. Four NEW one-time-mode Price objects
-# must be created in Stripe for Local before ANYAICAM_STRIPE_PRICE_
-# LOCAL_1_8/9_16/17_32/33_64 can be set to anything real again -- see
-# the restructure report for the full flagged list.
+# 2026-09-30: prices and billing now come from pricing_catalog.BASE_PLANS,
+# the one authoritative catalog (approved working pricing). Local and
+# Hybrid are both MONTHLY subscriptions again (Local $14.99/$24.99/$39.99/
+# $69.99, Hybrid $24.99/$39.99/$69.99/$99.99), so every tier is
+# billing_type "recurring" -> Stripe mode="subscription". The tuple shape
+# below is unchanged for existing callers. The earlier live-mode Price IDs
+# were created at the previous amounts, so new Stripe Price objects at
+# these amounts must be configured in ANYAICAM_STRIPE_PRICE_LOCAL_*/
+# HYBRID_* -- see PROJECT_CHECKPOINT.md.
+from pricing_catalog import BASE_PLANS as _CATALOG_BASE_PLANS
+from pricing_catalog import VMS_LICENSE_PRODUCT, VMS_LICENSES as _CATALOG_VMS_LICENSES
+
 PLAN_TIERS = [
     # plan_type, tier_label, min_cameras, max_cameras, camera_slot_maximum, monthly_retail_usd, price_id_env_var, billing_type
-    ("local", "1-8", 1, 8, 8, 14.99, "ANYAICAM_STRIPE_PRICE_LOCAL_1_8", "one_time"),
-    ("local", "9-16", 9, 16, 16, 19.99, "ANYAICAM_STRIPE_PRICE_LOCAL_9_16", "one_time"),
-    ("local", "17-32", 17, 32, 32, 29.99, "ANYAICAM_STRIPE_PRICE_LOCAL_17_32", "one_time"),
-    ("local", "33-64", 33, 64, 64, 49.99, "ANYAICAM_STRIPE_PRICE_LOCAL_33_64", "one_time"),
-    ("hybrid", "1-8", 1, 8, 8, 29.99, "ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "recurring"),
-    ("hybrid", "9-16", 9, 16, 16, 49.99, "ANYAICAM_STRIPE_PRICE_HYBRID_9_16", "recurring"),
-    ("hybrid", "17-32", 17, 32, 32, 89.99, "ANYAICAM_STRIPE_PRICE_HYBRID_17_32", "recurring"),
-    ("hybrid", "33-64", 33, 64, 64, 149.99, "ANYAICAM_STRIPE_PRICE_HYBRID_33_64", "recurring"),
+    (plan_type, tier_label, min_cameras, max_cameras, max_cameras, round(cents / 100, 2), env_var, "recurring")
+    for plan_type, tier_label, min_cameras, max_cameras, cents, env_var in _CATALOG_BASE_PLANS
 ]
 
 
@@ -390,11 +384,10 @@ def _plan_tier_rows() -> list[dict]:
 def pricing_table_for_website() -> list[dict]:
     """Prepared, ready-to-render pricing data for the customer-facing VMS
     website pricing section -- plan type, camera range, billing_type
-    ("one_time" for Local, "recurring" for Hybrid -- the website must
-    render "one-time" vs "/mo" off this field, never infer it from
-    plan_type), and placeholder retail price for all 8 tiers. Does NOT
-    include stripe_price_id (irrelevant to a pricing page, and unset for
-    all eight tiers today besides)."""
+    (every tier is "recurring" -- monthly -- as of 2026-09-30; the website
+    still renders off this field, never infers it from plan_type), and the
+    catalog's monthly retail price for all 8 tiers. Does NOT include
+    stripe_price_id (irrelevant to a pricing page)."""
     return [
         {"plan_type": r["plan_type"], "tier_label": r["tier_label"], "min_cameras": r["min_cameras"],
          "max_cameras": r["max_cameras"], "monthly_retail_usd": r["monthly_retail_usd"], "billing_type": r["billing_type"]}
@@ -421,6 +414,25 @@ def _load_price_tier_map() -> dict:
 
 
 PRICE_ID_CAMERA_SLOT_MAP = _load_price_tier_map()
+
+
+def _load_vms_license_map() -> dict:
+    """Stripe Price ID -> one-time VMS license capacity; unset env vars
+    contribute nothing (fail closed)."""
+    mapping = {}
+    for capacity, _cents, env_var in _CATALOG_VMS_LICENSES:
+        price_id = os.environ.get(env_var, "").strip()
+        if price_id:
+            mapping[price_id] = {"product": VMS_LICENSE_PRODUCT, "camera_slot_maximum": capacity, "billing_type": "one_time"}
+    return mapping
+
+
+PRICE_ID_VMS_LICENSE_MAP = _load_vms_license_map()
+
+
+def resolve_vms_license(price_id: str) -> Optional[dict]:
+    entry = PRICE_ID_VMS_LICENSE_MAP.get(price_id or "")
+    return dict(entry) if isinstance(entry, dict) else None
 
 SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
 
@@ -511,7 +523,7 @@ def _sync_checkout_completed(event: dict) -> dict:
     # any other metadata on this event claims (tamper resistance: a
     # forged/stale anyaicam_camera_slot_quantity value, if one is even
     # present on an old-shaped event, is never read here at all).
-    tier = resolve_tier(fields["price_id"])
+    tier = resolve_tier(fields["price_id"]) or resolve_vms_license(fields["price_id"])
     if not tier:
         return {"status": "ignored", "reason": "no verified tier mapping for this stripe price id", "price_id": fields["price_id"]}
 

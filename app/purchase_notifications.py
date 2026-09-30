@@ -129,7 +129,8 @@ def _first_name(full_name: Optional[str]) -> str:
     return name.split(" ", 1)[0]
 
 
-PLAN_LABELS = {"camera_slots_local": "Local", "camera_slots_hybrid": "Hybrid"}
+PLAN_LABELS = {"camera_slots_local": "Local", "camera_slots_hybrid": "Hybrid",
+               "vms_license": "AnyAiCam VMS software license (one-time)"}
 
 
 def _plan_label(product: str) -> str:

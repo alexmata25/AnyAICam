@@ -131,6 +131,39 @@ def _save_quotes(quotes: list) -> None:
     temp.write_text(json.dumps(builder + [item for item in quotes if 'quote_name' not in item], indent=2), encoding='utf-8'); temp.replace(QUOTES_FILE)
 
 
+def _earned_commissions_panel(identity: dict) -> str:
+    """Real, payment-verified commission records (sales_commissions.py) --
+    unlike the estimates above, these exist only once Stripe confirmed a
+    payment. A salesperson sees their own; a partner owner their company's;
+    a global administrator is pointed at /api/sales/commissions."""
+    import sales_commissions
+    from html import escape as _esc
+    role = identity.get('role')
+    if role == 'salesperson':
+        user = sales_commissions._sales_user(identity.get('email', ''))
+        entries = sales_commissions.ledger_for(salesperson_user_id=user['id']) if user else []
+    elif role == 'partner_owner' and identity.get('partner_id'):
+        entries = sales_commissions.ledger_for(partner_id=identity['partner_id'])
+    else:
+        return ''
+    summary = sales_commissions.summarize(entries)
+    from partner_db import rows as _rows
+    ids = sorted({e['customer_id'] for e in entries[:100]})
+    names = ({c['id']: c['name'] for c in _rows(f"SELECT id,name FROM customers WHERE id IN ({','.join('?' for _ in ids)})", tuple(ids))}
+             if ids else {})
+    kinds = {'activation': 'Activation', 'hardware': 'Hardware', 'recurring': 'Recurring'}
+    rows_html = ''.join(
+        f"<tr><td>{kinds.get(e['kind'], e['kind'])}</td><td>{_esc(names.get(e['customer_id']) or 'Customer')}</td>"
+        f"<td>${int(e['amount_cents']) / 100:,.2f}</td><td>{_esc(e['status'].replace('_', ' '))}</td>"
+        f"<td data-local-time=\"{_esc(e['earned_at'], quote=True)}\">{_esc(e['earned_at'][:10])}</td></tr>"
+        for e in entries[:100]
+    ) or '<tr><td colspan="5">No earned commissions yet.</td></tr>'
+    return (f'<section class="panel" style="margin-top:14px"><h2>Earned commissions</h2>'
+            f'<p class="health-detail">Recorded when payments are confirmed. Total earned: ${summary["earned_cents"] / 100:,.2f}.</p>'
+            f'<table><tr><th>Type</th><th>Customer</th><th>Amount</th><th>Status</th><th>Earned</th></tr>{rows_html}</table>'
+            '<script>document.querySelectorAll("[data-local-time]").forEach(el=>{const d=new Date(el.dataset.localTime);if(!isNaN(d))el.textContent=d.toLocaleDateString();});</script></section>')
+
+
 def register_partner_routes(app: FastAPI, shell: Callable) -> None:
     @app.get('/api/public-pricing')
     def public_prices() -> dict:
@@ -406,7 +439,7 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
         with connection() as db:
             quotes=[q for q in _read_quotes() if tenant_owns_partner(db,identity,q.get('partner_id'))]
         monthly=sum(float(q.get('monthly_recurring_profit',0)) for q in quotes); first_year=sum(float(q.get('first_year_profit',0)) for q in quotes)
-        content=f'''<header class="topbar"><div><p class="eyebrow">Protected partner tools</p><h1>Commissions and recurring revenue</h1></div></header><section class="summary"><div class="stat"><span class="stat-label">Active estimates</span><span class="stat-value">{len(quotes)}</span></div><div class="stat"><span class="stat-label">Estimated monthly recurring profit</span><span class="stat-value">${monthly:,.2f}</span></div><div class="stat"><span class="stat-label">Estimated first-year profit</span><span class="stat-value">${first_year:,.2f}</span></div></section><div class="empty">Revenue appears after partner quotes are saved and approved.</div>'''
+        content=f'''<header class="topbar"><div><p class="eyebrow">Protected partner tools</p><h1>Commissions and recurring revenue</h1></div></header><section class="summary"><div class="stat"><span class="stat-label">Active estimates</span><span class="stat-value">{len(quotes)}</span></div><div class="stat"><span class="stat-label">Estimated monthly recurring profit</span><span class="stat-value">${monthly:,.2f}</span></div><div class="stat"><span class="stat-label">Estimated first-year profit</span><span class="stat-value">${first_year:,.2f}</span></div></section><div class="empty">Revenue appears after partner quotes are saved and approved.</div>{_earned_commissions_panel(identity)}'''
         return shell('Partner revenue','partner-revenue',content)
 
     @app.get('/partner-pricing-admin', response_class=HTMLResponse)

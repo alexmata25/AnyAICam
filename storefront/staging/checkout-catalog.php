@@ -41,10 +41,18 @@ declare(strict_types=1);
  * subscriptions end to end) -- B is materially larger and riskier for a
  * staging build with no product requirement driving it yet.
  *
- * SANDBOX TEST PRICES: every display_price below is the tiny Stripe
- * TEST-mode amount that stripe-config.php's Price IDs actually charge,
- * not real retail. Never promote these numbers (or this catalog) to
- * production as-is.
+ * SANDBOX TEST PRICES: every display_price below is the tiny Stripe TEST
+ * amount the Price IDs in stripe-config.php actually charge -- never the
+ * retail price. Retail prices live ONLY in app/pricing_catalog.py
+ * (approved 2026-09-30); never promote these numbers to production.
+ * Structure follows that catalog: Local/Hybrid plans, the four analytics
+ * packages (flat, never per camera), Talk Down (per site, includes AAC
+ * Voice Call), and the one-time VMS software license -- charged for a DIY
+ * install, included (not charged) when an AnyAiCam appliance is in the
+ * cart. Secure Edge, Smart Motion and AACO are included in every plan.
+ * Advanced Analytics and the VMS licenses have no TEST Price ID yet and
+ * fail closed. Friends & Family is never a code: it is requested from the
+ * customer's signed-in AnyAiCam account and approved by an administrator.
  */
 
 require_once __DIR__ . '/stripe-config.php';
@@ -60,28 +68,49 @@ function config_value_checked(string $name): string {
 // catalog anywhere: camera plans and analytics.
 
 const CAMERA_PLAN_CATALOG = [
-    'local_1_8'    => ['type' => 'local',  'label' => 'Local 1–8 cameras',      'display_price' => 0.60, 'price_id_const' => 'LOCAL_1_8_PRICE_ID'],
-    'local_9_16'   => ['type' => 'local',  'label' => 'Local 9–16 cameras',     'display_price' => 0.61, 'price_id_const' => 'LOCAL_9_16_PRICE_ID'],
-    'local_17_32'  => ['type' => 'local',  'label' => 'Local 17–32 cameras',    'display_price' => 0.62, 'price_id_const' => 'LOCAL_17_32_PRICE_ID'],
-    'local_33_64'  => ['type' => 'local',  'label' => 'Local 33–64 cameras',    'display_price' => 0.63, 'price_id_const' => 'LOCAL_33_64_PRICE_ID'],
-    'hybrid_1_8'   => ['type' => 'hybrid', 'label' => 'Hybrid 1–8 cameras',     'display_price' => 0.70, 'price_id_const' => 'HYBRID_1_8_PRICE_ID'],
-    'hybrid_9_16'  => ['type' => 'hybrid', 'label' => 'Hybrid 9–16 cameras',    'display_price' => 0.71, 'price_id_const' => 'HYBRID_9_16_PRICE_ID'],
-    'hybrid_17_32' => ['type' => 'hybrid', 'label' => 'Hybrid 17–32 cameras',   'display_price' => 0.72, 'price_id_const' => 'HYBRID_17_32_PRICE_ID'],
-    'hybrid_33_64' => ['type' => 'hybrid', 'label' => 'Hybrid 33–64 cameras',   'display_price' => 0.73, 'price_id_const' => 'HYBRID_33_64_PRICE_ID'],
+    'local_1_8'    => ['type' => 'local',  'capacity' => 8,  'label' => 'Local 8 cameras',   'display_price' => 0.60, 'price_id_const' => 'LOCAL_1_8_PRICE_ID'],
+    'local_9_16'   => ['type' => 'local',  'capacity' => 16, 'label' => 'Local 16 cameras',  'display_price' => 0.61, 'price_id_const' => 'LOCAL_9_16_PRICE_ID'],
+    'local_17_32'  => ['type' => 'local',  'capacity' => 32, 'label' => 'Local 32 cameras',  'display_price' => 0.62, 'price_id_const' => 'LOCAL_17_32_PRICE_ID'],
+    'local_33_64'  => ['type' => 'local',  'capacity' => 64, 'label' => 'Local 64 cameras',  'display_price' => 0.63, 'price_id_const' => 'LOCAL_33_64_PRICE_ID'],
+    'hybrid_1_8'   => ['type' => 'hybrid', 'capacity' => 8,  'label' => 'Hybrid 8 cameras',  'display_price' => 0.70, 'price_id_const' => 'HYBRID_1_8_PRICE_ID'],
+    'hybrid_9_16'  => ['type' => 'hybrid', 'capacity' => 16, 'label' => 'Hybrid 16 cameras', 'display_price' => 0.71, 'price_id_const' => 'HYBRID_9_16_PRICE_ID'],
+    'hybrid_17_32' => ['type' => 'hybrid', 'capacity' => 32, 'label' => 'Hybrid 32 cameras', 'display_price' => 0.72, 'price_id_const' => 'HYBRID_17_32_PRICE_ID'],
+    'hybrid_33_64' => ['type' => 'hybrid', 'capacity' => 64, 'label' => 'Hybrid 64 cameras', 'display_price' => 0.73, 'price_id_const' => 'HYBRID_33_64_PRICE_ID'],
 ];
 
+// Analytics packages (flat, never per camera) and Talk Down (per site,
+// includes AAC Voice Call). Package contents live in app/pricing_catalog.py.
 const ANALYTICS_CATALOG = [
-    'smart_motion'         => ['label' => 'Smart Motion',                 'display_price' => 0.80, 'price_id_const' => 'ANALYTICS_SMART_MOTION_PRICE_ID'],
-    'people_counting'      => ['label' => 'People Counting',              'display_price' => 0.81, 'price_id_const' => 'ANALYTICS_PEOPLE_COUNTING_PRICE_ID'],
-    'lpr'                  => ['label' => 'License Plate Recognition',    'display_price' => 0.82, 'price_id_const' => 'ANALYTICS_LPR_PRICE_ID'],
-    'ppe'                  => ['label' => 'PPE Detection',                'display_price' => 0.83, 'price_id_const' => 'ANALYTICS_PPE_PRICE_ID'],
-    'talk_down'            => ['label' => 'Talk Down',                    'display_price' => 0.84, 'price_id_const' => 'ANALYTICS_TALK_DOWN_PRICE_ID'],
-    'ai_essentials'        => ['label' => 'AnyAiCam AI Essentials',       'display_price' => 0.85, 'price_id_const' => 'ANALYTICS_AI_ESSENTIALS_PRICE_ID'],
-    'ai_professional'      => ['label' => 'AnyAiCam AI Professional',     'display_price' => 0.86, 'price_id_const' => 'ANALYTICS_AI_PROFESSIONAL_PRICE_ID'],
-    'vehicle_intelligence' => ['label' => 'Vehicle Intelligence',         'display_price' => 0.87, 'price_id_const' => 'ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID'],
-    'cloud_overflow'       => ['label' => 'Cloud Overflow',               'display_price' => 0.88, 'price_id_const' => 'ANALYTICS_CLOUD_OVERFLOW_PRICE_ID'],
-    'facial_recognition'   => ['label' => 'Facial Recognition',           'display_price' => 0.89, 'price_id_const' => 'ANALYTICS_FACIAL_RECOGNITION_PRICE_ID'],
+    'ai_essentials'        => ['label' => 'AI Essentials',                        'display_price' => 0.85, 'price_id_const' => 'ANALYTICS_AI_ESSENTIALS_PRICE_ID'],
+    'ai_professional'      => ['label' => 'AI Professional',                      'display_price' => 0.86, 'price_id_const' => 'ANALYTICS_AI_PROFESSIONAL_PRICE_ID'],
+    'vehicle_intelligence' => ['label' => 'Vehicle Intelligence',                 'display_price' => 0.87, 'price_id_const' => 'ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID'],
+    'advanced_analytics'   => ['label' => 'Advanced Analytics',                   'display_price' => null, 'price_id_const' => 'ANALYTICS_ADVANCED_PRICE_ID'],
+    'talk_down'            => ['label' => 'Talk Down (includes AAC Voice Call)',  'display_price' => 0.84, 'price_id_const' => 'ANALYTICS_TALK_DOWN_PRICE_ID'],
 ];
+
+// One-time VMS software license, keyed by camera capacity. Sandbox TEST
+// amounts (retail: $49.99 / $79.99 / $129.99 / $199.99, app/pricing_catalog.py).
+const VMS_LICENSE_CATALOG = [
+    8  => ['label' => 'VMS software license, 8 cameras',  'display_price' => 0.40, 'price_id_const' => 'VMS_LICENSE_8_PRICE_ID'],
+    16 => ['label' => 'VMS software license, 16 cameras', 'display_price' => 0.41, 'price_id_const' => 'VMS_LICENSE_16_PRICE_ID'],
+    32 => ['label' => 'VMS software license, 32 cameras', 'display_price' => 0.42, 'price_id_const' => 'VMS_LICENSE_32_PRICE_ID'],
+    64 => ['label' => 'VMS software license, 64 cameras', 'display_price' => 0.43, 'price_id_const' => 'VMS_LICENSE_64_PRICE_ID'],
+];
+
+/** Fail-closed: an unknown or unconfigured license capacity resolves to null. */
+function resolve_vms_license(int $capacity): ?array {
+    if (!isset(VMS_LICENSE_CATALOG[$capacity])) {
+        return null;
+    }
+    $entry = VMS_LICENSE_CATALOG[$capacity];
+    $priceId = config_value_checked($entry['price_id_const']);
+    if ($priceId === '') {
+        return null;
+    }
+    return ['key' => (string)$capacity, 'capacity' => $capacity] + $entry + ['price_id' => $priceId];
+}
+
+const INCLUDED_FEATURES = ['Secure Edge', 'Smart Motion', 'AACO'];
 
 /** Fail-closed: an unknown camera-plan key resolves to null, never a guess. */
 function resolve_camera_plan(string $key): ?array {
@@ -165,12 +194,25 @@ function normalize_cart(array $raw, array $hardwareCatalog): array {
         throw new InvalidArgumentException('Select at least one item before checking out.');
     }
 
+    // One-time VMS software license: included with an AnyAiCam appliance
+    // (never charged twice); charged once for a DIY / customer-owned PC.
+    $vmsLicense = null;
+    $vmsLicenseIncluded = $cameraPlan !== null && $applianceSku !== '';
+    if ($cameraPlan !== null && $applianceSku === '') {
+        $vmsLicense = resolve_vms_license((int)$cameraPlan['capacity']);
+        if ($vmsLicense === null) {
+            throw new InvalidArgumentException('The VMS software license for this camera capacity is not available yet.');
+        }
+    }
+
     return [
         'customer_email' => $email,
         'appliance_sku' => $applianceSku,
         'relay' => $relay,
         'camera_plan' => $cameraPlan,
         'analytics' => $analytics,
+        'vms_license' => $vmsLicense,
+        'vms_license_included' => $vmsLicenseIncluded,
     ];
 }
 
@@ -217,6 +259,18 @@ function build_checkout_legs(array $cart, array $hardwareCatalog): array {
             'price_id' => $plan['price_id'],
             'mode' => 'subscription',
             'amount' => $plan['display_price'],
+        ];
+    }
+
+    if (($cart['vms_license'] ?? null) !== null) {
+        $license = $cart['vms_license'];
+        $legs[] = [
+            'kind' => 'vms_license',
+            'key' => $license['key'],
+            'label' => $license['label'],
+            'price_id' => $license['price_id'],
+            'mode' => 'payment',
+            'amount' => $license['display_price'],
         ];
     }
 

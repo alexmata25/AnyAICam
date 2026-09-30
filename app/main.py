@@ -7642,14 +7642,22 @@ class CameraSlotCheckoutModel(BaseModel):
 
 
 class AnalyticsAddonCheckoutModel(BaseModel):
-    # Commercial restructure confirmed 2026-09-21, corrected same day:
-    # Advanced Analytics is ONE recurring, customer-billed add-on that
-    # unlocks smart_motion/people_counting/lpr/ppe together (not four
-    # separate purchases); Face Access (facial_recognition) is its own
-    # separate recurring add-on. The customer selects one catalog
+    # Each analytics package (pricing_catalog.ADDONS) is ONE recurring,
+    # customer-billed add-on that unlocks its features together (Advanced
+    # Analytics: people_counting/lpr/ppe as of 2026-09-30; Smart Motion is
+    # included with every plan); Face Access is sold per door by size. The customer selects one catalog
     # addon_key (analytics_entitlements.ANALYTICS_CATALOG), never a
     # Stripe Price ID and never an internal analytic_key directly.
     addon_key: str
+    # Only for per-site / per-door items (Talk Down sites, Face Access
+    # doors); bounded server-side. Packages are flat and ignore it.
+    quantity: int = 1
+
+
+class VmsLicenseCheckoutModel(BaseModel):
+    # One-time AnyAiCam VMS software license for a DIY / customer-owned PC
+    # installation, sized to camera capacity (pricing_catalog.VMS_LICENSES).
+    capacity: int
 
 
 class StripeCheckoutCreateModel(BaseModel):
@@ -19274,6 +19282,46 @@ def stripe_configuration_snapshot() -> dict:
 
 
 
+
+
+def stripe_api_get(path: str) -> dict:
+    """Read-only Stripe GET (e.g. /v1/prices/{id}); same auth and error
+    handling as stripe_api_post()."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe is not configured. Add ANYAICAM_STRIPE_SECRET_KEY.")
+    request = UrlRequest(
+        f"{STRIPE_API_BASE}{path}", method="GET",
+        headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}", "User-Agent": f"AnyAiCam-VMS/{APP_VERSION}"},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Could not verify the price with Stripe. Try again shortly.") from exc
+
+
+_VERIFIED_STRIPE_PRICES: dict = {}
+
+
+def require_stripe_price_matches_catalog(price_id: str, expected_cents: int, interval: str | None) -> None:
+    """Pricing guard (2026-09-30): before any Checkout Session is created,
+    the configured Stripe Price must charge exactly what the customer was
+    shown (pricing_catalog), in the right billing mode. Stripe Price amounts
+    are immutable, so a Price ID left over from earlier pricing would
+    otherwise silently charge the old amount. Refuses (503) on mismatch;
+    a verified match is cached for the life of the process."""
+    key = (price_id, int(expected_cents), interval)
+    if _VERIFIED_STRIPE_PRICES.get(key):
+        return
+    price = stripe_api_get(f"/v1/prices/{quote(price_id, safe='')}")
+    actual_interval = ((price.get("recurring") or {}).get("interval")) if price.get("recurring") else None
+    if (int(price.get("unit_amount") or -1) != int(expected_cents) or actual_interval != interval
+            or str(price.get("currency") or "").lower() != "usd" or price.get("active") is False):
+        structured_log("stripe.price_catalog_mismatch", level="error", price_id=price_id,
+                       expected_cents=int(expected_cents), actual_cents=price.get("unit_amount"),
+                       expected_interval=interval, actual_interval=actual_interval)
+        raise HTTPException(status_code=503, detail="PRICE_MISMATCH: this item's Stripe price does not match the published price, so checkout is paused. Please contact AnyAiCam support.")
+    _VERIFIED_STRIPE_PRICES[key] = True
 
 
 def stripe_api_post(path: str, fields: list[tuple[str, str]]) -> dict:
@@ -41936,6 +41984,9 @@ PUBLIC_PATH_PREFIXES = (
     # 2026-09-26): it always answered 401 to the visitors it is for.
     # Exact path only -- /api/admin/partner-applications stays protected.
     "/api/partner-applications",
+    # Customer-safe price list (pricing_catalog.public_catalog(): no Stripe
+    # IDs, no commission data) for the website and storefront.
+    "/api/pricing/catalog",
 
     "/api/portal-login",
 
@@ -104140,6 +104191,11 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         plan_type = "hybrid" if camera_entitlement["product"] == "camera_slots_hybrid" else "local"
         tier_label = next((t[1] for t in PLAN_TIERS if t[0] == plan_type and t[4] == camera_entitlement["camera_slot_quantity"]), f"{licensed_slots} cameras")
         plan_summary = f"{plan_type.title()} {tier_label} &middot; {licensed_slots} licensed camera slots"
+        import pricing_catalog as _plan_catalog
+        _plan = _plan_catalog.find_base_plan(plan_type, tier_label)
+        if _plan:
+            plan_summary = (f"{escape(_plan['label'])} &middot; {licensed_slots} licensed camera slots"
+                            f" &middot; ${_plan['monthly_cents'] / 100:.2f}/mo")
     else:
         plan_summary = "No camera-slot plan purchased yet"
 
@@ -104171,13 +104227,75 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         upgrade_tier = next((t for t in hybrid_tier_options if t["camera_slot_maximum"] == camera_entitlement["camera_slot_quantity"]), None)
 
     active_analytics = set(get_active_analytics_for_customer(customer_id))
+    # 2026-09-30 pricing: prices and sellability come from pricing_catalog;
+    # which packages are held comes from addon_subscriptions (packages
+    # overlap, so "all of its features are on" no longer identifies one).
+    import pricing_catalog
+    import friends_family
+    from analytics_entitlements import active_addon_keys, checkout_item
+    from partner_db import rows as partner_rows
+    held_addons = set(active_addon_keys(customer_id))
+    _friends_family_panel = friends_family.customer_panel_html()
+    # One-time VMS software license (2026-09-30): included with an AnyAiCam
+    # appliance, bought once for a DIY / customer-owned PC installation.
+    from customer_entitlements import appliance_includes_vms_license, vms_license_capacity
+    _licensed = vms_license_capacity(customer_id)
+    _plan_capacity = int(camera_entitlement["camera_slot_quantity"] or 0) if camera_entitlement else 0
+    _license_offer = pricing_catalog.find_vms_license(_plan_capacity) if _plan_capacity else None
+    if appliance_includes_vms_license(customer_id):
+        _license_html = (f'<div class="health-row"><span>Included with your AnyAiCam appliance'
+                         f'{f" &middot; {_licensed} cameras" if _licensed else ""}</span><span class="pill">Included</span></div>')
+    elif _licensed:
+        _license_html = f'<div class="health-row"><span>Licensed for {_licensed} cameras (one-time purchase)</span><span class="pill">Active</span></div>'
+    elif _license_offer:
+        _price = f"${_license_offer['one_time_cents'] / 100:.2f} one-time"
+        if is_owner and _license_offer["stripe_price_id"]:
+            _action = f'<button class="ghost-button" id="vms-license-buy" data-capacity="{_license_offer["capacity"]}">Buy license</button>'
+        elif is_owner:
+            _action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
+        else:
+            _action = '<span class="health-detail">Not purchased</span>'
+        _license_html = (f'<div class="health-row"><span>Software license for {_license_offer["capacity"]} cameras<br>'
+                         f'<span class="health-detail">{_price} &middot; for your own PC. Included free with an AnyAiCam appliance.</span></span>{_action}</div>')
+    else:
+        _license_html = '<p class="health-detail">Choose a camera plan first; the software license matches its camera capacity. It is included with every AnyAiCam appliance.</p>'
+    _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'
+                      f'{_license_html}<p id="vms-license-message" class="health-detail"></p></section>')
+    site_count = max(1, len(partner_rows("SELECT id FROM sites WHERE customer_id=?", (customer_id,))))
+
+    def _price_text(addon_key: str) -> str:
+        addon = pricing_catalog.find_addon(addon_key)
+        if addon and addon["monthly_cents"] is not None:
+            per = " per site" if addon["unit"] == "per_site" else ""
+            return f"${addon['monthly_cents'] / 100:.2f}/mo{per}"
+        tier = next((t for t in pricing_catalog.face_access_tiers() if f"face_access_{t['size']}" == addon_key), None)
+        return f"${tier['monthly_cents_per_door'] / 100:.2f}/mo per door" if tier else ""
+
     addon_rows = ""
+    # Face Access: only the size that fits this customer's enrolled people is
+    # offered, billed per door; over 500 people is Enterprise (contact us).
+    from analytics_entitlements import face_access_size_for_customer, door_count_for_customer
+    face_size = face_access_size_for_customer(customer_id)
+    door_count = max(1, door_count_for_customer(customer_id))
+    face_access_held = any(key.startswith("face_access_") or key == "facial_recognition" for key in held_addons) or "facial_recognition" in active_analytics
     for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
         price_id = os.environ.get(env_var, "").strip()
-        is_active = bool(analytic_keys) and all(key in active_analytics for key in analytic_keys)
+        # Purchases made before addon_subscriptions existed are recognised
+        # by their exact old shape: the old Advanced Analytics granted these
+        # four keys; every other old SKU wrote a row keyed by the SKU itself.
+        is_active = (addon_key in held_addons or addon_key in active_analytics
+                     or (addon_key == "advanced_analytics"
+                         and {"smart_motion", "people_counting", "lpr", "ppe"} <= active_analytics))
+        item = checkout_item(addon_key, customer_id)
+        if addon_key == "facial_recognition" and not is_active:
+            continue  # the old single-price SKU: shown only to customers who hold it
+        if addon_key.startswith("face_access_") and not is_active:
+            if face_access_held or addon_key != f"face_access_{face_size}":
+                continue
+        quantity = site_count if item["unit"] == "per_site" else door_count if item["unit"] == "per_door" else 1
         if is_active:
             status_html = '<span class="pill">Active</span>'
-        elif not price_id:
+        elif not price_id or not item["sellable"]:
             # Catalog defines this SKU but its Stripe Price ID env var
             # isn't configured in this environment yet -- shown honestly
             # rather than silently omitted (a customer with it already
@@ -104186,15 +104304,24 @@ def _customer_subscription_portal_page(identity: dict) -> str:
             # aaco_product_status()'s own "sellable: false" precedent.
             status_html = '<span class="pending-badge" aria-disabled="true" title="Not available to purchase yet">Not available yet</span>'
         elif is_owner:
-            status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}">Add</button>'
+            status_html = f'<button class="ghost-button addon-buy-button" data-addon-key="{escape(addon_key,quote=True)}" data-quantity="{quantity}">Add</button>'
         else:
             status_html = '<span class="health-detail">Not purchased</span>'
         # What the add-on turns on, from the catalog's own analytic mapping
         # (only analytics customers see in the portal; no invented detail).
         from customer_analytics_panel import ANALYTIC_LABELS as _PORTAL_ANALYTICS
         included = [_PORTAL_ANALYTICS[key][0] for key in analytic_keys if key in _PORTAL_ANALYTICS]
-        includes_html = f'<br><span class="health-detail">Includes: {escape(", ".join(included))}</span>' if included else ''
+        details = [text for text in (_price_text(addon_key), f"Includes: {', '.join(included)}" if included else "") if text]
+        if addon_key == "talk_down" and site_count > 1:
+            details.append(f"{site_count} sites")
+        if addon_key.startswith("face_access_"):
+            details.append(f"{door_count} door{'s' if door_count != 1 else ''}")
+        includes_html = f'<br><span class="health-detail">{escape(" · ".join(details))}</span>' if details else ''
         addon_rows += f'<div class="health-row"><span>{escape(label)}{includes_html}</span>{status_html}</div>'
+    if face_size == pricing_catalog.FACE_ACCESS_ENTERPRISE and not face_access_held:
+        addon_rows += ('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">'
+                       'More than 500 enrolled people: custom pricing</span></span>'
+                       '<a class="ghost-button" href="mailto:amata@anyaicam.com?subject=Face%20Access%20Enterprise">Contact us</a></div>')
     if not addon_rows:
         addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
 
@@ -104215,14 +104342,19 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
-    <div class="health-row"><span><strong>Local</strong> &middot; one-time purchase</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance at home. Keeps working without an internet connection.</span></div>
-    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
+    <div class="health-row"><span><strong>Local</strong> &middot; monthly subscription</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance or your own PC at home. Keeps working without an internet connection.</span></div>
+    <div class="health-row"><span><strong>Hybrid</strong> &middot; monthly subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
     </section>
+    <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Included with every plan</h3>
+    <div class="health-row"><span>{escape(", ".join(label for _, label in pricing_catalog.INCLUDED_FEATURES))}</span><span class="pill">Included</span></div>
+    </section>
+    {_license_panel}
     {upgrade_panel}
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
     {addon_rows}
     <p id="subscription-addon-message" class="health-detail"></p>
-    </section>'''
+    </section>
+    {_friends_family_panel if is_owner else ""}'''
     scripts = '''<script>
     const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
     if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
@@ -104235,13 +104367,24 @@ def _customer_subscription_portal_page(identity: dict) -> str:
       if(!response.ok){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
       location.href=r.checkout_url
     };
+    const vmsLicenseButton=document.getElementById('vms-license-buy');
+    if(vmsLicenseButton)vmsLicenseButton.onclick=async()=>{
+      vmsLicenseButton.disabled=true;vmsLicenseButton.textContent='Redirecting…';
+      const messageEl=document.getElementById('vms-license-message');messageEl.textContent='';
+      let response,r;
+      try{response=await fetch('/api/customer/vms-license/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({capacity:Number(vmsLicenseButton.dataset.capacity)})});r=await response.json()}
+      catch(error){vmsLicenseButton.disabled=false;vmsLicenseButton.textContent='Buy license';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+      if(!response.ok){vmsLicenseButton.disabled=false;vmsLicenseButton.textContent='Buy license';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
+      location.href=r.checkout_url
+    };
     document.querySelectorAll('.addon-buy-button').forEach(button=>{
       button.onclick=async()=>{
         const addon_key=button.dataset.addonKey;
         button.disabled=true;button.textContent='Redirecting…';
         const messageEl=document.getElementById('subscription-addon-message');messageEl.textContent='';
         let response,r;
-        try{response=await fetch('/api/customer/analytics/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addon_key})});r=await response.json()}
+        const quantity=Number(button.dataset.quantity||1);
+        try{response=await fetch('/api/customer/analytics/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addon_key,quantity})});r=await response.json()}
         catch(error){button.disabled=false;button.textContent='Add';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
         if(!response.ok){button.disabled=false;button.textContent='Add';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
         location.href=r.checkout_url
@@ -113444,6 +113587,16 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
     stripe_mode = "payment" if billing_type == "one_time" else "subscription"
+    import pricing_catalog
+    _catalog_plan = pricing_catalog.find_base_plan(plan_type, tier_label)
+    require_stripe_price_matches_catalog(price_id, _catalog_plan["monthly_cents"], "month")
+    import friends_family
+    try:
+        friends_family.checkout_discount(customer_id, "base")
+    except friends_family.CheckoutHeld as held:
+        raise HTTPException(status_code=409, detail=str(held))
+    except RuntimeError as missing:
+        raise HTTPException(status_code=503, detail=str(missing))
     fields = [
         ("mode", stripe_mode),
         ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?camera_plan_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
@@ -113458,11 +113611,17 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         ("metadata[anyaicam_customer_id]", customer_id),
         ("metadata[anyaicam_camera_slot_plan_type]", plan_type),
         ("metadata[anyaicam_camera_slot_tier_label]", tier_label),
-        ("allow_promotion_codes", "true"),
     ]
+    # Friends & Family (approved by an administrator) is applied here, as
+    # a server-side coupon, before the session exists; otherwise the
+    # normal promotion-code field is offered. Never both.
+    friends_family.apply_to_checkout_fields(fields, customer_id, "base")
     if stripe_mode == "subscription":
         fields.append(("subscription_data[metadata][anyaicam_stripe_price_id]", price_id))
         fields.append(("subscription_data[metadata][anyaicam_customer_id]", customer_id))
+        fields.append(("subscription_data[metadata][anyaicam_product_class]", "base"))
+        fields.append(("subscription_data[metadata][anyaicam_camera_slot_plan_type]", plan_type))
+        fields.append(("subscription_data[metadata][anyaicam_camera_slot_maximum]", str(camera_slot_maximum)))
     if identity.get("email"):
         fields.append(("customer_email", str(identity["email"])))
     session = stripe_api_post("/v1/checkout/sessions", fields)
@@ -113509,8 +113668,8 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     ANALYTICS_CATALOG is a recurring add-on (there is no one-time
     analytics SKU), unlike camera-slot checkout where mode depends on
     billing_type. One addon_key per Checkout Session -- "advanced_
-    analytics" is one addon_key that resolves server-side to FOUR
-    internal analytic_keys (smart_motion/people_counting/lpr/ppe),
+    analytics" is one addon_key that resolves server-side to its
+    internal analytic_keys (people_counting/lpr/ppe, pricing_catalog),
     granted together by the webhook from this session's single Price
     ID; the browser never selects analytic_keys directly. The catalog
     key is resolved server-side only from ANALYTICS_CATALOG, never from
@@ -113525,35 +113684,59 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     identity = _authoritative_identity(request)
     if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
         raise HTTPException(status_code=403, detail="Customer owner permission required.")
-    from analytics_entitlements import ANALYTICS_CATALOG
+    from analytics_entitlements import ANALYTICS_CATALOG, checkout_item
     addon_key = payload.addon_key.strip().lower()
     catalog_entry = next((item for item in ANALYTICS_CATALOG if item[0] == addon_key), None)
     if not catalog_entry:
         raise HTTPException(status_code=400, detail="Unknown analytics add-on.")
     _, label, analytic_keys, env_var = catalog_entry
+    item = checkout_item(addon_key, identity["customer_id"])
+    if not item["sellable"]:
+        raise HTTPException(status_code=400, detail=item["unavailable_reason"] or "This add-on is not available yet.")
+    quantity = 1
+    if item["unit"] == "per_site":
+        quantity = max(1, min(int(payload.quantity or 1), 256))
+    elif item["unit"] == "per_door":
+        # Billed for every door the customer has set up, decided server-side.
+        from analytics_entitlements import door_count_for_customer
+        quantity = max(1, door_count_for_customer(identity["customer_id"]))
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:
         raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {addon_key}.")
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
+    import pricing_catalog
+    _catalog_addon = pricing_catalog.find_addon(addon_key)
+    _catalog_face = next((t for t in pricing_catalog.face_access_tiers() if f"face_access_{t['size']}" == addon_key), None)
+    _expected_cents = _catalog_addon["monthly_cents"] if _catalog_addon else _catalog_face["monthly_cents_per_door"]
+    require_stripe_price_matches_catalog(price_id, _expected_cents, "month")
+    import friends_family
+    try:
+        friends_family.checkout_discount(customer_id, item["discount_class"])
+    except friends_family.CheckoutHeld as held:
+        raise HTTPException(status_code=409, detail=str(held))
+    except RuntimeError as missing:
+        raise HTTPException(status_code=503, detail=str(missing))
     fields = [
         ("mode", "subscription"),
         ("success_url", f"{PUBLIC_BASE_URL}/customer/setup?analytics_addon_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
         ("cancel_url", f"{PUBLIC_BASE_URL}/customer/setup?analytics_addon_payment=cancelled"),
         ("client_reference_id", customer_id),
         ("line_items[0][price]", price_id),
-        # Fixed-tier subscription -- always exactly one, never a
-        # customer-submitted multiplier (same discipline as camera-slot
-        # and license-tier checkout above).
-        ("line_items[0][quantity]", "1"),
+        # Flat packages are always exactly one; only per-site (Talk Down)
+        # and per-door (Face Access) items take a server-bounded quantity.
+        ("line_items[0][quantity]", str(quantity)),
         ("metadata[anyaicam_stripe_price_id]", price_id),
         ("metadata[anyaicam_customer_id]", customer_id),
         ("metadata[anyaicam_addon_key]", addon_key),
+        ("metadata[anyaicam_quantity]", str(quantity)),
         ("subscription_data[metadata][anyaicam_stripe_price_id]", price_id),
         ("subscription_data[metadata][anyaicam_customer_id]", customer_id),
-        ("allow_promotion_codes", "true"),
+        ("subscription_data[metadata][anyaicam_product_class]", "addon"),
+        ("subscription_data[metadata][anyaicam_addon_key]", addon_key),
     ]
+    friends_family.apply_to_checkout_fields(fields, customer_id, item["discount_class"])
     if identity.get("email"):
         fields.append(("customer_email", str(identity["email"])))
     session = stripe_api_post("/v1/checkout/sessions", fields)
@@ -113603,6 +113786,72 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
 
 
 
+
+
+@app.post("/api/customer/vms-license/checkout")
+def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Request) -> dict:
+    """One-time VMS software license (2026-09-30) for a customer-owned PC /
+    DIY installation: Stripe mode="payment", resolved server-side from
+    pricing_catalog, granted only by the verified webhook
+    (customer_entitlements -> product "vms_license"). An AnyAiCam appliance
+    already includes the license, so an appliance customer is refused here
+    rather than charged twice; a customer already licensed is refused too."""
+    from partner_portal import partner_identity as _authoritative_identity
+    identity = _authoritative_identity(request)
+    if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
+        raise HTTPException(status_code=403, detail="Customer owner permission required.")
+    import pricing_catalog
+    import friends_family
+    from customer_entitlements import appliance_includes_vms_license, get_entitlements_for_customer
+    license_ = pricing_catalog.find_vms_license(payload.capacity)
+    if not license_:
+        raise HTTPException(status_code=400, detail="Unknown VMS license capacity.")
+    customer_id = identity["customer_id"]
+    if appliance_includes_vms_license(customer_id):
+        raise HTTPException(status_code=409, detail="Your AnyAiCam appliance already includes the VMS software license. There is nothing to pay.")
+    owned = max((int(e["camera_slot_quantity"] or 0) for e in get_entitlements_for_customer(customer_id)
+                 if e["product"] == pricing_catalog.VMS_LICENSE_PRODUCT and e["status"] == "active"), default=0)
+    if owned >= license_["capacity"]:
+        raise HTTPException(status_code=409, detail=f"Your VMS software license already covers {owned} cameras.")
+    if owned:
+        # Upgrade pricing between license sizes has not been decided.
+        raise HTTPException(status_code=409, detail="To move to a larger VMS software license, contact AnyAiCam support.")
+    if not license_["stripe_price_id"]:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {license_['price_env_var']}.")
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    require_stripe_price_matches_catalog(license_["stripe_price_id"], license_["one_time_cents"], None)
+    try:
+        friends_family.checkout_discount(customer_id, "vms_license")
+    except friends_family.CheckoutHeld as held:
+        raise HTTPException(status_code=409, detail=str(held))
+    except RuntimeError as missing:
+        raise HTTPException(status_code=503, detail=str(missing))
+    price_id = license_["stripe_price_id"]
+    fields = [
+        ("mode", "payment"),
+        ("success_url", f"{PUBLIC_BASE_URL}/subscription-portal?vms_license_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/subscription-portal?vms_license_payment=cancelled"),
+        ("client_reference_id", customer_id),
+        ("line_items[0][price]", price_id),
+        ("line_items[0][quantity]", "1"),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_customer_id]", customer_id),
+        ("metadata[anyaicam_product_class]", "vms_license"),
+        ("metadata[anyaicam_vms_license_capacity]", str(license_["capacity"])),
+    ]
+    friends_family.apply_to_checkout_fields(fields, customer_id, "vms_license")
+    if identity.get("email"):
+        fields.append(("customer_email", str(identity["email"])))
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+    structured_log("stripe.vms_license_checkout_created", session_id=session_id, customer_id=customer_id,
+                   capacity=license_["capacity"])
+    return {"status": "complete", "session_id": session_id, "checkout_url": checkout_url,
+            "capacity": license_["capacity"], "billing_type": "one_time", "message": "Stripe Checkout Session created."}
 
 
 @app.post("/api/payments/hardware-checkout")
@@ -114448,11 +114697,17 @@ def _stripe_webhook_steps() -> list:
         from analytics_entitlements import sync_analytics_from_stripe_event
         sync_analytics_from_stripe_event(event)
 
+    def commissions(event):
+        # Last, so the hardware order / entitlements it reads already exist.
+        from sales_commissions import sync_commissions_from_stripe_event
+        sync_commissions_from_stripe_event(event)
+
     return [
         ("legacy_billing", process_stripe_webhook_event),
         ("camera_slot_entitlements", entitlements),
         ("hardware_orders", hardware),
         ("analytics_entitlements", analytics),
+        ("sales_commissions", commissions),
     ]
 
 
@@ -155526,6 +155781,66 @@ def _aaco_language_adapter():
 
 import aaco_settings as _aaco_settings
 _aaco_settings.register_routes(app, page_shell, _aaco_identity_provider)
+
+# Pricing (2026-09-30): one catalog, Friends & Family approvals, and the
+# server-side commission ledger.
+import friends_family as _friends_family
+_friends_family.register_routes(app, page_shell)
+
+
+@app.get("/api/pricing/catalog")
+def pricing_catalog_api() -> dict:
+    """Customer-safe price list from pricing_catalog (no Stripe IDs, no
+    commission data) -- the one source the website and storefront render."""
+    import pricing_catalog
+    return pricing_catalog.public_catalog()
+
+
+class SalesAttributionModel(BaseModel):
+    customer_id: str
+    salesperson: str
+    replace: bool = False
+
+
+@app.post("/api/admin/sales-attribution")
+def set_sales_attribution(payload: SalesAttributionModel, request: Request) -> dict:
+    from website_partner import _require_global_admin
+    identity = _require_global_admin(request)
+    import sales_commissions
+    try:
+        record = sales_commissions.set_attribution(
+            customer_id=payload.customer_id, salesperson=payload.salesperson, source="administrator",
+            created_by=identity.get("email", ""), replace=payload.replace,
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return {"status": "complete", "attribution": record}
+
+
+@app.get("/api/sales/commissions")
+def sales_commissions_api(request: Request) -> dict:
+    """Earned commission records: a salesperson sees their own, a partner
+    owner their company's, a global administrator everything."""
+    from partner_portal import partner_identity
+    import sales_commissions
+    identity = partner_identity(request) or {}
+    role = identity.get("role")
+    if role == "administrator":
+        from website_partner import _require_global_admin
+        _require_global_admin(request)
+        entries = sales_commissions.ledger_for()
+    elif role == "partner_owner" and identity.get("partner_id"):
+        entries = sales_commissions.ledger_for(partner_id=identity["partner_id"])
+    elif role == "salesperson":
+        user = sales_commissions._sales_user(identity.get("email", ""))
+        if not user:
+            raise HTTPException(status_code=403, detail="Sales access required.")
+        entries = sales_commissions.ledger_for(salesperson_user_id=user["id"])
+    else:
+        raise HTTPException(status_code=403, detail="Sales access required.")
+    return {"summary": sales_commissions.summarize(entries), "entries": entries}
 register_aaco_routes(
     app,
     page_shell,

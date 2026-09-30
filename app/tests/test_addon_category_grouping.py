@@ -11,10 +11,12 @@ entry, price env var, or checkout/webhook wiring yet."""
 import analytics_entitlements as ae
 
 
-def test_advanced_analytics_addon_grants_exactly_the_four_existing_analytics():
+def test_advanced_analytics_addon_grants_every_sold_analytic():
+    """2026-09-30: Smart Motion is included with every plan, so Advanced
+    Analytics grants the three sold analytics."""
     entry = next(item for item in ae.ANALYTICS_CATALOG if item[0] == "advanced_analytics")
     _, _, analytic_keys, _ = entry
-    assert set(analytic_keys) == {"smart_motion", "people_counting", "lpr", "ppe"}
+    assert set(analytic_keys) == {"people_counting", "lpr", "ppe"}
     for key in analytic_keys:
         assert key in ae.ANALYTIC_KEYS
 
@@ -32,14 +34,18 @@ def test_advanced_analytics_and_facial_recognition_addons_do_not_overlap():
     assert advanced.isdisjoint(face)
 
 
-def test_every_other_catalog_entry_is_a_single_analytic_key_addon():
-    """Every addon_key except advanced_analytics grants exactly one
-    analytic_key, and that analytic_key equals its own addon_key -- the
-    2026-09-21 correction only changed advanced_analytics's shape."""
-    for addon_key, _label, analytic_keys, _env_var in ae.ANALYTICS_CATALOG:
-        if addon_key == "advanced_analytics":
-            continue
-        assert analytic_keys == (addon_key,)
+def test_catalog_grants_match_the_approved_package_mapping():
+    """2026-09-30 approved mapping (pricing_catalog): packages grant real
+    per-camera analytics; Talk Down also grants Voice Call; every Face
+    Access SKU grants facial_recognition."""
+    grants = {addon_key: set(keys) for addon_key, _label, keys, _env in ae.ANALYTICS_CATALOG}
+    assert grants["ai_essentials"] == {"people_counting"}
+    assert grants["ai_professional"] == {"people_counting", "ppe"}
+    assert grants["vehicle_intelligence"] == {"lpr"}
+    assert grants["talk_down"] == {"talk_down", "voice_call"}
+    assert grants["cloud_overflow"] == {"cloud_overflow"}
+    for key in ("face_access_small", "face_access_medium", "face_access_large", "facial_recognition"):
+        assert grants[key] == {"facial_recognition"}
 
 
 def test_aaco_is_explicitly_not_sellable_and_has_no_catalog_entry():

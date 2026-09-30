@@ -1164,6 +1164,21 @@ ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_volume TEXT;
     ('20260930_aaco_customer_settings','''
 CREATE TABLE IF NOT EXISTS aaco_customer_settings(customer_id TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT);
 '''),
+    # Pricing, Friends & Family and salesperson commission (2026-09-30):
+    # package-level add-on state (so overlapping packages never switch a
+    # shared feature off), administrator-approved Friends & Family
+    # requests, salesperson attribution, verified subscription payments and
+    # the server-side commission ledger. Additive only.
+    ('20260930_pricing_ff_commission','''
+CREATE TABLE IF NOT EXISTS addon_subscriptions(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, addon_key TEXT NOT NULL, status TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, stripe_customer_id TEXT, stripe_subscription_id TEXT, stripe_price_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(customer_id, addon_key));
+CREATE TABLE IF NOT EXISTS friends_family_requests(id TEXT PRIMARY KEY, customer_id TEXT NOT NULL, requested_by_email TEXT, status TEXT NOT NULL, customer_note TEXT, requested_at TEXT NOT NULL, decided_at TEXT, decided_by TEXT, decision_note TEXT);
+CREATE INDEX IF NOT EXISTS idx_friends_family_requests_customer ON friends_family_requests(customer_id, status);
+CREATE TABLE IF NOT EXISTS sales_attributions(customer_id TEXT PRIMARY KEY, salesperson_user_id TEXT NOT NULL, partner_id TEXT, source TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT);
+CREATE TABLE IF NOT EXISTS subscription_payments(id TEXT PRIMARY KEY, customer_id TEXT, stripe_customer_id TEXT, stripe_subscription_id TEXT, stripe_price_id TEXT, product_class TEXT, amount_paid_cents INTEGER NOT NULL, currency TEXT, period_start TEXT, paid_at TEXT NOT NULL, stripe_charge_id TEXT, stripe_payment_intent_id TEXT, status TEXT NOT NULL, refunded_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_subscription_payments_subscription ON subscription_payments(stripe_subscription_id, status);
+CREATE TABLE IF NOT EXISTS commission_ledger(id TEXT PRIMARY KEY, kind TEXT NOT NULL, source_ref TEXT NOT NULL, salesperson_user_id TEXT NOT NULL, partner_id TEXT, customer_id TEXT NOT NULL, stripe_subscription_id TEXT, stripe_invoice_id TEXT, hardware_order_id TEXT, plan_type TEXT, camera_slot_tier INTEGER, paid_month_index INTEGER, basis_cents INTEGER NOT NULL DEFAULT 0, original_amount_cents INTEGER NOT NULL, amount_cents INTEGER NOT NULL, status TEXT NOT NULL, friends_family INTEGER NOT NULL DEFAULT 0, earned_at TEXT NOT NULL, reversed_at TEXT, reversal_reason TEXT, UNIQUE(kind, source_ref));
+CREATE INDEX IF NOT EXISTS idx_commission_ledger_salesperson ON commission_ledger(salesperson_user_id, earned_at);
+'''),
 ]
 
 

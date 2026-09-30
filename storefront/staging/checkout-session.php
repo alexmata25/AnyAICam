@@ -171,6 +171,13 @@ function verified_leg(array $leg, array $hardwareCatalog): array {
         }
         return ['kind' => 'analytics', 'key' => $key, 'label' => $resolved['label'], 'price_id' => $resolved['price_id'], 'mode' => 'subscription'];
     }
+    if ($kind === 'vms_license') {
+        $resolved = resolve_vms_license((int)$key);
+        if ($resolved === null) {
+            json_fail_checkout('Unknown or unconfigured VMS software license in checkout leg.');
+        }
+        return ['kind' => 'vms_license', 'key' => $key, 'label' => $resolved['label'], 'price_id' => $resolved['price_id'], 'mode' => 'payment'];
+    }
     json_fail_checkout('Unknown checkout leg kind.');
 }
 
@@ -208,6 +215,10 @@ $fields = [
     'line_items[0][quantity]' => '1',
     'metadata[anyaicam_stripe_price_id]' => $currentLeg['price_id'],
 ];
+if ($currentLeg['kind'] === 'vms_license') {
+    $fields['metadata[anyaicam_product_class]'] = 'vms_license';
+    $fields['metadata[anyaicam_vms_license_capacity]'] = $currentLeg['key'];
+}
 if ($currentLeg['kind'] === 'hardware') {
     $fields['metadata[anyaicam_hardware_sku]'] = $currentLeg['key'];
     $fields['metadata[anyaicam_hardware_quantity]'] = '1';
