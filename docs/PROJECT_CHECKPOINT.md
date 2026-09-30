@@ -4792,3 +4792,47 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
   `sudo rmdir /opt/anyaicam/app-pre-event-mode-pilot-20260919T223956Z/recordings /opt/anyaicam/app-pre-event-mode-pilot-20260919T223956Z`
 
 **Remaining physical tests** (owner, when home): phone push re-enable; driveway grouping walk; Visitor Call push + tap; End call while talking; Live View Talk; greeting volume; Secure Edge intrusion alarm; LPR; iPhone Home Screen push.
+
+## 2026-09-30 day: launch readiness status and exact blockers
+
+**Current state**
+- Golden `02132f0`.
+- Staging `747b5bf` (rollback `portal-0d3cdd8-pre-747b5bf-20260930T124114Z-rollback`; 10/10 health; Ryzen Talk channel reconnected).
+- **Ryzen `7290f7c`**: left as is by owner decision; portal-only changes since then, so no new Ryzen release is needed.
+- Samsung untouched.
+
+**Done today (validated)**
+- AACO settings end-to-end on staging through the real signed-in API:
+  - door actions refused when off, before any lookup;
+  - camera restriction (Front Door 403, Driveway Left allowed, status lists 1 camera);
+  - live off, AACO off (the floating button disappears);
+  - another customer's/unknown camera rejected (400).
+  - The owner's own saved settings (door actions ON, set 00:43 CDT) were restored afterwards; verified.
+  - Off→on door confirmation is covered by unit tests; it was not re-toggled live, to keep the owner's setting.
+- Settings links: `/settings` → `/customer-app-settings` and `/customer-portal` each link AACO settings (desktop + phone).
+- Push tests (81): Visitor Call tap → `/aac/voice-call/<id>`; INTRUSION ALARM tap → `/customer/cameras/<id>/live?alarm=<id>`; disconnect cancels queued pushes; re-enrolling a token-paused device re-enables it.
+- `747b5bf` friendly not-found page (API/scripts keep JSON), found by the 31-page readiness sweep. All other pages clean on desktop + phone.
+- New SQL is portable: no SQLite-only constructs.
+- Full regression on `747b5bf`: 4,968 passed, 87 failed = 86 baseline + the known flake `test_semaphore_releases_after_cancellation` (intermittent even alone). Installer 35/35.
+
+**Launch blockers (need the owner or an environment we don't have)**
+1. **No production environment.** `app.anyaicam.com` is the staging stack ("STAGING ENVIRONMENT" banner) with Stripe in test mode. A production portal, domain cutover, Stripe live keys, webhook and FCM production project/credentials are all needed.
+2. **Pricing decisions**: Advanced Analytics bundle price (unset) vs the 4 per-analytic prices on staging; retire or set the legacy Starter/Professional/Enterprise prices (admin readiness check fails); AACO pricing and sellability; appliance naming (website vs Partner Portal) and whether cameras/PoE are sold in the Partner Portal.
+3. **Clean-install re-validation**: last true clean install 2026-09-11. Needs a spare machine/VM with fresh Ubuntu (not the Ryzen, not the Samsung).
+4. **Samsung**: on `f5a6d87`, 0 cameras; needs its own controlled release (owner-authorized).
+5. **Physical validation still open** (sequence below): phone push re-enable; grouping walk; Visitor Call push; End call while talking; Live View Talk; greeting volume; Secure Edge intrusion; LPR; iPhone Home Screen push.
+6. **Website (live anyaicam.com)**: `support.php` without CAPTCHA and with hard-coded credentials; `referral-entry.html` and `/customer-register` 404; two phone numbers; Shopify cart broken on 11 old Videoloft pages.
+7. **Owner/operator items**: DHCP reservation for the Ryzen (IP-conflict outage 2026-09-29); Bedroom camera offline behind the QX bridge; Front Door motion detector needs a watched walk-up; natural greeting voice choice (Kokoro vs Piper); Edge push "permission denied" in the owner's Edge profile.
+8. **Not validated here**: PostgreSQL runtime for the new tables; native Android/iOS apps (not in this repo); restrict the Firebase browser API key to the portal referrers.
+
+**Physical test sequence (in this order, about 45 minutes)**
+1. Phone: open Settings → Notifications (it reconnects automatically; tap Enable if it says "Needs reconnect"). Expect "Browser enrolled".
+2. PC + phone push: ask Claude for a test push → both show "AnyAiCam activity".
+3. Driveway walk (both driveway cameras, ~20 s) → **1 push** (2 at most). Tap it → Playback of that event.
+4. Front Door walk-up → immediate **Visitor Call** push + greeting (check the Medium volume). Tap → call screen.
+5. On the call: Answer → 🎤 talk (heard at the door) → **End call** → the voice stops, "Call ended.", greyed buttons; extra taps do nothing.
+6. Live → Living Room → 🎤 talk → heard at the camera (Live View Talk, first check after e3ee24e).
+7. Secure Edge: Security tab → Arm → cross a security line → immediate **INTRUSION ALARM** push → tap → Live view.
+8. LPR: drive a car past the LPR camera → one confident plate event with a clip.
+9. iPhone: Safari → app.anyaicam.com → Share → Add to Home Screen → open it → Settings → Notifications → Enable → ask Claude for a test push.
+10. Portal look-over: Bedroom tile "Camera offline"; Security + Investigate tabs; AACO settings; no Ctrl+Shift+R needed.
