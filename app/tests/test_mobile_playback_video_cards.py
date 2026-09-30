@@ -41,7 +41,7 @@ def _render(monkeypatch, recordings=None, events=None):
 
 
 def _mobile_function_body(html):
-    start = html.index("function renderMobileRecentEvents(cameraId,clips,events)")
+    start = html.index("function renderMobileRecentEvents(cameraId,clips,events")  # an options parameter was added later
     end = html.index("// === LANE_CORE_START ===", start)
     assert end > start
     return html[start:end]
@@ -103,7 +103,7 @@ def test_no_preview_and_analytics_only_text_are_gone_from_this_function(monkeypa
     code = _active_code_only(_mobile_function_body(html))
     assert "No preview" not in code
     assert "Analytics only" not in code
-    assert "No clip available" in code  # the new compact fallback, still present as a template string
+    assert "No clip" in code  # the compact fallback ("<Type> · No clip"; wording shortened later)
 
 
 # ---------------------------------------------------------------------------
@@ -153,9 +153,13 @@ def test_recording_card_still_calls_the_existing_unmodified_playclip(monkeypatch
 def test_event_card_still_uses_the_existing_unmodified_event_media_url_and_reveal_panel(monkeypatch):
     html = _render(monkeypatch)
     body = _mobile_function_body(html)
-    assert "/api/customer/events/${cameraId}/${eventId}/media/url" in body  # rendered output, single braces (f-string already evaluated)
-    assert "revealClipPanel();" in body
-    assert "video.src=payload.url;" in body
+    # Mobile event cards now open in the page's shared inline player, which
+    # fetches the event's media URL through static/event_media.js (the same
+    # module desktop cards use) instead of inlining that fetch here.
+    assert "inlinePlayer.open(row,cameraId,eventItem)" in body
+    from pathlib import Path as _P
+    shared = (_P(main.__file__).parent / "static" / "event_media.js").read_text(encoding="utf-8")
+    assert "/media/url" in shared
 
 
 def test_analytics_only_events_are_still_not_wired_as_playable_controls(monkeypatch):
