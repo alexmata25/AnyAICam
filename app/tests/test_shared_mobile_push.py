@@ -77,7 +77,7 @@ def test_push_cooldown_does_not_suppress_email(fake_channels):
     with connection() as db:
         db.execute("UPDATE customer_notification_channels SET email_enabled=1,email_address='owner@example.test'")
     fanout(eid='second')
-    assert len(jobs()) == 1
+    assert len([x for x in jobs() if x['status'] != 'skipped']) == 1
     with connection() as db:
         assert db.execute("SELECT count(*) FROM notification_deliveries WHERE channel='email'").fetchone()[0] == 1
 
@@ -588,8 +588,8 @@ def test_one_walk_sends_one_push_for_the_most_important_type(monkeypatch, fake_c
     assert sent == ['person']
     grouped = [j for j in jobs() if j['error'] == 'grouped_into_visit']
     # motion was held, then superseded by person; ppe (same rank as motion) and smart_motion
-    # (lower than person) were never queued at all
-    assert len(grouped) == 1 and len(jobs()) == 2
+    # (lower than person) were recorded as grouped without ever being queued to send
+    assert len(grouped) == 3 and len(jobs()) == 4
 
 
 def test_a_more_important_type_after_a_sent_push_upgrades_once(monkeypatch, fake_channels, clock):
@@ -603,7 +603,7 @@ def test_a_more_important_type_after_a_sent_push_upgrades_once(monkeypatch, fake
 def test_a_new_visit_after_the_window_pushes_again(monkeypatch, fake_channels, clock):
     seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
     fanout('person', 'e1'); drain_after_hold(clock)
-    clock['advance'](push.VISIT_WINDOW_SECONDS + 10); fanout('motion', 'e2'); drain_after_hold(clock)
+    clock['advance'](push.VISIT_GAP_SECONDS + 10); fanout('motion', 'e2'); drain_after_hold(clock)
     assert sent == ['person', 'motion']
 
 
@@ -643,3 +643,56 @@ def test_grouping_never_changes_in_app_or_email(monkeypatch, fake_channels, cloc
         email_rows = db.execute("SELECT COUNT(*) FROM notification_deliveries WHERE channel='email'").fetchone()[0]
     assert len(notifications) == 4  # every event still reaches the in-app list
     assert email_rows == 4          # and each still has its own email delivery record
+
+
+
+# ---------------------------------------------------------------- site-level sliding visits (2026-09-30)
+
+def second_camera():
+    with connection() as db:
+        db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,created_at) VALUES('cam-2','cust-1','site-cust-1','appl-cust-1','Camera 2','2026-09-16')")
+
+
+def test_two_cameras_at_one_site_share_one_visit(monkeypatch, fake_channels, clock):
+    """The owner's walk: both driveway cameras saw it and each pushed separately."""
+    seed(events=ALL_ACTIVITY); second_camera(); sent = sender(monkeypatch)
+    fanout('motion', 'a1', camera='cam-2'); clock['advance'](1)
+    fanout('person', 'b1', camera='cam-1'); clock['advance'](1)
+    fanout('motion', 'a2', camera='cam-1'); clock['advance'](30)
+    fanout('person', 'b2', camera='cam-2')
+    drain_after_hold(clock)
+    assert sent == ['person']
+
+
+def test_a_visit_slides_while_activity_continues(monkeypatch, fake_channels, clock):
+    """A 61 s gap after the push used to restart the visit mid-walk."""
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('person', 'p0'); drain_after_hold(clock)
+    for i in range(1, 6):              # activity every 40 s for over 3 minutes
+        clock['advance'](40); fanout('motion' if i % 2 else 'smart_motion', f'm{i}'); drain_after_hold(clock)
+    assert sent == ['person']
+
+
+def test_at_most_two_pushes_per_visit(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('motion', 'e1'); drain_after_hold(clock)
+    clock['advance'](10); fanout('smart_motion', 'e2'); drain_after_hold(clock)   # upgrade 1 -> 2
+    clock['advance'](10); fanout('person', 'e3'); drain_after_hold(clock)         # would be a second upgrade
+    assert sent == ['motion', 'smart_motion']
+
+
+def test_continuous_activity_still_reminds_after_the_visit_cap(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('motion', 'start'); drain_after_hold(clock)
+    steps = push.VISIT_MAX_SECONDS // 30 + 2
+    for i in range(steps):
+        clock['advance'](30); fanout('motion' if i % 2 else 'smart_motion', f'c{i}'); drain_after_hold(clock)
+    assert 2 <= len(sent) <= 4, sent   # a reminder after ~10 minutes, not one per event
+
+
+def test_grouped_events_are_explained_in_delivery_history(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sender(monkeypatch)
+    fanout('person', 'e1'); clock['advance'](2); fanout('motion', 'e2')
+    drain_after_hold(clock)
+    statuses = sorted((j['status'], j['error']) for j in jobs())
+    assert statuses == [('sent', None), ('skipped', 'grouped_into_visit')]

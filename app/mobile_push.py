@@ -46,14 +46,21 @@ def eligible(db, notification, *, now):
         _quiet_hours_clock(now.replace(tzinfo=timezone.utc)), prefs['quiet_start'], prefs['quiet_end']))
 
 
-# One push per camera visit (2026-09-30, owner-approved after the first real staging
-# test: one person walking past one camera produced person + motion + smart_motion + PPE
-# pushes, 4-5 buzzes in 20 s). Ordinary activity is held briefly so the most important
-# type from a visit can arrive first, then only one push per camera per window is sent.
-# A clearly more important type arriving after a lesser one was already sent may still
-# upgrade once. Visitor Calls and intrusion alarms are never held or grouped, and they
-# absorb the ordinary activity pushes from the same camera visit. System alerts (camera
-# offline, storage, ...) are not grouped. In-app, email and SMS are unaffected.
+# One push per visit (2026-09-30, owner-approved after real staging tests). One person
+# walking past a camera produced person + motion + smart_motion + PPE pushes (4-5 buzzes),
+# and per-camera grouping still gave 4-5 because two driveway cameras saw the same walk
+# and a fixed window restarted mid-walk. Now:
+# - A visit is ordinary activity from any camera at the same site (the camera itself
+#   when it has no site), lasting while activity continues with gaps under
+#   VISIT_GAP_SECONDS, capped at VISIT_MAX_SECONDS so continuous activity still
+#   reminds periodically.
+# - Ordinary activity is held ACTIVITY_HOLD_SECONDS so the most important type of the
+#   visit can arrive first; at most VISIT_MAX_PUSHES per visit (the first push plus one
+#   upgrade to a clearly more important type).
+# - Visitor Calls and intrusion alarms are never held or grouped, and they absorb the
+#   visit's ordinary pushes. System alerts are not grouped. In-app, email and SMS are
+#   unaffected. A grouped event keeps a 'skipped'/'grouped_into_visit' outbox row, so
+#   the delivery history explains it and the sliding window can see the activity.
 ACTIVITY_RANK = {
     'motion': 1, 'ppe': 1, 'people_counting': 1, 'occupancy': 1,
     'smart_motion': 2,
@@ -61,20 +68,42 @@ ACTIVITY_RANK = {
 }
 VISIT_RANK = {**ACTIVITY_RANK, 'aac_voice_call': 4, 'intrusion_alarm': 5}
 ACTIVITY_HOLD_SECONDS = 5
-VISIT_WINDOW_SECONDS = 60
+VISIT_GAP_SECONDS = 60
+VISIT_MAX_SECONDS = 600
+VISIT_MAX_PUSHES = 2
+_ACTIVE = ('pending', 'retry', 'sending', 'sent', 'unavailable')
 
 
-def _visit_rank_nearby(db, *, user_id, customer_id, camera_id, since, until, exclude_id, statuses):
-    """Highest visit rank among this user's pushes for one camera in a time range."""
+def _visit_scope(n):
+    if n['site_id']:
+        return 'site_id', n['site_id']
+    if n['camera_id']:
+        return 'camera_id', n['camera_id']
+    return None
+
+
+def _visit_rows(db, n, *, since, until):
+    """This user's visit-relevant outbox rows in the same scope (any device)."""
+    column, value = _visit_scope(n)
     types = tuple(VISIT_RANK)
     marks = ','.join('?' * len(types))
-    status_marks = ','.join('?' * len(statuses))
-    rows = db.execute(
-        f"SELECT DISTINCT n.event_type FROM mobile_push_outbox p JOIN notifications n ON n.id=p.notification_id "
-        f"WHERE n.user_id=? AND n.customer_id=? AND n.camera_id=? AND n.event_type IN ({marks}) "
-        f"AND p.created_at>=? AND p.created_at<=? AND n.id!=? AND p.status IN ({status_marks})",
-        (user_id, customer_id, camera_id, *types, since, until, exclude_id, *statuses)).fetchall()
-    return max((VISIT_RANK[r['event_type']] for r in rows), default=0)
+    return db.execute(
+        f"SELECT DISTINCT n.id AS nid, n.event_type, p.status, p.created_at FROM mobile_push_outbox p "
+        f"JOIN notifications n ON n.id=p.notification_id WHERE n.user_id=? AND n.customer_id=? AND n.{column}=? "
+        f"AND n.event_type IN ({marks}) AND p.created_at>=? AND p.created_at<=? AND n.id!=?",
+        (n['user_id'], n['customer_id'], value, *types, since, until, n['id'])).fetchall()
+
+
+def _visit_state(db, n, now):
+    """(highest rank pushed or queued, pushes) for the visit that is still going at `now`."""
+    rows = _visit_rows(db, n, since=(now-timedelta(seconds=VISIT_MAX_SECONDS)).isoformat(), until=now.isoformat())
+    start = now
+    for created in sorted({datetime.fromisoformat(r['created_at']) for r in rows}, reverse=True):
+        if (start - created).total_seconds() > VISIT_GAP_SECONDS:
+            break
+        start = created
+    active = [r for r in rows if r['status'] in _ACTIVE and datetime.fromisoformat(r['created_at']) >= start]
+    return max((VISIT_RANK[r['event_type']] for r in active), default=0), len({r['nid'] for r in active})
 
 
 def enqueue(db, notification_id, *, now=None):
@@ -85,17 +114,14 @@ def enqueue(db, notification_id, *, now=None):
     if not n or not eligible(db, n, now=now):
         return 0
     rank = ACTIVITY_RANK.get(n['event_type'])
-    if rank and n['camera_id']:
-        # Anything already queued or sent for this camera visit that is at least as
-        # important makes this ordinary push redundant.
-        nearby = _visit_rank_nearby(db, user_id=n['user_id'], customer_id=n['customer_id'], camera_id=n['camera_id'],
-            since=(now-timedelta(seconds=VISIT_WINDOW_SECONDS)).isoformat(), until=now.isoformat(), exclude_id=n['id'],
-            statuses=('pending', 'retry', 'sending', 'sent', 'unavailable'))
-        if nearby >= rank:
-            return 0
+    grouped_visit = bool(rank and _visit_scope(n))
+    grouped = False
+    if grouped_visit:
+        top, pushes = _visit_state(db, n, now)
+        grouped = top >= rank or pushes >= VISIT_MAX_PUSHES
     urgent = n['event_type'] in EMERGENCY_EVENT_TYPES
     cooldown = VOICE_CALL_CHANNEL_COOLDOWN_SECONDS if n['event_type'] == 'aac_voice_call' else NOTIFICATION_CHANNEL_COOLDOWN_SECONDS
-    if not urgent and cooldown > 0:
+    if not grouped and not urgent and cooldown > 0:
         recent = db.execute("SELECT 1 FROM mobile_push_outbox p JOIN notifications n ON n.id=p.notification_id WHERE n.user_id=? AND n.customer_id=? AND COALESCE(n.site_id,'')=? AND COALESCE(n.camera_id,'')=? AND n.event_type=? AND p.created_at>=? AND n.id!=? AND p.status NOT IN ('skipped','expired') LIMIT 1",
             (n['user_id'], n['customer_id'], n['site_id'] or '', n['camera_id'] or '', n['event_type'], (now-timedelta(seconds=cooldown)).isoformat(), n['id'])).fetchone()
         if recent:
@@ -107,12 +133,13 @@ def enqueue(db, notification_id, *, now=None):
     ttl = 120 if n['event_type'] == 'aac_voice_call' else (300 if urgent else 3600)
     devices = db.execute('SELECT id FROM mobile_push_devices WHERE user_id=? AND customer_id=? AND enabled=1', (n['user_id'], n['customer_id'])).fetchall()
     # Ordinary activity waits briefly so a more important type from the same visit can supersede it.
-    send_at = now + timedelta(seconds=ACTIVITY_HOLD_SECONDS) if (rank and n['camera_id']) else now
+    send_at = now + timedelta(seconds=ACTIVITY_HOLD_SECONDS) if grouped_visit else now
+    status, error = ('skipped', 'grouped_into_visit') if grouped else ('pending', None)
     count = 0
     for device in devices:
-        result = db.execute("INSERT INTO mobile_push_outbox(id,notification_id,device_id,event_key,status,next_at,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(device_id,event_key) DO NOTHING",
-            (secrets.token_hex(16), n['id'], device['id'], event_key, 'pending', send_at.isoformat(), (now+timedelta(seconds=ttl)).isoformat(), now.isoformat()))
-        count += result.rowcount
+        result = db.execute("INSERT INTO mobile_push_outbox(id,notification_id,device_id,event_key,status,next_at,expires_at,created_at,error) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(device_id,event_key) DO NOTHING",
+            (secrets.token_hex(16), n['id'], device['id'], event_key, status, send_at.isoformat(), (now+timedelta(seconds=ttl)).isoformat(), now.isoformat(), error))
+        count += 0 if grouped else result.rowcount
     return count
 
 
@@ -141,15 +168,13 @@ def drain(*, now=None, limit=100, urgent_only=None):
             d = db.execute('SELECT * FROM mobile_push_devices WHERE id=?', (job['device_id'],)).fetchone()
             allowed = bool(n and d and d['enabled'] and d['user_id']==n['user_id'] and d['customer_id']==n['customer_id'] and eligible(db, n, now=now))
             grouped = False
-            if allowed and job['attempt'] == 0 and ACTIVITY_RANK.get(n['event_type']) and n['camera_id']:
-                # Superseded while held: a more important push from the same camera visit
+            if allowed and job['attempt'] == 0 and ACTIVITY_RANK.get(n['event_type']) and _visit_scope(n):
+                # Superseded while held: a more important push from the same visit
                 # (queued up to the window after this one, or sent shortly before it).
                 created = datetime.fromisoformat(job['created_at'])
-                nearby = _visit_rank_nearby(db, user_id=n['user_id'], customer_id=n['customer_id'], camera_id=n['camera_id'],
-                    since=(created-timedelta(seconds=VISIT_WINDOW_SECONDS)).isoformat(),
-                    until=(created+timedelta(seconds=VISIT_WINDOW_SECONDS)).isoformat(), exclude_id=n['id'],
-                    statuses=('pending', 'retry', 'sending', 'sent', 'unavailable'))
-                grouped = nearby > ACTIVITY_RANK[n['event_type']]
+                nearby = _visit_rows(db, n, since=(created-timedelta(seconds=VISIT_GAP_SECONDS)).isoformat(),
+                    until=(created+timedelta(seconds=VISIT_GAP_SECONDS)).isoformat())
+                grouped = max((VISIT_RANK[r['event_type']] for r in nearby if r['status'] in _ACTIVE), default=0) > ACTIVITY_RANK[n['event_type']]
         attempt = job['attempt']
         if now.isoformat() >= job['expires_at']:
             result = {'status': 'expired'}
