@@ -57,3 +57,9 @@ def test_page_script_uses_the_shared_controls():
     assert "{' disabled' if call_over else ''}>End call</button>" in source
     assert "{'' if call_over else ' hidden'}><strong>Call ended.</strong>" in source
     assert 'call_over = (event.get("state") or "") in ("ended", "dismissed", "missed")' in source
+
+
+def test_disabled_call_buttons_look_disabled():
+    """Found on staging: a disabled Answer button still looked fully active."""
+    source = Path(aac_voice_call.__file__).read_text(encoding="utf-8")
+    assert ".dialog-actions button:disabled{{opacity:.4;cursor:not-allowed" in source
