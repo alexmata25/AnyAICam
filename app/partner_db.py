@@ -123,6 +123,10 @@ def initialize_database() -> None:
         # camera added to the account later is automatically included
         # without the customer having to re-save anything.
         '''CREATE TABLE IF NOT EXISTS customer_notification_channel_cameras(user_id TEXT NOT NULL,camera_id TEXT NOT NULL,PRIMARY KEY(user_id,camera_id),FOREIGN KEY(user_id) REFERENCES partner_users(id),FOREIGN KEY(camera_id) REFERENCES cameras(id))''',
+        # Shared VMS mobile push: account-scoped devices and durable per-device outbox.
+        '''CREATE TABLE IF NOT EXISTS mobile_push_devices(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,customer_id TEXT NOT NULL,installation_id TEXT NOT NULL,platform TEXT NOT NULL,token TEXT NOT NULL UNIQUE,enabled INTEGER NOT NULL DEFAULT 1,updated_at TEXT NOT NULL,UNIQUE(user_id,installation_id),FOREIGN KEY(user_id) REFERENCES partner_users(id))''',
+        '''CREATE TABLE IF NOT EXISTS mobile_push_outbox(id TEXT PRIMARY KEY,notification_id TEXT NOT NULL,device_id TEXT NOT NULL,event_key TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 0,next_at TEXT NOT NULL,expires_at TEXT NOT NULL,lease_until TEXT,claim_id TEXT,error TEXT,provider_id TEXT,created_at TEXT NOT NULL,UNIQUE(device_id,event_key),FOREIGN KEY(device_id) REFERENCES mobile_push_devices(id))''',
+        '''CREATE INDEX IF NOT EXISTS mobile_push_outbox_due ON mobile_push_outbox(status,next_at)''',
         # Appliance identity contract (see appliance_identity.py's own
         # module docstring for the full design): the explicit grant this
         # whole contract exists to require -- a user is authorized for a

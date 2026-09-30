@@ -41,7 +41,7 @@ from customer_analytics_panel import event_type_label,event_type_message
 # silently create zero notifications (the same class of gap 'ppe'/
 # 'storage_problem'/'facial_recognition' above were each added to fix),
 # even though the in-app notification is the entire point of Phase 3.
-SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm'}
+SUPPORTED={'system_health','motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm'}
 
 # Per-(user, camera, event_type) minimum spacing between EXTERNAL
 # (email/sms) delivery attempts -- "Prevent duplicate/spam notifications
@@ -295,6 +295,8 @@ def fanout_appliance_event(appliance: dict,event: dict):
         notification={'id':notification_id,'title':title,'message':message}
         with connection() as db:
             db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity') or ('critical' if event_type in EMERGENCY_EVENT_TYPES else 'info'),title,message,timestamp,event.get('thumbnail'),now.isoformat()))
+            from mobile_push import enqueue
+            enqueue(db, notification_id)
             external=_external_channels(db,user=user,customer_id=customer_id,camera_id=camera_id,event_type=event_type,current_time=current_time,now=now,notification_id=notification_id)
         recipients={'in_app':'local','email':external['email_address'],'sms':external['phone_number']}
         channels={'in_app':True,'email':external['email'],'sms':external['sms']}

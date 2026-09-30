@@ -127,6 +127,15 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
           <div class="health-detail" id="notif-test-sms-result"></div>
         </section>
         <section class="panel" style="margin-top:14px">
+          <div class="panel-head"><h2>Push notifications</h2></div>
+          <p>Receive VMS alerts on this browser. Choose event types and cameras below.
+          Intrusion alarms bypass quiet hours and normal alert spacing on enrolled devices.</p>
+          <p>Push alerts are immediate; the daily-summary option does not apply to push.</p>
+          <button class="ghost-button" type="button" id="vms-push-enable">Enable on this browser</button>
+          <p id="vms-push-status" role="status">Checking push availability…</p>
+          <div id="vms-push-devices"></div>
+        </section>
+        <section class="panel" style="margin-top:14px">
           <div class="panel-head"><h2>Event types</h2></div>
           <div class="notification-event-grid">{event_type_options}</div>
         </section>
@@ -149,7 +158,7 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
         </section>
         <div class="notification-actions" style="margin-top:14px"><button class="action-button" id="notif-save">Save notification settings</button></div>'''
 
-        scripts = '''<script>
+        scripts = '''<script type="module" src="/static/mobile-push.js"></script><script>
         const scopeAll=document.getElementById('notif-scope-all'),scopeSelected=document.getElementById('notif-scope-selected'),picker=document.getElementById('notif-camera-picker');
         function syncScope(){picker.hidden=!scopeSelected.checked}
         scopeAll.addEventListener('change',syncScope);scopeSelected.addEventListener('change',syncScope);

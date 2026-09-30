@@ -40519,6 +40519,8 @@ async def lifespan(app: FastAPI):
     # this call site's own role check is a plain optimization (never
     # spawn the task at all on edge), not a second, independently-
     # maintained copy of that gate.
+    import mobile_push
+    mobile_push_task = asyncio.create_task(mobile_push.worker()) if RUNTIME_ROLE in {"cloud", "combined"} else None
     notification_retry_task = (
         asyncio.create_task(notification_retry_worker.notification_retry_worker())
         if RUNTIME_ROLE in {"cloud", "combined"}
@@ -40719,6 +40721,8 @@ async def lifespan(app: FastAPI):
             recording_retention_sweep_task.cancel()
         if event_media_retry_task:
             event_media_retry_task.cancel()
+        if mobile_push_task:
+            mobile_push_task.cancel()
         if notification_retry_task:
             notification_retry_task.cancel()
         if camera_config_sync_task:
@@ -40835,6 +40839,8 @@ async def lifespan(app: FastAPI):
             pending.append(recording_retention_sweep_task)
         if event_media_retry_task:
             pending.append(event_media_retry_task)
+        if mobile_push_task:
+            pending.append(mobile_push_task)
         if notification_retry_task:
             pending.append(notification_retry_task)
         if camera_config_sync_task:
@@ -48518,6 +48524,8 @@ from pwa_routes import register_pwa_routes
 
 
 from mobile_notifications import register_mobile_notification_routes
+from mobile_push_routes import register_routes as register_mobile_push_routes
+register_mobile_push_routes(app)
 from customer_registration import register_customer_registration_routes
 
 
