@@ -41874,6 +41874,15 @@ CLOUD_CUSTOMER_NAV_PATH_PREFIXES = (
     # controls). Same bug, reported from a real email 2026-09-27: an
     # unauthenticated click landed on the local emergency sign-in page.
     "/aac/voice-call",
+    # Customer sidebar pages that still fell through to the recovery login
+    # (found 2026-09-30 by probing every nav path signed out on the cloud
+    # role): Facial Recognition, Phone access, Mobile devices, Help and
+    # Install mobile app (no longer public -- it is a signed-in page).
+    "/aac/people",
+    "/phone-connect",
+    "/mobile-devices",
+    "/mobile-app",
+    "/help",
 )
 
 # The same shape bug as CLOUD_CUSTOMER_NAV_PATH_PREFIXES above, for the

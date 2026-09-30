@@ -251,7 +251,10 @@ def test_dashboard_page_renders_5_camera_cards_for_the_real_customer_not_10(http
         assert f'id="dashboard-camera-{n}"' in html
 
 
-def test_dashboard_redirects_to_login_with_no_session_at_all_same_as_before_this_fix(http_client, db_path):
+def test_dashboard_redirects_to_login_with_no_session_at_all_same_as_before_this_fix(http_client, db_path, monkeypatch):
+    # The customer sign-in redirect below is the cloud portal's; an edge
+    # appliance sends a signed-out visitor to its own local /login instead.
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "cloud")
     # Pre-existing, unrelated to this fix: /dashboard requires some
     # login (confirmed identical before and after this patch via direct
     # A/B on the live container) -- a request with no session of any
