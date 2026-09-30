@@ -145,3 +145,24 @@ def test_secure_edge_says_it_is_not_a_monitoring_service_and_never_calls_911():
 
 def test_screenshots_contain_no_staging_markers_in_file_names():
     assert not [p.name for p in (SITE / "app-screens").iterdir() if re.search(r"(?i)stag|test|debug", p.name)]
+
+
+def test_vms_footer_pages_use_the_styled_site_footer():
+    """plans.html and analytics.html used an unstyled script-built footer whose
+    stylesheet never existed on the server: a 1280px logo made the page scroll
+    sideways (906px on a phone). Every page now uses the site's unified footer."""
+    for path in PAGES:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        assert 'class="stage-footer"' not in text, path.name
+        if "aic-unified-footer" in text:
+            assert ".aic-unified-footer" in text or "vms-product.css" in text, path.name
+
+
+def test_vms_page_shows_live_and_playback_screenshots():
+    text = (SITE / "vms.html").read_text(encoding="utf-8", errors="replace")
+    for name in ("vms-live-camera.webp", "vms-playback-timeline.webp"):
+        tag = re.search(r'<img src="app-screens/' + re.escape(name) + r'"[^>]*>', text)
+        assert tag, name
+        assert re.search(r'alt="[^"]{20,}"', tag.group(0)) and 'width="1600"' in tag.group(0), name
+        assert (SITE / "app-screens" / name).stat().st_size < 400_000, name
+    assert ".app-shot-pair" in text

@@ -4596,3 +4596,73 @@ camera test or real phone notification delivery is marked complete.
 
 **Stop at review. Do not deploy to Ryzen, Samsung, staging/EC2 or production based
 on this checkpoint.**
+
+## 2026-09-29 evening: anyaicam.com published; next Ryzen release prepared (NOT installed)
+
+**Website publication: CLOSED, passed.** The owner uploaded through Bluehost File Manager (no credentials shared).
+- Step 1: `.htaccess` deny rule; the two archives moved to `/site-private-archive`. Logs and archives return 403.
+- Step 2: 44 files uploaded.
+- Step 3: 17 orphan, test and vendor-copy files moved to `/site-private-archive/removed-2026-09-29`. All 17 return 404. No product was discontinued: the 13 LTS SKUs stay on `cameras.html` and in the Videoloft calculators.
+- Step 4: Cloudflare "Purge Everything".
+- Verified afterwards:
+  - 178 of 178 published files return 200; form handlers reject GET as designed.
+  - `config.php` returns an empty body.
+  - No live page links to a removed file, and none contains staging, Test Cart or LiveChat text.
+  - Real browser, 87 pages on desktop and phone: no new errors.
+- Rollback: `website-publish/rollback-original/` in git, plus the moved files in `/site-private-archive/removed-2026-09-29` on the server.
+- Found in the browser pass and fixed on `website/footer-and-app-screens-20260929` (not uploaded yet): plans.html and analytics.html had an unstyled footer (1280px logo, sideways scroll: 37px desktop, 906px phone). They now use the site's standard footer.
+- Pre-existing and still open (owner decisions):
+  - `/customer-register` (customer-account.html) and `referral-entry.html` return 404.
+  - The Shopify storefront API is blocked by CORS on the 11 old Videoloft storage/adapter pages.
+  - Partner Portal vs website catalog, pending a decision: the website sells two camera lines (LTS for Videoloft, Vivotek/MokerLink for the VMS). The app Partner Portal lists only the appliances and the relay, and the appliance names differ between them.
+- New app screenshots (privacy-scrubbed, not yet placed): `vms-live-camera.webp`, `vms-playback-timeline.webp`.
+
+**Ryzen:** back online at 18:28 CDT after a hard power loss or freeze. The previous boot's journal ends at 05:18 CDT with no shutdown. App healthy with 0 restarts; 4 of 5 cameras reachable. Bedroom (192.168.0.145, behind the QIXIANG bridge) is unreachable; the owner said not to pursue it.
+
+**Next Ryzen release prepared, NOT installed** (Ryzen currently `1175932`):
+- Commit `e3ee24e36653f298f0c5d88d2fc3183f7d0716d1` (= origin `reconcile/golden-foundation-20260911` = staging).
+- Package `anyaicam-appliance-installer-1.1.0-vms-e3ee24e36653.tar.gz`, sha256 `c9f0600594bd547e742d2b0a1d4de7041400555259919281259fe70a07ba9714`, on the Dell only.
+- MediaMTX: sha `9fac297a…`, identical to the Ryzen's installed binary.
+- Packaged code matches the commit byte for byte (LF).
+- Full suite: 87 failed, all in the baseline except the known flake (3 of 3 passes alone). 4 JS-syntax baseline failures are now fixed. 247 of 247 Talk/LPR/Voice Call tests pass.
+- Only DB change: `ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_volume TEXT` (additive; old code ignores it).
+- Behavior change: the talk-audio channel becomes on by default (the Ryzen does not set `ANYAICAM_TALK_AUDIO_ENABLED`).
+- Rollback: the installer tags the running image `anyaicam-vms:rollback-117593236a12` and takes a DB backup; restore with `sudo ./rollback.sh`.
+
+**Ryzen = `e3ee24e`, installed by the operator 2026-09-29 ~19:53 CDT (`install.sh --repair`).** Remote checks, read-only:
+- `/version` build `e3ee24e36653…`; container healthy, 0 restarts, 0 tracebacks; `app/main.py` matches the commit.
+- Rollback point: image `anyaicam-vms:rollback-117593236a12` and DB backup `recordings/partner_portal-pre-e3ee24e36653-20260930T005240Z.db`.
+- Settings kept: `ANYAICAM_ANALYTICS_SYNC_ENABLED`, `ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`, LPR and talkback discovery are on.
+- The Talk channel connected on startup (`talk_audio_relay_client.channel_connected`); it was off in `1175932`.
+- Recording: cameras 1, 2, 3 and 5 writing, plus HLS, clips and media. Camera 4 (Bedroom) is offline, as known.
+- Events sync to the cloud (`analytics_synced accepted`).
+- Two real Voice Calls within 3 minutes of startup: `41dc80c85e` at 00:55:53Z and `dfba6a63ec` at 00:56:31Z. Each played the greeting through the camera speaker (20 chunks, success), and the cloud reached "notified".
+- Not yet confirmed: that the greeting sounds right at the new Medium level. Needs a person at the door.
+- `validate.sh` output not received.
+
+**AAC Voice Call two-way audio: PHYSICALLY VALIDATED on Ryzen `e3ee24e` (owner test, 2026-09-30 ~01:07 UTC, Living Room `dfba6a63ec`).**
+- Camera → phone audio works.
+- Phone → camera talkdown works: `POST /talk/start` 200, then the audio WebSocket. On the Ryzen, the RTSP audio backchannel to 192.168.0.38 reached SETUP/PLAY 200 and `connect_succeeded`.
+- Full two-way conversation works; the greeting plays through the camera speaker (ISAPI, 20 chunks).
+- Live View Talk (normal VMS page), read-only analysis:
+  - The owner's failed Living Room Live Talk attempts were at 00:17:51–00:18:30 UTC. All 5 `POST /talk/start` returned 503 **before** the upgrade (the Ryzen Talk channel first connected at 00:53:48 on `e3ee24e`; `1175932` had no channel).
+  - The Voice Call and Live View mic buttons are the same client (`wireTalkMic`) using the same `/talk/start`, cloud relay and Ryzen transport. A browser probe (talk requests intercepted, nothing sent to the camera) confirmed both screens render an enabled, unobstructed mic that issues the identical request on desktop and phone.
+  - Only difference: Voice Call reuses the microphone opened at Answer; Live View asks for the microphone on the first tap.
+  - No Live View Talk attempt has happened since the upgrade, so Live View talkdown is **not yet validated**. It needs an owner re-test.
+- Defect found, not yet fixed: "End call" stops the call's microphone but not an active Talk session (Talk streams from a cloned track), and gives no clear feedback. The owner pressed End 11 times in 11 s. Proposed universal fix: End call also stops any active Talk session on the page, then disables Answer/End and shows "Call ended".
+
+**anyaicam.com update 2 published and verified (2026-09-29 evening).** Owner uploaded `website-publish-2` through File Manager and ran a Custom Purge of the 5 URLs.
+- Both screenshots match byte for byte.
+- plans/analytics/vms.html are the new versions. The only difference from the upload is Cloudflare's automatic email obfuscation.
+- Real browser, desktop 1366 and iPhone 13, on vms/plans/analytics: no sideways scroll (was 37px desktop / 906px phone), no broken images, no errors; footer logo 210px (was 1280px).
+- Rollback: `website-publish-2/rollback-original/`.
+
+**Voice Call End call fix: on staging `34658b8` (golden), 2026-09-30 02:07 UTC. NOT on any appliance** (it is cloud page code, so no Ryzen release is needed).
+- `1cdd445`: End call stops every active Talk on the page (the same stop() as a normal release: the audio WebSocket closes and transmission to the camera ends; an in-flight /talk/start is released), releases the Answer microphone (including one granted after End), disables Answer/End/mic, and shows "Call ended." — all before the server call. Repeated presses do nothing. The call still ends locally if the server is unreachable. A call that is already ended/dismissed/missed opens disabled.
+- `41e5252`: disabled buttons look disabled (found on staging `023031c`, where Answer still looked active).
+- Tests: 11 executed Node scenarios (desktop + phone) running the shipped wireTalkMic + call controls; 4 of them fail without the fix.
+- Full suite on `023031c`: 86 failed, all in the baseline; 4,846 passed. Voice Call/Talk focused tests: 167 passed on `34658b8`.
+- Staging cutovers: `023031c` (rollback `portal-e3ee24e-pre-023031c-20260930T015946Z-rollback`), then `34658b8` (rollback `portal-023031c-pre-34658b8-20260930T020628Z-rollback`). Both EXIT=0 with 100% health polls; the Ryzen Talk channel reconnected each time.
+- Browser check on staging (ended call, talk/answer/end requests intercepted): "Call ended." shown, controls disabled, no requests on tap, no errors, desktop and phone.
+- **Pending physical test:** answer a real Voice Call, Talk, press End; confirm the voice stops at the camera and the screen shows Call ended.
+- **Still pending:** normal Live View Talk physical test after `e3ee24e` (not yet validated).
