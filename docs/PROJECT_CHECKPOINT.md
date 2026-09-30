@@ -4592,3 +4592,9 @@ Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, 
   - Only difference: Voice Call reuses the microphone opened at Answer; Live View asks for the microphone on the first tap.
   - No Live View Talk attempt has happened since the upgrade, so Live View talkdown is **not yet validated**. It needs an owner re-test.
 - Defect found, not yet fixed: "End call" stops the call's microphone but not an active Talk session (Talk streams from a cloned track), and gives no clear feedback. The owner pressed End 11 times in 11 s. Proposed universal fix: End call also stops any active Talk session on the page, then disables Answer/End and shows "Call ended".
+
+**anyaicam.com update 2 published and verified (2026-09-29 evening).** Owner uploaded `website-publish-2` through File Manager and ran a Custom Purge of the 5 URLs.
+- Both screenshots match byte for byte.
+- plans/analytics/vms.html are the new versions. The only difference from the upload is Cloudflare's automatic email obfuscation.
+- Real browser, desktop 1366 and iPhone 13, on vms/plans/analytics: no sideways scroll (was 37px desktop / 906px phone), no broken images, no errors; footer logo 210px (was 1280px).
+- Rollback: `website-publish-2/rollback-original/`.
