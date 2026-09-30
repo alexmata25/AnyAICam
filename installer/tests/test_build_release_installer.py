@@ -168,6 +168,17 @@ class DockerfileCopySourcesAreAllReleasedTests(unittest.TestCase):
             if not dockerfile.is_file():
                 continue
             for source in self._copy_sources(dockerfile):
+                if any(ch in source for ch in "*?["):
+                    # A wildcard COPY only fails when NOTHING matches (e.g. the
+                    # opt-in push requirements step, 2026-09-30): it is safe
+                    # exactly when a REQUIRED release path always matches it.
+                    import fnmatch
+                    self.assertTrue(
+                        any(fnmatch.fnmatch(path, source) for path in REQUIRED_RELEASE_PATHS),
+                        f"{name} COPYs wildcard {source!r} but no REQUIRED_RELEASE_PATHS entry matches it -- "
+                        "a built release package could leave it with nothing to copy.",
+                    )
+                    continue
                 self.assertIn(
                     source, allowlisted,
                     f"{name} COPYs {source!r} but it is not in REQUIRED_RELEASE_PATHS or "
