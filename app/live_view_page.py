@@ -294,6 +294,23 @@ _P2P_JS = """
     return () => { lost = true; if (timer) { clearTimeout(timer); timer = null; } if (frozenPoll) { clearInterval(frozenPoll); frozenPoll = null; } if (qualityPoll) { clearInterval(qualityPoll); qualityPoll = null; } };
   };
 
+  // Offline/black-tile fix (2026-09-30): 'playing' can fire on a WebRTC
+  // stream from an unreachable camera with no frame ever decoded, which
+  // hid the placeholder and left a black tile. Reveal the video only once
+  // it reports real frame dimensions ('resize' fires when the first frame
+  // arrives); until then the placeholder -- and its status text -- stay.
+  window.revealLiveFrame = function(video, placeholder){
+    const reveal = () => {
+      if (video.videoWidth > 0) {
+        placeholder.hidden = true;
+        video.removeEventListener('playing', reveal);
+        video.removeEventListener('resize', reveal);
+      }
+    };
+    video.addEventListener('playing', reveal);
+    video.addEventListener('resize', reveal);
+  };
+
   window.reportLiveTransportOutcome = function(sessionId, transport, connectMs, error){
     if (!sessionId) return;
     fetch(`/api/customer/live/sessions/${sessionId}/transport-outcome`, {
@@ -732,6 +749,11 @@ def _customer_live_cameras(db, identity: dict, appliance_id: str = '') -> list[d
         ]
 
     for camera in cameras:
+        # Known offline (2026-09-30): the appliance reports each camera's
+        # online state (the Dashboard's source). No status row yet means
+        # unknown -- treated as online, never as offline.
+        status = db.execute('SELECT online FROM appliance_camera_status WHERE camera_id=?', (camera['id'],)).fetchone()
+        camera['known_offline'] = bool(status) and not status['online']
         camera.update(_talk_down_state(camera.pop('talk_down_supported')))
         # Capability hint only, same as talk_enabled above -- whether THIS
         # identity may actually press it is re-checked from scratch by
@@ -1102,7 +1124,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
     // decoded, exposing the <video> element's own default black
     // background. 'playing' only ever fires once a real frame is
     // genuinely visible.
-    video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
+    revealLiveFrame(video,placeholder);
     if(window.Hls&&Hls.isSupported()){{
       hls=new Hls();
       hls.loadSource(url);
@@ -1129,7 +1151,7 @@ def camera_live_panel(camera: dict, identity: dict, *, show_unlock_tool: bool = 
         video.removeAttribute('src');
         try{{video.load()}}catch(e){{}}
       }}
-      video.addEventListener('playing',()=>{{placeholder.hidden=true}},{{once:true}});
+      revealLiveFrame(video,placeholder);
       video.srcObject=result.stream;
       p2pConnection=result.pc;
       video.play().catch(()=>{{}});
@@ -1542,12 +1564,13 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
                 f' title="Unlock door" aria-label="Unlock door">🔓</button>'
                 if camera.get('door_enabled') else ''
             )
-            return f'''<article class="live-grid-tile" data-camera-id="{escape(camera['id'], quote=True)}">
+            offline = bool(camera.get('known_offline'))
+            return f'''<article class="live-grid-tile{' tile-offline' if offline else ''}" data-camera-id="{escape(camera['id'], quote=True)}"{' data-offline="1"' if offline else ''}>
               <div class="camera-view" style="border-radius:10px">
                 <video id="live-grid-video-{escape(camera['id'], quote=True)}" muted playsinline></video>
                 <div class="camera-placeholder" id="live-grid-placeholder-{escape(camera['id'], quote=True)}">
                   <span class="signal">◉</span>
-                  <strong id="live-grid-status-{escape(camera['id'], quote=True)}">Starting live view…</strong>
+                  <strong id="live-grid-status-{escape(camera['id'], quote=True)}">{'Camera offline' if offline else 'Starting live view…'}</strong>
                 </div>
                 <div class="tile-name-overlay">{escape(_camera_display_label(camera))}</div>
                 <div class="tile-controls-overlay">
@@ -1673,6 +1696,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
       video:document.getElementById(`live-grid-video-${{id}}`),
       placeholder:document.getElementById(`live-grid-placeholder-${{id}}`),
       status:document.getElementById(`live-grid-status-${{id}}`),
+      offline:document.querySelector(`.live-grid-tile[data-camera-id="${{id}}"]`)?.dataset.offline==='1',
     }};
   }});
 
@@ -1722,7 +1746,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   function showUnavailable(id){{
     stopPolling(id);
-    setStatus(id,'Live view unavailable right now.');
+    setStatus(id,tiles[id].offline?'Camera offline':'Live view unavailable right now.');
   }}
 
   async function pollPlaylist(id,deadline){{
@@ -1781,7 +1805,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
     // or a WebRTC srcObject below) -- {{once:true}} so a reconnect's
     // fresh attachPlayer() call never piles up a second listener on
     // this same persistent <video> element.
-    tile.video.addEventListener('playing',()=>{{tile.placeholder.hidden=true}},{{once:true}});
+    revealLiveFrame(tile.video,tile.placeholder);
     if(window.Hls&&Hls.isSupported()){{
       tile.hls=new Hls();
       tile.hls.loadSource(playlistUrl);
@@ -1811,7 +1835,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
         tile.video.removeAttribute('src');
         try{{tile.video.load()}}catch(e){{}}
       }}
-      tile.video.addEventListener('playing',()=>{{tile.placeholder.hidden=true}},{{once:true}});
+      revealLiveFrame(tile.video,tile.placeholder);
       tile.video.srcObject=result.stream;
       tile.p2pConnection=result.pc;
       tile.video.play().catch(()=>{{}});
@@ -1862,7 +1886,7 @@ def register_live_view_page_routes(app: FastAPI, page_shell: Callable) -> None:
 
   async function startSession(id){{
     const tile=tiles[id];
-    tile.stopped=false;tile.recoveryAttempts=0;tile.transport=null;tile.startedAt=Date.now();setStatus(id,'Starting live view…');
+    tile.stopped=false;tile.recoveryAttempts=0;tile.transport=null;tile.startedAt=Date.now();setStatus(id,tile.offline?'Camera offline · checking…':'Starting live view…');
     let response;
     try{{response=await fetch(`/api/customer/cameras/${{id}}/live/start`,{{method:'POST'}})}}catch(e){{showUnavailable(id);return}}
     if(!response.ok){{showUnavailable(id);return}}

@@ -1,3 +1,4 @@
+from pathlib import Path
 """Regression coverage for the black-tile fix (2026-09-21) on both
 /customer-live (the canonical grid) and /customer/cameras/{id}/live (its
 single-camera tools page): the placeholder overlay used to be hidden on
@@ -99,13 +100,13 @@ def test_grid_native_hls_loadedmetadata_no_longer_hides_the_placeholder(client):
 
 def test_grid_reveals_the_tile_on_the_video_playing_event_instead(client):
     html = _grid_html(client)
-    assert "tile.video.addEventListener('playing',()=>{tile.placeholder.hidden=true},{once:true})" in html
+    assert "revealLiveFrame(tile.video,tile.placeholder)" in html
 
 
 def test_grid_p2p_no_longer_hides_the_placeholder_before_a_frame_renders(client):
     html = _grid_html(client)
     assert "tile.video.srcObject=result.stream;\n      tile.p2pConnection=result.pc;\n      tile.placeholder.hidden=true" not in html
-    assert "tile.video.addEventListener('playing',()=>{tile.placeholder.hidden=true},{once:true});\n      tile.video.srcObject=result.stream" in html
+    assert "revealLiveFrame(tile.video,tile.placeholder);\n      tile.video.srcObject=result.stream" in html
 
 
 # --------------------------------------------------------- single-camera page
@@ -125,13 +126,13 @@ def test_single_camera_native_hls_loadedmetadata_no_longer_hides_the_placeholder
 
 def test_single_camera_reveals_the_tile_on_the_video_playing_event_instead(client):
     html = _single_html(client)
-    assert "video.addEventListener('playing',()=>{placeholder.hidden=true},{once:true})" in html
+    assert "revealLiveFrame(video,placeholder)" in html
 
 
 def test_single_camera_p2p_no_longer_hides_the_placeholder_before_a_frame_renders(client):
     html = _single_html(client)
     assert "video.srcObject=result.stream;\n      p2pConnection=result.pc;\n      placeholder.hidden=true" not in html
-    assert "video.addEventListener('playing',()=>{placeholder.hidden=true},{once:true});\n      video.srcObject=result.stream" in html
+    assert "revealLiveFrame(video,placeholder);\n      video.srcObject=result.stream" in html
 
 
 # ---------------------------------------------------- layout is unchanged
@@ -141,3 +142,42 @@ def test_grid_layout_markup_is_unchanged(client):
     (the video/placeholder elements the JS attaches to) is untouched."""
     html = _grid_html(client)
     assert 'id="live-grid-video-cam-a"' in html
+
+
+
+# ---------------------------------------------------------------- 2026-09-30: real frame, known offline
+
+def test_reveal_waits_for_a_real_frame_not_just_playing():
+    """'playing' fired on a frameless WebRTC stream from an offline camera and
+    left a black tile; the placeholder now stays until the video has size."""
+    import live_view_page
+    source = Path(live_view_page.__file__).read_text(encoding="utf-8")
+    helper = source[source.index("window.revealLiveFrame = function"):]
+    helper = helper[:helper.index("};") + 2]
+    assert "video.videoWidth > 0" in helper and "'resize'" in helper and "'playing'" in helper
+    assert "addEventListener('playing',()=>{{placeholder.hidden=true}}" not in source
+    assert "addEventListener('playing',()=>{{tile.placeholder.hidden=true}}" not in source
+
+
+def _set_camera_online(db_path, online):
+    with override_target(sqlite_path=str(db_path)):
+        from partner_db import connection
+        with connection() as conn:
+            conn.execute("INSERT OR REPLACE INTO appliance_camera_status(appliance_id,camera_id,name,online,recording,analytics,updated_at) "
+                         "VALUES('appl-a','cam-a','Camera 1',?,0,0,'2026-09-30T00:00:00')", (1 if online else 0,))
+
+
+def test_a_camera_the_appliance_reports_offline_says_so(client, db_path):
+    """The Bedroom tile was a blank black box with no explanation."""
+    _set_camera_online(db_path, False)
+    html = _grid_html(client)
+    assert 'data-offline="1"' in html and "tile-offline" in html
+    assert ">Camera offline</strong>" in html
+    assert "tiles[id].offline?'Camera offline':'Live view unavailable right now.'" in html
+
+
+def test_an_online_or_unreported_camera_starts_normally(client, db_path):
+    assert 'data-offline="1"' not in _grid_html(client)   # no status row yet: unknown, not offline
+    _set_camera_online(db_path, True)
+    html = _grid_html(client)
+    assert 'data-offline="1"' not in html and "Starting live view…" in html
