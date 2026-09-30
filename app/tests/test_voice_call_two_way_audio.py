@@ -67,12 +67,13 @@ def test_talk_control_for_talkback_cameras():
 
 
 def test_voice_call_answer_unmutes_and_requests_the_microphone():
-    import inspect
     import aac_voice_call
-    source = inspect.getsource(aac_voice_call)
-    answer = source[source.index("document.getElementById('voice-call-answer')"):source.index("function releaseCallMicrophone")]
+    # The Answer/End controls live in _CALL_CONTROLS_JS since 2026-09-30.
+    source = aac_voice_call._CALL_CONTROLS_JS
+    answer = source[source.index("answerButton.addEventListener('click'"):source.index("window.addEventListener('pagehide'")]
     assert answer.index("video.muted = false") < answer.index("await fetch(")  # unmuted inside the tap, before any await
-    assert "window.aacCallMicStream = await navigator.mediaDevices.getUserMedia" in answer
+    assert "const stream = await navigator.mediaDevices.getUserMedia({audio: true});" in answer
+    assert "window.aacCallMicStream = stream;" in answer
     assert "releaseCallMicrophone();" in source
 
 
