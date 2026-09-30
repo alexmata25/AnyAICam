@@ -193,6 +193,7 @@ def register_customer_platform_routes(
           <div class="settings-list">
             <a class="setting-link" href="/customer-app-settings"><div><strong>Camera analytics and alerts</strong><div class="health-detail">Enable paid analytics, email alerts, push alerts, schedules, and quiet hours.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/customer/voice-call-settings"><div><strong>Visitor Voice Call</strong><div class="health-detail">Greet visitors at your door and get a call you can answer live.</div></div><span>Open →</span></a>
+            <a class="setting-link" href="/customer/aaco-settings"><div><strong>AACO assistant</strong><div class="health-detail">Turn the assistant on or off and choose which cameras and actions it may use.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/playback"><div><strong>Playback</strong><div class="health-detail">Review authorized recordings and event footage.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/subscription-portal"><div><strong>Subscription</strong><div class="health-detail">Review billing and plan access.</div></div><span>Open →</span></a>
             <a class="setting-link" href="/mobile-app"><div><strong>Install phone app</strong><div class="health-detail">Install ANY AI CAM on Android or iPhone.</div></div><span>Install →</span></a>
@@ -248,6 +249,11 @@ def register_customer_platform_routes(
               <strong>Visitor Voice Call</strong>
               <p class="health-detail">Choose entrance cameras, their greeting and greeting volume.</p>
               <a class="ghost-button" href="/customer/voice-call-settings">Voice Call settings</a>
+            </div>
+            <div class="push-status" style="margin-top:16px">
+              <strong>AACO assistant</strong>
+              <p class="health-detail">Turn the assistant on or off, show or hide its button, and choose which cameras and actions it may use.</p>
+              <a class="ghost-button" href="/customer/aaco-settings">AACO settings</a>
             </div>
             <div class="push-status" style="margin-top:16px">
               <strong>Phone alerts</strong>

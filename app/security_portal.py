@@ -144,7 +144,7 @@ def register_security_routes(app: FastAPI, page_shell) -> None:
             return RedirectResponse('/partner-login', status_code=303)
         with connection() as db:
             overview = security_overview(db, identity)
-        return page_shell('Security', 'dashboard', security_page_content(overview), SECURITY_PAGE_SCRIPT)
+        return page_shell('Security', 'security', security_page_content(overview), SECURITY_PAGE_SCRIPT)
 
 
 MODE_BUTTONS = (('stay', 'Arm Stay'), ('away', 'Arm Away'), ('disarmed', 'Disarm'))

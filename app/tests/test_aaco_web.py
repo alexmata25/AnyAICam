@@ -121,7 +121,13 @@ def test_unauthenticated_and_cross_tenant_requests_are_denied():
     assert not [call for call in vms.calls if call[0] == "live"]
 
 
-def test_unlock_door_reaches_the_boundary_and_never_the_generic_camera_gate():
+def _door_actions_on(monkeypatch):
+    import aaco_settings
+    monkeypatch.setattr(aaco_settings, "load", lambda _customer_id: dict(aaco_settings.DEFAULTS, allow_door_actions=True))
+
+
+def test_unlock_door_reaches_the_boundary_and_never_the_generic_camera_gate(monkeypatch):
+    _door_actions_on(monkeypatch)  # off by default since 2026-09-30 (AACO settings)
     client, vms = _client()
     response = client.post("/api/aaco/command", json={"command": "Open Front Door"})
     assert response.status_code == 200 and response.json()["kind"] == "door_unlock"
@@ -136,7 +142,8 @@ def test_unlock_door_ambiguous_match_returns_a_clarification_not_an_action():
     assert response.json()["kind"] == "clarification"
 
 
-def test_unlock_door_unauthorized_or_nonexistent_fails_closed():
+def test_unlock_door_unauthorized_or_nonexistent_fails_closed(monkeypatch):
+    _door_actions_on(monkeypatch)  # off by default since 2026-09-30 (AACO settings)
     client, _vms = _client()
     nonexistent = client.post("/api/aaco/command", json={"command": "Open the back gate"})
     assert nonexistent.status_code == 403
