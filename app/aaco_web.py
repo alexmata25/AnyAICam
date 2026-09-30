@@ -452,7 +452,11 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
 
     @app.get("/aaco", response_class=HTMLResponse)
     def aaco_workspace(request: Request):
-        _require_customer(identity_provider(request))
+        identity = _require_customer(identity_provider(request))
+        import aaco_settings
+        if not aaco_settings.load(identity.get("customer_id")).get("enabled", True):
+            return page_shell("AACO", "aaco", '<header class="topbar"><div><p class="eyebrow">Assistant</p><h1>AACO</h1></div></header>'
+                              f'<section class="panel"><div class="empty">{aaco_settings.DISABLED_MESSAGE}</div></section>')
         log.info("aaco.workspace_opened mode=on_demand historical_autoload=false")
         return page_shell("AACO", "aaco", _workspace())
 
@@ -469,6 +473,15 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
         if not isinstance(command_text, str) or not command_text.strip() or len(command_text) > MAX_COMMAND_LENGTH:
             raise HTTPException(status_code=400, detail="A command between 1 and 500 characters is required.")
         vms = vms_factory(request)
+        # AACO settings (2026-09-30): the account's on/off switch, allowed
+        # cameras and allowed actions. Enforced here, between understanding
+        # and execution -- the free-form interpretation below is unchanged.
+        import aaco_settings
+        settings = aaco_settings.load(identity.get("customer_id"))
+        if not settings.get("enabled", True):
+            log.info("aaco.command_blocked reason=disabled")
+            return {"kind": "clarification", "message": aaco_settings.DISABLED_MESSAGE}
+        vms = aaco_settings.restrict(vms, settings, identity.get("customer_id"))
         context = _context(payload.get("context"))
         # Free-form input (aaco_freeform.py) matches camera mentions against
         # the cameras this customer may see -- supplied here, server-side,
@@ -485,6 +498,10 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
         if isinstance(parsed, Clarification):
             log.info("aaco.command_clarification")
             return {"kind": "clarification", "message": parsed.message}
+        denial = aaco_settings.operation_denial(settings, parsed.operation)
+        if denial:
+            log.info("aaco.command_blocked operation=%s", parsed.operation)
+            return {"kind": "clarification", "message": denial}
         try:
             result = execute(parsed, identity=identity, vms=vms)
         except PermissionError as error:

@@ -1159,6 +1159,11 @@ CREATE TABLE IF NOT EXISTS camera_capabilities(
     ('20260929_aac_greeting_volume','''
 ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_volume TEXT;
 '''),
+    # AACO settings, first release (2026-09-30): per-customer on/off, floating
+    # button, allowed cameras and allowed actions (aaco_settings.py). Additive.
+    ('20260930_aaco_customer_settings','''
+CREATE TABLE IF NOT EXISTS aaco_customer_settings(customer_id TEXT PRIMARY KEY, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT);
+'''),
 ]
 
 

@@ -48375,8 +48375,17 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
     # is ever called.
     aaco_widget_html = ""
     if shell_role in CUSTOMER_PORTAL_ROLES and active != "aaco":
-        from aaco_web import render_aaco_floating_widget
-        aaco_widget_html = render_aaco_floating_widget()
+        # AACO settings (2026-09-30): the owner can hide the floating button
+        # or turn AACO off; a settings read failure keeps today's behavior.
+        try:
+            import aaco_settings
+            _aaco = aaco_settings.load((shell_user or {}).get("customer_id"))
+            _show_aaco = _aaco.get("enabled", True) and _aaco.get("show_floating", True)
+        except Exception:
+            _show_aaco = True
+        if _show_aaco:
+            from aaco_web import render_aaco_floating_widget
+            aaco_widget_html = render_aaco_floating_widget()
 
 
 
@@ -155464,6 +155473,8 @@ def _aaco_language_adapter():
     return aaco_freeform.FreeFormAacoLanguageAdapter(aaco_llm.NaturalAacoLanguageAdapter(aaco_llm.default_interpreter()))
 
 
+import aaco_settings as _aaco_settings
+_aaco_settings.register_routes(app, page_shell, _aaco_identity_provider)
 register_aaco_routes(
     app,
     page_shell,
