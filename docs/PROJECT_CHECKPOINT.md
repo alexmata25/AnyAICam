@@ -4836,3 +4836,60 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 8. LPR: drive a car past the LPR camera → one confident plate event with a clip.
 9. iPhone: Safari → app.anyaicam.com → Share → Add to Home Screen → open it → Settings → Notifications → Enable → ask Claude for a test push.
 10. Portal look-over: Bedroom tile "Camera offline"; Security + Investigate tabs; AACO settings; no Ctrl+Shift+R needed.
+
+
+## 2026-09-30 afternoon: baseline test triage finished; full regression clean; merged
+
+**Current state**
+- Golden `b6fb337` (merge of `fix/overnight-readiness-20260930`, tip `c286291`).
+- Staging `4b6a59e` (rollback `portal-747b5bf-pre-4b6a59e-20260930T140707Z-rollback`). The later commits are test-only, so staging runs the same product code as golden.
+- Ryzen `7290f7c`: untouched, no release needed. Samsung: untouched. No pricing changes.
+
+**Full regression on `c286291`: 5,062 passed, 0 failed, 129 skipped.**
+- Run in 10 batches of about 36 files each, because a single full run was stopped for low memory on the Dell.
+- Every batch was rerun after its last change.
+- Previous baseline: 4,968 passed, 87 failed.
+- Installer: 35 passed, 2 skipped (installer unchanged since).
+- No known intermittent exceptions remain.
+
+**Product defects found by the triage (fixed, tested, browser-validated on staging, desktop and phone)**
+1. Playback silently dropped every **Line Crossing** event.
+   - `filterCategory()` gives `line_crossing` its own category, but the fixed `activeFilters` set omitted it.
+   - It is now included, with a "Line crossing" legend entry. Markers use the existing fallback lane.
+   - On staging, pink markers are visible and the legend is correct.
+2. Five customer sidebar pages sent a signed-out **cloud** visitor to the appliance's local recovery `/login`:
+   - Facial Recognition (`/aac/people`), Phone access, Mobile devices, Help, and Install mobile app (no longer public; it is a signed-in page).
+   - They are now in `CLOUD_CUSTOMER_NAV_PATH_PREFIXES`, so they go to `/customer-login.html`. Edge behavior is unchanged.
+   - Verified signed out on staging.
+
+**Test-only fixes (current behavior verified correct before each change)**
+- **Licensed-slot and `AWS_REGION` setup:** discovery/provisioning, recording uploader, customer setup.
+- **Superseded strings:** mobile playback, HLS recovery, autoplay, Playback lanes and segment chaining, Investigate (now paged via `/api/customer/investigate/search`), setup wizard.
+- **Design changes:**
+  - event-media retry honours the upload gate;
+  - retention walks only DB cameras and keeps the newest segment;
+  - Live hides placeholder cameras;
+  - Step 5 of setup is appliance-scoped;
+  - `_upload_recording` has a new signature.
+- **Mobile poll JS harness:** now defines the day-view globals.
+- **Windows path forms:** assertions made OS-neutral.
+- **PPE real-model test:** skips where the model file is not installed.
+- **Dev-machine leak:** the Dell carries a persisted appliance activation identity (`AIC-DEVICE-0001`), which pushed four sign-in tests through the delegated appliance path.
+  - Those tests now stub `own_appliance_identity`.
+  - The technician-cannot-select-Administrator check (403) passes on the cloud path; no access-control defect.
+- **`test_semaphore_releases_after_cancellation`** (was intermittent, 3 failures in 8 runs alone):
+  - The failing assertion was always the test's own "encode has started" precondition after a fixed 10 loop ticks.
+  - The semaphore-release check never failed.
+  - It now waits for the encode to start (bounded); 12 of 12 passes.
+
+**Remaining launch blockers:** unchanged from the "2026-09-30 day" section above.
+1. No production environment (live Stripe, domain cutover, production FCM).
+2. Pricing decisions (owner).
+3. Clean-install re-validation on a spare machine or VM.
+4. Samsung controlled release (owner-authorized).
+5. Physical validation (the 10-step sequence above).
+6. Live anyaicam.com website issues.
+7. Owner/operator items: Ryzen DHCP reservation, Bedroom camera, Front Door walk-up, greeting voice, Edge push permission.
+8. Not validated here: PostgreSQL runtime for the new tables, native apps, Firebase browser-key referrer restriction.
+
+**Physical test addition:** in step 10 (portal look-over), also open Playback on a camera with Line Crossing rules and confirm the pink markers and legend entry.
