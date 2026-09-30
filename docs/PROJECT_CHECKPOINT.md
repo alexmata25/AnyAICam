@@ -4581,3 +4581,14 @@ Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, 
 - Two real Voice Calls within 3 minutes of startup: `41dc80c85e` at 00:55:53Z and `dfba6a63ec` at 00:56:31Z. Each played the greeting through the camera speaker (20 chunks, success), and the cloud reached "notified".
 - Not yet confirmed: that the greeting sounds right at the new Medium level. Needs a person at the door.
 - `validate.sh` output not received.
+
+**AAC Voice Call two-way audio: PHYSICALLY VALIDATED on Ryzen `e3ee24e` (owner test, 2026-09-30 ~01:07 UTC, Living Room `dfba6a63ec`).**
+- Camera → phone audio works.
+- Phone → camera talkdown works: `POST /talk/start` 200, then the audio WebSocket. On the Ryzen, the RTSP audio backchannel to 192.168.0.38 reached SETUP/PLAY 200 and `connect_succeeded`.
+- Full two-way conversation works; the greeting plays through the camera speaker (ISAPI, 20 chunks).
+- Live View Talk (normal VMS page), read-only analysis:
+  - The owner's failed Living Room Live Talk attempts were at 00:17:51–00:18:30 UTC. All 5 `POST /talk/start` returned 503 **before** the upgrade (the Ryzen Talk channel first connected at 00:53:48 on `e3ee24e`; `1175932` had no channel).
+  - The Voice Call and Live View mic buttons are the same client (`wireTalkMic`) using the same `/talk/start`, cloud relay and Ryzen transport. A browser probe (talk requests intercepted, nothing sent to the camera) confirmed both screens render an enabled, unobstructed mic that issues the identical request on desktop and phone.
+  - Only difference: Voice Call reuses the microphone opened at Answer; Live View asks for the microphone on the first tap.
+  - No Live View Talk attempt has happened since the upgrade, so Live View talkdown is **not yet validated**. It needs an owner re-test.
+- Defect found, not yet fixed: "End call" stops the call's microphone but not an active Talk session (Talk streams from a cloned track), and gives no clear feedback. The owner pressed End 11 times in 11 s. Proposed universal fix: End call also stops any active Talk session on the page, then disables Answer/End and shows "Call ended".
