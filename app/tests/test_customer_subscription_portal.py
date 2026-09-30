@@ -82,7 +82,7 @@ def test_local_customer_sees_the_local_plan_badge(http_client, db_path):
     assert response.status_code == 200
     assert "My subscription" in response.text
     assert '<span class="pill">Local</span>' in response.text
-    assert "Local 1-8" in response.text
+    assert "Local 8 cameras &middot; 8 licensed camera slots" in response.text
 
 
 def test_hybrid_customer_sees_the_hybrid_plan_badge_and_no_upgrade_panel(http_client, db_path, monkeypatch):
@@ -118,7 +118,7 @@ def test_local_vs_hybrid_comparison_is_always_shown(http_client, db_path):
     assert "Local vs Hybrid" in html
     # 2026-09-30 pricing: Local and Hybrid are both monthly.
     assert "<strong>Local</strong> &middot; monthly subscription" in html
-    assert "recurring subscription" in html
+    assert "<strong>Hybrid</strong> &middot; monthly subscription" in html
     assert "one-time purchase" not in html
 
 

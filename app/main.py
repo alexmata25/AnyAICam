@@ -104154,7 +104154,8 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         import pricing_catalog as _plan_catalog
         _plan = _plan_catalog.find_base_plan(plan_type, tier_label)
         if _plan:
-            plan_summary += f" &middot; ${_plan['monthly_cents'] / 100:.2f}/mo"
+            plan_summary = (f"{escape(_plan['label'])} &middot; {licensed_slots} licensed camera slots"
+                            f" &middot; ${_plan['monthly_cents'] / 100:.2f}/mo")
     else:
         plan_summary = "No camera-slot plan purchased yet"
 
@@ -104295,8 +104296,8 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
-    <div class="health-row"><span><strong>Local</strong> &middot; monthly subscription</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance at home. Keeps working without an internet connection.</span></div>
-    <div class="health-row"><span><strong>Hybrid</strong> &middot; recurring subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
+    <div class="health-row"><span><strong>Local</strong> &middot; monthly subscription</span><span>Recording, playback, live view and analytics on your AnyAiCam appliance or your own PC at home. Keeps working without an internet connection.</span></div>
+    <div class="health-row"><span><strong>Hybrid</strong> &middot; monthly subscription</span><span>Everything in Local, plus remote live view from anywhere, email and phone alerts, and event clips saved to the cloud.</span></div>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Included with every plan</h3>
     <div class="health-row"><span>{escape(", ".join(label for _, label in pricing_catalog.INCLUDED_FEATURES))}</span><span class="pill">Included</span></div>

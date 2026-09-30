@@ -638,7 +638,7 @@ def test_my_subscription_shows_catalog_prices_and_included_features(portal, db_p
         from customer_entitlements import upsert_entitlement
         upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
-    assert "Local 1-8 &middot; 8 licensed camera slots &middot; $14.99/mo" in html
+    assert "Local 8 cameras &middot; 8 licensed camera slots &middot; $14.99/mo" in html
     assert "Secure Edge, Smart Motion, AACO" in html
     assert "$24.99/mo · Includes: People Counting, LPR, PPE" in html
     assert "<span>Talk Down (includes AAC Voice Call)<br><span class=\"health-detail\">$4.99/mo per site</span>" in html

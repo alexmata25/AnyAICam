@@ -196,7 +196,10 @@ def customer_panel_html() -> str:
     if(state.status==='declined'){{text.textContent='Your last request was declined. You can ask again if something has changed.';button.hidden=false;return;}}
     text.textContent='Family or friend of the AnyAiCam team? Ask for the Friends & Family discount before you check out.';button.hidden=false;
   }}
-  async function load(){{try{{const r=await fetch('/api/customer/friends-family');if(r.ok)show(await r.json());}}catch(e){{}}}}
+  async function load(){{
+    try{{const r=await fetch('/api/customer/friends-family');if(r.ok){{show(await r.json());return;}}}}catch(e){{}}
+    if(text.textContent==='Checking…')text.textContent='Friends & Family status is unavailable right now. Refresh the page to try again.';
+  }}
   button.addEventListener('click',async()=>{{
     button.disabled=true;
     try{{const r=await fetch('/api/customer/friends-family/request',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});
