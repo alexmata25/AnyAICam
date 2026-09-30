@@ -48192,6 +48192,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
             ("live", "/customer-live", "Cameras"),
             ("alerts", "/alerts", "Alerts"),
             ("playback", "/playback", "Playback"),
+            ("investigate", "/investigate", "Investigate"),
             ("dashboard", "/customer-portal", "Account"),
         ]
 
@@ -48322,7 +48323,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
     )
     if analytics_menu:
         mobile_links = [f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>' for key, url, label in mobile_items]
-        mobile_links.insert(2, analytics_menu[1])  # Cameras, Alerts, Analytics, Playback, Account
+        mobile_links.insert(2, analytics_menu[1])  # Cameras, Alerts, Analytics, Playback, Investigate, Account
         mobile = "".join(mobile_links)
         import customer_analytics_workspace
         scripts = analytics_menu[2] + customer_analytics_workspace.NAV_ASSETS + scripts
