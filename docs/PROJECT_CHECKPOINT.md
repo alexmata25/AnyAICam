@@ -4666,3 +4666,48 @@ on this checkpoint.**
 - Browser check on staging (ended call, talk/answer/end requests intercepted): "Call ended." shown, controls disabled, no requests on tap, no errors, desktop and phone.
 - **Pending physical test:** answer a real Voice Call, Talk, press End; confirm the voice stops at the camera and the screen shows Call ended.
 - **Still pending:** normal Live View Talk physical test after `e3ee24e` (not yet validated).
+
+## MORNING CHECKPOINT — 2026-09-30 (overnight autonomous pass)
+
+**1. Builds deployed**
+- Golden (`reconcile/golden-foundation-20260911`) = `5b26bf1`. Release commit `e690f10`: push + fixes; tree identical to staging `c0e7e04`.
+- **Staging** = `c0e7e04`, push ON (staging only). Rollback `portal-87ce735-pre-c0e7e04-20260930T042129Z-rollback`. 15/15 health checks; Ryzen Talk channel reconnected.
+- **Ryzen** = `e690f10`, installed by the owner via `install.sh --repair`. Rollback image `anyaicam-vms:rollback-e3ee24e36653`; DB backup `partner_portal-pre-e690f109c187-20260930T044259Z.db`. Package sha256 `bb924ed7…3745`, verified on the Ryzen.
+- **Samsung**: untouched.
+
+**2. What changed**
+- Push: site-level visit grouping with a sliding 60 s window, 10-minute cap and at most 2 pushes per visit (`f64ea04`). Visitor Call and INTRUSION ALARM are immediate and never grouped; system alerts are not grouped; in-app/email/SMS unchanged.
+- Push earlier: a push error can't cost in-app/email/SMS (savepoint); the tap works with a tab open; Firebase SDK only in opted-in cloud images; read-only credential mount; staging FCM configured (dedicated send-only service account; key transferred by an encrypted tunnel, never printed).
+- Home Screen app (`c0e7e04`): the manifest and offline page no longer redirect to sign-in (fixed "Manifest: Line 1 syntax error"); square 192/512/maskable/180 icons; "Samsung hub" wording removed.
+- Voice Call (`1cdd445`, `41e5252`): End call stops active Talk and the mic, shows "Call ended.", repeated presses do nothing, disabled buttons look disabled.
+- Website update 2 (live on anyaicam.com): standard footer on plans/analytics; Live/Playback screenshots on vms.html.
+
+**3. Focused tests**: push 76 + manifest 5 + website 302 + notification/email/SMS/Voice Call 339 — all pass. Grouping regressions for multiple cameras, overlap, sliding extension, upgrades, Visitor Call, intrusion, long-running activity and unchanged email.
+
+**4. Full suite** (`f64ea04`/`c0e7e04`): 4,923 passed, 88 failed, 128 skipped. 86 in the baseline; 2 outside it, both timing flakes:
+- `test_semaphore_releases_after_cancellation` (known);
+- `test_no_appliance_channel_uses_local_isapi_fallback`: asserts "stopped" before the server's async stop finishes under load. Passes 3/3 alone and 18/18 in its file; untouched code.
+The installer-style edge build (no `requirements-push.txt`, default args) passes, and firebase-admin is absent from the appliance image.
+
+**5. Health**
+- Staging: healthy, push available.
+- Ryzen post-install: `e690f10` healthy, 0 restarts, main.py matches the release; sync/event-media/LPR/talkdown flags kept; 4/4 cameras reachable; MediaMTX API 200; Talk channel connected; cams 2/3 recording continuously, cams 1/5 writing event buffers (event mode, as before); events accepted by the cloud; 0 tracebacks; push inert (no worker, no Firebase library).
+
+**6. Found, intentionally not changed**
+- The PC Chrome device receives no pushes although FCM accepts them (phone works with the same code). Needs the owner's `chrome://gcm-internals` check.
+- Edge: `pushManager.subscribe` → "permission denied" in the owner's Edge profile (it works in a clean Edge profile). Browser/profile issue, tracked separately.
+- AACO settings: no settings page or route exists, linked or unlinked. Configuration is only server env vars (`ANYAICAM_AACO_LOCAL_LLM_ENABLED`, `ANYAICAM_AACO_LLM_MODEL_PATH`); no per-customer table; not sellable. A UI needs product decisions (what customers control, per-role access).
+- Live grid: an offline camera shows a blank black tile with no "Offline" label (Bedroom). Playback timeline label truncates ("Driveway Right — …"). Both are UI polish in critical live/playback code, left for daytime.
+- A throwaway Firebase Installation was created while validating the corrected API key (harmless, expires).
+- Automated desktop push display can't be validated here: FCM treats automation-profile tokens as NotRegistered.
+
+**7. Physical tests, in order**
+1. PC push: `chrome://gcm-internals` → CONNECTED? Start Recording → ask for a test push → did it log? Check Windows notifications, Do Not Disturb, Chrome running in the background.
+2. Push grouping (phone): walk past both driveway cameras once → expect **1** push (at most 2).
+3. Visitor Call push + tap: Front Door walk-up → an immediate "Visitor Call" push; tap → the call screen.
+4. Voice Call End call: Answer, tap 🎤, talk, End call → the voice stops at the camera; "Call ended."; buttons greyed; extra presses do nothing.
+5. Live View Talk (not yet validated after e3ee24e): Live → Living Room → 🎤 → talk → heard at the camera.
+6. Greeting volume (Medium, ~9 dB quieter) at the door.
+7. INTRUSION ALARM push: arm Secure Edge, cross a security line → an immediate INTRUSION ALARM push; tap → Live view.
+8. iPhone Home Screen: open app.anyaicam.com in Safari → Share → Add to Home Screen → open it → Settings → Notifications → Enable → a test push.
+9. Tap deep links from a real notification (ordinary → Playback event; Visitor Call → call screen).
