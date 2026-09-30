@@ -4773,3 +4773,22 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 10. LPR drive-by.
 11. iPhone: Safari → Add to Home Screen → Notifications → Enable → test push.
 12. Portal look-over: Bedroom tile says "Camera offline"; no Ctrl+Shift+R needed after an update; Security/Investigate tabs; AACO settings.
+
+## 2026-09-30 morning: Ryzen 7290f7c installed; PC push validated; installer stale-directory fix
+
+**Ryzen = `7290f7c`** (owner-installed; `validate.sh`: 0 failures). Read-only checks:
+- `/version` = `7290f7c`; healthy, 0 restarts; main.py and aaco_settings.py match the commit.
+- Settings kept (analytics sync, event media, LPR, talkback discovery); push inert (no firebase_admin).
+- 4/4 cameras reachable; MediaMTX 200; Talk channel connected; cams 1/2/3/5 writing; events syncing; 0 tracebacks; `aaco_customer_settings` created.
+- Rollback: image `anyaicam-vms:rollback-e690f109c187` (also `rollback-e3ee24e36653`); DB `partner_portal-pre-7290f7c017e5-20260930T120200Z.db`.
+
+**Push on the PC: VALIDATED by the owner** (desktop Chrome displays pushes). The earlier missing display was Windows notifications being off, not the app.
+
+**Installer message "cannot delete non-empty directory: app-pre-event-mode-pilot-20260919T223956Z"** (`a36a440`, golden `c58e880`):
+- Cause: a hand-made 2026-09-19 backup inside `/opt/anyaicam` holding only an empty `recordings/` folder (8 KB, root-owned). The mirror's `--exclude 'recordings/'` protects any recordings/ folder, deliberately, since it also guards the legacy `app/recordings`, so `rsync --delete` could never remove it.
+- Fix: before the mirror, top-level `*-pre-*` folders not in the release are MOVED, contents intact, to `/var/lib/anyaicam/rollback/stale-install-dirs/`. Nothing is deleted and the excludes are unchanged. Installer tests 35/35. Ships with the next Ryzen release.
+- Nothing was removed from the running Ryzen. The next installer run will move it automatically.
+- Optional immediate cleanup (owner, sudo). `rmdir` removes only EMPTY folders and refuses otherwise, so it cannot delete data:
+  `sudo rmdir /opt/anyaicam/app-pre-event-mode-pilot-20260919T223956Z/recordings /opt/anyaicam/app-pre-event-mode-pilot-20260919T223956Z`
+
+**Remaining physical tests** (owner, when home): phone push re-enable; driveway grouping walk; Visitor Call push + tap; End call while talking; Live View Talk; greeting volume; Secure Edge intrusion alarm; LPR; iPhone Home Screen push.
