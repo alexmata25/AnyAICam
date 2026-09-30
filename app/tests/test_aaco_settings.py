@@ -221,3 +221,10 @@ def test_the_floating_button_follows_the_setting(monkeypatch):
     source = open(main.__file__, encoding="utf-8").read()
     assert '_show_aaco = _aaco.get("enabled", True) and _aaco.get("show_floating", True)' in source
     assert html_on == html_off or "aaco-float-toggle" not in html_off
+
+
+def test_settings_pages_link_to_aaco_settings():
+    import customer_platform
+    source = open(customer_platform.__file__, encoding="utf-8").read()
+    assert '<a class="ghost-button" href="/customer/aaco-settings">AACO settings</a>' in source   # Settings page
+    assert '<a class="setting-link" href="/customer/aaco-settings">' in source                    # Account page controls

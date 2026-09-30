@@ -251,6 +251,11 @@ def register_customer_platform_routes(
               <a class="ghost-button" href="/customer/voice-call-settings">Voice Call settings</a>
             </div>
             <div class="push-status" style="margin-top:16px">
+              <strong>AACO assistant</strong>
+              <p class="health-detail">Turn the assistant on or off, show or hide its button, and choose which cameras and actions it may use.</p>
+              <a class="ghost-button" href="/customer/aaco-settings">AACO settings</a>
+            </div>
+            <div class="push-status" style="margin-top:16px">
               <strong>Phone alerts</strong>
               <p class="health-detail">Pair your phone with the AnyAiCam app to get push alerts, or pause alerts for a paired device.</p>
               <a class="ghost-button" href="/mobile-devices">Manage mobile devices</a>
