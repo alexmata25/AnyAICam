@@ -8388,6 +8388,10 @@ motion_event_lock = asyncio.Lock()
 # rapidly repeated detections produces one clip, not several"), just
 # not previously wired into this detection path.
 ai_event_clip_windows: dict[int, tuple] = {}
+# When each camera's previously scanned frame happened: an object detected
+# now entered after it, so its event clip starts no later than this
+# (detection_timing.detection_event_span()).
+ai_last_frame_time: dict[int, datetime] = {}
 ai_event_clip_windows_lock = threading.Lock()
 
 # The main application event loop, captured lazily on ai_person_detector()'s
@@ -16195,7 +16199,7 @@ async def event_buffer_janitor(camera_number: int) -> None:
     whose local_recording_mode is not 'event', so this can safely run
     for every camera slot unconditionally rather than needing to be
     started/stopped as a mode changes."""
-    from local_recording_policy import BufferSegment, is_buffer_segment_still_needed
+    from local_recording_policy import DETECTION_LOOKBACK_SECONDS, BufferSegment, is_buffer_segment_still_needed
 
     while True:
         await asyncio.sleep(EVENT_BUFFER_SEGMENT_SECONDS)
@@ -16223,6 +16227,7 @@ async def event_buffer_janitor(camera_number: int) -> None:
             if not is_buffer_segment_still_needed(
                 segment, now=now, pre_roll_seconds=settings["pre_roll_seconds"],
                 in_flight_event_windows=in_flight,
+                lookback_seconds=DETECTION_LOOKBACK_SECONDS + settings["post_roll_seconds"],
             ):
                 try:
                     path.unlink()
@@ -16398,8 +16403,13 @@ async def persist_event_recording(
             temp_output = destination.with_suffix(".tmp.mkv")
             result = await asyncio.to_thread(
                 subprocess.run,
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-                 "-ss", str(offset_seconds), "-t", str(duration_seconds),
+                # -ss BEFORE -i: with stream copy an output-side -ss drops
+                # packets up to the offset, so the file could begin mid-GOP
+                # and show nothing until the next keyframe -- the event's
+                # first seconds lost. Input-side seeking starts at the
+                # keyframe at or before the offset instead.
+                ["ffmpeg", "-y", "-ss", str(offset_seconds), "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-t", str(duration_seconds),
                  "-c", "copy", str(temp_output)],
                 capture_output=True, timeout=60, check=False,
             )
@@ -36322,6 +36332,21 @@ def get_yolo_model():
 
 
 
+def _hls_read_frame_time(manifest: Path) -> datetime | None:
+    """Wall-clock time of the frame OpenCV/FFmpeg will return for this live
+    playlist (it starts a few segments behind live -- detection_timing.py).
+    None if it cannot be worked out; callers then fall back to "now"."""
+    from detection_timing import estimate_hls_frame_time, parse_hls_segments
+    try:
+        segments = parse_hls_segments(manifest.read_text(encoding="utf-8", errors="replace"))
+        if not segments:
+            return None
+        newest_end = datetime.fromtimestamp((manifest.parent / segments[-1][0]).stat().st_mtime)
+        return estimate_hls_frame_time(segments, newest_end)
+    except (OSError, ValueError):
+        return None
+
+
 def detect_objects_frame(camera_number: int) -> dict:
 
 
@@ -36466,6 +36491,8 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
+    # When the frame read below actually happened (detection_timing.py).
+    frame_captured_at = _hls_read_frame_time(manifest)
     capture = cv2.VideoCapture(str(manifest))
 
 
@@ -36939,6 +36966,7 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
         "frame": frame,
+        "frame_captured_at": frame_captured_at,
 
 
 
@@ -37115,6 +37143,14 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
     now = datetime.now()
+    # The detection frame's own time, and the previous scanned frame's
+    # (the object entered after it): the clip's pre-roll counts back from
+    # there, so it shows the object arriving (detection_timing.py).
+    from detection_timing import detection_event_span
+    event_start, event_moment = detection_event_span(
+        result.get("frame_captured_at"), result.get("previous_frame_captured_at"),
+        now=now, scan_interval_seconds=AI_DETECTION_INTERVAL_SECONDS,
+    )
 
 
 
@@ -37645,7 +37681,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-    linked_recording = linked_recording_for(camera_number, now)
+    linked_recording = linked_recording_for(camera_number, event_moment)
 
 
 
@@ -37748,7 +37784,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     if qualifying_detections:
         from event_clips import compute_clip_window, should_merge
 
-        window = compute_clip_window(now, now)
+        window = compute_clip_window(event_start, event_moment)
         with ai_event_clip_windows_lock:
             previous_window = ai_event_clip_windows.get(camera_number)
             is_duplicate = (
@@ -37785,7 +37821,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             async def _build_and_upload_ai_event_media_inner() -> None:
                 try:
                     clip_url = await build_motion_event_clip(
-                        event_group_id, camera_number, now, now
+                        event_group_id, camera_number, event_start, event_moment
                     )
                 except Exception as error:
                     # Diagnostic-only guard: this call used to be
@@ -37820,8 +37856,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         upload_motion_event_media,
                         event_id=event_group_id,
                         camera_number=camera_number,
-                        event_start=now,
-                        event_end=now,
+                        event_start=event_start,
+                        event_end=event_moment,
                         clip_url=clip_url,
                         thumbnail_url=thumbnail_url,
                         already_classified=True,
@@ -37894,7 +37930,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             try:
                 asyncio.run_coroutine_threadsafe(
                     persist_event_recording(
-                        camera_number, now, now,
+                        camera_number, event_start, event_moment,
                         detector="ai_detection", trigger_id=event_group_id,
                     ),
                     _ai_event_media_loop,
@@ -38011,7 +38047,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-            timestamp=now,
+            timestamp=event_moment,
 
 
 
@@ -38148,7 +38184,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         else "PPE violation"
                     ),
                     event_type="ppe",
-                    timestamp=now,
+                    timestamp=event_moment,
                     confidence=ppe_result["confidence"],
                     thumbnail=thumbnail_url,
                     linked_recording=linked_recording,
@@ -38328,7 +38364,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         try:
             asyncio.run_coroutine_threadsafe(
                 _backfill_ai_event_linked_recording(
-                    camera_number, backfill_event_ids, now,
+                    camera_number, backfill_event_ids, event_moment,
                 ),
                 _ai_event_media_loop,
             )
@@ -39109,6 +39145,9 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
             state["status"] = "running" if result.get("ok") else "waiting"
+            if result.get("ok"):
+                result["previous_frame_captured_at"] = ai_last_frame_time.get(camera_number)
+                ai_last_frame_time[camera_number] = result.get("frame_captured_at") or datetime.now()
 
 
 
