@@ -104272,7 +104272,12 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         return f"${tier['monthly_cents_per_door'] / 100:.2f}/mo per door" if tier else ""
 
     addon_rows = ""
-    face_access_row_done = False
+    # Face Access: only the size that fits this customer's enrolled people is
+    # offered, billed per door; over 500 people is Enterprise (contact us).
+    from analytics_entitlements import face_access_size_for_customer, door_count_for_customer
+    face_size = face_access_size_for_customer(customer_id)
+    door_count = max(1, door_count_for_customer(customer_id))
+    face_access_held = any(key.startswith("face_access_") or key == "facial_recognition" for key in held_addons) or "facial_recognition" in active_analytics
     for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
         price_id = os.environ.get(env_var, "").strip()
         # Purchases made before addon_subscriptions existed are recognised
@@ -104282,17 +104287,12 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                      or (addon_key == "advanced_analytics"
                          and {"smart_motion", "people_counting", "lpr", "ppe"} <= active_analytics))
         item = checkout_item(addon_key, customer_id)
-        is_face_access = addon_key.startswith("face_access_") or addon_key == "facial_recognition"
-        if is_face_access and not is_active and not item["sellable"]:
-            # One honest row for Face Access until its sizes can be sold.
-            if not face_access_row_done:
-                face_access_row_done = True
-                prices = [t["monthly_cents_per_door"] for t in pricing_catalog.face_access_tiers()]
-                addon_rows += (f'<div class="health-row"><span>Face Access<br><span class="health-detail">'
-                               f'${min(prices) / 100:.2f}–${max(prices) / 100:.2f}/mo per door, sized by enrolled people</span></span>'
-                               '<span class="pending-badge" aria-disabled="true" title="Not available to purchase yet">Not available yet</span></div>')
-            continue
-        quantity = site_count if item["unit"] == "per_site" else 1
+        if addon_key == "facial_recognition" and not is_active:
+            continue  # the old single-price SKU: shown only to customers who hold it
+        if addon_key.startswith("face_access_") and not is_active:
+            if face_access_held or addon_key != f"face_access_{face_size}":
+                continue
+        quantity = site_count if item["unit"] == "per_site" else door_count if item["unit"] == "per_door" else 1
         if is_active:
             status_html = '<span class="pill">Active</span>'
         elif not price_id or not item["sellable"]:
@@ -104314,8 +104314,14 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         details = [text for text in (_price_text(addon_key), f"Includes: {', '.join(included)}" if included else "") if text]
         if addon_key == "talk_down" and site_count > 1:
             details.append(f"{site_count} sites")
+        if addon_key.startswith("face_access_"):
+            details.append(f"{door_count} door{'s' if door_count != 1 else ''}")
         includes_html = f'<br><span class="health-detail">{escape(" · ".join(details))}</span>' if details else ''
         addon_rows += f'<div class="health-row"><span>{escape(label)}{includes_html}</span>{status_html}</div>'
+    if face_size == pricing_catalog.FACE_ACCESS_ENTERPRISE and not face_access_held:
+        addon_rows += ('<div class="health-row"><span>Face Access Enterprise<br><span class="health-detail">'
+                       'More than 500 enrolled people: custom pricing</span></span>'
+                       '<a class="ghost-button" href="mailto:amata@anyaicam.com?subject=Face%20Access%20Enterprise">Contact us</a></div>')
     if not addon_rows:
         addon_rows = '<p class="health-detail">No analytics add-ons are configured for purchase yet.</p>'
 
@@ -113688,8 +113694,12 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     if not item["sellable"]:
         raise HTTPException(status_code=400, detail=item["unavailable_reason"] or "This add-on is not available yet.")
     quantity = 1
-    if item["unit"] in ("per_site", "per_door"):
+    if item["unit"] == "per_site":
         quantity = max(1, min(int(payload.quantity or 1), 256))
+    elif item["unit"] == "per_door":
+        # Billed for every door the customer has set up, decided server-side.
+        from analytics_entitlements import door_count_for_customer
+        quantity = max(1, door_count_for_customer(identity["customer_id"]))
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:
         raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {addon_key}.")

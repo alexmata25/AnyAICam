@@ -85,13 +85,12 @@ def test_face_access_is_separate_per_door_and_not_in_advanced():
     assert "facial_recognition" not in pc.find_addon("advanced_analytics")["grants"]
 
 
-def test_face_access_size_follows_enrolled_people_once_thresholds_are_set(monkeypatch):
-    monkeypatch.delenv(pc.FACE_ACCESS_SMALL_MAX_ENV, raising=False)
-    assert pc.face_access_size_for(3) is None
-    assert not any(t["sellable"] for t in pc.face_access_tiers())
-    monkeypatch.setenv(pc.FACE_ACCESS_SMALL_MAX_ENV, "25")
-    monkeypatch.setenv(pc.FACE_ACCESS_MEDIUM_MAX_ENV, "100")
-    assert [pc.face_access_size_for(n) for n in (1, 25, 26, 100, 101)] == ["small", "small", "medium", "medium", "large"]
+def test_face_access_size_follows_enrolled_people():
+    """Owner-approved 2026-09-30: Small up to 25, Medium 26-100, Large
+    101-500; over 500 is Enterprise / custom pricing."""
+    assert [pc.face_access_size_for(n) for n in (0, 25, 26, 100, 101, 500, 501)] == [
+        "small", "small", "medium", "medium", "large", "large", "enterprise"]
+    assert all(t["sellable"] for t in pc.face_access_tiers())
 
 
 def test_cloud_overflow_has_no_invented_price_and_is_not_bundled():
@@ -102,7 +101,7 @@ def test_cloud_overflow_has_no_invented_price_and_is_not_bundled():
 
 def test_friends_family_percentages_and_quote():
     # The one-time VMS license has no approved Friends & Family discount (0%).
-    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0}
+    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0, "face_access": 0}
     quote = pc.quote(plan_type="local", tier_label="1-8", addon_keys=["advanced_analytics"], friends_family_approved=True)
     base, advanced = quote["lines"]
     assert base["cents"] == 1499 - 750  # 50% of $14.99, rounded to the cent like Stripe
@@ -396,7 +395,7 @@ def test_unsellable_items_cannot_be_checked_out(portal, db_path, monkeypatch):
     client, captured, sent = portal
     _seed(db_path)
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW", "price_overflow")
-    for key in ("cloud_overflow", "face_access_small", "facial_recognition"):
+    for key in ("cloud_overflow", "facial_recognition"):
         response = client.post("/api/customer/analytics/checkout", json={"addon_key": key}, cookies=_cookie(*OWNER))
         assert response.status_code == 400, key
     assert captured == []
@@ -836,3 +835,78 @@ def test_checkout_refuses_a_one_time_price_for_a_monthly_item(license_portal, db
     response = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
     assert response.status_code == 503 and "PRICE_MISMATCH" in response.json()["detail"]
     assert captured == []
+
+
+
+# ================================================================ Face Access sizing
+
+def _enroll(db_path, count, customer_id="cust-1"):
+    conn = sqlite3.connect(db_path)
+    conn.executemany("INSERT INTO facial_people(id,customer_id,display_name,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                     [(f"person-{customer_id}-{i}", customer_id, f"Person {i}", "active", "2026-01-01", "2026-01-01") for i in range(count)])
+    conn.commit()
+    conn.close()
+
+
+def _doors(db_path, camera_ids):
+    conn = sqlite3.connect(db_path)
+    for camera_id in camera_ids:
+        conn.execute("UPDATE cameras SET door_access_enabled=1 WHERE id=?", (camera_id,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture()
+def face_portal(portal, monkeypatch):
+    for size in ("SMALL", "MEDIUM", "LARGE"):
+        monkeypatch.setenv(f"ANYAICAM_STRIPE_PRICE_FACE_ACCESS_{size}", f"price_face_{size.lower()}")
+    return portal
+
+
+def test_face_access_is_sold_in_the_customers_size_billed_per_door(face_portal, db_path):
+    client, captured, sent = face_portal
+    _seed(db_path)
+    _enroll(db_path, 30)  # Medium
+    _doors(db_path, ["cam-1", "cam-2"])
+    small = client.post("/api/customer/analytics/checkout", json={"addon_key": "face_access_small"}, cookies=_cookie(*OWNER))
+    assert small.status_code == 400 and "Face Access Medium" in small.json()["detail"]
+    medium = client.post("/api/customer/analytics/checkout", json={"addon_key": "face_access_medium", "quantity": 1}, cookies=_cookie(*OWNER))
+    assert medium.status_code == 200, medium.text
+    assert captured[-1]["line_items[0][price]"] == "price_face_medium"
+    assert captured[-1]["line_items[0][quantity]"] == "2"  # every door set up, decided server-side
+    assert "discounts[0][coupon]" not in captured[-1]
+
+
+def test_face_access_gets_no_friends_family_discount(face_portal, db_path):
+    client, captured, sent = face_portal
+    _seed(db_path)
+    request_id = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()["request_id"]
+    client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
+    response = client.post("/api/customer/analytics/checkout", json={"addon_key": "face_access_small"}, cookies=_cookie(*OWNER))
+    assert response.status_code == 200
+    assert "discounts[0][coupon]" not in captured[-1]
+    assert captured[-1]["metadata[anyaicam_friends_family]"] == "approved"
+
+
+def test_over_500_people_is_enterprise_contact_not_an_online_purchase(face_portal, db_path):
+    client, captured, sent = face_portal
+    _seed(db_path)
+    _enroll(db_path, 501)
+    for size in ("small", "medium", "large"):
+        response = client.post("/api/customer/analytics/checkout", json={"addon_key": f"face_access_{size}"}, cookies=_cookie(*OWNER))
+        assert response.status_code == 400 and "Enterprise" in response.json()["detail"]
+    assert captured == []
+    html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
+    assert "Face Access Enterprise" in html and "custom pricing" in html
+    assert 'data-addon-key="face_access_' not in html
+
+
+def test_my_subscription_offers_only_the_matching_face_access_size(face_portal, db_path):
+    client, captured, sent = face_portal
+    _seed(db_path)
+    _enroll(db_path, 120)  # Large
+    _doors(db_path, ["cam-1"])
+    html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
+    assert 'data-addon-key="face_access_large"' in html
+    assert "$69.99/mo per door · Includes: Facial Recognition · 1 door" in html
+    assert 'data-addon-key="face_access_small"' not in html and 'data-addon-key="face_access_medium"' not in html

@@ -201,10 +201,10 @@ def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, m
     assert "$7.99/mo · Includes: People Counting" in html
 
 
-def test_face_access_is_one_honest_per_door_row_until_its_sizes_are_defined(http_client, db_path, monkeypatch):
-    """2026-09-30: Face Access is sold per door by size (enrolled people);
-    the thresholds are not decided, so no Face Access buy button exists --
-    not even for the old single-price SKU, which is no longer sold."""
+def test_face_access_offers_one_size_per_door_and_never_the_old_sku(http_client, db_path, monkeypatch):
+    """2026-09-30: Face Access is sold per door in the size matching the
+    customer's enrolled people (none enrolled = Small). The old
+    single-price SKU is no longer sold, so it never gets a buy button."""
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION", "price_test_facial_recognition")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
@@ -212,10 +212,11 @@ def test_face_access_is_one_honest_per_door_row_until_its_sizes_are_defined(http
     conn.close()
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert html.count("<span>Face Access<br>") == 1
-    assert "$39.99–$69.99/mo per door" in html
+    assert html.count("<span>Face Access Small<br>") == 1
+    assert "$39.99/mo per door" in html
+    assert "Face Access Medium" not in html and "Face Access Large" not in html
     assert 'data-addon-key="facial_recognition"' not in html
-    assert 'data-addon-key="face_access_' not in html
+    assert 'data-addon-key="face_access_' not in html  # no Face Access Price ID configured here
 
 
 def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(http_client, db_path):

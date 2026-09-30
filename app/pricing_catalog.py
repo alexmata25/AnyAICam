@@ -115,8 +115,7 @@ ANALYTICS_PACKAGE_KEYS = ("ai_essentials", "ai_professional", "vehicle_intellige
 
 # 6. Face Access: separate premium access-control product, priced per door
 # by size. Size is decided by enrolled people count (owner decision
-# 2026-09-30); the thresholds are not decided yet, so Face Access stays
-# unsellable until both thresholds are configured.
+# 2026-09-30) with owner-approved thresholds (FACE_ACCESS_SIZE_LIMITS).
 FACE_ACCESS_TIERS = [
     # size, label, monthly price per door (cents), Stripe Price ID env var
     ("small", "Face Access Small", _cents("39.99"), "ANYAICAM_STRIPE_PRICE_FACE_ACCESS_SMALL"),
@@ -124,17 +123,18 @@ FACE_ACCESS_TIERS = [
     ("large", "Face Access Large", _cents("69.99"), "ANYAICAM_STRIPE_PRICE_FACE_ACCESS_LARGE"),
 ]
 FACE_ACCESS_GRANTS = ("facial_recognition",)
-# Enrolled-people thresholds: Small up to SMALL_MAX, Medium up to MEDIUM_MAX,
-# Large above that.
-FACE_ACCESS_SMALL_MAX_ENV = "ANYAICAM_FACE_ACCESS_SMALL_MAX_PEOPLE"
-FACE_ACCESS_MEDIUM_MAX_ENV = "ANYAICAM_FACE_ACCESS_MEDIUM_MAX_PEOPLE"
+# Enrolled-people limits per size (owner-approved 2026-09-30): Small up to
+# 25, Medium 26-100, Large 101-500. More than 500 enrolled people is
+# Enterprise / custom pricing -- not sold online.
+FACE_ACCESS_SIZE_LIMITS = (("small", 25), ("medium", 100), ("large", 500))
+FACE_ACCESS_ENTERPRISE = "enterprise"
 
 # --------------------------------------------------------------------------
 # 9. Friends & Family (approved by an administrator, never a promo code).
 # --------------------------------------------------------------------------
-# The one-time VMS license has no approved Friends & Family discount yet
-# (class "vms_license" -> 0%); flagged for a decision, never invented.
-FRIENDS_FAMILY_PERCENT_OFF = {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0}
+# The one-time VMS license and Face Access get no Friends & Family discount
+# (owner decision 2026-09-30, "0% for now").
+FRIENDS_FAMILY_PERCENT_OFF = {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0, "face_access": 0}
 FRIENDS_FAMILY_COUPON_ENV = {
     "base": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE",
     "analytics": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS",
@@ -209,33 +209,21 @@ def find_addon(addon_key: str) -> Optional[dict]:
     return next((a for a in addons() if a["addon_key"] == addon_key), None)
 
 
-def face_access_thresholds() -> Optional[tuple[int, int]]:
-    try:
-        small = int(os.environ.get(FACE_ACCESS_SMALL_MAX_ENV, "").strip())
-        medium = int(os.environ.get(FACE_ACCESS_MEDIUM_MAX_ENV, "").strip())
-    except ValueError:
-        return None
-    return (small, medium) if 0 < small < medium else None
-
-
-def face_access_size_for(enrolled_people: int) -> Optional[str]:
-    """small/medium/large for this many enrolled people, or None while the
-    thresholds are not configured (Face Access is then not sellable)."""
-    thresholds = face_access_thresholds()
-    if thresholds is None:
-        return None
-    small, medium = thresholds
-    if enrolled_people <= small:
-        return "small"
-    return "medium" if enrolled_people <= medium else "large"
+def face_access_size_for(enrolled_people: int) -> str:
+    """small / medium / large for this many enrolled people, or "enterprise"
+    above the Large limit (custom pricing, not sold online)."""
+    for size, limit in FACE_ACCESS_SIZE_LIMITS:
+        if int(enrolled_people) <= limit:
+            return size
+    return FACE_ACCESS_ENTERPRISE
 
 
 def face_access_tiers() -> list[dict]:
-    sellable = face_access_thresholds() is not None
+    limits = dict(FACE_ACCESS_SIZE_LIMITS)
     return [
         {"size": size, "label": label, "monthly_cents_per_door": cents, "grants": FACE_ACCESS_GRANTS,
-         "price_env_var": env_var, "stripe_price_id": _price_id(env_var), "sellable": sellable,
-         "unavailable_reason": None if sellable else "Face Access size thresholds (enrolled people) have not been set."}
+         "max_people": limits[size], "price_env_var": env_var, "stripe_price_id": _price_id(env_var),
+         "sellable": True, "unavailable_reason": None}
         for size, label, cents, env_var in FACE_ACCESS_TIERS
     ]
 
@@ -329,8 +317,9 @@ def public_catalog() -> dict:
         ],
         "face_access": [
             {"size": t["size"], "label": t["label"], "monthly_per_door": dollars(t["monthly_cents_per_door"]),
-             "sellable": t["sellable"], "unavailable_reason": t["unavailable_reason"]}
+             "max_enrolled_people": t["max_people"], "sellable": t["sellable"]}
             for t in face_access_tiers()
         ],
+        "face_access_enterprise": {"over_enrolled_people": FACE_ACCESS_SIZE_LIMITS[-1][1], "pricing": "custom"},
         "friends_family": {"percent_off": dict(FRIENDS_FAMILY_PERCENT_OFF), "requires_administrator_approval": True},
     }

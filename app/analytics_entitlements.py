@@ -235,13 +235,25 @@ def checkout_item(addon_key: str, customer_id: Optional[str] = None) -> dict:
         result = {"sellable": tier["sellable"], "unavailable_reason": tier["unavailable_reason"],
                   "unit": "per_door", "discount_class": "face_access"}
         if tier["sellable"] and customer_id:
-            enrolled = row("SELECT COUNT(*) AS n FROM facial_people WHERE customer_id=? AND status='active'", (customer_id,))
-            size = _catalog.face_access_size_for(int((enrolled or {}).get("n") or 0))
-            if size != tier["size"]:
-                result.update(sellable=False, unavailable_reason=f"Your account needs Face Access {str(size).title()} for the people enrolled.")
+            size = face_access_size_for_customer(customer_id)
+            if size == _catalog.FACE_ACCESS_ENTERPRISE:
+                result.update(sellable=False, unavailable_reason="More than 500 enrolled people needs Face Access Enterprise pricing. Contact AnyAiCam.")
+            elif size != tier["size"]:
+                result.update(sellable=False, unavailable_reason=f"Your account needs Face Access {size.title()} for the people enrolled.")
         return result
     return {"sellable": False, "unavailable_reason": "Face Access is now sold per door by size.",
             "unit": "per_account", "discount_class": "face_access"}
+
+
+def face_access_size_for_customer(customer_id: str) -> str:
+    enrolled = row("SELECT COUNT(*) AS n FROM facial_people WHERE customer_id=? AND status='active'", (customer_id,))
+    return _catalog.face_access_size_for(int((enrolled or {}).get("n") or 0))
+
+
+def door_count_for_customer(customer_id: str) -> int:
+    """Doors for per-door Face Access billing: cameras set up with a door."""
+    doors = row("SELECT COUNT(*) AS n FROM cameras WHERE customer_id=? AND door_access_enabled=1", (customer_id,))
+    return int((doors or {}).get("n") or 0)
 
 
 def _grants_for(addon_key: str) -> tuple:
