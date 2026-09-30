@@ -144,3 +144,13 @@ def test_other_connection_check_rows_are_unaffected(http_client, db_path, monkey
     # Customer wording since 2026-09-25 (was "Needs VAPID keys").
     assert "<span>Phone alerts</span><strong>Not available yet</strong>" in html
     assert "VAPID" not in html and "Samsung laptop" not in html
+
+
+def test_phone_status_recognizes_shared_fcm_without_legacy_vapid(http_client, db_path, monkeypatch):
+    monkeypatch.setattr(main, 'VAPID_PUBLIC_KEY', '')
+    monkeypatch.setattr(main, 'VAPID_PRIVATE_KEY', '')
+    monkeypatch.setattr(main, 'mobile_push_web_configuration', lambda: {'available': True})
+    _seeded(db_path)
+    response=http_client.get('/phone-connect',cookies={partner_portal.SESSION_COOKIE:_owner_cookie('cust-1')})
+    assert '<span>Phone alerts</span><strong>Ready to enable</strong>' in response.text
+    assert 'Choose alerts and enable push for this browser' in response.text

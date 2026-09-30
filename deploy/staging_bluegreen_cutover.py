@@ -75,6 +75,21 @@ STAGING_MOUNTS = (
     "/var/lib/anyaicam-staging/hls:/app/static/hls",
     "/var/lib/anyaicam-staging/data-config:/opt/anyaicam/data/config",
 )
+# Optional read-only secret folders (2026-09-30), mounted only when present
+# on the host, so a staging host without them runs exactly as before. The
+# FCM sender credential for shared mobile push lives here; the container
+# only gets GOOGLE_APPLICATION_CREDENTIALS (a path) from the env file.
+STAGING_SECRET_MOUNTS = (
+    ("/etc/anyaicam-staging/firebase", "/run/secrets/firebase"),
+)
+
+
+def default_mounts(isdir=None) -> tuple[str, ...]:
+    import os
+    isdir = isdir or os.path.isdir
+    return STAGING_MOUNTS + tuple(f"{src}:{dst}:ro" for src, dst in STAGING_SECRET_MOUNTS if isdir(src))
+
+
 APP_COMMAND = ("uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers")
 # Cloudflare in front of staging answers Python's default "Python-urllib/x"
 # agent with 403 (error 1010) -- found on the first real run, where every
@@ -88,14 +103,15 @@ class Cutover:
                  host_header: str = "portal-staging.anyaicam.com",
                  network: str = "deploy_default", aliases: tuple[str, ...] = ("portal", "vms"),
                  env_file: str = "/etc/anyaicam-staging/vms-staging.env",
-                 mounts: tuple[str, ...] = STAGING_MOUNTS,
+                 mounts: tuple[str, ...] | None = None,
                  candidate_timeout: float = 120, public_timeout: float = 180, public_successes: int = 3,
                  watch_seconds: float = 45, outage_grace: float = 70, poll: float = 2,
                  caddy_container: str = "anyaicam-staging-caddy", pinned_after: float = 30,
                  run=None, http_get=None, sleep=time.sleep, clock=time.monotonic, log=print):
         self.live, self.candidate, self.image, self.build_id = live, candidate, image, build_id
         self.public_url, self.host_header = public_url.rstrip("/"), host_header
-        self.network, self.aliases, self.env_file, self.mounts = network, aliases, env_file, mounts
+        self.network, self.aliases, self.env_file = network, aliases, env_file
+        self.mounts = default_mounts() if mounts is None else mounts
         self.candidate_timeout, self.public_timeout, self.public_successes = candidate_timeout, public_timeout, public_successes
         self.watch_seconds, self.outage_grace, self.poll = watch_seconds, outage_grace, poll
         self.caddy_container, self.pinned_after = caddy_container, pinned_after

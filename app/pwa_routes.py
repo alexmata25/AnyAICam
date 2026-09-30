@@ -20,14 +20,17 @@ def register_pwa_routes(app, *, page_shell: Callable, current_user: Callable):
                 "background_color": "#071032",
                 "theme_color": "#071032",
                 "orientation": "any",
+                # Square icons (2026-09-30): brand-icon.png is 1280x906, so declaring it as
+                # 192x192/512x512 gave stretched or rejected Home Screen icons.
                 "icons": [
-                    {"src": "/static/brand-icon.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
-                    {"src": "/static/brand-icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+                    {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                    {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                    {"src": "/static/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
                 ],
                 "shortcuts": [
-                    {"name": "Live cameras", "url": "/", "icons": [{"src": "/static/brand-icon.png", "sizes": "192x192"}]},
-                    {"name": "Alerts", "url": "/alerts", "icons": [{"src": "/static/brand-icon.png", "sizes": "192x192"}]},
-                    {"name": "Playback", "url": "/playback", "icons": [{"src": "/static/brand-icon.png", "sizes": "192x192"}]},
+                    {"name": "Live cameras", "url": "/", "icons": [{"src": "/static/icon-192.png", "sizes": "192x192"}]},
+                    {"name": "Alerts", "url": "/alerts", "icons": [{"src": "/static/icon-192.png", "sizes": "192x192"}]},
+                    {"name": "Playback", "url": "/playback", "icons": [{"src": "/static/icon-192.png", "sizes": "192x192"}]},
                 ],
             },
             media_type="application/manifest+json",
@@ -70,7 +73,7 @@ self.addEventListener('notificationclick',event=>{
     @app.get("/offline", response_class=HTMLResponse)
     def offline_page():
         return HTMLResponse(
-            '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071032"><title>Offline · ANY AI CAM</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#071032;color:white;font-family:Arial;padding:24px}.card{max-width:520px;text-align:center;padding:32px;border-radius:20px;background:#111a3b}.card img{width:100px}.card p{color:#d8e2ff;line-height:1.6}.card button{padding:12px 18px;border:0;border-radius:999px;font-weight:800}</style></head><body><div class="card"><img src="/static/brand-icon.png"><h1>Internet connection unavailable</h1><p>The local VMS can continue operating, but public camera access, cloud uploads, and push delivery require the Samsung hub to reconnect to the internet.</p><button onclick="location.reload()">Try again</button></div></body></html>'''
+            '''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#071032"><title>Offline · ANY AI CAM</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#071032;color:white;font-family:Arial;padding:24px}.card{max-width:520px;text-align:center;padding:32px;border-radius:20px;background:#111a3b}.card img{width:100px}.card p{color:#d8e2ff;line-height:1.6}.card button{padding:12px 18px;border:0;border-radius:999px;font-weight:800}</style></head><body><div class="card"><img src="/static/brand-icon.png"><h1>Internet connection unavailable</h1><p>The local VMS can continue operating, but public camera access, cloud uploads, and push alerts need your AnyAiCam system to reconnect to the internet.</p><button onclick="location.reload()">Try again</button></div></body></html>'''
         )
 
     @app.get("/mobile-app", response_class=HTMLResponse)

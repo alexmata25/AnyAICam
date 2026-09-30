@@ -44,7 +44,7 @@ def _img_src_csp() -> str:
     return f"img-src 'self' data: blob: https://{bucket}.s3.amazonaws.com"
 
 
-def _connect_src_csp() -> str:
+def _connect_src_csp(request=None) -> str:
     """Allow browser/service-worker fetches to the exact recordings
     bucket used by presigned Playback media and thumbnails."""
     sources = [
@@ -55,6 +55,8 @@ def _connect_src_csp() -> str:
     bucket = os.environ.get("ANYAICAM_RECORDING_S3_BUCKET", "").strip()
     if bucket:
         sources.append(f"https://{bucket}.s3.amazonaws.com")
+    if request is not None and request.url.path in {'/settings/notifications', '/mobile-push-sw.js'}:
+        sources.extend(['https://firebaseinstallations.googleapis.com', 'https://fcmregistrations.googleapis.com'])
     return "connect-src " + " ".join(sources)
 
 
@@ -212,7 +214,8 @@ class ProductionSecurityMiddleware(BaseHTTPMiddleware):
         if response is None: response=await call_next(request)
         frame_ancestors=_frame_ancestors_csp(request)
         response.headers['X-Content-Type-Options']='nosniff'; response.headers['X-Frame-Options']='DENY' if frame_ancestors=='none' else 'SAMEORIGIN'; response.headers['Referrer-Policy']='same-origin'; response.headers['Permissions-Policy']='camera=(self), microphone=(self)'
-        response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp()+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; worker-src 'self' blob:; frame-ancestors '"+frame_ancestors+"'; base-uri 'self'; form-action 'self'"
+        firebase_scripts = ' https://www.gstatic.com/firebasejs/12.0.0/' if request.url.path in {'/settings/notifications', '/mobile-push-sw.js'} else ''
+        response.headers['Content-Security-Policy']="default-src 'self'; "+_img_src_csp()+"; "+_media_src_csp()+"; "+_connect_src_csp(request)+"; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"+firebase_scripts+"; worker-src 'self' blob:; frame-ancestors '"+frame_ancestors+"'; base-uri 'self'; form-action 'self'"
         if 'server' in response.headers: del response.headers['server']
         if origin:
             response.headers['Access-Control-Allow-Origin']=origin; response.headers['Access-Control-Allow-Credentials']='true'; response.headers['Vary']='Origin'; response.headers['Access-Control-Allow-Headers']='Content-Type, X-CSRF-Token, Authorization, X-Customer-ID'; response.headers['Access-Control-Allow-Methods']='GET, POST, PUT, PATCH, DELETE, OPTIONS'

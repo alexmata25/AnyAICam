@@ -41,7 +41,7 @@ from customer_analytics_panel import event_type_label,event_type_message
 # silently create zero notifications (the same class of gap 'ppe'/
 # 'storage_problem'/'facial_recognition' above were each added to fix),
 # even though the in-app notification is the entire point of Phase 3.
-SUPPORTED={'motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm'}
+SUPPORTED={'system_health','motion','smart_motion','person','vehicle','line_crossing','intrusion','lpr','people_counting','occupancy','camera_offline','recording_stopped','appliance_offline','low_disk','storage_problem','high_cpu','software_update','ppe','facial_recognition','aac_voice_call','intrusion_alarm'}
 
 # Per-(user, camera, event_type) minimum spacing between EXTERNAL
 # (email/sms) delivery attempts -- "Prevent duplicate/spam notifications
@@ -262,6 +262,22 @@ def _security_sms_wanted(customer_id: str, site_id: str) -> bool:
         return True  # fail toward delivering an emergency alert
 
 
+def _enqueue_mobile_push(db, notification_id: str) -> None:
+    """Queue push inside a savepoint (2026-09-30): an error in push queueing
+    rolls back only the push rows and is logged, so it can never cost the
+    in-app notification, the email or the SMS -- including INTRUSION ALARM.
+    Before this, an exception here rolled back the whole notification."""
+    db.execute('SAVEPOINT mobile_push_enqueue')
+    try:
+        from mobile_push import enqueue
+        enqueue(db, notification_id)
+    except Exception as exc:
+        db.execute('ROLLBACK TO SAVEPOINT mobile_push_enqueue')
+        import logging
+        logging.getLogger(__name__).warning('mobile push enqueue failed notification_id=%s error=%s', notification_id, type(exc).__name__)
+    db.execute('RELEASE SAVEPOINT mobile_push_enqueue')
+
+
 def fanout_appliance_event(appliance: dict,event: dict):
     customer_id=appliance.get('customer_id'); site_id=appliance.get('site_id'); camera_id=str(event.get('camera_id') or '') or None; event_type=str(event.get('event_type') or '')
     if not customer_id or event_type not in SUPPORTED: return 0
@@ -295,6 +311,7 @@ def fanout_appliance_event(appliance: dict,event: dict):
         notification={'id':notification_id,'title':title,'message':message}
         with connection() as db:
             db.execute('INSERT INTO notifications(id,user_id,customer_id,site_id,camera_id,event_id,recording_id,event_type,severity,title,message,timestamp,thumbnail,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(notification_id,user['id'],customer_id,site_id,camera_id,event.get('id'),event.get('recording_id') or event.get('linked_recording'),event_type,event.get('severity') or ('critical' if event_type in EMERGENCY_EVENT_TYPES else 'info'),title,message,timestamp,event.get('thumbnail'),now.isoformat()))
+            _enqueue_mobile_push(db, notification_id)
             external=_external_channels(db,user=user,customer_id=customer_id,camera_id=camera_id,event_type=event_type,current_time=current_time,now=now,notification_id=notification_id)
         recipients={'in_app':'local','email':external['email_address'],'sms':external['phone_number']}
         channels={'in_app':True,'email':external['email'],'sms':external['sms']}

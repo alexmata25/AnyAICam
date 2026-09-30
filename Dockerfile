@@ -7,6 +7,15 @@ COPY requirements-cpu.txt /tmp/requirements-cpu.txt
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-cpu.txt \
     && pip install --no-cache-dir -r /tmp/requirements.txt
+# Shared mobile push (2026-09-30): the Firebase Admin SDK is installed only
+# for cloud images built with --build-arg ANYAICAM_INSTALL_PUSH=1. Edge
+# appliance builds keep the default 0 and are unchanged; the wildcard COPY
+# also works for the appliance installer payload, which does not ship
+# requirements-push.txt.
+ARG ANYAICAM_INSTALL_PUSH=0
+COPY requirements*.txt /tmp/push-requirements/
+RUN if [ "$ANYAICAM_INSTALL_PUSH" = "1" ]; then pip install --no-cache-dir -r /tmp/push-requirements/requirements-push.txt; fi \
+    && rm -rf /tmp/push-requirements
 COPY ./app /app
 # PPE model weights (2026-09-17): ppe.py's PPE_MODEL_NAME default
 # has never been an Ultralytics-hosted model name -- unlike main.py's
