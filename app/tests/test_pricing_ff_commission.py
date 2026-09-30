@@ -912,3 +912,48 @@ def test_my_subscription_offers_only_the_matching_face_access_size(face_portal, 
     assert 'data-addon-key="face_access_large"' in html
     assert "$69.99/mo per door · Includes: Facial Recognition · 1 door" in html
     assert 'data-addon-key="face_access_small"' not in html and 'data-addon-key="face_access_medium"' not in html
+
+
+# ================================================================ current Stripe API shapes (2026-07-29.dahlia)
+
+def _dahlia_invoice_event(event_id, invoice_id, price_id, amount_cents):
+    """invoice.paid as this account's API version sends it: no charge and no
+    payment_intent on the invoice (they moved to the invoice payments list)."""
+    event = _invoice_event(event_id, invoice_id, price_id, amount_cents)
+    obj = event["data"]["object"]
+    obj.pop("charge"); obj.pop("payment_intent")
+    return event
+
+
+def test_refunds_reverse_commission_with_current_stripe_api_shapes(ledger, monkeypatch):
+    """Found in staging E2E: a real refund did not reverse the commission,
+    because current Stripe versions no longer link charges and invoices
+    directly. The PaymentIntent is looked up through invoice payments."""
+    sc = ledger
+    import main
+    calls = []
+
+    def fake_get(path):
+        calls.append(path)
+        if path.startswith("/v1/invoice_payments?invoice=in_d1"):
+            return {"data": [{"status": "paid", "payment": {"type": "payment_intent", "payment_intent": "pi_d1"}, "invoice": "in_d1"}]}
+        if "payment_intent]=pi_d2" in path:
+            return {"data": [{"status": "paid", "payment": {"type": "payment_intent", "payment_intent": "pi_d2"}, "invoice": "in_d2"}]}
+        if path.startswith("/v1/invoice_payments?invoice=in_d2"):
+            raise RuntimeError("Stripe unavailable")  # recorded without a PaymentIntent
+        return {"data": []}
+
+    monkeypatch.setattr(main, "stripe_api_get", fake_get)
+    sc.sync_commissions_from_stripe_event(_dahlia_invoice_event("evt_d1", "in_d1", "price_local_8", 1499))
+    sc.sync_commissions_from_stripe_event(_dahlia_invoice_event("evt_d2", "in_d2", "price_local_8", 1499))
+    from partner_db import row
+    assert row("SELECT stripe_payment_intent_id FROM subscription_payments WHERE id='in_d1'")["stripe_payment_intent_id"] == "pi_d1"
+    # Refund of month 1: the charge names no invoice; matched through the stored PaymentIntent.
+    sc.sync_commissions_from_stripe_event({"id": "evt_rd1", "type": "charge.refunded", "data": {"object": {
+        "object": "charge", "id": "ch_d1", "payment_intent": "pi_d1", "amount": 1499, "amount_refunded": 1499}}})
+    # Dispute on month 2: no PaymentIntent was stored, so Stripe is asked which invoice pi_d2 paid.
+    sc.sync_commissions_from_stripe_event({"id": "evt_dd2", "type": "charge.dispute.created", "data": {"object": {
+        "object": "dispute", "charge": "ch_d2", "payment_intent": "pi_d2", "amount": 1499}}})
+    assert {e["stripe_invoice_id"]: e["status"] for e in _entries(sc, "recurring")} == {"in_d1": "reversed", "in_d2": "reversed"}
+    assert _entries(sc, "activation")[0]["status"] == "reversed"
+    assert any("payment_intent]=pi_d2" in c for c in calls)

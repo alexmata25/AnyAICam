@@ -140,6 +140,50 @@ def _invoice_subscription_id(invoice: dict) -> str:
     return str(sub.get("id") if isinstance(sub, dict) else sub or "")
 
 
+def _stripe_get(path: str) -> dict:
+    """Read-only Stripe call through the app's own helper (auth, errors).
+    Imported lazily: main imports this module's webhook step."""
+    import main
+    return main.stripe_api_get(path)
+
+
+def _invoice_payment_intent(invoice: dict) -> Optional[str]:
+    """The PaymentIntent that paid this invoice. Older Stripe API versions put
+    it on the invoice (`payment_intent`); current ones (e.g. 2026-07-29.dahlia,
+    this account's version) moved it to the invoice's payments list, which is
+    not in the webhook payload, so it is looked up. None if not found."""
+    direct = invoice.get("payment_intent")
+    if direct:
+        return str(direct.get("id") if isinstance(direct, dict) else direct)
+    for item in ((invoice.get("payments") or {}).get("data") or []):
+        intent = (item.get("payment") or {}).get("payment_intent")
+        if intent:
+            return str(intent.get("id") if isinstance(intent, dict) else intent)
+    try:
+        listed = _stripe_get(f"/v1/invoice_payments?invoice={invoice['id']}&limit=5")
+    except Exception:
+        return None
+    for item in listed.get("data") or []:
+        intent = (item.get("payment") or {}).get("payment_intent")
+        if intent and item.get("status", "paid") == "paid":
+            return str(intent.get("id") if isinstance(intent, dict) else intent)
+    return None
+
+
+def _invoice_for_payment_intent(intent: str) -> Optional[str]:
+    """Reverse lookup for a refund/dispute on current Stripe API versions,
+    whose charges no longer name their invoice."""
+    try:
+        listed = _stripe_get(f"/v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]={intent}&limit=1")
+    except Exception:
+        return None
+    data = listed.get("data") or []
+    if not data:
+        return None
+    invoice = data[0].get("invoice")
+    return str(invoice.get("id") if isinstance(invoice, dict) else invoice) if invoice else None
+
+
 def _classify(price_id: str) -> tuple[Optional[str], Optional[dict]]:
     from customer_entitlements import resolve_tier
     tier = resolve_tier(price_id)
@@ -192,7 +236,7 @@ def _invoice_paid(event: dict) -> dict:
                 "amount_paid_cents,currency,period_start,paid_at,stripe_charge_id,stripe_payment_intent_id,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (invoice_id, customer_id, str(invoice.get("customer") or ""), subscription_id, price_id, product_class, basis,
                  str(invoice.get("currency") or "usd"), str(invoice.get("period_start") or ""), _now(),
-                 str(invoice.get("charge") or "") or None, str(invoice.get("payment_intent") or "") or None, "paid"),
+                 str(invoice.get("charge") or "") or None, _invoice_payment_intent(invoice), "paid"),
             )
     attribution = attribution_for(customer_id)
     if not attribution:
@@ -279,6 +323,13 @@ def _charge_reversed(event: dict, *, reason: str) -> dict:
             payment = row(f"SELECT * FROM subscription_payments WHERE {column}=?", (value,))
             if payment:
                 break
+    if payment is None and intent:
+        # Current Stripe API versions: the charge doesn't name its invoice
+        # and the invoice.paid payload didn't carry the PaymentIntent, so ask
+        # Stripe which invoice this PaymentIntent paid.
+        looked_up = _invoice_for_payment_intent(intent)
+        if looked_up:
+            payment = row("SELECT * FROM subscription_payments WHERE id=?", (looked_up,))
     reversed_ids = []
     if payment:
         if fraction >= 0.999:
