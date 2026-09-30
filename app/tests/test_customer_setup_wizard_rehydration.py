@@ -258,7 +258,9 @@ def test_setup_page_loads_the_latest_scan_on_open_and_on_appliance_change(http_c
     assert "async function loadLatestScan()" in body
     assert "/scans/latest" in body
     assert "showSetup();loadLatestScan();" in body  # called once on page bootstrap
-    assert "onchange=async()=>{await loadLatestScan();showSetup()}" in body  # and on appliance change
+    # On appliance change the choice is saved and the page reloads, so the
+    # bootstrap call above loads that appliance's latest scan.
+    assert "getElementById('customer-appliance').onchange=async()=>{await saveProgress();location.reload()}" in body
 
 
 def test_setup_page_sends_appliance_id_when_provisioning_a_discovered_camera(http_client, db_path):
