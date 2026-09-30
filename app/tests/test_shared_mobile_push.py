@@ -403,3 +403,76 @@ def test_urgent_retry_backoff_and_quota_minimum(monkeypatch,fake_channels):
     monkeypatch.setattr(provider,'send',lambda *a,**k: {'status':'retry','error':'provider_throttled'})
     push.drain(now=now+timedelta(seconds=5))
     assert datetime.fromisoformat(jobs()[0]['next_at'])==now+timedelta(seconds=65)
+
+
+def test_worker_activation_finishing_before_listener_does_not_timeout():
+    import subprocess, shutil
+    from pathlib import Path
+    node=shutil.which('node')
+    if not node: pytest.skip('Node is not installed')
+    script=Path(__file__).parents[1]/'static'/'mobile-push.js'
+    harness=r"""
+    const vm=require('vm'),fs=require('fs'),assert=require('assert');
+    const status={},devices={replaceChildren(){}};
+    const ctx=vm.createContext({document:{getElementById:id=>id==='vms-push-status'?status:id==='vms-push-devices'?devices:null},
+      navigator:{serviceWorker:{register:async()=>({active:null,installing:{state:'activated',addEventListener(){}}})}},
+      localStorage:{getItem:()=> 'stable-installation',setItem(){}},setTimeout,clearTimeout,
+      fetch:async()=>({ok:true,json:async()=>({devices:[]})})});
+    vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),ctx);
+    vm.runInContext("firebaseModules=Promise.resolve([{getApps:()=>[],initializeApp:()=>({})},{isSupported:async()=>true,getMessaging:()=>({}),getToken:async()=> 'fake-token'}])",ctx);
+    Promise.race([vm.runInContext("enroll({firebase:{},vapid_public_key:'fake'})",ctx),new Promise((_,reject)=>setTimeout(()=>reject(new Error('activation race timed out')),500))]).then(()=>{assert(status.textContent.startsWith('Browser enrolled.'))}).catch(e=>{console.error(e);process.exit(1)});
+    """
+    subprocess.run([node,'-e',harness,str(script)],check=True,capture_output=True)
+
+
+def test_full_app_only_public_push_assets_bypass_login(monkeypatch):
+    import main
+    monkeypatch.delenv('ANYAICAM_MOBILE_PUSH_BACKEND',raising=False)
+    client=TestClient(main.app,follow_redirects=False)
+    worker=client.get('/mobile-push-sw.js')
+    assert worker.status_code==200
+    assert 'https://www.gstatic.com/firebasejs/12.0.0/' in worker.headers['content-security-policy']
+    assert client.get('/api/mobile/push/config').status_code==200
+    assert client.get('/api/mobile/push/firebase-config.js').status_code==503
+    for path in ['/api/mobile/push/devices','/api/mobile/push/deliveries','/api/mobile/push/notifications/anything','/api/mobile/push/config-private']:
+        assert client.get(path).status_code in (401,403)
+
+
+def test_full_app_enrollment_uses_real_customer_session_and_csrf():
+    import main,partner_portal
+    from token_security import sign
+    seed(devices=0)
+    client=TestClient(main.app,follow_redirects=False)
+    cookie=partner_portal._token('owner-cust-1@example.test','customer_owner',None,'cust-1',None)
+    csrf=sign('csrf',28800)
+    client.cookies.set(partner_portal.SESSION_COOKIE,cookie)
+    client.cookies.set('anyaicam_csrf',csrf)
+    result=client.put('/api/mobile/push/devices',json=enrollment(),headers={'X-CSRF-Token':csrf})
+    assert result.status_code==200,result.text
+    listed=client.get('/api/mobile/push/devices')
+    assert len(listed.json()['devices'])==1
+    assert 'token' not in listed.text
+
+
+def test_customer_role_rechecked_at_enrollment(client):
+    with connection() as db:
+        db.execute("UPDATE partner_users SET role='technician'")
+    assert client.put('/api/mobile/push/devices',json=enrollment()).status_code==403
+
+
+@pytest.mark.parametrize('kind',['person','lpr'])
+def test_push_tap_preserves_available_event_clip(client,fake_channels,kind):
+    from urllib.parse import urlsplit,parse_qs
+    fanout(kind,eid='clip-event')
+    with connection() as db:
+        db.execute('INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+            ('clip-event','cust-1','site-cust-1','appl-cust-1','cam-1','local-clip',kind,'2026-09-29T12:00:00','2026-09-29T12:00:00'))
+        db.execute('INSERT INTO detection_event_media(id,detection_event_id,customer_id,camera_id,s3_key,started_at,ended_at,created_at) VALUES(?,?,?,?,?,?,?,?)',
+            ('media-1','clip-event','cust-1','cam-1','test/clip.mp4','2026-09-29T12:00:00','2026-09-29T12:00:10','2026-09-29T12:00:00'))
+        nid=db.execute('SELECT id FROM notifications').fetchone()[0]
+    response=client.get('/api/mobile/push/notifications/'+nid)
+    assert response.status_code==200
+    parsed=urlsplit(response.json()['path'])
+    assert parsed.path=='/playback'
+    assert parse_qs(parsed.query)['event']==['clip-event']
+    assert parse_qs(parsed.query)['camera']==['cam-1']

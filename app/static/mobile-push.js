@@ -42,10 +42,12 @@ async function enroll(config) {
     const worker = registration.installing || registration.waiting;
     const timeout = setTimeout(() => reject(new Error('Push setup timed out. Please try again.')), 15000);
     if (!worker) { clearTimeout(timeout); reject(new Error('Push worker unavailable.')); return; }
-    worker.addEventListener('statechange', () => {
+    const checkState = () => {
       if (worker.state === 'activated') { clearTimeout(timeout); resolve(); }
       if (worker.state === 'redundant') { clearTimeout(timeout); reject(new Error('Push worker could not start.')); }
-    });
+    };
+    worker.addEventListener('statechange', checkState);
+    checkState(); // Activation can finish between the initial check and listener registration.
   });
   const messaging = messagingSdk.getMessaging(app);
   const token = await messagingSdk.getToken(messaging, {vapidKey: config.vapid_public_key, serviceWorkerRegistration: registration});

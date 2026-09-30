@@ -42097,7 +42097,7 @@ async def authentication_middleware(request: Request, call_next):
 
 
 
-    if path in {"/favicon.ico"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
+    if path in {"/favicon.ico", "/mobile-push-sw.js", "/api/mobile/push/config", "/api/mobile/push/firebase-config.js"} or any(path == prefix or path.startswith(prefix) for prefix in PUBLIC_PATH_PREFIXES):
 
 
 
@@ -48524,6 +48524,7 @@ from pwa_routes import register_pwa_routes
 
 
 from mobile_notifications import register_mobile_notification_routes
+from mobile_push_provider import web_configuration as mobile_push_web_configuration
 from mobile_push_routes import register_routes as register_mobile_push_routes
 register_mobile_push_routes(app)
 from customer_registration import register_customer_registration_routes
@@ -132347,7 +132348,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-check"><strong>4</strong><span>Pair the phone under <a class="download" href="/mobile-devices">Mobile devices</a>, then choose which alerts you get in <a class="download" href="/settings/notifications">Notification settings</a>.</span></div>
+          <div class="phone-check"><strong>4</strong><span>Choose alerts and enable push for this browser in <a class="download" href="/settings/notifications">Notification settings</a>. Manage existing phone pairings under <a class="download" href="/mobile-devices">Mobile devices</a>.</span></div>
 
 
 
@@ -132428,7 +132429,7 @@ def phone_connect(request: Request) -> str:
 
 
 
-          <div class="phone-status-row"><span>Phone alerts</span><strong>{'Available' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Not available yet'}</strong></div>
+          <div class="phone-status-row"><span>Phone alerts</span><strong>{'Ready to enable' if mobile_push_web_configuration()['available'] else ('Available' if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY else 'Not available yet')}</strong></div>
 
 
 

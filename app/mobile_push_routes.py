@@ -21,7 +21,7 @@ def user_context(request, db):
     if not identity:
         raise HTTPException(401, 'Customer sign-in required.')
     user_id, _ = _camera_context(db, identity)
-    user = db.execute("SELECT id FROM partner_users WHERE id=? AND customer_id=? AND approved=1 AND account_status='active'", (user_id, identity['customer_id'])).fetchone()
+    user = db.execute("SELECT id FROM partner_users WHERE id=? AND customer_id=? AND approved=1 AND account_status='active' AND role IN ('customer_owner','customer_viewer')", (user_id, identity['customer_id'])).fetchone()
     if not user:
         raise HTTPException(403, 'Active customer account required.')
     return user_id, identity['customer_id']
@@ -97,7 +97,7 @@ def register_routes(app):
     @app.get('/api/mobile/push/notifications/{notification_id}')
     def open_notification(notification_id: str, request: Request):
         # No arbitrary URL from the push payload is ever used as a destination.
-        from notification_email import event_path
+        from notification_email import alert_context, event_path
         with connection() as db:
             user_id, customer_id = user_context(request, db)
             n = db.execute('SELECT * FROM notifications WHERE id=? AND user_id=? AND customer_id=?', (notification_id, user_id, customer_id)).fetchone()
@@ -108,5 +108,5 @@ def register_routes(app):
             u = db.execute('SELECT role,camera_access_mode FROM partner_users WHERE id=?', (user_id,)).fetchone()
             if n['camera_id'] and n['camera_id'] not in authorized_camera_ids(db,user_id=user_id,customer_id=customer_id,role=u['role'],access_mode=u['camera_access_mode'] or 'selected'):
                 raise HTTPException(404, 'Notification not found.')
-            context = dict(n)
+            context = alert_context(db, notification_id) or dict(n)
         return {'notification_id': notification_id, 'path': event_path(context)}
