@@ -384,9 +384,22 @@ def test_customer_account_without_appliance_id_groups_by_appliance_never_merges(
 # ------------------------------------------------------------- /customer-live
 
 
+def _provision_old_cameras(db_path) -> None:
+    """Live shows only provisioned cameras (camera_number set; placeholders
+    are hidden since the 2026-09-13 tile-grid fix), and sends a customer
+    whose selected appliance has none to /customer-account. These Live
+    isolation tests need the older appliance's five cameras to be real."""
+    with override_target(sqlite_path=str(db_path)):
+        conn = sqlite3.connect(db_path)
+        for n in range(1, 6):
+            conn.execute("UPDATE cameras SET camera_number=? WHERE id=?", (10 + n, f"cam-old-{n}"))
+        conn.commit()
+
+
 def test_customer_live_scoped_to_selected_appliance_excludes_other_appliance(client, db_path):
     _seed_world(db_path)
     _activate(db_path, "appl-old")
+    _provision_old_cameras(db_path)
     cookie = {"anyaicam_partner_session": _owner_cookie()}
 
     ryzen = client.get("/customer-live", params={"appliance_id": "appl-ryzen"}, cookies=cookie)
@@ -416,6 +429,7 @@ def test_customer_live_cross_customer_appliance_id_is_rejected_not_leaked(client
 def test_customer_live_without_appliance_id_groups_tiles_by_appliance_never_merges(client, db_path):
     _seed_world(db_path)
     _activate(db_path, "appl-old")
+    _provision_old_cameras(db_path)
     response = client.get("/customer-live", cookies={"anyaicam_partner_session": _owner_cookie()})
     assert response.status_code == 200, response.text
     assert "Ryzen Camera 1" in response.text
