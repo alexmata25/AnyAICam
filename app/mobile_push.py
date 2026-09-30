@@ -46,6 +46,37 @@ def eligible(db, notification, *, now):
         _quiet_hours_clock(now.replace(tzinfo=timezone.utc)), prefs['quiet_start'], prefs['quiet_end']))
 
 
+# One push per camera visit (2026-09-30, owner-approved after the first real staging
+# test: one person walking past one camera produced person + motion + smart_motion + PPE
+# pushes, 4-5 buzzes in 20 s). Ordinary activity is held briefly so the most important
+# type from a visit can arrive first, then only one push per camera per window is sent.
+# A clearly more important type arriving after a lesser one was already sent may still
+# upgrade once. Visitor Calls and intrusion alarms are never held or grouped, and they
+# absorb the ordinary activity pushes from the same camera visit. System alerts (camera
+# offline, storage, ...) are not grouped. In-app, email and SMS are unaffected.
+ACTIVITY_RANK = {
+    'motion': 1, 'ppe': 1, 'people_counting': 1, 'occupancy': 1,
+    'smart_motion': 2,
+    'person': 3, 'vehicle': 3, 'lpr': 3, 'line_crossing': 3, 'intrusion': 3, 'facial_recognition': 3,
+}
+VISIT_RANK = {**ACTIVITY_RANK, 'aac_voice_call': 4, 'intrusion_alarm': 5}
+ACTIVITY_HOLD_SECONDS = 5
+VISIT_WINDOW_SECONDS = 60
+
+
+def _visit_rank_nearby(db, *, user_id, customer_id, camera_id, since, until, exclude_id, statuses):
+    """Highest visit rank among this user's pushes for one camera in a time range."""
+    types = tuple(VISIT_RANK)
+    marks = ','.join('?' * len(types))
+    status_marks = ','.join('?' * len(statuses))
+    rows = db.execute(
+        f"SELECT DISTINCT n.event_type FROM mobile_push_outbox p JOIN notifications n ON n.id=p.notification_id "
+        f"WHERE n.user_id=? AND n.customer_id=? AND n.camera_id=? AND n.event_type IN ({marks}) "
+        f"AND p.created_at>=? AND p.created_at<=? AND n.id!=? AND p.status IN ({status_marks})",
+        (user_id, customer_id, camera_id, *types, since, until, exclude_id, *statuses)).fetchall()
+    return max((VISIT_RANK[r['event_type']] for r in rows), default=0)
+
+
 def enqueue(db, notification_id, *, now=None):
     """Called in the notification INSERT transaction; network-free and atomic."""
     from notification_engine import EMERGENCY_EVENT_TYPES, NOTIFICATION_CHANNEL_COOLDOWN_SECONDS, VOICE_CALL_CHANNEL_COOLDOWN_SECONDS
@@ -53,6 +84,15 @@ def enqueue(db, notification_id, *, now=None):
     n = db.execute('SELECT * FROM notifications WHERE id=?', (notification_id,)).fetchone()
     if not n or not eligible(db, n, now=now):
         return 0
+    rank = ACTIVITY_RANK.get(n['event_type'])
+    if rank and n['camera_id']:
+        # Anything already queued or sent for this camera visit that is at least as
+        # important makes this ordinary push redundant.
+        nearby = _visit_rank_nearby(db, user_id=n['user_id'], customer_id=n['customer_id'], camera_id=n['camera_id'],
+            since=(now-timedelta(seconds=VISIT_WINDOW_SECONDS)).isoformat(), until=now.isoformat(), exclude_id=n['id'],
+            statuses=('pending', 'retry', 'sending', 'sent', 'unavailable'))
+        if nearby >= rank:
+            return 0
     urgent = n['event_type'] in EMERGENCY_EVENT_TYPES
     cooldown = VOICE_CALL_CHANNEL_COOLDOWN_SECONDS if n['event_type'] == 'aac_voice_call' else NOTIFICATION_CHANNEL_COOLDOWN_SECONDS
     if not urgent and cooldown > 0:
@@ -66,10 +106,12 @@ def enqueue(db, notification_id, *, now=None):
     event_key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     ttl = 120 if n['event_type'] == 'aac_voice_call' else (300 if urgent else 3600)
     devices = db.execute('SELECT id FROM mobile_push_devices WHERE user_id=? AND customer_id=? AND enabled=1', (n['user_id'], n['customer_id'])).fetchall()
+    # Ordinary activity waits briefly so a more important type from the same visit can supersede it.
+    send_at = now + timedelta(seconds=ACTIVITY_HOLD_SECONDS) if (rank and n['camera_id']) else now
     count = 0
     for device in devices:
         result = db.execute("INSERT INTO mobile_push_outbox(id,notification_id,device_id,event_key,status,next_at,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(device_id,event_key) DO NOTHING",
-            (secrets.token_hex(16), n['id'], device['id'], event_key, 'pending', now.isoformat(), (now+timedelta(seconds=ttl)).isoformat(), now.isoformat()))
+            (secrets.token_hex(16), n['id'], device['id'], event_key, 'pending', send_at.isoformat(), (now+timedelta(seconds=ttl)).isoformat(), now.isoformat()))
         count += result.rowcount
     return count
 
@@ -98,11 +140,23 @@ def drain(*, now=None, limit=100, urgent_only=None):
             n = db.execute('SELECT * FROM notifications WHERE id=?', (job['notification_id'],)).fetchone()
             d = db.execute('SELECT * FROM mobile_push_devices WHERE id=?', (job['device_id'],)).fetchone()
             allowed = bool(n and d and d['enabled'] and d['user_id']==n['user_id'] and d['customer_id']==n['customer_id'] and eligible(db, n, now=now))
+            grouped = False
+            if allowed and job['attempt'] == 0 and ACTIVITY_RANK.get(n['event_type']) and n['camera_id']:
+                # Superseded while held: a more important push from the same camera visit
+                # (queued up to the window after this one, or sent shortly before it).
+                created = datetime.fromisoformat(job['created_at'])
+                nearby = _visit_rank_nearby(db, user_id=n['user_id'], customer_id=n['customer_id'], camera_id=n['camera_id'],
+                    since=(created-timedelta(seconds=VISIT_WINDOW_SECONDS)).isoformat(),
+                    until=(created+timedelta(seconds=VISIT_WINDOW_SECONDS)).isoformat(), exclude_id=n['id'],
+                    statuses=('pending', 'retry', 'sending', 'sent', 'unavailable'))
+                grouped = nearby > ACTIVITY_RANK[n['event_type']]
         attempt = job['attempt']
         if now.isoformat() >= job['expires_at']:
             result = {'status': 'expired'}
         elif not allowed:
             result = {'status': 'skipped'}
+        elif grouped:
+            result = {'status': 'skipped', 'error': 'grouped_into_visit'}
         else:
             stats['attempted'] += 1
             attempt += 1

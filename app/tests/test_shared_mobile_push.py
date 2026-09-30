@@ -33,6 +33,11 @@ def fanout(kind='person', eid='event-1', camera='cam-1'):
     return engine.fanout_appliance_event(_appliance(),{'id':eid,'event_type':kind,'camera_id':camera})
 
 
+def later(seconds=0):
+    """Just after the ordinary-activity hold (mobile_push.ACTIVITY_HOLD_SECONDS)."""
+    return push.utcnow() + timedelta(seconds=push.ACTIVITY_HOLD_SECONDS + 1 + seconds)
+
+
 def jobs():
     with connection() as db:
         return [dict(r) for r in db.execute('SELECT * FROM mobile_push_outbox ORDER BY created_at,id').fetchall()]
@@ -106,7 +111,7 @@ def test_revoked_account_never_sends_queued_alert(monkeypatch,fake_channels):
     with connection() as db:
         db.execute("UPDATE partner_users SET account_status='disabled'")
     monkeypatch.setattr(provider,'send',lambda *a,**k: pytest.fail('provider must not run'))
-    push.drain()
+    push.drain(now=later())
     assert jobs()[0]['status']=='skipped'
 
 
@@ -115,7 +120,7 @@ def test_current_camera_scope_rechecked(monkeypatch,fake_channels):
     with connection() as db:
         db.execute("UPDATE customer_notification_channels SET camera_scope='selected'")
     monkeypatch.setattr(provider,'send',lambda *a,**k: pytest.fail('provider must not run'))
-    push.drain()
+    push.drain(now=later())
     assert jobs()[0]['status']=='skipped'
 
 
@@ -129,7 +134,7 @@ def test_expired_visitor_call_never_delivered(monkeypatch,fake_channels):
 def test_unregistered_token_disabled(monkeypatch,fake_channels):
     seed();fanout()
     monkeypatch.setattr(provider,'send',lambda *a,**k: {'status':'invalid_token'})
-    push.drain()
+    push.drain(now=later())
     with connection() as db:
         assert db.execute('SELECT enabled FROM mobile_push_devices').fetchone()[0]==0
 
@@ -137,7 +142,7 @@ def test_unregistered_token_disabled(monkeypatch,fake_channels):
 def test_missing_credentials_honest_and_no_network(monkeypatch,fake_channels):
     monkeypatch.delenv('ANYAICAM_MOBILE_PUSH_BACKEND',raising=False)
     seed();fanout()
-    push.drain()
+    push.drain(now=later())
     assert jobs()[0]['status']=='unavailable'
     assert jobs()[0]['error']=='fcm_not_configured'
 
@@ -244,7 +249,7 @@ def test_viewer_camera_permission_revocation_rechecked(monkeypatch,fake_channels
     with connection() as db:
         db.execute("UPDATE partner_users SET role='customer_viewer',camera_access_mode='selected'")
     monkeypatch.setattr(provider,'send',lambda *a,**k: pytest.fail('revoked camera'))
-    push.drain()
+    push.drain(now=later())
     assert jobs()[0]['status']=='skipped'
 
 
@@ -263,7 +268,7 @@ def test_token_refresh_inflight_not_disabled(monkeypatch,fake_channels):
             db.execute('UPDATE mobile_push_devices SET token=? WHERE id=?',('refreshed-token',d['id']))
         return {'status':'invalid_token'}
     monkeypatch.setattr(provider,'send',send)
-    push.drain()
+    push.drain(now=later())
     with connection() as db:
         assert db.execute('SELECT enabled FROM mobile_push_devices').fetchone()[0]==1
 
@@ -271,17 +276,17 @@ def test_token_refresh_inflight_not_disabled(monkeypatch,fake_channels):
 def test_second_worker_cannot_claim_inflight_delivery(monkeypatch,fake_channels):
     seed();fanout()
     def send(*a,**kw):
-        assert push.drain()['attempted']==0
+        assert push.drain(now=later())['attempted']==0
         return {'status':'sent'}
     monkeypatch.setattr(provider,'send',send)
-    assert push.drain()['sent']==1
+    assert push.drain(now=later())['sent']==1
 
 
 def test_failure_retries_bounded(monkeypatch,fake_channels):
     seed();fanout()
     monkeypatch.setattr(provider,'send',lambda *a,**kw: {'status':'retry'})
     for _ in range(6):
-        push.drain()
+        push.drain(now=later())
         with connection() as db:
             db.execute('UPDATE mobile_push_outbox SET next_at=?',(push.utcnow().isoformat(),))
     assert jobs()[0]['status']=='failed'
@@ -389,8 +394,9 @@ def test_urgent_lane_independent_of_activity(monkeypatch,fake_channels):
     monkeypatch.setattr(provider,'send',lambda d,n,**kw: sent.append(n['event_type']) or {'status':'sent'})
     assert push.drain(urgent_only=True)['sent']==2
     assert sent==['intrusion_alarm','aac_voice_call']
-    assert push.drain(urgent_only=False)['sent']==1
-    assert sent[-1]=='person'
+    # Same camera visit: the alarm/Visitor Call absorb the ordinary person push.
+    assert push.drain(now=later(), urgent_only=False)['sent']==0
+    assert [j['error'] for j in jobs() if j['status']=='skipped']==['grouped_into_visit']
 
 
 def test_urgent_retry_backoff_and_quota_minimum(monkeypatch,fake_channels):
@@ -544,3 +550,96 @@ def test_firebase_sdk_is_installed_only_for_opted_in_cloud_images():
     assert 'COPY requirements*.txt /tmp/push-requirements/' in dockerfile
     assert 'if [ "$ANYAICAM_INSTALL_PUSH" = "1" ]' in dockerfile
     assert 'firebase-admin==7.7.0' in (root / 'requirements-push.txt').read_text(encoding='utf-8')
+
+
+# ---------------------------------------------------------------- one push per camera visit (2026-09-30)
+
+@pytest.fixture()
+def clock(monkeypatch):
+    state = {'now': push.utcnow()}
+    monkeypatch.setattr(push, 'utcnow', lambda: state['now'])
+    def advance(seconds):
+        state['now'] = state['now'] + timedelta(seconds=seconds)
+        return state['now']
+    state['advance'] = advance
+    return state
+
+
+def sender(monkeypatch):
+    sent = []
+    monkeypatch.setattr(provider, 'send', lambda d, n, **kw: sent.append(n['event_type']) or {'status': 'sent'})
+    return sent
+
+
+def drain_after_hold(clock):
+    return push.drain(now=clock['now'] + timedelta(seconds=push.ACTIVITY_HOLD_SECONDS + 1))
+
+
+ALL_ACTIVITY = ['motion', 'smart_motion', 'person', 'ppe', 'vehicle', 'aac_voice_call']
+
+
+def test_one_walk_sends_one_push_for_the_most_important_type(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('motion', 'e-motion'); clock['advance'](1)
+    fanout('ppe', 'e-ppe'); clock['advance'](1)
+    fanout('person', 'e-person'); clock['advance'](1)
+    fanout('smart_motion', 'e-smart')
+    drain_after_hold(clock)
+    assert sent == ['person']
+    grouped = [j for j in jobs() if j['error'] == 'grouped_into_visit']
+    # motion was held, then superseded by person; ppe (same rank as motion) and smart_motion
+    # (lower than person) were never queued at all
+    assert len(grouped) == 1 and len(jobs()) == 2
+
+
+def test_a_more_important_type_after_a_sent_push_upgrades_once(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('motion', 'e1'); drain_after_hold(clock)
+    clock['advance'](10); fanout('person', 'e2'); drain_after_hold(clock)
+    clock['advance'](10); fanout('smart_motion', 'e3'); drain_after_hold(clock)
+    assert sent == ['motion', 'person']
+
+
+def test_a_new_visit_after_the_window_pushes_again(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('person', 'e1'); drain_after_hold(clock)
+    clock['advance'](push.VISIT_WINDOW_SECONDS + 10); fanout('motion', 'e2'); drain_after_hold(clock)
+    assert sent == ['person', 'motion']
+
+
+def test_visitor_call_is_immediate_and_absorbs_the_visit(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('person', 'e-person'); clock['advance'](1)
+    fanout('aac_voice_call', 'e-call')
+    assert push.drain(now=clock['now'])['sent'] == 1  # no hold for the Visitor Call
+    clock['advance'](2); fanout('motion', 'e-motion')
+    drain_after_hold(clock)
+    assert sent == ['aac_voice_call']
+
+
+def test_intrusion_alarm_is_never_grouped_or_held(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY); sent = sender(monkeypatch)
+    fanout('person', 'e-person'); drain_after_hold(clock)
+    clock['advance'](5); fanout('intrusion_alarm', 'alarm-1')
+    assert push.drain(now=clock['now'])['sent'] == 1
+    assert sent == ['person', 'intrusion_alarm']
+
+
+def test_system_alerts_are_not_grouped_with_activity(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY + ['camera_offline']); sent = sender(monkeypatch)
+    fanout('person', 'e-person'); clock['advance'](1)
+    fanout('camera_offline', 'e-offline')
+    assert push.drain(now=clock['now'])['sent'] == 1  # system alert: no hold
+    drain_after_hold(clock)
+    assert sorted(sent) == ['camera_offline', 'person']
+
+
+def test_grouping_never_changes_in_app_or_email(monkeypatch, fake_channels, clock):
+    seed(events=ALL_ACTIVITY, email=True); sender(monkeypatch)
+    for kind in ('motion', 'ppe', 'person', 'smart_motion'):
+        fanout(kind, 'e-' + kind); clock['advance'](1)
+    with connection() as db:
+        notifications = db.execute('SELECT id FROM notifications').fetchall()
+        email_rows = db.execute("SELECT COUNT(*) FROM notification_deliveries WHERE channel='email'").fetchone()[0]
+    assert len(notifications) == 4  # every event still reaches the in-app list
+    assert email_rows == 4          # and each still has its own email delivery record
