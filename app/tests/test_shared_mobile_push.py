@@ -533,3 +533,14 @@ def test_notification_tap_opens_a_window_when_an_open_tab_refuses_navigation():
     static = Path(__file__).parents[1]/'static'
     done = subprocess.run([node,'-e',harness,str(static/'mobile-push-sw.js')],capture_output=True,text=True)
     assert done.returncode == 0, done.stderr
+
+
+def test_firebase_sdk_is_installed_only_for_opted_in_cloud_images():
+    from pathlib import Path
+    root = Path(__file__).parents[2]
+    dockerfile = (root / 'Dockerfile').read_text(encoding='utf-8')
+    assert 'ARG ANYAICAM_INSTALL_PUSH=0' in dockerfile
+    # Wildcard: the appliance installer payload ships no requirements-push.txt.
+    assert 'COPY requirements*.txt /tmp/push-requirements/' in dockerfile
+    assert 'if [ "$ANYAICAM_INSTALL_PUSH" = "1" ]' in dockerfile
+    assert 'firebase-admin==7.7.0' in (root / 'requirements-push.txt').read_text(encoding='utf-8')

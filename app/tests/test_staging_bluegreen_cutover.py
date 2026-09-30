@@ -281,3 +281,10 @@ def test_inside_probe_rejects_a_wrong_build_non_json_or_failure():
     for answer in ((0, json.dumps({"build_id": OLD})), (0, "<html>"), (1, "")):
         job.run = lambda args, answer=answer: answer
         assert job.caddy_reaches_candidate() is False
+
+
+def test_secret_folder_is_mounted_read_only_only_when_present():
+    base = cut.default_mounts(isdir=lambda path: False)
+    assert base == cut.STAGING_MOUNTS
+    with_secret = cut.default_mounts(isdir=lambda path: path == "/etc/anyaicam-staging/firebase")
+    assert with_secret == cut.STAGING_MOUNTS + ("/etc/anyaicam-staging/firebase:/run/secrets/firebase:ro",)
