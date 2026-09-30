@@ -34,6 +34,18 @@ from database_backend import override_target
 from partner_db import initialize_database, password_hash
 
 
+# Licensed camera slots (2026-09-30): provisioning enforces the purchased
+# camera-slot limit (customer_entitlements.total_camera_slots(), added after
+# these tests were written), so without this every provisioning call in this
+# file stopped at "Camera limit reached: licensed for 0 camera(s)" and the
+# tests never reached the code they cover. Tests about the limit itself still
+# set their own value with monkeypatch.
+@pytest.fixture(autouse=True)
+def _licensed_camera_slots(monkeypatch):
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 64)
+
+
 def _route(path, method="GET"):
     for r in main.app.routes:
         if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or {method}):

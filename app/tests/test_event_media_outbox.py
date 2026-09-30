@@ -1,11 +1,21 @@
 from datetime import datetime
 import asyncio
 
+import pytest
+
 import event_media_outbox as outbox
 import event_media_uploader as uploader
 import recording_retention_sweep as sweep
 from database_backend import override_target
 from partner_db import connection, initialize_database
+
+
+@pytest.fixture(autouse=True)
+def _event_media_upload_enabled(monkeypatch):
+    # retry_pending_event_media() is a deliberate no-op while the
+    # ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED gate is off (it is on for real
+    # appliances); these tests exercise the retry path itself.
+    monkeypatch.setattr(uploader, "EVENT_MEDIA_UPLOAD_ENABLED", True)
 
 
 def test_outbox_is_atomic_and_deduplicates_event_ids(tmp_path, monkeypatch):

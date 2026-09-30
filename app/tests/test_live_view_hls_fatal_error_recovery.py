@@ -178,7 +178,7 @@ def test_grid_attach_player_destroys_any_existing_instance_first(client):
     same tile at once -- destroyHls(id) must appear before the `new
     Hls()` call inside attachPlayer's own body."""
     html = _grid_html(client)
-    attach_start = html.index("function attachPlayer(id,playlistUrl)")
+    attach_start = html.index("function attachPlayer(id,playlistUrl")
     new_hls_index = html.index("tile.hls=new Hls()", attach_start)
     destroy_index = html.index("destroyHls(id)", attach_start)
     assert destroy_index < new_hls_index
@@ -186,7 +186,7 @@ def test_grid_attach_player_destroys_any_existing_instance_first(client):
 
 def test_single_camera_attach_player_destroys_any_existing_instance_first(client):
     html = _single_html(client)
-    attach_start = html.index("function attachPlayer()")
+    attach_start = html.index("function attachPlayer(")
     new_hls_index = html.index("hls=new Hls()", attach_start)
     destroy_index = html.index("destroyHls()", attach_start)
     assert destroy_index < new_hls_index
@@ -211,7 +211,7 @@ def test_grid_fatal_error_handling_is_scoped_per_tile(client):
     tiles[id], never a bare module-level `hls`/`recoveryAttempts`."""
     html = _grid_html(client)
     handler_start = html.index("function handleFatalError(id,data)")
-    handler_end = html.index("function attachPlayer(id,playlistUrl)", handler_start)
+    handler_end = html.index("function attachPlayer(id,playlistUrl", handler_start)
     handler_body = html[handler_start:handler_end]
     assert "tiles[id]" in handler_body
     assert "tile.recoveryAttempts" in handler_body

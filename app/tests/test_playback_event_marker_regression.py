@@ -162,7 +162,7 @@ def test_filter_category_recognizes_every_real_pipeline_event_type(monkeypatch):
 
 def test_active_filters_default_to_all_six_categories(monkeypatch):
     html = _render_playback(monkeypatch)
-    assert "let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);" in html
+    assert "let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion','line_crossing']);" in html
 
 
 # ---------------------------------------------------------------------------

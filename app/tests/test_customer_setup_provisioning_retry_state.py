@@ -43,6 +43,14 @@ from database_backend import override_target
 from partner_db import initialize_database, password_hash
 
 
+@pytest.fixture(autouse=True)
+def _licensed_camera_slots(monkeypatch):
+    # Provisioning enforces the licensed camera-slot limit; this suite is
+    # about retry state, so give the test customer capacity.
+    import customer_entitlements
+    monkeypatch.setattr(customer_entitlements, "total_camera_slots", lambda customer_id: 64)
+
+
 def _route(path, method="GET"):
     for r in main.app.routes:
         if getattr(r, "path", None) == path and method in (getattr(r, "methods", None) or {method}):

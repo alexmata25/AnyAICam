@@ -168,12 +168,12 @@ def test_investigate_page_embeds_event_link_for_event_with_clip(http_client, db_
     conn.commit()
     conn.close()
 
-    response = http_client.get("/investigate", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
+    # Investigate no longer embeds every event in the page; its Search and
+    # "Load more" buttons page through /api/customer/investigate/search,
+    # which carries the same per-event Playback link.
+    response = http_client.get("/api/customer/investigate/search", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
     assert response.status_code == 200
-    match = re.search(r"const investigationEvents=(\[.*?\]);", response.text, re.S)
-    assert match, "investigationEvents JSON not found in /investigate response"
-    import json
-    events = json.loads(match.group(1))
+    events = response.json()["events"]
     event = next(e for e in events if e["id"] == "evt-with-clip")
     assert event["recording"] == "/playback?camera=cam-a1&event=evt-with-clip&autoplay=event"
 
@@ -186,11 +186,12 @@ def test_investigate_page_preserves_canonical_event_link_while_media_is_pending(
     conn.commit()
     conn.close()
 
-    response = http_client.get("/investigate", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
+    # Investigate no longer embeds every event in the page; its Search and
+    # "Load more" buttons page through /api/customer/investigate/search,
+    # which carries the same per-event Playback link.
+    response = http_client.get("/api/customer/investigate/search", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-a")})
     assert response.status_code == 200
-    match = re.search(r"const investigationEvents=(\[.*?\]);", response.text, re.S)
-    import json
-    events = json.loads(match.group(1))
+    events = response.json()["events"]
     event = next(e for e in events if e["id"] == "evt-no-clip")
     assert event["recording"] == "/playback?camera=cam-a1&event=evt-no-clip&autoplay=event"
     assert "&t=" not in event["recording"]

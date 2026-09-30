@@ -85,20 +85,25 @@ PREVIOUSLY_BROKEN_CUSTOMER_PATHS = [
     "/alerts",
     "/investigate",
     "/subscription-portal",
+    # 2026-09-30: remaining customer sidebar pages.
+    "/aac/people",
+    "/phone-connect",
+    "/mobile-devices",
+    "/mobile-app",
+    "/help",
 ]
 
 
-def test_mobile_app_is_already_public_so_this_fix_deliberately_excludes_it(monkeypatch):
-    # NAV_ITEMS' one remaining bare-path customer link -- but it's
-    # already in PUBLIC_PATH_PREFIXES (pre-existing, untouched by this
-    # fix), so authentication_middleware never reaches CLOUD_CUSTOMER_
-    # NAV_PATH_PREFIXES for it at all, on either role. Confirms that
-    # intentional exclusion rather than assuming it.
-    assert "/mobile-app" not in main.CLOUD_CUSTOMER_NAV_PATH_PREFIXES
-    assert any(
+def test_mobile_app_is_a_signed_in_page_routed_to_customer_login(monkeypatch):
+    # /mobile-app used to be public; it is now a signed-in page (it calls
+    # current_user()), so on the cloud role a signed-out visitor must reach
+    # the customer sign-in, like every other customer sidebar page.
+    assert not any(
         "/mobile-app" == prefix or "/mobile-app".startswith(prefix)
         for prefix in main.PUBLIC_PATH_PREFIXES
     )
+    for path in ("/mobile-app", "/mobile-devices", "/phone-connect", "/help", "/aac/people"):
+        assert path in main.CLOUD_CUSTOMER_NAV_PATH_PREFIXES, path
 
 
 @pytest.mark.parametrize("path", PREVIOUSLY_BROKEN_CUSTOMER_PATHS)
@@ -338,6 +343,8 @@ def test_cloud_customer_nav_path_prefixes_defined_and_matches_the_customer_nav()
         "/dashboard", "/playback", "/events", "/alerts",
         "/investigate", "/analytics", "/subscription-portal", "/aaco",
         "/aac/voice-call",  # the Voice Call email's call screen (test_notification_email_deep_links.py)
+        # remaining customer sidebar pages (2026-09-30)
+        "/aac/people", "/phone-connect", "/mobile-devices", "/mobile-app", "/help",
     }
 
 

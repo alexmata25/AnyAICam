@@ -107,10 +107,12 @@ def _seed_appliance(conn, appliance_id="appl-1", customer_id="cust-1", cloud_id=
     conn.commit()
 
 
-def _seed_placeholder_camera(conn, camera_id, *, customer_id="cust-1", name="Camera 1"):
+def _seed_placeholder_camera(conn, camera_id, *, customer_id="cust-1", name="Camera 1", appliance_id="appl-1"):
+    # Onboarding placeholders are created on the customer's appliance, and
+    # Step 5 lists only the selected appliance's cameras (2026-09-12).
     conn.execute(
-        "INSERT INTO cameras(id,customer_id,site_id,name,status,device_key,camera_number,created_at) VALUES(?,?,?,?,?,NULL,NULL,?)",
-        (camera_id, customer_id, "site-1", name, "pending_installation", "2026-01-01"),
+        "INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,status,device_key,camera_number,created_at) VALUES(?,?,?,?,?,?,NULL,NULL,?)",
+        (camera_id, customer_id, "site-1", appliance_id, name, "pending_installation", "2026-01-01"),
     )
     conn.commit()
 
@@ -170,9 +172,8 @@ def test_review_shows_every_purchased_analytic_and_no_others(http_client, db_pat
     # whole-body substring check coincidentally collided with it purely
     # because its label text matches the analytic's own display name.
     body = response.text.split("</nav>", 1)[-1]
-    assert "Smart Motion" in body
-    assert "People Counting" in body
-    assert "License Plate Recognition" in body
+    # Labels come from customer_analytics_panel.ANALYTIC_LABELS, in key order.
+    assert "Analytics: LPR, People Counting, Smart Motion</p>" in body
     # Unpurchased analytics must not appear as if they were enabled.
     assert "Talk Down" not in body
     assert "PPE Detection" not in body

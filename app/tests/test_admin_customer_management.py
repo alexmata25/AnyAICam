@@ -101,6 +101,15 @@ def _onboard_payload(email="new@example.com", name="New Customer", **extra):
     return payload
 
 
+@pytest.fixture(autouse=True)
+def _no_local_appliance_identity(monkeypatch):
+    # These tests cover the cloud Portal selector. A developer machine that
+    # was once activated as an appliance persists a local identity, which
+    # would route /api/portal-login through the appliance's cloud-delegated
+    # sign-in instead.
+    monkeypatch.setattr(main, "own_appliance_identity", lambda: None)
+
+
 @pytest.fixture()
 def http_client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")

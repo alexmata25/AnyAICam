@@ -185,6 +185,9 @@ def test_semaphore_releases_on_success_and_on_exception():
 
 def test_camera_startup_offsets_are_staggered(monkeypatch):
     monkeypatch.setattr(main, "cv2", None)  # forces an early return right after the stagger sleep
+    # ai_detection_state is built from this machine's configured cameras.
+    for camera_number in range(1, 6):
+        monkeypatch.setitem(main.ai_detection_state, camera_number, {"status": "starting"})
     sleep_calls = []
     real_sleep = asyncio.sleep
 

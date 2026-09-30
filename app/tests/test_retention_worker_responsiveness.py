@@ -65,8 +65,12 @@ def test_delete_expired_recordings_preserves_retention_policy(monkeypatch, tmp_p
     camera_folder.mkdir(parents=True)
 
     motion_events = recordings / "motion_events.jsonl"
-    old_recording = camera_folder / "old.mkv"
-    current_recording = camera_folder / "current.mkv"
+    # Timestamp names like real segments: retention never touches a
+    # camera's newest file (still being written), so a third, newest one
+    # sits after the two under test.
+    old_recording = camera_folder / "camera1_2026-01-01_00-00-00.mkv"
+    current_recording = camera_folder / "camera1_2026-01-02_00-00-00.mkv"
+    (camera_folder / "camera1_2026-01-03_00-00-00.mkv").write_bytes(b"live")
     old_thumbnail = thumbnails / "old.jpg"
     current_thumbnail = thumbnails / "current.jpg"
     for path in (old_recording, current_recording, old_thumbnail, current_thumbnail):
@@ -93,7 +97,19 @@ def test_delete_expired_recordings_preserves_retention_policy(monkeypatch, tmp_p
     monkeypatch.setattr(main, "MOTION_THUMBNAILS_FOLDER", thumbnails)
     monkeypatch.setattr(main, "MOTION_EVENTS_FILE", motion_events)
 
-    main.delete_expired_recordings()
+    # Retention walks only cameras registered in the database, so each
+    # deletion also drops its Playback catalog row.
+    from database_backend import override_target
+    from partner_db import connection, initialize_database
+    with override_target(sqlite_path=tmp_path / "retention.db"):
+        initialize_database()
+        with connection() as db:
+            db.execute("INSERT INTO partners(id,name,created_at) VALUES('p1','P','2026-01-01')")
+            db.execute("INSERT INTO customers(id,partner_id,name,email,status,created_at) VALUES('c1','p1','C','c1@example.com','active','2026-01-01')")
+            db.execute("INSERT INTO sites(id,customer_id,name,created_at) VALUES('s1','c1','Main','2026-01-01')")
+            db.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at) VALUES('a1','c1','s1','AIC-1','2026-01-01')")
+            db.execute("INSERT INTO cameras(id,customer_id,site_id,appliance_id,name,camera_number,created_at) VALUES('cam1','c1','s1','a1','Camera 1',1,'2026-01-01')")
+        main.delete_expired_recordings()
 
     assert not old_recording.exists()
     assert current_recording.exists()

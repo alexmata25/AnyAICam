@@ -65,6 +65,8 @@ def test_unconfigured_instance_is_completely_unaffected_by_the_delegated_path(ht
     monkeypatch.delenv("ANYAICAM_APPLIANCE_ID", raising=False)
     monkeypatch.delenv("ANYAICAM_APPLIANCE_CLOUD_ID", raising=False)
     monkeypatch.delenv("ANYAICAM_APPLIANCE_CREDENTIAL", raising=False)
+    # Unconfigured: also ignore any identity a developer machine persisted.
+    monkeypatch.setattr(main, "own_appliance_identity", lambda: None)
     client, db_path = http_client
     with override_target(sqlite_path=str(db_path)):
         with connection() as db:

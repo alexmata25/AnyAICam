@@ -128,12 +128,13 @@ def test_horizontal_timestamp_positioning_unchanged(monkeypatch):
 
 def test_event_colors_and_legend_unchanged(monkeypatch):
     html = _render(monkeypatch)
-    assert "const EVENT_COLORS={motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d'};" in html
+    assert "const EVENT_COLORS={motion:'#f0b94d',person:'#4d9ef0',vehicle:'#a06df0',lpr:'#3dbfae',people_counting:'#4dcf7a',intrusion:'#f0954d',line_crossing:'#e0507a'};" in html
     assert "marker.style.background=category?EVENT_COLORS[category]:'#9aa7b5';" in html
     assert "segment.style.background='#e8eef6';" in html, "recording-segment color must be unchanged"
     for dot, color in [
         ("motion", "#f0b94d"), ("person", "#4d9ef0"), ("vehicle", "#a06df0"),
         ("lpr", "#3dbfae"), ("people_counting", "#4dcf7a"), ("intrusion", "#f0954d"),
+        ("line_crossing", "#e0507a"),
     ]:
         assert f".legend-dot.event-{dot}{{background:{color}}}" in html
 
@@ -151,7 +152,7 @@ def test_category_filtering_logic_unchanged(monkeypatch):
     # 2026-09-25: the filter buttons left Playback (filtering lives in
     # Analytics/Events/Investigate/Smart alerts); every category shows.
     assert 'data-filter="' not in html
-    assert "let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);" in html
+    assert "let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion','line_crossing']);" in html
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +251,20 @@ def test_timeline_lane_height_override_carries_important_and_matches_content(mon
 
 def test_monitor_timeline_min_height_floor_is_removed_and_scoped_to_playback_only(monkeypatch):
     html = _render(monkeypatch)
-    assert "#playback-monitor-timeline{min-height:0!important}" in html
+    assert "#playback-monitor-timeline{min-height:0!important;" in html
     # The override must target an id unique to this page's own <section>,
     # not the shared class -- otherwise it would also strip Live View's
     # Monitor page's own (intentional, unrelated) use of that floor.
     assert '<section class="monitor-timeline" id="playback-monitor-timeline"' in html
+
+
+def test_line_crossing_events_are_shown_with_their_own_legend_entry(monkeypatch):
+    """Regression (2026-09-30): filterCategory() maps line_crossing to its
+    own category, but activeFilters (fixed, now that the filter buttons are
+    gone) omitted it, so every Line Crossing marker and recent-activity row
+    was silently dropped from Playback."""
+    html = _render(monkeypatch)
+    assert "if(eventType==='line_crossing')return 'line_crossing';" in html
+    start = html.index("let activeFilters=new Set([")
+    assert "'line_crossing'" in html[start:html.index("]", start)]
+    assert '<i class="legend-dot event-line_crossing"></i>Line crossing' in html

@@ -304,7 +304,7 @@ def test_existing_clip_output_and_schema_preserved(monkeypatch, _isolated_clip_p
     # the ffmpeg invocation and the final, real preserved behavior instead.
     assert "cmd" in captured_ffmpeg_cmd
     assert captured_ffmpeg_cmd["cmd"][0] == "ffmpeg"
-    assert str(segment) in captured_ffmpeg_cmd["list_file_content"]
+    assert segment.as_posix() in captured_ffmpeg_cmd["list_file_content"]  # concat list uses POSIX paths
     assert result == f"/recordings/clips/motion/{expected_output.name}"
     assert expected_output.exists()
     assert expected_output.read_bytes() == b"fake mp4 bytes"

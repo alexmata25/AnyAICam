@@ -272,7 +272,9 @@ def test_investigate_deep_links_use_cameras_id_and_the_shared_playback_route(mon
         result = main.investigation_page(object())
     events = _investigation_events(result)
     camera_id = camera_ids[0]
-    assert events[0]["recording"] == f"/playback?camera={camera_id}&t={quote(events[0]['timestamp'])}"
+    # The shared canonical Playback link (_customer_event_playback_href):
+    # the event's own id, never a raw ISO timestamp in the URL.
+    assert events[0]["recording"] == f"/playback?camera={camera_id}&event=evt-{camera_id}&autoplay=event"
     assert events[0]["live"] == f"/customer/cameras/{camera_id}/live"
 
 

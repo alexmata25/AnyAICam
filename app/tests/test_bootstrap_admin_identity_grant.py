@@ -106,6 +106,8 @@ def test_bootstrap_admin_can_log_in_before_activation(http_client, monkeypatch):
     monkeypatch.delenv("ANYAICAM_APPLIANCE_ID", raising=False)
     monkeypatch.delenv("ANYAICAM_APPLIANCE_CLOUD_ID", raising=False)
     monkeypatch.delenv("ANYAICAM_APPLIANCE_CREDENTIAL", raising=False)
+    # Not activated: also ignore any identity a developer machine persisted.
+    monkeypatch.setattr(main, "own_appliance_identity", lambda: None)
 
     response = http_client.post(
         "/api/portal-login",

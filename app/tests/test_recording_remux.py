@@ -84,11 +84,11 @@ def test_upload_recording_uses_mp4_content_type():
         "bucket": "test-bucket",
         "key_prefix": "recordings/cust/site/appl/cam/",
     }
+    # The caller now owns the S3 client and passes it in (with the camera
+    # number, used for the recording thumbnail); skip the thumbnail here.
     fake_client = MagicMock()
-    fake_boto3 = MagicMock()
-    fake_boto3.client.return_value = fake_client
-    with patch.object(ru, "boto3", fake_boto3):
-        ru._upload_recording(session, Path("/tmp/fake.mp4"), datetime(2026, 8, 21))
+    with patch.object(ru, "_create_recording_thumbnail", return_value=None):
+        ru._upload_recording(fake_client, session, Path("/tmp/fake.mp4"), datetime(2026, 8, 21), 1)
     _, kwargs = fake_client.upload_file.call_args
     assert kwargs["ExtraArgs"]["ContentType"] == "video/mp4"
 
