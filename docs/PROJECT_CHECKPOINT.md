@@ -5017,3 +5017,76 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 2. Run `tools/stripe_create_catalog_prices.py --apply` in the portal container. Set the printed `ANYAICAM_STRIPE_PRICE_*` / `ANYAICAM_STRIPE_COUPON_*` values in the staging environment.
 3. Subscribe the staging webhook endpoint to `invoice.paid`, `charge.refunded` and `charge.dispute.created` (the commission ledger needs them).
 4. Deploy through the normal blue/green cutover, run the storefront PHP tests in a PHP container, and repeat the browser check on staging.
+
+## 2026-09-30 late evening: commission refund/dispute fix and Stripe-return sign-in fix, deployed to staging and validated
+
+**Code (golden `cb3b8d4`, pushed; also on `push/staging-readiness-20260930` and `feature/pricing-ff-commission-20260930`; `main` untouched at `d08282f`)**
+- `7e7ae08`: commissions reverse on refunds/disputes under this Stripe account's API version (2026-07-29.dahlia).
+  - Charges no longer name their invoice, and invoices no longer carry the PaymentIntent.
+  - The link is now read from `/v1/invoice_payments`, in both directions.
+- `7f7ab7b`:
+  - a fully reversed commission row now shows `amount_cents=0` (it used to keep the partial remainder, e.g. $4.00 of $8.00);
+  - a disputed payment is marked `disputed` instead of `refunded`.
+- `fedc712`: the portal session cookie (`anyaicam_partner_session`) is now `SameSite=Lax`, no longer `Strict`.
+  - Returning from Stripe Checkout is a top-level navigation from checkout.stripe.com. The Strict cookie was not sent, so the customer landed on sign-in instead of `/customer/setup`.
+  - Lax is never sent on a cross-site POST, and unsafe methods still need the double-submit CSRF token.
+  - Every GET route was scanned for writes. Only idempotent appliance status-cache refreshes were found.
+  - New `app/tests/test_stripe_return_session_cookie.py` (9 tests) failed before the fix and passes after it.
+
+**Regression**
+- `7f7ab7b`: 5,161 passed, 0 failed, 129 skipped.
+- `fedc712` (identical code to `cb3b8d4`): 5,169 passed, 129 skipped, 1 failed.
+  - The failure is the known intermittent `test_talk_audio_relay.py::test_no_appliance_channel_uses_local_isapi_fallback` (test-harness teardown race).
+  - Rerun 10/10 passed on `fedc712`; it also failed 1 in 10 on the pre-fix `3ef2a52`.
+- Dell note: a leaked OneDrive process had consumed about 100 GB of committed memory, which is what crashed the earlier session and made pytest/git fail with MemoryError. OneDrive was restarted.
+
+**Staging**
+- Blue/green cutover `portal-3ef2a52` → `portal-cb3b8d4`: `CUTOVER_COMPLETE`.
+- Rollback container: `portal-3ef2a52-pre-cb3b8d4-20260930T211013Z-rollback`.
+- The live session cookie is issued as `HttpOnly; Secure; SameSite=lax`.
+
+**Ledger reconciliation (E2E test tenant `e2e-pricing-20260930-*` only; 0 rows outside it)**
+- Two Stripe events had been processed by pre-fix code and left the ledger overstating commission by $6.00:
+  - the $24.99 Advanced Analytics refund;
+  - the $4.99 Talk Down dispute.
+- Dry run first, then applied.
+  - The real stored Stripe events were replayed through the fixed handler. Replay is idempotent: only `earned` rows change.
+  - Payments already in their final state were skipped, so their `refunded_at` is preserved.
+  - The two rows reversed by the earlier code were zeroed, with the note `[amount zeroed 2026-09-30: pre-fix reversed row]`.
+  - The $7.99 AI Essentials payment was corrected from `refunded` to `disputed`. Its original `refunded_at` was 2026-09-30T19:59:35.84.
+
+**Stripe TEST validation on `cb3b8d4` (real signed webhooks)**
+- Refund: the $14.99 Local 8 charge was fully refunded.
+  - The payment is `refunded`.
+  - The $40.00 activation and $3.00 recurring commissions are `reversed`, `amount_cents=0`, originals kept.
+- Dispute plus the sign-in fix: Local 8 was bought from the real `/customer/setup` Review step with card 4000 0000 0000 0259.
+  - Stripe charged $14.99.
+  - The browser returned to `/customer/setup?camera_plan_payment=success` still signed in, on desktop and phone (no sideways scroll).
+  - The dispute opened. The payment is `disputed`, and the $3.00 recurring commission (paid month 2) is reversed to $0.
+  - No second activation was written.
+  - The synthetic subscription was cancelled, and the `camera_slots_local` entitlement went to `cancelled`, 0 slots.
+- Friends & Family: new isolated tenant `e2e-pricing-20260930-ff2`, no purchases.
+  - Request → pending. The admin email was sent.
+  - While pending, the plan, Talk Down, AI Essentials, VMS license and Face Access checkouts all returned 409.
+  - Opening the review page left the request pending. Approving from the review page worked, and the customer sees "Approved".
+  - Stripe sessions:
+    - Local 8: $14.99 → $7.49 (base 50% coupon);
+    - Talk Down: $4.99 → $3.74 (analytics 25% coupon);
+    - AI Essentials: $7.99 → $5.99 (analytics 25% coupon);
+    - no promotion codes on those three;
+    - VMS license 8 ($49.99) and Face Access Small ($39.99): 0%, promotion codes available as for any customer.
+  - All five sessions were expired unpaid.
+  - The earlier F&F tenant covers actual purchases ($7.49 plan, $11.24 Vehicle Intelligence, $1,249.99 hardware at 0%) and the decline flow.
+- Final ledger for the E2E tenant:
+  - 1 `earned` ($50 hardware);
+  - 4 `not_eligible_friends_family` ($0);
+  - 7 `reversed` ($0 now, $61.60 original).
+- No duplicate commission `source_ref`, active entitlements or active add-on subscriptions.
+- All E2E sessions revoked.
+- Stripe stayed in TEST mode throughout. No LIVE Price created or changed. Ryzen and Samsung untouched.
+
+**Follow-ups found (not changed in this pass)**
+- The setup wizard shows no "payment received" confirmation after `camera_plan_payment=success`. It reopens at the saved step.
+- The wizard's numbered tabs look clickable but have no handler. Customers can only move with Save and continue.
+- The approved F&F customer copy says "Hardware is not discounted" but does not mention that the VMS license and Face Access are also 0%. Face Access could read as "analytics".
+- A Face Access Small checkout for an account with no door-enabled cameras still starts with quantity 1 door.
