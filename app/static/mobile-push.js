@@ -18,7 +18,7 @@ async function listDevices() {
   for (const d of data.devices) {
     const row = document.createElement('p');
     const label = document.createElement('span');
-    label.textContent = `${d.platform} · ${d.enabled ? 'Enrolled' : 'Disabled'} · ${d.id.slice(0, 8)} `;
+    label.textContent = `${d.platform} · ${d.enabled ? 'Enrolled' : 'Needs reconnect (open this page on that device)'} · ${d.id.slice(0, 8)} `;
     const remove = document.createElement('button');
     remove.type = 'button'; remove.className = 'ghost-button'; remove.textContent = 'Disconnect';
     remove.addEventListener('click', async () => {
@@ -78,8 +78,12 @@ if (enable) {
       const enrolled = await listDevices();
       const config = await (await fetch('/api/mobile/push/config')).json();
       const installation = localStorage.getItem('anyaicam-push-installation');
-      if (config.available && 'Notification' in window && Notification.permission === 'granted' && enrolled.some(d => d.enabled && d.installation_id === installation)) {
-        await enroll(config); // Refresh an existing token; never silently re-enable a revoked device.
+      // Refresh this browser's token whenever it is still enrolled, including after
+      // FCM reported the old token unregistered (the server then pauses the device;
+      // 2026-09-30: a phone stayed paused until Enable was tapped again). Disconnect
+      // deletes the enrollment, so a disconnected browser is never re-enabled here.
+      if (config.available && 'Notification' in window && Notification.permission === 'granted' && enrolled.some(d => d.installation_id === installation)) {
+        await enroll(config);
         return;
       }
       enable.disabled = !config.available;

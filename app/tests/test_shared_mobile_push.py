@@ -696,3 +696,16 @@ def test_grouped_events_are_explained_in_delivery_history(monkeypatch, fake_chan
     drain_after_hold(clock)
     statuses = sorted((j['status'], j['error']) for j in jobs())
     assert statuses == [('sent', None), ('skipped', 'grouped_into_visit')]
+
+
+def test_a_token_paused_browser_reconnects_on_its_next_visit_but_a_disconnected_one_does_not():
+    """2026-09-30: the phone's token was reported unregistered right after a refresh and the
+    device stayed paused until Enable was tapped again."""
+    from pathlib import Path
+    js = (Path(__file__).parents[1] / 'static' / 'mobile-push.js').read_text(encoding='utf-8')
+    assert "enrolled.some(d => d.installation_id === installation)" in js       # enabled or token-paused
+    assert "enrolled.some(d => d.enabled && d.installation_id === installation)" not in js
+    # Disconnect deletes the enrollment, so there is nothing left to refresh for that browser.
+    import mobile_push_routes, inspect
+    source = inspect.getsource(mobile_push_routes)
+    assert "DELETE FROM mobile_push_devices WHERE id=?" in source
