@@ -42357,6 +42357,8 @@ PARTNER_IDENTITY_ONLY_NAV_KEYS = {
     "live", "appliances", "partner",
     "partner-sales", "partner-quotes", "partner-install", "partner-performance",
     "setup", "subscription", "pricing",
+    # Secure Edge (/customer-security) needs a customer identity (2026-09-30).
+    "security",
 }
 
 # Customer video/footage nav items -- Events, Smart alerts, Playback,
@@ -46963,6 +46965,7 @@ NAV_ITEMS = [
 
 
     ("dashboard", "/dashboard", "◉", "Dashboard"),
+    ("security", "/customer-security", "⛨", "Security"),
 
 
 
@@ -47626,7 +47629,7 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
-            "live", "events", "alerts", "playback", "analytics", "investigate", "dashboard", "aac",
+            "live", "events", "alerts", "playback", "analytics", "investigate", "dashboard", "security", "aac",
 
 
 
@@ -48190,6 +48193,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
     elif shell_role in CUSTOMER_PORTAL_ROLES:
         mobile_items = [
             ("live", "/customer-live", "Cameras"),
+            ("security", "/customer-security", "Security"),
             ("alerts", "/alerts", "Alerts"),
             ("playback", "/playback", "Playback"),
             ("investigate", "/investigate", "Investigate"),
@@ -48323,7 +48327,7 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
     )
     if analytics_menu:
         mobile_links = [f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>' for key, url, label in mobile_items]
-        mobile_links.insert(2, analytics_menu[1])  # Cameras, Alerts, Analytics, Playback, Investigate, Account
+        mobile_links.insert(3, analytics_menu[1])  # Cameras, Security, Alerts, Analytics, Playback, Investigate, Account
         mobile = "".join(mobile_links)
         import customer_analytics_workspace
         scripts = analytics_menu[2] + customer_analytics_workspace.NAV_ASSETS + scripts
