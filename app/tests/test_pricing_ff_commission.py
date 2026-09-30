@@ -882,6 +882,7 @@ def test_face_access_is_sold_in_the_customers_size_billed_per_door(face_portal, 
 def test_face_access_gets_no_friends_family_discount(face_portal, db_path):
     client, captured, sent = face_portal
     _seed(db_path)
+    _doors(db_path, ["cam-1"])  # billed per door: a door must exist to buy it
     request_id = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()["request_id"]
     client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
     response = client.post("/api/customer/analytics/checkout", json={"addon_key": "face_access_small"}, cookies=_cookie(*OWNER))

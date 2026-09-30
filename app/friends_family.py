@@ -21,6 +21,7 @@ Flow (2026-09-30):
 """
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime
@@ -57,6 +58,23 @@ def is_approved(customer_id: str) -> bool:
     return status_for(customer_id) == APPROVED
 
 
+_DISCOUNTED_WHAT = {"base": "your camera plan", "analytics": "analytics packages and Talk Down"}
+_UNDISCOUNTED_WHAT = {"hardware": "Hardware", "vms_license": "VMS software licenses", "face_access": "Face Access"}
+
+
+def approved_message() -> str:
+    """What an approved customer is told, built from the same percentages
+    checkout applies, so the two can never disagree."""
+    percent = pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF
+    off = [f"{percent[c]}% off {what}" for c, what in _DISCOUNTED_WHAT.items() if percent.get(c)]
+    full = [what for c, what in _UNDISCOUNTED_WHAT.items() if not percent.get(c)]
+    message = "Approved: " + " and ".join(off) + "." if off else "Approved."
+    if full:
+        listed = full[0] if len(full) == 1 else ", ".join(full[:-1]) + " and " + full[-1]
+        message += f" {listed} {'is' if len(full) == 1 else 'are'} not discounted."
+    return message
+
+
 def customer_status(customer_id: str) -> dict:
     request = latest_request(customer_id)
     if not request:
@@ -65,6 +83,7 @@ def customer_status(customer_id: str) -> dict:
         "status": request["status"], "request_id": request["id"],
         "requested_at": request["requested_at"], "decided_at": request["decided_at"],
         "percent_off": dict(pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF),
+        "approved_message": approved_message(),
     }
 
 
@@ -192,7 +211,7 @@ def customer_panel_html() -> str:
     button.hidden=true;
     if(state.status==='pending'){{text.textContent='Pending administrator approval. You can check out once it is decided.';timer=timer||setInterval(load,20000);return;}}
     if(timer){{clearInterval(timer);timer=null;}}
-    if(state.status==='approved'){{text.textContent='Approved: 50% off your camera plan and 25% off analytics and Talk Down. Hardware is not discounted.';return;}}
+    if(state.status==='approved'){{text.textContent=state.approved_message||{json.dumps(approved_message())};return;}}
     if(state.status==='declined'){{text.textContent='Your last request was declined. You can ask again if something has changed.';button.hidden=false;return;}}
     text.textContent='Family or friend of the AnyAiCam team? Ask for the Friends & Family discount before you check out.';button.hidden=false;
   }}
