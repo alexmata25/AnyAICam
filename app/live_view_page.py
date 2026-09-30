@@ -573,6 +573,9 @@ function wireTalkMic(button, cameraId) {
     button.addEventListener('pointerleave', (event) => stop(event));
   }
   window.addEventListener('pagehide', () => stop());
+  // Lets a page end every active talk at once (the Voice Call screen's
+  // End call, 2026-09-30): the same stop() a normal release runs.
+  (window.anyaicamTalkStops = window.anyaicamTalkStops || []).push(() => stop());
 }
 """
 

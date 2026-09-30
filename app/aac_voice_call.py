@@ -789,6 +789,97 @@ class UnlockConfirmPayload(BaseModel):
     confirm_token: str
 
 
+# Answer / End call controls for the Voice Call screen (2026-09-30), kept as
+# a plain module constant so tests run the exact shipped code under Node.
+# End call ends everything the call started on this phone, in this order:
+# every active Talk session on the page is stopped (wireTalkMic registers
+# its own stop() in window.anyaicamTalkStops -- the same teardown a normal
+# release runs, which closes the audio WebSocket and so ends transmission
+# to the camera), the microphone opened at Answer is released, Answer/End
+# and the mic are disabled and "Call ended" is shown -- all before the
+# server is told, so a slow or failed request never leaves the mic open.
+# Repeated presses do nothing. Found in the 2026-09-30 physical test: End
+# released only the call's own microphone while Talk kept streaming from
+# its clone, and the owner pressed End 11 times.
+_CALL_CONTROLS_JS = r"""
+let callEnded = callInitiallyOver;
+const answerButton = document.getElementById('voice-call-answer');
+const endButton = document.getElementById('voice-call-end');
+function releaseCallMicrophone() {
+  if (window.aacCallMicStream) {
+    window.aacCallMicStream.getTracks().forEach(track => track.stop());
+    window.aacCallMicStream = null;
+  }
+}
+function stopCallTalk() {
+  (window.anyaicamTalkStops || []).forEach(stopTalk => { try { stopTalk(); } catch (e) {} });
+}
+function finishCallLocally() {
+  callEnded = true;
+  stopCallTalk();
+  releaseCallMicrophone();
+  if (answerButton) answerButton.disabled = true;
+  if (endButton) endButton.disabled = true;
+  document.querySelectorAll('.talk-mic').forEach(mic => { mic.disabled = true; });
+  const state = document.getElementById('voice-call-state');
+  if (state) state.textContent = 'ended';
+  const note = document.getElementById('voice-call-ended');
+  if (note) note.hidden = false;
+}
+if (callEnded) finishCallLocally();
+// Answer (2026-09-28): turn the live audio on inside this tap (a phone
+// only plays sound after a user gesture), record the answer, then ask for
+// the microphone once so Talk works without a second prompt.
+answerButton.addEventListener('click', async () => {
+  if (callEnded) return;
+  const video = document.getElementById('live-view-video');
+  if (video) {
+    video.muted = false;
+    try { video.play(); } catch (e) {}
+    const muteButton = document.getElementById('live-view-mute');
+    if (muteButton) muteButton.textContent = '♫';
+  }
+  const response = await fetch(`/api/customer/aac/voice-call/events/${eventId}/answer`, {method: 'POST'});
+  const data = await response.json();
+  if (!response.ok) { showToast(data.detail || 'Could not answer this call.'); return; }
+  if (callEnded) return;
+  document.getElementById('voice-call-state').textContent = 'answered';
+  let micMessage = '';
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      // Ended while the permission prompt was open: never keep this mic.
+      if (callEnded) { stream.getTracks().forEach(track => track.stop()); return; }
+      window.aacCallMicStream = stream;
+      micMessage = ' Tap the microphone under the video to talk.';
+    } catch (e) {
+      micMessage = ' Microphone blocked: open this page in Safari or Chrome and allow the microphone to talk.';
+    }
+  } else {
+    micMessage = ' This browser cannot use the microphone here: open the page in Safari or Chrome to talk.';
+  }
+  showToast('Call answered.' + micMessage);
+});
+window.addEventListener('pagehide', releaseCallMicrophone);
+endButton.addEventListener('click', async () => {
+  if (callEnded) return;
+  finishCallLocally();
+  try {
+    const response = await fetch(`/api/customer/aac/voice-call/events/${eventId}/end`, {method: 'POST'});
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      showToast(data.detail || 'Call ended on this phone, but it could not be saved. Please check your connection.');
+      return;
+    }
+  } catch (e) {
+    showToast('Call ended on this phone, but it could not be saved. Please check your connection.');
+    return;
+  }
+  showToast('Call ended.');
+});
+"""
+
+
 def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/customer/aac/voice-call/entrance-cameras")
     def list_entrance_cameras(request: Request) -> dict:
@@ -1018,6 +1109,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
             raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
         camera = row("SELECT id,name,talk_down_supported FROM cameras WHERE id=? AND customer_id=?", (event["camera_id"], identity["customer_id"]))
         camera_name = (camera or {}).get("name") or "Entrance camera"
+        call_over = (event.get("state") or "") in ("ended", "dismissed", "missed")
 
         import os
 
@@ -1072,57 +1164,17 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
   <p class="health-detail">{esc(audio_status)}</p>
 </section>
 <section class="panel dialog-actions">
-  <button class="action-button" id="voice-call-answer" type="button">Answer</button>
-  <button class="ghost-button" id="voice-call-end" type="button">End call</button>
+  <p id="voice-call-ended" class="call-ended-note" role="status"{'' if call_over else ' hidden'}><strong>Call ended.</strong></p>
+  <button class="action-button" id="voice-call-answer" type="button"{' disabled' if call_over else ''}>Answer</button>
+  <button class="ghost-button" id="voice-call-end" type="button"{' disabled' if call_over else ''}>End call</button>
   {'<button class="ghost-button" id="voice-call-unlock" type="button">Unlock Door</button>' if show_unlock_button else ''}
 </section>
 {live_panel_html}
 {'<p id="voice-call-unlock-status" class="health-detail"></p>' if show_unlock_button else ''}'''
         scripts = live_panel_scripts + f'''<script>
 const eventId={event_id!r};
-// Answer (2026-09-28): turn the live audio on inside this tap (a phone
-// only plays sound after a user gesture), record the answer, then ask for
-// the microphone once so Talk works without a second prompt.
-document.getElementById('voice-call-answer').addEventListener('click', async () => {{
-  const video = document.getElementById('live-view-video');
-  if (video) {{
-    video.muted = false;
-    try {{ video.play(); }} catch (e) {{}}
-    const muteButton = document.getElementById('live-view-mute');
-    if (muteButton) muteButton.textContent = '♫';
-  }}
-  const response = await fetch(`/api/customer/aac/voice-call/events/${{eventId}}/answer`, {{method: 'POST'}});
-  const data = await response.json();
-  if (!response.ok) {{ showToast(data.detail || 'Could not answer this call.'); return; }}
-  document.getElementById('voice-call-state').textContent = 'answered';
-  let micMessage = '';
-  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {{
-    try {{
-      window.aacCallMicStream = await navigator.mediaDevices.getUserMedia({{audio: true}});
-      micMessage = ' Tap the microphone under the video to talk.';
-    }} catch (e) {{
-      micMessage = ' Microphone blocked: open this page in Safari or Chrome and allow the microphone to talk.';
-    }}
-  }} else {{
-    micMessage = ' This browser cannot use the microphone here: open the page in Safari or Chrome to talk.';
-  }}
-  showToast('Call answered.' + micMessage);
-}});
-function releaseCallMicrophone() {{
-  if (window.aacCallMicStream) {{
-    window.aacCallMicStream.getTracks().forEach(track => track.stop());
-    window.aacCallMicStream = null;
-  }}
-}}
-window.addEventListener('pagehide', releaseCallMicrophone);
-document.getElementById('voice-call-end').addEventListener('click', async () => {{
-  const response = await fetch(`/api/customer/aac/voice-call/events/${{eventId}}/end`, {{method: 'POST'}});
-  const data = await response.json();
-  if (!response.ok) {{ showToast(data.detail || 'Could not end this call.'); return; }}
-  document.getElementById('voice-call-state').textContent = 'ended';
-  releaseCallMicrophone();
-  showToast('Call ended.');
-}});
+const callInitiallyOver={'true' if call_over else 'false'};
+''' + _CALL_CONTROLS_JS + f'''
 {'''const unlockButton=document.getElementById('voice-call-unlock');
 const unlockStatus=document.getElementById('voice-call-unlock-status');
 unlockButton.addEventListener('click', async () => {
