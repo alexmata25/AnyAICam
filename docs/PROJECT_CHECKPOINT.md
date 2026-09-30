@@ -4538,3 +4538,35 @@ Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, 
 **Blocked:**
 - The Ryzen is offline since ~05:50 CDT (Tailscale offline; no ping or SSH), so there are no Live, Playback or security-line screenshots yet.
 - The AWS login expired, so there is no staging deploy of the portal fixes (the AACO screenshot shows the committed UI, applied in the capture browser).
+
+## 2026-09-29 evening: anyaicam.com published; next Ryzen release prepared (NOT installed)
+
+**Website publication: CLOSED, passed.** The owner uploaded through Bluehost File Manager (no credentials shared).
+- Step 1: `.htaccess` deny rule; the two archives moved to `/site-private-archive`. Logs and archives return 403.
+- Step 2: 44 files uploaded.
+- Step 3: 17 orphan, test and vendor-copy files moved to `/site-private-archive/removed-2026-09-29`. All 17 return 404. No product was discontinued: the 13 LTS SKUs stay on `cameras.html` and in the Videoloft calculators.
+- Step 4: Cloudflare "Purge Everything".
+- Verified afterwards:
+  - 178 of 178 published files return 200; form handlers reject GET as designed.
+  - `config.php` returns an empty body.
+  - No live page links to a removed file, and none contains staging, Test Cart or LiveChat text.
+  - Real browser, 87 pages on desktop and phone: no new errors.
+- Rollback: `website-publish/rollback-original/` in git, plus the moved files in `/site-private-archive/removed-2026-09-29` on the server.
+- Found in the browser pass and fixed on `website/footer-and-app-screens-20260929` (not uploaded yet): plans.html and analytics.html had an unstyled footer (1280px logo, sideways scroll: 37px desktop, 906px phone). They now use the site's standard footer.
+- Pre-existing and still open (owner decisions):
+  - `/customer-register` (customer-account.html) and `referral-entry.html` return 404.
+  - The Shopify storefront API is blocked by CORS on the 11 old Videoloft storage/adapter pages.
+  - Partner Portal vs website catalog, pending a decision: the website sells two camera lines (LTS for Videoloft, Vivotek/MokerLink for the VMS). The app Partner Portal lists only the appliances and the relay, and the appliance names differ between them.
+- New app screenshots (privacy-scrubbed, not yet placed): `vms-live-camera.webp`, `vms-playback-timeline.webp`.
+
+**Ryzen:** back online at 18:28 CDT after a hard power loss or freeze. The previous boot's journal ends at 05:18 CDT with no shutdown. App healthy with 0 restarts; 4 of 5 cameras reachable. Bedroom (192.168.0.145, behind the QIXIANG bridge) is unreachable; the owner said not to pursue it.
+
+**Next Ryzen release prepared, NOT installed** (Ryzen currently `1175932`):
+- Commit `e3ee24e36653f298f0c5d88d2fc3183f7d0716d1` (= origin `reconcile/golden-foundation-20260911` = staging).
+- Package `anyaicam-appliance-installer-1.1.0-vms-e3ee24e36653.tar.gz`, sha256 `c9f0600594bd547e742d2b0a1d4de7041400555259919281259fe70a07ba9714`, on the Dell only.
+- MediaMTX: sha `9fac297a…`, identical to the Ryzen's installed binary.
+- Packaged code matches the commit byte for byte (LF).
+- Full suite: 87 failed, all in the baseline except the known flake (3 of 3 passes alone). 4 JS-syntax baseline failures are now fixed. 247 of 247 Talk/LPR/Voice Call tests pass.
+- Only DB change: `ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_volume TEXT` (additive; old code ignores it).
+- Behavior change: the talk-audio channel becomes on by default (the Ryzen does not set `ANYAICAM_TALK_AUDIO_ENABLED`).
+- Rollback: the installer tags the running image `anyaicam-vms:rollback-117593236a12` and takes a DB backup; restore with `sudo ./rollback.sh`.
