@@ -45,7 +45,20 @@ $hardwareCatalog = [
 // ------------------------------------------------------------ price IDs
 
 check(count(CAMERA_PLAN_CATALOG) === 8, 'camera plan catalog has all 8 tiers (4 Local + 4 Hybrid)');
-check(count(ANALYTICS_CATALOG) === 10, 'analytics catalog has all 10 products');
+check(count(ANALYTICS_CATALOG) === 5, 'analytics catalog is the 4 packages + Talk Down (2026-09-30 pricing)');
+$expectedPlanPrices = ['local_1_8' => 14.99, 'local_9_16' => 24.99, 'local_17_32' => 39.99, 'local_33_64' => 69.99,
+    'hybrid_1_8' => 24.99, 'hybrid_9_16' => 39.99, 'hybrid_17_32' => 69.99, 'hybrid_33_64' => 99.99];
+foreach ($expectedPlanPrices as $key => $price) {
+    check(abs(CAMERA_PLAN_CATALOG[$key]['display_price'] - $price) < 0.001, "{$key} shows the approved price {$price}");
+}
+$expectedPackagePrices = ['ai_essentials' => 7.99, 'ai_professional' => 14.99, 'vehicle_intelligence' => 14.99,
+    'advanced_analytics' => 24.99, 'talk_down' => 4.99];
+foreach ($expectedPackagePrices as $key => $price) {
+    check(abs(ANALYTICS_CATALOG[$key]['display_price'] - $price) < 0.001, "{$key} shows the approved price {$price}");
+}
+check(INCLUDED_FEATURES === ['Secure Edge', 'Smart Motion', 'AACO'], 'Secure Edge, Smart Motion and AACO are included, not sold');
+check(!isset(ANALYTICS_CATALOG['smart_motion']), 'Smart Motion is no longer sold separately');
+check(!isset(ANALYTICS_CATALOG['facial_recognition']) && !isset(ANALYTICS_CATALOG['cloud_overflow']), 'Face Access and Cloud Overflow are not sold here');
 
 foreach (CAMERA_PLAN_CATALOG as $key => $entry) {
     $resolved = resolve_camera_plan($key);
@@ -53,6 +66,9 @@ foreach (CAMERA_PLAN_CATALOG as $key => $entry) {
     check($resolved !== null && $resolved['price_id'] !== '', "camera plan '{$key}' has a non-empty price_id");
 }
 foreach (ANALYTICS_CATALOG as $key => $entry) {
+    if ($key === 'advanced_analytics') {
+        continue;  // no TEST Price ID yet -- asserted to fail closed below
+    }
     $resolved = resolve_analytic($key);
     check($resolved !== null, "analytic '{$key}' resolves");
     check($resolved !== null && $resolved['price_id'] !== '', "analytic '{$key}' has a non-empty price_id");
@@ -60,7 +76,9 @@ foreach (ANALYTICS_CATALOG as $key => $entry) {
 
 check(resolve_camera_plan('local_1_8')['price_id'] === 'price_1UD2xKGllhK80H2nFJwtFJvw', 'local_1_8 price_id matches the exact TEST Price ID');
 check(resolve_camera_plan('hybrid_33_64')['price_id'] === 'price_1UD33SGllhK80H2nxrbBT2ch', 'hybrid_33_64 price_id matches the exact TEST Price ID');
-check(resolve_analytic('facial_recognition')['price_id'] === 'price_1UD3UuGllhK80H2nAdGKN4ff', 'facial_recognition price_id matches the exact TEST Price ID');
+check(resolve_analytic('facial_recognition') === null, 'Face Access is not sold here (per door, sized by enrolled people)');
+check(resolve_analytic('advanced_analytics') === null, 'Advanced Analytics fails closed until its TEST Price ID exists');
+check(resolve_analytic('smart_motion') === null, 'Smart Motion cannot be bought (included in every plan)');
 check(resolve_analytic('talk_down')['price_id'] === 'price_1UD377GllhK80H2nC1Z2VNh0', 'talk_down price_id matches the exact TEST Price ID');
 
 // Fail-closed on unknown keys -- never a guess.
@@ -76,6 +94,10 @@ check(resolve_analytic('not_a_real_analytic') === null, 'unknown analytic key fa
 // price id).
 foreach (array_merge(array_column(CAMERA_PLAN_CATALOG, 'price_id_const'), array_column(ANALYTICS_CATALOG, 'price_id_const')) as $const) {
     $value = config_value_checked($const);
+    if ($const === 'ANALYTICS_ADVANCED_PRICE_ID') {
+        check($value === '', 'ANALYTICS_ADVANCED_PRICE_ID is intentionally empty until created');
+        continue;
+    }
     check(str_starts_with($value, 'price_'), "{$const} looks like a Price ID, not a live secret key or blank value");
 }
 
@@ -93,7 +115,7 @@ $validCart = normalize_cart([
     'appliance_sku' => 'AIC-APPLIANCE-RYZEN-STARTER',
     'relay' => true,
     'camera_plan' => 'local_1_8',
-    'analytics' => ['smart_motion', 'people_counting', 'talk_down'],
+    'analytics' => ['ai_essentials', 'vehicle_intelligence', 'talk_down'],
 ], $hardwareCatalog);
 check($validCart['appliance_sku'] === 'AIC-APPLIANCE-RYZEN-STARTER', 'valid cart keeps the appliance selection');
 check($validCart['camera_plan']['key'] === 'local_1_8', 'valid cart keeps the camera plan selection');
@@ -106,7 +128,9 @@ check(count($validCart['analytics']) === 3, 'valid cart keeps all 3 analytics se
 check(!is_array($validCart['camera_plan']) || isset($validCart['camera_plan']['key']), 'camera_plan is a single selection, never a list');
 
 // Duplicate analytics keys collapse to one, not an error and not two legs.
-$dedupedCart = normalize_cart(['analytics' => ['smart_motion', 'smart_motion', 'people_counting']], $hardwareCatalog);
+$dedupedCart = normalize_cart(['analytics' => ['ai_essentials', 'ai_essentials', 'talk_down']], $hardwareCatalog);
+check(throws(fn() => normalize_cart(['analytics' => ['advanced_analytics']], $hardwareCatalog)) !== null, 'Advanced Analytics is rejected until configured');
+check(throws(fn() => normalize_cart(['analytics' => ['smart_motion']], $hardwareCatalog)) !== null, 'Smart Motion is rejected (included, not sold)');
 check(count($dedupedCart['analytics']) === 2, 'duplicate analytics keys are deduplicated, not doubled');
 
 // ---------------------------------------------------------------- legs
@@ -129,7 +153,7 @@ check(count(build_checkout_legs($localOnlyCart, $hardwareCatalog)) === 1 && buil
 $hybridOnlyCart = normalize_cart(['camera_plan' => 'hybrid_1_8'], $hardwareCatalog);
 check(build_checkout_legs($hybridOnlyCart, $hardwareCatalog)[0]['price_id'] === 'price_1UD31AGllhK80H2nMKtYEmVw', 'Hybrid alone resolves the correct recurring Price ID');
 
-$analyticsOnlyCart = normalize_cart(['analytics' => ['facial_recognition']], $hardwareCatalog);
+$analyticsOnlyCart = normalize_cart(['analytics' => ['talk_down']], $hardwareCatalog);
 check(count(build_checkout_legs($analyticsOnlyCart, $hardwareCatalog)) === 1, 'one analytic alone stays a single recurring leg');
 
 // ------------------------------------------------------- order summary
@@ -138,7 +162,7 @@ $summary = order_summary($legs);
 check(count($summary['one_time']['items']) === 2, 'summary separates the 2 one-time items (appliance + relay)');
 check(count($summary['monthly']['items']) === 4, 'summary separates the 4 monthly items (camera plan + 3 analytics)');
 check(abs($summary['one_time']['subtotal'] - 1.03) < 0.001, 'one-time subtotal is $0.50 + $0.53 = $1.03');
-check(abs($summary['monthly']['subtotal'] - (0.60 + 0.80 + 0.81 + 0.84)) < 0.001, 'monthly subtotal is $0.60 + $0.80 + $0.81 + $0.84 (Local + Smart Motion + People Counting + Talk Down)');
+check(abs($summary['monthly']['subtotal'] - (14.99 + 7.99 + 14.99 + 4.99)) < 0.001, 'monthly subtotal is $14.99 + $7.99 + $14.99 + $4.99 (Local 8 + AI Essentials + Vehicle Intelligence + Talk Down)');
 // Never combined into one misleading total: assert the two buckets are
 // genuinely separate keys, not summed into a single 'total' field.
 check(!array_key_exists('total', $summary), 'order summary never exposes a combined one-time+monthly total');

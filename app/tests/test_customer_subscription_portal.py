@@ -116,8 +116,10 @@ def test_local_vs_hybrid_comparison_is_always_shown(http_client, db_path):
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Local vs Hybrid" in html
-    assert "one-time purchase" in html
+    # 2026-09-30 pricing: Local and Hybrid are both monthly.
+    assert "<strong>Local</strong> &middot; monthly subscription" in html
     assert "recurring subscription" in html
+    assert "one-time purchase" not in html
 
 
 # --------------------------------------------------------- upgrade to hybrid
@@ -184,10 +186,25 @@ def test_an_active_addon_shows_an_active_pill_not_a_buy_button(http_client, db_p
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
     assert "Advanced Analytics" in html
-    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">Includes: [^<]+</span></span><span class="pill">Active</span>', html)
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">[^<]*Includes: [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS", "price_test_ai_essentials")
+    conn = sqlite3.connect(db_path)
+    _seed_tenant(conn, "cust-1")
+    conn.commit()
+    conn.close()
+    response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
+    html = response.text
+    assert 'data-addon-key="ai_essentials"' in html
+    assert "$7.99/mo · Includes: People Counting" in html
+
+
+def test_face_access_is_one_honest_per_door_row_until_its_sizes_are_defined(http_client, db_path, monkeypatch):
+    """2026-09-30: Face Access is sold per door by size (enrolled people);
+    the thresholds are not decided, so no Face Access buy button exists --
+    not even for the old single-price SKU, which is no longer sold."""
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION", "price_test_facial_recognition")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
@@ -195,8 +212,10 @@ def test_an_inactive_but_priced_addon_shows_a_buy_button(http_client, db_path, m
     conn.close()
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert "Face Access" in html
-    assert 'data-addon-key="facial_recognition"' in html
+    assert html.count("<span>Face Access<br>") == 1
+    assert "$39.99–$69.99/mo per door" in html
+    assert 'data-addon-key="facial_recognition"' not in html
+    assert 'data-addon-key="face_access_' not in html
 
 
 def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(http_client, db_path):
@@ -216,7 +235,7 @@ def test_an_unpriced_addon_shows_an_honest_coming_soon_state_not_a_buy_button(ht
     assert "Advanced Analytics" in html
     # 2026-09-25: shown as clearly unavailable (not an active-looking
     # "Coming soon"), with what it includes from the catalog mapping.
-    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">Includes: Smart Motion, People Counting, [^<]+</span></span>'
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">\$24\.99/mo · Includes: People Counting, LPR, PPE</span></span>'
                      r'<span class="pending-badge" aria-disabled="true"[^>]*>Not available yet</span>', html)
     assert 'data-addon-key="advanced_analytics"' not in html
 
@@ -238,7 +257,7 @@ def test_an_addon_already_active_without_its_price_id_configured_still_shows_act
             upsert_analytics_subscription(customer_id="cust-1", analytic_key=key, status="active")
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
     html = response.text
-    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">Includes: [^<]+</span></span><span class="pill">Active</span>', html)
+    assert re.search(r'<span>Advanced Analytics<br><span class="health-detail">[^<]*Includes: [^<]+</span></span><span class="pill">Active</span>', html)
 
 
 # ------------------------------------------------------- customer_viewer role
@@ -251,7 +270,7 @@ def test_viewer_sees_the_new_page_with_real_data_but_no_purchase_actions(http_cl
     The underlying data (plan badge, add-on active/inactive state) is
     identical to what an owner sees; only the actionable buttons differ."""
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_FACIAL_RECOGNITION", "price_test_facial_recognition")
+    monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_ANALYTICS_AI_ESSENTIALS", "price_test_ai_essentials")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
@@ -266,7 +285,8 @@ def test_viewer_sees_the_new_page_with_real_data_but_no_purchase_actions(http_cl
     assert '<span class="pill">Local</span>' in html
     assert 'id="upgrade-to-hybrid"' not in html
     assert 'id="subscription-upgrade-button"' not in html
-    assert 'data-addon-key="facial_recognition"' not in html
+    assert 'data-addon-key="ai_essentials"' not in html
+    assert 'id="friends-family-panel"' not in html
     assert "Not purchased" in html
 
 

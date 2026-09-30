@@ -90,7 +90,8 @@ h1{font-size:clamp(1.6rem,3vw,2.2rem);margin:.4rem 0 .2rem}
 
   <section class="section">
     <h2>Analytics add-ons</h2>
-    <p class="hint">Optional. Select any number. Each is billed as its own separate recurring subscription.</p>
+    <p class="hint">Every plan includes Secure Edge, Smart Motion and AACO. Packages are optional flat monthly add-ons (never per camera); each is billed as its own subscription.</p>
+    <p class="hint">Friends &amp; Family? Sign in to your AnyAiCam account and request it under My subscription before you check out; an administrator approves it.</p>
     <div class="analytics-grid" id="analytics-options"></div>
   </section>
 
@@ -136,21 +137,17 @@ const APPLIANCES = [
 ];
 const RELAY = {sku:'AIC-RELAY-NUMATO-3CH', name:'Numato 3-Channel Relay Module', model:'Numato 3-channel Ethernet relay', price:0.53};
 const CAPACITY_TIERS = ['1_8','9_16','17_32','33_64'];
-const CAPACITY_LABELS = {'1_8':'1–8 cameras','9_16':'9–16 cameras','17_32':'17–32 cameras','33_64':'33–64 cameras'};
-const LOCAL_PRICES = {'1_8':0.60,'9_16':0.61,'17_32':0.62,'33_64':0.63};
-const HYBRID_PRICES = {'1_8':0.70,'9_16':0.71,'17_32':0.72,'33_64':0.73};
-// Facial Recognition stays an analytics add-on here, never an appliance category.
+const CAPACITY_LABELS = {'1_8':'Up to 8 cameras','9_16':'Up to 16 cameras','17_32':'Up to 32 cameras','33_64':'Up to 64 cameras'};
+const LOCAL_PRICES = {'1_8':14.99,'9_16':24.99,'17_32':39.99,'33_64':69.99};
+const HYBRID_PRICES = {'1_8':24.99,'9_16':39.99,'17_32':69.99,'33_64':99.99};
+// Approved pricing (app/pricing_catalog.py). Packages are flat add-ons, never
+// per camera; Secure Edge, Smart Motion and AACO are included in every plan.
 const ANALYTICS = [
-  {key:'smart_motion', label:'Smart Motion', price:0.80},
-  {key:'people_counting', label:'People Counting', price:0.81},
-  {key:'lpr', label:'License Plate Recognition', price:0.82},
-  {key:'ppe', label:'PPE Detection', price:0.83},
-  {key:'talk_down', label:'Talk Down', price:0.84},
-  {key:'ai_essentials', label:'AnyAiCam AI Essentials', price:0.85},
-  {key:'ai_professional', label:'AnyAiCam AI Professional', price:0.86},
-  {key:'vehicle_intelligence', label:'Vehicle Intelligence', price:0.87},
-  {key:'cloud_overflow', label:'Cloud Overflow', price:0.88},
-  {key:'facial_recognition', label:'Facial Recognition', price:0.89},
+  {key:'ai_essentials', label:'AI Essentials', note:'People Counting', price:7.99},
+  {key:'ai_professional', label:'AI Professional', note:'People Counting and PPE', price:14.99},
+  {key:'vehicle_intelligence', label:'Vehicle Intelligence', note:'License plates and vehicle events', price:14.99},
+  {key:'advanced_analytics', label:'Advanced Analytics', note:'People Counting, License plates and PPE', price:24.99},
+  {key:'talk_down', label:'Talk Down', note:'Per site, includes AAC Voice Call', price:4.99},
 ];
 
 const state = {applianceSku:null, relay:false, service:null, tier:null, analytics:new Set()};
@@ -211,7 +208,7 @@ function renderAnalytics() {
   container.innerHTML = ANALYTICS.map(item => `
     <div class="analytics-row">
       <input type="checkbox" id="an-${item.key}" ${state.analytics.has(item.key) ? 'checked' : ''}>
-      <label for="an-${item.key}">${item.label}</label>
+      <label for="an-${item.key}">${item.label}${item.note ? `<br><small>${item.note}</small>` : ''}</label>
       <span class="price">${money(item.price)}/mo</span>
     </div>`).join('');
   ANALYTICS.forEach(item => {

@@ -138,7 +138,8 @@ def test_setting_the_advanced_analytics_env_var_makes_that_addon_resolvable(monk
     mapping = ae._load_price_map()
     entry = mapping["price_real_advanced_analytics"]
     assert entry["addon_key"] == "advanced_analytics"
-    assert set(entry["analytic_keys"]) == {"smart_motion", "people_counting", "lpr", "ppe"}
+    # 2026-09-30: Smart Motion is included with every plan, not sold.
+    assert set(entry["analytic_keys"]) == {"people_counting", "lpr", "ppe"}
 
 
 # --------------------------------------------------------- grant / revoke

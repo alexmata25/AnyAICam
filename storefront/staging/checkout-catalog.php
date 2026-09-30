@@ -41,10 +41,19 @@ declare(strict_types=1);
  * subscriptions end to end) -- B is materially larger and riskier for a
  * staging build with no product requirement driving it yet.
  *
- * SANDBOX TEST PRICES: every display_price below is the tiny Stripe
- * TEST-mode amount that stripe-config.php's Price IDs actually charge,
- * not real retail. Never promote these numbers (or this catalog) to
- * production as-is.
+ * PRICES (2026-09-30): display_price is the approved retail price from the
+ * one authoritative catalog, app/pricing_catalog.py (Local $14.99/$24.99/
+ * $39.99/$69.99, Hybrid $24.99/$39.99/$69.99/$99.99 per month; AI
+ * Essentials $7.99, AI Professional $14.99, Vehicle Intelligence $14.99,
+ * Advanced Analytics $24.99 flat, Talk Down $4.99 per site). The Stripe
+ * TEST Price IDs in stripe-config.php were created at sandbox amounts
+ * ($0.60-$0.89) and must be recreated at these amounts before staging
+ * checkout charges what this page shows; Advanced Analytics has no Price
+ * ID yet and fails closed. Secure Edge, Smart Motion and AACO are
+ * included in every plan and are not sold separately. Face Access and
+ * Cloud Overflow are not sold here (no size rule / no price yet).
+ * Friends & Family is never a code: it is requested from the customer's
+ * signed-in AnyAiCam account and approved by an administrator.
  */
 
 require_once __DIR__ . '/stripe-config.php';
@@ -60,28 +69,27 @@ function config_value_checked(string $name): string {
 // catalog anywhere: camera plans and analytics.
 
 const CAMERA_PLAN_CATALOG = [
-    'local_1_8'    => ['type' => 'local',  'label' => 'Local 1–8 cameras',      'display_price' => 0.60, 'price_id_const' => 'LOCAL_1_8_PRICE_ID'],
-    'local_9_16'   => ['type' => 'local',  'label' => 'Local 9–16 cameras',     'display_price' => 0.61, 'price_id_const' => 'LOCAL_9_16_PRICE_ID'],
-    'local_17_32'  => ['type' => 'local',  'label' => 'Local 17–32 cameras',    'display_price' => 0.62, 'price_id_const' => 'LOCAL_17_32_PRICE_ID'],
-    'local_33_64'  => ['type' => 'local',  'label' => 'Local 33–64 cameras',    'display_price' => 0.63, 'price_id_const' => 'LOCAL_33_64_PRICE_ID'],
-    'hybrid_1_8'   => ['type' => 'hybrid', 'label' => 'Hybrid 1–8 cameras',     'display_price' => 0.70, 'price_id_const' => 'HYBRID_1_8_PRICE_ID'],
-    'hybrid_9_16'  => ['type' => 'hybrid', 'label' => 'Hybrid 9–16 cameras',    'display_price' => 0.71, 'price_id_const' => 'HYBRID_9_16_PRICE_ID'],
-    'hybrid_17_32' => ['type' => 'hybrid', 'label' => 'Hybrid 17–32 cameras',   'display_price' => 0.72, 'price_id_const' => 'HYBRID_17_32_PRICE_ID'],
-    'hybrid_33_64' => ['type' => 'hybrid', 'label' => 'Hybrid 33–64 cameras',   'display_price' => 0.73, 'price_id_const' => 'HYBRID_33_64_PRICE_ID'],
+    'local_1_8'    => ['type' => 'local',  'label' => 'Local 8 cameras',   'display_price' => 14.99, 'price_id_const' => 'LOCAL_1_8_PRICE_ID'],
+    'local_9_16'   => ['type' => 'local',  'label' => 'Local 16 cameras',  'display_price' => 24.99, 'price_id_const' => 'LOCAL_9_16_PRICE_ID'],
+    'local_17_32'  => ['type' => 'local',  'label' => 'Local 32 cameras',  'display_price' => 39.99, 'price_id_const' => 'LOCAL_17_32_PRICE_ID'],
+    'local_33_64'  => ['type' => 'local',  'label' => 'Local 64 cameras',  'display_price' => 69.99, 'price_id_const' => 'LOCAL_33_64_PRICE_ID'],
+    'hybrid_1_8'   => ['type' => 'hybrid', 'label' => 'Hybrid 8 cameras',  'display_price' => 24.99, 'price_id_const' => 'HYBRID_1_8_PRICE_ID'],
+    'hybrid_9_16'  => ['type' => 'hybrid', 'label' => 'Hybrid 16 cameras', 'display_price' => 39.99, 'price_id_const' => 'HYBRID_9_16_PRICE_ID'],
+    'hybrid_17_32' => ['type' => 'hybrid', 'label' => 'Hybrid 32 cameras', 'display_price' => 69.99, 'price_id_const' => 'HYBRID_17_32_PRICE_ID'],
+    'hybrid_33_64' => ['type' => 'hybrid', 'label' => 'Hybrid 64 cameras', 'display_price' => 99.99, 'price_id_const' => 'HYBRID_33_64_PRICE_ID'],
 ];
 
+// Analytics packages (flat, never per camera) and Talk Down (per site,
+// includes AAC Voice Call). Package contents live in app/pricing_catalog.py.
 const ANALYTICS_CATALOG = [
-    'smart_motion'         => ['label' => 'Smart Motion',                 'display_price' => 0.80, 'price_id_const' => 'ANALYTICS_SMART_MOTION_PRICE_ID'],
-    'people_counting'      => ['label' => 'People Counting',              'display_price' => 0.81, 'price_id_const' => 'ANALYTICS_PEOPLE_COUNTING_PRICE_ID'],
-    'lpr'                  => ['label' => 'License Plate Recognition',    'display_price' => 0.82, 'price_id_const' => 'ANALYTICS_LPR_PRICE_ID'],
-    'ppe'                  => ['label' => 'PPE Detection',                'display_price' => 0.83, 'price_id_const' => 'ANALYTICS_PPE_PRICE_ID'],
-    'talk_down'            => ['label' => 'Talk Down',                    'display_price' => 0.84, 'price_id_const' => 'ANALYTICS_TALK_DOWN_PRICE_ID'],
-    'ai_essentials'        => ['label' => 'AnyAiCam AI Essentials',       'display_price' => 0.85, 'price_id_const' => 'ANALYTICS_AI_ESSENTIALS_PRICE_ID'],
-    'ai_professional'      => ['label' => 'AnyAiCam AI Professional',     'display_price' => 0.86, 'price_id_const' => 'ANALYTICS_AI_PROFESSIONAL_PRICE_ID'],
-    'vehicle_intelligence' => ['label' => 'Vehicle Intelligence',         'display_price' => 0.87, 'price_id_const' => 'ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID'],
-    'cloud_overflow'       => ['label' => 'Cloud Overflow',               'display_price' => 0.88, 'price_id_const' => 'ANALYTICS_CLOUD_OVERFLOW_PRICE_ID'],
-    'facial_recognition'   => ['label' => 'Facial Recognition',           'display_price' => 0.89, 'price_id_const' => 'ANALYTICS_FACIAL_RECOGNITION_PRICE_ID'],
+    'ai_essentials'        => ['label' => 'AI Essentials',                        'display_price' => 7.99,  'price_id_const' => 'ANALYTICS_AI_ESSENTIALS_PRICE_ID'],
+    'ai_professional'      => ['label' => 'AI Professional',                      'display_price' => 14.99, 'price_id_const' => 'ANALYTICS_AI_PROFESSIONAL_PRICE_ID'],
+    'vehicle_intelligence' => ['label' => 'Vehicle Intelligence',                 'display_price' => 14.99, 'price_id_const' => 'ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID'],
+    'advanced_analytics'   => ['label' => 'Advanced Analytics',                   'display_price' => 24.99, 'price_id_const' => 'ANALYTICS_ADVANCED_PRICE_ID'],
+    'talk_down'            => ['label' => 'Talk Down (includes AAC Voice Call)',  'display_price' => 4.99,  'price_id_const' => 'ANALYTICS_TALK_DOWN_PRICE_ID'],
 ];
+
+const INCLUDED_FEATURES = ['Secure Edge', 'Smart Motion', 'AACO'];
 
 /** Fail-closed: an unknown camera-plan key resolves to null, never a guess. */
 function resolve_camera_plan(string $key): ?array {

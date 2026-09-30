@@ -134,14 +134,14 @@ walk_journey([
 ], 'sandbox-hybrid-only@example.test', $secretKey, 'Hybrid only');
 
 walk_journey([
-    ['kind' => 'analytics', 'key' => 'smart_motion', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'ai_essentials', 'expected_mode' => 'subscription'],
 ], 'sandbox-analytics-only@example.test', $secretKey, 'One analytics only');
 
 walk_journey([
     ['kind' => 'hardware', 'key' => 'AIC-APPLIANCE-RYZEN-STARTER', 'expected_mode' => 'payment'],
     ['kind' => 'camera_plan', 'key' => 'local_1_8', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'smart_motion', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'people_counting', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'ai_essentials', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'vehicle_intelligence', 'expected_mode' => 'subscription'],
     ['kind' => 'analytics', 'key' => 'talk_down', 'expected_mode' => 'subscription'],
 ], 'sandbox-hw-local-3analytics@example.test', $secretKey, 'Hardware + Local + 3 analytics');
 
@@ -149,8 +149,8 @@ walk_journey([
     ['kind' => 'hardware', 'key' => 'AIC-APPLIANCE-RYZEN-ENTERPRISE', 'expected_mode' => 'payment'],
     ['kind' => 'hardware', 'key' => 'AIC-RELAY-NUMATO-3CH', 'expected_mode' => 'payment'],
     ['kind' => 'camera_plan', 'key' => 'hybrid_9_16', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'lpr', 'expected_mode' => 'subscription'],
-    ['kind' => 'analytics', 'key' => 'facial_recognition', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'ai_professional', 'expected_mode' => 'subscription'],
+    ['kind' => 'analytics', 'key' => 'talk_down', 'expected_mode' => 'subscription'],
 ], 'sandbox-hw-hybrid-analytics@example.test', $secretKey, 'Hardware + relay + Hybrid + 2 analytics');
 
 // -------------------------------------------------------- fail-closed

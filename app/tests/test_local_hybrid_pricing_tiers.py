@@ -25,15 +25,16 @@ from partner_db import initialize_database
 import customer_entitlements as ce
 
 
+# Approved working pricing, 2026-09-30 (pricing_catalog.BASE_PLANS).
 EXPECTED = {
     ("local", "1-8"): (8, 14.99),
-    ("local", "9-16"): (16, 19.99),
-    ("local", "17-32"): (32, 29.99),
-    ("local", "33-64"): (64, 49.99),
-    ("hybrid", "1-8"): (8, 29.99),
-    ("hybrid", "9-16"): (16, 49.99),
-    ("hybrid", "17-32"): (32, 89.99),
-    ("hybrid", "33-64"): (64, 149.99),
+    ("local", "9-16"): (16, 24.99),
+    ("local", "17-32"): (32, 39.99),
+    ("local", "33-64"): (64, 69.99),
+    ("hybrid", "1-8"): (8, 24.99),
+    ("hybrid", "9-16"): (16, 39.99),
+    ("hybrid", "17-32"): (32, 69.99),
+    ("hybrid", "33-64"): (64, 99.99),
 }
 
 
@@ -78,20 +79,16 @@ def test_pricing_table_for_website_omits_stripe_internals():
     local_1_8 = next(r for r in table if r["plan_type"] == "local" and r["tier_label"] == "1-8")
     assert local_1_8["monthly_retail_usd"] == 14.99
     hybrid_33_64 = next(r for r in table if r["plan_type"] == "hybrid" and r["tier_label"] == "33-64")
-    assert hybrid_33_64["monthly_retail_usd"] == 149.99
+    assert hybrid_33_64["monthly_retail_usd"] == 99.99
 
 
-def test_local_is_one_time_and_hybrid_is_recurring():
-    """Business decision confirmed 2026-09-21: Local became a one-time
-    purchase, Hybrid stayed a recurring subscription. billing_type is
+def test_local_and_hybrid_are_both_monthly_subscriptions():
+    """Approved pricing 2026-09-30: Local and Hybrid are both monthly
+    (superseding the 2026-09-21 one-time Local model). billing_type is
     what create_camera_slot_checkout() uses to pick Stripe Checkout
-    mode=payment vs mode=subscription -- this locks the decision in so
-    it can't silently drift back."""
+    mode=subscription -- this locks it in."""
     for row in ce._plan_tier_rows():
-        if row["plan_type"] == "local":
-            assert row["billing_type"] == "one_time"
-        elif row["plan_type"] == "hybrid":
-            assert row["billing_type"] == "recurring"
+        assert row["billing_type"] == "recurring"
 
 
 def test_local_and_hybrid_have_distinct_product_keys_even_at_the_same_slot_maximum():
@@ -116,7 +113,7 @@ def test_no_tier_has_a_stripe_price_id_configured_by_default():
 def test_setting_a_tiers_price_id_env_var_makes_it_resolvable(monkeypatch):
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_LOCAL_1_8", "price_real_local_1_8")
     mapping = ce._load_price_tier_map()
-    assert mapping == {"price_real_local_1_8": {"product": "camera_slots_local", "camera_slot_maximum": 8, "billing_type": "one_time"}}
+    assert mapping == {"price_real_local_1_8": {"product": "camera_slots_local", "camera_slot_maximum": 8, "billing_type": "recurring"}}
 
 
 # --------------------------------------------- Local vs Hybrid entitlements
@@ -201,7 +198,12 @@ def test_cancelling_hybrid_leaves_local_active(db_path, _real_tier_map):
 # exact right product/camera-slot-maximum when set as env vars -- it
 # never calls Stripe itself.
 #
-# STALE AS OF 2026-09-21: Local became a one-time purchase (billing_type
+# STALE AS OF 2026-09-30: every one of these eight Price objects was
+# created at the PREVIOUS amounts (Local $14.99/$19.99/$29.99/$49.99,
+# Hybrid $29.99/$49.99/$89.99/$149.99). Only Local 1-8 ($14.99/month)
+# matches the approved pricing; do not configure any of the others, and
+# confirm Local 1-8's amount and interval in Stripe before reusing it.
+# Earlier history -- as of 2026-09-21 Local became a one-time purchase (billing_type
 # "one_time" -> Stripe Checkout mode="payment"), but these four LOCAL
 # Price IDs were created as RECURRING-monthly Price objects under the
 # old model. A Stripe Price's recurring/one-time nature is fixed
@@ -225,10 +227,10 @@ LIVE_PRICE_IDS = {
 }
 
 EXPECTED_FOR_LIVE_ID = {
-    "price_1UDee3GllhK80H2nK4uQLBKe": ("camera_slots_local", 8, "one_time"),
-    "price_1UDeehGllhK80H2nf61pHif8": ("camera_slots_local", 16, "one_time"),
-    "price_1UDeeqGllhK80H2nyZ9Mz8BE": ("camera_slots_local", 32, "one_time"),
-    "price_1UDeeQGllhK80H2nVRRrsksb": ("camera_slots_local", 64, "one_time"),
+    "price_1UDee3GllhK80H2nK4uQLBKe": ("camera_slots_local", 8, "recurring"),
+    "price_1UDeehGllhK80H2nf61pHif8": ("camera_slots_local", 16, "recurring"),
+    "price_1UDeeqGllhK80H2nyZ9Mz8BE": ("camera_slots_local", 32, "recurring"),
+    "price_1UDeeQGllhK80H2nVRRrsksb": ("camera_slots_local", 64, "recurring"),
     "price_1UDecwGllhK80H2nEDSd6dww": ("camera_slots_hybrid", 8, "recurring"),
     "price_1UDef0GllhK80H2n5NcWtqDK": ("camera_slots_hybrid", 16, "recurring"),
     "price_1UDef2GllhK80H2nbIf7ZTHY": ("camera_slots_hybrid", 32, "recurring"),

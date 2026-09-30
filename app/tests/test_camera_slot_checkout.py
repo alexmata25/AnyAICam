@@ -81,11 +81,10 @@ def _seed_tenant(db_path, customer_id="cust-1", email="signedin@example.test", p
 # ------------------------------------------------------------ happy path
 
 
-def test_local_checkout_is_a_one_time_payment_session_with_full_metadata(client, db_path):
-    """Business decision confirmed 2026-09-21: Local is a one-time
-    purchase -- mode="payment", and Stripe rejects subscription_data
-    params outright in that mode, so they must be completely absent
-    from the request, not just unused."""
+def test_local_checkout_is_a_monthly_subscription_session_with_full_metadata(client, db_path):
+    """Approved pricing 2026-09-30: Local is a monthly subscription
+    ($14.99 for 8 cameras), so mode="subscription" with subscription
+    metadata the webhook and commission ledger read."""
     test_client, captured = client
     _seed_tenant(db_path, customer_id="cust-1", email="owner@example.test")
     response = test_client.post(
@@ -98,20 +97,20 @@ def test_local_checkout_is_a_one_time_payment_session_with_full_metadata(client,
     assert body["status"] == "complete"
     assert body["checkout_url"] == "https://checkout.stripe.test/cs_test_camera_1"
     assert body["camera_slot_maximum"] == 8
-    assert body["billing_type"] == "one_time"
+    assert body["billing_type"] == "recurring"
 
     fields = _fields_dict(captured["fields"])
-    assert fields["mode"] == "payment"
+    assert fields["mode"] == "subscription"
     assert fields["line_items[0][price]"] == "price_test_local_1_8"
     # Fixed-tier purchase: always exactly one line item, never a
-    # customer-submitted multiplier -- same discipline as the existing
-    # license-tier checkout.
+    # customer-submitted multiplier.
     assert fields["line_items[0][quantity]"] == "1"
     assert fields["metadata[anyaicam_stripe_price_id]"] == "price_test_local_1_8"
     assert fields["metadata[anyaicam_customer_id]"] == "cust-1"
-    assert not any(key.startswith("subscription_data") for key in fields), (
-        "mode=payment must never carry subscription_data params -- Stripe rejects the whole session if it does"
-    )
+    assert fields["subscription_data[metadata][anyaicam_customer_id]"] == "cust-1"
+    assert fields["subscription_data[metadata][anyaicam_product_class]"] == "base"
+    assert fields["allow_promotion_codes"] == "true"
+    assert "discounts[0][coupon]" not in fields
     assert fields["client_reference_id"] == "cust-1"
     assert fields["customer_email"] == "owner@example.test"
     assert "customer/setup" in fields["success_url"]

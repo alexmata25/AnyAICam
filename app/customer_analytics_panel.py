@@ -176,6 +176,15 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
     ).fetchone()
     licensed_quantity = subscription["licensed_quantity"] if subscription else 0
 
+    # 2026-09-30 pricing: included features (Smart Motion with any paid
+    # plan) and features from a flat analytics package cover every camera
+    # on the account -- they are never per-camera licences. Anything else
+    # keeps the per-site licensed_quantity rule below unchanged.
+    from analytics_entitlements import account_wide_feature_active
+    if account_wide_feature_active(db, customer_id, analytic_key):
+        _activate_camera_analytic(db, camera_id, analytic_key, now=now)
+        return
+
     already_entitled = db.execute(
         "SELECT 1 FROM camera_analytics_entitlements WHERE camera_id=? AND analytic_key=? AND status='active'",
         (camera_id, analytic_key),
@@ -202,6 +211,10 @@ def assign_entitlement(db, camera_id: str, analytic_key: str, *, now: str) -> No
             f"that limit is already in use."
         )
 
+    _activate_camera_analytic(db, camera_id, analytic_key, now=now)
+
+
+def _activate_camera_analytic(db, camera_id: str, analytic_key: str, *, now: str) -> None:
     db.execute(
         "INSERT INTO camera_analytics_entitlements(camera_id,analytic_key,status,created_at,updated_at) "
         "VALUES(?,?,'active',?,?) "

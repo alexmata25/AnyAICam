@@ -137,6 +137,9 @@ define('ANALYTICS_AI_PROFESSIONAL_PRICE_ID', 'price_1UD38aGllhK80H2nMSdir4BE');
 define('ANALYTICS_VEHICLE_INTELLIGENCE_PRICE_ID', 'price_1UD39XGllhK80H2nnyJJoXKQ');
 define('ANALYTICS_CLOUD_OVERFLOW_PRICE_ID', 'price_1UD3UMGllhK80H2nqMJhbPe6');
 define('ANALYTICS_FACIAL_RECOGNITION_PRICE_ID', 'price_1UD3UuGllhK80H2nAdGKN4ff');
+// Advanced Analytics ($24.99 flat, 2026-09-30): no TEST Price ID exists yet --
+// empty means checkout-catalog.php rejects it (fail closed).
+define('ANALYTICS_ADVANCED_PRICE_ID', '');
 
 // Env-overridable, same convention as STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET
 // above: the deployed storefront container sets ANYAICAM_STOREFRONT_BASE_URL

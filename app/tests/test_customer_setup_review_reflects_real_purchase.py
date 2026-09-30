@@ -172,6 +172,10 @@ def test_review_shows_every_purchased_analytic_and_no_others(http_client, db_pat
     # whole-body substring check coincidentally collided with it purely
     # because its label text matches the analytic's own display name.
     body = response.text.split("</nav>", 1)[-1]
+    # 2026-09-30: scoped to the Licensing & billing panel itself -- the
+    # Friends & Family panel that follows it describes the discount on
+    # "analytics and Talk Down" in general, not a purchase.
+    body = body.split('id="customer-subscription-review"', 1)[-1].split('id="friends-family-panel"', 1)[0]
     # Labels come from customer_analytics_panel.ANALYTIC_LABELS, in key order.
     assert "Analytics: LPR, People Counting, Smart Motion</p>" in body
     # Unpurchased analytics must not appear as if they were enabled.
