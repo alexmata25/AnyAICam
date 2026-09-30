@@ -228,3 +228,9 @@ def test_settings_pages_link_to_aaco_settings():
     source = open(customer_platform.__file__, encoding="utf-8").read()
     assert '<a class="ghost-button" href="/customer/aaco-settings">AACO settings</a>' in source   # Settings page
     assert '<a class="setting-link" href="/customer/aaco-settings">' in source                    # Account page controls
+
+
+def test_camera_list_is_really_hidden_when_all_cameras_is_chosen():
+    """display:grid overrode the hidden attribute on staging."""
+    source = open(aaco_settings.__file__, encoding="utf-8").read()
+    assert ".aaco-camera-list[hidden]{{display:none}}" in source

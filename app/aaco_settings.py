@@ -244,6 +244,7 @@ def render_page(identity: dict) -> tuple[str, str]:
       .aaco-toggle small{{display:block;color:var(--muted,#9aa7b5);font-weight:400;margin-top:2px}}
       .aaco-scope{{display:flex;gap:18px;flex-wrap:wrap;margin:8px 0}}
       .aaco-camera-list{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:8px}}
+      .aaco-camera-list[hidden]{{display:none}}
       .aaco-camera{{display:flex;gap:8px;align-items:center}}
       .aaco-status{{margin-top:10px}}
     </style>
