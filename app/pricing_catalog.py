@@ -54,6 +54,23 @@ BASE_PLANS = [
 PLAN_TYPE_LABELS = {"local": "Local", "hybrid": "Hybrid"}
 
 # --------------------------------------------------------------------------
+# One-time AnyAiCam VMS software license (approved 2026-09-30), sized to the
+# camera capacity of the chosen plan. A separate one-time line item from
+# the monthly Local/Hybrid plan. INCLUDED with an AnyAiCam appliance (never
+# charged twice); charged for a customer-owned PC / DIY installation.
+# Capacity is recorded as a customer_entitlements row (product
+# "vms_license") -- licensing data, never a hard-coded VMS limit.
+# --------------------------------------------------------------------------
+VMS_LICENSE_PRODUCT = "vms_license"
+VMS_LICENSES = [
+    # camera capacity, one-time price (cents), Stripe Price ID env var
+    (8, _cents("49.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_8"),
+    (16, _cents("79.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_16"),
+    (32, _cents("129.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_32"),
+    (64, _cents("199.99"), "ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"),
+]
+
+# --------------------------------------------------------------------------
 # 3. Included in every paid Local or Hybrid plan -- never charged for.
 # (feature key, label). smart_motion is also an analytics feature key
 # (customer_analytics_panel.ANALYTIC_LABELS); secure_edge and aaco are
@@ -115,7 +132,9 @@ FACE_ACCESS_MEDIUM_MAX_ENV = "ANYAICAM_FACE_ACCESS_MEDIUM_MAX_PEOPLE"
 # --------------------------------------------------------------------------
 # 9. Friends & Family (approved by an administrator, never a promo code).
 # --------------------------------------------------------------------------
-FRIENDS_FAMILY_PERCENT_OFF = {"base": 50, "analytics": 25, "hardware": 0}
+# The one-time VMS license has no approved Friends & Family discount yet
+# (class "vms_license" -> 0%); flagged for a decision, never invented.
+FRIENDS_FAMILY_PERCENT_OFF = {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0}
 FRIENDS_FAMILY_COUPON_ENV = {
     "base": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE",
     "analytics": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS",
@@ -159,6 +178,19 @@ def base_plans() -> list[dict]:
 
 def find_base_plan(plan_type: str, tier_label: str) -> Optional[dict]:
     return next((p for p in base_plans() if p["plan_type"] == plan_type and p["tier_label"] == tier_label), None)
+
+
+def vms_licenses() -> list[dict]:
+    return [
+        {"capacity": capacity, "label": f"AnyAiCam VMS software license, {capacity} cameras", "one_time_cents": cents,
+         "billing_type": "one_time", "product": VMS_LICENSE_PRODUCT, "price_env_var": env_var,
+         "stripe_price_id": _price_id(env_var)}
+        for capacity, cents, env_var in VMS_LICENSES
+    ]
+
+
+def find_vms_license(capacity: int) -> Optional[dict]:
+    return next((lic for lic in vms_licenses() if lic["capacity"] == int(capacity)), None)
 
 
 def addons() -> list[dict]:
@@ -226,11 +258,13 @@ def discounted_cents(cents: int, percent_off: int) -> int:
 
 
 def quote(*, plan_type: str, tier_label: str, addon_keys=(), talk_down_sites: int = 0,
-          friends_family_approved: bool = False) -> dict:
-    """Monthly subscription quote for one base plan plus flat add-ons.
-    Advanced Analytics (and every package) is flat -- never multiplied by
-    camera slots. Talk Down is per site. Hardware is quoted separately and
-    never discounted."""
+          friends_family_approved: bool = False, with_appliance: Optional[bool] = None) -> dict:
+    """Monthly subscription quote for one base plan plus flat add-ons, and
+    (when with_appliance is given) the one-time VMS license for the plan's
+    capacity: $0 "included" with an AnyAiCam appliance, charged for a DIY
+    installation. Advanced Analytics (and every package) is flat -- never
+    multiplied by camera slots. Talk Down is per site. Hardware is quoted
+    separately and never discounted."""
     plan = find_base_plan(plan_type, tier_label)
     if plan is None:
         raise ValueError("Unknown base plan.")
@@ -253,10 +287,21 @@ def quote(*, plan_type: str, tier_label: str, addon_keys=(), talk_down_sites: in
     if talk_down_sites:
         talk_down = find_addon("talk_down")
         add(talk_down["label"], talk_down["monthly_cents"], "analytics", quantity=int(talk_down_sites))
+    one_time = []
+    if with_appliance is not None:
+        license_ = find_vms_license(plan["camera_slot_maximum"])
+        if with_appliance:
+            one_time.append({"label": license_["label"] + " (included with appliance)", "cents": 0, "included": True})
+        else:
+            percent = friends_family_percent("vms_license") if friends_family_approved else 0
+            one_time.append({"label": license_["label"], "cents": discounted_cents(license_["one_time_cents"], percent),
+                             "included": False})
     return {
         "lines": lines,
         "monthly_list_cents": sum(line["list_cents"] for line in lines),
         "monthly_cents": sum(line["cents"] for line in lines),
+        "one_time_lines": one_time,
+        "one_time_cents": sum(line["cents"] for line in one_time),
         "friends_family_approved": friends_family_approved,
     }
 
@@ -271,6 +316,11 @@ def public_catalog() -> dict:
             for p in base_plans()
         ],
         "included_features": [{"key": k, "label": label} for k, label in INCLUDED_FEATURES],
+        "vms_licenses": [
+            {"capacity": lic["capacity"], "label": lic["label"], "one_time": dollars(lic["one_time_cents"]),
+             "included_with_appliance": True}
+            for lic in vms_licenses()
+        ],
         "addons": [
             {"key": a["addon_key"], "label": a["label"], "unit": a["unit"], "grants": list(a["grants"]),
              "monthly": dollars(a["monthly_cents"]) if a["monthly_cents"] is not None else None,

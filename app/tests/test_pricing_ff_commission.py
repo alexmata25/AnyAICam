@@ -101,7 +101,8 @@ def test_cloud_overflow_has_no_invented_price_and_is_not_bundled():
 
 
 def test_friends_family_percentages_and_quote():
-    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "analytics": 25, "hardware": 0}
+    # The one-time VMS license has no approved Friends & Family discount (0%).
+    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0}
     quote = pc.quote(plan_type="local", tier_label="1-8", addon_keys=["advanced_analytics"], friends_family_approved=True)
     base, advanced = quote["lines"]
     assert base["cents"] == 1499 - 750  # 50% of $14.99, rounded to the cent like Stripe
@@ -641,3 +642,167 @@ def test_my_subscription_shows_catalog_prices_and_included_features(portal, db_p
     assert "Secure Edge, Smart Motion, AACO" in html
     assert "$24.99/mo · Includes: People Counting, LPR, PPE" in html
     assert "<span>Talk Down (includes AAC Voice Call)<br><span class=\"health-detail\">$4.99/mo per site</span>" in html
+
+
+# ================================================================ one-time VMS software license
+
+@pytest.mark.parametrize("capacity,cents", [(8, 4999), (16, 7999), (32, 12999), (64, 19999)])
+def test_vms_license_prices_are_one_time(capacity, cents):
+    lic = pc.find_vms_license(capacity)
+    assert lic["one_time_cents"] == cents and lic["billing_type"] == "one_time"
+
+
+def test_vms_license_does_not_change_the_monthly_plans():
+    assert [p["monthly_cents"] for p in pc.base_plans()] == [1499, 2499, 3999, 6999, 2499, 3999, 6999, 9999]
+
+
+@pytest.mark.parametrize("plan_type,tier,capacity,cents", [
+    ("local", "1-8", 8, 4999), ("local", "9-16", 16, 7999), ("hybrid", "17-32", 32, 12999), ("hybrid", "33-64", 64, 19999),
+])
+def test_diy_quote_adds_the_matching_license_and_appliance_quote_includes_it(plan_type, tier, capacity, cents):
+    diy = pc.quote(plan_type=plan_type, tier_label=tier, with_appliance=False)
+    assert diy["one_time_cents"] == cents and f"{capacity} cameras" in diy["one_time_lines"][0]["label"]
+    appliance = pc.quote(plan_type=plan_type, tier_label=tier, with_appliance=True)
+    assert appliance["one_time_cents"] == 0 and appliance["one_time_lines"][0]["included"] is True
+    assert diy["monthly_cents"] == appliance["monthly_cents"]  # separate line item; plan price unchanged
+
+
+def _paid_appliance_order(db_path, customer_id="cust-1", status="paid"):
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO hardware_orders(id,customer_id,sku,product_name,stripe_price_id,stripe_checkout_session_id,quantity,amount_cents,currency,status,fulfillment_status,created_at,updated_at) "
+                 "VALUES('hw-app',?,'AIC-APPLIANCE-RYZEN-STARTER','AnyAiCam Starter','price_hw','cs_hw_app',1,124999,'usd',?,'paid','2026-01-01','2026-01-01')",
+                 (customer_id, status))
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture()
+def license_portal(portal, monkeypatch):
+    for capacity in (8, 16, 32, 64):
+        monkeypatch.setenv(f"ANYAICAM_STRIPE_PRICE_VMS_LICENSE_{capacity}", f"price_vms_{capacity}")
+    return portal
+
+
+def test_diy_customer_buys_the_one_time_license_for_the_chosen_capacity(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    response = client.post("/api/customer/vms-license/checkout", json={"capacity": 16}, cookies=_cookie(*OWNER))
+    assert response.status_code == 200, response.text
+    fields = captured[-1]
+    assert fields["mode"] == "payment"  # one-time, never a subscription
+    assert fields["line_items[0][price]"] == "price_vms_16" and fields["line_items[0][quantity]"] == "1"
+    assert fields["metadata[anyaicam_product_class]"] == "vms_license"
+    assert fields["metadata[anyaicam_vms_license_capacity]"] == "16"
+    assert not any(key.startswith("subscription_data") for key in fields)
+    assert client.post("/api/customer/vms-license/checkout", json={"capacity": 12}, cookies=_cookie(*OWNER)).status_code == 400
+
+
+def test_appliance_customer_is_never_charged_for_the_license(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    _paid_appliance_order(db_path)
+    response = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
+    assert response.status_code == 409 and "appliance already includes" in response.json()["detail"]
+    assert captured == []
+
+
+def test_license_webhook_grants_capacity_without_adding_camera_slots(license_portal, db_path, monkeypatch):
+    _seed(db_path)
+    import customer_entitlements as ce
+    _stripe_maps(monkeypatch, ANYAICAM_STRIPE_PRICE_LOCAL_1_8="price_local_8")
+    monkeypatch.setattr(ce, "PRICE_ID_VMS_LICENSE_MAP", ce._load_vms_license_map())
+    event = {"id": "evt_lic", "type": "checkout.session.completed", "data": {"object": {
+        "id": "cs_lic", "customer": "cus_1", "mode": "payment", "payment_status": "paid",
+        "customer_details": {"email": "owner@example.test"},
+        "metadata": {"anyaicam_stripe_price_id": "price_vms_8", "anyaicam_customer_id": "cust-1"}}}}
+    assert ce.sync_entitlement_from_stripe_event(event)["status"] == "entitlement_updated"
+    assert ce.vms_license_capacity("cust-1") == 8
+    assert ce.total_camera_slots("cust-1") == 0  # a license is not camera slots
+    ce.upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
+    assert ce.total_camera_slots("cust-1") == 8  # never double-counted
+    client, captured, sent = license_portal
+    again = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
+    assert again.status_code == 409 and "already covers 8" in again.json()["detail"]
+
+
+def test_appliance_included_license_follows_the_plan_capacity(db_path):
+    _seed(db_path)
+    _paid_appliance_order(db_path)
+    import customer_entitlements as ce
+    assert ce.appliance_includes_vms_license("cust-1")
+    ce.upsert_entitlement(customer_id="cust-1", product="camera_slots_hybrid", camera_slot_quantity=32)
+    assert ce.vms_license_capacity("cust-1") == 32
+
+
+def test_an_unpaid_appliance_order_does_not_include_a_license(db_path):
+    _seed(db_path)
+    _paid_appliance_order(db_path, status="pending")
+    import customer_entitlements as ce
+    assert not ce.appliance_includes_vms_license("cust-1")
+
+
+def test_license_checkout_waits_for_a_pending_friends_family_decision(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER))
+    assert client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER)).status_code == 409
+    assert captured == []
+
+
+def test_plan_checkout_is_unaffected_by_the_license(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    assert _checkout_plan(client).status_code == 200
+    assert captured[-1]["mode"] == "subscription" and captured[-1]["line_items[0][price]"] == "price_local_8"
+
+
+def test_license_payment_earns_no_commission(ledger, db_path, monkeypatch):
+    sc = ledger
+    result = sc.sync_commissions_from_stripe_event({"id": "evt_lic", "type": "checkout.session.completed",
+                                                    "data": {"object": {"id": "cs_lic", "mode": "payment", "payment_status": "paid"}}})
+    assert result["status"] == "ignored" and _entries(sc) == []
+
+
+def test_my_subscription_offers_the_license_to_diy_and_shows_it_included_with_an_appliance(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    import customer_entitlements as ce
+    ce.upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=16)
+    diy = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
+    assert "Software license for 16 cameras" in diy and "$79.99 one-time" in diy and 'id="vms-license-buy"' in diy
+    _paid_appliance_order(db_path)
+    owner = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
+    assert "Included with your AnyAiCam appliance &middot; 16 cameras" in owner and 'id="vms-license-buy"' not in owner
+
+
+# ================================================================ Stripe object script (offline)
+
+def _load_price_script():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "tools" / "stripe_create_catalog_prices.py"
+    spec = importlib.util.spec_from_file_location("stripe_create_catalog_prices", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_price_script_creates_new_prices_at_catalog_amounts_and_one_time_licenses():
+    script = _load_price_script()
+    items = {i["env"]: i for i in script.catalog_prices()}
+    assert items["ANYAICAM_STRIPE_PRICE_HYBRID_33_64"]["amount"] == 9999 and items["ANYAICAM_STRIPE_PRICE_HYBRID_33_64"]["interval"] == "month"
+    assert items["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"]["amount"] == 19999 and items["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"]["interval"] is None
+    assert items["ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS"]["amount"] == 2499
+    assert "ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW" not in items  # no invented price
+    # lookup keys embed the amount, so a changed price always becomes a NEW Price object
+    assert all(str(i["amount"]) in i["lookup_key"] for i in items.values())
+    coupons = {c["env"]: c["percent_off"] for c in script.catalog_coupons()}
+    assert coupons == {"ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE": 50, "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS": 25}
+
+
+def test_price_script_refuses_live_keys(monkeypatch, capsys):
+    script = _load_price_script()
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_live_not_real")
+    monkeypatch.setattr("sys.argv", ["stripe_create_catalog_prices.py", "--apply"])
+    assert script.main() == 2
+    assert "TEST-mode" in capsys.readouterr().err

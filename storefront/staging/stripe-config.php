@@ -140,6 +140,12 @@ define('ANALYTICS_FACIAL_RECOGNITION_PRICE_ID', 'price_1UD3UuGllhK80H2nAdGKN4ff'
 // Advanced Analytics ($24.99 flat, 2026-09-30): no TEST Price ID exists yet --
 // empty means checkout-catalog.php rejects it (fail closed).
 define('ANALYTICS_ADVANCED_PRICE_ID', '');
+// One-time VMS software license (2026-09-30): no TEST Price IDs yet -- empty
+// means a DIY cart with a camera plan is refused (fail closed).
+define('VMS_LICENSE_8_PRICE_ID', '');
+define('VMS_LICENSE_16_PRICE_ID', '');
+define('VMS_LICENSE_32_PRICE_ID', '');
+define('VMS_LICENSE_64_PRICE_ID', '');
 
 // Env-overridable, same convention as STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET
 // above: the deployed storefront container sets ANYAICAM_STOREFRONT_BASE_URL

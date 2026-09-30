@@ -7654,6 +7654,12 @@ class AnalyticsAddonCheckoutModel(BaseModel):
     quantity: int = 1
 
 
+class VmsLicenseCheckoutModel(BaseModel):
+    # One-time AnyAiCam VMS software license for a DIY / customer-owned PC
+    # installation, sized to camera capacity (pricing_catalog.VMS_LICENSES).
+    capacity: int
+
+
 class StripeCheckoutCreateModel(BaseModel):
 
 
@@ -104189,6 +104195,31 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     from partner_db import rows as partner_rows
     held_addons = set(active_addon_keys(customer_id))
     _friends_family_panel = friends_family.customer_panel_html()
+    # One-time VMS software license (2026-09-30): included with an AnyAiCam
+    # appliance, bought once for a DIY / customer-owned PC installation.
+    from customer_entitlements import appliance_includes_vms_license, vms_license_capacity
+    _licensed = vms_license_capacity(customer_id)
+    _plan_capacity = int(camera_entitlement["camera_slot_quantity"] or 0) if camera_entitlement else 0
+    _license_offer = pricing_catalog.find_vms_license(_plan_capacity) if _plan_capacity else None
+    if appliance_includes_vms_license(customer_id):
+        _license_html = (f'<div class="health-row"><span>Included with your AnyAiCam appliance'
+                         f'{f" &middot; {_licensed} cameras" if _licensed else ""}</span><span class="pill">Included</span></div>')
+    elif _licensed:
+        _license_html = f'<div class="health-row"><span>Licensed for {_licensed} cameras (one-time purchase)</span><span class="pill">Active</span></div>'
+    elif _license_offer:
+        _price = f"${_license_offer['one_time_cents'] / 100:.2f} one-time"
+        if is_owner and _license_offer["stripe_price_id"]:
+            _action = f'<button class="ghost-button" id="vms-license-buy" data-capacity="{_license_offer["capacity"]}">Buy license</button>'
+        elif is_owner:
+            _action = '<span class="pending-badge" aria-disabled="true">Not available yet</span>'
+        else:
+            _action = '<span class="health-detail">Not purchased</span>'
+        _license_html = (f'<div class="health-row"><span>Software license for {_license_offer["capacity"]} cameras<br>'
+                         f'<span class="health-detail">{_price} &middot; for your own PC. Included free with an AnyAiCam appliance.</span></span>{_action}</div>')
+    else:
+        _license_html = '<p class="health-detail">Choose a camera plan first; the software license matches its camera capacity. It is included with every AnyAiCam appliance.</p>'
+    _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'
+                      f'{_license_html}<p id="vms-license-message" class="health-detail"></p></section>')
     site_count = max(1, len(partner_rows("SELECT id FROM sites WHERE customer_id=?", (customer_id,))))
 
     def _price_text(addon_key: str) -> str:
@@ -104270,6 +104301,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Included with every plan</h3>
     <div class="health-row"><span>{escape(", ".join(label for _, label in pricing_catalog.INCLUDED_FEATURES))}</span><span class="pill">Included</span></div>
     </section>
+    {_license_panel}
     {upgrade_panel}
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Add-ons</h3>
     {addon_rows}
@@ -104286,6 +104318,16 @@ def _customer_subscription_portal_page(identity: dict) -> str:
       try{response=await fetch('/api/customer/camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type:'hybrid',tier_label})});r=await response.json()}
       catch(error){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
       if(!response.ok){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
+      location.href=r.checkout_url
+    };
+    const vmsLicenseButton=document.getElementById('vms-license-buy');
+    if(vmsLicenseButton)vmsLicenseButton.onclick=async()=>{
+      vmsLicenseButton.disabled=true;vmsLicenseButton.textContent='Redirecting…';
+      const messageEl=document.getElementById('vms-license-message');messageEl.textContent='';
+      let response,r;
+      try{response=await fetch('/api/customer/vms-license/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({capacity:Number(vmsLicenseButton.dataset.capacity)})});r=await response.json()}
+      catch(error){vmsLicenseButton.disabled=false;vmsLicenseButton.textContent='Buy license';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+      if(!response.ok){vmsLicenseButton.disabled=false;vmsLicenseButton.textContent='Buy license';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
       location.href=r.checkout_url
     };
     document.querySelectorAll('.addon-buy-button').forEach(button=>{
@@ -113685,6 +113727,71 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
 
 
 
+
+
+@app.post("/api/customer/vms-license/checkout")
+def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Request) -> dict:
+    """One-time VMS software license (2026-09-30) for a customer-owned PC /
+    DIY installation: Stripe mode="payment", resolved server-side from
+    pricing_catalog, granted only by the verified webhook
+    (customer_entitlements -> product "vms_license"). An AnyAiCam appliance
+    already includes the license, so an appliance customer is refused here
+    rather than charged twice; a customer already licensed is refused too."""
+    from partner_portal import partner_identity as _authoritative_identity
+    identity = _authoritative_identity(request)
+    if not identity or identity.get("role") != "customer_owner" or not identity.get("customer_id"):
+        raise HTTPException(status_code=403, detail="Customer owner permission required.")
+    import pricing_catalog
+    import friends_family
+    from customer_entitlements import appliance_includes_vms_license, get_entitlements_for_customer
+    license_ = pricing_catalog.find_vms_license(payload.capacity)
+    if not license_:
+        raise HTTPException(status_code=400, detail="Unknown VMS license capacity.")
+    customer_id = identity["customer_id"]
+    if appliance_includes_vms_license(customer_id):
+        raise HTTPException(status_code=409, detail="Your AnyAiCam appliance already includes the VMS software license. There is nothing to pay.")
+    owned = max((int(e["camera_slot_quantity"] or 0) for e in get_entitlements_for_customer(customer_id)
+                 if e["product"] == pricing_catalog.VMS_LICENSE_PRODUCT and e["status"] == "active"), default=0)
+    if owned >= license_["capacity"]:
+        raise HTTPException(status_code=409, detail=f"Your VMS software license already covers {owned} cameras.")
+    if owned:
+        # Upgrade pricing between license sizes has not been decided.
+        raise HTTPException(status_code=409, detail="To move to a larger VMS software license, contact AnyAiCam support.")
+    if not license_["stripe_price_id"]:
+        raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {license_['price_env_var']}.")
+    if not PUBLIC_BASE_URL:
+        raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    try:
+        friends_family.checkout_discount(customer_id, "vms_license")
+    except friends_family.CheckoutHeld as held:
+        raise HTTPException(status_code=409, detail=str(held))
+    except RuntimeError as missing:
+        raise HTTPException(status_code=503, detail=str(missing))
+    price_id = license_["stripe_price_id"]
+    fields = [
+        ("mode", "payment"),
+        ("success_url", f"{PUBLIC_BASE_URL}/subscription-portal?vms_license_payment=success&session_id={{CHECKOUT_SESSION_ID}}"),
+        ("cancel_url", f"{PUBLIC_BASE_URL}/subscription-portal?vms_license_payment=cancelled"),
+        ("client_reference_id", customer_id),
+        ("line_items[0][price]", price_id),
+        ("line_items[0][quantity]", "1"),
+        ("metadata[anyaicam_stripe_price_id]", price_id),
+        ("metadata[anyaicam_customer_id]", customer_id),
+        ("metadata[anyaicam_product_class]", "vms_license"),
+        ("metadata[anyaicam_vms_license_capacity]", str(license_["capacity"])),
+    ]
+    friends_family.apply_to_checkout_fields(fields, customer_id, "vms_license")
+    if identity.get("email"):
+        fields.append(("customer_email", str(identity["email"])))
+    session = stripe_api_post("/v1/checkout/sessions", fields)
+    session_id = str(session.get("id") or "")
+    checkout_url = str(session.get("url") or "")
+    if not session_id or not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe did not return a Checkout Session URL.")
+    structured_log("stripe.vms_license_checkout_created", session_id=session_id, customer_id=customer_id,
+                   capacity=license_["capacity"])
+    return {"status": "complete", "session_id": session_id, "checkout_url": checkout_url,
+            "capacity": license_["capacity"], "billing_type": "one_time", "message": "Stripe Checkout Session created."}
 
 
 @app.post("/api/payments/hardware-checkout")

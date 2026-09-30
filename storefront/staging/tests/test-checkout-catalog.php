@@ -46,16 +46,14 @@ $hardwareCatalog = [
 
 check(count(CAMERA_PLAN_CATALOG) === 8, 'camera plan catalog has all 8 tiers (4 Local + 4 Hybrid)');
 check(count(ANALYTICS_CATALOG) === 5, 'analytics catalog is the 4 packages + Talk Down (2026-09-30 pricing)');
-$expectedPlanPrices = ['local_1_8' => 14.99, 'local_9_16' => 24.99, 'local_17_32' => 39.99, 'local_33_64' => 69.99,
-    'hybrid_1_8' => 24.99, 'hybrid_9_16' => 39.99, 'hybrid_17_32' => 69.99, 'hybrid_33_64' => 99.99];
-foreach ($expectedPlanPrices as $key => $price) {
-    check(abs(CAMERA_PLAN_CATALOG[$key]['display_price'] - $price) < 0.001, "{$key} shows the approved price {$price}");
+// Sandbox TEST amounts only -- retail lives in app/pricing_catalog.py and is
+// never mixed into this sandbox catalog.
+foreach (array_merge(CAMERA_PLAN_CATALOG, ANALYTICS_CATALOG, VMS_LICENSE_CATALOG) as $key => $entry) {
+    check($entry['display_price'] === null || $entry['display_price'] < 1.00, "{$key} shows a sandbox TEST amount, never a retail price");
 }
-$expectedPackagePrices = ['ai_essentials' => 7.99, 'ai_professional' => 14.99, 'vehicle_intelligence' => 14.99,
-    'advanced_analytics' => 24.99, 'talk_down' => 4.99];
-foreach ($expectedPackagePrices as $key => $price) {
-    check(abs(ANALYTICS_CATALOG[$key]['display_price'] - $price) < 0.001, "{$key} shows the approved price {$price}");
-}
+check(array_column(CAMERA_PLAN_CATALOG, 'capacity') === [8, 16, 32, 64, 8, 16, 32, 64], 'every plan carries its camera capacity');
+check(array_keys(VMS_LICENSE_CATALOG) === [8, 16, 32, 64], 'one VMS software license per capacity (8/16/32/64)');
+check(resolve_vms_license(8) === null, 'VMS license fails closed until its TEST Price ID exists');
 check(INCLUDED_FEATURES === ['Secure Edge', 'Smart Motion', 'AACO'], 'Secure Edge, Smart Motion and AACO are included, not sold');
 check(!isset(ANALYTICS_CATALOG['smart_motion']), 'Smart Motion is no longer sold separately');
 check(!isset(ANALYTICS_CATALOG['facial_recognition']) && !isset(ANALYTICS_CATALOG['cloud_overflow']), 'Face Access and Cloud Overflow are not sold here');
@@ -120,6 +118,8 @@ $validCart = normalize_cart([
 check($validCart['appliance_sku'] === 'AIC-APPLIANCE-RYZEN-STARTER', 'valid cart keeps the appliance selection');
 check($validCart['camera_plan']['key'] === 'local_1_8', 'valid cart keeps the camera plan selection');
 check(count($validCart['analytics']) === 3, 'valid cart keeps all 3 analytics selections');
+check($validCart['vms_license'] === null && $validCart['vms_license_included'] === true,
+    'with an AnyAiCam appliance the VMS software license is included, never charged');
 
 // One Local/Hybrid plan maximum -- the cart shape itself only ever
 // accepts a single 'camera_plan' string, never an array, so "Local AND
@@ -147,11 +147,17 @@ $hardwareOnlyCart = normalize_cart(['appliance_sku' => 'AIC-APPLIANCE-RYZEN-STAR
 $hardwareOnlyLegs = build_checkout_legs($hardwareOnlyCart, $hardwareCatalog);
 check(count($hardwareOnlyLegs) === 1 && $hardwareOnlyLegs[0]['mode'] === 'payment', 'hardware alone stays a single one-time leg');
 
-$localOnlyCart = normalize_cart(['camera_plan' => 'local_1_8'], $hardwareCatalog);
-check(count(build_checkout_legs($localOnlyCart, $hardwareCatalog)) === 1 && build_checkout_legs($localOnlyCart, $hardwareCatalog)[0]['mode'] === 'subscription', 'Local alone stays a single recurring leg');
+// DIY (customer-owned PC): a camera plan without an appliance needs the
+// one-time VMS software license, so it fails closed until that TEST Price
+// ID exists -- never silently sold without the license.
+check(throws(fn() => normalize_cart(['camera_plan' => 'local_1_8'], $hardwareCatalog)) !== null,
+    'a DIY plan-only cart is refused while the VMS license is unconfigured');
 
-$hybridOnlyCart = normalize_cart(['camera_plan' => 'hybrid_1_8'], $hardwareCatalog);
-check(build_checkout_legs($hybridOnlyCart, $hardwareCatalog)[0]['price_id'] === 'price_1UD31AGllhK80H2nMKtYEmVw', 'Hybrid alone resolves the correct recurring Price ID');
+$appliancePlanCart = normalize_cart(['appliance_sku' => 'AIC-APPLIANCE-RYZEN-STARTER', 'camera_plan' => 'hybrid_1_8'], $hardwareCatalog);
+$appliancePlanLegs = build_checkout_legs($appliancePlanCart, $hardwareCatalog);
+check(count($appliancePlanLegs) === 2, 'appliance + Hybrid = 2 legs, no separate license leg');
+check(!in_array('vms_license', array_column($appliancePlanLegs, 'kind'), true), 'no VMS license leg when an appliance is bought (no double charge)');
+check($appliancePlanLegs[1]['price_id'] === 'price_1UD31AGllhK80H2nMKtYEmVw', 'Hybrid resolves the correct recurring Price ID');
 
 $analyticsOnlyCart = normalize_cart(['analytics' => ['talk_down']], $hardwareCatalog);
 check(count(build_checkout_legs($analyticsOnlyCart, $hardwareCatalog)) === 1, 'one analytic alone stays a single recurring leg');
@@ -161,8 +167,8 @@ check(count(build_checkout_legs($analyticsOnlyCart, $hardwareCatalog)) === 1, 'o
 $summary = order_summary($legs);
 check(count($summary['one_time']['items']) === 2, 'summary separates the 2 one-time items (appliance + relay)');
 check(count($summary['monthly']['items']) === 4, 'summary separates the 4 monthly items (camera plan + 3 analytics)');
-check(abs($summary['one_time']['subtotal'] - 1.03) < 0.001, 'one-time subtotal is $0.50 + $0.53 = $1.03');
-check(abs($summary['monthly']['subtotal'] - (14.99 + 7.99 + 14.99 + 4.99)) < 0.001, 'monthly subtotal is $14.99 + $7.99 + $14.99 + $4.99 (Local 8 + AI Essentials + Vehicle Intelligence + Talk Down)');
+check(abs($summary['one_time']['subtotal'] - 1.03) < 0.001, 'one-time subtotal is $0.50 + $0.53 = $1.03 (license included with the appliance)');
+check(abs($summary['monthly']['subtotal'] - (0.60 + 0.85 + 0.87 + 0.84)) < 0.001, 'monthly subtotal is the sandbox $0.60 + $0.85 + $0.87 + $0.84 (Local 8 + AI Essentials + Vehicle Intelligence + Talk Down)');
 // Never combined into one misleading total: assert the two buckets are
 // genuinely separate keys, not summed into a single 'total' field.
 check(!array_key_exists('total', $summary), 'order summary never exposes a combined one-time+monthly total');

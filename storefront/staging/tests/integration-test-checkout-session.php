@@ -161,5 +161,8 @@ check($unknownResult['status'] >= 400, 'unknown analytics key fails closed (non-
 $unknownCameraResult = call_endpoint(['customer_email' => 'x@example.test', 'legs' => [['kind' => 'camera_plan', 'key' => 'local_1_9000']]]);
 check($unknownCameraResult['status'] >= 400, 'unknown camera plan key fails closed (non-200)');
 
+$licenseResult = call_endpoint(['customer_email' => 'x@example.test', 'legs' => [['kind' => 'vms_license', 'key' => '8']]]);
+check($licenseResult['status'] >= 400, 'VMS license leg fails closed until its TEST Price ID exists (non-200)');
+
 echo "\n" . ($failures === 0 ? "ALL PASSED" : "{$failures} FAILURE(S)") . "\n";
 exit($failures === 0 ? 0 : 1);

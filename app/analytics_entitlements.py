@@ -127,7 +127,10 @@ def aaco_product_status() -> dict:
         "key": "aaco",
         "label": "AACO",
         "sellable": False,
-        "reason": "Pricing, scope, and dependency on Face Access are not finalized -- business decision required before any catalog entry, Price ID, or checkout path is built.",
+        # 2026-09-30: AACO is included with every paid Local/Hybrid plan
+        # (pricing_catalog.INCLUDED_FEATURES) -- never sold on its own.
+        "included_with_plans": True,
+        "reason": "AACO is included with every paid Local and Hybrid plan; it is not sold separately.",
     }
 
 
