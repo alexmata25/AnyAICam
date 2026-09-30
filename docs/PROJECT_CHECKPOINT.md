@@ -5090,3 +5090,51 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 - The wizard's numbered tabs look clickable but have no handler. Customers can only move with Save and continue.
 - The approved F&F customer copy says "Hardware is not discounted" but does not mention that the VMS license and Face Access are also 0%. Face Access could read as "analytics".
 - A Face Access Small checkout for an account with no door-enabled cameras still starts with quantity 1 door.
+
+## 2026-09-30 night: Stripe return confirmation, setup tabs, Friends & Family copy, zero-door Face Access (deployed to staging)
+
+**Code**
+- Fix commit `b4f4e55` on `fix/stripe-ff-followups-20260930`, merged into golden as `eebeb9f`. The merge tree is identical to the deployed `b4f4e55`.
+- Deploy branch `push/staging-readiness-20260930` is at `b4f4e55`. `main` untouched (`d08282f`).
+
+**The four follow-ups from the previous staging E2E**
+1. **Payment confirmation.** `/customer/setup?camera_plan_payment=success|analytics_addon_payment=success` now shows a status panel.
+   - It calls the new read-only `GET /api/customer/setup/checkout-return?session_id=…`. That endpoint reads the Checkout Session from Stripe and refuses (404) a session that belongs to another customer.
+   - It reports "Payment received. Activating your … " and then "… is active." only once the verified webhook has granted the plan or add-on. An unpaid session is never called "received".
+   - The URL and the endpoint grant nothing.
+   - A cancelled checkout shows "Checkout cancelled. Nothing was charged."
+   - A **View billing** button opens the Review step.
+2. **Setup wizard tabs** now navigate (same saved-progress behavior as Save and continue), with `aria-current="step"`. They were buttons with no handler.
+3. **Approved Friends & Family message** is built from `pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF` (`friends_family.approved_message()`, also returned by `/api/customer/friends-family`). It reads: "Approved: 50% off your camera plan and 25% off analytics packages and Talk Down. Hardware, VMS software licenses and Face Access are not discounted."
+4. **Face Access with no door**
+   - `checkout_item` marks it unavailable with the reason: "billed per door; enable Face Access for a door camera first".
+   - The checkout route no longer rounds zero doors up to one (`max(1, …)` removed), so nothing is sent to Stripe.
+   - My subscription shows the reason, "No door cameras set up yet", and no Add button.
+   - The analytics webhook grants no per-door add-on without a paid door quantity (`anyaicam_quantity` ≥ 1 and `amount_total` > 0).
+   - The earlier test `test_face_access_gets_no_friends_family_discount` had bought Face Access with zero doors; it now sets up a door first.
+
+**Tests**
+- New `app/tests/test_stripe_ff_followups.py`: 19 tests. 14 fail on the pre-fix source; 5 are guards that pass on both.
+- Affected groups: 693 passed, 2 skipped.
+- Full regression on `b4f4e55` (10 memory-safe batches): **5,189 passed, 0 failed, 129 skipped**. The known intermittent Talk relay test passed this run.
+
+**Staging**
+- Blue/green cutover `portal-cb3b8d4` → `portal-b4f4e55`: `CUTOVER_COMPLETE`.
+- Rollback: `portal-cb3b8d4-pre-b4f4e55-20260930T221227Z-rollback`.
+
+**Browser validation on staging (real Chromium, desktop 1280×900 and phone 390×844, no page errors, no sideways scroll)**
+- Tabs 6 → 2 → 1 each show their own step with `aria-current`.
+- My subscription (0 doors) shows the per-door reason and no Face Access Add button.
+- The approved F&F tenant shows the new message.
+- One Local 8 TEST purchase on the E2E DIY tenant (card 4242):
+  - it returned signed in;
+  - the panel went "Confirming your payment with Stripe…" → "Payment received. Your Local 1-8 camera plan is active.";
+  - View billing opened Review showing "Local 1-8 · 8 licensed camera slots".
+  - The subscription was then cancelled and the charge refunded. The payment is `refunded`, the entitlement `cancelled`, and the $3.00 recurring commission `reversed` to $0.
+- No duplicate commission `source_ref`, active entitlements or active add-on subscriptions. 0 commission rows outside the test tenant. E2E sessions revoked.
+- Stripe stayed in TEST mode; no LIVE Price touched. Ryzen, Samsung, camera configuration, networking, Firebase and the production website were untouched.
+
+**Remaining customer-facing items seen (not changed)**
+- On phones, the floating assistant bubble covers the right edge of the setup wizard's "Save and continue" button.
+- An account with no active license shows "License attention: License status is inactive" at the top of setup until a plan is active.
+- The setup page's "Step 6/7 of 7 (Customer portion)" caption counts onboarding steps, not the wizard tabs, so it can disagree with the highlighted tab.
