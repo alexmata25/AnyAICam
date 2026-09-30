@@ -1163,6 +1163,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
   <p><strong>Call state:</strong> <span id="voice-call-state">{esc(event.get("state") or "triggered")}</span></p>
   <p class="health-detail">{esc(audio_status)}</p>
 </section>
+<style>.dialog-actions button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(1)}}.call-ended-note{{margin:0 auto 0 0}}</style>
 <section class="panel dialog-actions">
   <p id="voice-call-ended" class="call-ended-note" role="status"{'' if call_over else ' hidden'}><strong>Call ended.</strong></p>
   <button class="action-button" id="voice-call-answer" type="button"{' disabled' if call_over else ''}>Answer</button>
