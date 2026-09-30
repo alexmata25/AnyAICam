@@ -310,6 +310,11 @@ def render_aaco_floating_widget() -> str:
 /* Phones with the portal's bottom tab bar (<=760px): sit above the bar so
    the button never covers its last tab (2026-09-25). */
 @media (max-width:760px){{body:has(.mobile-nav) .aaco-float-root{{bottom:84px}}body:has(.mobile-nav) .aaco-float-panel{{bottom:146px;max-height:min(60vh,520px)}}}}
+/* Pages whose primary actions sit at the bottom right (e.g. the setup
+   wizard's "Save and continue") mark themselves data-aaco-dock="inline".
+   On phones the button then docks below the page content instead of
+   floating over those controls; AACO stays one tap away (2026-09-30). */
+@media (max-width:760px){{body:has([data-aaco-dock="inline"]) .aaco-float-root{{position:static;display:flex;justify-content:flex-end;padding:0 16px;margin:4px 0 100px}}}}
 </style>
 <div class="aaco-float-root">
 <div id="aaco-float-panel" class="aaco-float-panel" hidden>
