@@ -4538,3 +4538,61 @@ Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, 
 **Blocked:**
 - The Ryzen is offline since ~05:50 CDT (Tailscale offline; no ping or SSH), so there are no Live, Playback or security-line screenshots yet.
 - The AWS login expired, so there is no staging deploy of the portal fixes (the AACO screenshot shows the committed UI, applied in the capture browser).
+
+
+## 2026-09-29: shared VMS FCM push — code-only, ready for review
+
+Branch `feat/shared-vms-mobile-push`, based on authoritative `e3ee24e`.
+**No deployment, live push send, Firebase modification, Ryzen/Samsung access,
+website edit, pricing/Stripe/licensing change, or appliance/camera/network change.**
+
+Code commits:
+- `3b9f6e8bf9c0b19144656890ca283a54bfe14d8a` — shared VMS FCM outbox/provider,
+  authenticated device lifecycle, browser enrollment and regression tests.
+- `e5c468d7a00bfe1e8b9ba00be3a430201c1c9d7b` — real-app worker/config route access,
+  activation race, active customer-role checks, phone status and exact event-clip links.
+
+Previously there was only an unused shared push placeholder, a separate legacy
+pywebpush/VAPID path, and JSON mobile enrollments with no native delivery. Push now
+queues from the common customer notification engine for intrusion alarms, Visitor
+Calls, selected person/vehicle/analytics/LPR and relevant system/camera events.
+Email/SMS delivery and cooldown logic, media waits and `skipped_voice_call` are
+preserved. Push has separate cooldown history, per-device deduplication/leases,
+expiry, bounded retries, token invalidation and permission rechecks. Intrusion
+alarms bypass normal quiet hours/cooldown but respect authorization and enrollment.
+Urgent traffic has its own delivery lane. No camera or customer is hardcoded.
+
+FCM HTTP v1 handles Android, browser Web Push (public VAPID key), and native iOS
+through APNs. The owner's screenshots show Firebase project `any-ai-cam`, sender
+ID `208354453610`, a generated Web Push key pair and a registered web app. These
+public values were not applied to a runtime. Private VAPID material stays with
+Firebase; server ADC/workload identity or a securely mounted service-account file
+remains a separate configuration/review step. No private credentials requested.
+
+Verification:
+- **164 focused checks passed** on the final follow-up, including actual app
+  middleware, signed sessions/CSRF, new push tests, existing email/SMS/preferences,
+  JS syntax, phone access and email/event deep links. Real SDK 7.7.0 payload encoding
+  passed with network send mocked and no credentials loaded.
+- **Full core implementation suite: 4,887 passed / 87 failed / 128 skipped.**
+  Baseline: 4,819 passed / 101 failed / 127 skipped. Every final failed test ID was
+  also a baseline failure; no new failed IDs. Fourteen baseline failures did not
+  recur; this task does not claim to have fixed them. Full run used isolated TEMP/TMP.
+  The later browser/middleware/clip follow-up was checked in the focused suite.
+- Desktop 1440×900 and phone 390×844 Chromium smoke checks passed for unconfigured
+  state, enrollment, token refresh, disconnect and no silent re-enrollment; SDK and
+  all network responses mocked. This is not physical/live delivery validation.
+
+Review: `docs/shared-vms-push-notifications.md` (configuration, architecture,
+API/native-client contract, limitations and next step) and
+`docs/shared-vms-push-test-results.json` (exact failure-ID comparison).
+
+Remaining: separately authorized secure cloud sender configuration/deployment;
+actual browser/background/offline/token-lifecycle tests; native apps must integrate
+the documented device contract and Android channels; native iOS needs APNs setup.
+No native app source was found here. High-priority routing does not claim an Apple
+Critical Alerts entitlement or override of OS Focus/Do Not Disturb. No physical
+camera test or real phone notification delivery is marked complete.
+
+**Stop at review. Do not deploy to Ryzen, Samsung, staging/EC2 or production based
+on this checkpoint.**
