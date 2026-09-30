@@ -476,3 +476,60 @@ def test_push_tap_preserves_available_event_clip(client,fake_channels,kind):
     assert parsed.path=='/playback'
     assert parse_qs(parsed.query)['event']==['clip-event']
     assert parse_qs(parsed.query)['camera']==['cam-1']
+
+
+# ---------------------------------------------------------------- 2026-09-30 staging-readiness fixes
+
+@pytest.mark.parametrize('kind', ['person', 'intrusion_alarm'])
+def test_push_enqueue_failure_never_costs_in_app_email_or_sms(monkeypatch, fake_channels, kind):
+    """A push error used to roll back the whole notification transaction."""
+    seed(events=[kind], email=True)
+    def broken(db, notification_id):
+        db.execute("INSERT INTO mobile_push_outbox(id,notification_id,device_id,event_key,status,next_at,expires_at,created_at) VALUES('partial',?,'device-0','k','pending','','','')", (notification_id,))
+        raise RuntimeError('push table problem')
+    monkeypatch.setattr(push, 'enqueue', broken)
+    fanout(kind, 'evt-broken-push')
+    with connection() as db:
+        stored = db.execute("SELECT id FROM notifications WHERE event_id='evt-broken-push'").fetchall()
+    assert len(stored) == 1, 'the in-app notification must survive a push failure'
+    with connection() as db:
+        channels = {r['channel'] for r in db.execute('SELECT channel FROM notification_deliveries WHERE notification_id=?', (stored[0]['id'],)).fetchall()}
+    # Email is recorded exactly as without push: sent now, or held for the event
+    # picture (existing media-waiting behaviour for person events).
+    assert {'in_app', 'email'} <= channels, channels
+    if kind == 'intrusion_alarm':
+        assert len(fake_channels['email'].calls) == 1, 'an alarm email is sent immediately'
+    assert jobs() == [], 'partial push rows are rolled back with the savepoint'
+
+
+def test_notification_tap_opens_a_window_when_an_open_tab_refuses_navigation():
+    """Portal tabs are not controlled by the /mobile-push/ worker, so browsers
+    reject navigate(); the tap must still open the event."""
+    import subprocess
+    import shutil
+    from pathlib import Path
+    node = shutil.which('node')
+    if not node: pytest.skip('Node is not installed')
+    harness = r'''
+    const vm=require('vm'),fs=require('fs'),assert=require('assert');
+    async function run(navigateImpl){
+      let callback,opened=[],focused=0;
+      const tab={url:'https://portal.example/dashboard',navigate:navigateImpl,focus:async()=>{focused++}};
+      const self={location:{origin:'https://portal.example'},addEventListener:(n,fn)=>{if(n==='notificationclick')callback=fn}};
+      const ctx={self,URL,importScripts:()=>{},firebase:{initializeApp:()=>{},messaging:()=>{}},
+        fetch:async()=>({ok:true,json:async()=>({path:'/events?event=e1'})}),
+        clients:{matchAll:async()=>[tab],openWindow:async url=>{opened.push(url)}}};
+      vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),ctx);
+      let wait; callback({stopImmediatePropagation(){},notification:{close(){},data:{notification_id:'nid'}},waitUntil:p=>wait=p});
+      await wait; return {opened,focused};
+    }
+    (async()=>{
+      const refused=await run(async()=>{throw new TypeError('not controlled')});
+      assert.deepEqual(refused.opened,['https://portal.example/events?event=e1']);
+      const allowed=await run(async function(){return {focus:async()=>{}}});
+      assert.deepEqual(allowed.opened,[]);
+    })().catch(e=>{console.error(e);process.exit(1)});
+    '''
+    static = Path(__file__).parents[1]/'static'
+    done = subprocess.run([node,'-e',harness,str(static/'mobile-push-sw.js')],capture_output=True,text=True)
+    assert done.returncode == 0, done.stderr

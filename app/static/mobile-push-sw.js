@@ -34,7 +34,16 @@ self.addEventListener('notificationclick', event => {
     if (destination.origin !== self.location.origin) return;
     const windows = await clients.matchAll({type: 'window', includeUncontrolled: true});
     const existing = windows.find(w => new URL(w.url).origin === self.location.origin);
-    if (existing) { await existing.navigate(destination.href); return existing.focus(); }
+    // Portal tabs are not controlled by this /mobile-push/-scoped worker, and
+    // browsers reject navigate() on an uncontrolled client -- which used to
+    // make the tap do nothing whenever AnyAiCam was already open. Try it, and
+    // open the destination in a window when it is refused.
+    if (existing) {
+      try {
+        const navigated = await existing.navigate(destination.href);
+        if (navigated) return navigated.focus();
+      } catch (_) {}
+    }
     return clients.openWindow(destination.href);
   })());
 });
