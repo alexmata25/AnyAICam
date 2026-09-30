@@ -104276,7 +104276,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     # offered, billed per door; over 500 people is Enterprise (contact us).
     from analytics_entitlements import face_access_size_for_customer, door_count_for_customer
     face_size = face_access_size_for_customer(customer_id)
-    door_count = max(1, door_count_for_customer(customer_id))
+    door_count = door_count_for_customer(customer_id)
     face_access_held = any(key.startswith("face_access_") or key == "facial_recognition" for key in held_addons) or "facial_recognition" in active_analytics
     for addon_key, label, analytic_keys, env_var in ANALYTICS_CATALOG:
         price_id = os.environ.get(env_var, "").strip()
@@ -104295,6 +104295,9 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         quantity = site_count if item["unit"] == "per_site" else door_count if item["unit"] == "per_door" else 1
         if is_active:
             status_html = '<span class="pill">Active</span>'
+        elif price_id and not item["sellable"] and addon_key.startswith("face_access_") and item["unavailable_reason"]:
+            # Say what the customer needs to do (e.g. set up a door first).
+            status_html = f'<span class="health-detail" style="max-width:320px;text-align:right">{escape(item["unavailable_reason"])}</span>'
         elif not price_id or not item["sellable"]:
             # Catalog defines this SKU but its Stripe Price ID env var
             # isn't configured in this environment yet -- shown honestly
@@ -104315,7 +104318,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         if addon_key == "talk_down" and site_count > 1:
             details.append(f"{site_count} sites")
         if addon_key.startswith("face_access_"):
-            details.append(f"{door_count} door{'s' if door_count != 1 else ''}")
+            details.append(f"{door_count} door{'s' if door_count != 1 else ''}" if door_count else "No door cameras set up yet")
         includes_html = f'<br><span class="health-detail">{escape(" · ".join(details))}</span>' if details else ''
         addon_rows += f'<div class="health-row"><span>{escape(label)}{includes_html}</span>{status_html}</div>'
     if face_size == pricing_catalog.FACE_ACCESS_ENTERPRISE and not face_access_held:
@@ -113698,8 +113701,11 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
         quantity = max(1, min(int(payload.quantity or 1), 256))
     elif item["unit"] == "per_door":
         # Billed for every door the customer has set up, decided server-side.
-        from analytics_entitlements import door_count_for_customer
-        quantity = max(1, door_count_for_customer(identity["customer_id"]))
+        # Never rounded up: zero doors is refused, not billed as one.
+        from analytics_entitlements import door_count_for_customer, NO_DOORS_REASON
+        quantity = door_count_for_customer(identity["customer_id"])
+        if quantity < 1:
+            raise HTTPException(status_code=409, detail=NO_DOORS_REASON)
     price_id = os.environ.get(env_var, "").strip()
     if not price_id:
         raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {addon_key}.")

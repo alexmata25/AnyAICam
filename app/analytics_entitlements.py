@@ -220,6 +220,10 @@ def upsert_analytics_subscription(
     return row("SELECT * FROM analytics_subscriptions WHERE id=?", (subscription_id,))
 
 
+NO_DOORS_REASON = ("Face Access is billed per door. Turn on \"Enable Face Access for this camera\" in "
+                   "Camera Settings for at least one door camera, then add it here.")
+
+
 def checkout_item(addon_key: str, customer_id: Optional[str] = None) -> dict:
     """Whether this SKU can be bought right now, how it is counted and which
     Friends & Family discount class it belongs to -- all from
@@ -240,6 +244,9 @@ def checkout_item(addon_key: str, customer_id: Optional[str] = None) -> dict:
                 result.update(sellable=False, unavailable_reason="More than 500 enrolled people needs Face Access Enterprise pricing. Contact AnyAiCam.")
             elif size != tier["size"]:
                 result.update(sellable=False, unavailable_reason=f"Your account needs Face Access {size.title()} for the people enrolled.")
+            elif door_count_for_customer(customer_id) < 1:
+                # Billed per door: with no door set up there is nothing to bill.
+                result.update(sellable=False, unavailable_reason=NO_DOORS_REASON)
         return result
     return {"sellable": False, "unavailable_reason": "Face Access is now sold per door by size.",
             "unit": "per_account", "discount_class": "face_access"}
@@ -423,6 +430,11 @@ def _sync_checkout_completed(event: dict) -> dict:
     addon = resolve_addon(fields["price_id"])
     if not addon:
         return {"status": "ignored", "reason": "no verified analytics mapping for this stripe price id", "price_id": fields["price_id"]}
+    if checkout_item(addon["addon_key"])["unit"] == "per_door" and (
+            not _positive_int((session_obj.get("metadata") or {}).get("anyaicam_quantity"))
+            or ("amount_total" in session_obj and int(session_obj.get("amount_total") or 0) <= 0)):
+        # Billed per door: no paid door, no Face Access.
+        return {"status": "ignored", "reason": "per-door add-on without a paid door quantity", "addon_key": addon["addon_key"]}
 
     customer = None
     if fields["authoritative_customer_id"]:
