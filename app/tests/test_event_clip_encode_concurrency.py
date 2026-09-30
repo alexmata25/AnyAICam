@@ -247,9 +247,13 @@ def test_semaphore_releases_after_cancellation(monkeypatch, _isolated_clip_paths
             main.build_motion_event_clip("evt-release-cancel", 1, event_time, event_time)
         )
         # Let it get past the pre-roll wait / shortlist / acquire the
-        # semaphore and start "encoding" before cancelling mid-flight.
-        for _ in range(10):
-            await asyncio.sleep(0)
+        # semaphore and start "encoding" before cancelling mid-flight. Wait
+        # for that to actually happen (bounded) -- a fixed number of loop
+        # ticks was not always enough and made this test intermittent.
+        for _ in range(200):
+            if counter["active"] == 1:
+                break
+            await asyncio.sleep(0.01)
         assert counter["active"] == 1, "expected the encode to have started before cancellation"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
