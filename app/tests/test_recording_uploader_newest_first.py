@@ -40,6 +40,17 @@ from partner_db import initialize_database
 import recording_uploader as ru
 
 
+# AWS region for the uploader's S3 client constructor (2026-09-30): the
+# uploader refuses an empty region, so on a machine without AWS_REGION every
+# test here stopped before exercising the upload logic. The S3 client is faked;
+# no AWS call is made.
+@pytest.fixture(autouse=True)
+def _aws_region(monkeypatch):
+    import recording_uploader
+    if not recording_uploader.AWS_REGION:   # read once at import from AWS_REGION/AWS_DEFAULT_REGION
+        monkeypatch.setattr(recording_uploader, "AWS_REGION", "us-east-1")
+
+
 @pytest.fixture(autouse=True)
 def _reset_module_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ru, "RECORDINGS_FOLDER", tmp_path)
