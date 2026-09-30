@@ -230,3 +230,48 @@ Recommended next step: review the two code commits and this handoff, then separa
 authorize secure sender-identity configuration and a controlled cloud-only test
 release. Real browser/native-device validation follows that authorization. No
 Ryzen/Samsung release or other deployment is authorized by this completed task.
+
+## Staging status, 2026-09-30 (continued by Claude from Codex's branch)
+
+Review of Codex commits `3b9f6e8`, `e5c468d`, `a841a7e`: design confirmed; four gaps fixed on
+`push/staging-readiness-20260930`:
+
+- `dd91931` A push enqueue error rolled back the whole notification (in-app, email and SMS,
+  including INTRUSION ALARM). It now runs in a SAVEPOINT and is logged.
+- `dd91931` A notification tap did nothing when a portal tab was already open (navigate() is
+  rejected on a client the `/mobile-push/`-scoped worker does not control). It now falls back
+  to openWindow().
+- `b11dc22` `firebase-admin` was never installed in any image. It is now installed only with
+  `--build-arg ANYAICAM_INSTALL_PUSH=1` (cloud images). Edge appliance builds are unchanged,
+  and the wildcard COPY works with the installer payload, which has no requirements-push.txt.
+- `b11dc22` The staging cutover mounts `/etc/anyaicam-staging/firebase` read-only at
+  `/run/secrets/firebase`, only when that folder exists.
+
+Full suite on `6c1fb55` (push branch + golden `34658b8`): 4,912 passed, 87 failed. 86 are in the
+baseline; the other is the known timing flake `test_semaphore_releases_after_cancellation`
+(passes 2 of 3 alone).
+
+Staging configuration (`/etc/anyaicam-staging/vms-staging.env`, a backup before each change):
+- `ANYAICAM_FCM_PROJECT_ID`, `ANYAICAM_FIREBASE_WEB_CONFIG_JSON`,
+  `ANYAICAM_FIREBASE_WEB_VAPID_PUBLIC_KEY`: public values supplied by the owner.
+- `GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase/fcm-sender.json` (a path only).
+- `ANYAICAM_MOBILE_PUSH_BACKEND` is **not set: push is OFF**.
+
+Sender identity: dedicated service account `anyaicam-staging-fcm-sender@any-ai-cam.iam.gserviceaccount.com`
+with only the "Firebase Cloud Messaging API Admin" role. The key file was moved from the
+owner's PC through an SSM port-forwarding tunnel into a one-time loopback-only receiver. Its
+content was never printed, logged or stored in SSM command history; only size and SHA-256
+were compared (identical). On the host it is `root:root 0400` in a `0700` folder, mounted
+read-only. The owner's downloaded copy was overwritten and deleted after verification. An
+FCM `dry_run=True` topic send from the new image with the mounted credential succeeded:
+credential and send permission accepted, nothing delivered.
+
+Staging cutover to `6c1fb55` (not golden; golden is unchanged, so no appliance release
+contains push). EXIT=0, rollback `portal-34658b8-pre-6c1fb55-20260930T025219Z-rollback`,
+15/15 health checks passed, Ryzen talk channel reconnected. `/api/mobile/push/config` returns
+`available:false` with no config; the worker config returns 503. 0 devices, 0 outbox rows.
+
+Remaining: enable (`ANYAICAM_MOBILE_PUSH_BACKEND=fcm` plus a container recreate) only when the
+owner is ready for real-device tests. Then: enrollment, ordinary event / Visitor Call /
+INTRUSION ALARM delivery and priority, tap deep links, token refresh, disconnected device.
+Optional hardening: restrict the browser API key to the portal's HTTP referrers in Google Cloud.
