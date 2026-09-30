@@ -137,7 +137,7 @@ decoded in memory and discarded.
   `test_facial_recognition_ui.py::test_audit_log_never_contains_the_raw_uploaded_image_or_embedding`
   proves it dynamically against a real `audit_logs` row.
 - CSRF: new routes authenticate via the same `partner_portal` session cookie
-  (`SameSite=Strict`, `HttpOnly`) every other partner-portal-style route
+  (`SameSite=Lax` since 2026-09-30, `HttpOnly`, plus the double-submit CSRF token) every other partner-portal-style route
   already relies on. No existing CSRF behavior was changed or bypassed.
 - File paths: reference-image and thumbnail paths are always constructed
   from a fixed root plus internally-generated ids (`customer_id`/`person_id`/
