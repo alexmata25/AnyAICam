@@ -86,6 +86,10 @@ globalThis.clearTimeout = fakeClearTimeout;
 // parse is a faithful enough stand-in for these tests, which are about
 // the polling state machine built on top of it, not that parsing.
 globalThis.playbackDate = (timestamp) => new Date(timestamp);
+// Day-view globals the poll's render step reads (added with Playback's
+// per-day timeline): no specific day selected, so every event is shown.
+globalThis.viewingDate = null;
+globalThis.eventsForLocalDate = (events) => events;
 
 class FakeAbortController {
   constructor() {
