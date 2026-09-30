@@ -87,10 +87,14 @@ def establish_partner_session(destination: str, *, request: Request, email: str,
             ),
         )
     response = RedirectResponse(destination, status_code=303)
+    # Lax, not Strict: returning from Stripe Checkout (and clicking an email
+    # link) is a top-level navigation from another site, which Strict drops,
+    # sending the customer to sign-in. Lax still never rides a cross-site
+    # POST, and unsafe methods also need the double-submit CSRF token.
     response.set_cookie(
         SESSION_COOKIE,
         _token(email, role, user.get('partner_id') if user else None, user.get('customer_id') if user else None, session_id, session_ttl_hours),
-        httponly=True, samesite='strict', secure=settings.secure_cookies, max_age=session_ttl_hours * 3600, domain=settings.cookie_domain or None,
+        httponly=True, samesite='lax', secure=settings.secure_cookies, max_age=session_ttl_hours * 3600, domain=settings.cookie_domain or None,
     )
     return response
 

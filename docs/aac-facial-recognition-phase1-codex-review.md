@@ -91,7 +91,7 @@ prove it, not just assert it:
   matching pass for one customer's camera never sees another customer's
   enrolled embeddings (already covered in Phase 1; re-verified here).
 - **CSRF:** unchanged. AAC routes authenticate via the same
-  `partner_portal` session cookie (`SameSite=Strict`, `HttpOnly`) every
+  `partner_portal` session cookie (`SameSite=Lax` since 2026-09-30, `HttpOnly`, plus the double-submit CSRF token) every
   other partner-portal-style route already relies on for CSRF protection;
   no new CSRF-sensitive surface was added, and nothing about the existing
   mechanism was touched.
