@@ -41067,6 +41067,43 @@ REQUEST_CONTEXT: ContextVar[Request | None] = ContextVar(
 
 
 app = FastAPI(title="AnyAiCam VMS", lifespan=lifespan)
+
+
+# Friendly "not found" page for people (2026-09-30). A browser that followed an
+# old notification/email link or a mistyped address got raw JSON such as
+# {"detail":"Not Found"}. Only a browser page request -- a GET that accepts HTML,
+# outside /api/ and /static/ -- gets this page; the status stays 404, and API
+# calls and scripts keep their JSON errors exactly as before.
+from starlette.exceptions import HTTPException as _StarletteHTTPException
+from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
+
+
+def _wants_html_page(request: Request) -> bool:
+    path = request.url.path
+    return (request.method == "GET" and "text/html" in request.headers.get("accept", "")
+            and not path.startswith(("/api/", "/static/")))
+
+
+def _not_found_page(request: Request) -> str:
+    call = request.url.path.startswith("/aac/voice-call/")
+    heading = "This Voice Call is no longer available" if call else "Page not found"
+    detail = ("The call may have ended or been removed. Recent calls and alerts are in Alerts."
+              if call else "This page isn't available. The link may be out of date or mistyped.")
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="theme-color" content="#071032"><title>Not found · AnyAiCam</title><style>'
+            'body{margin:0;min-height:100vh;display:grid;place-items:center;background:#071032;color:#fff;font-family:Arial,sans-serif;padding:24px}'
+            '.card{max-width:520px;text-align:center;padding:32px;border-radius:20px;background:#111a3b}.card img{width:84px}'
+            '.card p{color:#d8e2ff;line-height:1.6}.card a{display:inline-block;margin:6px;padding:11px 18px;border-radius:999px;'
+            'background:#42e4dc;color:#04211f;font-weight:800;text-decoration:none}.card a.secondary{background:transparent;color:#fff;border:1px solid #5b6b8f}'
+            f'</style></head><body><main class="card"><img src="/static/icon-192.png" alt=""><h1>{heading}</h1><p>{detail}</p>'
+            '<a href="/customer-live">Go to your cameras</a><a class="secondary" href="/alerts">Alerts</a></main></body></html>')
+
+
+@app.exception_handler(_StarletteHTTPException)
+async def _friendly_not_found(request: Request, exc: _StarletteHTTPException):
+    if exc.status_code == 404 and _wants_html_page(request):
+        return HTMLResponse(_not_found_page(request), status_code=404)
+    return await _default_http_exception_handler(request, exc)
 # One-time secrets in query strings (password-reset tokens) never reach the
 # access log in plain text (2026-09-28). See access_log_redaction.py.
 import access_log_redaction

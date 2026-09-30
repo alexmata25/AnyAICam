@@ -709,3 +709,39 @@ def test_a_token_paused_browser_reconnects_on_its_next_visit_but_a_disconnected_
     import mobile_push_routes, inspect
     source = inspect.getsource(mobile_push_routes)
     assert "DELETE FROM mobile_push_devices WHERE id=?" in source
+
+
+# ---------------------------------------------------------------- lifecycle and deep-link gaps (2026-09-30)
+
+def test_visitor_call_tap_opens_that_call(client, fake_channels):
+    fanout('aac_voice_call', eid='call-event-1')
+    with connection() as db:
+        nid = db.execute("SELECT id FROM notifications WHERE event_type='aac_voice_call'").fetchone()[0]
+    response = client.get('/api/mobile/push/notifications/' + nid)
+    assert response.status_code == 200 and response.json()['path'] == '/aac/voice-call/call-event-1'
+
+
+def test_intrusion_alarm_tap_opens_live_view_of_that_camera(client, fake_channels):
+    fanout('intrusion_alarm', eid='alarm-7')
+    with connection() as db:
+        nid = db.execute("SELECT id FROM notifications WHERE event_type='intrusion_alarm'").fetchone()[0]
+    response = client.get('/api/mobile/push/notifications/' + nid)
+    assert response.status_code == 200 and response.json()['path'] == '/customer/cameras/cam-1/live?alarm=alarm-7'
+
+
+def test_disconnect_cancels_queued_pushes_for_that_device(client, fake_channels, monkeypatch):
+    did = client.put('/api/mobile/push/devices', json=enrollment()).json()['device']['id']
+    fanout('intrusion_alarm', eid='alarm-queued')
+    assert [j for j in jobs() if j['device_id'] == did], 'the alarm was queued for the device'
+    assert client.delete('/api/mobile/push/devices/' + did).status_code == 200
+    monkeypatch.setattr(provider, 'send', lambda *a, **k: pytest.fail('a disconnected device must never be sent to'))
+    push.drain(now=later())
+    assert [j for j in jobs() if j['device_id'] == did] == []
+
+
+def test_reenrolling_a_token_paused_device_turns_it_back_on(client):
+    did = client.put('/api/mobile/push/devices', json=enrollment()).json()['device']['id']
+    with connection() as db:
+        db.execute('UPDATE mobile_push_devices SET enabled=0 WHERE id=?', (did,))   # FCM said "unregistered"
+    again = client.put('/api/mobile/push/devices', json=enrollment('a-fresh-token-after-the-pause-1234'))
+    assert again.status_code == 200 and again.json()['device']['id'] == did and again.json()['device']['enabled'] == 1
