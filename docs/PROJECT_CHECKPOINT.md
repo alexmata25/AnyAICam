@@ -4570,3 +4570,14 @@ Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, 
 - Only DB change: `ALTER TABLE aac_voice_call_entrance_cameras ADD COLUMN greeting_volume TEXT` (additive; old code ignores it).
 - Behavior change: the talk-audio channel becomes on by default (the Ryzen does not set `ANYAICAM_TALK_AUDIO_ENABLED`).
 - Rollback: the installer tags the running image `anyaicam-vms:rollback-117593236a12` and takes a DB backup; restore with `sudo ./rollback.sh`.
+
+**Ryzen = `e3ee24e`, installed by the operator 2026-09-29 ~19:53 CDT (`install.sh --repair`).** Remote checks, read-only:
+- `/version` build `e3ee24e36653…`; container healthy, 0 restarts, 0 tracebacks; `app/main.py` matches the commit.
+- Rollback point: image `anyaicam-vms:rollback-117593236a12` and DB backup `recordings/partner_portal-pre-e3ee24e36653-20260930T005240Z.db`.
+- Settings kept: `ANYAICAM_ANALYTICS_SYNC_ENABLED`, `ANYAICAM_EVENT_MEDIA_UPLOAD_ENABLED`, LPR and talkback discovery are on.
+- The Talk channel connected on startup (`talk_audio_relay_client.channel_connected`); it was off in `1175932`.
+- Recording: cameras 1, 2, 3 and 5 writing, plus HLS, clips and media. Camera 4 (Bedroom) is offline, as known.
+- Events sync to the cloud (`analytics_synced accepted`).
+- Two real Voice Calls within 3 minutes of startup: `41dc80c85e` at 00:55:53Z and `dfba6a63ec` at 00:56:31Z. Each played the greeting through the camera speaker (20 chunks, success), and the cloud reached "notified".
+- Not yet confirmed: that the greeting sounds right at the new Medium level. Needs a person at the door.
+- `validate.sh` output not received.
