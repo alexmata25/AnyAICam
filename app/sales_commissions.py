@@ -297,7 +297,7 @@ def _reverse(entries: list[dict], *, fraction: float, reason: str) -> list[str]:
             # already-reduced one.
             remaining = int(round(int(entry["original_amount_cents"]) * (1 - fraction)))
             if fraction >= 0.999 or remaining <= 0:
-                db.execute("UPDATE commission_ledger SET status=?,reversed_at=?,reversal_reason=? WHERE id=?",
+                db.execute("UPDATE commission_ledger SET status=?,amount_cents=0,reversed_at=?,reversal_reason=? WHERE id=?",
                            (REVERSED, _now(), reason, entry["id"]))
             else:
                 db.execute("UPDATE commission_ledger SET amount_cents=?,reversal_reason=? WHERE id=?",
@@ -334,7 +334,8 @@ def _charge_reversed(event: dict, *, reason: str) -> dict:
     if payment:
         if fraction >= 0.999:
             with connection() as db:
-                db.execute("UPDATE subscription_payments SET status='refunded',refunded_at=? WHERE id=?", (_now(), payment["id"]))
+                db.execute("UPDATE subscription_payments SET status=?,refunded_at=? WHERE id=?",
+                           ("disputed" if reason == "dispute" else "refunded", _now(), payment["id"]))
         entries = rows("SELECT * FROM commission_ledger WHERE stripe_invoice_id=?", (payment["id"],))
         reversed_ids += _reverse(entries, fraction=fraction, reason=reason)
     if intent:

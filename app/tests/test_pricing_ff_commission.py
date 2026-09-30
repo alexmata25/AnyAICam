@@ -527,7 +527,7 @@ def test_refunds_and_disputes_reverse_the_commission_they_generated(ledger):
                                                                           "invoice": "in_2", "amount": 1499, "amount_refunded": 1499}}}
     sc.sync_commissions_from_stripe_event(full)
     month2 = next(e for e in _entries(sc, "recurring") if e["stripe_invoice_id"] == "in_2")
-    assert month2["status"] == "reversed"
+    assert month2["status"] == "reversed" and month2["amount_cents"] == 0 and month2["original_amount_cents"] == 300
     # A dispute on the first payment reverses its recurring AND activation commission.
     dispute = {"id": "evt_d", "type": "charge.dispute.created", "data": {"object": {"object": "dispute", "charge": "ch_in_1",
                                                                                  "payment_intent": "pi_in_1", "amount": 1499}}}
