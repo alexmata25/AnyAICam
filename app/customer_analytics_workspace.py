@@ -662,7 +662,11 @@ NAV_ASSETS = """<style>
   }
   const mToggle=document.querySelector('.mobile-analytics-toggle'),sheet=document.getElementById('mobile-analytics-sheet');
   if(mToggle&&sheet){
-    const setOpen=v=>{sheet.hidden=!v;mToggle.setAttribute('aria-expanded',v?'true':'false')};
+    // Sit just above the bottom bar, however tall it is (it wraps to two
+    // rows when there are more items than columns).
+    const place=()=>{const bar=document.querySelector('.mobile-nav');if(bar)sheet.style.bottom=Math.max(78,innerHeight-bar.getBoundingClientRect().top+8)+'px'};
+    const setOpen=v=>{if(v)place();sheet.hidden=!v;mToggle.setAttribute('aria-expanded',v?'true':'false')};
+    addEventListener('resize',()=>{if(!sheet.hidden)place()});
     mToggle.addEventListener('click',e=>{e.stopPropagation();setOpen(sheet.hidden)});
     document.addEventListener('click',e=>{if(!sheet.hidden&&!sheet.contains(e.target))setOpen(false)});
     document.addEventListener('keydown',e=>{if(e.key==='Escape')setOpen(false)});
