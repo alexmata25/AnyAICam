@@ -4711,3 +4711,65 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 7. INTRUSION ALARM push: arm Secure Edge, cross a security line → an immediate INTRUSION ALARM push; tap → Live view.
 8. iPhone Home Screen: open app.anyaicam.com in Safari → Share → Add to Home Screen → open it → Settings → Notifications → Enable → a test push.
 9. Tap deep links from a real notification (ordinary → Playback event; Visitor Call → call screen).
+
+## CHECKPOINT — 2026-09-30 (second overnight pass, owner at work)
+
+**Builds**
+- Golden = `7290f7c`: merge of `fix/overnight-readiness-20260930`; tree identical to the tested `0d3cdd8`.
+- **Staging** = `0d3cdd8`, push ON (staging only). Rollback `portal-ec14513-pre-0d3cdd8-20260930T054528Z-rollback`; 10/10 health; Ryzen Talk channel reconnected 05:46:01Z.
+- **Ryzen** = `e690f10` (unchanged tonight, healthy). **Release `7290f7c` is staged, NOT installed** (the installer needs the owner's sudo): `~/anyaicam-release-7290f7c`. Package sha256 `bb70b171…8536e` verified on the Ryzen; reproducible build (two builds, same hash); packaged files match the commit; 0 CRLF; no secrets; builder checks PASS. Install when home:
+  `ssh ryzen-tailscale` then `cd ~/anyaicam-release-7290f7c && sudo ./install.sh --repair && sudo ./validate.sh`.
+  The installer saves `e690f10` as `anyaicam-vms:rollback-e690f109c187` plus a DB backup; `rollback-e3ee24e36653` also remains.
+- **Samsung**: untouched.
+
+**Changed (all on staging)**
+- `73527d4` Live: an offline camera shows "Camera offline" (known from the appliance status), never a blank black tile; the video is revealed only once a real frame exists (grid + single camera).
+- `be55b2b` Service worker: this caused the Ctrl+Shift+R problem (cache-first /static/ under a never-changing cache name, and every request routed through the worker). Now: a per-build cache, /static/ network-first, nothing else intercepted.
+- `6fe5ecd` Playback timeline: the camera name wraps with the date on a second line (was clipped).
+- `e15e119` Mobile bar: Investigate. `02775e2` Security (Secure Edge) in the customer sidebar and mobile bar (Cameras, Security, Alerts, [Analytics], Playback, Investigate, Account); the Security page highlights its tab.
+- `2f85de0`, `a1af50e`, `3f9feab` **AACO settings, first release** (Settings → AACO assistant, `/customer/aaco-settings`):
+  - Use AACO, show the floating button, allowed cameras (all / selected), live, recordings & events, talk, door actions.
+  - **Door actions are OFF by default**; turning them on needs an owner confirmation; unlocks still need the person's own door permission.
+  - Owner-only changes, validated and audited; viewers read-only.
+  - Enforced between understanding and execution: free-form parsing unchanged (tested). Disallowed cameras fail closed at authorized_camera(); searches, status, free-form names and doors are filtered.
+  - Additive migration `20260930_aaco_customer_settings`.
+- `4d11bcd` Push: a browser paused by an FCM "unregistered" token reconnects on its next Notifications visit (the phone was paused this way at 05:05Z). Disconnect still deletes it; the list says "Needs reconnect".
+- `ec14513`, `0d3cdd8` Dashboard: no sideways scrolling on phones (AI summary column, 24-bar chart).
+- `5cad799` Installer test: a wildcard Dockerfile COPY is checked the way Docker applies it (the real builds were never affected).
+
+**Tests**
+- Final full suite on `0d3cdd8`: **4,962 passed, 86 failed, 128 skipped; all 86 in the baseline, 0 new**.
+- Installer 32/32. Focused: AACO 302 + settings 15, push 77, live/black-tile 12, navigation 236, website 302, service worker 2.
+- Readiness sweep (19 customer pages × desktop + phone on staging): clean. The only flag is the owner's own phone name "samsung" on Mobile devices, which is correct data.
+
+**Push on staging overnight**: 43 events grouped into visits, 10 sent, 0 stuck, 0 push errors. The phone enrollment `7d406f1e` is paused (token unregistered 05:05Z).
+
+**Pricing / catalog / checkout: remaining (owner decisions; nothing changed)**
+- Stripe is test mode only (`sk_test_`); `app.anyaicam.com` is the staging stack; no production payment environment exists.
+- Configured on staging: storage tiers Local/Hybrid × 1–8/9–16/17–32/33–64, analytics add-ons, 3 appliances, the Numato relay.
+- **Advanced Analytics** (Smart Motion + People Counting + LPR + PPE bundle) needs `ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS`, which is unset → not purchasable. Staging instead has 4 per-analytic price IDs (SMART_MOTION, PEOPLE_COUNTING, LPR, PPE) that the current catalog no longer uses. Decide: bundle price vs per-analytic catalog.
+- Legacy plan prices STARTER/PROFESSIONAL/ENTERPRISE are unset → the admin readiness check "Stripe product prices configured" fails. Decide whether to retire those checks or those plans.
+- AACO: deliberately not sellable (pricing, scope and the Face Access dependency are undecided).
+- Website appliance names (Ryzen 7 255 VMS Edge / AI Access Edge) vs Partner Portal (AnyAiCam Starter/Professional/Enterprise); camera lines (LTS vs Vivotek/MokerLink) not in the Partner Portal. From 2026-09-29, still open.
+
+**Installer audit**: no hard-coded IPs or camera counts; Samsung/Ryzen appear only in comments; 32/32 tests. Nothing else found.
+
+**Known, not changed**
+- Edge push "permission denied" in the owner's Edge profile (works in a clean profile).
+- PC Chrome shows no pushes although FCM accepts them (needs `chrome://gcm-internals`).
+- The Talk relay test `test_no_appliance_channel_uses_local_isapi_fallback` is a load-timing race in the test.
+- The Playback main player is blank until a timeline point is chosen (UX).
+
+**Physical tests when home, in order**
+1. Ryzen install (command above), then tell Claude to validate.
+2. Phone: open Settings → Notifications (it now reconnects itself; tap Enable if needed).
+3. PC push: `chrome://gcm-internals` → Start Recording → ask for a test push.
+4. Driveway walk → expect 1 push (at most 2).
+5. Front Door walk-up → an immediate Visitor Call push; tap → the call screen.
+6. Voice Call: Answer, 🎤 talk, End call → the voice stops, "Call ended.", greyed buttons.
+7. Live View Talk on Living Room.
+8. Greeting volume at the door.
+9. Secure Edge: arm, cross a line → INTRUSION ALARM push; tap → Live.
+10. LPR drive-by.
+11. iPhone: Safari → Add to Home Screen → Notifications → Enable → test push.
+12. Portal look-over: Bedroom tile says "Camera offline"; no Ctrl+Shift+R needed after an update; Security/Investigate tabs; AACO settings.
