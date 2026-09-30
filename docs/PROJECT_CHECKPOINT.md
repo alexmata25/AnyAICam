@@ -4893,3 +4893,127 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 8. Not validated here: PostgreSQL runtime for the new tables, native apps, Firebase browser-key referrer restriction.
 
 **Physical test addition:** in step 10 (portal look-over), also open Playback on a camera with Line Crossing rules and confirm the pink markers and legend entry.
+
+## 2026-09-30 evening: approved pricing, VMS license, Friends & Family and commission ledger (merged, not deployed)
+
+**Branch and state**
+- Working branch `feature/pricing-ff-commission-20260930`, started from golden `a28e893`.
+- Commits:
+  - `978a20e` catalog, Friends & Family, commission ledger;
+  - `eb02943` one-time VMS license, sandbox prices kept separate;
+  - `cb50fa2` My subscription copy fixes;
+  - `2053843` Stripe price guard;
+  - `a1a4493` Face Access sizes.
+- Merged into golden as `75a15c2`.
+- **Not deployed anywhere.** The AWS CLI session on the Dell expired (`aws login` required), so staging was not reached. Deployment waits for AWS access (owner instruction).
+- Ryzen, Samsung and GitHub `main` were not touched. No Stripe object was created or changed.
+
+**One source of truth: `app/pricing_catalog.py`**
+
+| Item | Price | Notes |
+|---|---|---|
+| Local 8 / 16 / 32 / 64 | $14.99 / $24.99 / $39.99 / $69.99 per month | camera counts are licensing tiers only |
+| Hybrid 8 / 16 / 32 / 64 | $24.99 / $39.99 / $69.99 / $99.99 per month | |
+| VMS software license 8 / 16 / 32 / 64 | $49.99 / $79.99 / $129.99 / $199.99 one-time | separate line item; included with an AnyAiCam appliance (never charged twice); charged once for a DIY / customer-owned PC |
+| Included in every plan | Secure Edge, Smart Motion, AACO | never charged |
+| AI Essentials | $7.99 per month | People Counting |
+| AI Professional | $14.99 per month | People Counting + PPE |
+| Vehicle Intelligence | $14.99 per month | LPR |
+| Advanced Analytics | $24.99 per month, flat | People Counting + LPR + PPE; never per camera, not the sum of the packages |
+| Talk Down | $4.99 per month per site | includes AAC Voice Call (both entitlements) |
+| Face Access Small / Medium / Large | $39.99 / $49.99 / $69.99 per door per month | up to 25 / 26–100 / 101–500 enrolled people; over 500 is Enterprise (custom, "Contact us") |
+| Cloud Overflow | no price | unconfigured and unsellable until the owner sets a price |
+| Hardware | $1,249.99 / $1,749.99 / $2,249.99 | unchanged, in `hardware_orders.HARDWARE_CATALOG` |
+
+- `customer_entitlements.PLAN_TIERS` and `analytics_entitlements.ANALYTICS_CATALOG` are derived from the catalog. Local is monthly again (it had been one-time since 2026-09-21).
+- Legacy Videoloft per-camera pricing (`pricing_config.py`) is untouched.
+- Public, customer-safe price list: `GET /api/pricing/catalog` (no Stripe IDs, no commission data).
+
+**Entitlements (recorded as implemented)**
+- Packages cover every camera on the account.
+  - Before this change, Stripe-granted package rows had `licensed_quantity=1`, so a site got a package analytic on only one camera.
+  - Smart Motion is licensed on every camera for any customer with an active paid plan.
+- `addon_subscriptions` records which packages a customer holds, so cancelling one overlapping package never switches off a shared feature.
+- Existing grants are never removed. Old Advanced purchases keep Smart Motion and are recognised by their exact old shape.
+- The VMS license is a `customer_entitlements` row with product `vms_license`.
+  - It is excluded from `total_camera_slots()`, so slots are never doubled.
+  - An appliance customer's included license follows their current plan's capacity.
+- Face Access is offered only in the size matching the customer's active enrolled people. Checkout refuses any other size. The door quantity is every door-enabled camera, decided server-side.
+- **Enforcement deliberately not added** (next controlled pass, so currently working VMS behavior doesn't change):
+  - Talk Down and Voice Call are granted with Talk Down but not gated;
+  - the VMS license is recorded but not enforced by the VMS.
+
+**Friends & Family (never a promo code)**
+1. The customer requests it from My subscription or the setup review.
+2. The request is stored as pending. Plan, analytics, Face Access and license checkout is held (409) while it is pending.
+3. The administrator (`ANYAICAM_FRIENDS_FAMILY_ADMIN_EMAIL`, default `amata@anyaicam.com`) is emailed a Review Request link.
+4. Opening the review page changes nothing. Approve or Decline is a separate POST that needs a live global administrator grant.
+5. Approved: 50% off base plans and 25% off analytics packages and Talk Down, applied as server-side Stripe coupons (`ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE` / `_ANALYTICS`).
+   - Promotion codes are switched off on those sessions, so discounts never stack.
+   - 0% on hardware, the VMS license and Face Access (owner: "0% for now").
+   - If the coupon is missing, checkout is refused (503) rather than charging full price.
+- Admin list: `/admin/friends-family` (linked for global administrators in the Partner Portal).
+
+**Commission ledger (`sales_commissions.py`, a Stripe webhook step)**
+- Activation: $40 / $60 / $90 / $125 for 8 / 16 / 32 / 64, once per customer, on the first paid plan invoice.
+- Recurring: 20% of the amount actually collected (tax excluded), for the customer's first 12 paid plan months.
+  - Nothing is paid ahead; a cancellation stops future commission.
+  - Failed or unpaid invoices earn nothing.
+- Hardware: $50 / $75 / $100 for the three appliances; $0 for the relay or no appliance.
+- DIY VMS license sales: $0 commission (owner: "$0 for now").
+- Friends & Family approved: every commission is $0, but the row is kept (status `not_eligible_friends_family`) for attribution.
+- Refunds (proportional, cumulative) and disputes reverse the commission that payment generated.
+- Worked example: Local 8 + Starter appliance, 12 paid months = $40 + $50 + $36.00 = $126.00. The recurring part is 12 × 20% of $14.99, rounded per payment.
+- Attribution comes from `sales_attributions` (set with `POST /api/admin/sales-attribution`), or else from the salesperson who created the customer.
+- Visibility: `GET /api/sales/commissions` (salesperson: own; partner owner: company; global administrator: all) and an "Earned commissions" table on `/partner-revenue`.
+
+**Stripe**
+- The webhook remains payment-authoritative; the success page grants nothing (tested).
+- New guard: before any plan, add-on or license Checkout Session, the Stripe Price is fetched and must match the catalog amount and billing mode. Otherwise checkout is paused with 503 `PRICE_MISMATCH` instead of charging the wrong amount.
+- `tools/stripe_create_catalog_prices.py` creates **new** test-mode Prices and the two coupons.
+  - It is idempotent: lookup keys include the amount, so existing immutable Prices are never modified.
+  - It refuses live keys, never prints the secret, and prints `ENV=value` lines.
+  - **Not run yet** (needs staging access).
+
+**Storefront (store-staging, Stripe TEST sandbox)**
+- Keeps its penny/$0.50 test amounts; retail prices live only in the catalog.
+- Restructured to the packages plus Talk Down.
+- A DIY cart gets the VMS license leg; an appliance cart shows the license as included.
+- Advanced Analytics and license test Price IDs are empty, so they fail closed.
+- Top-level review pages (`storefront/vms.html`, `build-your-system.html`) show the approved retail plan prices.
+- The storefront PHP tests were updated but **not run** (no PHP on the Dell; staging unreachable).
+
+**Tests and results**
+- New `app/tests/test_pricing_ff_commission.py`: 97 tests covering catalog, entitlements, Friends & Family, commissions, VMS license, Face Access sizing, Stripe authority and the price guard.
+- Existing tests updated to the approved pricing.
+- **Full regression on final commit `a1a4493`: 5,160 passed, 0 failed, 129 skipped** (10 memory-safe batches, one per call). Installer: 35 passed, 2 skipped.
+- Known pre-existing intermittent test: `test_talk_audio_relay.py::test_no_appliance_channel_uses_local_isapi_fallback`.
+  - It fails about 2 in 10 on golden as well.
+  - The test client tears the socket handler down before its cleanup `stop()` runs.
+  - It is a test-harness issue, not a product defect.
+- Local browser check (real Chromium against the app, temporary database, desktop and phone, no page errors, no sideways scroll):
+  - My subscription shows catalog prices, included features and the license section.
+  - Request → pending → admin email → review page → Approve → the customer sees Approved.
+  - Buy license goes to Stripe checkout.
+
+**Conflicts found (reported, not changed)**
+1. The eight previously created live Price IDs are at the old amounts. Only Local 8 ($14.99 monthly) matches the approved pricing.
+2. Staging's configured test Price IDs are also at earlier amounts. The price guard pauses those checkouts until new Prices are configured.
+3. Appliance names differ: Starter / Professional / Enterprise in the code vs Ryzen 7 Starter / Ryzen AI 9 Professional / Ryzen AI 9 X1 Pro. Prices agree.
+4. The storefront sandbox and the portal use Price IDs from two different Stripe accounts.
+
+**Owner decisions recorded 2026-09-30**
+- Face Access thresholds as above.
+- Friends & Family 0% on the VMS license and Face Access.
+- License-size upgrades: contact support.
+- DIY license commission: $0.
+- Cloud Overflow: unsellable until priced.
+- No new Talk Down, Voice Call or license enforcement in this pass.
+
+**Still open:** Cloud Overflow price; Talk Down / Voice Call and VMS license enforcement (next controlled pass).
+
+**Before deploying to staging (once AWS access is restored)**
+1. `aws login` on the Dell.
+2. Run `tools/stripe_create_catalog_prices.py --apply` in the portal container. Set the printed `ANYAICAM_STRIPE_PRICE_*` / `ANYAICAM_STRIPE_COUPON_*` values in the staging environment.
+3. Subscribe the staging webhook endpoint to `invoice.paid`, `charge.refunded` and `charge.dispute.created` (the commission ledger needs them).
+4. Deploy through the normal blue/green cutover, run the storefront PHP tests in a PHP container, and repeat the browser check on staging.
