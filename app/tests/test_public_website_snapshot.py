@@ -156,3 +156,13 @@ def test_vms_footer_pages_use_the_styled_site_footer():
         assert 'class="stage-footer"' not in text, path.name
         if "aic-unified-footer" in text:
             assert ".aic-unified-footer" in text or "vms-product.css" in text, path.name
+
+
+def test_vms_page_shows_live_and_playback_screenshots():
+    text = (SITE / "vms.html").read_text(encoding="utf-8", errors="replace")
+    for name in ("vms-live-camera.webp", "vms-playback-timeline.webp"):
+        tag = re.search(r'<img src="app-screens/' + re.escape(name) + r'"[^>]*>', text)
+        assert tag, name
+        assert re.search(r'alt="[^"]{20,}"', tag.group(0)) and 'width="1600"' in tag.group(0), name
+        assert (SITE / "app-screens" / name).stat().st_size < 400_000, name
+    assert ".app-shot-pair" in text
