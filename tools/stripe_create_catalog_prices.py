@@ -49,7 +49,22 @@ def catalog_prices() -> list[dict]:
     for lic in pc.vms_licenses():
         items.append({"env": lic["price_env_var"], "lookup_key": f"anyaicam_vms_license_{lic['capacity']}_{lic['one_time_cents']}",
                       "name": lic["label"], "amount": lic["one_time_cents"], "interval": None})
+    items.extend(catalog_hardware())
     return items
+
+
+def catalog_hardware() -> list[dict]:
+    """One-time hardware Prices at the approved amounts already in
+    hardware_orders.HARDWARE_CATALOG (read, never retyped). Hardware is not
+    in pricing_catalog; if that module can't be imported here, hardware is
+    skipped rather than guessed."""
+    try:
+        from hardware_orders import HARDWARE_CATALOG
+    except Exception:
+        return []
+    return [{"env": env_var, "lookup_key": f"anyaicam_hw_{sku.lower().replace('-', '_')}_{cents}",
+             "name": name, "amount": cents, "interval": None}
+            for sku, _product, name, cents, env_var in HARDWARE_CATALOG]
 
 
 def catalog_coupons() -> list[dict]:
