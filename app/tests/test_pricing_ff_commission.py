@@ -793,6 +793,8 @@ def test_price_script_creates_new_prices_at_catalog_amounts_and_one_time_license
     assert items["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"]["amount"] == 19999 and items["ANYAICAM_STRIPE_PRICE_VMS_LICENSE_64"]["interval"] is None
     assert items["ANYAICAM_STRIPE_PRICE_ADVANCED_ANALYTICS"]["amount"] == 2499
     assert "ANYAICAM_STRIPE_PRICE_ANALYTICS_CLOUD_OVERFLOW" not in items  # no invented price
+    assert items["ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"]["amount"] == 124999 and items["ANYAICAM_STRIPE_PRICE_RYZEN_STARTER"]["interval"] is None
+    assert items["ANYAICAM_STRIPE_PRICE_RELAY_NUMATO_3CH"]["amount"] == 14999
     # lookup keys embed the amount, so a changed price always becomes a NEW Price object
     assert all(str(i["amount"]) in i["lookup_key"] for i in items.values())
     coupons = {c["env"]: c["percent_off"] for c in script.catalog_coupons()}
