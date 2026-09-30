@@ -33,7 +33,7 @@ def test_no_deep_link_selects_the_most_recent_clip_without_autoplay(monkeypatch)
     monkeypatch.setattr(main, "_customer_detection_events", lambda request: [])
     html = main._render_customer_playback([{"id": "cam-1", "name": "Front Door", "camera_number": 1}], _fake_request())
     i = html.index("if(seekTimestamp){")
-    j = html.index("filterButtons.forEach", i)
+    j = html.index("timelinePlayButton.addEventListener('click'", i)  # filterButtons no longer follows this branch
     branch = html[i:j]
     assert "}else if(clips.length){" in branch
     assert "selectedClip=clips[clips.length-1];" in branch  # newest; clips is oldest-first
