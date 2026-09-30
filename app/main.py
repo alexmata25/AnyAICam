@@ -143949,6 +143949,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '.legend-dot.event-lpr{background:#3dbfae}'
         '.legend-dot.event-people_counting{background:#4dcf7a}'
         '.legend-dot.event-intrusion{background:#f0954d}'
+        '.legend-dot.event-line_crossing{background:#e0507a}'
         '.event-segment{cursor:pointer}'
         # Playhead: a thin vertical indicator overlaid on the same
         # position:relative lane the recording bars already draw into
@@ -144116,6 +144117,7 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
         '<span><i class="legend-dot event-lpr"></i>License plate</span>'
         '<span><i class="legend-dot event-people_counting"></i>People count</span>'
         '<span><i class="legend-dot event-intrusion"></i>Intrusion</span>'
+        '<span><i class="legend-dot event-line_crossing"></i>Line crossing</span>'
         '<span><i class="legend-dot" style="background:#e8eef6"></i>Recording</span>'
         '</div>'
         '</section>'
@@ -144676,7 +144678,10 @@ def _render_customer_playback(cameras: list[dict], request: Request) -> str:
     return closest;
   }}
 
-  let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion']);
+  // line_crossing included (2026-09-30): filterCategory() gives it its own
+  // category, and with no filter buttons left every category must show --
+  // without it Line Crossing markers were silently dropped from the timeline.
+  let activeFilters=new Set(['motion','person','vehicle','lpr','people_counting','intrusion','line_crossing']);
 
   // P0 #5 remediation round 2 (2026-09-05, Codex second review) --
   // two further gaps in round 1's design: (1) MOBILE_EVENT_FETCH_

@@ -160,7 +160,7 @@ def test_exact_timeline_seek_lands_in_the_correct_segment_and_offset(monkeypatch
 def test_stale_ended_event_cannot_hijack_a_newer_manual_selection(monkeypatch):
     html = _render(monkeypatch)
     idx = html.index("function playClip(cameraId,clip,options){")
-    block = html[idx: idx + 1000]
+    block = html[idx: html.index(chr(10) + "  }", idx)]  # whole function; it grew explanatory comments
     assert "selectedClip=clip;" in block
     assert "video.pause();" in block
     assert "video.src=url;" in block
