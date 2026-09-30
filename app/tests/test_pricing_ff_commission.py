@@ -254,7 +254,7 @@ def test_old_advanced_purchases_keep_everything_they_had(db_path, monkeypatch):
 # ================================================================ portal + Friends & Family
 
 @pytest.fixture()
-def portal(db_path, tmp_path, monkeypatch):
+def portal(db_path, tmp_path, monkeypatch, fake_stripe_prices):
     import main
     monkeypatch.setattr(main, "USERS_FILE", tmp_path / "users.json")
     monkeypatch.setattr(main, "SESSIONS_FILE", tmp_path / "sessions.json")
@@ -806,3 +806,33 @@ def test_price_script_refuses_live_keys(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["stripe_create_catalog_prices.py", "--apply"])
     assert script.main() == 2
     assert "TEST-mode" in capsys.readouterr().err
+
+
+# ================================================================ Stripe price guard
+
+def test_checkout_refuses_a_stripe_price_that_does_not_match_the_catalog(portal, db_path, fake_stripe_prices):
+    """A Price ID left over from earlier pricing (Stripe amounts are
+    immutable) must never charge a customer something other than what
+    they were shown."""
+    client, captured, sent = portal
+    _seed(db_path)
+    fake_stripe_prices["price_local_8"] = {"id": "price_local_8", "unit_amount": 1499, "currency": "usd", "active": True,
+                                           "recurring": {"interval": "month"}}
+    assert _checkout_plan(client).status_code == 200  # matches: $14.99 monthly
+    import main
+    main._VERIFIED_STRIPE_PRICES.clear()
+    fake_stripe_prices["price_local_8"]["unit_amount"] = 60  # an old sandbox amount
+    captured.clear()
+    response = _checkout_plan(client)
+    assert response.status_code == 503 and "PRICE_MISMATCH" in response.json()["detail"]
+    assert captured == []
+
+
+def test_checkout_refuses_a_one_time_price_for_a_monthly_item(license_portal, db_path, fake_stripe_prices):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    fake_stripe_prices["price_vms_8"] = {"id": "price_vms_8", "unit_amount": 4999, "currency": "usd", "active": True,
+                                         "recurring": {"interval": "month"}}  # wrong: the license is one-time
+    response = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
+    assert response.status_code == 503 and "PRICE_MISMATCH" in response.json()["detail"]
+    assert captured == []

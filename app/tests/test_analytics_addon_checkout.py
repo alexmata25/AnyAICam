@@ -34,7 +34,7 @@ def db_path(tmp_path):
 
 
 @pytest.fixture()
-def client(db_path, tmp_path, monkeypatch):
+def client(db_path, tmp_path, monkeypatch, fake_stripe_prices):
     with override_target(sqlite_path=str(db_path)):
         from partner_db import initialize_database
         initialize_database()

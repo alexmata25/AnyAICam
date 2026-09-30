@@ -64,3 +64,36 @@ def _reset_partner_application_limiter():
     if limiter is not None:
         limiter.events.clear()
     yield
+
+
+@pytest.fixture()
+def fake_stripe_prices(monkeypatch):
+    """Answers main.stripe_api_get('/v1/prices/<id>') with the catalog amount
+    for whichever catalog item a test configured that Price ID for, so the
+    checkout price guard (require_stripe_price_matches_catalog) sees a
+    matching Stripe Price. Tests that want a mismatch override `overrides`."""
+    import main
+    import pricing_catalog as pc
+    overrides = {}
+
+    def _get(path):
+        price_id = path.rsplit("/", 1)[-1]
+        if price_id in overrides:
+            return overrides[price_id]
+        for plan in pc.base_plans():
+            if plan["stripe_price_id"] == price_id:
+                return {"id": price_id, "unit_amount": plan["monthly_cents"], "currency": "usd", "active": True, "recurring": {"interval": "month"}}
+        for addon in pc.addons():
+            if addon["stripe_price_id"] == price_id:
+                return {"id": price_id, "unit_amount": addon["monthly_cents"], "currency": "usd", "active": True, "recurring": {"interval": "month"}}
+        for tier in pc.face_access_tiers():
+            if tier["stripe_price_id"] == price_id:
+                return {"id": price_id, "unit_amount": tier["monthly_cents_per_door"], "currency": "usd", "active": True, "recurring": {"interval": "month"}}
+        for lic in pc.vms_licenses():
+            if lic["stripe_price_id"] == price_id:
+                return {"id": price_id, "unit_amount": lic["one_time_cents"], "currency": "usd", "active": True, "recurring": None}
+        raise AssertionError(f"unexpected Stripe price lookup: {price_id}")
+
+    monkeypatch.setattr(main, "stripe_api_get", _get)
+    monkeypatch.setattr(main, "_VERIFIED_STRIPE_PRICES", {})
+    return overrides

@@ -19284,6 +19284,46 @@ def stripe_configuration_snapshot() -> dict:
 
 
 
+def stripe_api_get(path: str) -> dict:
+    """Read-only Stripe GET (e.g. /v1/prices/{id}); same auth and error
+    handling as stripe_api_post()."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Stripe is not configured. Add ANYAICAM_STRIPE_SECRET_KEY.")
+    request = UrlRequest(
+        f"{STRIPE_API_BASE}{path}", method="GET",
+        headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}", "User-Agent": f"AnyAiCam-VMS/{APP_VERSION}"},
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Could not verify the price with Stripe. Try again shortly.") from exc
+
+
+_VERIFIED_STRIPE_PRICES: dict = {}
+
+
+def require_stripe_price_matches_catalog(price_id: str, expected_cents: int, interval: str | None) -> None:
+    """Pricing guard (2026-09-30): before any Checkout Session is created,
+    the configured Stripe Price must charge exactly what the customer was
+    shown (pricing_catalog), in the right billing mode. Stripe Price amounts
+    are immutable, so a Price ID left over from earlier pricing would
+    otherwise silently charge the old amount. Refuses (503) on mismatch;
+    a verified match is cached for the life of the process."""
+    key = (price_id, int(expected_cents), interval)
+    if _VERIFIED_STRIPE_PRICES.get(key):
+        return
+    price = stripe_api_get(f"/v1/prices/{quote(price_id, safe='')}")
+    actual_interval = ((price.get("recurring") or {}).get("interval")) if price.get("recurring") else None
+    if (int(price.get("unit_amount") or -1) != int(expected_cents) or actual_interval != interval
+            or str(price.get("currency") or "").lower() != "usd" or price.get("active") is False):
+        structured_log("stripe.price_catalog_mismatch", level="error", price_id=price_id,
+                       expected_cents=int(expected_cents), actual_cents=price.get("unit_amount"),
+                       expected_interval=interval, actual_interval=actual_interval)
+        raise HTTPException(status_code=503, detail="PRICE_MISMATCH: this item's Stripe price does not match the published price, so checkout is paused. Please contact AnyAiCam support.")
+    _VERIFIED_STRIPE_PRICES[key] = True
+
+
 def stripe_api_post(path: str, fields: list[tuple[str, str]]) -> dict:
 
 
@@ -113541,6 +113581,9 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
     stripe_mode = "payment" if billing_type == "one_time" else "subscription"
+    import pricing_catalog
+    _catalog_plan = pricing_catalog.find_base_plan(plan_type, tier_label)
+    require_stripe_price_matches_catalog(price_id, _catalog_plan["monthly_cents"], "month")
     import friends_family
     try:
         friends_family.checkout_discount(customer_id, "base")
@@ -113653,6 +113696,11 @@ def create_analytics_addon_checkout(payload: AnalyticsAddonCheckoutModel, reques
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
     customer_id = identity["customer_id"]
+    import pricing_catalog
+    _catalog_addon = pricing_catalog.find_addon(addon_key)
+    _catalog_face = next((t for t in pricing_catalog.face_access_tiers() if f"face_access_{t['size']}" == addon_key), None)
+    _expected_cents = _catalog_addon["monthly_cents"] if _catalog_addon else _catalog_face["monthly_cents_per_door"]
+    require_stripe_price_matches_catalog(price_id, _expected_cents, "month")
     import friends_family
     try:
         friends_family.checkout_discount(customer_id, item["discount_class"])
@@ -113762,6 +113810,7 @@ def create_vms_license_checkout(payload: VmsLicenseCheckoutModel, request: Reque
         raise HTTPException(status_code=503, detail=f"PRICE_ID_REQUIRED: no Stripe Price ID is configured for {license_['price_env_var']}.")
     if not PUBLIC_BASE_URL:
         raise HTTPException(status_code=503, detail="ANYAICAM_PUBLIC_URL is required for Stripe Checkout.")
+    require_stripe_price_matches_catalog(license_["stripe_price_id"], license_["one_time_cents"], None)
     try:
         friends_family.checkout_discount(customer_id, "vms_license")
     except friends_family.CheckoutHeld as held:
