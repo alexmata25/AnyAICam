@@ -4598,3 +4598,13 @@ Physical tests are paused (no one at home). No Ryzen, Samsung, camera, network, 
 - plans/analytics/vms.html are the new versions. The only difference from the upload is Cloudflare's automatic email obfuscation.
 - Real browser, desktop 1366 and iPhone 13, on vms/plans/analytics: no sideways scroll (was 37px desktop / 906px phone), no broken images, no errors; footer logo 210px (was 1280px).
 - Rollback: `website-publish-2/rollback-original/`.
+
+**Voice Call End call fix: on staging `34658b8` (golden), 2026-09-30 02:07 UTC. NOT on any appliance** (it is cloud page code, so no Ryzen release is needed).
+- `1cdd445`: End call stops every active Talk on the page (the same stop() as a normal release: the audio WebSocket closes and transmission to the camera ends; an in-flight /talk/start is released), releases the Answer microphone (including one granted after End), disables Answer/End/mic, and shows "Call ended." — all before the server call. Repeated presses do nothing. The call still ends locally if the server is unreachable. A call that is already ended/dismissed/missed opens disabled.
+- `41e5252`: disabled buttons look disabled (found on staging `023031c`, where Answer still looked active).
+- Tests: 11 executed Node scenarios (desktop + phone) running the shipped wireTalkMic + call controls; 4 of them fail without the fix.
+- Full suite on `023031c`: 86 failed, all in the baseline; 4,846 passed. Voice Call/Talk focused tests: 167 passed on `34658b8`.
+- Staging cutovers: `023031c` (rollback `portal-e3ee24e-pre-023031c-20260930T015946Z-rollback`), then `34658b8` (rollback `portal-023031c-pre-34658b8-20260930T020628Z-rollback`). Both EXIT=0 with 100% health polls; the Ryzen Talk channel reconnected each time.
+- Browser check on staging (ended call, talk/answer/end requests intercepted): "Call ended." shown, controls disabled, no requests on tap, no errors, desktop and phone.
+- **Pending physical test:** answer a real Voice Call, Talk, press End; confirm the voice stops at the camera and the screen shows Call ended.
+- **Still pending:** normal Live View Talk physical test after `e3ee24e` (not yet validated).
