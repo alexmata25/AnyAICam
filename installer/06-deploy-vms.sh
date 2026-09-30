@@ -170,6 +170,31 @@ normalize_vms_install_ownership() {
         -o -exec chown -h "$owner" {} +
 }
 
+# ---------------------------------------------------------------- stale backup directories
+# (2026-09-30) Hand-made backups left inside the install root (e.g. the
+# Ryzen's app-pre-event-mode-pilot-20260919T223956Z) made every upgrade print
+# "cannot delete non-empty directory": the mirror below protects any folder
+# named recordings/ (legacy customer state), so a backup holding one can never
+# be deleted -- and it should not be silently deleted anyway. Top-level
+# folders named like a backup (*-pre-*) that are not part of the release are
+# MOVED, contents intact, to $ROLLBACK_DIR/stale-install-dirs/ before the
+# mirror runs. Everything else is handled exactly as before.
+relocate_stale_install_dirs() {
+    local entry name dest_root dest stamp
+    [[ -d "$VMS_INSTALL_ROOT" ]] || return 0
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    dest_root="${ROLLBACK_DIR:-/var/lib/anyaicam/rollback}/stale-install-dirs"
+    for entry in "$VMS_INSTALL_ROOT"/*-pre-*; do
+        [[ -d "$entry" && ! -L "$entry" ]] || continue
+        name="$(basename "$entry")"
+        [[ -e "$VMS_PAYLOAD_DIR/$name" ]] && continue
+        mkdir -p "$dest_root" && chmod 0750 "$dest_root" || return 1
+        dest="$dest_root/$name-moved-$stamp"
+        mv "$entry" "$dest" || return 1
+        log "Moved stale backup directory $name out of $VMS_INSTALL_ROOT to $dest (contents kept)."
+    done
+}
+
 # ---------------------------------------------------------------- rollback point
 # (2026-09-25) A repair/upgrade rebuilds anyaicam-vms:latest in place and
 # rsync --delete replaces the code, so before this the previous release
@@ -316,6 +341,7 @@ deploy_vms() {
     # normalize_vms_install_ownership() also repairs files an earlier
     # install already left with the wrong owner (rsync skips unchanged
     # files, so --no-owner alone would never fix those).
+    relocate_stale_install_dirs || return 1
     rsync -a --no-owner --no-group --delete \
         --exclude 'recordings/' --exclude 'data/config/' --exclude '.env' --exclude 'mediamtx/' \
         "$VMS_PAYLOAD_DIR/" "$VMS_INSTALL_ROOT/"

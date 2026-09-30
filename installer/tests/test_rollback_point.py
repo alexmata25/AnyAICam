@@ -193,3 +193,47 @@ deploy_vms clean
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(BASH, "bash is required")
+class StaleInstallDirTests(unittest.TestCase):
+    """(2026-09-30) The Ryzen's hand-made app-pre-event-mode-pilot-20260919T223956Z
+    backup made every upgrade print "cannot delete non-empty directory" (it holds a
+    recordings/ folder, which the mirror protects). Such folders are now moved out,
+    contents intact, instead of lingering or being deleted."""
+    setUp = RollbackPointTests.setUp
+    env = RollbackPointTests.env
+    run_bash = RollbackPointTests.run_bash
+
+    def _relocate(self, payload_names=()):
+        payload = self.tmp / "payload"
+        payload.mkdir(exist_ok=True)
+        for name in payload_names:
+            (payload / name).mkdir()
+        return self.run_bash(f'VMS_PAYLOAD_DIR="{bash_path(payload)}"\nROLLBACK_DIR="{bash_path(self.rollback_dir)}"\nrelocate_stale_install_dirs\n')
+
+    def test_a_stale_backup_is_moved_out_with_its_contents(self):
+        stale = self.install_root / "app-pre-event-mode-pilot-20260919T223956Z"
+        (stale / "recordings").mkdir(parents=True)
+        (stale / "note.txt").write_text("kept")
+        result = self._relocate()
+        self.assertFalse(stale.exists())
+        moved = list((self.rollback_dir / "stale-install-dirs").glob("app-pre-event-mode-pilot-20260919T223956Z-moved-*"))
+        self.assertEqual(len(moved), 1)
+        self.assertEqual((moved[0] / "note.txt").read_text(), "kept")
+        self.assertTrue((moved[0] / "recordings").is_dir())
+        self.assertIn("Moved stale backup directory", result.stdout)
+
+    def test_release_folders_and_unrelated_folders_stay(self):
+        (self.install_root / "tools-pre-built").mkdir()        # part of the release payload
+        (self.install_root / "custom").mkdir()                  # not backup-named
+        self._relocate(payload_names=("tools-pre-built",))
+        self.assertTrue((self.install_root / "tools-pre-built").is_dir())
+        self.assertTrue((self.install_root / "custom").is_dir())
+        self.assertTrue((self.install_root / "recordings" / "legacy.mkv").exists())
+        self.assertFalse((self.rollback_dir / "stale-install-dirs").exists())
+
+    def test_nothing_to_move_is_a_no_op(self):
+        self._relocate()
+        self.assertFalse((self.rollback_dir / "stale-install-dirs").exists())
+        self.assertEqual((self.install_root / "app" / "main.py").read_text(), "OLD RELEASE CODE\n")
