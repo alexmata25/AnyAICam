@@ -1,3 +1,4 @@
+import os
 """ppe.py tests. summarize_ppe()/_parse_detections() are pure and
 covered thoroughly with synthetic detection data -- no model or image
 needed. detect_ppe() is exercised against the real, real model file
@@ -114,6 +115,10 @@ def test_detect_ppe_returns_none_for_empty_image():
 
 # --------------------------------------------------------- real model, real inference call
 
+@pytest.mark.skipif(
+    not os.path.exists(ppe.PPE_MODEL_NAME),
+    reason="PPE model file not installed on this machine (appliances carry it)",
+)
 def test_real_model_loads():
     model = ppe._get_model()
     assert model is not None

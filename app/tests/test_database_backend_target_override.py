@@ -42,7 +42,7 @@ class DatabaseBackendTargetOverrideTests(unittest.TestCase):
         with database_backend.override_target(sqlite_path='/tmp/override-wins.db'):
             os.environ['ANYAICAM_PARTNER_DB'] = '/tmp/should-not-be-used-b.db'
             self.assertEqual(database_backend.sqlite_target_path(), Path('/tmp/override-wins.db'))
-            self.assertEqual(database_backend.target_key(), ('sqlite', '/tmp/override-wins.db'))
+            self.assertEqual(database_backend.target_key(), ('sqlite', str(Path('/tmp/override-wins.db'))))  # OS path form
 
     def test_os_environ_is_consulted_again_after_override_exits(self):
         with database_backend.override_target(sqlite_path='/tmp/temporary.db'):
