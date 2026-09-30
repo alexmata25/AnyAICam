@@ -161,7 +161,8 @@ def test_each_analytic_reports_its_own_stored_fields(client):
     assert ppe["ppe-1"]["confidence"] is None  # PPE's stored 0.0 is not a real confidence
     assert _get(client, "ppe").json()["summary"]["by_result"] == {"violation": 2, "compliant": 1, "missing_hard_hat": 1, "missing_vest": 1}
     lpr = {e["event_id"]: e for e in _get(client, "lpr").json()["events"]}
-    assert lpr["lpr-1"]["details"] == {"plate": "ABC123"} and lpr["lpr-1"]["has_clip"]
+    assert lpr["lpr-1"]["details"] == {"plate": "ABC123", "has_plate_image": False, "vehicle_type": None, "vehicle_color": None,
+                                     "vehicle_make": None, "vehicle_model": None} and lpr["lpr-1"]["has_clip"]
     faces = _get(client, "facial_recognition", cookies=_other()).json()
     assert faces["summary"]["by_result"] == {"known": 1, "unknown": 1}
     assert {e["event_id"]: e["details"]["person"] for e in faces["events"]} == {"fr-1": "Ana", "fr-2": None}

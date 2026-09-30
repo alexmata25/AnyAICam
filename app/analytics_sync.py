@@ -477,8 +477,8 @@ def _build_payload(event: dict) -> dict:
     # `detections` field (the cloud's detection_events.detections_json
     # column already exists and is already unused for "ppe" rows) so
     # the customer-facing PPE view can show compliant/violation status
-    # without a new column, a new endpoint field, or touching the paused
-    # LPR pipeline this same mechanism deliberately does NOT extend to.
+    # without a new column or a new endpoint field. (LPR plate events use
+    # the same mechanism, below.)
     if str(event.get("event_type") or "").strip() == "ppe" and payload_detections is None:
         payload_detections = [{
             "hard_hat_present": bool(event.get("hard_hat_present")),
@@ -528,6 +528,23 @@ def _build_payload(event: dict) -> dict:
             "rule_id": event.get("rule_id"),
             "direction": event.get("direction"),
         }]
+    # LPR (2026-09-30): the plate read and the vehicle it was read on, for
+    # the customer's License Plates table. Without this the cloud had no
+    # plate text at all. Vehicle colour/make/model are None unless the edge
+    # knew them reliably (lpr_vehicle.py); the plate crop travels as a small
+    # JPEG (_plate_crop_jpeg_b64) since it has no media slot of its own.
+    if str(event.get("event_type") or "").strip() == "plate" and payload_detections is None:
+        payload_detections = [{
+            "plate": event.get("plate_number"),
+            "plate_confidence": event.get("confidence"),
+            "vehicle_type": event.get("vehicle_type"),
+            "vehicle_color": event.get("vehicle_color"),
+            "vehicle_color_confidence": event.get("vehicle_color_confidence"),
+            "vehicle_make": event.get("vehicle_make"),
+            "vehicle_model": event.get("vehicle_model"),
+            "vehicle_make_model_confidence": event.get("vehicle_make_model_confidence"),
+            "plate_crop_jpeg": _plate_crop_jpeg_b64(event.get("plate_crop")),
+        }]
     return {
         "local_event_id": str(event.get("id") or "").strip(),
         "event_type": str(event.get("event_type") or "").strip(),
@@ -537,6 +554,43 @@ def _build_payload(event: dict) -> dict:
         "event_timestamp": str(event.get("timestamp") or "").strip(),
         "parent_local_event_id": _parent_local_event_id(event),
     }
+
+
+PLATE_CROP_MAX_BYTES = 24_000
+
+
+def _plate_crop_jpeg_b64(url) -> str | None:
+    """The plate crop the appliance saved (a /recordings/... media URL), as
+    base64 JPEG, if it is a real file under RECORDINGS_FOLDER and small
+    enough; larger crops are scaled down; anything else is None."""
+    import base64
+    from urllib.parse import unquote
+    text = str(url or "")
+    if not text.startswith("/recordings/"):
+        return None
+    root = RECORDINGS_FOLDER.resolve()
+    try:
+        path = (root / unquote(text[len("/recordings/"):])).resolve()
+        if root not in path.parents or path.suffix.lower() not in (".jpg", ".jpeg"):
+            return None
+        data = path.read_bytes()
+    except (OSError, ValueError):
+        return None
+    if len(data) > PLATE_CROP_MAX_BYTES:
+        try:
+            import cv2
+            import numpy as np
+            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            scale = 320 / max(1, image.shape[1])
+            if scale < 1:
+                image = cv2.resize(image, (320, max(1, int(image.shape[0] * scale))))
+            ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            data = encoded.tobytes() if ok else b""
+        except Exception:
+            return None
+        if not data or len(data) > PLATE_CROP_MAX_BYTES:
+            return None
+    return base64.b64encode(data).decode("ascii")
 
 
 def _parent_local_event_id(event: dict) -> str | None:

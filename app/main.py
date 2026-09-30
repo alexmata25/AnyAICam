@@ -37020,7 +37020,8 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 async def _build_and_upload_owned_analytics_clip(
-    event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None
+    event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None,
+    start: datetime | None = None,
 ) -> None:
     """A Facial Recognition / People Counting result that no registered clip
     covers gets its own clip (see event_media_sharing.py), built and
@@ -37028,14 +37029,14 @@ async def _build_and_upload_owned_analytics_clip(
     reuse it are registered once it lands."""
     registered = False
     try:
-        clip_url = await build_motion_event_clip(event_id, camera_number, moment, moment)
+        clip_url = await build_motion_event_clip(event_id, camera_number, start or moment, moment)
         if clip_url:
             from event_media_uploader import upload_motion_event_media
             registered = bool(await asyncio.to_thread(
                 upload_motion_event_media,
                 event_id=event_id,
                 camera_number=camera_number,
-                event_start=moment,
+                event_start=start or moment,
                 event_end=moment,
                 clip_url=clip_url,
                 thumbnail_url=thumbnail_url,
@@ -37047,11 +37048,12 @@ async def _build_and_upload_owned_analytics_clip(
         await asyncio.to_thread(event_media_sharing.owner_finished, event_id, camera_number, registered)
 
 
-def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None) -> None:
+def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None,
+                                   start: datetime | None = None) -> None:
     """Schedule _build_and_upload_owned_analytics_clip() from a detection
     worker thread (save_yolo_events() runs via asyncio.to_thread) or from
     the event loop itself (people_counting_worker())."""
-    coroutine = _build_and_upload_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url)
+    coroutine = _build_and_upload_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url, start)
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
@@ -37071,7 +37073,8 @@ def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: da
         event_media_sharing.owners.finish(event_id, False)
 
 
-def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime) -> str | None:
+def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime,
+                           start: datetime | None = None) -> str | None:
     """The local id of the event whose clip this result shows: a
     registered clip covering this moment on this camera; or, when there is
     none and one can be kept, event_id itself (the caller then schedules
@@ -37082,7 +37085,7 @@ def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime) 
     if owner:
         return owner
     if event_media_sharing.should_build_own_clip(camera_number):
-        window = compute_clip_window(moment, moment)
+        window = compute_clip_window(start or moment, moment)
         event_media_sharing.owners.register(camera_number, event_id, window.start, window.end)
         return event_id
     return None
@@ -38433,8 +38436,29 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
         full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
     confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame)
     events = []
+    from detection_timing import plate_event_span
+    import lpr_vehicle
     for plate in confirmed:
         now = datetime.now()
+        # Timed from the frames, not from when this ran: the plate event is
+        # the first read, and its clip starts before the vehicle arrived
+        # (detection_timing.py).
+        event_start, first_read, moment = plate_event_span(
+            result.get("frame_captured_at"), result.get("previous_frame_captured_at"), now=now,
+            first_read_age_seconds=plate.get("first_read_age_seconds") or 0.0,
+            scan_interval_seconds=max(AI_DETECTION_INTERVAL_SECONDS, float(getattr(lpr, "LPR_SCAN_SECONDS", 0) or 0)),
+        )
+        # The vehicle the plate was read on: its detector class, and its
+        # colour only when one clearly dominates (lpr_vehicle.py). No
+        # make/model classifier is installed: those stay None ("Unknown").
+        vehicle_type = lpr_vehicle.vehicle_type_for(plate.get("vehicle_box"), result.get("detections"))
+        vehicle_color, vehicle_color_confidence = None, None
+        if plate.get("vehicle_box"):
+            try:
+                vx, vy, vw, vh = plate["vehicle_box"]
+                vehicle_color, vehicle_color_confidence = lpr_vehicle.estimate_vehicle_color(frame[vy : vy + vh, vx : vx + vw])
+            except Exception as error:
+                print(f"Camera {camera_number} vehicle colour skipped (non-fatal): {error}")
         day_folder = AI_THUMBNAILS_FOLDER / now.strftime("%Y-%m-%d")
         day_folder.mkdir(parents=True, exist_ok=True)
         event_id = uuid.uuid4().hex[:12]
@@ -38463,14 +38487,22 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             site="home",
             rule_name="LPR",
             event_type="plate",
-            timestamp=now,
+            timestamp=first_read,
             confidence=round(plate["confidence"] / 100, 4),
             plate_number=plate["plate_number"],
             plate_crop=plate_crop_url,
             thumbnail=thumbnail_url,
-            linked_recording=linked_recording_for(camera_number, now),
+            linked_recording=linked_recording_for(camera_number, moment),
             mock=False,
         ).model_dump(mode="json")
+        plate_event.update(
+            vehicle_type=vehicle_type,
+            vehicle_color=vehicle_color,
+            vehicle_color_confidence=vehicle_color_confidence,
+            vehicle_make=None,
+            vehicle_model=None,
+            vehicle_make_model_confidence=None,
+        )
         # An Event-mode camera only records when something triggers it. A
         # plate confirmed while the vehicle-event cooldown/stationary
         # suppression is active has no vehicle event to do that (found on
@@ -38481,22 +38513,22 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
         if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    persist_event_recording(camera_number, now, now, detector="lpr", trigger_id=event_id),
+                    persist_event_recording(camera_number, event_start, moment, detector="lpr", trigger_id=event_id),
                     _ai_event_media_loop,
                 )
             except RuntimeError as error:
                 print(f"LPR event {event_id}: could not schedule Event-mode recording persist: {error}")
-        media_owner = _analytics_media_owner(camera_number, event_id, now)
+        media_owner = _analytics_media_owner(camera_number, event_id, moment, event_start)
         event_media_sharing.link(plate_event, media_owner)
         append_analytics_event(plate_event)
         if media_owner == event_id:
-            _schedule_owned_analytics_clip(event_id, camera_number, now, thumbnail_url)
+            _schedule_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url, event_start)
         elif media_owner:
             event_media_sharing.attach_child(media_owner, event_id, camera_number)
         if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    _backfill_ai_event_linked_recording(camera_number, [event_id], now),
+                    _backfill_ai_event_linked_recording(camera_number, [event_id], moment),
                     _ai_event_media_loop,
                 )
             except RuntimeError as error:

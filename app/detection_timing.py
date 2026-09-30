@@ -103,3 +103,27 @@ def detection_event_span(
     if previous_frame_time is not None and earliest <= previous_frame_time < moment:
         return previous_frame_time, moment
     return max(earliest, moment - timedelta(seconds=max(0.0, scan_interval_seconds))), moment
+
+
+def plate_event_span(
+    frame_time: Optional[datetime],
+    previous_frame_time: Optional[datetime],
+    *,
+    now: datetime,
+    first_read_age_seconds: float,
+    scan_interval_seconds: float,
+) -> tuple[datetime, datetime, datetime]:
+    """(event_start, first_read, confirmed_moment) for a confirmed plate.
+
+    A plate is confirmed only after several agreeing reads, so the frame it
+    was confirmed on can be well after the vehicle arrived. first_read is
+    when it was first read (the event's time); the event starts one scan
+    interval before that -- or at the previous scanned frame, if earlier --
+    and never more than MAX_EVENT_LEAD_SECONDS before the confirmation."""
+    start, moment = detection_event_span(frame_time, previous_frame_time, now=now,
+                                         scan_interval_seconds=scan_interval_seconds)
+    age = max(0.0, min(float(first_read_age_seconds or 0.0), MAX_EVENT_LEAD_SECONDS))
+    first_read = moment - timedelta(seconds=age)
+    earliest = moment - timedelta(seconds=MAX_EVENT_LEAD_SECONDS)
+    start = max(earliest, min(start, first_read - timedelta(seconds=max(0.0, scan_interval_seconds))))
+    return start, first_read, moment

@@ -53,7 +53,7 @@
     if(key==='people_counting'){
       return [d.direction==='in'?'Entry':d.direction==='out'?'Exit':'Count',d.direction==='in'?'good':'',d.direction==='in'?'Person entered':d.direction==='out'?'Person left':'People count',[]];
     }
-    if(key==='lpr')return ['LPR','',d.plate?`Plate ${d.plate}`:'License plate read',[d.plate?null:'Plate text is kept on the appliance',e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
+    if(key==='lpr')return ['LPR','',d.plate?`Plate ${d.plate}`:'License plate read',[d.plate?null:'Plate not recorded',e.confidence!=null?`${pct(e.confidence)}% confidence`:null]];
     if(key==='ppe'){
       const part=(n,v)=>v==null?null:`${n} ${v?'✓':'✗ missing'}`;
       return [d.status==='violation'?'Violation':d.status==='compliant'?'Compliant':'PPE',d.status==='violation'?'bad':d.status==='compliant'?'good':'',
@@ -80,6 +80,38 @@
       <span class="aw-thumb" data-preview="${e.has_thumbnail?'loading':'none'}">${img}<span class="aw-badge ${badgeClass}">${esc(badge)}</span>${plate}${e.has_clip?'<span class="aw-play" aria-hidden="true">▶</span>':''}</span>
       <span class="aw-body"><strong>${esc(title)}</strong><span class="aw-meta">${meta}</span></span></button>`;
   }
+  // License Plates (2026-09-30): a table, one row per plate read -- time,
+  // camera, plate, plate image, make, model, colour/type and its clip.
+  // Anything not known reliably reads "Unknown" (never guessed); reads
+  // synced before these fields existed show what they have.
+  const LPR=key==='lpr';
+  const LPR_COLUMNS=['Time','Camera','Plate','Plate image','Make','Model','Color / type','Clip'];
+  const LPR_HEAD=`<div class="aw-lpr-head" role="row">${LPR_COLUMNS.map(c=>`<span role="columnheader">${esc(c)}</span>`).join('')}</div>`;
+  if(LPR){results.className='aw-lpr';results.setAttribute('role','table')}
+  function whenPrecise(ms){
+    if(typeof ms!=='number')return '';
+    const d=new Date(ms),now=new Date(),y=new Date(now.getFullYear(),now.getMonth(),now.getDate()-1);
+    const t=d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit',second:'2-digit'});
+    if(d.toDateString()===now.toDateString())return `Today, ${t}`;
+    if(d.toDateString()===y.toDateString())return `Yesterday, ${t}`;
+    return d.toLocaleDateString([],{month:'short',day:'numeric',year:d.getFullYear()===now.getFullYear()?undefined:'numeric'})+`, ${t}`;
+  }
+  const unknown='<span class="aw-muted">Unknown</span>';
+  function colorType(d){
+    if(d.vehicle_color&&d.vehicle_type)return esc(`${d.vehicle_color} ${d.vehicle_type.toLowerCase()}`);
+    if(d.vehicle_color)return esc(d.vehicle_color);
+    if(d.vehicle_type)return `${esc(d.vehicle_type)} <span class="aw-muted">· color unknown</span>`;
+    return unknown;
+  }
+  function lprRow(e){
+    const d=e.details||{};
+    const plate=d.plate?`<span class="aw-plate-text">${esc(d.plate)}</span>`:'<span class="aw-muted">Not recorded</span>';
+    const image=d.has_plate_image?`<img class="aw-plate-img" src="/api/customer/analytics/lpr/${encodeURIComponent(e.event_id)}/plate-image" alt="Plate ${esc(d.plate||'')}" loading="lazy" decoding="async">`:'<span class="aw-muted">—</span>';
+    const clip=e.has_clip?`<button type="button" class="ghost-button aw-lpr-open" aria-label="Play clip of ${esc(d.plate||'this plate read')}">▶ Play clip</button>`
+      :e.has_thumbnail?'<button type="button" class="ghost-button aw-lpr-open">View snapshot</button>':'<span class="aw-muted">No clip</span>';
+    const cells=[esc(whenPrecise(e.timestamp_ms)),esc(cameraName[e.camera_id]||'Camera'),plate,image,d.vehicle_make?esc(d.vehicle_make):unknown,d.vehicle_model?esc(d.vehicle_model):unknown,colorType(d),clip];
+    return `<div class="aw-lpr-row" role="row" data-inline-key="${e.has_clip?'event':'snapshot'}:${esc(e.event_id)}" data-event="${esc(e.event_id)}" aria-expanded="false">${cells.map((c,i)=>`<span role="cell" data-label="${esc(LPR_COLUMNS[i])}">${c}</span>`).join('')}</div>`;
+  }
   function openItem(button){
     const e=state.items.get(button.dataset.event);if(!e)return;
     const [, , title]=describe(e);
@@ -91,7 +123,12 @@
       playbackHref:href,shareUrl:location.origin+href,
     });
   }
-  results.addEventListener('click',ev=>{const b=ev.target.closest('.aw-card');if(b)openItem(b)});
+  results.addEventListener('click',ev=>{
+    if(LPR){const b=ev.target.closest('.aw-lpr-open');if(b)openItem(b.closest('.aw-lpr-row'));return}
+    const b=ev.target.closest('.aw-card');if(b)openItem(b);
+  });
+  // A plate image that cannot load reads "—", like a read without one.
+  results.addEventListener('error',ev=>{const t=ev.target;if(t.tagName==='IMG'&&t.classList.contains('aw-plate-img'))t.outerHTML='<span class="aw-muted">—</span>'},true);
   // Preview images: load/error don't bubble, so listen in the capture phase.
   results.addEventListener('load',ev=>{const t=ev.target;if(t.tagName==='IMG'&&t.parentElement.classList.contains('aw-thumb'))t.parentElement.dataset.preview='ready'},true);
   results.addEventListener('error',ev=>{
@@ -125,12 +162,12 @@
   const EMPTY={smart_motion:'No people, vehicle or motion detections',people_counting:'No entries or exits',lpr:'No license plate reads',ppe:'No PPE checks',facial_recognition:'No faces',line_crossing:'No line crossings',intrusion:'No zone intrusions'};
   async function load(append){
     if(state.loading)return;state.loading=true;
-    if(!append){state.before=null;state.items.clear();inline.close();results.innerHTML='<div class="aw-empty">Loading…</div>'}
+    if(!append){state.before=null;state.items.clear();inline.close();results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">Loading…</div>'}
     const [start,end]=range(),ids=scope();
     const q=new URLSearchParams({start_ms:start,end_ms:end,result:state.result,q:state.q});
     if(state.before)q.set('before',state.before);
     try{
-      if(ids!==null&&!ids.length){results.innerHTML='<div class="aw-empty">No cameras at this site.</div>';stats.innerHTML='';more.hidden=true;return}
+      if(ids!==null&&!ids.length){results.innerHTML=(LPR?LPR_HEAD:'')+'<div class="aw-empty">No cameras at this site.</div>';stats.innerHTML='';more.hidden=true;return}
       if(ids)q.set('camera_id',ids.join(','));
       const r=await fetch(`/api/customer/analytics/${key}/events?${q}`,{credentials:'same-origin'});
       const body=await r.json().catch(()=>({}));
@@ -138,11 +175,11 @@
       if(!append)renderSummary(body.summary||{});
       body.events.forEach(e=>state.items.set(e.event_id,e));
       const offset=append?results.querySelectorAll('.aw-card').length:0;
-      const html=body.events.map((e,i)=>card(e,offset+i)).join('');
+      const html=body.events.map((e,i)=>LPR?lprRow(e):card(e,offset+i)).join('');
       if(append){results.insertAdjacentHTML('beforeend',html);inline.reattach(results)}
-      else results.innerHTML=html||`<div class="aw-empty">${esc(EMPTY[key]||'Nothing')} in this period.</div>`;
+      else results.innerHTML=(LPR?LPR_HEAD:'')+(html||`<div class="aw-empty">${esc(EMPTY[key]||'Nothing')} in this period.</div>`);
       state.before=body.next_before;more.hidden=!body.next_before;
-    }catch(error){if(!append)results.innerHTML=`<div class="aw-empty">${esc(error.message)}</div>`}
+    }catch(error){if(!append)results.innerHTML=(LPR?LPR_HEAD:'')+`<div class="aw-empty">${esc(error.message)}</div>`}
     finally{state.loading=false}
   }
   function syncUrl(){const q=new URLSearchParams();if(state.camera)q.set('camera',state.camera);history.replaceState(null,'',`/analytics/${config.slug}${q.toString()?'?'+q:''}`)}
