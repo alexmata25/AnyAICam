@@ -197,7 +197,8 @@ def test_retry_failed_deliveries_skips_a_row_with_no_recipient(fake_channels):
     assert fake_channels["email"].calls == []
 
 
-def test_retry_failed_deliveries_records_a_provider_exception_as_an_error_never_raises(fake_channels):
+def test_retry_failed_deliveries_records_a_provider_exception_as_an_error_never_raises(fake_channels, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_SMS_ALERT_EVENT_TYPES", "smart_motion,motion,person")  # the seeded notification's type
     fake_channels["sms"].raises = True
     old_enough = (datetime.now() - timedelta(hours=1)).isoformat()
     with connection() as db:

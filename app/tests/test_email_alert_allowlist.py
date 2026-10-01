@@ -49,6 +49,7 @@ def test_allowlist_parsing(monkeypatch):
 
 def test_noisy_event_gets_in_app_and_sms_but_no_email(monkeypatch, channels):
     monkeypatch.setenv("ANYAICAM_EMAIL_ALERT_EVENT_TYPES", CRITICAL)
+    monkeypatch.setenv("ANYAICAM_SMS_ALERT_EVENT_TYPES", "person")  # SMS has its own allowlist
     _owner_with_email_and_sms(["person", "smart_motion", "aac_voice_call"])
     notification_engine.fanout_appliance_event(_appliance(), {"camera_id": "cam-1", "event_type": "person"})
     assert sorted(d["channel"] for d in _deliveries()) == ["in_app", "sms"]  # SMS unaffected

@@ -108,18 +108,40 @@ class TwilioSms(SmsBackend):
         )
         try:
             with urllib.request.urlopen(request, timeout=15, context=ssl.create_default_context()) as response:
-                response.read()
-            return {"type": message_type, "to": to, "status": "sent", "created_at": datetime.now().isoformat()}
+                answer = _json_body(response.read())
+            return {"type": message_type, "to": to, "status": "sent", "created_at": datetime.now().isoformat(),
+                    "provider": "twilio", "provider_message_id": str(answer.get("sid") or "")[:64] or None}
         except urllib.error.HTTPError as error:
+            answer = _json_body(error.read())
+            code = str(answer.get("code") or "")[:16] or None
+            # A permanent rejection is final ("rejected" is never retried);
+            # anything else stays "failed" for the retry worker.
+            status = "rejected" if code in TWILIO_PERMANENT_ERROR_CODES else "failed"
             return {
-                "type": message_type, "to": to, "status": "failed",
-                "created_at": datetime.now().isoformat(), "detail": f"Twilio rejected the request ({error.code}).",
+                "type": message_type, "to": to, "status": status, "created_at": datetime.now().isoformat(),
+                "provider": "twilio", "provider_error_code": code,
+                "detail": f"Twilio rejected the request ({error.code}{', error ' + code if code else ''}).",
             }
         except OSError as error:
             return {
                 "type": message_type, "to": to, "status": "failed",
                 "created_at": datetime.now().isoformat(), "detail": f"SMS delivery failed: {error}",
             }
+
+
+# Twilio errors that no retry can fix: the number is invalid, unreachable,
+# not a mobile number, in a region not enabled, or the recipient replied
+# STOP (21610). Account/sender errors are left retryable, so a corrected
+# configuration still delivers the alerts that failed meanwhile.
+TWILIO_PERMANENT_ERROR_CODES = frozenset({"21211", "21214", "21217", "21265", "21408", "21610", "21612", "21614"})
+
+
+def _json_body(raw: bytes) -> dict:
+    try:
+        value = json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def get_sms_service() -> SmsBackend:

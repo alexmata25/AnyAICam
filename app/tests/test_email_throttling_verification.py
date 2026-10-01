@@ -134,7 +134,8 @@ def test_front_door_video_event_and_voice_call_email(ch):
     assert len(subjects) == 2 and all(r == "owner@example.test" for _, r in ch["email"].calls)
 
 
-def test_email_disabled_means_no_email(ch):
+def test_email_disabled_means_no_email(ch, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_SMS_ALERT_EVENT_TYPES", "person,aac_voice_call")
     _seed(email_enabled=False, sms_enabled=True)
     _event("person", "front", 0)
     _event("aac_voice_call", "front", 10)
@@ -143,6 +144,7 @@ def test_email_disabled_means_no_email(ch):
 
 def test_operator_allowlist_narrows_email_only(ch, monkeypatch):
     monkeypatch.setenv("ANYAICAM_EMAIL_ALERT_EVENT_TYPES", "aac_voice_call,camera_offline")
+    monkeypatch.setenv("ANYAICAM_SMS_ALERT_EVENT_TYPES", "person,aac_voice_call")
     _seed(sms_enabled=True)
     _event("person", "front", 0)
     _event("aac_voice_call", "drive", 1)
