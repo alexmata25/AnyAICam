@@ -5138,3 +5138,84 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 - On phones, the floating assistant bubble covers the right edge of the setup wizard's "Save and continue" button.
 - An account with no active license shows "License attention: License status is inactive" at the top of setup until a plan is active.
 - The setup page's "Step 6/7 of 7 (Customer portion)" caption counts onboarding steps, not the wizard tabs, so it can disagree with the highlighted tab.
+
+## 2026-09-30 late night: setup-page AACO dock, event-clip pre-roll timing, License Plates table
+
+**Branch and deployment**
+- Work is on branch `fix/mobile-aaco-preroll-lpr-20260930`, cut from golden `2d1b6e8`. Commits:
+  - `e2377d2`: AACO phone dock (first version, CSS);
+  - `02636f1`: event-clip timing;
+  - `4b00355`: License Plates table;
+  - `f3fc95b`: Analytics phone submenu;
+  - `3ecf46c`: AACO docked in the setup action row at every width.
+- Merged into golden as `b97473d`.
+- Staging runs `3ecf46c` (`portal-3ecf46c`; rollback `portal-f3fc95b-pre-3ecf46c-20261001T002950Z-rollback`). `main` is untouched (`d08282f`). Ryzen and Samsung are untouched.
+
+**1. AACO button over "Save and continue" (setup page)**
+- The first fix docked the button below the content on phones only. Staging then showed the same overlap on desktop (1280x800).
+- Final fix: the setup wizard's action row has a `data-aaco-dock-slot`. The widget (`aaco_web.py`) moves its button there, beside Back / Save and continue, at every width. The panel still opens as an overlay. Pages without a slot keep the floating button.
+- Browser regression `test_setup_mobile_aaco_dock.py` (Chromium, Edge and WebKit at 390x844, 360x640 and 1280x800) checks that at every step and scroll position the button overlaps no control, there is no sideways scroll, and AACO still opens.
+
+**2. Event clips started too late (vehicle already mid-frame or leaving)**
+- Traced cause:
+  - `detect_objects_frame()` reads its frame from the live HLS playlist. FFmpeg opens that `live_start_index=-3` segments behind the newest segment (2 s each, longer with long keyframe intervals), so the frame is already about 6 s or more old.
+  - `save_yolo_events()` then stamped the event `datetime.now()` after YOLO and the LPR scan.
+  - The 5 s pre-roll was counted back from that late stamp, so a clip could begin after the frame that showed the vehicle.
+  - In addition, Event mode cut its recording with an output-side `-ss` using stream copy, which drops everything up to the next keyframe.
+- Fix (`detection_timing.py`, pure):
+  - The frame's wall-clock time is estimated from the playlist's `#EXTINF` values and the newest segment's end. Any error adds pre-roll, never removes it.
+  - The event starts at the previous scanned frame (the object entered after it), so the pre-roll precedes the arrival. The start moves earlier; the tail is unchanged.
+  - The event time, clip window, clip build, cloud upload window, linked recording, Event-mode persist and backfill all use these times.
+  - Event-mode buffer segments are kept `DETECTION_LOOKBACK_SECONDS` (60) plus the post-roll longer.
+  - The cut seeks on the input side, so it starts at the keyframe before the offset.
+- Tests: `test_detection_clip_timing.py` (15). They reproduce the reported case (the old window started after the detection frame).
+
+**3. License Plates: from loose clips to a table**
+- Found: the appliance synced plate events with `detections=None`, so the cloud never had the plate text.
+- Appliance changes:
+  - `run_lpr_scan()` times each plate from its frames. The event time is the first agreeing read (`lpr.confirm_plate()` now reports `first_read_age_seconds`). The clip, Event-mode recording and media-sharing window start one scan earlier (`detection_timing.plate_event_span()`), so the linked clip shows that vehicle arriving.
+  - `lpr_vehicle.py` provides the vehicle details:
+    - type = the detector class of the box the plate was read in;
+    - colour only when one colour covers at least 60% of the body in a real-colour frame (IR/night frames and mixed colours are Unknown);
+    - make and model are always None, because no classifier is installed.
+  - `analytics_sync` sends the plate, confidences, vehicle fields and the saved plate crop in the existing `detections` field. The crop is a JPEG of at most 24 KB, read only from under `RECORDINGS_FOLDER`. No schema change.
+- Cloud changes:
+  - `/analytics/lpr` is a table with columns time (viewer-local), camera, plate, plate image, make, model, colour/type and Play clip. Play clip opens the existing inline player under the row.
+  - Missing values or values below 0.6 confidence read "Unknown". Older reads show "Not recorded" / "—".
+  - Phones show labelled stacked rows.
+  - New route `GET /api/customer/analytics/lpr/{id}/plate-image`: checks tenant, camera and entitlement, and serves JPEG only.
+  - Plate search matches the plate text only.
+- Tests:
+  - `test_lpr_structured_table.py` (17);
+  - `test_lpr_table_browser.py` (4, opt-in; Chromium and Edge, desktop and phone).
+  - Two older test stubs were widened for the new optional `start` argument.
+- Staging holds 19 historical plate events, all without details. They render as "Not recorded" / "Unknown".
+
+**Also fixed**
+- The Analytics phone submenu overlapped the two-row bottom bar by about 20 px. This was a pre-existing failure of `test_analytics_workspace_browser.py` on golden in Chromium and Edge. The submenu is now placed above the bar's real top.
+
+**Tests**
+- New focused tests were written first.
+- Full regression (10 memory-safe batches) on `f3fc95b`: 5,223 passed, 0 failed, 140 skipped. On `3ecf46c`: 5,223 passed, 0 failed, 143 skipped.
+- Opt-in browser suites: analytics workspace 20/20, AACO dock 12/12, LPR table 4/4.
+
+**Needs a new Ryzen (appliance) release before it has any effect**
+- The detection timing, Event-mode cut and buffer lookback, the LPR timing and vehicle fields, and the plate sync all run on the appliance.
+- The cloud table works with today's data (as "Not recorded"/"Unknown") and fills in once an appliance runs this build.
+
+**Still needs a physical drive-by after that release**
+- A vehicle clip shows the vehicle entering before the detection (daylight and night, continuous and Event mode).
+- An Event-mode recording starts cleanly on a keyframe.
+- Each LPR row's plate text, plate image and clip belong to the same vehicle.
+- Colour is correct in daylight and Unknown at night / on IR.
+- The Event-mode buffer disk use stays small with the longer lookback.
+
+**Dell note**
+- OneDrive is leaking memory again (about 17.7 GB about 3 h after its restart). Restart it before long unattended runs.
+- Staging validation (`portal-3ecf46c`, real Chromium, E2E test tenant, desktop 1280x800 and phones 390x844 / 360x640):
+  - the AACO button sits in the setup action row with no overlap at any step or scroll position, and it opens;
+  - no sideways scroll; the Analytics submenu sits above the bottom bar;
+  - `/analytics/lpr` shows "Not enabled for your cameras" for a tenant without LPR;
+  - the plate-image route returns 404 for an unknown id and 401 signed out;
+  - no page errors.
+- E2E sessions revoked.
