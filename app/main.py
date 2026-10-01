@@ -16347,12 +16347,9 @@ async def persist_event_recording(
             )
         )
         if start_new:
-            camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
-            camera_folder.mkdir(parents=True, exist_ok=True)
-            destination = camera_folder / f"camera{camera_number}_{window.start:%Y-%m-%d_%H-%M-%S}.mkv"
-            _open_event_recordings[camera_number] = {"start": window.start, "end": window.end, "path": destination}
+            # Named once the real cut point is known (below).
+            _open_event_recordings[camera_number] = {"start": window.start, "end": window.end, "path": None}
         else:
-            destination = open_recording["path"]
             _open_event_recordings[camera_number]["end"] = window.end
 
         # recording_start is the ORIGINAL event's start (unchanged across
@@ -16387,29 +16384,35 @@ async def persist_event_recording(
                 camera_number, detector, trigger_id, recording_start.isoformat(), window.end.isoformat(),
             )
             return
-        first_source_start = sources[0][0]
-        # -c copy can only cut on keyframe boundaries, so this trims close
-        # to -- not frame-exact at -- the requested window, same trade-off
-        # build_motion_event_clip()'s own -ss/-t already accepts for its
-        # (re-encoded) output. Previously absent here: the concat ran on
-        # whole 30s buffer segments with no trim at all, so every saved
-        # clip carried up to one full segment's worth of untrimmed padding
-        # on each end.
-        offset_seconds = max(0.0, (recording_start - first_source_start).total_seconds())
-        duration_seconds = max(0.0, (window.end - recording_start).total_seconds())
+        # Cut on the keyframe at or before the requested start, inside the
+        # buffer segment holding it (a concat "inpoint" -- the demuxer
+        # ignores an -ss seek with stream copy), and label the recording
+        # with that keyframe's real time (local_recording_policy.
+        # keyframe_cut()). Clips, linked recordings and Playback all map
+        # time to position from that label, so it must be the truth.
+        from local_recording_policy import keyframe_cut, recording_name_time
+        first_index = max((i for i, (start, _) in enumerate(sources) if start <= recording_start), default=0)
+        sources = sources[first_index:]
+        keyframes = await asyncio.to_thread(_keyframe_times, sources[0][1])
+        inpoint, true_start = keyframe_cut(recording_start, sources[0][0], keyframes)
+        if _open_event_recordings[camera_number]["path"] is None:
+            camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+            camera_folder.mkdir(parents=True, exist_ok=True)
+            _open_event_recordings[camera_number]["path"] = (
+                camera_folder / f"camera{camera_number}_{recording_name_time(true_start):%Y-%m-%d_%H-%M-%S}.mkv")
+        _open_event_recordings[camera_number]["start"] = true_start
+        destination = _open_event_recordings[camera_number]["path"]
+        duration_seconds = max(0.0, (window.end - true_start).total_seconds())
         list_file = destination.with_suffix(".sources.txt")
         try:
-            list_file.write_text("".join(f"file '{source}'\n" for _, source in sources))
+            lines = [f"file '{sources[0][1]}'\n" + (f"inpoint {inpoint:.6f}\n" if inpoint > 0 else "")]
+            lines += [f"file '{source}'\n" for _, source in sources[1:]]
+            list_file.write_text("".join(lines))
             temp_output = destination.with_suffix(".tmp.mkv")
             result = await asyncio.to_thread(
                 subprocess.run,
-                # -ss BEFORE -i: with stream copy an output-side -ss drops
-                # packets up to the offset, so the file could begin mid-GOP
-                # and show nothing until the next keyframe -- the event's
-                # first seconds lost. Input-side seeking starts at the
-                # keyframe at or before the offset instead.
-                ["ffmpeg", "-y", "-ss", str(offset_seconds), "-f", "concat", "-safe", "0", "-i", str(list_file),
-                 "-t", str(duration_seconds),
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-t", f"{duration_seconds:.3f}",
                  "-c", "copy", str(temp_output)],
                 capture_output=True, timeout=60, check=False,
             )
@@ -16421,10 +16424,17 @@ async def persist_event_recording(
                 duration = await asyncio.to_thread(_probe_recording_duration_seconds, destination)
                 log.info(
                     "event_recording.persisted camera=%s detector=%s trigger_id=%s "
-                    "path=%s duration_seconds=%s",
-                    camera_number, detector, trigger_id, destination,
+                    "path=%s true_start=%s inpoint=%.3f duration_seconds=%s",
+                    camera_number, detector, trigger_id, destination, true_start.isoformat(), inpoint,
                     round(duration, 1) if duration is not None else None,
                 )
+                if duration is not None and abs(duration - duration_seconds) > 1.5:
+                    # The label no longer describes the content: say so.
+                    log.warning(
+                        "event_recording.duration_mismatch camera=%s trigger_id=%s path=%s "
+                        "expected_seconds=%.1f actual_seconds=%.1f",
+                        camera_number, trigger_id, destination, duration_seconds, duration,
+                    )
             else:
                 log.warning(
                     "event_recording.concat_failed camera=%s detector=%s trigger_id=%s "
@@ -142360,6 +142370,23 @@ def _row_to_recording_metadata(row: dict) -> dict:
         "name": row["s3_key"].rsplit("/", 1)[-1],
         "kind": "recording",
     }
+
+
+def _keyframe_times(path: Path) -> list[float]:
+    """Keyframe times (seconds) of one Event-mode buffer segment, for
+    persist_event_recording()'s cut point. Same appliance-wide ffprobe
+    budget as every other probe; [] on any failure (the cut then starts at
+    the segment's own first frame, which is always a keyframe)."""
+    try:
+        with _ffprobe_semaphore:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+                 "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+        return sorted(float(item.strip().rstrip(",")) for item in probe.stdout.split() if item.strip().rstrip(",") not in ("", "N/A"))
+    except Exception:  # any probe failure: no keyframe information
+        return []
 
 
 def _probe_recording_duration_seconds(path: Path) -> float | None:

@@ -206,7 +206,7 @@ def test_janitor_applies_the_detection_lookback():
     assert 'lookback_seconds=DETECTION_LOOKBACK_SECONDS + settings["post_roll_seconds"]' in inspect.getsource(main.event_buffer_janitor)
 
 
-def test_event_recording_cut_seeks_on_the_input_so_it_starts_on_a_keyframe(tmp_path, monkeypatch):
+def test_event_recording_is_cut_on_a_keyframe_and_labelled_with_its_true_start(tmp_path, monkeypatch):
     import main
     monkeypatch.setattr(main, "RECORDINGS_FOLDER", tmp_path / "recordings")
 
@@ -217,20 +217,26 @@ def test_event_recording_cut_seeks_on_the_input_so_it_starts_on_a_keyframe(tmp_p
     commands = []
 
     def fake_run(args, **kwargs):
-        commands.append(list(args))
         if "concat" in args:
+            commands.append((list(args), Path(args[args.index("-i") + 1]).read_text(encoding="utf-8")))
             Path(args[-1]).write_bytes(b"clip")
         return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
     buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
     buffer_folder.mkdir(parents=True)
     (buffer_folder / f"buf1_{T - timedelta(seconds=30):%Y-%m-%d_%H-%M-%S}.mkv").write_bytes(b"a")
     main._open_event_recordings.pop(1, None)
     main._event_recording_locks.pop(1, None)
     asyncio.run(main.persist_event_recording(1, T - timedelta(seconds=6), T))
-    command = next(c for c in commands if "concat" in c)
-    assert command.index("-ss") < command.index("-i")
-    assert float(command[command.index("-ss") + 1]) == 19.0  # (T-6-5) - (T-30)
-    assert float(command[command.index("-t") + 1]) == 16.0   # (T+5) - (T-11)
+    command, sources = commands[0]
+    # Requested start T-11 is 19 s into the segment; the last keyframe at or
+    # before it is 16 s, so the cut starts there (never after the request)
+    # and the recording is labelled with that true time, T-14.
+    assert "-ss" not in command  # the concat demuxer ignores -ss with stream copy
+    assert "inpoint 16.000000" in sources
+    assert float(command[command.index("-t") + 1]) == 19.0   # (T+5) - (T-14)
+    assert main._open_event_recordings[1]["start"] == T - timedelta(seconds=14)
+    assert main._open_event_recordings[1]["path"].name == f"camera1_{T - timedelta(seconds=14):%Y-%m-%d_%H-%M-%S}.mkv"
     main._open_event_recordings.pop(1, None)
