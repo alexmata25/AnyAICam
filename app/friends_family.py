@@ -192,6 +192,33 @@ def notify_administrator(request: dict, customer: Optional[dict]) -> dict:
                       subject=subject, text=text, html=html, metadata={"friends_family_request_id": request["id"]})
 
 
+def notify_customer_of_decision(request: dict, customer: Optional[dict]) -> dict:
+    """The customer hears the outcome (2026-10-01): before, a decision was
+    only visible if they reopened My subscription."""
+    approved = request["status"] == APPROVED
+    recipient = request.get("requested_by_email") or (customer or {}).get("email") or ""
+    from purchase_notifications import _first_name, _portal_url, _send_once
+    first = _first_name((customer or {}).get("name")) or "there"
+    link = _portal_url("/subscription-portal")
+    if approved:
+        subject = "Your Friends & Family discount is approved"
+        lead = approved_message().removeprefix("Approved: ")
+        body = (f"Hi {first},\n\nYour Friends & Family request is approved: {lead}\n"
+                f"It applies to your new checkouts. Continue from My subscription: {link}\n\nThe AnyAiCam team")
+        html = (f"<p>Hi {escape(first)},</p><p>Your Friends &amp; Family request is <strong>approved</strong>: {escape(lead)}</p>"
+                f'<p>It applies to your new checkouts. <a href="{escape(link, quote=True)}">Continue from My subscription</a>.</p><p>The AnyAiCam team</p>')
+    else:
+        subject = "About your Friends & Family request"
+        body = (f"Hi {first},\n\nYour Friends & Family request was not approved. You can check out at the regular "
+                f"price, or ask again from My subscription if something has changed: {link}\n\nThe AnyAiCam team")
+        html = (f"<p>Hi {escape(first)},</p><p>Your Friends &amp; Family request was not approved. You can check out at the "
+                f'regular price, or ask again from <a href="{escape(link, quote=True)}">My subscription</a> if something has changed.</p>'
+                "<p>The AnyAiCam team</p>")
+    return _send_once(event_id=f"friends-family-decision:{request['id']}", notification_type="friends_family_decision",
+                      customer_id=request["customer_id"], recipient_email=recipient, subject=subject, text=body, html=html,
+                      metadata={"friends_family_request_id": request["id"], "decision": request["status"]})
+
+
 # ------------------------------------------------------------------ pages
 
 CUSTOMER_PANEL_ID = "friends-family-panel"
@@ -240,11 +267,14 @@ def _review_page(request: dict, customer: Optional[dict]) -> str:
         for label, value in (
             ("Customer", customer_name),
             ("Email", escape(request.get("requested_by_email") or (customer or {}).get("email") or "")),
-            ("Account", escape(request["customer_id"])),
             ("Requested", f'<span data-local-time="{escape(request.get("requested_at") or "", quote=True)}">{when}</span>'),
             ("Customer note", escape(request.get("customer_note") or "None")),
             ("Status", escape(request["status"].title())),
-        )
+        ) + ((
+            ("Decided", f'<span data-local-time="{escape(request.get("decided_at") or "", quote=True)}">{escape((request.get("decided_at") or "")[:16].replace("T", " "))}</span>'),
+            ("Decided by", escape(request.get("decided_by") or "")),
+            ("Decision note", escape(request.get("decision_note") or "None")),
+        ) if decided else ())
     )
     percent = pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF
     actions = "" if decided else f'''
@@ -255,7 +285,6 @@ def _review_page(request: dict, customer: Optional[dict]) -> str:
   </div>
   <p class="health-detail" id="ff-result"></p>
   <script>
-  document.querySelectorAll('[data-local-time]').forEach(el=>{{const d=new Date(el.dataset.localTime);if(!isNaN(d))el.textContent=d.toLocaleString();}});
   async function decide(decision){{
     const out=document.getElementById('ff-result');
     document.getElementById('ff-approve').disabled=document.getElementById('ff-decline').disabled=true;
@@ -270,7 +299,8 @@ def _review_page(request: dict, customer: Optional[dict]) -> str:
     return f'''<header class="topbar"><div><p class="eyebrow">Administrator review</p><h1>Friends &amp; Family request</h1></div></header>
 <section class="panel"><table>{rows_html}</table>
 <p class="health-detail">Approving gives {percent["base"]}% off camera plans and {percent["analytics"]}% off analytics and Talk Down on this customer's new checkouts. Hardware is never discounted, promotion codes can't be combined with it, and no salesperson commission is paid on this customer's sales.</p>
-{actions}</section>'''
+{actions}</section>
+<script>document.querySelectorAll('[data-local-time]').forEach(el=>{{const d=new Date(el.dataset.localTime);if(!isNaN(d))el.textContent=d.toLocaleString();}});</script>'''
 
 
 def register_routes(app, shell) -> None:
@@ -285,6 +315,32 @@ def register_routes(app, shell) -> None:
     def administrator(request: Request) -> dict:
         from website_partner import _require_global_admin
         return _require_global_admin(request)
+
+    def administrator_page(request: Request):
+        """The emailed Review Request link is opened in whatever browser is
+        at hand. Signed out: Partner Portal sign-in, then straight back here.
+        Signed in as someone else (often the customer account itself): say
+        so, and offer to switch -- never a bare JSON error."""
+        from fastapi.responses import RedirectResponse
+        from urllib.parse import quote
+        here = quote(request.url.path, safe="/")
+        identity = partner_identity(request)
+        if not identity:
+            return None, RedirectResponse(f"/partner.html?next={here}", status_code=303)
+        try:
+            return administrator(request), None
+        except HTTPException:
+            who = escape(identity.get("email") or "this account")
+            content = (
+                '<header class="topbar"><div><p class="eyebrow">Administrator review</p><h1>Friends &amp; Family request</h1></div></header>'
+                '<section class="panel"><h2>Platform administrator sign-in needed</h2>'
+                f'<p class="health-detail">You are signed in as {who}, which cannot review Friends &amp; Family requests. '
+                'Sign in with the AnyAiCam platform administrator account to open this request.</p>'
+                '<button class="action-button" id="ff-switch" type="button">Sign in as administrator</button></section>'
+                '<script>document.getElementById("ff-switch").addEventListener("click",async()=>{'
+                'try{await fetch("/partner-logout",{method:"POST"});}catch(e){}'
+                f'location.href="/partner.html?next={here}";}});</script>')
+            return None, HTMLResponse(shell("Friends & Family request", "admin-portal", content), status_code=403)
 
     @app.get("/api/customer/friends-family")
     def friends_family_status(request: Request) -> dict:
@@ -308,7 +364,9 @@ def register_routes(app, shell) -> None:
 
     @app.get("/admin/friends-family", response_class=HTMLResponse)
     def friends_family_admin_list(request: Request):
-        administrator(request)
+        _identity, page = administrator_page(request)
+        if page:
+            return page
         items = rows("SELECT r.*, c.name AS customer_name FROM friends_family_requests r "
                      "LEFT JOIN customers c ON c.id=r.customer_id ORDER BY r.requested_at DESC LIMIT 200")
         body = "".join(
@@ -322,7 +380,9 @@ def register_routes(app, shell) -> None:
 
     @app.get("/admin/friends-family/{request_id}", response_class=HTMLResponse)
     def friends_family_review(request_id: str, request: Request):
-        administrator(request)  # viewing never changes anything
+        _identity, page = administrator_page(request)  # viewing never changes anything
+        if page:
+            return page
         record = row("SELECT * FROM friends_family_requests WHERE id=?", (request_id,))
         if not record:
             raise HTTPException(status_code=404, detail="Request not found.")
@@ -346,4 +406,8 @@ def register_routes(app, shell) -> None:
             raise HTTPException(status_code=404, detail="Request not found.")
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error))
+        try:
+            notify_customer_of_decision(record, row("SELECT * FROM customers WHERE id=?", (record["customer_id"],)))
+        except Exception:
+            pass  # the decision is saved either way; My subscription shows it
         return {"status": record["status"], "request_id": record["id"], "decided_at": record["decided_at"]}
