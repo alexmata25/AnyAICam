@@ -19,7 +19,9 @@ one exists for them.
 """
 from __future__ import annotations
 
-from datetime import datetime
+import os
+import secrets
+from datetime import datetime, timedelta
 from html import escape
 from typing import Callable
 
@@ -39,6 +41,18 @@ from partner_db import connection
 from partner_portal import partner_identity
 
 CUSTOMER_ROLES = {"customer_owner", "customer_viewer"}
+
+
+def _test_sms_limit_reached(db, *, user_id: str) -> bool:
+    """Each "Send test SMS" click is a paid message to a typed-in number:
+    at most ANYAICAM_SMS_TEST_MAX_PER_HOUR (default 3) per user per hour."""
+    try:
+        limit = max(1, int(os.environ.get("ANYAICAM_SMS_TEST_MAX_PER_HOUR", "3")))
+    except ValueError:
+        limit = 3
+    since = (datetime.now() - timedelta(hours=1)).isoformat()
+    sent = db.execute("SELECT COUNT(*) FROM sms_test_sends WHERE user_id=? AND created_at>=?", (user_id, since)).fetchone()[0]
+    return sent >= limit
 
 
 def _camera_context(db, identity: dict) -> tuple[str, set[str]]:
@@ -122,6 +136,7 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
           <div class="panel-head"><h2>SMS / text message</h2></div>
           <label><input type="checkbox" id="notif-sms-enabled"> Enable SMS notifications</label>
           <label>Notification mobile number<input id="notif-phone-number" placeholder="+15551234567"></label>
+          <div class="health-detail" id="notif-sms-consent">By enabling SMS you agree to receive AnyAiCam security texts at this number: intrusion alarms, visitor calls and camera or system problems. Everyday detections stay in the app, push and email. Message frequency varies. Message and data rates may apply. Reply STOP to opt out or HELP for help.</div>
           <div class="health-detail" id="notif-phone-verified-status">Unverified</div>
           <button class="ghost-button" type="button" id="notif-test-sms">Send test SMS</button>
           <div class="health-detail" id="notif-test-sms-result"></div>
@@ -206,7 +221,7 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
         });
         document.getElementById('notif-test-sms').addEventListener('click',async()=>{
           const response=await fetch('/api/customer/notifications/test-sms',{method:'POST'}),r=await response.json();
-          document.getElementById('notif-test-sms-result').textContent=r.message;if(response.ok)loadPreferences();
+          document.getElementById('notif-test-sms-result').textContent=r.message||r.detail||'Test SMS could not be sent.';if(response.ok)loadPreferences();
         });
         loadPreferences();
         </script>'''
@@ -296,11 +311,17 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
             preferences = get_preferences(db, user_id=user_id)
             if not preferences["phone_number"]:
                 raise HTTPException(status_code=400, detail="Save a notification mobile number first.")
+            if _test_sms_limit_reached(db, user_id=user_id):
+                raise HTTPException(status_code=429, detail="Test SMS limit reached. Please try again in an hour.")
             result = get_sms_service().send(
                 "notification_test", preferences["phone_number"],
                 "AnyAiCam test notification: SMS alerts are working for your account.",
             )
             status = result.get("status", "unavailable")
+            db.execute(
+                "INSERT INTO sms_test_sends(id,user_id,customer_id,status,created_at) VALUES(?,?,?,?,?)",
+                (secrets.token_hex(12), user_id, identity.get("customer_id"), status, datetime.now().isoformat()),
+            )
             if status == "sent":
                 mark_phone_verified(db, user_id=user_id, now=datetime.now().isoformat())
         message = {
@@ -308,5 +329,6 @@ def register_notification_settings_routes(app: FastAPI, shell: Callable) -> None
             "preview": "No SMS provider is configured yet -- this test was written to the local preview log, not delivered.",
             "unavailable": "SMS delivery is not configured yet.",
             "failed": result.get("detail") or "Test SMS could not be delivered.",
+            "rejected": "This number cannot receive texts from AnyAiCam (invalid, not a mobile number, or it replied STOP).",
         }.get(status, "Test SMS could not be delivered.")
         return {"status": status, "message": message}

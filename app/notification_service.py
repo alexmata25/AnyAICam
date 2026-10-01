@@ -55,7 +55,8 @@ class SmsChannel(NotificationChannel):
     # real, event-triggered fanout path here never did.
     def send(self,notification,recipient):
         result=get_sms_service().send('appliance_alert',recipient,notification.get('message') or notification['title'])
-        return {'channel':'sms','status':result['status'],'provider':'twilio' if result['status']=='sent' else 'configured_sms','error':result.get('detail')}
+        return {'channel':'sms','status':result['status'],'provider':result.get('provider') or 'configured_sms','error':result.get('detail'),
+                'provider_message_id':result.get('provider_message_id'),'provider_error_code':result.get('provider_error_code')}
 
 
 CHANNELS={'in_app':InAppChannel(),'email':EmailChannel(),'web_push':WebPushPreparation(),'sms':SmsChannel()}

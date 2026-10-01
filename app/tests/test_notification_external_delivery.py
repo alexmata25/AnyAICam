@@ -132,7 +132,8 @@ def test_email_enabled_and_event_type_selected_reaches_the_provider(fake_channel
     assert deliveries["email"]["attempt"] == 1
 
 
-def test_sms_enabled_and_event_type_selected_reaches_the_provider(fake_channels):
+def test_sms_enabled_and_event_type_selected_reaches_the_provider(fake_channels, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_SMS_ALERT_EVENT_TYPES", "smart_motion")  # operator widened SMS to this type
     with connection() as db:
         user_id = _seed(db)
         _set_preferences(db, user_id=user_id, customer_id="cust-1", phone_number="+15551234567", sms_enabled=True, event_types=["smart_motion"])

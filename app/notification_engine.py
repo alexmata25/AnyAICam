@@ -89,6 +89,51 @@ def email_alert_allowed(event_type: str) -> bool:
     return allowed is None or event_type in allowed
 
 
+# SMS is for what needs a phone to buzz now (2026-10-01). On staging the
+# shared event-type list produced up to 345 texts a day for one customer,
+# almost all person/motion/PPE/Smart Motion. Ordinary detections stay on
+# push, email and in-app; SMS carries these types unless the operator sets
+# ANYAICAM_SMS_ALERT_EVENT_TYPES. intrusion_alarm is always eligible.
+DEFAULT_SMS_ALERT_EVENT_TYPES = frozenset({'intrusion_alarm', 'aac_voice_call', 'camera_offline', 'appliance_offline', 'storage_problem'})
+
+
+def _sms_alert_event_types() -> frozenset[str]:
+    raw = os.environ.get("ANYAICAM_SMS_ALERT_EVENT_TYPES", "")
+    types = frozenset(item.strip() for item in raw.split(",") if item.strip())
+    return types or DEFAULT_SMS_ALERT_EVENT_TYPES
+
+
+def sms_alert_allowed(event_type: str) -> bool:
+    return event_type in EMERGENCY_EVENT_TYPES or event_type in _sms_alert_event_types()
+
+
+def _sms_daily_cap() -> int:
+    """Non-emergency SMS per user per rolling 24 hours
+    (ANYAICAM_SMS_DAILY_CAP_PER_USER, default 20; 0 = no cap)."""
+    try:
+        return max(0, int(os.environ.get("ANYAICAM_SMS_DAILY_CAP_PER_USER", "20")))
+    except ValueError:
+        return 20
+
+
+def sms_daily_cap_reached(db, *, user_id: str, now: datetime) -> bool:
+    """First attempts of non-emergency SMS for this user in the last 24
+    hours, whatever their outcome; skipped rows and retries do not count.
+    An INTRUSION ALARM is never capped and never counted."""
+    cap = _sms_daily_cap()
+    if cap <= 0:
+        return False
+    from datetime import timedelta
+    emergency = sorted(EMERGENCY_EVENT_TYPES)
+    sent = db.execute(
+        "SELECT COUNT(*) FROM notification_deliveries d JOIN notifications n ON n.id=d.notification_id "
+        "WHERE n.user_id=? AND d.channel='sms' AND d.attempt=1 AND d.status NOT LIKE 'skipped%' "
+        f"AND n.event_type NOT IN ({','.join('?' for _ in emergency)}) AND d.created_at>=?",
+        (user_id, *emergency, (now - timedelta(days=1)).isoformat()),
+    ).fetchone()[0]
+    return sent >= cap
+
+
 def _quiet_hours_clock(now: datetime, tz=None) -> str:
     """HH:MM in the customer's local time zone (the same zone alert emails
     display, notification_email._display_timezone()) for the quiet-hours
@@ -200,7 +245,7 @@ def _external_channels(db,*,user,customer_id: str,camera_id: str | None,event_ty
         return disabled
     return {
         'email':bool(prefs['email_enabled'] and prefs['email_address'] and email_alert_allowed(event_type)),
-        'sms':bool(prefs['sms_enabled'] and prefs['phone_number']),
+        'sms':bool(prefs['sms_enabled'] and prefs['phone_number'] and sms_alert_allowed(event_type)),
         'email_address':prefs['email_address'],
         'phone_number':prefs['phone_number'],
     }
@@ -330,8 +375,13 @@ def fanout_appliance_event(appliance: dict,event: dict):
                     # deadline): notification_retry_worker.send_pending_media_emails().
                     with connection() as db: db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,'email','pending_media','configured_email',None,recipients['email'],0,now.isoformat()))
                     continue
+            if channel=='sms' and event_type not in EMERGENCY_EVENT_TYPES:
+                with connection() as db:
+                    if sms_daily_cap_reached(db,user_id=user['id'],now=now):
+                        db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,'sms','skipped_daily_cap','configured_sms',None,recipients['sms'],0,now.isoformat()))
+                        continue
             try: result=CHANNELS[channel].send(notification,recipients[channel])
             except Exception as error: result={'channel':channel,'status':'error','provider':'configured','error':str(error)}
-            with connection() as db: db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,channel,result['status'],result.get('provider'),result.get('error'),recipients[channel],1,now.isoformat()))
+            with connection() as db: db.execute('INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at,provider_message_id,provider_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(secrets.token_hex(12),notification_id,channel,result['status'],result.get('provider'),result.get('error'),recipients[channel],1,now.isoformat(),result.get('provider_message_id'),result.get('provider_error_code')))
         created+=1
     return created

@@ -1619,3 +1619,13 @@ def apply_migrations():
         if 'recipient' not in notification_delivery_columns: db.execute('ALTER TABLE notification_deliveries ADD COLUMN recipient TEXT')
         if 'attempt' not in notification_delivery_columns: db.execute('ALTER TABLE notification_deliveries ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1')
         db.execute('CREATE INDEX IF NOT EXISTS idx_notification_deliveries_notification_channel ON notification_deliveries(notification_id,channel,created_at)')
+
+        # SMS production safety (2026-10-01): the provider's own message ID
+        # (Twilio "SM...") and error code for each attempt, so a delivery
+        # can be traced at the provider and a STOP/invalid number is
+        # visible. NULL for every other channel and every older row.
+        if 'provider_message_id' not in notification_delivery_columns: db.execute('ALTER TABLE notification_deliveries ADD COLUMN provider_message_id TEXT')
+        if 'provider_error_code' not in notification_delivery_columns: db.execute('ALTER TABLE notification_deliveries ADD COLUMN provider_error_code TEXT')
+        # Every "Send test SMS" click, for its per-user hourly limit.
+        db.execute('CREATE TABLE IF NOT EXISTS sms_test_sends(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,customer_id TEXT,status TEXT NOT NULL,created_at TEXT NOT NULL)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_sms_test_sends_user ON sms_test_sends(user_id,created_at)')

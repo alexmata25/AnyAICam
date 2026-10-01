@@ -110,8 +110,12 @@ def retry_failed_deliveries() -> dict:
             continue
         # The operator email allowlist applies to retries too, so narrowing
         # email alerts can never be undone by re-sending older failures.
-        from notification_engine import email_alert_allowed
+        from notification_engine import email_alert_allowed, sms_alert_allowed
         if delivery["channel"] == "email" and not email_alert_allowed(str(notification["event_type"] or "")):
+            continue
+        # The same for the SMS allowlist: an older failed person/motion SMS
+        # is never re-sent once SMS is narrowed to urgent types.
+        if delivery["channel"] == "sms" and not sms_alert_allowed(str(notification["event_type"] or "")):
             continue
         notification = {key: notification[key] for key in ("id", "title", "message")}
         attempted += 1
@@ -124,12 +128,13 @@ def retry_failed_deliveries() -> dict:
         import secrets
         with connection() as db:
             db.execute(
-                "INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO notification_deliveries(id,notification_id,channel,status,provider,error,recipient,attempt,created_at,"
+                "provider_message_id,provider_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     secrets.token_hex(12), delivery["notification_id"], delivery["channel"],
                     result["status"], result.get("provider"), result.get("error"),
                     delivery["recipient"], delivery["attempt"] + 1, now.isoformat(),
+                    result.get("provider_message_id"), result.get("provider_error_code"),
                 ),
             )
         logger.info(
