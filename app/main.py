@@ -16578,6 +16578,36 @@ def delete_expired_recordings() -> None:
             continue
 
     delete_expired_event_media(cutoff)
+    prune_expired_in_app_alerts(cutoff)
+
+
+def prune_expired_in_app_alerts(cutoff: datetime) -> None:
+    """in_app_alerts.jsonl is append-only (every event plus repeated health
+    alerts: 133,000 lines in 19 days on the Ryzen); keep RETENTION_DAYS of
+    it like motion_events.jsonl. Rewritten only when something expired;
+    lines that cannot be dated are kept."""
+    if not IN_APP_ALERTS_FILE.exists():
+        return
+    try:
+        lines = IN_APP_ALERTS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    kept = []
+    for line in lines:
+        try:
+            if datetime.fromisoformat(json.loads(line)["timestamp"]) < cutoff:
+                continue
+        except (KeyError, TypeError, ValueError):
+            pass
+        kept.append(line)
+    if len(kept) == len(lines):
+        return
+    temporary = IN_APP_ALERTS_FILE.with_suffix(".tmp")
+    try:
+        temporary.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+        os.replace(temporary, IN_APP_ALERTS_FILE)
+    except OSError as error:
+        print(f"Could not prune in-app alerts: {error}")
 
 
 def delete_expired_event_media(cutoff: datetime) -> None:

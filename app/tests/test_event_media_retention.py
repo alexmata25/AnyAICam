@@ -65,15 +65,35 @@ def test_the_hourly_retention_pass_includes_event_media(root, monkeypatch):
     monkeypatch.setattr(main, "RETENTION_DAYS", 7)
     calls = []
     monkeypatch.setattr(main, "delete_expired_event_media", lambda cutoff: calls.append(cutoff))
+    monkeypatch.setattr(main, "prune_expired_in_app_alerts", lambda cutoff: calls.append(cutoff))
     from database_backend import override_target
     from partner_db import initialize_database
     with override_target(sqlite_path=str(root.parent / "retention.db")):
         initialize_database()
         main.delete_expired_recordings()
-    assert len(calls) == 1
+    assert len(calls) == 2 and calls[0] == calls[1]
     assert abs((datetime.now() - timedelta(days=7) - calls[0]).total_seconds()) < 60
 
 
 def test_nothing_happens_without_the_folders(root):
     main.delete_expired_event_media(datetime.now())
     assert list(root.iterdir()) == []
+
+
+def test_in_app_alerts_keep_only_the_retention_window(root, monkeypatch):
+    import json as _json
+    alerts = root / "in_app_alerts.jsonl"
+    monkeypatch.setattr(main, "IN_APP_ALERTS_FILE", alerts)
+    now = datetime.now()
+    rows = [{"id": "old", "timestamp": (now - timedelta(days=9)).isoformat()},
+            {"id": "new", "timestamp": (now - timedelta(days=1)).isoformat()},
+            {"id": "undated"}]
+    alerts.write_text("".join(_json.dumps(row) + "\n" for row in rows) + "not json\n", encoding="utf-8")
+
+    main.prune_expired_in_app_alerts(now - timedelta(days=7))
+
+    lines = alerts.read_text(encoding="utf-8").splitlines()
+    assert [_json.loads(line)["id"] for line in lines[:2]] == ["new", "undated"] and lines[2] == "not json"
+    stamp = alerts.stat().st_mtime
+    main.prune_expired_in_app_alerts(now - timedelta(days=7))  # nothing expired: not rewritten
+    assert alerts.stat().st_mtime == stamp
