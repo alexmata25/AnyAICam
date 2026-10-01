@@ -41964,6 +41964,11 @@ CLOUD_PARTNER_NAV_PATH_PREFIXES = (
     "/partner-pricing-admin",
     "/partner-applications",
     "/admin-portal",
+    # Friends & Family review (2026-10-01): the emailed Review Request link
+    # sent a signed-out reviewer to the appliance's emergency /login, whose
+    # local session the review page cannot accept ("Partner authorization
+    # required").
+    "/admin/friends-family",
 )
 
 
