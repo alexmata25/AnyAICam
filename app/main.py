@@ -76438,7 +76438,7 @@ async function updateDashboard(){
 
 
 
-        document.getElementById('memory-metric').textContent=metrics.memory_percent+'%';}
+        document.getElementById('memory-metric').textContent=metrics.memory_percent+'%';
 
 
 
@@ -76465,7 +76465,7 @@ async function updateDashboard(){
 
 
 
-        document.getElementById('storage-detail').textContent=metrics.storage_percent+'% of disk in use · retention active';
+        document.getElementById('storage-detail').textContent=metrics.storage_percent+'% of disk in use · retention active';}
 
 
 
