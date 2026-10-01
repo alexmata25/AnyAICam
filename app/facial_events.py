@@ -474,7 +474,13 @@ def record_facial_events(
                     confidence=confidence,
                     matched_person_id=accepted.person_id if accepted else None,
                     matched_watchlist_id=(matched_watchlist or {}).get("id"),
-                    relay_provider=relay_provider,
+                    # Per-camera routing (2026-09-25): a door configured in
+                    # access_control.py gets the service's automatic-trigger
+                    # checks (known lock state, controller online, one
+                    # command at a time, timed relock); any other door keeps
+                    # the provider it was given.
+                    relay_provider=door_access.CameraDoorProvider(
+                        context, relay_provider, person_id=accepted.person_id if accepted else None),
                     detection_event_id=event["detection_event_id"],
                     current_time=_hhmm(now),
                 )
