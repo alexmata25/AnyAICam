@@ -85,7 +85,7 @@ def test_the_review_page_shows_details_and_no_internal_ids(portal, db_path):
 
 
 @pytest.mark.parametrize("decision,status,subject_part,body_part", [
-    ("approve", "approved", "approved", "off your camera plan"),
+    ("approve", "approved", "approved", "50% off AnyAiCam VMS software and camera plans"),
     ("decline", "declined", "About your Friends & Family request", "regular price"),
 ])
 def test_the_decision_is_saved_shown_and_emailed_to_the_customer(portal, db_path, decision, status, subject_part, body_part):

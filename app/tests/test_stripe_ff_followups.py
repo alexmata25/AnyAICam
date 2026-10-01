@@ -155,8 +155,9 @@ def test_setup_tabs_are_real_navigation(portal, db_path):
 def test_approved_message_names_everything_not_discounted():
     import friends_family
     message = friends_family.approved_message()
-    assert message == ("Approved: 50% off your camera plan and 25% off analytics packages and Talk Down. "
-                       "Hardware, VMS software licenses and Face Access are not discounted.")
+    assert message == ("Approved: 50% off AnyAiCam VMS software and camera plans, and 25% off analytics packages, "
+                       "Talk Down and Face Access. Hardware (appliances, cameras, relay modules and other devices) "
+                       "is not discounted.")
 
 
 def test_approved_customer_gets_the_catalog_message(portal, db_path):
@@ -166,7 +167,8 @@ def test_approved_customer_gets_the_catalog_message(portal, db_path):
     client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
     status = client.get("/api/customer/friends-family", cookies=_cookie(*OWNER)).json()
     assert status["status"] == "approved"
-    assert "VMS software licenses" in status["approved_message"] and "Face Access" in status["approved_message"]
+    assert "50% off AnyAiCam VMS software" in status["approved_message"] and "Face Access" in status["approved_message"]
+    assert "Hardware (appliances, cameras, relay modules and other devices) is not discounted." in status["approved_message"]
     html = client.get("/subscription-portal", cookies=_cookie(*OWNER)).text
     assert "Hardware is not discounted." not in html  # the old, incomplete wording
 

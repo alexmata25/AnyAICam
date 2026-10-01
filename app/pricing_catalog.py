@@ -132,12 +132,20 @@ FACE_ACCESS_ENTERPRISE = "enterprise"
 # --------------------------------------------------------------------------
 # 9. Friends & Family (approved by an administrator, never a promo code).
 # --------------------------------------------------------------------------
-# The one-time VMS license and Face Access get no Friends & Family discount
-# (owner decision 2026-09-30, "0% for now").
-FRIENDS_FAMILY_PERCENT_OFF = {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0, "face_access": 0}
+# Owner rule (2026-10-01): every AnyAiCam software product is discounted,
+# nothing physical is. 50% off the AnyAiCam VMS software license and the
+# camera-slot plans; 25% off analytics and add-on software (analytics
+# packages, Talk Down, Face Access); 0% on hardware -- appliances, cameras,
+# relay modules and any other device. Never stacked with a promotion code,
+# and never commissionable (sales_commissions.py).
+FRIENDS_FAMILY_PERCENT_OFF = {"base": 50, "vms_license": 50, "analytics": 25, "face_access": 25, "hardware": 0}
+# One Stripe percent-off coupon per percentage, shared by the classes that
+# use it (both are plain percent-off coupons with no product restriction).
 FRIENDS_FAMILY_COUPON_ENV = {
     "base": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE",
+    "vms_license": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE",
     "analytics": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS",
+    "face_access": "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS",
 }
 
 # --------------------------------------------------------------------------

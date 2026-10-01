@@ -11,8 +11,9 @@ Flow (2026-09-30):
    (GET) only shows the request; approving or declining is a separate,
    CSRF-protected POST that requires a live global administrator grant.
 4. The customer's page polls the status and shows Approved/Declined.
-5. Approved: base plans 50% off, analytics packages/Talk Down 25% off,
-   hardware 0% (pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF). Applied as
+5. Approved: AnyAiCam VMS software license and camera plans 50% off;
+   analytics packages, Talk Down and Face Access 25% off; hardware 0%
+   (pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF). Applied as
    server-side Stripe coupons on that customer's own Checkout Sessions --
    there is no code a customer could share -- and customer promotion
    codes are switched off on those sessions, so discounts never stack.
@@ -58,21 +59,45 @@ def is_approved(customer_id: str) -> bool:
     return status_for(customer_id) == APPROVED
 
 
-_DISCOUNTED_WHAT = {"base": "your camera plan", "analytics": "analytics packages and Talk Down"}
-_UNDISCOUNTED_WHAT = {"hardware": "Hardware", "vms_license": "VMS software licenses", "face_access": "Face Access"}
+# Customer-facing names per discount class, in the order they are listed.
+_CLASS_WHAT = {
+    "vms_license": "AnyAiCam VMS software",
+    "base": "camera plans",
+    "analytics": "analytics packages",
+    "face_access": "Face Access",
+}
+_HARDWARE_WHAT = "Hardware (appliances, cameras, relay modules and other devices)"
+
+
+def _listed(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def discount_summary() -> str:
+    """'50% off AnyAiCam VMS software and camera plans, and 25% off analytics
+    packages, Talk Down and Face Access. Hardware (...) is not discounted.'
+    Built from the same percentages checkout applies, so the two can never
+    disagree."""
+    percent = pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF
+    groups: dict[int, list[str]] = {}
+    for discount_class, what in _CLASS_WHAT.items():
+        if percent.get(discount_class):
+            groups.setdefault(percent[discount_class], []).append(what)
+            if discount_class == "analytics":
+                groups[percent[discount_class]].append("Talk Down")
+    parts = [f"{value}% off {_listed(items)}" for value, items in sorted(groups.items(), reverse=True)]
+    full = [what for discount_class, what in _CLASS_WHAT.items() if not percent.get(discount_class)]
+    if not percent.get("hardware"):
+        full.append(_HARDWARE_WHAT)
+    summary = (", and ".join(parts) + ".") if parts else ""
+    if full:
+        summary += f" {_listed(full)} {'is' if len(full) == 1 else 'are'} not discounted."
+    return summary.strip()
 
 
 def approved_message() -> str:
-    """What an approved customer is told, built from the same percentages
-    checkout applies, so the two can never disagree."""
-    percent = pricing_catalog.FRIENDS_FAMILY_PERCENT_OFF
-    off = [f"{percent[c]}% off {what}" for c, what in _DISCOUNTED_WHAT.items() if percent.get(c)]
-    full = [what for c, what in _UNDISCOUNTED_WHAT.items() if not percent.get(c)]
-    message = "Approved: " + " and ".join(off) + "." if off else "Approved."
-    if full:
-        listed = full[0] if len(full) == 1 else ", ".join(full[:-1]) + " and " + full[-1]
-        message += f" {listed} {'is' if len(full) == 1 else 'are'} not discounted."
-    return message
+    """What an approved customer is told."""
+    return "Approved: " + discount_summary()
 
 
 def customer_status(customer_id: str) -> dict:
@@ -298,7 +323,7 @@ def _review_page(request: dict, customer: Optional[dict]) -> str:
   </script>'''
     return f'''<header class="topbar"><div><p class="eyebrow">Administrator review</p><h1>Friends &amp; Family request</h1></div></header>
 <section class="panel"><table>{rows_html}</table>
-<p class="health-detail">Approving gives {percent["base"]}% off camera plans and {percent["analytics"]}% off analytics and Talk Down on this customer's new checkouts. Hardware is never discounted, promotion codes can't be combined with it, and no salesperson commission is paid on this customer's sales.</p>
+<p class="health-detail">Approving gives this customer, on their new checkouts: {escape(discount_summary())} Promotion codes can't be combined with it, and no salesperson commission is paid on this customer's sales.</p>
 {actions}</section>
 <script>document.querySelectorAll('[data-local-time]').forEach(el=>{{const d=new Date(el.dataset.localTime);if(!isNaN(d))el.textContent=d.toLocaleString();}});</script>'''
 

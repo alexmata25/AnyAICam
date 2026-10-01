@@ -100,13 +100,19 @@ def test_cloud_overflow_has_no_invented_price_and_is_not_bundled():
 
 
 def test_friends_family_percentages_and_quote():
-    # The one-time VMS license has no approved Friends & Family discount (0%).
-    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "analytics": 25, "hardware": 0, "vms_license": 0, "face_access": 0}
-    quote = pc.quote(plan_type="local", tier_label="1-8", addon_keys=["advanced_analytics"], friends_family_approved=True)
+    # Owner rule 2026-10-01: software discounted, hardware never.
+    assert pc.FRIENDS_FAMILY_PERCENT_OFF == {"base": 50, "vms_license": 50, "analytics": 25, "face_access": 25, "hardware": 0}
+    quote = pc.quote(plan_type="local", tier_label="1-8", addon_keys=["advanced_analytics"], friends_family_approved=True,
+                     with_appliance=False)
     base, advanced = quote["lines"]
     assert base["cents"] == 1499 - 750  # 50% of $14.99, rounded to the cent like Stripe
     assert advanced["cents"] == 2499 - 625  # 25% of $24.99
     assert quote["monthly_list_cents"] == 3998
+    (license_line,) = quote["one_time_lines"]
+    assert license_line["cents"] == 4999 - 2500  # VMS software license, 50% of $49.99
+    # An appliance-included license stays $0, and nobody else gets a discount.
+    assert pc.quote(plan_type="local", tier_label="1-8", friends_family_approved=True, with_appliance=True)["one_time_cents"] == 0
+    assert pc.quote(plan_type="local", tier_label="1-8", with_appliance=False)["one_time_cents"] == 4999
 
 
 def test_public_catalog_exposes_prices_but_no_stripe_ids_or_commissions():
@@ -799,6 +805,12 @@ def test_price_script_creates_new_prices_at_catalog_amounts_and_one_time_license
     assert all(str(i["amount"]) in i["lookup_key"] for i in items.values())
     coupons = {c["env"]: c["percent_off"] for c in script.catalog_coupons()}
     assert coupons == {"ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_BASE": 50, "ANYAICAM_STRIPE_COUPON_FRIENDS_FAMILY_ANALYTICS": 25}
+    # Every discounted class uses a coupon of exactly its own percentage, so a
+    # shared coupon can never give a class the wrong discount.
+    for discount_class, percent in pc.FRIENDS_FAMILY_PERCENT_OFF.items():
+        if percent:
+            assert coupons[pc.FRIENDS_FAMILY_COUPON_ENV[discount_class]] == percent, discount_class
+    assert "hardware" not in pc.FRIENDS_FAMILY_COUPON_ENV
 
 
 def test_price_script_refuses_live_keys(monkeypatch, capsys):
@@ -879,7 +891,7 @@ def test_face_access_is_sold_in_the_customers_size_billed_per_door(face_portal, 
     assert "discounts[0][coupon]" not in captured[-1]
 
 
-def test_face_access_gets_no_friends_family_discount(face_portal, db_path):
+def test_face_access_gets_the_25_percent_add_on_discount(face_portal, db_path):
     client, captured, sent = face_portal
     _seed(db_path)
     _doors(db_path, ["cam-1"])  # billed per door: a door must exist to buy it
@@ -887,8 +899,40 @@ def test_face_access_gets_no_friends_family_discount(face_portal, db_path):
     client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
     response = client.post("/api/customer/analytics/checkout", json={"addon_key": "face_access_small"}, cookies=_cookie(*OWNER))
     assert response.status_code == 200
-    assert "discounts[0][coupon]" not in captured[-1]
+    assert captured[-1]["discounts[0][coupon]"] == "coupon_ff_analytics"
+    assert "allow_promotion_codes" not in captured[-1]  # never stacked with a promotion code
     assert captured[-1]["metadata[anyaicam_friends_family]"] == "approved"
+
+
+def test_approved_diy_customer_gets_50_percent_off_the_vms_software_license(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    request_id = client.post("/api/customer/friends-family/request", json={}, cookies=_cookie(*OWNER)).json()["request_id"]
+    client.post(f"/api/admin/friends-family/{request_id}/decision", json={"decision": "approve"}, cookies=_make_global_admin(db_path))
+    response = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
+    assert response.status_code == 200, response.text
+    assert captured[-1]["discounts[0][coupon]"] == "coupon_ff_base"
+    assert "allow_promotion_codes" not in captured[-1]
+    assert captured[-1]["metadata[anyaicam_friends_family]"] == "approved"
+
+
+def test_without_friends_family_the_license_is_full_price_and_promo_codes_stay_available(license_portal, db_path):
+    client, captured, sent = license_portal
+    _seed(db_path)
+    response = client.post("/api/customer/vms-license/checkout", json={"capacity": 8}, cookies=_cookie(*OWNER))
+    assert response.status_code == 200, response.text
+    assert "discounts[0][coupon]" not in captured[-1]
+    assert captured[-1]["allow_promotion_codes"] == "true"
+
+
+def test_hardware_is_never_friends_family_discounted():
+    assert pc.friends_family_percent("hardware") == 0
+    # The hardware checkout never consults Friends & Family and never takes a code.
+    import inspect
+    import main
+    hardware_checkout = inspect.getsource(main.create_hardware_checkout)
+    assert "friends_family" not in hardware_checkout and "discounts[" not in hardware_checkout
+    assert '("allow_promotion_codes", "false")' in hardware_checkout
 
 
 def test_over_500_people_is_enterprise_contact_not_an_online_purchase(face_portal, db_path):
