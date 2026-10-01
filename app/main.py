@@ -52917,24 +52917,20 @@ def system_metrics() -> dict:
 
 
 
+def _cloud_customer_session(request: Request) -> bool:
+    """A customer signed in to the cloud portal: this host's own CPU/disk and
+    alert log are the cloud's, not theirs (2026-10-01), so host-level APIs
+    refuse them; their appliance's health comes from its heartbeat."""
+    if RUNTIME_ROLE != "cloud":
+        return False
+    from partner_portal import partner_identity
+    return (partner_identity(request) or {}).get("role") in {"customer_owner", "customer_viewer"}
+
+
 @app.get("/api/system/metrics")
-
-
-
-
-
-
-
-
-def metrics_api() -> dict:
-
-
-
-
-
-
-
-
+def metrics_api(request: Request) -> dict:
+    if _cloud_customer_session(request):
+        raise HTTPException(status_code=403, detail="Not available for customer accounts.")
     return system_metrics()
 
 
@@ -54043,15 +54039,9 @@ def update_alert_rule(camera_number: int, rule: AlertRuleModel, http_request: Re
 
 
 @app.get("/api/alerts")
-
-
-
-
-
-
-
-
-def in_app_alerts(limit: int = 100) -> dict:
+def in_app_alerts(request: Request, limit: int = 100) -> dict:
+    if _cloud_customer_session(request):
+        raise HTTPException(status_code=403, detail="Not available for customer accounts.")
 
 
 
@@ -75042,6 +75032,52 @@ def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, f
         '</article>'
     )
 
+def _customer_appliance_health(customer_id: str) -> dict:
+    """The customer's own appliance(s), from their last heartbeat."""
+    from partner_db import connection
+    with connection() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT state, cpu, memory, disk_capacity, disk FROM appliances WHERE customer_id=?",
+            (customer_id,),
+        ).fetchall()]
+    online = [row for row in rows if row.get("state") == "online"]
+    reporting = [row for row in rows if float(row.get("disk_capacity") or 0) > 0]
+    capacity = sum(float(row["disk_capacity"]) for row in reporting)
+    used = sum(min(float(row.get("disk") or 0), float(row["disk_capacity"])) for row in reporting)
+    if not rows:
+        health, storage_text, detail = "No appliance connected", "No appliance connected", "Storage appears once your appliance is connected."
+    else:
+        health = (("Appliance online" if online else "Appliance offline") if len(rows) == 1
+                  else f"{len(online)} of {len(rows)} appliances online")
+        storage_text = f"{capacity - used:.1f} GB free" if reporting else "Not reported yet"
+        detail = (f"{round(used / capacity * 100)}% of appliance disk in use" if reporting
+                  else "Your appliance has not reported its storage yet.")
+    single = rows[0] if len(rows) == 1 and online else None
+    return {"health": health, "online": bool(online), "storage_text": storage_text, "storage_detail": detail,
+            "used_percent": round(used / capacity * 100) if capacity else 0,
+            "cpu": single.get("cpu") if single else None, "memory": single.get("memory") if single else None}
+
+
+def _dashboard_health_stats_html(fleet: dict | None, clips, plan_stat, recording_stat, storage_text) -> str:
+    plan = (f'<a class="stat" href="/subscription-portal" style="text-decoration:none;color:inherit"><span class="stat-label">Plan</span>'
+            f'<span class="stat-value">{plan_stat}</span></a>') if plan_stat is not None else ''
+    recording = f'<div class="stat"><span class="stat-label">Recording</span><span class="stat-value">{recording_stat}</span></div>'
+    storage = f'<div class="stat"><span class="stat-label">Storage available</span><span class="stat-value" id="storage-metric">{escape(storage_text)}</span></div>'
+    if fleet is None:  # this appliance's own dashboard, unchanged
+        return (f'<div class="stat"><span class="stat-label">System health</span><span class="stat-value"><span class="dot"></span>VMS running</span></div>'
+                f'{plan}{recording}<div class="stat"><span class="stat-label">Saved clips</span><span class="stat-value">{len(clips)}</span></div>'
+                '<div class="stat"><span class="stat-label">CPU</span><span class="stat-value" id="cpu-metric" data-live="1">Checking…</span></div>'
+                '<div class="stat"><span class="stat-label">Memory</span><span class="stat-value" id="memory-metric">Checking…</span></div>'
+                f'{storage}')
+    dot = '<span class="dot"></span>' if fleet["online"] else ''
+    load = ''
+    if fleet["cpu"] is not None and fleet["memory"] is not None:
+        load = (f'<div class="stat"><span class="stat-label">Appliance CPU</span><span class="stat-value" id="cpu-metric">{round(float(fleet["cpu"]))}%</span></div>'
+                f'<div class="stat"><span class="stat-label">Appliance memory</span><span class="stat-value" id="memory-metric">{round(float(fleet["memory"]))}%</span></div>')
+    return (f'<div class="stat"><span class="stat-label">System health</span><span class="stat-value">{dot}{escape(fleet["health"])}</span></div>'
+            f'{plan}{recording}{load}{storage}')
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 
 
@@ -75214,106 +75250,32 @@ def dashboard(request: Request) -> str:
 
 
 
-    clips = sorted(
-
-
-
-
-
-
-
-
-        RECORDINGS_FOLDER.rglob("*.mkv"),
-
-
-
-
-
-
-
-
-        key=lambda clip: clip.stat().st_mtime,
-
-
-
-
-
-
-
-
-        reverse=True,
-
-
-
-
-
-
-
-
+    # A customer on the cloud portal: health, CPU/memory and storage come
+    # from their own appliance(s)' last heartbeat (appliances table, GB as
+    # metrics.py reports them) -- never from this cloud host, whose disk,
+    # CPU and recordings folder are not theirs (2026-10-01: staging showed
+    # a camera-less customer "VMS running", the EC2's CPU/memory and
+    # "12.0 GB free · 74.6% of disk in use").
+    _dashboard_fleet = (
+        _customer_appliance_health(_dashboard_identity["customer_id"])
+        if RUNTIME_ROLE == "cloud" and _dashboard_identity and _dashboard_identity.get("customer_id") else None
     )
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        disk = shutil.disk_usage(RECORDINGS_FOLDER)
-
-
-
-
-
-
-
-
-        used_percent = round((disk.used / disk.total) * 100) if disk.total else 0
-
-
-
-
-
-
-
-
-        free_gb = disk.free / (1024**3)
-
-
-
-
-
-
-
-
-        storage_text = f"{free_gb:.1f} GB free"
-
-
-
-
-
-
-
-
-    except OSError:
-
-
-
-
-
-
-
-
-        used_percent, storage_text = 0, "Storage unavailable"
+    if _dashboard_fleet is not None:
+        clips = None
+        used_percent, storage_text = _dashboard_fleet["used_percent"], _dashboard_fleet["storage_text"]
+    else:
+        clips = sorted(
+            RECORDINGS_FOLDER.rglob("*.mkv"),
+            key=lambda clip: clip.stat().st_mtime,
+            reverse=True,
+        )
+        try:
+            disk = shutil.disk_usage(RECORDINGS_FOLDER)
+            used_percent = round((disk.used / disk.total) * 100) if disk.total else 0
+            free_gb = disk.free / (1024**3)
+            storage_text = f"{free_gb:.1f} GB free"
+        except OSError:
+            used_percent, storage_text = 0, "Storage unavailable"
 
 
 
@@ -75919,53 +75881,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="stat"><span class="stat-label">System health</span><span class="stat-value"><span class="dot"></span>VMS running</span></div>
-
-
-
-
-
-
-
-
-        {f'<a class="stat" href="/subscription-portal" style="text-decoration:none;color:inherit"><span class="stat-label">Plan</span><span class="stat-value">{_dashboard_plan_stat}</span></a>' if _dashboard_plan_stat is not None else ''}
-        <div class="stat"><span class="stat-label">Recording</span><span class="stat-value">{_dashboard_recording_stat}</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">Saved clips</span><span class="stat-value">{len(clips)}</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">CPU</span><span class="stat-value" id="cpu-metric">Checking…</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">Memory</span><span class="stat-value" id="memory-metric">Checking…</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">Storage available</span><span class="stat-value" id="storage-metric">{storage_text}</span></div>
+        {_dashboard_health_stats_html(_dashboard_fleet, clips, _dashboard_plan_stat, _dashboard_recording_stat, storage_text)}
 
 
 
@@ -76253,7 +76169,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="panel"><div class="panel-head"><h2>Storage</h2><span class="health-detail">Local</span></div><div class="stat-value">{storage_text}</div><div class="storage-bar"><span id="storage-bar-value" style="width:{used_percent}%"></span></div><div class="health-detail" id="storage-detail">{used_percent}% of disk in use · {RETENTION_DAYS}-day retention</div></div>
+        <div class="panel"><div class="panel-head"><h2>Storage</h2><span class="health-detail">{"Your appliance" if _dashboard_fleet is not None else "Local"}</span></div><div class="stat-value">{storage_text}</div><div class="storage-bar"><span id="storage-bar-value" style="width:{used_percent}%"></span></div><div class="health-detail" id="storage-detail">{escape(_dashboard_fleet["storage_detail"]) if _dashboard_fleet is not None else f"{used_percent}% of disk in use · {RETENTION_DAYS}-day retention"}</div></div>
 
 
 
@@ -76370,6 +76286,7 @@ async function updateDashboard(){
 
 
 
+        const hostMetrics=document.getElementById('cpu-metric')?.dataset.live==='1';
         const [statusResponse,metricsResponse,intelligenceResponse]=await Promise.all([
 
 
@@ -76388,8 +76305,7 @@ async function updateDashboard(){
 
 
 
-            fetch('/api/system/metrics',{cache:'no-store'}),
-
+            hostMetrics?fetch('/api/system/metrics',{cache:'no-store'}):Promise.resolve(null),
 
 
 
@@ -76415,7 +76331,7 @@ async function updateDashboard(){
 
 
 
-        const statusData=await statusResponse.json();const metrics=await metricsResponse.json();const intelligence=await intelligenceResponse.json();
+        const statusData=await statusResponse.json();const metrics=metricsResponse?await metricsResponse.json():null;const intelligence=await intelligenceResponse.json();
 
 
 
@@ -76480,7 +76396,7 @@ async function updateDashboard(){
 
 
 
-        document.getElementById('cpu-metric').textContent=metrics.cpu_percent+'%';
+        if(metrics){document.getElementById('cpu-metric').textContent=metrics.cpu_percent+'%';
 
 
 
@@ -76488,8 +76404,7 @@ async function updateDashboard(){
 
 
 
-
-        document.getElementById('memory-metric').textContent=metrics.memory_percent+'%';
+        document.getElementById('memory-metric').textContent=metrics.memory_percent+'%';}
 
 
 
