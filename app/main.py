@@ -8392,6 +8392,13 @@ ai_event_clip_windows: dict[int, tuple] = {}
 # now entered after it, so its event clip starts no later than this
 # (detection_timing.detection_event_span()).
 ai_last_frame_time: dict[int, datetime] = {}
+# Continuous activity on a camera is one event (ai_activity.py).
+import ai_activity as _ai_activity
+ai_activities = _ai_activity.ActivityTracker()
+# The classes that open/continue an activity -- the same set save_yolo_events()
+# draws and clips (its class_colors); tests keep the two in step.
+AI_ACTIVITY_CLASSES = frozenset({"person", "car", "truck", "bus", "motorcycle", "bicycle", "dog", "cat",
+                                 "bird", "backpack", "suitcase"})
 ai_event_clip_windows_lock = threading.Lock()
 
 # The main application event loop, captured lazily on ai_person_detector()'s
@@ -16252,11 +16259,22 @@ _open_event_recordings: dict[int, dict] = {}
 _event_recording_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
+def _ai_activity_limits(camera_number: int) -> tuple[float, float]:
+    """(continuation gap, maximum length) seconds for this camera's AI
+    activities, from its recording settings (defaults if not configured)."""
+    from event_clips import DEFAULT_MERGE_GAP_SECONDS
+    from local_recording_policy import DEFAULT_MAX_EVENT_RECORDING_SECONDS
+    settings = _local_recording_settings(camera_number)
+    gap = _ai_activity.continuation_gap(settings.get("merge_gap_seconds", DEFAULT_MERGE_GAP_SECONDS), AI_DETECTION_INTERVAL_SECONDS)
+    return gap, float(settings.get("max_event_seconds", DEFAULT_MAX_EVENT_RECORDING_SECONDS))
+
+
 def _in_flight_event_windows(camera_number: int) -> list[tuple[datetime, datetime]]:
+    windows = ai_activities.in_flight_windows(camera_number, lead_seconds=_ai_activity.MAX_LEAD_SECONDS)
     open_recording = _open_event_recordings.get(camera_number)
-    if not open_recording:
-        return []
-    return [(open_recording["start"], open_recording["end"])]
+    if open_recording:
+        windows.append((open_recording["start"], open_recording["end"]))
+    return windows
 
 
 async def persist_event_recording(
@@ -16347,12 +16365,9 @@ async def persist_event_recording(
             )
         )
         if start_new:
-            camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
-            camera_folder.mkdir(parents=True, exist_ok=True)
-            destination = camera_folder / f"camera{camera_number}_{window.start:%Y-%m-%d_%H-%M-%S}.mkv"
-            _open_event_recordings[camera_number] = {"start": window.start, "end": window.end, "path": destination}
+            # Named once the real cut point is known (below).
+            _open_event_recordings[camera_number] = {"start": window.start, "end": window.end, "path": None}
         else:
-            destination = open_recording["path"]
             _open_event_recordings[camera_number]["end"] = window.end
 
         # recording_start is the ORIGINAL event's start (unchanged across
@@ -16387,29 +16402,35 @@ async def persist_event_recording(
                 camera_number, detector, trigger_id, recording_start.isoformat(), window.end.isoformat(),
             )
             return
-        first_source_start = sources[0][0]
-        # -c copy can only cut on keyframe boundaries, so this trims close
-        # to -- not frame-exact at -- the requested window, same trade-off
-        # build_motion_event_clip()'s own -ss/-t already accepts for its
-        # (re-encoded) output. Previously absent here: the concat ran on
-        # whole 30s buffer segments with no trim at all, so every saved
-        # clip carried up to one full segment's worth of untrimmed padding
-        # on each end.
-        offset_seconds = max(0.0, (recording_start - first_source_start).total_seconds())
-        duration_seconds = max(0.0, (window.end - recording_start).total_seconds())
+        # Cut on the keyframe at or before the requested start, inside the
+        # buffer segment holding it (a concat "inpoint" -- the demuxer
+        # ignores an -ss seek with stream copy), and label the recording
+        # with that keyframe's real time (local_recording_policy.
+        # keyframe_cut()). Clips, linked recordings and Playback all map
+        # time to position from that label, so it must be the truth.
+        from local_recording_policy import keyframe_cut, recording_name_time
+        first_index = max((i for i, (start, _) in enumerate(sources) if start <= recording_start), default=0)
+        sources = sources[first_index:]
+        keyframes = await asyncio.to_thread(_keyframe_times, sources[0][1])
+        inpoint, true_start = keyframe_cut(recording_start, sources[0][0], keyframes)
+        if _open_event_recordings[camera_number]["path"] is None:
+            camera_folder = RECORDINGS_FOLDER / f"camera{camera_number}"
+            camera_folder.mkdir(parents=True, exist_ok=True)
+            _open_event_recordings[camera_number]["path"] = (
+                camera_folder / f"camera{camera_number}_{recording_name_time(true_start):%Y-%m-%d_%H-%M-%S}.mkv")
+        _open_event_recordings[camera_number]["start"] = true_start
+        destination = _open_event_recordings[camera_number]["path"]
+        duration_seconds = max(0.0, (window.end - true_start).total_seconds())
         list_file = destination.with_suffix(".sources.txt")
         try:
-            list_file.write_text("".join(f"file '{source}'\n" for _, source in sources))
+            lines = [f"file '{sources[0][1]}'\n" + (f"inpoint {inpoint:.6f}\n" if inpoint > 0 else "")]
+            lines += [f"file '{source}'\n" for _, source in sources[1:]]
+            list_file.write_text("".join(lines))
             temp_output = destination.with_suffix(".tmp.mkv")
             result = await asyncio.to_thread(
                 subprocess.run,
-                # -ss BEFORE -i: with stream copy an output-side -ss drops
-                # packets up to the offset, so the file could begin mid-GOP
-                # and show nothing until the next keyframe -- the event's
-                # first seconds lost. Input-side seeking starts at the
-                # keyframe at or before the offset instead.
-                ["ffmpeg", "-y", "-ss", str(offset_seconds), "-f", "concat", "-safe", "0", "-i", str(list_file),
-                 "-t", str(duration_seconds),
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-t", f"{duration_seconds:.3f}",
                  "-c", "copy", str(temp_output)],
                 capture_output=True, timeout=60, check=False,
             )
@@ -16421,10 +16442,17 @@ async def persist_event_recording(
                 duration = await asyncio.to_thread(_probe_recording_duration_seconds, destination)
                 log.info(
                     "event_recording.persisted camera=%s detector=%s trigger_id=%s "
-                    "path=%s duration_seconds=%s",
-                    camera_number, detector, trigger_id, destination,
+                    "path=%s true_start=%s inpoint=%.3f duration_seconds=%s",
+                    camera_number, detector, trigger_id, destination, true_start.isoformat(), inpoint,
                     round(duration, 1) if duration is not None else None,
                 )
+                if duration is not None and abs(duration - duration_seconds) > 1.5:
+                    # The label no longer describes the content: say so.
+                    log.warning(
+                        "event_recording.duration_mismatch camera=%s trigger_id=%s path=%s "
+                        "expected_seconds=%.1f actual_seconds=%.1f",
+                        camera_number, trigger_id, destination, duration_seconds, duration,
+                    )
             else:
                 log.warning(
                     "event_recording.concat_failed camera=%s detector=%s trigger_id=%s "
@@ -37784,182 +37812,37 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         detection for detection in detections
         if detection["class_name"] in AI_CLIP_EVENT_TYPES
     ]
+    # Continuous activity is ONE event (ai_activity.py): the first detection
+    # opens it -- its card, its clip, its notification -- and a detection
+    # that continues it adds no new card for a kind of object already in it.
+    # Its single clip and Event-mode recording are built when it ends
+    # (_finalize_ai_activity()), covering all of it.
+    activity = None
+    media_owner_id = None
+    continuing = False
     if qualifying_detections:
-        from event_clips import compute_clip_window, should_merge
-
-        window = compute_clip_window(event_start, event_moment)
-        with ai_event_clip_windows_lock:
-            previous_window = ai_event_clip_windows.get(camera_number)
-            is_duplicate = (
-                previous_window is not None
-                and should_merge(previous_window.end, window.start)
-            )
-            ai_event_clip_windows[camera_number] = window
-
-        if not is_duplicate:
+        from event_clips import compute_clip_window
+        gap_seconds, max_seconds = _ai_activity_limits(camera_number)
+        activity = ai_activities.continuing(camera_number, event_moment, gap_seconds=gap_seconds, max_seconds=max_seconds)
+        if activity is not None:
+            continuing = True
+            ai_activities.seen(camera_number, event_moment, gap_seconds=gap_seconds, max_seconds=max_seconds)
+            media_owner_id = activity.owner_id
+            event_media_sharing.owners.extend(media_owner_id, compute_clip_window(activity.start, event_moment).end)
+            # A continuing scan is a merged scan: one PPE result per
+            # continuous presence, as before activities existed.
+            is_duplicate = True
+        else:
             primary_class_name = qualifying_detections[0]["class_name"]
-            # PPE / Facial Recognition results from this scan (and later
-            # ones inside this window) reuse this clip -- see
-            # event_media_sharing.py.
+            media_owner_id = event_group_id
+            window = compute_clip_window(event_start, event_moment)
+            with ai_event_clip_windows_lock:
+                ai_event_clip_windows[camera_number] = window
+            # PPE / Facial Recognition results during the activity reuse its
+            # clip -- see event_media_sharing.py.
             event_media_sharing.owners.register(camera_number, event_group_id, window.start, window.end)
-            # Optimistic path, matching store_motion_event()'s own
-            # convention: extraction/upload run in the background (the
-            # extractor waits out the post-roll first), so this is the
-            # location the clip will exist at once that finishes, not
-            # a confirmation it already has or that upload succeeded.
-            event_clip_path = (
-                f"/recordings/clips/motion/motion_{event_group_id}.mp4"
-            )
-
-            # Whether this clip landed, for the PPE / Facial Recognition
-            # results that reuse it (event_media_sharing.owner_finished()).
-            ai_media_registered = [False]
-
-            async def build_and_upload_ai_event_media() -> None:
-                try:
-                    await _build_and_upload_ai_event_media_inner()
-                finally:
-                    await asyncio.to_thread(event_media_sharing.owner_finished, event_group_id, camera_number, ai_media_registered[0])
-
-            async def _build_and_upload_ai_event_media_inner() -> None:
-                try:
-                    clip_url = await build_motion_event_clip(
-                        event_group_id, camera_number, event_start, event_moment
-                    )
-                except Exception as error:
-                    # Diagnostic-only guard: this call used to be
-                    # unguarded, so a raised exception here was silently
-                    # swallowed. This coroutine is scheduled via
-                    # asyncio.run_coroutine_threadsafe() (see below) and
-                    # nothing ever retrieves the resulting
-                    # concurrent.futures.Future's result/exception --
-                    # unlike asyncio.create_task(), whose Task at least
-                    # logs "exception was never retrieved" on garbage
-                    # collection, an unretrieved Future here logs
-                    # nothing at all. Fail open exactly like the
-                    # scheduling try/except below already does -- the
-                    # analytics event itself and its existing
-                    # linked_recording fallback are unaffected -- but
-                    # LOGGED with enough detail (event id, camera
-                    # number, exception type and message) to actually
-                    # diagnose the real failure instead of guessing at
-                    # it. Not a behavior change: this is the same
-                    # "no clip" outcome the `if not clip_url: return`
-                    # branch below already produces.
-                    print(
-                        f"AI event {event_group_id} camera {camera_number}: "
-                        f"clip build failed: {type(error).__name__}: {error}"
-                    )
-                    return
-                if not clip_url:
-                    return
-                try:
-                    from event_media_uploader import upload_motion_event_media
-                    ai_media_registered[0] = bool(await asyncio.to_thread(
-                        upload_motion_event_media,
-                        event_id=event_group_id,
-                        camera_number=camera_number,
-                        event_start=event_start,
-                        event_end=event_moment,
-                        clip_url=clip_url,
-                        thumbnail_url=thumbnail_url,
-                        already_classified=True,
-                    ))
-                except Exception as error:
-                    print(
-                        f"AI event {event_group_id}: media upload failed: "
-                        f"{type(error).__name__}: {error}"
-                    )
-
-            # save_yolo_events() executes via await asyncio.to_thread(...)
-            # (confirmed live on the Samsung appliance) -- a worker thread
-            # with no event loop of its own, so asyncio.ensure_future()/
-            # asyncio.create_task() cannot be used here (each only
-            # schedules onto "the current thread's running loop"; called
-            # from a thread with none, they raise RuntimeError).
-            # asyncio.run_coroutine_threadsafe(coro, loop) is the correct
-            # cross-thread primitive: it hands the coroutine to a specific,
-            # already-running loop -- _ai_event_media_loop, captured once
-            # on ai_person_detector()'s own first run (see that function's
-            # own opening lines) -- regardless of which thread is doing
-            # the scheduling.
-            if _ai_event_media_loop is not None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        build_and_upload_ai_event_media(), _ai_event_media_loop
-                    )
-                except RuntimeError as error:
-                    # Fail open -- the analytics event itself and its
-                    # existing linked_recording fallback are unaffected --
-                    # but LOGGED, not silently swallowed.
-                    print(
-                        f"AI event {event_group_id}: could not schedule "
-                        f"clip build/upload: {type(error).__name__}: {error}"
-                    )
-                    event_media_sharing.owners.finish(event_group_id, False)
-            else:
-                print(
-                    f"AI event {event_group_id}: could not schedule clip "
-                    f"build/upload: no main event loop captured yet."
-                )
-                event_media_sharing.owners.finish(event_group_id, False)
-
-        # 2026-09-20, moved outside `if not is_duplicate:` on 2026-09-22:
-        # the same Event-mode persistence the basic motion path already
-        # schedules (see store_motion_event()'s own build_and_upload_
-        # event_media() sibling call) -- Smart Motion/person/vehicle-
-        # triggered events must behave consistently with basic motion for
-        # a camera in Event mode, not just cloud-classified detections.
-        # Purely additive, alongside -- never instead of -- the Hybrid
-        # clip build/upload above.
-        #
-        # Confirmed reproducible by code inspection: this call used to sit
-        # INSIDE `if not is_duplicate:`, so during sustained activity --
-        # exactly the case a person lingers in frame, producing repeated
-        # qualifying scans a few seconds apart, each should_merge()-ing
-        # with the last -- only the very FIRST scan in the whole burst
-        # ever reached persist_event_recording(). Every later scan was
-        # dropped by the SAME dedup that (correctly) also avoids building
-        # a duplicate Hybrid clip, even though persist_event_recording()
-        # has its own independent, correct extend-vs-new decision
-        # (should_start_new_event_recording()) that a suppressed call
-        # never gets the chance to run. The practical effect: a genuinely
-        # multi-minute event's local recording was silently truncated to
-        # just the first scan's own pre-roll+post-roll window. The Hybrid
-        # dedup above is unchanged and still gates the clip build/upload;
-        # this call now runs on every qualifying scan regardless, letting
-        # persist_event_recording()'s own merge logic decide extend-vs-new.
-        if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    persist_event_recording(
-                        camera_number, event_start, event_moment,
-                        detector="ai_detection", trigger_id=event_group_id,
-                    ),
-                    _ai_event_media_loop,
-                )
-            except RuntimeError as error:
-                print(
-                    f"AI event {event_group_id}: could not schedule "
-                    f"Event-mode recording persist: {type(error).__name__}: {error}"
-                )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            event_clip_path = f"/recordings/clips/motion/motion_{event_group_id}.mp4"
+            activity = ai_activities.open(camera_number, event_group_id, start=event_start, moment=event_moment)
     for class_name, class_detections in grouped.items():
 
 
@@ -37996,144 +37879,35 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-        event = AnalyticsEventModel(
-
-
-
-
-
-
-
-
-            id=(event_group_id if class_name == primary_class_name else uuid.uuid4().hex[:12]),
-
-
-
-
-
-
-
-
-            camera=camera_number,
-
-
-
-
-
-
-
-
-            site="home",
-
-
-
-
-
-
-
-
-            rule_name=f"Local YOLO {class_name} detection",
-
-
-
-
-
-
-
-
-            event_type=class_name,
-
-
-
-
-
-
-
-
-            timestamp=event_moment,
-
-
-
-
-
-
-
-
-            confidence=round(best_confidence, 4),
-
-
-
-
-
-
-
-
-            thumbnail=thumbnail_url,
-
-
-
-
-
-
-
-
-            linked_recording=linked_recording,
-
-
-
-
-
-
-
-
-            mock=False,
-
-
-
-
-
-
-
-
-        ).model_dump(mode="json")
-
-
-
-
-
-
-
-
-        event["object_count"] = len(class_detections)
-
-
-
-
-
-
-
-
-        event["detections"] = class_detections
-
-        # New, additive field -- only the one primary_class_name event
-        # this scan actually owns the clip/upload for gets a path; a
-        # secondary class detected in the same frame (e.g. person AND
-        # car) keeps its own independent analytics-history record but
-        # None here, exactly like an analytics-only event already had
-        # -- detection_event_media.detection_event_id is UNIQUE in the
-        # cloud schema, so only one event could ever own this clip's
-        # registration anyway. Existing "linked_recording" above is
-        # untouched, so nothing that already reads it changes behavior.
-        event["event_clip"] = event_clip_path if class_name == primary_class_name else None
-
-
-
-
-
-
-
-
-        append_analytics_event(event)
+        # A kind of object already in a continuing activity gets no new card
+        # (no new notification): the activity's card and clip cover it.
+        event = None
+        if not (continuing and class_name in activity.classes):
+            event = AnalyticsEventModel(
+                id=(event_group_id if class_name == primary_class_name else uuid.uuid4().hex[:12]),
+                camera=camera_number,
+                site="home",
+                rule_name=f"Local YOLO {class_name} detection",
+                event_type=class_name,
+                timestamp=event_moment,
+                confidence=round(best_confidence, 4),
+                thumbnail=thumbnail_url,
+                linked_recording=linked_recording,
+                mock=False,
+            ).model_dump(mode="json")
+            event["object_count"] = len(class_detections)
+            event["detections"] = class_detections
+            # Only the activity's opening card owns the clip; every other
+            # card (another kind of object, now or later in the activity)
+            # plays the same clip through event_media_sharing.
+            event["event_clip"] = event_clip_path if class_name == primary_class_name else None
+            if media_owner_id and event["id"] != media_owner_id:
+                event_media_sharing.link(event, media_owner_id)
+            append_analytics_event(event)
+            if media_owner_id and event["id"] != media_owner_id:
+                event_media_sharing.attach_child(media_owner_id, event["id"], camera_number)
+            if activity is not None and class_name in AI_ACTIVITY_CLASSES:
+                ai_activities.add(activity, classes=[class_name])
         smart_motion.record_object_detection(camera_number, class_name)
         # 2026-09-16: ppe.is_camera_enabled() is deployment-pilot scope
         # only (ANYAICAM_PPE_CAMERAS); it was never customer-entitlement-
@@ -38198,9 +37972,9 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 # PPE only runs in a scan that builds a clip (`not
                 # is_duplicate` above), so its result shows that clip --
                 # the same frame's own clip owner, event_group_id.
-                event_media_sharing.link(ppe_event, event_group_id)
+                event_media_sharing.link(ppe_event, media_owner_id or event_group_id)
                 append_analytics_event(ppe_event)
-                event_media_sharing.attach_child(event_group_id, ppe_event["id"], camera_number)
+                event_media_sharing.attach_child(media_owner_id or event_group_id, ppe_event["id"], camera_number)
                 saved_events.append(ppe_event)
         # AAC (facial recognition / access-control analytics).
         # Same shape as the PPE hook directly above: a person's own crop
@@ -38277,11 +38051,11 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         # Media (2026-09-26): the clip covering this moment on
                         # this camera, else a clip of its own -- see
                         # event_media_sharing.py.
-                        media_owner = _analytics_media_owner(camera_number, aac_event["id"], now)
+                        media_owner = _analytics_media_owner(camera_number, aac_event["id"], event_moment)
                         event_media_sharing.link(facial_local_event, media_owner)
                         append_analytics_event(facial_local_event)
                         if media_owner == aac_event["id"]:
-                            _schedule_owned_analytics_clip(aac_event["id"], camera_number, now, thumbnail_url)
+                            _schedule_owned_analytics_clip(aac_event["id"], camera_number, event_moment, thumbnail_url)
                         elif media_owner:
                             event_media_sharing.attach_child(media_owner, aac_event["id"], camera_number)
                         facial_event_ids.append(aac_event["id"])
@@ -38347,7 +38121,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         # LPR no longer runs here (2026-09-28): it runs on its own cadence
         # from the AI loop -- run_lpr_scan() -- so a plate is not only read
         # when a vehicle event happens to be saved. See lpr.scan_frame().
-        saved_events.append(event)
+        if event is not None:
+            saved_events.append(event)
 
     # linked_recording backfill (2026-09-22): the SAME trigger condition
     # already used to schedule persist_event_recording() above -- this
@@ -38363,7 +38138,36 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     # schedule a redundant duplicate backfill per detected class in the
     # same scan.
     backfill_event_ids = [saved["id"] for saved in saved_events] + facial_event_ids
-    if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and backfill_event_ids:
+    # Event mode: the activity's recording is cut when it ends, so its events'
+    # linked recordings are filled in then (_finalize_ai_activity()).
+    if activity is not None and backfill_event_ids:
+        ai_activities.add(activity, event_ids=backfill_event_ids)
+    # The finaliser starts only now, with this opening scan's cards and ids
+    # already on the activity (started at open(), it could close the
+    # activity before they were recorded).
+    if activity is not None and not continuing:
+        if _ai_event_media_loop is not None:
+            try:
+                activity.has_finalizer = True
+                asyncio.run_coroutine_threadsafe(
+                    _finalize_ai_activity(camera_number, activity, thumbnail_url), _ai_event_media_loop,
+                )
+            except RuntimeError as error:
+                activity.has_finalizer = False
+                print(
+                    f"AI event {event_group_id}: could not schedule "
+                    f"clip build/upload: {type(error).__name__}: {error}"
+                )
+                event_media_sharing.owners.finish(event_group_id, False)
+        else:
+            # No clip without a loop; the activity still de-duplicates
+            # cards (it ends by the continuation gap) but pins no footage.
+            print(
+                f"AI event {event_group_id}: could not schedule clip "
+                f"build/upload: no main event loop captured yet."
+            )
+            event_media_sharing.owners.finish(event_group_id, False)
+    elif _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and backfill_event_ids:
         try:
             asyncio.run_coroutine_threadsafe(
                 _backfill_ai_event_linked_recording(
@@ -38376,22 +38180,73 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                 f"AI event {event_group_id}: could not schedule "
                 f"linked_recording backfill: {type(error).__name__}: {error}"
             )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     return saved_events
+
+
+async def _finalize_ai_activity(camera_number: int, activity, thumbnail_url: str | None, *, clock=None, sleep=None) -> None:
+    """Wait for a continuous AI activity to end (quiet for the continuation
+    gap, or at the maximum length), then build its ONE clip, upload it once,
+    cut its ONE Event-mode recording and fill in its events' linked
+    recordings -- all covering the whole activity."""
+    clock = clock or (lambda: datetime.now())  # read the clock fresh on every check
+    sleep = sleep or asyncio.sleep
+    owner_id = activity.owner_id
+    registered = False
+    try:
+        while True:
+            gap_seconds, max_seconds = _ai_activity_limits(camera_number)
+            due = ai_activities.close_due(activity, clock(), gap_seconds=gap_seconds, max_seconds=max_seconds)
+            if due is None:
+                break
+            await sleep(max(0.5, min(5.0, (due - clock()).total_seconds())))
+        ai_activities.close(activity)
+        start, end = activity.start, activity.last_seen
+        from event_clips import compute_clip_window
+        event_media_sharing.owners.extend(owner_id, compute_clip_window(start, end).end)
+        logging.getLogger("anyaicam.event_recording").info(
+            "ai_activity.closed camera=%s owner=%s start=%s end=%s seconds=%.1f classes=%s events=%s",
+            camera_number, owner_id, start.isoformat(), end.isoformat(), (end - start).total_seconds(),
+            sorted(activity.classes), len(activity.event_ids),
+        )
+        event_mode = _local_recording_settings(camera_number).get("mode") == "event"
+        if event_mode:
+            await persist_event_recording(camera_number, start, end, detector="ai_detection", trigger_id=owner_id)
+            # Local first: the events get their linked recording as soon as it
+            # exists, never held behind the clip encode or a slow upload.
+            if activity.event_ids:
+                linked = await asyncio.to_thread(linked_recording_for, camera_number, activity.first_moment, activity.first_moment)
+                if linked:
+                    await asyncio.to_thread(_patch_analytics_events_linked_recording, list(activity.event_ids), linked)
+        try:
+            clip_url = await build_motion_event_clip(owner_id, camera_number, start, end)
+        except Exception as error:
+            print(f"AI event {owner_id} camera {camera_number}: clip build failed: {type(error).__name__}: {error}")
+            clip_url = None
+        if clip_url:
+            try:
+                from event_media_uploader import upload_motion_event_media
+                registered = bool(await asyncio.to_thread(
+                    upload_motion_event_media,
+                    event_id=owner_id, camera_number=camera_number, event_start=start, event_end=end,
+                    clip_url=clip_url, thumbnail_url=thumbnail_url, already_classified=True,
+                ))
+            except Exception as error:
+                print(f"AI event {owner_id}: media upload failed: {type(error).__name__}: {error}")
+    except GeneratorExit:
+        # Closed without ever finishing -- e.g. garbage-collected after its
+        # loop was shut down. Run NOTHING here: no lock, no thread, no
+        # await. (Calling asyncio.to_thread() from a coroutine being closed
+        # can re-enter ThreadPoolExecutor.submit() on a thread that already
+        # holds its lock -- a deadlock, found in the test suite.)
+        raise
+    except BaseException:
+        # Cancelled or failed while running: release the results queued on
+        # this activity's clip without a worker thread, then propagate.
+        ai_activities.close(activity)
+        event_media_sharing.owner_finished(owner_id, camera_number, False)
+        raise
+    ai_activities.close(activity)
+    await asyncio.to_thread(event_media_sharing.owner_finished, owner_id, camera_number, registered)
 
 
 
@@ -39212,6 +39067,14 @@ async def ai_person_detector(camera_number: int) -> None:
             stationary_repeat = bool(detections) and ai_stationary_memory.is_repeat(
                 camera_number, detection_signature, now_monotonic,
             )
+            # A scan that still sees something moving extends the camera's open
+            # AI activity (ai_activity.py) -- never a stationary repeat (a
+            # parked car must not hold an activity open).
+            if result.get("ok") and not stationary_repeat and any(
+                    d.get("class_name") in AI_ACTIVITY_CLASSES for d in detections):
+                _gap, _cap = _ai_activity_limits(camera_number)
+                ai_activities.seen(camera_number, ai_last_frame_time.get(camera_number) or datetime.now(),
+                                   gap_seconds=_gap, max_seconds=_cap)
             if stationary_repeat and now_monotonic - ai_person_last_event[camera_number] >= AI_PERSON_COOLDOWN_SECONDS:
                 state["stationary_suppressed"] = int(state.get("stationary_suppressed") or 0) + 1
 
@@ -39313,7 +39176,7 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
 
-                if events:
+                if events or ai_activities.is_open(camera_number):
 
 
 
@@ -142360,6 +142223,23 @@ def _row_to_recording_metadata(row: dict) -> dict:
         "name": row["s3_key"].rsplit("/", 1)[-1],
         "kind": "recording",
     }
+
+
+def _keyframe_times(path: Path) -> list[float]:
+    """Keyframe times (seconds) of one Event-mode buffer segment, for
+    persist_event_recording()'s cut point. Same appliance-wide ffprobe
+    budget as every other probe; [] on any failure (the cut then starts at
+    the segment's own first frame, which is always a keyframe)."""
+    try:
+        with _ffprobe_semaphore:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+                 "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+        return sorted(float(item.strip().rstrip(",")) for item in probe.stdout.split() if item.strip().rstrip(",") not in ("", "N/A"))
+    except Exception:  # any probe failure: no keyframe information
+        return []
 
 
 def _probe_recording_duration_seconds(path: Path) -> float | None:

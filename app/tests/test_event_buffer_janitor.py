@@ -235,13 +235,13 @@ def test_extending_an_event_no_longer_drops_the_beginning_of_the_original(tmp_pa
         list_file = Path(args[args.index("-i") + 1])
         concat_calls.append({
             "sources": list_file.read_text(encoding="utf-8"),
-            "offset": args[args.index("-ss") + 1],
             "duration": args[args.index("-t") + 1],
         })
         Path(args[-1]).write_bytes(b"concatenated clip")
         return type("Result", (), {"returncode": 0})()
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
+    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
 
     t0 = datetime(2026, 1, 1, 12, 0, 0)
     buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
@@ -301,14 +301,18 @@ def test_event_recording_is_trimmed_to_the_requested_window_not_whole_segments(t
     concat_calls = []
 
     def fake_run(args, **kwargs):
+        sources = Path(args[args.index("-i") + 1]).read_text(encoding="utf-8")
+        inpoints = [float(line.split()[1]) for line in sources.splitlines() if line.startswith("inpoint ")]
         concat_calls.append({
-            "offset": float(args[args.index("-ss") + 1]),
+            "inpoint": inpoints[0] if inpoints else 0.0,
             "duration": float(args[args.index("-t") + 1]),
         })
         Path(args[-1]).write_bytes(b"concatenated clip")
         return type("Result", (), {"returncode": 0})()
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
+    # Keyframes every 4 s in each 30 s buffer segment.
+    monkeypatch.setattr(main, "_keyframe_times", lambda path: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0])
 
     t0 = datetime(2026, 1, 1, 12, 0, 0)
     buffer_folder = tmp_path / "recordings" / "camera1" / main.EVENT_BUFFER_SUBFOLDER_NAME
@@ -322,17 +326,20 @@ def test_event_recording_is_trimmed_to_the_requested_window_not_whole_segments(t
     main._event_recording_locks.pop(1, None)
 
     asyncio.run(main.persist_event_recording(1, t0, t0))
-    # Original window [t0-5, t0+5]; first (only) source starts at t0-30.
-    # offset = (t0-5) - (t0-30) = 25s; duration = (t0+5) - (t0-5) = 10s.
-    assert concat_calls[0]["offset"] == 25.0
-    assert concat_calls[0]["duration"] == 10.0
+    # Original window [t0-5, t0+5]; the source starts at t0-30, so the
+    # request is 25 s in. A stream copy can only start on a keyframe: the
+    # last one at or before 25 s is 24 s, so the recording really starts at
+    # t0-6 and runs to t0+5 = 11 s -- and is labelled t0-6, its true start.
+    assert concat_calls[0]["inpoint"] == 24.0
+    assert concat_calls[0]["duration"] == 11.0
+    assert main._open_event_recordings[1]["start"] == t0 - timedelta(seconds=6)
+    assert main._open_event_recordings[1]["path"].name == f"camera1_{t0 - timedelta(seconds=6):%Y-%m-%d_%H-%M-%S}.mkv"
 
     asyncio.run(main.persist_event_recording(1, t0 + timedelta(seconds=6), t0 + timedelta(seconds=6)))
-    # recording_start is still the ORIGINAL t0-5 (unchanged by the extend);
-    # first source is still segment A at t0-30 -- same 25s offset. The
-    # extended window now ends at t0+11: duration = (t0+11) - (t0-5) = 16s.
-    assert concat_calls[1]["offset"] == 25.0
-    assert concat_calls[1]["duration"] == 16.0
+    # The extension keeps the ORIGINAL true start (t0-6, the same keyframe)
+    # and now runs to t0+11: 17 s.
+    assert concat_calls[1]["inpoint"] == 24.0
+    assert concat_calls[1]["duration"] == 17.0
 
 
 def test_concurrent_extends_for_the_same_camera_do_not_share_temp_files(tmp_path, monkeypatch):

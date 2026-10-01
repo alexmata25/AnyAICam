@@ -59,13 +59,18 @@ def _fake_result(*class_names: str, base_conf: float = 0.9) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _reset_module_state():
+def _reset_module_state(monkeypatch):
     """ai_event_clip_windows and _ai_event_media_loop are module-level
     state -- must not leak between tests."""
     main.ai_event_clip_windows.clear()
+    main.ai_activities.reset()
+    # Single-scan tests: an activity ends at once (ai_activity.py); the
+    # continuous-activity contract has its own tests.
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
     previous_loop = main._ai_event_media_loop
     yield
     main.ai_event_clip_windows.clear()
+    main.ai_activities.reset()
     main._ai_event_media_loop = previous_loop
 
 
@@ -287,10 +292,13 @@ def test_ai_person_detector_captures_the_loop_exactly_once(monkeypatch):
 # --------------------------------------------------------- dedup still works (cross-thread)
 
 
-def test_duplicate_detections_still_dedup_when_scheduled_cross_thread(
-    monkeypatch, tmp_path, fake_uploader, background_loop
-):
+def test_continuous_activity_is_one_event_with_one_clip(monkeypatch, tmp_path, fake_uploader, background_loop):
+    """Owner decision 2026-10-01 (ai_activity.py): continuous activity is ONE
+    event. A person seen again inside the continuation gap adds no second
+    person card; a car arriving during it gets its own card, playing the
+    activity's clip; exactly one clip is built and uploaded, when it ends."""
     monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))
 
     async def fake_build_motion_event_clip(event_id, camera_number, start, end):
         return f"/recordings/clips/motion/motion_{event_id}.mp4"
@@ -298,17 +306,23 @@ def test_duplicate_detections_still_dedup_when_scheduled_cross_thread(
     monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
     _standard_mocks(monkeypatch, tmp_path)
 
-    def worker():
-        main.save_yolo_events(161, _fake_result("person"))
-        main.save_yolo_events(161, _fake_result("car"))  # well within the merge gap
+    first = main.save_yolo_events(161, _fake_result("person"))
+    again = main.save_yolo_events(161, _fake_result("person"))
+    car = main.save_yolo_events(161, _fake_result("car"))
+    person = first[0]
+    assert [e["event_type"] for e in first] == ["person"] and person["event_clip"]
+    assert again == []                                        # same activity: no second person card
+    assert [e["event_type"] for e in car] == ["car"]          # a new kind of object: its own card...
+    assert car[0]["media_parent_event_id"] == person["id"]    # ...playing the activity's clip
+    assert main.ai_activities.is_open(161)
 
-    thread = threading.Thread(target=worker)
-    thread.start()
-    thread.join(timeout=5)
-
-    _wait_until(lambda: len(fake_uploader) >= 1)
-    time.sleep(0.3)  # let a wrongly-scheduled second upload have a chance to also land
-    assert len(fake_uploader) == 1, "a merged/deduplicated scan must not trigger a second upload"
+    time.sleep(0.3)
+    assert fake_uploader == []                                # nothing until the activity ends
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    assert _wait_until(lambda: len(fake_uploader) == 1, timeout=10)
+    time.sleep(0.3)
+    assert [u["event_id"] for u in fake_uploader] == [person["id"]]
+    assert not main.ai_activities.is_open(161)
 
 
 # --------------------------------------------------------- unrelated behavior unchanged
@@ -432,59 +446,38 @@ def test_ai_classified_detection_does_not_persist_a_recording_for_a_continuous_m
     assert persisted == [], "a Continuous-mode camera must never get an Event-mode recording persisted"
 
 
-def test_ai_detection_dedup_does_not_suppress_persist_event_recording_during_sustained_activity(
-    monkeypatch, tmp_path, fake_uploader, background_loop
-):
-    """Codex review item, confirmed by code inspection (2026-09-22):
-    persist_event_recording() scheduling used to sit INSIDE `if not
-    is_duplicate:` -- the same per-camera dedup gate that (correctly)
-    skips building a second, near-identical Hybrid clip for a burst of
-    rapidly repeated detections. During sustained activity (a person
-    lingering in frame, producing several qualifying scans a few seconds
-    apart), every scan after the first was should_merge()-classified as a
-    duplicate and its persist_event_recording() call was dropped entirely
-    -- even though that function has its own independent, correct merge/
-    extend logic that a suppressed call never gets the chance to run. Net
-    effect: a genuinely multi-minute event's LOCAL recording was silently
-    truncated to just the first scan's own pre-roll+post-roll window.
-
-    Two real, back-to-back save_yolo_events() calls (close enough in wall-
-    clock time that the second is a genuine should_merge() duplicate for
-    the Hybrid path) must still each schedule persist_event_recording() --
-    that function's own should_start_new_event_recording() is what decides
-    extend-vs-new, not this dedup gate."""
+def test_sustained_activity_is_one_event_mode_recording_covering_all_of_it(monkeypatch, tmp_path, fake_uploader, background_loop):
+    """A person lingering in frame used to produce one recording per saved
+    detection (~30 s apart). Now the activity's ONE Event-mode recording is
+    cut when it ends, from its start through its last sighting."""
     monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
     monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))
 
     async def fake_build_motion_event_clip(event_id, camera_number, start, end):
         return f"/recordings/clips/motion/motion_{event_id}.mp4"
 
     monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
     _standard_mocks(monkeypatch, tmp_path)
-
     persisted = []
 
     async def fake_persist_event_recording(camera_number, start, end, *, detector=None, trigger_id=None):
-        persisted.append((camera_number, detector, trigger_id))
+        persisted.append((camera_number, start, end, detector, trigger_id))
 
     monkeypatch.setattr(main, "persist_event_recording", fake_persist_event_recording)
 
+    first = main.save_yolo_events(172, _fake_result("car"))
+    time.sleep(0.05)
     main.save_yolo_events(172, _fake_result("car"))
-    main.save_yolo_events(172, _fake_result("car"))  # same burst -- a Hybrid dedup duplicate
-
-    assert _wait_until(lambda: len(persisted) == 2), (
-        "both scans in the same burst must schedule persist_event_recording() "
-        "-- the Hybrid dedup gate must not suppress the second call"
-    )
-    assert _wait_until(lambda: len(fake_uploader) == 1), (
-        "the Hybrid clip/upload path itself must still be deduplicated -- "
-        "only the FIRST scan builds/uploads a clip"
-    )
-    assert persisted[0][0] == persisted[1][0] == 172
-    # Distinct trigger ids: persist_event_recording()'s own merge logic
-    # (not this dedup) is what should decide whether the second call
-    # extends the first recording or starts a new one.
-    assert persisted[0][2] != persisted[1][2]
+    activity = main.ai_activities.get(172, first[0]["id"])
+    last_seen = activity.last_seen
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    assert _wait_until(lambda: len(persisted) == 1 and len(fake_uploader) == 1, timeout=10)
+    time.sleep(0.3)
+    assert len(persisted) == 1 and len(fake_uploader) == 1
+    camera_number, start, end, detector, trigger_id = persisted[0]
+    assert (camera_number, detector, trigger_id) == (172, "ai_detection", first[0]["id"])
+    assert start == activity.start and end == last_seen > activity.first_moment
 
 
 # --------------------------------------- 2026-09-22: linked_recording backfill scheduling
@@ -493,13 +486,9 @@ def test_ai_detection_dedup_does_not_suppress_persist_event_recording_during_sus
 def test_linked_recording_backfill_is_scheduled_for_an_event_mode_camera(
     monkeypatch, tmp_path, fake_uploader, background_loop
 ):
-    """The real gap this closes: save_yolo_events() resolves
-    linked_recording_for() synchronously, before persist_event_
-    recording() has even started building this camera's Event-mode
-    clip, so it reliably finds nothing -- with no retry anywhere, the
-    event stayed linked_recording: null forever. This proves the
-    companion backfill task is actually scheduled, with the real
-    camera/timestamp and every event id from this detection batch."""
+    """save_yolo_events() resolves linked_recording_for() before the
+    Event-mode recording exists. The activity's events get it once their
+    recording has been cut, when the activity ends."""
     monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
     monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
 
@@ -507,24 +496,25 @@ def test_linked_recording_backfill_is_scheduled_for_an_event_mode_camera(
         return f"/recordings/clips/motion/motion_{event_id}.mp4"
 
     monkeypatch.setattr(main, "build_motion_event_clip", fake_build_motion_event_clip)
-    monkeypatch.setattr(main, "persist_event_recording", lambda *a, **k: asyncio.sleep(0))
+    persisted = []
+
+    async def fake_persist(*a, **k):
+        persisted.append(a)
+
+    monkeypatch.setattr(main, "persist_event_recording", fake_persist)
     _standard_mocks(monkeypatch, tmp_path)
-
-    backfill_calls = []
-
-    async def fake_backfill(camera_number, event_ids, event_time):
-        backfill_calls.append((camera_number, event_ids, event_time))
-
-    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", fake_backfill)
+    lookups, patched = [], []
+    monkeypatch.setattr(main, "linked_recording_for",
+                        lambda camera, at, *a, **k: lookups.append(at) or ("/recordings/camera180/x.mkv#t=1,9" if persisted else None))
+    monkeypatch.setattr(main, "_patch_analytics_events_linked_recording", lambda ids, linked: patched.append((ids, linked)))
 
     events = main.save_yolo_events(180, _fake_result("car"))
 
-    assert _wait_until(lambda: len(backfill_calls) == 1), \
-        "the linked_recording backfill must actually be scheduled on the background loop"
-    camera_number, event_ids, event_time = backfill_calls[0]
-    assert camera_number == 180
+    assert _wait_until(lambda: len(patched) == 1, timeout=10), \
+        "the activity's events must get their linked recording once it is cut"
+    event_ids, linked = patched[0]
     assert set(event_ids) == {event["id"] for event in events}
-    assert event_time == events[0]["timestamp"] or event_time is not None
+    assert linked == "/recordings/camera180/x.mkv#t=1,9"
 
 
 def test_linked_recording_backfill_is_not_scheduled_for_a_continuous_mode_camera(

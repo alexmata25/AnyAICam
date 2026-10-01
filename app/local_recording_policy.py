@@ -95,6 +95,36 @@ def is_buffer_segment_still_needed(
     return False
 
 
+def keyframe_cut(request_start: datetime, segment_start: datetime, keyframes: list[float]) -> tuple[float, datetime]:
+    """Where an Event-mode recording cut from one buffer segment really
+    starts: (inpoint seconds into that segment, true wall-clock start).
+
+    A stream-copy cut can only begin on a keyframe, so it begins on the last
+    keyframe at or before the requested start -- never after it (that would
+    lose the beginning of the event). The returned true start is what the
+    recording must be labelled with: every consumer (event clips, linked
+    recordings, Playback) maps time to position from that label.
+
+    Found 2026-10-01 (Ryzen, Living Room): neither previous cut honoured
+    this. An output-side -ss began on the NEXT keyframe while the file was
+    labelled with the requested time (content up to one keyframe interval
+    late); an input-side -ss on the concat demuxer ignored the seek and
+    began at the start of the first buffer file (content 6-8 s early). Both
+    shifted every event clip cut from the recording."""
+    local = max(0.0, (request_start - segment_start).total_seconds())
+    inpoint = max([k for k in keyframes if 0.0 <= k <= local + 1e-3] or [0.0])
+    return inpoint, segment_start + timedelta(seconds=inpoint)
+
+
+def recording_name_time(true_start: datetime) -> datetime:
+    """The whole second an Event-mode recording is named by (its filename
+    carries seconds only). Rounded UP: the label may then be up to a second
+    later than the first frame, so a clip cut by label starts slightly
+    early -- never late."""
+    whole = true_start.replace(microsecond=0)
+    return whole if whole == true_start else whole + timedelta(seconds=1)
+
+
 def should_start_new_event_recording(
     *,
     current_recording_start: datetime,
