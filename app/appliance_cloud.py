@@ -306,6 +306,7 @@ def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_loca
 # its own 'motion'-only rule in _resolve_parent_motion_event() above,
 # unchanged.
 AI_CLIP_PARENT_TYPES=frozenset({'person','car','truck','bus','motorcycle','bicycle','dog','cat','bird','backpack','suitcase'})
+RULE_EVENT_TYPES=frozenset({'line_crossing','intrusion','intrusion_alarm'})
 # Continuous AI activity (2026-10-01, ai_activity.py): one activity owns
 # one clip, and every other object class seen during it (a truck beside
 # the car that opened it, a suitcase carried past) is its own card showing
@@ -317,6 +318,10 @@ ANALYTICS_MEDIA_PARENT_TYPES={
     'facial_recognition':AI_CLIP_PARENT_TYPES|{'facial_recognition'},
     'people_counting_in':AI_CLIP_PARENT_TYPES|{'people_counting_in','people_counting_out'},
     'people_counting_out':AI_CLIP_PARENT_TYPES|{'people_counting_in','people_counting_out'},
+    # Line crossings, intrusion zones and Secure Edge INTRUSION ALARMs
+    # (2026-10-01): the clip covering the crossing -- the person's own AI
+    # activity, or another rule event that had to build one.
+    **{event_type:AI_CLIP_PARENT_TYPES|RULE_EVENT_TYPES for event_type in ('line_crossing','intrusion','intrusion_alarm')},
 }
 
 

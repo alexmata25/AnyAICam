@@ -48010,6 +48010,18 @@ def navigation_keys_for_role(role: str) -> set[str] | None:
 
 
 
+def _face_access_active(customer_id: str | None) -> bool:
+    """Whether this account holds the Face Access add-on -- the same
+    account-level facial_recognition analytic the /aac/* pages gate on."""
+    if not customer_id:
+        return False
+    try:
+        from analytics_entitlements import get_active_analytics_for_customer
+        return "facial_recognition" in get_active_analytics_for_customer(customer_id)
+    except Exception:
+        return False
+
+
 def _facial_view_permitted(shell_user: dict | None, shell_role: str) -> bool:
     """AAC (facial recognition) nav-visibility gate: True only for an
     identity partner_db.ROLE_PERMISSIONS actually grants 'facial.view'
@@ -48328,6 +48340,13 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
             ("investigate", "/investigate", "Investigate"),
             ("dashboard", "/customer-portal", "Account"),
         ]
+        # People on the phone (2026-10-01): Facial Recognition was reachable
+        # only from the desktop sidebar. Shown to an account with the Face
+        # Access add-on (others reach the page from Account, which explains
+        # the add-on), and only to identities granted facial.view.
+        if (shell_has_partner_identity and _facial_view_permitted(shell_user, shell_role)
+                and _face_access_active((shell_user or {}).get("customer_id"))):
+            mobile_items.insert(5, ("aac", "/aac/people", "People"))
 
 
 

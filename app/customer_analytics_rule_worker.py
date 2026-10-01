@@ -263,7 +263,21 @@ def persist_rule_event(camera_number: int, fired: dict, now: datetime, thumbnail
     if analytic_type == "intrusion_alarm":
         record["severity"] = "critical"
         record["security_mode"] = fired.get("security_mode")
+    # Event clip (2026-10-01): line crossings and Secure Edge alarms reached
+    # the cloud with a thumbnail and never a clip (staging: 100 line
+    # crossings in a day, none with video). Same rule as People Counting:
+    # show the clip that already covers this moment on this camera (the
+    # person's own AI activity, usually), else build one -- see
+    # event_media_sharing.py.
+    import event_media_sharing
+    from main import _analytics_media_owner, _schedule_owned_analytics_clip
+    media_owner = _analytics_media_owner(camera_number, record["id"], now)
+    event_media_sharing.link(record, media_owner)
     append_analytics_event(record)
+    if media_owner == record["id"]:
+        _schedule_owned_analytics_clip(record["id"], camera_number, now, thumbnail_url)
+    elif media_owner:
+        event_media_sharing.attach_child(media_owner, record["id"], camera_number)
     return record
 
 
