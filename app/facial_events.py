@@ -75,6 +75,20 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(10)}"
 
 
+def _weekday_and_date(now) -> tuple[str | None, str | None]:
+    """('mon'..'sun', 'YYYY-MM-DD') for the door-grant day and date checks;
+    (None, None) -- no day/date restriction -- if `now` does not parse, the
+    same never-lose-a-detection rule as _hhmm()."""
+    from datetime import datetime as _dt
+    value = now
+    if not hasattr(value, "strftime"):
+        try:
+            value = _dt.fromisoformat(str(now))
+        except (TypeError, ValueError):
+            return None, None
+    return value.strftime("%a").lower(), value.date().isoformat()
+
+
 def _hhmm(now) -> str | None:
     """HH:MM for the schedule check in evaluate_access_rules() -- `now`
     may be a real datetime OR a plain ISO string (this module's own
@@ -270,6 +284,27 @@ def create_match_event(
     }
 
 
+def person_access_open(db, *, customer_id: str, person_id: str, today: str | None) -> bool:
+    """Whether this enrolled person's Face Access is on and within its dates
+    (YYYY-MM-DD, inclusive; missing = open-ended). A person this appliance
+    does not know, or a database without these columns yet, is closed only
+    when it says so -- never guessed open for a disabled record."""
+    row = db.execute("SELECT * FROM facial_people WHERE id=? AND customer_id=?", (person_id, customer_id)).fetchone()
+    if not row:
+        return False
+    keys = row.keys()
+    if row["status"] != "active" or ("access_enabled" in keys and not row["access_enabled"]):
+        return False
+    if today:
+        starts = row["access_starts_on"] if "access_starts_on" in keys else None
+        expires = row["access_expires_on"] if "access_expires_on" in keys else None
+        if starts and today < starts:
+            return False
+        if expires and today > expires:
+            return False
+    return True
+
+
 def evaluate_access_rules(
     db,
     *,
@@ -282,6 +317,8 @@ def evaluate_access_rules(
     relay_provider: "relay_control.RelayProvider",
     detection_event_id: str,
     current_time: str | None = None,
+    current_weekday: str | None = None,
+    today: str | None = None,
 ) -> list[dict]:
     """Loads this customer's enabled facial_rules (scoped to this
     camera or camera-agnostic, i.e. camera_id IS NULL), evaluates each
@@ -293,6 +330,11 @@ def evaluate_access_rules(
     provider actually activated -- e.g. a rule under cooldown still
     appears, with activated=False). An empty facial_rules table (the
     default -- see the Phase 1 report) means this always returns []."""
+    # Face Access off, not started yet or expired (2026-10-01): this person
+    # opens no door by any rule. They are still recognized, so the resident
+    # is alerted as for anyone without automatic entry.
+    if matched_person_id and not person_access_open(db, customer_id=customer_id, person_id=matched_person_id, today=today):
+        return []
     rows = db.execute(
         "SELECT * FROM facial_rules WHERE customer_id=? AND enabled=1 AND (camera_id=? OR camera_id IS NULL)",
         (customer_id, camera_id),
@@ -312,6 +354,7 @@ def evaluate_access_rules(
             person_id=row["person_id"],
             schedule_start=row["schedule_start"] if "schedule_start" in row.keys() else None,
             schedule_end=row["schedule_end"] if "schedule_end" in row.keys() else None,
+            days_of_week=row["days_of_week"] if "days_of_week" in row.keys() else None,
         )
         if not relay_control.rule_applies(
             rule,
@@ -320,6 +363,7 @@ def evaluate_access_rules(
             matched_person_id=matched_person_id,
             matched_watchlist_id=matched_watchlist_id,
             current_time=current_time,
+            current_weekday=current_weekday,
         ):
             continue
         request = relay_control.build_request(rule, reason=f"facial_event:{detection_event_id}")
@@ -483,6 +527,8 @@ def record_facial_events(
                         context, relay_provider, person_id=accepted.person_id if accepted else None),
                     detection_event_id=event["detection_event_id"],
                     current_time=_hhmm(now),
+                    current_weekday=_weekday_and_date(now)[0],
+                    today=_weekday_and_date(now)[1],
                 )
                 event["relay_outcomes"] = outcomes
                 # Persisted separately from the INSERT above (the

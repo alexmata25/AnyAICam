@@ -384,12 +384,55 @@ async def _reply(send, message: dict) -> None:
         logger.warning("talk_audio_relay_client.reply_failed type=%s error=%s", message.get("type"), error)
 
 
+async def _resync_facial_directory() -> None:
+    try:
+        import facial_embedding_sync
+        summary = await asyncio.to_thread(facial_embedding_sync.sync_facial_directory)
+        logger.info("talk_audio_relay_client.facial_resync status=%s", (summary or {}).get("status"))
+    except Exception as error:
+        logger.warning("talk_audio_relay_client.facial_resync_failed error=%s", type(error).__name__)
+
+
+def _door_unlock_on_appliance(message: dict) -> dict:
+    """The cloud has already authorized this person for this door; the
+    door itself (access_control / relay) still applies its own checks --
+    dry run, one command at a time, controller online. Never raises."""
+    camera_id = message.get("camera_id")
+    if not isinstance(camera_id, str) or not camera_id:
+        return {"status": "error", "reason": "bad_request"}
+    try:
+        import door_access
+        from partner_db import connection
+        with connection() as db:
+            camera = db.execute("SELECT * FROM cameras WHERE id=? AND door_access_enabled=1", (camera_id,)).fetchone()
+        if not camera:
+            return {"status": "error", "reason": "not_a_door_here"}
+        pulse = message.get("pulse_ms") if isinstance(message.get("pulse_ms"), int) else None
+        result = door_access.trigger_door(dict(camera), reason=f"remote_unlock:{camera_id}", actor=str(message.get("actor") or "portal"),
+                                          trigger_type="manual", pulse_ms=pulse)
+        return {"status": "ok", "channel": result.channel, "activated": bool(result.activated),
+                "dry_run": bool(result.dry_run), "suppressed_reason": result.suppressed_reason}
+    except Exception as error:
+        logger.warning("talk_audio_relay_client.door_unlock_failed camera_id=%s error=%s", camera_id, type(error).__name__)
+        return {"status": "error", "reason": "door_unreachable"}
+
+
 async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=None) -> None:
     try:
         message = json.loads(raw_message)
     except json.JSONDecodeError:
         return
-    message_type = message.get("type")
+    message_type = message.get("type") if isinstance(message, dict) else None
+    # Not Talk (2026-10-01): the cloud also uses this channel to ask for an
+    # immediate face/door-grant re-sync and to open a door for an authorized
+    # portal user. Both run off the event loop.
+    if message_type == "facial_directory_changed":
+        asyncio.create_task(_resync_facial_directory())
+        return
+    if message_type == "door_unlock":
+        result = await asyncio.to_thread(_door_unlock_on_appliance, message)
+        await _reply(send, {"type": "door_unlock_result", "request_id": message.get("request_id"), **result})
+        return
     session_id = message.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         return

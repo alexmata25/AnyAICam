@@ -158,6 +158,32 @@ class CameraDoorProvider(relay_control.RelayProvider):
                             person_id=self.person_id)
 
 
+class DoorNotReachable(Exception):
+    """The door's appliance could not be asked to open it; nothing moved."""
+
+
+def dispatch_manual_unlock(camera: dict, *, actor: str, pulse_ms: int | None) -> relay_control.RelayResult:
+    """Where the door hardware is (2026-10-01). On the appliance itself this
+    is trigger_door(). In the cloud portal the door's relay is plugged into
+    the customer's appliance, so the already-authorized command goes there
+    over its control channel and the appliance's own answer is returned.
+    Fails closed: not connected or no answer means the door stays shut."""
+    import os
+    if os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower() != "cloud":
+        return trigger_door(camera, reason=f"manual_unlock:{camera['id']}", actor=actor, trigger_type='manual', pulse_ms=pulse_ms)
+    import appliance_control
+    appliance_id = camera.get("appliance_id")
+    if not appliance_id or not appliance_control.connected(appliance_id):
+        raise DoorNotReachable("the appliance for this door is not connected right now")
+    answer = appliance_control.request(appliance_id, {"type": "door_unlock", "camera_id": camera["id"], "actor": actor, "pulse_ms": pulse_ms})
+    if not answer or answer.get("status") == "timeout":
+        raise DoorNotReachable("the appliance did not answer in time")
+    if answer.get("status") != "ok":
+        raise DoorNotReachable({"not_a_door_here": "the appliance does not have this door set up yet"}.get(answer.get("reason"), "the door could not be reached"))
+    return relay_control.RelayResult(channel=int(answer.get("channel") or 0), activated=bool(answer.get("activated")),
+                                     dry_run=bool(answer.get("dry_run")), suppressed_reason=answer.get("suppressed_reason"))
+
+
 def door_camera(db, *, customer_id: str, camera_id: str) -> dict | None:
     """The one door-configured-camera lookup every consumer (the manual
     unlock route below, the live-tile visibility check, Camera Settings)
@@ -264,8 +290,17 @@ def register_door_access_routes(app: FastAPI) -> None:
                     )
             raise
         try:
-            result = trigger_door(camera, reason=f"manual_unlock:{camera['id']}", actor=identity['email'],
-                                  trigger_type='manual', pulse_ms=camera['door_relay_pulse_ms'])
+            result = dispatch_manual_unlock(camera, actor=identity['email'], pulse_ms=camera['door_relay_pulse_ms'])
+        except DoorNotReachable as error:
+            with connection() as audit_db:
+                record_door_access_event(
+                    audit_db, customer_id=identity['customer_id'], camera_id=camera['id'], door_name=camera['name'],
+                    relay_channel=camera['door_relay_channel'], trigger_type='manual',
+                    actor_user_id=user_id, actor_email=identity['email'],
+                    authorization_result='authorized', relay_result='not_sent', success=False,
+                    error=str(error), now=now,
+                )
+            raise HTTPException(status_code=503, detail=f"{camera['name']} was not opened: {error}.") from error
         except Exception as error:
             with connection() as audit_db:
                 record_door_access_event(

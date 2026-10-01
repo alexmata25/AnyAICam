@@ -198,6 +198,26 @@ class RelayRule:
     # differently-shaped schedule concept.
     schedule_start: str | None = None
     schedule_end: str | None = None
+    # Days of the week this grant is valid ("mon,tue,..."; None = every day),
+    # 2026-10-01 -- an apartment cleaner on weekdays only, for example.
+    days_of_week: str | None = None
+
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def normalize_days(value) -> str | None:
+    """'mon,wed' / ['mon','wed'] -> 'mon,wed' in week order; empty or all
+    seven -> None (every day). Raises ValueError for anything else."""
+    if value in (None, "", []):
+        return None
+    items = value.split(",") if isinstance(value, str) else list(value)
+    days = {str(item).strip().lower()[:3] for item in items if str(item).strip()}
+    if not days <= set(WEEKDAYS):
+        raise ValueError("Days must be mon, tue, wed, thu, fri, sat or sun.")
+    if not days or days == set(WEEKDAYS):
+        return None
+    return ",".join(day for day in WEEKDAYS if day in days)
 
 
 def _within_schedule(current_time: str, schedule_start: str | None, schedule_end: str | None) -> bool:
@@ -216,6 +236,7 @@ def rule_applies(
     matched_person_id: str | None,
     matched_watchlist_id: str | None,
     current_time: str | None = None,
+    current_weekday: str | None = None,
 ) -> bool:
     """Pure decision: would this rule fire for this match? Never touches
     a RelayProvider or a database -- see facial_events.evaluate_access_rules()
@@ -233,6 +254,8 @@ def rule_applies(
     if confidence < rule.min_confidence:
         return False
     if current_time is not None and not _within_schedule(current_time, rule.schedule_start, rule.schedule_end):
+        return False
+    if current_weekday is not None and rule.days_of_week and current_weekday not in rule.days_of_week.split(","):
         return False
     if rule.trigger_type == "known_person":
         return match_state == "known"

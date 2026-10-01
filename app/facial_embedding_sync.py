@@ -154,22 +154,29 @@ def _replace_local_directory(customer_id: str, directory: dict) -> dict:
     embeddings = [item for item in directory.get("embeddings", []) if isinstance(item, dict)]
     watchlists = [item for item in directory.get("watchlists", []) if isinstance(item, dict)]
     memberships = [item for item in directory.get("watchlist_members", []) if isinstance(item, dict)]
+    door_grants = [item for item in directory.get("door_grants", []) if isinstance(item, dict)]
     now = datetime.now().isoformat()
     with connect() as db:
         # Children before parents, matching the schema's own FK
         # dependency order -- see db_migrations.py's facial_* block.
+        # Door grants made in the customer portal (2026-10-01) are children
+        # of the people they belong to and are replaced with them; grants
+        # made on this appliance (origin 'local') are never touched.
+        db.execute("DELETE FROM facial_rules WHERE customer_id=? AND origin='cloud'", (customer_id,))
         db.execute("DELETE FROM facial_watchlist_members WHERE watchlist_id IN (SELECT id FROM facial_watchlists WHERE customer_id=?)", (customer_id,))
         db.execute("DELETE FROM facial_embeddings WHERE customer_id=?", (customer_id,))
         db.execute("DELETE FROM facial_watchlists WHERE customer_id=?", (customer_id,))
         db.execute("DELETE FROM facial_people WHERE customer_id=?", (customer_id,))
         for person in people:
             db.execute(
-                "INSERT INTO facial_people(id,customer_id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO facial_people(id,customer_id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by,"
+                "unit,access_enabled,access_starts_on,access_expires_on) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     person.get("id"), customer_id, person.get("site_id"), person.get("external_reference"),
                     person.get("display_name"), person.get("status", "active"), person.get("notes"),
                     person.get("created_at", now), person.get("updated_at", now), person.get("created_by"),
+                    person.get("unit"), 0 if person.get("access_enabled") in (0, False) else 1,
+                    person.get("access_starts_on"), person.get("access_expires_on"),
                 ),
             )
         for embedding in embeddings:
@@ -198,7 +205,24 @@ def _replace_local_directory(customer_id: str, directory: dict) -> dict:
                 "INSERT INTO facial_watchlist_members(watchlist_id,person_id,added_at,added_by) VALUES(?,?,?,?)",
                 (membership.get("watchlist_id"), membership.get("person_id"), membership.get("added_at", now), membership.get("added_by")),
             )
-    return {"people": len(people), "embeddings": len(embeddings), "watchlists": len(watchlists), "watchlist_members": len(memberships)}
+        person_ids = {person.get("id") for person in people}
+        for grant in door_grants:
+            if grant.get("person_id") not in person_ids or grant.get("relay_channel") is None:
+                continue  # never a grant for someone this appliance does not hold
+            db.execute(
+                "INSERT INTO facial_rules(id,customer_id,camera_id,name,trigger_type,person_id,min_confidence,relay_channel,pulse_ms,"
+                "cooldown_seconds,dry_run,enabled,schedule_start,schedule_end,days_of_week,origin,created_at,updated_at) "
+                "VALUES(?,?,?,?,'specific_person',?,?,?,?,?,0,?,?,?,?,'cloud',?,?)",
+                (
+                    grant.get("id"), customer_id, grant.get("camera_id"), grant.get("name") or "Door access",
+                    grant.get("person_id"), grant.get("min_confidence", 0.85), grant.get("relay_channel"),
+                    grant.get("pulse_ms", 3000), grant.get("cooldown_seconds", 10), 1 if grant.get("enabled", 1) else 0,
+                    grant.get("schedule_start"), grant.get("schedule_end"), grant.get("days_of_week"),
+                    grant.get("created_at", now), grant.get("updated_at", now),
+                ),
+            )
+    return {"people": len(people), "embeddings": len(embeddings), "watchlists": len(watchlists),
+            "watchlist_members": len(memberships), "door_grants": len(door_grants)}
 
 
 def sync_facial_directory() -> dict:

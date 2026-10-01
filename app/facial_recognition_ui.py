@@ -30,6 +30,7 @@ carry which of the two.
 from __future__ import annotations
 
 import base64
+import os
 import binascii
 import html
 import json
@@ -116,6 +117,15 @@ def _require(request: Request, permission: str) -> dict:
     if not allowed(identity, permission):
         raise HTTPException(status_code=403, detail="You do not have permission for this action.")
     return identity
+
+
+def _require_face_access(identity: dict) -> None:
+    """Face Access settings and enrollment previews belong to the Face Access
+    add-on (2026-10-01): a customer account without it is refused here, as
+    its pages already show the add-on instead. Staff tools are unaffected."""
+    context = _customer_facial_context(identity)
+    if context is not None and not context["entitled"]:
+        raise HTTPException(status_code=403, detail="Face Access is not active on this account.")
 
 
 def _customer_facial_context(identity: dict) -> dict | None:
@@ -216,6 +226,172 @@ def _customer_picker(input_id: str) -> str:
     )
 
 
+def _push_directory_now(customer_id: str) -> None:
+    """Reduced access takes effect on the appliance now, not at its next
+    5-minute sync (2026-10-01). Best effort: the periodic sync still runs."""
+    if os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower() != "cloud":
+        return
+    try:
+        import appliance_control
+        appliance_control.notify_facial_directory_changed(customer_id)
+    except Exception:
+        pass
+
+
+def _face_previews(image_bgr) -> list[dict]:
+    """Faces found in one image, largest first (the one an enrollment would
+    use), each with its quality and a small JPEG crop. Nothing is stored."""
+    import cv2
+    previews = []
+    observations = sorted(facial_recognition.detect_and_embed(image_bgr),
+                          key=lambda o: o.bbox.width * o.bbox.height, reverse=True)
+    height, width = image_bgr.shape[:2]
+    for index, observation in enumerate(observations[:5]):
+        box = observation.bbox
+        pad = int(max(box.width, box.height) * 0.25)
+        x0, y0 = max(0, box.x - pad), max(0, box.y - pad)
+        x1, y1 = min(width, box.x + box.width + pad), min(height, box.y + box.height + pad)
+        ok, encoded = cv2.imencode(".jpg", image_bgr[y0:y1, x0:x1], [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        previews.append({
+            "quality": observation.quality, "width": box.width, "height": box.height,
+            "used_for_enrollment": index == 0,
+            "crop_jpeg_base64": base64.b64encode(encoded.tobytes()).decode() if ok else None,
+        })
+    return previews
+
+
+PERSON_PAGE_JS = r'''const PERSON_URL=id=>`/api/aac/people/${encodeURIComponent(id)}`+(FIXED_CUSTOMER_ID?'':`?customer_id=${encodeURIComponent(customerId())}`);
+function customerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('e-customer-id')?.value.trim()||'');}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+const $=id=>document.getElementById(id);
+let personId=new URLSearchParams(location.search).get('person_id')||null;
+let pendingImage=null;
+function say(id,text){$(id).textContent=text;}
+
+async function loadPerson(){
+  if(!personId)return;
+  const r=await fetch(PERSON_URL(personId));
+  if(!r.ok){say('e-status','This person could not be loaded.');return;}
+  const p=await r.json();
+  $('e-heading').textContent=p.display_name;
+  $('e-name').value=p.display_name||'';$('e-reference').value=p.external_reference||'';$('e-notes').value=p.notes||'';
+  $('e-create').textContent='Save details';
+  $('e-after-create').hidden=false;
+  const list=$('e-image-list');
+  list.innerHTML=(p.reference_images||[]).length?('<p class="health-detail">'+p.reference_images.length+' face photo(s) enrolled.</p>'):'<p class="health-detail">No face photo yet. Add one below.</p>';
+  loadAccess();
+}
+
+$('e-create')?.addEventListener('click',async()=>{
+  const body={customer_id:customerId(),display_name:$('e-name').value.trim(),external_reference:$('e-reference').value.trim(),notes:$('e-notes').value};
+  if(!body.display_name){say('e-status','Enter the person\'s name.');return;}
+  const r=personId?await fetch(PERSON_URL(personId),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+                  :await fetch('/api/aac/people',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const result=await r.json().catch(()=>({}));
+  if(!r.ok){say('e-status',result.detail||'Could not save.');return;}
+  if(!personId){personId=result.person_id;history.replaceState(null,'',`?person_id=${encodeURIComponent(personId)}`);}
+  say('e-status','Saved.');loadPerson();
+});
+
+// ---------- face photo: Take Photo / Upload Photo / Enroll from Camera
+document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));
+  document.querySelectorAll('[data-pane]').forEach(p=>p.hidden=p.dataset.pane!==b.dataset.tab);
+  if(b.dataset.tab!=='take')stopCamera();
+}));
+
+async function preview(imageBase64,boxId){
+  const box=$(boxId);box.innerHTML='<p class="health-detail">Looking for a face…</p>';
+  const r=await fetch('/api/aac/face-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer_id:customerId(),image_base64:imageBase64})});
+  const data=await r.json().catch(()=>({faces:[]}));
+  if(!r.ok||!data.faces.length){box.innerHTML='<p class="health-detail">No face was found. Face the camera in good light and try again.</p>';return null;}
+  const face=data.faces[0];
+  box.innerHTML=`<div class="face-pick"><img alt="Face to enroll" src="data:image/jpeg;base64,${face.crop_jpeg_base64}"><div><strong>This face will be enrolled.</strong><div class="health-detail">Quality ${Math.round(face.quality*100)}%${data.faces.length>1?` · ${data.faces.length} faces in the picture; the largest is used`:''}</div></div></div>`;
+  return face;
+}
+async function saveFace(imageBase64,statusId){
+  const r=await fetch(`/api/aac/people/${encodeURIComponent(personId)}/images`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer_id:customerId(),image_base64:imageBase64})});
+  const result=await r.json().catch(()=>({}));
+  say(statusId,r.ok?'Face photo enrolled.':(result.detail||'The photo could not be enrolled.'));
+  if(r.ok)loadPerson();
+  return r.ok;
+}
+
+let stream=null;
+function stopCamera(){if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}}
+$('take-start')?.addEventListener('click',async()=>{
+  try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user'},audio:false});$('take-video').srcObject=stream;$('take-video').hidden=false;$('take-snap').hidden=false;say('take-status','Look at the camera, then take the photo.');}
+  catch(e){say('take-status','The camera could not be opened. Allow camera access, or use Upload Photo.');}
+});
+$('take-snap')?.addEventListener('click',async()=>{
+  const v=$('take-video');if(!v.videoWidth)return;
+  const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);
+  pendingImage=c.toDataURL('image/jpeg',0.92);
+  if(await preview(pendingImage,'take-preview'))$('take-save').hidden=false;
+});
+$('take-save')?.addEventListener('click',async()=>{if(pendingImage&&await saveFace(pendingImage,'take-status')){stopCamera();$('take-video').hidden=true;$('take-snap').hidden=true;$('take-save').hidden=true;}});
+
+$('upload-file')?.addEventListener('change',()=>{
+  const file=$('upload-file').files[0];if(!file)return;
+  const reader=new FileReader();
+  reader.onload=async()=>{pendingImage=reader.result;if(await preview(pendingImage,'upload-preview'))$('upload-save').hidden=false;};
+  reader.readAsDataURL(file);
+});
+$('upload-save')?.addEventListener('click',()=>pendingImage&&saveFace(pendingImage,'upload-status'));
+
+let cameraCandidates=[];
+$('cam-start')?.addEventListener('click',async()=>{
+  const cameraId=$('cam-select').value;if(!cameraId)return;
+  $('cam-start').disabled=true;$('cam-candidates').innerHTML='';cameraCandidates=[];
+  say('cam-status','Starting the camera… ask the person to look at it.');
+  try{await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}/live/start`,{method:'POST'});}catch(e){}
+  for(let i=0;i<10&&cameraCandidates.length<6;i++){
+    await new Promise(r=>setTimeout(r,i?900:2500));
+    say('cam-status',`Capturing… ${i+1}`);
+    const r=await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}/live/still.jpg`,{cache:'no-store'});
+    if(!r.ok)continue;
+    const b=await r.blob();const data=await new Promise(res=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.readAsDataURL(b);});
+    const p=await fetch('/api/aac/face-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({customer_id:customerId(),image_base64:data})});
+    const found=await p.json().catch(()=>({faces:[]}));
+    if(p.ok&&found.faces.length)cameraCandidates.push({image:data,face:found.faces[0]});
+  }
+  $('cam-start').disabled=false;
+  if(!cameraCandidates.length){say('cam-status','No usable face was captured. Have the person stand closer to the camera, facing it, and try again.');return;}
+  cameraCandidates.sort((a,b)=>b.face.quality-a.face.quality);
+  say('cam-status','Choose the best picture of this person, then confirm.');
+  $('cam-candidates').innerHTML=cameraCandidates.slice(0,4).map((c,i)=>`<label class="face-pick"><input type="radio" name="cam-pick" value="${i}" ${i===0?'checked':''}><img alt="Captured face ${i+1}" src="data:image/jpeg;base64,${c.face.crop_jpeg_base64}"><span class="health-detail">Quality ${Math.round(c.face.quality*100)}%</span></label>`).join('')
+    +'<button class="action-button" id="cam-confirm" type="button">Confirm and enroll this face</button>';
+  $('cam-confirm').addEventListener('click',()=>{const pick=document.querySelector('[name=cam-pick]:checked');if(pick)saveFace(cameraCandidates[+pick.value].image,'cam-status');});
+});
+
+// ---------- Face Access
+const DAYS=['mon','tue','wed','thu','fri','sat','sun'],DAY_LABEL={mon:'Mon',tue:'Tue',wed:'Wed',thu:'Thu',fri:'Fri',sat:'Sat',sun:'Sun'};
+async function loadAccess(){
+  const r=await fetch(PERSON_URL(personId).replace(/(\?|$)/,'/access$1'));
+  if(!r.ok)return;
+  const a=await r.json();
+  $('a-enabled').checked=a.access_enabled;$('a-unit').value=a.unit||'';
+  $('a-site').innerHTML='<option value="">—</option>'+a.sites.map(s=>`<option value="${esc(s.id)}" ${s.id===a.site_id?'selected':''}>${esc(s.name)}</option>`).join('');
+  $('a-starts').value=a.access_starts_on||'';$('a-expires').value=a.access_expires_on||'';
+  $('a-doors').innerHTML=a.doors.length?a.doors.map(d=>`<fieldset class="door-grant" data-camera="${esc(d.camera_id)}"><legend><label><input type="checkbox" class="d-allowed" ${d.allowed?'checked':''} ${CAN_MANAGE?'':'disabled'}> ${esc(d.name)}${d.site?` <span class="health-detail">· ${esc(d.site)}</span>`:''}</label></legend>
+      <div class="day-row">${DAYS.map(x=>`<label><input type="checkbox" class="d-day" value="${x}" ${(!d.days.length||d.days.includes(x))?'checked':''} ${CAN_MANAGE?'':'disabled'}>${DAY_LABEL[x]}</label>`).join('')}</div>
+      <div class="time-row"><label>From<input type="time" class="d-start" value="${esc(d.start||'')}" ${CAN_MANAGE?'':'disabled'}></label><label>To<input type="time" class="d-end" value="${esc(d.end||'')}" ${CAN_MANAGE?'':'disabled'}></label><span class="health-detail">Leave both empty for any time.</span></div></fieldset>`).join('')
+    :'<p class="health-detail">No doors are set up yet. Turn on Face Access for a door camera in its Camera Settings.</p>';
+}
+$('a-save')?.addEventListener('click',async()=>{
+  const doors=[...document.querySelectorAll('.door-grant')].map(f=>{const days=[...f.querySelectorAll('.d-day:checked')].map(x=>x.value);
+    return {camera_id:f.dataset.camera,allowed:f.querySelector('.d-allowed').checked,days:days.length===7?[]:days,start:f.querySelector('.d-start').value,end:f.querySelector('.d-end').value};});
+  if(doors.some(d=>d.allowed&&d.days.length===0&&[...document.querySelectorAll(`.door-grant[data-camera="${d.camera_id}"] .d-day:checked`)].length===0)){say('a-status','Pick at least one day for each allowed door.');return;}
+  const body={customer_id:customerId(),access_enabled:$('a-enabled').checked,unit:$('a-unit').value,site_id:$('a-site').value,access_starts_on:$('a-starts').value,access_expires_on:$('a-expires').value,doors};
+  const r=await fetch(PERSON_URL(personId).replace(/(\?|$)/,'/access$1'),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const result=await r.json().catch(()=>({}));
+  say('a-status',r.ok?'Face Access saved.':(result.detail||'Could not save Face Access.'));
+  if(r.ok)loadAccess();
+});
+loadPerson();
+'''
+
+
 def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
     # ---------------------------------------------------------------- API
 
@@ -301,6 +477,8 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         if not updated:
             raise HTTPException(status_code=404, detail="Person not found.")
         audit(identity, "facial.person.updated", "facial_people", person_id, {"customer_id": resolved, "fields": list(payload.keys())})
+        if payload.get("status") not in (None, "active"):
+            _push_directory_now(resolved)  # a disabled person leaves the appliance now
         return {"status": "updated"}
 
     @app.delete("/api/aac/people/{person_id}")
@@ -317,7 +495,53 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         # tenant-scoped not-found (handled above), so there is no
         # ordering risk of auditing a deletion that silently failed.
         audit(identity, "facial.person.deleted", "facial_people", person_id, {"customer_id": resolved, "biometric_templates": "hard_deleted"})
+        _push_directory_now(resolved)
         return {"status": "deleted"}
+
+    @app.get("/api/aac/people/{person_id}/access")
+    def aac_person_access(request: Request, person_id: str, customer_id: str | None = None) -> dict:
+        identity = _require(request, "facial.view")
+        resolved = _resolve_customer_id(identity, customer_id)
+        import face_access_people
+        with connection() as db:
+            settings = face_access_people.get_access(db, customer_id=resolved, person_id=person_id)
+        if settings is None:
+            raise HTTPException(status_code=404, detail="Person not found.")
+        return settings
+
+    @app.put("/api/aac/people/{person_id}/access")
+    def aac_save_person_access(request: Request, person_id: str, payload: dict) -> dict:
+        identity = _require(request, "facial.manage")
+        _require_face_access(identity)
+        resolved = _resolve_customer_id(identity, payload.get("customer_id"))
+        import face_access_people
+        try:
+            with connection() as db:
+                outcome = face_access_people.save_access(db, customer_id=resolved, person_id=person_id, payload=payload,
+                                                          actor=identity.get("email", ""), now=datetime.now().isoformat())
+        except LookupError as error:
+            raise HTTPException(status_code=404, detail="Person not found.") from error
+        except face_access_people.AccessSettingsError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        settings = outcome["settings"]
+        audit(identity, "facial.person.access_updated", "facial_people", person_id, {
+            "customer_id": resolved, "access_enabled": settings["access_enabled"], "unit": settings["unit"],
+            "starts_on": settings["access_starts_on"], "expires_on": settings["access_expires_on"],
+            "doors": [d["camera_id"] for d in settings["doors"] if d["allowed"]],
+        })
+        if outcome["access_reduced"]:
+            _push_directory_now(resolved)
+        return settings
+
+    @app.post("/api/aac/face-preview")
+    def aac_face_preview(request: Request, payload: dict) -> dict:
+        """Take Photo / Enroll from Camera: which faces this image holds and
+        which one an enrollment would use, before anything is saved."""
+        identity = _require(request, "facial.manage")
+        _require_face_access(identity)
+        _resolve_customer_id(identity, payload.get("customer_id"))
+        image = _decode_image(str(payload.get("image_base64", "")))
+        return {"faces": _face_previews(image)}
 
     @app.post("/api/aac/people/{person_id}/images")
     def aac_add_reference_image(request: Request, person_id: str, payload: dict) -> dict:
@@ -522,10 +746,10 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         if facial_ctx and not facial_ctx["entitled"]:
             return shell("Facial Recognition · People", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>People</h1></div></header>' + _FACE_ACCESS_UPSELL)
         customer_id_field = "" if facial_ctx else _customer_picker("aac-customer-id")
-        empty_message = "Search or refresh to load your enrolled people." if facial_ctx else "Choose a customer and refresh."
+        empty_message = "Loading your people…" if facial_ctx else "Choose a customer and refresh."
         fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
         content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>People</h1></div>
-<a class="action-button" href="/aac/people/enroll">Enroll person</a></header>
+<a class="action-button" href="/aac/people/enroll">Add person</a></header>
 <section class="panel">''' + customer_id_field + '''<label>Search<input id="aac-search"></label><button class="ghost-button" id="aac-refresh">Refresh</button></section>
 <section class="panel" id="aac-people-list"><p class="health-detail">''' + empty_message + '''</p></section>''')
         scripts = '''<script>
@@ -548,72 +772,85 @@ async function aacLoadPeople(){
   // value below is HTML-escaped before it reaches innerHTML so a
   // maliciously-crafted name can never execute as markup/script in
   // another user's (e.g. an administrator's) browser session.
-  box.innerHTML='<table class="data-table"><thead><tr><th>Name</th><th>Reference</th><th>Status</th><th></th></tr></thead><tbody>'+
-    data.people.map(p=>`<tr><td><a href="/aac/people/enroll?person_id=${encodeURIComponent(p.id)}&customer_id=${encodeURIComponent(customerId)}">${aacEsc(p.display_name)}</a></td><td>${aacEsc(p.external_reference||'')}</td><td>${aacEsc(p.status)}</td>
-    <td><button class="ghost-button" onclick="aacDeletePerson('${p.id}','${customerId}')">Delete</button></td></tr>`).join('')+'</tbody></table>';
+  // Phone-first cards (2026-10-01): name, unit and Face Access at a glance.
+  box.innerHTML='<div class="people-cards">'+data.people.map(p=>{const access=p.status!=='active'?'Disabled':(p.access_enabled===0||p.access_enabled===false?'Face Access off':'Face Access on');
+    return `<div class="setting-link"><a href="/aac/people/enroll?person_id=${encodeURIComponent(p.id)}${FIXED_CUSTOMER_ID?'':'&customer_id='+encodeURIComponent(customerId)}"><strong>${aacEsc(p.display_name)}</strong><div class="health-detail">${p.unit?'Unit '+aacEsc(p.unit)+' · ':''}${aacEsc(access)}${p.external_reference?' · '+aacEsc(p.external_reference):''}</div></a>
+    <button class="ghost-button" type="button" onclick="aacDeletePerson('${p.id}','${customerId}')">Remove</button></div>`;}).join('')+'</div>';
 }
 async function aacDeletePerson(personId,customerId){
-  if(!confirm('Delete this person and all biometric templates? This cannot be undone.'))return;
+  if(!confirm('Remove this person? Their face templates and door access are deleted now; past recognition and door history is kept.'))return;
   await fetch(`/api/aac/people/${personId}?customer_id=${customerId}`,{method:'DELETE'});
   aacLoadPeople();
 }
 document.getElementById('aac-refresh').addEventListener('click',aacLoadPeople);
+document.getElementById('aac-search').addEventListener('keydown',e=>{if(e.key==='Enter')aacLoadPeople();});
+if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
 </script>'''
         return shell("Facial Recognition · People", "aac", content, scripts)
 
     @app.get("/aac/people/enroll", response_class=HTMLResponse)
     def aac_enroll_page(request: Request):
+        """Add or edit one person (2026-10-01): details; a face photo by Take
+        Photo, Upload Photo or Enroll from Camera (each previews the face that
+        will be enrolled before anything is saved); and Face Access -- on/off,
+        unit/apartment, site/building, start and expiry dates, and the doors
+        they may open on which days and hours. Phone-first layout."""
         identity = _require(request, "facial.view")
         facial_ctx = _customer_facial_context(identity)
+        title = "Person"
         if facial_ctx and not facial_ctx["entitled"]:
-            return shell("Enroll person", "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>' + _FACE_ACCESS_UPSELL)
+            return shell(title, "aac", '<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>' + _FACE_ACCESS_UPSELL)
+        can_manage = allowed(identity, "facial.manage")
         customer_id_field = "" if facial_ctx else _customer_picker("e-customer-id")
-        fixed_customer_id_js = "const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null") + ";"
-        content = ('''<header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1>Enroll person</h1></div></header>
-<section class="panel rule-form" style="max-width:640px">
-''' + customer_id_field + '''<label>Display name<input id="e-name" required></label>
-<label>Employee/customer reference<input id="e-reference"></label>
-<label>Notes<textarea id="e-notes"></textarea></label>
-<button class="action-button" id="e-create">Create person</button>
-<p role="status" id="e-status"></p>
-<div id="e-images" style="display:none">
-<h2>Reference images</h2>
-<label>Upload a clear, front-facing photo<input id="e-file" type="file" accept="image/*"></label>
-<button class="action-button" id="e-upload">Add reference image</button>
-<p class="health-detail">Only the detected face crop is stored -- the original photo is never saved.</p>
-<div id="e-image-list"></div>
-</div>
-</section>''')
-        scripts = '''<script>
-''' + fixed_customer_id_js + '''
-function eGetCustomerId(){return FIXED_CUSTOMER_ID!==null?FIXED_CUSTOMER_ID:(document.getElementById('e-customer-id')?.value.trim()||'');}
-let currentPersonId=null;
-document.getElementById('e-create').addEventListener('click',async()=>{
-  const customerId=eGetCustomerId();
-  const response=await fetch('/api/aac/people',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({customer_id:customerId,display_name:document.getElementById('e-name').value,
-    external_reference:document.getElementById('e-reference').value,notes:document.getElementById('e-notes').value})});
-  const result=await response.json();
-  if(!response.ok){document.getElementById('e-status').textContent=result.detail;return;}
-  currentPersonId=result.person_id;
-  document.getElementById('e-status').textContent='Person created. Add at least one reference image.';
-  document.getElementById('e-images').style.display='block';
-});
-document.getElementById('e-upload').addEventListener('click',async()=>{
-  const file=document.getElementById('e-file').files[0];
-  const customerId=eGetCustomerId();
-  if(!file||!currentPersonId)return;
-  const reader=new FileReader();
-  reader.onload=async()=>{
-    const response=await fetch(`/api/aac/people/${currentPersonId}/images`,{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({customer_id:customerId,image_base64:reader.result})});
-    const result=await response.json();
-    document.getElementById('e-status').textContent=response.ok?`Reference image added (quality ${result.quality}).`:result.detail;
-  };
-  reader.readAsDataURL(file);
-});
-</script>'''
-        return shell("Enroll person", "aac", content, scripts)
+        cameras = []
+        if facial_ctx:
+            with connection() as db:
+                cameras = [dict(row) for row in db.execute(
+                    "SELECT id,name FROM cameras WHERE customer_id=? AND (status IS NULL OR status<>'deleted') ORDER BY name", (facial_ctx["customer_id"],)
+                ).fetchall()]
+        camera_options = "".join(f'<option value="{html.escape(c["id"], quote=True)}">{html.escape(c["name"] or "Camera")}</option>' for c in cameras)
+        ro = "" if can_manage else " disabled"
+        content = ('''<style>
+.person-page .panel{max-width:760px}.person-page label{display:grid;gap:6px;margin:10px 0}
+.person-page input,.person-page select,.person-page textarea{width:100%;box-sizing:border-box}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 12px}.tabs button{flex:1 1 auto;min-height:44px}.tabs button.active{outline:2px solid var(--brand-soft,#42e4dc)}
+.face-pick{display:flex;gap:12px;align-items:center;margin:10px 0}.face-pick img{width:96px;height:96px;object-fit:cover;border-radius:10px}
+#take-video{width:100%;max-width:480px;border-radius:10px;background:#000}
+.door-grant{border:1px solid rgba(170,196,207,.25);border-radius:10px;padding:10px;margin:10px 0}
+.day-row{display:flex;flex-wrap:wrap;gap:4px 12px}.day-row label{display:flex;gap:4px;align-items:center;margin:4px 0}
+.day-row input{width:auto}.time-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:end}.time-row .health-detail{grid-column:1/-1}
+.toggle{display:flex!important;gap:10px;align-items:center}.toggle input{width:auto}
+</style>
+<div class="person-page"><header class="topbar"><div><p class="eyebrow">Facial Recognition</p><h1 id="e-heading">Add person</h1></div><a class="ghost-button" href="/aac/people">People</a></header>
+<section class="panel"><h2>Details</h2>''' + customer_id_field + f'''
+<label>Name (person or tenant)<input id="e-name" required{ro}></label>
+<label>Reference (optional, e.g. lease or employee number)<input id="e-reference"{ro}></label>
+<label>Notes<textarea id="e-notes"{ro}></textarea></label>
+''' + ('<button class="action-button" id="e-create" type="button">Add person</button>' if can_manage else "") + '''<p role="status" id="e-status" class="health-detail"></p></section>
+<div id="e-after-create" hidden>
+<section class="panel"><h2>Face photo</h2><div id="e-image-list"></div>''' + ('''
+<div class="tabs" role="tablist"><button class="ghost-button active" data-tab="take" type="button">Take Photo</button><button class="ghost-button" data-tab="upload" type="button">Upload Photo</button><button class="ghost-button" data-tab="camera" type="button">Enroll from Camera</button></div>
+<div data-pane="take"><p class="health-detail">Use this phone, tablet or computer camera. Face the camera in good light.</p>
+<button class="ghost-button" id="take-start" type="button">Open camera</button><video id="take-video" autoplay playsinline muted hidden></video>
+<button class="action-button" id="take-snap" type="button" hidden>Take photo</button><div id="take-preview"></div>
+<button class="action-button" id="take-save" type="button" hidden>Enroll this face</button><p class="health-detail" id="take-status" role="status"></p></div>
+<div data-pane="upload" hidden><label>Choose a clear, front-facing photo<input id="upload-file" type="file" accept="image/*"></label><div id="upload-preview"></div>
+<button class="action-button" id="upload-save" type="button" hidden>Enroll this face</button><p class="health-detail" id="upload-status" role="status"></p></div>
+<div data-pane="camera" hidden><p class="health-detail">Have the person stand in front of one of your cameras and look at it for a few seconds. Several frames are captured; you choose the best face before it is enrolled.</p>
+<label>Camera<select id="cam-select">''' + camera_options + '''</select></label><button class="ghost-button" id="cam-start" type="button">Capture from this camera</button>
+<p class="health-detail" id="cam-status" role="status"></p><div id="cam-candidates"></div></div>
+<p class="health-detail">Only the face area is stored as the template&#39;s reference -- the full photo is never saved.</p>''' if can_manage else "") + f'''</section>
+<section class="panel"><h2>Face Access</h2>
+<label class="toggle"><input type="checkbox" id="a-enabled"{ro}> Face Access enabled for this person</label>
+<label>Unit / apartment (optional)<input id="a-unit" maxlength="40"{ro}></label>
+<label>Site / building<select id="a-site"{ro}></select></label>
+<div class="time-row"><label>Start date<input type="date" id="a-starts"{ro}></label><label>Expiration date<input type="date" id="a-expires"{ro}></label><span class="health-detail">Leave empty for no limit. Turning Face Access off or an expired date stops every automatic unlock right away; history is kept.</span></div>
+<h3>Doors this person may open</h3><div id="a-doors"></div>
+''' + ('<button class="action-button" id="a-save" type="button">Save Face Access</button>' if can_manage else "") + '''<p class="health-detail" id="a-status" role="status"></p></section>
+</div></div>''')
+        scripts = ("<script>const FIXED_CUSTOMER_ID=" + (json.dumps(facial_ctx["customer_id"]) if facial_ctx else "null")
+                   + ";const CAN_MANAGE=" + json.dumps(bool(can_manage)) + ";\n" + PERSON_PAGE_JS + "</script>")
+        return shell(title, "aac", content, scripts)
 
     @app.get("/aac/watchlists", response_class=HTMLResponse)
     def aac_watchlists_page(request: Request):
