@@ -149,6 +149,65 @@ def test_the_moment_at_the_edges_of_the_clip_window_counts_and_nothing_beyond(cl
         assert (_media(local_id) is not None) is accepted
 
 
+# ------------------------------------------------ continuous AI activity (2026-10-01)
+
+@pytest.mark.parametrize("owner_type", sorted(appliance_cloud.AI_CLIP_PARENT_TYPES))
+def test_every_object_class_card_of_an_activity_shows_the_activity_clip(cloud, owner_type):
+    """ai_activity.py: one activity owns one clip; each other object class
+    seen during it is its own card linked to that clip. Live on the Ryzen
+    (bd73eb6) every such card was refused 403 -- the route only knew PPE,
+    Facial Recognition and People Counting as children. Any YOLO class may
+    now reuse any YOLO class owner's clip, under the unchanged checks."""
+    key = _owner_with_clip(cloud, "cam-1", "owner-1", event_type=owner_type)
+    for n, child_type in enumerate(sorted(appliance_cloud.AI_CLIP_PARENT_TYPES)):
+        local_id = f"card-{n}"
+        assert _sync(cloud, "cam-1", local_id, child_type, parent="owner-1").status_code == 200
+        response = _share(cloud, "cam-1", local_id, "owner-1")
+        assert response.status_code == 200 and response.json()["status"] == "accepted", (child_type, response.text)
+        assert _media(local_id)["s3_key"] == key + ".mp4"
+        assert _media(local_id)["source_media_id"] == _media("owner-1")["id"]
+
+
+def test_object_class_cards_keep_every_existing_boundary(cloud):
+    _owner_with_clip(cloud, "cam-1", "car-1", event_type="car")
+    _owner_with_clip(cloud, "cam-2", "motion-1", event_type="motion")
+    _owner_with_clip(cloud, "cam-2", "ppe-1", event_type="ppe")
+    # Only a YOLO class's clip: never a Motion or PPE event's.
+    for child, parent in (("t1", "motion-1"), ("t2", "ppe-1")):
+        assert _sync(cloud, "cam-2", child, "truck", parent=parent).status_code == 200
+        assert _share(cloud, "cam-2", child, parent).status_code == 409, child
+    # Never another camera's clip.
+    assert _sync(cloud, "cam-2", "t3", "truck", parent="car-1").status_code == 200
+    assert _share(cloud, "cam-2", "t3", "car-1").status_code == 409
+    # Never a moment the clip did not record.
+    assert _sync(cloud, "cam-1", "t4", "truck", parent="car-1", timestamp="2026-09-26T10:00:11").status_code == 200
+    response = _share(cloud, "cam-1", "t4", "car-1")
+    assert response.status_code == 403 and "outside" in response.json()["detail"]
+    # Never a shared copy of a clip.
+    assert _sync(cloud, "cam-1", "t5", "truck", parent="car-1").status_code == 200
+    assert _share(cloud, "cam-1", "t5", "car-1").json()["status"] == "accepted"
+    assert _sync(cloud, "cam-1", "t6", "suitcase", parent="t5").status_code == 200
+    assert _share(cloud, "cam-1", "t6", "t5").status_code == 403
+    # Never another tenant's.
+    assert _sync(cloud, "cam-3", "theirs", "truck", parent="car-1", appliance="appl-2", credential="credential-2").status_code == 200
+    assert _share(cloud, "cam-3", "theirs", "car-1", appliance="appl-2", credential="credential-2").status_code == 409
+    assert _media("t3", camera="cam-2") is None and _media("t4") is None and _media("t6") is None
+    assert _media("theirs", camera="cam-3") is None
+
+
+def test_a_card_refused_before_this_fix_heals_on_the_appliance_retry(cloud):
+    """Cards the Ryzen synced while the cloud refused them have no frozen
+    correlation; the appliance's outbox retry replays the card's own sync
+    first (register_shared_event_media()), which now completes it once."""
+    _owner_with_clip(cloud, "cam-1", "car-1", event_type="car")
+    with connection() as db:  # what an earlier cloud stored: no correlation
+        db.execute("INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,confidence,object_count,event_timestamp,created_at) "
+                   "VALUES('old-truck','cust-1','site-1','appl-1','cam-1','truck-1','truck',0.9,1,?,?)", (MOMENT, NOW))
+    assert _share(cloud, "cam-1", "truck-1", "car-1").status_code == 409
+    assert _sync(cloud, "cam-1", "truck-1", "truck", parent="car-1").json()["status"] == "duplicate"
+    assert _share(cloud, "cam-1", "truck-1", "car-1").json()["status"] == "accepted"
+
+
 # ------------------------------------------------ what must never attach
 
 def test_ambiguous_nearby_clips_only_the_one_that_recorded_the_moment_attaches(cloud):
@@ -208,7 +267,7 @@ def test_disallowed_parent_types_never_resolve(cloud):
                                               ("cam-2", "c3", "people_counting_in", "ppe-1")):
         assert _sync(cloud, camera, child, child_type, parent=parent).status_code == 200
         assert _share(cloud, camera, child, parent).status_code == 409, child
-    # Other event types still can't use the shared route at all.
+    # Other event types (not a YOLO class) still can't use the shared route at all.
     assert _sync(cloud, "cam-1", "plate-1", "plate", parent="motion-1").status_code == 200
     assert _share(cloud, "cam-1", "plate-1", "motion-1").status_code == 403
 

@@ -21,6 +21,8 @@ import event_media_outbox
 import event_media_uploader
 import recording_uploader as recording_upload
 
+_REAL_CONTROL_PLANE_POST = recording_upload._control_plane_post
+
 
 @pytest.fixture(autouse=True)
 def _enabled(monkeypatch):
@@ -248,3 +250,71 @@ def test_retry_pending_event_media_still_uses_upload_path_for_ordinary_upload_en
 
     assert summary == {"attempted": 1, "completed": 1, "pending": 0}
     assert len(upload_calls) == 1
+
+
+def _real_control_plane_answering(monkeypatch, statuses):
+    """The real recording_uploader._control_plane_post(), with only the
+    network answered: each POST pops the next HTTP status (200 = accepted)."""
+    import io
+    import urllib.error
+    monkeypatch.setattr(recording_upload, "_load_appliance_identity", lambda: ("appl-1", "credential"))
+    monkeypatch.setattr(recording_upload, "CLOUD_URL", "https://cloud.example")
+    monkeypatch.setattr(recording_upload, "_control_plane_post", _REAL_CONTROL_PLANE_POST)
+    posts = []
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(request, timeout=None):
+        posts.append(request.full_url)
+        status = statuses.pop(0) if statuses else 200
+        if status != 200:
+            raise urllib.error.HTTPError(request.full_url, status, "refused", {}, io.BytesIO(b"{}"))
+        return _Response(b'{"status": "accepted"}')
+
+    monkeypatch.setattr(recording_upload.urllib.request, "urlopen", urlopen)
+    return posts
+
+
+@pytest.mark.parametrize("status", [400, 403])
+def test_a_definitive_refusal_is_not_hammered_but_stays_queued_for_the_backed_off_retry(monkeypatch, status):
+    """2026-10-01, Ryzen: the cloud refused secondary activity cards with
+    403 and each one cost 12 identical POSTs a minute apart, every retry.
+    A refusal is now asked once per attempt; the outbox entry stays, so a
+    cloud that starts accepting (or an entitlement that changes) still
+    heals it on the next backed-off retry."""
+    _wire_happy_path(monkeypatch)
+    posts = _real_control_plane_answering(monkeypatch, [status] * 20)
+    sleeps = []
+    monkeypatch.setattr(event_media_uploader.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert _call() is False
+    assert len([p for p in posts if p.endswith("/media/shared")]) == 1 and sleeps == []
+    jobs = event_media_outbox.load()
+    assert len(jobs) == 1 and jobs[0]["kind"] == "shared" and jobs[0]["parent_local_event_id"] == "base-evt-1"
+
+
+@pytest.mark.parametrize("status", [404, 409, 500, 503])
+def test_not_yet_answers_keep_their_quick_retries(monkeypatch, status):
+    """404 (event not in the cloud yet), 409 (parent media pending) and
+    server errors resolve on their own -- unchanged: retried a few seconds
+    apart, then registered."""
+    _wire_happy_path(monkeypatch)
+    posts = _real_control_plane_answering(monkeypatch, [status, status])
+    monkeypatch.setattr(event_media_uploader.time, "sleep", lambda seconds: None)
+
+    assert _call() is True
+    assert len([p for p in posts if p.endswith("/media/shared")]) == 3
+    assert event_media_outbox.load() == []
+
+
+def test_a_refusal_status_never_leaks_into_the_next_post(monkeypatch):
+    _real_control_plane_answering(monkeypatch, [403])
+    assert recording_upload._control_plane_post("/x", {}) is None
+    assert recording_upload.last_control_plane_post_status() == 403
+    assert recording_upload._control_plane_post("/x", {}) == {"status": "accepted"}
+    assert recording_upload.last_control_plane_post_status() is None

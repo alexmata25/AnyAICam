@@ -73,6 +73,8 @@ EVENT_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
 RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
 RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
 RETRY_MAX_JOBS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_JOBS", "10")))
+# Cloud answers to .../media/shared that no quick retry can change.
+SHARED_REGISTRATION_REFUSED = frozenset({400, 403})
 event_media_retry_state = {"worker_status": "not_started", "last_summary": None, "last_error": None}
 
 
@@ -585,6 +587,13 @@ def register_shared_event_media(
             )
             event_media_outbox.remove(event_id)
             return True
+
+        # 404 (event not in the cloud yet) and 409 (parent media pending)
+        # resolve within seconds, so they are worth these quick retries; a
+        # 400/403 refusal is the same answer every time -- leave it to the
+        # outbox's backed-off retry instead of a minute of identical POSTs.
+        if recording_upload.last_control_plane_post_status() in SHARED_REGISTRATION_REFUSED:
+            break
 
         if attempt < 12:
             time.sleep(5)

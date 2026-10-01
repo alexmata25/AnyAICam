@@ -306,7 +306,13 @@ def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_loca
 # its own 'motion'-only rule in _resolve_parent_motion_event() above,
 # unchanged.
 AI_CLIP_PARENT_TYPES=frozenset({'person','car','truck','bus','motorcycle','bicycle','dog','cat','bird','backpack','suitcase'})
+# Continuous AI activity (2026-10-01, ai_activity.py): one activity owns
+# one clip, and every other object class seen during it (a truck beside
+# the car that opened it, a suitcase carried past) is its own card showing
+# that clip -- so a YOLO class may also reuse a YOLO class owner's clip,
+# under exactly the same camera/appliance/tenant/moment-in-clip checks.
 ANALYTICS_MEDIA_PARENT_TYPES={
+    **{event_type:AI_CLIP_PARENT_TYPES for event_type in AI_CLIP_PARENT_TYPES},
     'ppe':AI_CLIP_PARENT_TYPES,
     'facial_recognition':AI_CLIP_PARENT_TYPES|{'facial_recognition'},
     'people_counting_in':AI_CLIP_PARENT_TYPES|{'people_counting_in','people_counting_out'},

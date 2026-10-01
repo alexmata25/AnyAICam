@@ -282,7 +282,18 @@ def _control_plane_headers(appliance_id: str, credential: str) -> dict:
     }
 
 
+_last_post = threading.local()
+
+
+def last_control_plane_post_status() -> int | None:
+    """HTTP status of this thread's most recent _control_plane_post() that
+    the cloud answered with an error (None after a success or a network
+    failure), so a caller can tell a definitive refusal from "not yet"."""
+    return getattr(_last_post, "status", None)
+
+
 def _control_plane_post(path: str, payload: dict) -> dict | None:
+    _last_post.status = None
     identity = _load_appliance_identity()
     if not identity or not CLOUD_URL:
         return None
@@ -295,6 +306,7 @@ def _control_plane_post(path: str, payload: dict) -> dict | None:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode() or "{}")
     except urllib.error.HTTPError as error:
+        _last_post.status = error.code
         logger.warning("recording_upload.control_plane_http_error path=%s status=%s", path, error.code)
         return None
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
