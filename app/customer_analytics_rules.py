@@ -306,14 +306,15 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
             <div style="flex:1 1 640px;min-width:0;max-width:640px">
               <div style="position:relative;width:640px;max-width:100%;background:#111;border-radius:8px;overflow:hidden">
                 <video id="rule-video" muted playsinline style="width:100%;display:block"></video>
-                <canvas id="rule-canvas" width="640" height="360" style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair"></canvas>
+                <canvas id="rule-canvas" width="640" height="360" style="position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;touch-action:none"></canvas>
               </div>
               <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
                 <button class="compact-button" id="capture-frame" type="button">Capture frame</button>
+                <button class="compact-button" id="undo-point" type="button">Undo last point</button>
                 <button class="compact-button" id="clear-drawing" type="button">Clear drawing</button>
               </div>
               <p class="health-detail" id="preview-status" role="status" style="margin-top:8px">Starting the live preview…</p>
-              <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then click on the image to place points. A line needs 2 points; a zone needs at least 3. Zones to ignore are drawn in red.</p>
+              <p class="health-detail" id="draw-hint" style="margin-top:8px">Capture a frame, pick a rule type, then tap or click on the image to place points. Drag a point to move it. A line needs 2 points; a zone needs at least 3. Zones to ignore are drawn in red.</p>
             </div>
             <div style="flex:1;min-width:260px;display:grid;gap:12px;align-content:start">
               <label style="display:grid;gap:6px">Rule type
@@ -472,10 +473,15 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     const nx=-dy/len*sign*far, ny=dx/len*sign*far, ux=dx/len*far, uy=dy/len*far;
     ctx.save();ctx.globalAlpha=0.22;ctx.fillStyle='#ef4444';ctx.beginPath();
     ctx.moveTo(a.x-ux,a.y-uy);ctx.lineTo(b.x+ux,b.y+uy);ctx.lineTo(b.x+ux+nx,b.y+uy+ny);ctx.lineTo(a.x-ux+nx,a.y-uy+ny);ctx.closePath();ctx.fill();
-    ctx.globalAlpha=1;ctx.font='bold 14px sans-serif';
+    ctx.globalAlpha=1;ctx.font='bold '+Math.round(14*screenScale())+'px sans-serif';
     const mx=(a.x+b.x)/2-dy/len*sign*28, my=(a.y+b.y)/2+dx/len*sign*28;
     ctx.fillText('PROTECTED',Math.min(Math.max(mx-40,4),canvas.width-90),Math.min(Math.max(my,16),canvas.height-6));
     ctx.restore();
+  }
+
+  function screenScale(){
+    const shown=canvas.getBoundingClientRect().width;
+    return shown>0?Math.max(1,canvas.width/shown):1;
   }
 
   function redraw(){
@@ -483,7 +489,10 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     if(!points.length)return;
     if(ruleType.value==='security_line'&&points.length===2)shadeProtectedSide();
     const color=ruleType.value==='exclusion'||ruleType.value==='security_line'?'#ef4444':'#22c55e';
-    ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;
+    // Drawn in camera-frame pixels: a 1280-wide frame on a 322 px phone
+    // screen shrank a 2 px line to half a pixel. Size them for the screen.
+    const px=screenScale();
+    ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=3*px;
     ctx.beginPath();
     points.forEach((p,i)=>{
       const x=p.x*canvas.width, y=p.y*canvas.height;
@@ -496,7 +505,8 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
     ctx.stroke();
     points.forEach(p=>{
       const x=p.x*canvas.width, y=p.y*canvas.height;
-      ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();
+      ctx.beginPath();ctx.arc(x,y,7*px,0,Math.PI*2);ctx.fill();
+      ctx.save();ctx.strokeStyle='#fff';ctx.lineWidth=2*px;ctx.stroke();ctx.restore();
     });
   }
 
@@ -532,21 +542,51 @@ def register_customer_analytics_rules_routes(app: FastAPI, page_shell: Callable)
   document.getElementById('capture-frame').addEventListener('click',()=>{captureFrame();});
   document.getElementById('clear-drawing').addEventListener('click',()=>{points=[];redraw();});
 
+  document.getElementById('undo-point').addEventListener('click',()=>{points.pop();redraw();});
+
   if(canEdit){
-    canvas.addEventListener('click',(e)=>{
-      if(!hasFrame)return;
+    // Pointer input (2026-10-01): one handler for finger, pen and mouse. A
+    // finger that moved a little used to scroll the page instead of placing
+    // a point, and a point could not be adjusted. Tap places a point; press
+    // on an existing point and drag to move it.
+    let dragIndex=-1, down=null;
+    function toPoint(e){
       const rect=canvas.getBoundingClientRect();
-      const x=(e.clientX-rect.left)/rect.width;
-      const y=(e.clientY-rect.top)/rect.height;
+      return {x:Math.min(1,Math.max(0,(e.clientX-rect.left)/rect.width)),y:Math.min(1,Math.max(0,(e.clientY-rect.top)/rect.height))};
+    }
+    function pointNear(p,e){
+      const rect=canvas.getBoundingClientRect(), reach=e.pointerType==='mouse'?10:26;
+      let best=-1, bestDistance=Infinity;
+      points.forEach((q,i)=>{const d=Math.hypot((q.x-p.x)*rect.width,(q.y-p.y)*rect.height);if(d<bestDistance){bestDistance=d;best=i;}});
+      return bestDistance<=reach?best:-1;
+    }
+    canvas.addEventListener('pointerdown',(e)=>{
+      if(!hasFrame){setStatus('Waiting for the camera image. Points can be placed as soon as it appears.');return;}
+      e.preventDefault();
+      const p=toPoint(e);
+      dragIndex=pointNear(p,e);
+      down=dragIndex>=0?null:p;
+      if(dragIndex>=0&&canvas.setPointerCapture)canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener('pointermove',(e)=>{
+      if(dragIndex<0)return;
+      e.preventDefault();
+      points[dragIndex]=toPoint(e);redraw();
+    });
+    canvas.addEventListener('pointerup',(e)=>{
+      if(dragIndex>=0){dragIndex=-1;return;}
+      if(!down)return;
+      const p=toPoint(e);down=null;
       const cap=isLine(ruleType.value)?2:''' + str(MAX_POLYGON_POINTS) + ''';
       if(points.length>=cap){
-        if(isLine(ruleType.value))points=[{x:x,y:y}];
+        if(isLine(ruleType.value))points=[p];
         else return;
       }else{
-        points.push({x:x,y:y});
+        points.push(p);
       }
       redraw();
     });
+    canvas.addEventListener('pointercancel',()=>{dragIndex=-1;down=null;});
   }
 
   document.getElementById('cancel-edit').addEventListener('click',resetForm);
