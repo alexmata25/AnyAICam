@@ -48676,6 +48676,8 @@ from mobile_notifications import register_mobile_notification_routes
 from mobile_push_provider import web_configuration as mobile_push_web_configuration
 from mobile_push_routes import register_routes as register_mobile_push_routes
 register_mobile_push_routes(app)
+from customer_downloads import register_customer_download_routes
+register_customer_download_routes(app)
 from customer_registration import register_customer_registration_routes
 
 
@@ -104230,8 +104232,25 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                          f'<span class="health-detail">{_price} &middot; for your own PC. Included free with an AnyAiCam appliance.</span></span>{_action}</div>')
     else:
         _license_html = '<p class="health-detail">Choose a camera plan first; the software license matches its camera capacity. It is included with every AnyAiCam appliance.</p>'
+    # Installer download (2026-10-01): the account owner of a licensed account
+    # gets the exact published installer, with what they need to verify it.
+    _download_html = ''
+    if _licensed and is_owner:
+        import customer_downloads
+        _installer = customer_downloads.latest_vms_installer()
+        if _installer:
+            _download_html = (
+                f'<div class="health-row" id="vms-installer-download"><span>AnyAiCam VMS installer {escape(str(_installer["version"]))}'
+                f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory) &middot; '
+                f'{customer_downloads.human_size(int(_installer["size_bytes"]))} &middot; build {escape(_installer["commit"][:7])}</span>'
+                f'<br><span class="health-detail">SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></span></span>'
+                f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
+                '<p class="health-detail">Install: extract the file, then run <code>sudo ./install.sh</code> and <code>sudo ./validate.sh</code> in the extracted folder. '
+                'Then link it to this account with <code>sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup</code>.</p>')
+        else:
+            _download_html = '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
     _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'
-                      f'{_license_html}<p id="vms-license-message" class="health-detail"></p></section>')
+                      f'{_license_html}{_download_html}<p id="vms-license-message" class="health-detail"></p></section>')
     site_count = max(1, len(partner_rows("SELECT id FROM sites WHERE customer_id=?", (customer_id,))))
 
     def _price_text(addon_key: str) -> str:
