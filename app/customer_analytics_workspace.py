@@ -57,7 +57,7 @@ WORKSPACES: dict[str, dict] = {
                         "types": ("people_counting", "people_counting_in", "people_counting_out"),
                         "description": "Entries and exits, totals and daily trends."},
     "lpr": {"slug": "lpr", "label": "License Plates", "entitlement": "lpr", "types": ("plate",),
-            "description": "License plate reads with their snapshots and clips."},
+            "description": "Every plate read, with the vehicle it was read on and its clip."},
     "ppe": {"slug": "ppe", "label": "PPE", "entitlement": "ppe", "types": ("ppe",),
             "description": "Hard-hat and safety-vest checks."},
     "facial_recognition": {"slug": "facial-recognition", "label": "Facial Recognition",
@@ -104,7 +104,7 @@ def _row_details(key: str, row: dict) -> dict:
         return {"state": detections.get("match_state"), "person": detections.get("matched_person_name"),
                 "watchlist": detections.get("matched_watchlist_name")}
     if key == "lpr":
-        return {"plate": detections.get("plate")}
+        return lpr_details(detections)
     if key == "people_counting":
         event_type = row.get("event_type")
         return {"direction": "in" if event_type == "people_counting_in" else "out" if event_type == "people_counting_out" else None}
@@ -116,6 +116,28 @@ def _row_details(key: str, row: dict) -> dict:
         rule = match.group(1) if match else rule
         return {"rule": None if rule in ("", "unnamed rule") else rule, "direction": detections.get("direction")}
     return {"object_count": row.get("object_count")}
+
+
+VEHICLE_TYPE_LABELS = {"car": "Car", "truck": "Truck", "bus": "Bus", "motorcycle": "Motorcycle"}
+JPEG_SIGNATURE = bytes((0xFF, 0xD8))
+
+
+def lpr_details(detections: dict) -> dict:
+    """One License Plates table row's fields. Anything missing -- older
+    reads synced before these fields existed -- or below the confidence
+    threshold is None, which the page shows as "Unknown"; nothing is
+    guessed."""
+    from lpr_vehicle import reliable
+    plate = str(detections.get("plate") or "").strip() or None
+    make_confidence = detections.get("vehicle_make_model_confidence")
+    return {
+        "plate": plate,
+        "has_plate_image": bool(plate and detections.get("plate_crop_jpeg")),
+        "vehicle_type": VEHICLE_TYPE_LABELS.get(str(detections.get("vehicle_type") or "").lower()),
+        "vehicle_color": reliable(detections.get("vehicle_color"), detections.get("vehicle_color_confidence")),
+        "vehicle_make": reliable(detections.get("vehicle_make"), make_confidence),
+        "vehicle_model": reliable(detections.get("vehicle_model"), make_confidence),
+    }
 
 
 def _confidence(key: str, event_type: str, value):
@@ -171,7 +193,8 @@ def query_events(*, customer_id: str, camera_ids: list[str], key: str, start_ms:
         search_sql, search_args = " AND de.detections_json LIKE ? ESCAPE '\\'", [_like(q.strip())]
     page_sql = base_where + result_sql + search_sql + (" AND de.event_timestamp<?" if before else "")
     page_args = base_args + result_args + search_args + ([before] if before else [])
-    post_filtered = key in ("ppe", "facial_recognition") and result
+    plate_query = q.strip().upper() if key == "lpr" and q.strip() else ""
+    post_filtered = (key in ("ppe", "facial_recognition") and result) or bool(plate_query)
     fetch = limit * 4 if post_filtered else limit
     with connection() as db:
         rows = [dict(r) for r in db.execute(
@@ -180,7 +203,7 @@ def query_events(*, customer_id: str, camera_ids: list[str], key: str, start_ms:
             "CASE WHEN length(COALESCE(dem.thumbnail_s3_key, ''))>0 THEN 1 ELSE 0 END AS has_thumbnail "
             "FROM detection_events de LEFT JOIN detection_event_media dem ON dem.detection_event_id=de.id "
             f"WHERE {page_sql} ORDER BY de.event_timestamp DESC LIMIT ?", (*page_args, fetch + 1)).fetchall()]
-        summary = _summary(db, key, base_where + search_sql, base_args + search_args)
+        summary = _summary(db, key, base_where + search_sql, base_args + search_args, plate_query)
     more = len(rows) > fetch
     rows = rows[:fetch]
     events = []
@@ -189,6 +212,8 @@ def query_events(*, customer_id: str, camera_ids: list[str], key: str, start_ms:
                 "timestamp_ms": epoch_ms(row["event_timestamp"]), "confidence": _confidence(key, row["event_type"], row["confidence"]),
                 "has_clip": bool(row["has_clip"]), "has_thumbnail": bool(row["has_thumbnail"]),
                 "details": _row_details(key, row)}
+        if plate_query and plate_query not in (item["details"]["plate"] or "").upper():
+            continue
         if _post_filter(key, result, item):
             events.append(item)
     events = events[:limit]
@@ -196,9 +221,13 @@ def query_events(*, customer_id: str, camera_ids: list[str], key: str, start_ms:
     return {"events": events, "summary": summary, "next_before": next_before}
 
 
-def _summary(db, key: str, where: str, args: list) -> dict:
+def _summary(db, key: str, where: str, args: list, plate_query: str = "") -> dict:
     """Totals over the whole selected range (not just the loaded page)."""
-    total = db.execute(f"SELECT COUNT(*) AS n FROM detection_events de WHERE {where}", args).fetchone()["n"]
+    if plate_query:
+        total = sum(1 for r in db.execute(f"SELECT de.detections_json FROM detection_events de WHERE {where}", args)
+                    if plate_query in (lpr_details(_parse_detections(r["detections_json"]))["plate"] or "").upper())
+    else:
+        total = db.execute(f"SELECT COUNT(*) AS n FROM detection_events de WHERE {where}", args).fetchone()["n"]
     out: dict = {"total": total}
     if key in ("smart_motion", "people_counting"):
         out["by_type"] = {r["event_type"]: r["n"] for r in db.execute(
@@ -308,6 +337,31 @@ def register_customer_analytics_routes(app: FastAPI, customer_cameras: Callable[
         data["enabled_camera_ids"] = entitled
         return data
 
+    @app.get("/api/customer/analytics/lpr/{event_id}/plate-image")
+    def customer_lpr_plate_image(request: Request, event_id: str):
+        """The cropped plate image of one of this customer's plate reads, on
+        a camera they may see and that has License Plates."""
+        import base64
+        from fastapi.responses import Response
+        cameras = customer_cameras(request)
+        identity = customer_identity(request)
+        if cameras is None or not identity:
+            raise HTTPException(status_code=403, detail="Customer access is required.")
+        with connection() as db:
+            entitled = entitled_camera_ids(db, [c["id"] for c in cameras], "lpr")
+            row = db.execute("SELECT camera_id, detections_json FROM detection_events WHERE id=? AND customer_id=? AND event_type='plate'",
+                             (event_id, identity["customer_id"])).fetchone()
+        if not row or row["camera_id"] not in entitled:
+            raise HTTPException(status_code=404, detail="Plate image not found.")
+        encoded = _parse_detections(row["detections_json"]).get("plate_crop_jpeg")
+        try:
+            image = base64.b64decode(str(encoded or ""), validate=True)
+        except (ValueError, TypeError):
+            image = b""
+        if not image.startswith(JPEG_SIGNATURE):  # a JPEG, nothing else
+            raise HTTPException(status_code=404, detail="Plate image not found.")
+        return Response(image, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
 
 # ---------------------------------------------------------------- pages
 
@@ -373,6 +427,20 @@ PAGE_CSS = """<link rel="stylesheet" href="/static/inline_media.css"><style>
 .aw-tile strong{font-size:17px}.aw-tile .aw-count{font-size:26px;font-weight:800}
 .aw-rules-action{margin-top:auto;padding-top:6px;color:#43d1cc;font-weight:700;font-size:14px}
 @media(max-width:640px){.aw-filter{flex:1 1 140px}.aw-grid{grid-template-columns:1fr}.aw-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.aw-lpr{display:block;border:1px solid rgba(170,196,207,.16);border-radius:12px;background:rgba(24,33,50,.94);overflow:hidden}
+.aw-lpr-head,.aw-lpr-row{display:grid;grid-template-columns:minmax(130px,1.3fr) minmax(90px,1fr) minmax(90px,.9fr) 132px minmax(70px,.7fr) minmax(70px,.7fr) minmax(110px,1fr) 118px;gap:10px;align-items:center;padding:10px 14px}
+.aw-lpr-head{color:var(--muted);font-size:12px;font-weight:700}
+.aw-lpr-row{border-top:1px solid rgba(170,196,207,.12);font-size:14px}
+.aw-lpr-row[aria-expanded="true"]{background:rgba(67,209,204,.08)}
+.aw-lpr-row>span{min-width:0;overflow-wrap:anywhere}
+.aw-lpr .aw-empty,.aw-lpr .inline-media-card{margin:12px}
+.aw-plate-text{display:inline-block;padding:3px 8px;border-radius:6px;background:#f5f1d6;color:#111;font:800 14px/1.2 ui-monospace,Consolas,monospace;letter-spacing:.06em}
+.aw-plate-img{display:block;max-width:128px;max-height:44px;border-radius:4px;background:#0b111b}
+.aw-lpr-open{min-height:36px;padding:6px 10px;white-space:nowrap}
+.aw-muted{color:var(--muted)}
+@media(max-width:900px){.aw-lpr-head{display:none}.aw-lpr-row{grid-template-columns:1fr;gap:6px;padding:12px 14px}
+.aw-lpr-row>span{display:grid;grid-template-columns:104px minmax(0,1fr);gap:10px;align-items:center}
+.aw-lpr-row>span::before{content:attr(data-label);color:var(--muted);font-size:12px;font-weight:700}}
 </style>"""
 
 
@@ -594,7 +662,11 @@ NAV_ASSETS = """<style>
   }
   const mToggle=document.querySelector('.mobile-analytics-toggle'),sheet=document.getElementById('mobile-analytics-sheet');
   if(mToggle&&sheet){
-    const setOpen=v=>{sheet.hidden=!v;mToggle.setAttribute('aria-expanded',v?'true':'false')};
+    // Sit just above the bottom bar, however tall it is (it wraps to two
+    // rows when there are more items than columns).
+    const place=()=>{const bar=document.querySelector('.mobile-nav');if(bar)sheet.style.bottom=Math.max(78,innerHeight-bar.getBoundingClientRect().top+8)+'px'};
+    const setOpen=v=>{if(v)place();sheet.hidden=!v;mToggle.setAttribute('aria-expanded',v?'true':'false')};
+    addEventListener('resize',()=>{if(!sheet.hidden)place()});
     mToggle.addEventListener('click',e=>{e.stopPropagation();setOpen(sheet.hidden)});
     document.addEventListener('click',e=>{if(!sheet.hidden&&!sheet.contains(e.target))setOpen(false)});
     document.addEventListener('keydown',e=>{if(e.key==='Escape')setOpen(false)});

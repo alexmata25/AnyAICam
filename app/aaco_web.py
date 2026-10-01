@@ -310,6 +310,13 @@ def render_aaco_floating_widget() -> str:
 /* Phones with the portal's bottom tab bar (<=760px): sit above the bar so
    the button never covers its last tab (2026-09-25). */
 @media (max-width:760px){{body:has(.mobile-nav) .aaco-float-root{{bottom:84px}}body:has(.mobile-nav) .aaco-float-panel{{bottom:146px;max-height:min(60vh,520px)}}}}
+/* Pages whose primary actions sit at the bottom right (e.g. the setup
+   wizard's "Save and continue") give the button a place in their own
+   action row: an element marked data-aaco-dock-slot. The button moves
+   there (script below), so at any width it never floats over those
+   controls; the panel still opens as the usual overlay (2026-09-30). */
+.aaco-float-root.aaco-docked{{position:static;display:inline-flex}}
+.aaco-float-root.aaco-docked .aaco-float-toggle{{width:44px;height:44px;line-height:44px;font-size:19px}}
 </style>
 <div class="aaco-float-root">
 <div id="aaco-float-panel" class="aaco-float-panel" hidden>
@@ -322,6 +329,8 @@ def render_aaco_floating_widget() -> str:
 (function(){{
 var toggle=document.getElementById('aaco-float-toggle'),panel=document.getElementById('aaco-float-panel'),closeBtn=document.getElementById('aaco-float-close');
 if(!toggle||!panel)return;
+var slot=document.querySelector('[data-aaco-dock-slot]'),root=toggle.parentElement;
+if(slot&&root){{slot.appendChild(root);root.classList.add('aaco-docked');}}
 function setOpen(open){{
 panel.hidden=!open;
 toggle.setAttribute('aria-expanded',open?'true':'false');

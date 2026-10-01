@@ -38,6 +38,12 @@ DEFAULT_BUFFER_SEGMENT_SECONDS = 30
 # starts reading it.
 DEFAULT_BUFFER_SAFETY_MARGIN_SECONDS = 10
 DEFAULT_MAX_EVENT_RECORDING_SECONDS = 300
+# An AI event's clip starts before the moment it was scheduled: the
+# detection frame is a few seconds old, the event is taken to start at the
+# previous scan (detection_timing.py, up to MAX_EVENT_LEAD_SECONDS), and
+# the recording is cut only after the post-roll. Buffer segments must stay
+# reachable that far back, beyond the pre-roll itself.
+DETECTION_LOOKBACK_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -53,12 +59,13 @@ def buffer_retention_cutoff(
     *,
     pre_roll_seconds: int,
     safety_margin_seconds: int = DEFAULT_BUFFER_SAFETY_MARGIN_SECONDS,
+    lookback_seconds: int = 0,
 ) -> datetime:
     """The oldest a buffer segment might still be needed to satisfy a
     fresh event's pre-roll, right now. Any segment that already ended
     before this cutoff cannot contribute pre-roll to any event detected
     from this moment forward."""
-    return now - timedelta(seconds=pre_roll_seconds + safety_margin_seconds)
+    return now - timedelta(seconds=pre_roll_seconds + safety_margin_seconds + lookback_seconds)
 
 
 def is_buffer_segment_still_needed(
@@ -68,6 +75,7 @@ def is_buffer_segment_still_needed(
     pre_roll_seconds: int,
     safety_margin_seconds: int = DEFAULT_BUFFER_SAFETY_MARGIN_SECONDS,
     in_flight_event_windows: tuple[tuple[datetime, datetime], ...] = (),
+    lookback_seconds: int = 0,
 ) -> bool:
     """False means the janitor may delete this segment now -- this is
     the actual mechanism that keeps an idle Event-mode camera from
@@ -77,6 +85,7 @@ def is_buffer_segment_still_needed(
     seconds, and must never race the janitor for the same file)."""
     cutoff = buffer_retention_cutoff(
         now, pre_roll_seconds=pre_roll_seconds, safety_margin_seconds=safety_margin_seconds,
+        lookback_seconds=lookback_seconds,
     )
     if segment.end >= cutoff:
         return True

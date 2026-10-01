@@ -8388,6 +8388,10 @@ motion_event_lock = asyncio.Lock()
 # rapidly repeated detections produces one clip, not several"), just
 # not previously wired into this detection path.
 ai_event_clip_windows: dict[int, tuple] = {}
+# When each camera's previously scanned frame happened: an object detected
+# now entered after it, so its event clip starts no later than this
+# (detection_timing.detection_event_span()).
+ai_last_frame_time: dict[int, datetime] = {}
 ai_event_clip_windows_lock = threading.Lock()
 
 # The main application event loop, captured lazily on ai_person_detector()'s
@@ -16195,7 +16199,7 @@ async def event_buffer_janitor(camera_number: int) -> None:
     whose local_recording_mode is not 'event', so this can safely run
     for every camera slot unconditionally rather than needing to be
     started/stopped as a mode changes."""
-    from local_recording_policy import BufferSegment, is_buffer_segment_still_needed
+    from local_recording_policy import DETECTION_LOOKBACK_SECONDS, BufferSegment, is_buffer_segment_still_needed
 
     while True:
         await asyncio.sleep(EVENT_BUFFER_SEGMENT_SECONDS)
@@ -16223,6 +16227,7 @@ async def event_buffer_janitor(camera_number: int) -> None:
             if not is_buffer_segment_still_needed(
                 segment, now=now, pre_roll_seconds=settings["pre_roll_seconds"],
                 in_flight_event_windows=in_flight,
+                lookback_seconds=DETECTION_LOOKBACK_SECONDS + settings["post_roll_seconds"],
             ):
                 try:
                     path.unlink()
@@ -16398,8 +16403,13 @@ async def persist_event_recording(
             temp_output = destination.with_suffix(".tmp.mkv")
             result = await asyncio.to_thread(
                 subprocess.run,
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-                 "-ss", str(offset_seconds), "-t", str(duration_seconds),
+                # -ss BEFORE -i: with stream copy an output-side -ss drops
+                # packets up to the offset, so the file could begin mid-GOP
+                # and show nothing until the next keyframe -- the event's
+                # first seconds lost. Input-side seeking starts at the
+                # keyframe at or before the offset instead.
+                ["ffmpeg", "-y", "-ss", str(offset_seconds), "-f", "concat", "-safe", "0", "-i", str(list_file),
+                 "-t", str(duration_seconds),
                  "-c", "copy", str(temp_output)],
                 capture_output=True, timeout=60, check=False,
             )
@@ -36322,6 +36332,21 @@ def get_yolo_model():
 
 
 
+def _hls_read_frame_time(manifest: Path) -> datetime | None:
+    """Wall-clock time of the frame OpenCV/FFmpeg will return for this live
+    playlist (it starts a few segments behind live -- detection_timing.py).
+    None if it cannot be worked out; callers then fall back to "now"."""
+    from detection_timing import estimate_hls_frame_time, parse_hls_segments
+    try:
+        segments = parse_hls_segments(manifest.read_text(encoding="utf-8", errors="replace"))
+        if not segments:
+            return None
+        newest_end = datetime.fromtimestamp((manifest.parent / segments[-1][0]).stat().st_mtime)
+        return estimate_hls_frame_time(segments, newest_end)
+    except (OSError, ValueError):
+        return None
+
+
 def detect_objects_frame(camera_number: int) -> dict:
 
 
@@ -36466,6 +36491,8 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 
+    # When the frame read below actually happened (detection_timing.py).
+    frame_captured_at = _hls_read_frame_time(manifest)
     capture = cv2.VideoCapture(str(manifest))
 
 
@@ -36939,6 +36966,7 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
         "frame": frame,
+        "frame_captured_at": frame_captured_at,
 
 
 
@@ -36992,7 +37020,8 @@ def detect_objects_frame(camera_number: int) -> dict:
 
 
 async def _build_and_upload_owned_analytics_clip(
-    event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None
+    event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None,
+    start: datetime | None = None,
 ) -> None:
     """A Facial Recognition / People Counting result that no registered clip
     covers gets its own clip (see event_media_sharing.py), built and
@@ -37000,14 +37029,14 @@ async def _build_and_upload_owned_analytics_clip(
     reuse it are registered once it lands."""
     registered = False
     try:
-        clip_url = await build_motion_event_clip(event_id, camera_number, moment, moment)
+        clip_url = await build_motion_event_clip(event_id, camera_number, start or moment, moment)
         if clip_url:
             from event_media_uploader import upload_motion_event_media
             registered = bool(await asyncio.to_thread(
                 upload_motion_event_media,
                 event_id=event_id,
                 camera_number=camera_number,
-                event_start=moment,
+                event_start=start or moment,
                 event_end=moment,
                 clip_url=clip_url,
                 thumbnail_url=thumbnail_url,
@@ -37019,11 +37048,12 @@ async def _build_and_upload_owned_analytics_clip(
         await asyncio.to_thread(event_media_sharing.owner_finished, event_id, camera_number, registered)
 
 
-def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None) -> None:
+def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: datetime, thumbnail_url: str | None,
+                                   start: datetime | None = None) -> None:
     """Schedule _build_and_upload_owned_analytics_clip() from a detection
     worker thread (save_yolo_events() runs via asyncio.to_thread) or from
     the event loop itself (people_counting_worker())."""
-    coroutine = _build_and_upload_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url)
+    coroutine = _build_and_upload_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url, start)
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
@@ -37043,7 +37073,8 @@ def _schedule_owned_analytics_clip(event_id: str, camera_number: int, moment: da
         event_media_sharing.owners.finish(event_id, False)
 
 
-def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime) -> str | None:
+def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime,
+                           start: datetime | None = None) -> str | None:
     """The local id of the event whose clip this result shows: a
     registered clip covering this moment on this camera; or, when there is
     none and one can be kept, event_id itself (the caller then schedules
@@ -37054,7 +37085,7 @@ def _analytics_media_owner(camera_number: int, event_id: str, moment: datetime) 
     if owner:
         return owner
     if event_media_sharing.should_build_own_clip(camera_number):
-        window = compute_clip_window(moment, moment)
+        window = compute_clip_window(start or moment, moment)
         event_media_sharing.owners.register(camera_number, event_id, window.start, window.end)
         return event_id
     return None
@@ -37115,6 +37146,14 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
     now = datetime.now()
+    # The detection frame's own time, and the previous scanned frame's
+    # (the object entered after it): the clip's pre-roll counts back from
+    # there, so it shows the object arriving (detection_timing.py).
+    from detection_timing import detection_event_span
+    event_start, event_moment = detection_event_span(
+        result.get("frame_captured_at"), result.get("previous_frame_captured_at"),
+        now=now, scan_interval_seconds=AI_DETECTION_INTERVAL_SECONDS,
+    )
 
 
 
@@ -37645,7 +37684,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-    linked_recording = linked_recording_for(camera_number, now)
+    linked_recording = linked_recording_for(camera_number, event_moment)
 
 
 
@@ -37748,7 +37787,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     if qualifying_detections:
         from event_clips import compute_clip_window, should_merge
 
-        window = compute_clip_window(now, now)
+        window = compute_clip_window(event_start, event_moment)
         with ai_event_clip_windows_lock:
             previous_window = ai_event_clip_windows.get(camera_number)
             is_duplicate = (
@@ -37785,7 +37824,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             async def _build_and_upload_ai_event_media_inner() -> None:
                 try:
                     clip_url = await build_motion_event_clip(
-                        event_group_id, camera_number, now, now
+                        event_group_id, camera_number, event_start, event_moment
                     )
                 except Exception as error:
                     # Diagnostic-only guard: this call used to be
@@ -37820,8 +37859,8 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         upload_motion_event_media,
                         event_id=event_group_id,
                         camera_number=camera_number,
-                        event_start=now,
-                        event_end=now,
+                        event_start=event_start,
+                        event_end=event_moment,
                         clip_url=clip_url,
                         thumbnail_url=thumbnail_url,
                         already_classified=True,
@@ -37894,7 +37933,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             try:
                 asyncio.run_coroutine_threadsafe(
                     persist_event_recording(
-                        camera_number, now, now,
+                        camera_number, event_start, event_moment,
                         detector="ai_detection", trigger_id=event_group_id,
                     ),
                     _ai_event_media_loop,
@@ -38011,7 +38050,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
 
 
 
-            timestamp=now,
+            timestamp=event_moment,
 
 
 
@@ -38148,7 +38187,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
                         else "PPE violation"
                     ),
                     event_type="ppe",
-                    timestamp=now,
+                    timestamp=event_moment,
                     confidence=ppe_result["confidence"],
                     thumbnail=thumbnail_url,
                     linked_recording=linked_recording,
@@ -38328,7 +38367,7 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
         try:
             asyncio.run_coroutine_threadsafe(
                 _backfill_ai_event_linked_recording(
-                    camera_number, backfill_event_ids, now,
+                    camera_number, backfill_event_ids, event_moment,
                 ),
                 _ai_event_media_loop,
             )
@@ -38397,8 +38436,29 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
         full_frame = lpr.latest_full_resolution_frame(camera_number, RECORDINGS_FOLDER / f"camera{camera_number}" / "_event_buffer")
     confirmed = lpr.scan_frame(camera_number, frame, boxes, full_frame=full_frame)
     events = []
+    from detection_timing import plate_event_span
+    import lpr_vehicle
     for plate in confirmed:
         now = datetime.now()
+        # Timed from the frames, not from when this ran: the plate event is
+        # the first read, and its clip starts before the vehicle arrived
+        # (detection_timing.py).
+        event_start, first_read, moment = plate_event_span(
+            result.get("frame_captured_at"), result.get("previous_frame_captured_at"), now=now,
+            first_read_age_seconds=plate.get("first_read_age_seconds") or 0.0,
+            scan_interval_seconds=max(AI_DETECTION_INTERVAL_SECONDS, float(getattr(lpr, "LPR_SCAN_SECONDS", 0) or 0)),
+        )
+        # The vehicle the plate was read on: its detector class, and its
+        # colour only when one clearly dominates (lpr_vehicle.py). No
+        # make/model classifier is installed: those stay None ("Unknown").
+        vehicle_type = lpr_vehicle.vehicle_type_for(plate.get("vehicle_box"), result.get("detections"))
+        vehicle_color, vehicle_color_confidence = None, None
+        if plate.get("vehicle_box"):
+            try:
+                vx, vy, vw, vh = plate["vehicle_box"]
+                vehicle_color, vehicle_color_confidence = lpr_vehicle.estimate_vehicle_color(frame[vy : vy + vh, vx : vx + vw])
+            except Exception as error:
+                print(f"Camera {camera_number} vehicle colour skipped (non-fatal): {error}")
         day_folder = AI_THUMBNAILS_FOLDER / now.strftime("%Y-%m-%d")
         day_folder.mkdir(parents=True, exist_ok=True)
         event_id = uuid.uuid4().hex[:12]
@@ -38427,14 +38487,22 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
             site="home",
             rule_name="LPR",
             event_type="plate",
-            timestamp=now,
+            timestamp=first_read,
             confidence=round(plate["confidence"] / 100, 4),
             plate_number=plate["plate_number"],
             plate_crop=plate_crop_url,
             thumbnail=thumbnail_url,
-            linked_recording=linked_recording_for(camera_number, now),
+            linked_recording=linked_recording_for(camera_number, moment),
             mock=False,
         ).model_dump(mode="json")
+        plate_event.update(
+            vehicle_type=vehicle_type,
+            vehicle_color=vehicle_color,
+            vehicle_color_confidence=vehicle_color_confidence,
+            vehicle_make=None,
+            vehicle_model=None,
+            vehicle_make_model_confidence=None,
+        )
         # An Event-mode camera only records when something triggers it. A
         # plate confirmed while the vehicle-event cooldown/stationary
         # suppression is active has no vehicle event to do that (found on
@@ -38445,22 +38513,22 @@ def run_lpr_scan(camera_number: int, result: dict) -> list[dict]:
         if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    persist_event_recording(camera_number, now, now, detector="lpr", trigger_id=event_id),
+                    persist_event_recording(camera_number, event_start, moment, detector="lpr", trigger_id=event_id),
                     _ai_event_media_loop,
                 )
             except RuntimeError as error:
                 print(f"LPR event {event_id}: could not schedule Event-mode recording persist: {error}")
-        media_owner = _analytics_media_owner(camera_number, event_id, now)
+        media_owner = _analytics_media_owner(camera_number, event_id, moment, event_start)
         event_media_sharing.link(plate_event, media_owner)
         append_analytics_event(plate_event)
         if media_owner == event_id:
-            _schedule_owned_analytics_clip(event_id, camera_number, now, thumbnail_url)
+            _schedule_owned_analytics_clip(event_id, camera_number, moment, thumbnail_url, event_start)
         elif media_owner:
             event_media_sharing.attach_child(media_owner, event_id, camera_number)
         if _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None:
             try:
                 asyncio.run_coroutine_threadsafe(
-                    _backfill_ai_event_linked_recording(camera_number, [event_id], now),
+                    _backfill_ai_event_linked_recording(camera_number, [event_id], moment),
                     _ai_event_media_loop,
                 )
             except RuntimeError as error:
@@ -39109,6 +39177,9 @@ async def ai_person_detector(camera_number: int) -> None:
 
 
             state["status"] = "running" if result.get("ok") else "waiting"
+            if result.get("ok"):
+                result["previous_frame_captured_at"] = ai_last_frame_time.get(camera_number)
+                ai_last_frame_time[camera_number] = result.get("frame_captured_at") or datetime.now()
 
 
 

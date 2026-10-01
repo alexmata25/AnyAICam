@@ -485,6 +485,9 @@ def confirm_plate(camera_number, result, *, now: float | None = None):
         _emitted[(key, text)] = now
     confirmed = dict(result)
     confirmed["confirmations"] = agreeing
+    # How long ago this plate was first read: the vehicle was already there
+    # then, so its event (and clip) starts before that (detection_timing).
+    confirmed["first_read_age_seconds"] = round(now - min(t for t, v in recent if v == text), 3)
     return confirmed
 
 
