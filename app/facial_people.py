@@ -171,6 +171,9 @@ def delete_person(db, *, customer_id: str, person_id: str) -> bool:
     if get_person(db, customer_id=customer_id, person_id=person_id) is None:
         return False
     image_paths = _embedding_image_paths(db, customer_id=customer_id, person_id=person_id)
+    # Their door grants go with them (configuration, not history); the
+    # recognition and door audit history keeps its own name snapshot.
+    db.execute("DELETE FROM facial_rules WHERE customer_id=? AND person_id=?", (customer_id, person_id))
     db.execute("DELETE FROM facial_people WHERE id=? AND customer_id=?", (person_id, customer_id))
     for path in image_paths:
         try:

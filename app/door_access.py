@@ -93,6 +93,108 @@ def record_door_access_event(
     return event_id
 
 
+def trigger_door(camera: dict, *, reason: str, actor: str, trigger_type: str, pulse_ms: int | None = None,
+                 dry_run: bool = False, facial_event_id: str | None = None,
+                 person_id: str | None = None) -> relay_control.RelayResult:
+    """The one physical dispatch for every door consumer (the Unlock
+    button, AACO, AAC Voice Call, facial access rules), 2026-09-25.
+
+    A camera with a door configured in the access-control service
+    (access_control.py: a Z-Wave lock, a relay strike/maglock, or the
+    simulator) goes through that service -- health, fail-secure checks,
+    one command at a time, timed relock, hardware command log. Any other
+    door-enabled camera keeps exactly its previous path: a RelayRequest to
+    relay_control.get_provider(). Either way the caller gets a RelayResult
+    and keeps writing its own door_access_events audit row, as before.
+
+    A dry-run request (facial rules default to dry_run) never reaches
+    hardware on either path."""
+    import access_control
+    service = access_control.get_service()
+    door = service.door_for_camera(camera["id"]) if service is not None else None
+    if door is None:
+        request_obj = relay_control.RelayRequest(
+            channel=camera["door_relay_channel"],
+            pulse_ms=pulse_ms or camera.get("door_relay_pulse_ms") or relay_control.DEFAULT_PULSE_MS,
+            reason=reason, dry_run=dry_run, requested_by=actor,
+        )
+        return relay_control.get_provider().trigger(request_obj)
+    channel = camera.get("door_relay_channel") or 0
+    if dry_run:
+        return relay_control.RelayResult(channel=channel, activated=False, dry_run=True)
+    outcome = service.unlock(door.id, duration_seconds=(pulse_ms / 1000.0) if pulse_ms else None, reason=reason,
+                             actor=actor, trigger=trigger_type, person_id=person_id, facial_event_id=facial_event_id)
+    if outcome.ok:
+        return relay_control.RelayResult(channel=channel, activated=True, dry_run=False)
+    # "duplicate" keeps the existing "just unlocked, wait a moment" message.
+    suppressed = "cooldown" if outcome.result == "duplicate" else outcome.result
+    return relay_control.RelayResult(channel=channel, activated=False, dry_run=outcome.result == "dry_run",
+                                     suppressed_reason=suppressed)
+
+
+class CameraDoorProvider(relay_control.RelayProvider):
+    """What facial_events.evaluate_access_rules() is given for a door
+    camera: the same RelayProvider interface, routed per camera through
+    trigger_door() (automatic trigger: the service additionally refuses
+    an unknown/jammed lock state or an offline controller)."""
+
+    def __init__(self, camera: dict, base: relay_control.RelayProvider, *, person_id: str | None = None):
+        self.camera = camera
+        self.base = base
+        self.person_id = person_id
+
+    def capability(self) -> dict:
+        return self.base.capability()
+
+    def trigger(self, request: relay_control.RelayRequest) -> relay_control.RelayResult:
+        import access_control
+        service = access_control.get_service()
+        if service is None or service.door_for_camera(self.camera["id"]) is None:
+            return self.base.trigger(request)
+        reason = request.reason or ""
+        facial_event_id = reason.split(":", 1)[1] if reason.startswith("facial_event:") else None
+        return trigger_door(self.camera, reason=reason, actor="facial_recognition", trigger_type="automatic",
+                            pulse_ms=request.pulse_ms, dry_run=request.dry_run, facial_event_id=facial_event_id,
+                            person_id=self.person_id)
+
+
+class DoorNotReachable(Exception):
+    """The door's appliance could not be asked to open it; nothing moved."""
+
+
+def dispatch_manual_unlock(camera: dict, *, actor: str, pulse_ms: int | None) -> relay_control.RelayResult:
+    """Where the door hardware is (2026-10-01). On the appliance itself this
+    is trigger_door(). In the cloud portal the door's relay is plugged into
+    the customer's appliance, so the already-authorized command goes there
+    over its control channel and the appliance's own answer is returned.
+    Fails closed: not connected or no answer means the door stays shut."""
+    import os
+    if os.environ.get("ANYAICAM_RUNTIME_ROLE", "edge").strip().lower() != "cloud":
+        return trigger_door(camera, reason=f"manual_unlock:{camera['id']}", actor=actor, trigger_type='manual', pulse_ms=pulse_ms)
+    import appliance_control
+    appliance_id = camera.get("appliance_id")
+    if not appliance_id or not appliance_control.connected(appliance_id):
+        raise DoorNotReachable("the appliance for this door is not connected right now")
+    answer = appliance_control.request(appliance_id, {"type": "door_unlock", "camera_id": camera["id"], "actor": actor, "pulse_ms": pulse_ms})
+    if not answer or answer.get("status") == "timeout":
+        raise DoorNotReachable("the appliance did not answer in time")
+    if answer.get("status") != "ok":
+        raise DoorNotReachable({"not_a_door_here": "the appliance does not have this door set up yet"}.get(answer.get("reason"), "the door could not be reached"))
+    return relay_control.RelayResult(channel=int(answer.get("channel") or 0), activated=bool(answer.get("activated")),
+                                     dry_run=bool(answer.get("dry_run")), suppressed_reason=answer.get("suppressed_reason"),
+                                     simulated=bool(answer.get("simulated")))
+
+
+SIMULATED_MESSAGE = "No door relay is connected to {name} yet, so nothing was unlocked."
+
+
+def audit_relay_result(result: relay_control.RelayResult) -> str:
+    """The door_access_events.relay_result for a finished trigger."""
+    if result.simulated:
+        return 'simulated'
+    return 'activated' if result.activated else ('suppressed' if result.suppressed_reason else 'failed')
+
+
 def door_camera(db, *, customer_id: str, camera_id: str) -> dict | None:
     """The one door-configured-camera lookup every consumer (the manual
     unlock route below, the live-tile visibility check, Camera Settings)
@@ -198,15 +300,18 @@ def register_door_access_routes(app: FastAPI) -> None:
                         relay_result='skipped', success=False, error=error.detail, now=now,
                     )
             raise
-        request_obj = relay_control.RelayRequest(
-            channel=camera['door_relay_channel'],
-            pulse_ms=camera['door_relay_pulse_ms'] or relay_control.DEFAULT_PULSE_MS,
-            reason=f"manual_unlock:{camera['id']}",
-            dry_run=False,
-            requested_by=identity['email'],
-        )
         try:
-            result = relay_control.get_provider().trigger(request_obj)
+            result = dispatch_manual_unlock(camera, actor=identity['email'], pulse_ms=camera['door_relay_pulse_ms'])
+        except DoorNotReachable as error:
+            with connection() as audit_db:
+                record_door_access_event(
+                    audit_db, customer_id=identity['customer_id'], camera_id=camera['id'], door_name=camera['name'],
+                    relay_channel=camera['door_relay_channel'], trigger_type='manual',
+                    actor_user_id=user_id, actor_email=identity['email'],
+                    authorization_result='authorized', relay_result='not_sent', success=False,
+                    error=str(error), now=now,
+                )
+            raise HTTPException(status_code=503, detail=f"{camera['name']} was not opened: {error}.") from error
         except Exception as error:
             with connection() as audit_db:
                 record_door_access_event(
@@ -217,15 +322,18 @@ def register_door_access_routes(app: FastAPI) -> None:
                     error=str(error), now=now,
                 )
             raise HTTPException(status_code=502, detail='The door relay could not be reached.') from error
-        relay_result = 'activated' if result.activated else ('suppressed' if result.suppressed_reason else 'failed')
+        relay_result = audit_relay_result(result)
         with connection() as audit_db:
             record_door_access_event(
                 audit_db, customer_id=identity['customer_id'], camera_id=camera['id'], door_name=camera['name'],
                 relay_channel=camera['door_relay_channel'], trigger_type='manual',
                 actor_user_id=user_id, actor_email=identity['email'],
-                authorization_result='authorized', relay_result=relay_result, success=result.activated,
+                authorization_result='authorized', relay_result=relay_result,
+                success=result.activated and not result.simulated,
                 error=result.suppressed_reason, now=now,
             )
+        if result.simulated:
+            raise HTTPException(status_code=409, detail=SIMULATED_MESSAGE.format(name=camera['name']))
         if not result.activated:
             detail = 'This door was just unlocked -- please wait a moment before trying again.' if result.suppressed_reason == 'cooldown' else 'The door could not be unlocked.'
             raise HTTPException(status_code=409, detail=detail)

@@ -547,7 +547,7 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         # recording strategy to run for a camera. Omitting it here would
         # be the exact same unreachable-in-practice gap this comment
         # already documents for people_counting_enabled.
-        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
+        appliance=authenticate_appliance(request); camera_items=rows('SELECT id,name,site_id,door_access_enabled,door_relay_channel,door_relay_pulse_ms,resolution,status,camera_number,device_key,onvif_endpoint,cloud_recording_mode AS recording_mode,local_recording_mode,local_recording_pre_roll_seconds,local_recording_post_roll_seconds,local_recording_merge_gap_seconds,local_recording_max_event_seconds,people_counting_enabled,smart_motion_enabled,lpr_enabled,ppe_enabled,talk_down_supported,talk_down_metadata FROM cameras WHERE appliance_id=? ORDER BY camera_number,name',(appliance['id'],))
         # analytics_rules (2026-09-21): the tenant-safe customer-drawn
         # Intrusion Zone / Line-Crossing rules (customer_analytics_
         # rules.py) for THIS appliance's own cameras only -- the same
@@ -1204,7 +1204,8 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
         customer_id=appliance['customer_id']
         with connection() as db:
             people=[dict(item) for item in db.execute(
-                'SELECT id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by FROM facial_people WHERE customer_id=? AND status=? ORDER BY id',
+                'SELECT id,site_id,external_reference,display_name,status,notes,created_at,updated_at,created_by,'
+                'unit,access_enabled,access_starts_on,access_expires_on FROM facial_people WHERE customer_id=? AND status=? ORDER BY id',
                 (customer_id,'active'),
             ).fetchall()]
             embeddings=[dict(item) for item in db.execute(
@@ -1222,8 +1223,18 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
                 'JOIN facial_watchlists fw ON fw.id=fwm.watchlist_id WHERE fw.customer_id=? ORDER BY fwm.watchlist_id,fwm.person_id',
                 (customer_id,),
             ).fetchall()]
+            # Door grants made in the customer portal (2026-10-01): who may
+            # open which door, on which days and hours. Only active people's.
+            door_grants=[dict(item) for item in db.execute(
+                "SELECT r.id,r.camera_id,r.person_id,r.name,r.relay_channel,r.pulse_ms,r.cooldown_seconds,r.min_confidence,"
+                "r.schedule_start,r.schedule_end,r.days_of_week,r.enabled,r.created_at,r.updated_at FROM facial_rules r "
+                "JOIN facial_people p ON p.id=r.person_id WHERE r.customer_id=? AND r.origin='cloud' "
+                "AND r.trigger_type='specific_person' AND p.status='active' ORDER BY r.id",
+                (customer_id,),
+            ).fetchall()]
         directory={
             'people': people,
+            'door_grants': door_grants,
             'embeddings': embeddings,
             'watchlists': watchlists,
             'watchlist_members': watchlist_members,

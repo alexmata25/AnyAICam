@@ -205,15 +205,10 @@ def confirm_unlock(*, event_id: str, customer_id: str, identity: dict, confirm_t
             )
         raise door_access.HTTPException(status_code=409, detail="This confirmation has expired or was already used -- request a new unlock confirmation.")
 
-    request_obj = relay_control.RelayRequest(
-        channel=camera["door_relay_channel"],
-        pulse_ms=camera["door_relay_pulse_ms"] or relay_control.DEFAULT_PULSE_MS,
-        reason=f"aac_voice_call_unlock:{camera['id']}",
-        dry_run=False,
-        requested_by=identity.get("email"),
-    )
     try:
-        result = relay_control.get_provider().trigger(request_obj)
+        result = door_access.trigger_door(camera, reason=f"aac_voice_call_unlock:{camera['id']}",
+                                          actor=identity.get("email") or "", trigger_type="aac_voice_call",
+                                          pulse_ms=camera["door_relay_pulse_ms"])
     except Exception as error:
         with connection() as audit_db:
             door_access.record_door_access_event(
@@ -225,16 +220,19 @@ def confirm_unlock(*, event_id: str, customer_id: str, identity: dict, confirm_t
             )
         raise door_access.HTTPException(status_code=502, detail="The door relay could not be reached.") from error
 
-    relay_result = "activated" if result.activated else ("suppressed" if result.suppressed_reason else "failed")
+    relay_result = door_access.audit_relay_result(result)
     with connection() as audit_db:
         door_access.record_door_access_event(
             audit_db, customer_id=customer_id, camera_id=camera["id"], door_name=camera["name"],
             relay_channel=camera["door_relay_channel"], trigger_type="aac_voice_call",
             actor_user_id=user_id, actor_email=identity.get("email"),
-            authorization_result="authorized", relay_result=relay_result, success=result.activated,
+            authorization_result="authorized", relay_result=relay_result,
+            success=result.activated and not result.simulated,
             error=result.suppressed_reason, now=now, aac_voice_call_event_id=event_id,
         )
 
+    if result.simulated:
+        raise door_access.HTTPException(status_code=409, detail=door_access.SIMULATED_MESSAGE.format(name=camera["name"]))
     if not result.activated:
         detail = "This door was just unlocked -- please wait a moment before trying again." if result.suppressed_reason == "cooldown" else "The door could not be unlocked."
         raise door_access.HTTPException(status_code=409, detail=detail)

@@ -40504,6 +40504,14 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"edge", "combined"}
         else None
     )
+    # Door hardware (access_control.py): restart recovery first, then
+    # door-position/REX supervision -- where the hardware is attached.
+    import access_control
+    access_control_task = (
+        asyncio.create_task(access_control.edge_worker(event_sink=_access_door_event_to_timeline))
+        if RUNTIME_ROLE in {"edge", "combined"}
+        else None
+    )
     # camera_url is main.py's own credentialed-RTSP-URL builder -- injected
     # rather than imported by webrtc_publisher.py, which this module
     # imports to wire this task, exactly the same circular-import
@@ -40768,6 +40776,8 @@ async def lifespan(app: FastAPI):
             live_relay_idle_sweep_task.cancel()
         if hls_segment_sweeper_task:
             hls_segment_sweeper_task.cancel()
+        if access_control_task:
+            access_control_task.cancel()
         if webrtc_publisher_task:
             webrtc_publisher_task.cancel()
         if local_storage_manager_task:
@@ -40886,6 +40896,8 @@ async def lifespan(app: FastAPI):
             pending.append(live_relay_idle_sweep_task)
         if hls_segment_sweeper_task:
             pending.append(hls_segment_sweeper_task)
+        if access_control_task:
+            pending.append(access_control_task)
         if webrtc_publisher_task:
             pending.append(webrtc_publisher_task)
         if local_storage_manager_task:
@@ -48815,6 +48827,34 @@ register_aac_voice_call_routes(app, page_shell)
 register_platform_owner_routes(app, page_shell)
 register_door_access_routes(app)
 register_security_routes(app, page_shell)
+from access_control_api import register_access_control_routes
+register_access_control_routes(app, page_shell)
+
+
+ACCESS_TIMELINE_EVENTS = {"unlocked", "door_forced", "door_held_open", "request_to_exit", "relock_failed",
+                          "lock_failed", "offline", "controller_offline"}
+
+
+def _access_door_event_to_timeline(door, event_type: str, detail: dict) -> None:
+    """Access-control door events on the linked camera's Events/Playback
+    timeline (a bookmark next to the video), through the same
+    append_analytics_event() path every other analytics event uses."""
+    if event_type not in ACCESS_TIMELINE_EVENTS or not door.camera_id:
+        return
+    from partner_db import connection
+    with connection() as db:
+        row = db.execute("SELECT camera_number FROM cameras WHERE id=?", (door.camera_id,)).fetchone()
+    if not row or row["camera_number"] is None:
+        return
+    now = datetime.now()
+    record = AnalyticsEventModel(
+        camera=int(row["camera_number"]), site="home", rule_name=f"Door: {door.name}",
+        event_type=f"access_{event_type}", confidence=1.0,
+        linked_recording=linked_recording_for(int(row["camera_number"]), now), mock=False,
+    ).model_dump(mode="json")
+    record["door_id"] = door.id
+    record["access_detail"] = {k: v for k, v in detail.items() if k in ("trigger", "person_id", "seconds", "duration_seconds", "facial_event_id")}
+    append_analytics_event(record)
 register_wireguard_remote_appliance_routes(app)
 
 
@@ -155755,15 +155795,9 @@ class _ClassicAacoBoundary:
                     )
             raise PermissionError("Door is unavailable.") from error
 
-        request_obj = relay_control.RelayRequest(
-            channel=camera["door_relay_channel"],
-            pulse_ms=camera["door_relay_pulse_ms"] or relay_control.DEFAULT_PULSE_MS,
-            reason=f"aaco_unlock:{camera['id']}",
-            dry_run=False,
-            requested_by=identity["email"],
-        )
         try:
-            result = relay_control.get_provider().trigger(request_obj)
+            result = door_access.trigger_door(camera, reason=f"aaco_unlock:{camera['id']}", actor=identity["email"],
+                                              trigger_type="aaco", pulse_ms=camera["door_relay_pulse_ms"])
         except Exception as error:
             with connection() as audit_db:
                 door_access.record_door_access_event(
@@ -155775,15 +155809,19 @@ class _ClassicAacoBoundary:
                 )
             raise PermissionError("The door could not be unlocked.") from error
 
-        relay_result = "activated" if result.activated else ("suppressed" if result.suppressed_reason else "failed")
+        relay_result = door_access.audit_relay_result(result)
         with connection() as audit_db:
             door_access.record_door_access_event(
                 audit_db, customer_id=identity["customer_id"], camera_id=camera["id"], door_name=camera["name"],
                 relay_channel=camera["door_relay_channel"], trigger_type="aaco",
                 actor_user_id=user_id, actor_email=identity["email"],
-                authorization_result="authorized", relay_result=relay_result, success=result.activated,
+                authorization_result="authorized", relay_result=relay_result,
+                success=result.activated and not result.simulated,
                 error=result.suppressed_reason, now=now,
             )
+        if result.simulated:
+            # No relay hardware behind this door yet: say so, never "unlocked".
+            return Clarification(door_access.SIMULATED_MESSAGE.format(name=camera["name"]))
         if not result.activated:
             raise PermissionError("The door could not be unlocked.")
 

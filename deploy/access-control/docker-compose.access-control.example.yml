@@ -1,0 +1,44 @@
+# AnyAiCam access-control hardware overlay (EXAMPLE -- not used by the
+# installer and not active on any appliance).
+#
+# Use on hardware day only, alongside the appliance's own compose file:
+#   docker compose -f docker-compose.yml \
+#     -f deploy/access-control/docker-compose.access-control.example.yml up -d
+# See docs/access-control-hardware.md for the full procedure.
+#
+# Device paths: always use /dev/serial/by-id/..., never /dev/ttyUSB0 or
+# /dev/ttyACM0 -- those numbers change with plug order and reboots. Find
+# the real names with:  ls -l /dev/serial/by-id/
+services:
+  # Z-Wave JS (official image). It owns the Aeotec Z-Stick 7 and exposes the
+  # zwave-js-server WebSocket API on port 3000 to the VMS container over the
+  # compose network only. Nothing is published outside the host.
+  zwave-js:
+    image: zwavejs/zwave-js-ui:${ZWAVE_JS_UI_TAG:?pin a tested zwave-js-ui tag}
+    container_name: anyaicam-zwave-js
+    restart: unless-stopped
+    devices:
+      # Aeotec Z-Stick 7 (Silicon Labs 700 series, USB id 0658:0200).
+      - ${ANYAICAM_ZWAVE_STICK_BY_ID:?set to the Z-Stick /dev/serial/by-id path}:/dev/zwave
+    volumes:
+      # Holds the network's S0/S2 security keys. Back this directory up:
+      # losing the keys means every secure lock has to be excluded and
+      # re-included.
+      - /var/lib/anyaicam/zwave-js:/usr/src/app/store
+    environment:
+      - TZ=${TZ:-UTC}
+    ports:
+      # Setup UI for the installer on the appliance itself only
+      # (ssh -L 8091:127.0.0.1:8091). Enable "WS Server" on port 3000 and
+      # set the serial port to /dev/zwave in its settings.
+      - 127.0.0.1:8091:8091
+
+  vms:
+    environment:
+      - ANYAICAM_ZWAVE_JS_URL=ws://zwave-js:3000
+      - ANYAICAM_ZWAVE_SERIAL_PATH=${ANYAICAM_ZWAVE_STICK_BY_ID}
+    devices:
+      # Dry-contact USB relay module (Numato-protocol). Remove this line
+      # for a Z-Wave-only site. The container path must match the door's
+      # config.path.
+      - ${ANYAICAM_RELAY_BY_ID:?set to the relay module /dev/serial/by-id path}:${ANYAICAM_RELAY_BY_ID}

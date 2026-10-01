@@ -524,6 +524,23 @@ def test_mode1_authorized_auto_unlock_has_no_notify_message_and_audits_success(d
     assert audit["success"] == 1
 
 
+def test_mode1_with_no_relay_hardware_is_recorded_as_simulated_never_as_an_unlock(db):
+    """2026-10-01: the production provider has no hardware behind it, so an
+    authorized face is recorded as 'simulated' (nothing opened) and the
+    usual "<name> is at <door>." notice still goes out."""
+    _entitle(db)
+    person_id = facial_people.enroll_person(db, customer_id="cust-1", display_name="Alice", now=NOW)
+    facial_people.add_reference_image(db, customer_id="cust-1", person_id=person_id, embedding=(1.0, 0.0), engine="haar_intensity", engine_version="1", now=NOW)
+    _door_rule(db, dry_run=0)
+    provider = MockRelayProvider(simulated=True)
+    events = facial_events.record_facial_events(db, camera_number=1, appliance_id="appl-1", person_crop_bgr=_frame(), now=NOW, engine=_FixedVectorEngine((1.0, 0.0)), relay_provider=provider)
+    assert events[0]["relay_outcomes"][0]["simulated"] is True
+    assert events[0]["door_notify_message"] == "Alice is at Camera 1."
+    audit = db.execute("SELECT * FROM door_access_events WHERE facial_event_id=?", (events[0]["id"],)).fetchone()
+    assert audit["authorization_result"] == "authorized"
+    assert audit["relay_result"] == "simulated"
+    assert audit["success"] == 0
+
 def test_mode2_recognized_without_authorization_notifies_and_never_unlocks(db):
     """No facial_rules row at all for this customer -- a real person is
     recognized but no rule authorizes automatic entry."""

@@ -457,6 +457,17 @@ def sync_provisioned_cameras() -> dict:
                     talk_down_supported, talk_down_metadata, talk_down_verified_at, now,
                 ),
             )
+            # Door setup (2026-10-01): which cameras are doors, and their relay
+            # channel and unlock time, is set in the customer portal; without
+            # it here a face at the door could never be checked against a door
+            # grant. Applied only when the cloud sends it, so an older cloud
+            # never clears a door configured on this appliance.
+            if "door_access_enabled" in item:
+                db.execute(
+                    "UPDATE cameras SET door_access_enabled=?,door_relay_channel=?,door_relay_pulse_ms=? WHERE id=?",
+                    (1 if item.get("door_access_enabled") else 0, item.get("door_relay_channel"),
+                     item.get("door_relay_pulse_ms"), camera_id),
+                )
             synced += 1
 
             if not device_key:

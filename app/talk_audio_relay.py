@@ -341,6 +341,10 @@ async def _handle_appliance_message(appliance_id: str, raw: str) -> None:
         message = json.loads(raw)
     except (TypeError, ValueError):
         return
+    if isinstance(message, dict) and str(message.get("type") or "").endswith("_result"):
+        import appliance_control
+        appliance_control.resolve(appliance_id, message)
+        return
     session_id = message.get("session_id") if isinstance(message, dict) else None
     relay = _active_relays.get(session_id) if isinstance(session_id, str) else None
     if relay is None or relay.get("appliance_id") != appliance_id:
@@ -822,6 +826,8 @@ def register_talk_audio_relay_routes(app: FastAPI) -> None:
             return
         await websocket.accept()
         _appliance_channels[appliance["id"]] = websocket
+        import appliance_control  # door unlocks and face re-syncs ride this channel too (2026-10-01)
+        appliance_control.bind_loop(asyncio.get_running_loop())
         try:
             while True:
                 raw = await websocket.receive_text()

@@ -1152,6 +1152,60 @@ CREATE TABLE IF NOT EXISTS camera_capabilities(
     capabilities_json TEXT NOT NULL,
     probed_at TEXT NOT NULL
 );
+'''),    # Access-control hardware (2026-09-25, access_control.py): doors as
+    # their own records (Z-Wave lock, relay strike/maglock, simulator), the
+    # persisted relock state that restart recovery reads, a hardware-level
+    # command log and door events (forced, held open, REX, offline).
+    # door_access_events stays the authorization-level audit.
+    ('20260925_access_control','''
+CREATE TABLE IF NOT EXISTS access_doors(
+    id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    camera_id TEXT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    unlock_seconds INTEGER NOT NULL DEFAULT 5,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    dry_run INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_doors_customer ON access_doors(customer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_doors_camera ON access_doors(camera_id) WHERE camera_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS access_door_state(
+    door_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    relock_due_at REAL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS access_door_commands(
+    id TEXT PRIMARY KEY,
+    door_id TEXT NOT NULL,
+    customer_id TEXT,
+    camera_id TEXT,
+    command TEXT NOT NULL,
+    trigger_type TEXT,
+    actor TEXT,
+    reason TEXT,
+    person_id TEXT,
+    facial_event_id TEXT,
+    result TEXT NOT NULL,
+    detail TEXT,
+    duration_seconds INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_door_commands_door_created ON access_door_commands(door_id,created_at);
+CREATE TABLE IF NOT EXISTS access_door_events(
+    id TEXT PRIMARY KEY,
+    door_id TEXT NOT NULL,
+    customer_id TEXT,
+    camera_id TEXT,
+    event_type TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_door_events_door_created ON access_door_events(door_id,created_at);
 '''),
     # Greeting-only volume per AAC entrance camera (2026-09-29): low /
     # medium / high, NULL = medium. Synced to the edge with the rest of
@@ -1629,3 +1683,22 @@ def apply_migrations():
         # Every "Send test SMS" click, for its per-user hourly limit.
         db.execute('CREATE TABLE IF NOT EXISTS sms_test_sends(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,customer_id TEXT,status TEXT NOT NULL,created_at TEXT NOT NULL)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_sms_test_sends_user ON sms_test_sends(user_id,created_at)')
+
+        # Face Access for apartments and businesses (2026-10-01): who a person
+        # is (unit/apartment), whether their Face Access is on, and the dates
+        # it is valid for; per door grant, the days of the week. All nullable
+        # or defaulted, so an older build reading this database is unaffected.
+        def _columns(table):
+            if backend()=='sqlite':
+                return {item['name'] for item in db.execute(f'PRAGMA table_info({table})').fetchall()}
+            return {item['column_name'] for item in db.execute("SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=?",(table,)).fetchall()}
+        facial_people_columns=_columns('facial_people')
+        if 'unit' not in facial_people_columns: db.execute('ALTER TABLE facial_people ADD COLUMN unit TEXT')
+        if 'access_enabled' not in facial_people_columns: db.execute('ALTER TABLE facial_people ADD COLUMN access_enabled INTEGER NOT NULL DEFAULT 1')
+        if 'access_starts_on' not in facial_people_columns: db.execute('ALTER TABLE facial_people ADD COLUMN access_starts_on TEXT')
+        if 'access_expires_on' not in facial_people_columns: db.execute('ALTER TABLE facial_people ADD COLUMN access_expires_on TEXT')
+        facial_rules_columns=_columns('facial_rules')
+        if 'days_of_week' not in facial_rules_columns: db.execute('ALTER TABLE facial_rules ADD COLUMN days_of_week TEXT')
+        # 'cloud' = a door grant made in the customer portal and mirrored to
+        # the appliance by facial_embedding_sync; 'local' = made on the appliance.
+        if 'origin' not in facial_rules_columns: db.execute("ALTER TABLE facial_rules ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'")

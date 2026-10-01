@@ -91,6 +91,11 @@ class RelayResult:
     dry_run: bool
     suppressed_reason: str | None = None
     at: float = field(default_factory=time.monotonic)
+    # True when no hardware exists behind the provider (2026-10-01): the
+    # result is bookkeeping only, nothing physical moved. Every customer-
+    # facing caller reports this as "nothing was unlocked", never as an
+    # unlock, and the door history records relay_result 'simulated'.
+    simulated: bool = False
 
 
 class RelayProvider:
@@ -116,8 +121,13 @@ class MockRelayProvider(RelayProvider):
     Thread-safe: a real appliance may call trigger() from more than one
     detection worker."""
 
-    def __init__(self, *, cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS, clock=time.monotonic) -> None:
+    def __init__(self, *, cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS, clock=time.monotonic,
+                 simulated: bool = False) -> None:
         self.cooldown_seconds = cooldown_seconds
+        # get_provider() -- the one production instance -- sets this, so
+        # its non-dry-run results say plainly that no hardware moved.
+        # Tests that stand a mock in for real hardware leave it False.
+        self.simulated = simulated
         self._clock = clock
         self._lock = threading.Lock()
         self._last_activated_at: dict[int, float] = {}
@@ -152,6 +162,7 @@ class MockRelayProvider(RelayProvider):
                     dry_run=request.dry_run,
                     suppressed_reason="cooldown",
                     at=now,
+                    simulated=self.simulated,
                 )
                 self.results.append(result)
                 return result
@@ -164,7 +175,7 @@ class MockRelayProvider(RelayProvider):
             # I/O. This is the one line a future hardware provider
             # replaces with a genuine GPIO/serial pulse.
             self._last_activated_at[request.channel] = now
-            result = RelayResult(channel=request.channel, activated=True, dry_run=False, at=now)
+            result = RelayResult(channel=request.channel, activated=True, dry_run=False, at=now, simulated=self.simulated)
             self.results.append(result)
             return result
 
@@ -198,6 +209,26 @@ class RelayRule:
     # differently-shaped schedule concept.
     schedule_start: str | None = None
     schedule_end: str | None = None
+    # Days of the week this grant is valid ("mon,tue,..."; None = every day),
+    # 2026-10-01 -- an apartment cleaner on weekdays only, for example.
+    days_of_week: str | None = None
+
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def normalize_days(value) -> str | None:
+    """'mon,wed' / ['mon','wed'] -> 'mon,wed' in week order; empty or all
+    seven -> None (every day). Raises ValueError for anything else."""
+    if value in (None, "", []):
+        return None
+    items = value.split(",") if isinstance(value, str) else list(value)
+    days = {str(item).strip().lower()[:3] for item in items if str(item).strip()}
+    if not days <= set(WEEKDAYS):
+        raise ValueError("Days must be mon, tue, wed, thu, fri, sat or sun.")
+    if not days or days == set(WEEKDAYS):
+        return None
+    return ",".join(day for day in WEEKDAYS if day in days)
 
 
 def _within_schedule(current_time: str, schedule_start: str | None, schedule_end: str | None) -> bool:
@@ -216,6 +247,7 @@ def rule_applies(
     matched_person_id: str | None,
     matched_watchlist_id: str | None,
     current_time: str | None = None,
+    current_weekday: str | None = None,
 ) -> bool:
     """Pure decision: would this rule fire for this match? Never touches
     a RelayProvider or a database -- see facial_events.evaluate_access_rules()
@@ -233,6 +265,8 @@ def rule_applies(
     if confidence < rule.min_confidence:
         return False
     if current_time is not None and not _within_schedule(current_time, rule.schedule_start, rule.schedule_end):
+        return False
+    if current_weekday is not None and rule.days_of_week and current_weekday not in rule.days_of_week.split(","):
         return False
     if rule.trigger_type == "known_person":
         return match_state == "known"
@@ -257,7 +291,7 @@ def get_provider() -> RelayProvider:
     global _provider
     with _provider_lock:
         if _provider is None:
-            _provider = MockRelayProvider()
+            _provider = MockRelayProvider(simulated=True)
         return _provider
 
 

@@ -295,7 +295,7 @@ def test_replace_local_directory_inserts_the_full_snapshot(edge_db_path):
             "watchlist_members": [{"watchlist_id": "wl-1", "person_id": "person-1"}],
         }
         summary = facial_embedding_sync._replace_local_directory("cust-1", directory)
-        assert summary == {"people": 1, "embeddings": 1, "watchlists": 1, "watchlist_members": 1}
+        assert summary == {"people": 1, "embeddings": 1, "watchlists": 1, "watchlist_members": 1, "door_grants": 0}
         with connection() as db:
             people = facial_people.list_people(db, customer_id="cust-1")
             assert [p["display_name"] for p in people] == ["Alice"]
