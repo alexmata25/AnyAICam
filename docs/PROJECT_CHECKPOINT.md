@@ -5349,3 +5349,23 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
 - The merge's `app/` tree is byte-identical to the tested `d2616de`.
 
 **Deployment status:** cloud staging still runs `3ecf46c` and the Ryzen still runs `bd73eb6`. Nothing has been deployed. The proposed plan is in the session report: cloud first, then a Ryzen release only after owner approval.
+
+## 2026-10-01: cloud staging deployed `2e10862` (golden); Ryzen held on `bd73eb6`
+
+- **`cc8043c` deployed to staging** (13:21 UTC) by blue/green from `3ecf46c`. A signed-in browser check as the owner's own customer account (read-only) found one regression from `25588f5`. Its `if(metrics){…}` guard did not cover the storage writes, so on the cloud, where metrics is null, `updateDashboard()` threw. Today's activity stayed "—", AI summary and Smart alerts stayed "Loading…", and Camera health said "Status service unavailable".
+- **Fix `2c77fe5`:** all host-metric writes are inside the guard. A new node test runs the rendered `updateDashboard()` for the cloud (it fails on `cc8043c`) and for the edge.
+- **Full regression on `2c77fe5`:** 5,299 passed, 1 failed (the known talk relay flake, which also fails on `46296f1`), 147 skipped. Merged as `2e10862`.
+- **`2e10862` deployed to staging** (14:14 UTC). Rollbacks are kept: `portal-cc8043c-pre-2e10862-20261001T141305Z-rollback` and `portal-3ecf46c-pre-cc8043c-20261001T132104Z-rollback`.
+- **Verified signed in, desktop and phone:**
+  - `/` goes to Live.
+  - Dashboard health is the appliance's: 1 of 2 appliances online, 614 GB free, 34% of the appliance disk; there is no host license banner.
+  - Today's activity, AI summary and Smart alerts render.
+  - The 10 host-local APIs return 403 and `/storage` returns 404 for the customer.
+  - Events is readable on a phone.
+  - All 25 customer pages load without errors.
+- **Open:**
+  - The owner account has a second, stale appliance record (last check-in 2026-09-30), so it shows "1 of 2". It is data, not code, and was left untouched.
+  - The offline Bedroom tile on Live shows plain black. Its "Camera offline · checking…" label is in the page but not visible.
+  - LPR misreads plates tilted -15° (already present).
+  - The talk relay test is flaky.
+- **Ryzen release pending owner approval:** `8fc2e3b` (edge part), `317253e`, `c41b6ad` and `72daf09` on top of `bd73eb6`, built from `2e10862`.
