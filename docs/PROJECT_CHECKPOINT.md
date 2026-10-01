@@ -5301,3 +5301,37 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 - Bedroom (camera 4) has been down since 9/29.
 - Dell OneDrive memory leak (restart it before long runs).
 - Phone push enrollment, SMS provider, and the daylight LPR drive-by.
+
+## 2026-10-01 overnight: launch-readiness audit (branch `fix/launch-readiness-20261001` @ `d2616de`, pushed, NOT merged, NOT deployed)
+
+The Ryzen runs `bd73eb6` (installed 2026-10-01 ~04:59 UTC). It was healthy all night: 0 restarts, 0 tracebacks, about 3.3 GB memory, disk 66%. Nothing was deployed anywhere.
+
+**Defects found and fixed on the branch (each has regression tests that fail on the old code)**
+1. `8fc2e3b`: **shared-clip 403**. The cloud's `.../media/shared` route accepted only PPE, Facial Recognition and People Counting as children, so every secondary object card of a continuous activity was refused. Any YOLO class may now reuse a YOLO class owner's clip, with the camera, appliance, tenant, original-upload and moment-in-clip checks unchanged. Cards refused earlier heal through the appliance's outbox retry. On the appliance side, a 400/403 response now ends the 12-POST quick-retry loop.
+2. `317253e`: **event-media outbox**.
+   - Environmentally skipped motion jobs stayed in the outbox forever, due on every retry pass. The worker takes only 10 jobs per pass, so 10 of them would block every real retry.
+   - A retry also re-ran the environmental classification at retry time, which could drop real clips after an outage.
+   - The verdict is now final both ways.
+3. `c41b6ad`: **retention**. `clips/motion` and `media/ai` were never pruned (190 GB in 18 days on the Ryzen, about 10 GB/day). At the disk reserve, the storage manager would have deleted recordings instead. Both now expire with `RETENTION_DAYS`; customer exports are untouched.
+4. `72daf09`: `in_app_alerts.jsonl` (append-only, 133,000 lines) now keeps `RETENTION_DAYS`.
+5. `e4075a5`: **cloud `/`**. A signed-in customer saw the appliance's own camera wall (duplicated "Camera 1–8" tiles that can never connect). Customers now go to `/customer-live`.
+6. `25588f5`, `d2616de`: **cloud customer Dashboard**.
+   - It showed the cloud host's own CPU, memory and disk, "VMS running", and saved clips counted on the cloud disk. It now uses the customer's appliance heartbeat; online means online/degraded and checked in within 3 minutes.
+   - The "License attention" banner showed the host's VMS license. It is now hidden for cloud customers.
+   - The Events empty-state message was cut off on phones.
+7. `27023c8`: **cloud tenant isolation**.
+   - Customer sessions could read host-local APIs: `/api/alerts`, `/api/events`, `/api/sites/summary`, `/api/analytics/summary`, `/api/analytics/events`, `/api/dashboard/intelligence`, `/api/ai/status`, `/api/health/issues`, `/api/system/metrics`, `/api/media`. They now get 403 on the cloud.
+   - `/storage/{category}` served any category, including face crops, to any signed-in account. It now serves only `updates`.
+
+**Regression: INCOMPLETE**
+- Claude Code stopped the full run because the Dell was critically low on memory (OneDrive at about 46 GB private memory).
+- Batches 0–3 ran 1,925 passed. The single failure (`test_p05_mobile_poll_js`, "no such table: cameras") passes alone and in its exact batch order (325 passed), so it was treated as transient under memory starvation.
+- Batches 4–9 were not run.
+- Targeted suites for every change (602 + 49 + 40 + 31 + 23 tests) passed.
+- Before merging into golden: restart OneDrive, run the full regression, and run the FFmpeg-dependent tests in the staging container.
+
+**Not fixed (needs a decision or a later pass)**
+- Each camera's live HLS is re-encoded with libx264 (40–70% of a core per camera, measured on the Ryzen), and YOLO runs on the CPU. This is a capacity limit for tiers above about 8–12 cameras on an 8-core appliance.
+- Camera RTSP credentials are visible in the appliance's process list (ffmpeg command line).
+- An AI activity open during a VMS restart gets no clip (cards are released without media).
+- The fix for the shared-clip 403 only takes effect once the cloud (staging) is deployed. Until then the Ryzen keeps retrying those cards hourly, which is harmless.
