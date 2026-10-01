@@ -9,6 +9,7 @@ Reuses test_dashboard_plan_indicator.py's harness.
 """
 
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -43,8 +44,9 @@ def _seed(db_path, customer_id, appliances=()):
                  (customer_id, "partner-1", customer_id, f"{customer_id}@example.test", "active", NOW))
     conn.execute("INSERT OR IGNORE INTO sites(id,customer_id,name,created_at) VALUES(?,?,?,?)", (f"{customer_id}-site", customer_id, "Site", NOW))
     for n, (state, cpu, memory, capacity, used) in enumerate(appliances):
-        conn.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at,state,cpu,memory,disk_capacity,disk) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                     (f"{customer_id}-appl-{n}", customer_id, f"{customer_id}-site", f"AIC-{customer_id}-{n}", NOW, state, cpu, memory, capacity, used))
+        conn.execute("INSERT INTO appliances(id,customer_id,site_id,cloud_id,created_at,state,cpu,memory,disk_capacity,disk,last_check_in) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     (f"{customer_id}-appl-{n}", customer_id, f"{customer_id}-site", f"AIC-{customer_id}-{n}", NOW, state, cpu, memory, capacity, used,
+                      datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -163,3 +165,53 @@ def test_local_storage_serves_only_update_packages(tmp_path, monkeypatch):
         assert client.get("/storage/thumbnails/facial/cust-2/evt.jpg").status_code == 404
         assert client.get("/storage/updates/pkg.tar.gz").content == b"pkg"
     assert route is not None
+
+
+def _fresh(minutes_ago=0):
+    from datetime import datetime, timedelta
+    return (datetime.now() - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def _set_check_in(db_path, customer_id, when):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE appliances SET last_check_in=? WHERE customer_id=?", (when, customer_id))
+    conn.commit()
+    conn.close()
+
+
+def test_a_degraded_but_reporting_appliance_is_online(http_client, db_path, cloud):
+    _seed(db_path, "cust-deg", [("degraded", 20, 30, 100.0, 50.0)])
+    _set_check_in(db_path, "cust-deg", _fresh(1))
+    assert "Appliance online" in _dashboard(http_client, "cust-deg")
+
+
+def test_an_appliance_silent_for_over_three_minutes_is_offline_whatever_its_state(http_client, db_path, cloud):
+    """The fleet sweep that flips state to offline only runs when staff
+    pages load, so a stale 'online' must not be believed."""
+    _seed(db_path, "cust-stale", [("online", 20, 30, 100.0, 50.0)])
+    _set_check_in(db_path, "cust-stale", _fresh(10))
+    html = _dashboard(http_client, "cust-stale")
+    assert "Appliance offline" in html and "Appliance CPU" not in html
+
+
+def test_cloud_customer_pages_show_no_host_license_banner(http_client, db_path, cloud, monkeypatch):
+    monkeypatch.setattr(main, "LICENSE_ENFORCEMENT_MODE", "warn")
+    monkeypatch.setattr(main, "license_enforcement_snapshot", lambda **kwargs: {"warnings": [{"message": "License status is inactive."}]})
+    _seed(db_path, "cust-lic")
+    assert "License attention" not in _dashboard(http_client, "cust-lic")
+
+
+def test_the_edge_appliance_still_shows_its_license_banner(http_client, db_path, monkeypatch):
+    monkeypatch.setattr(main, "RUNTIME_ROLE", "edge")
+    monkeypatch.setattr(main, "LICENSE_ENFORCEMENT_MODE", "warn")
+    monkeypatch.setattr(main, "license_enforcement_snapshot", lambda **kwargs: {"warnings": [{"message": "License status is inactive."}]})
+    _seed(db_path, "cust-lic-edge")
+    assert "License attention" in _dashboard(http_client, "cust-lic-edge")
+
+
+def test_an_empty_table_message_stays_in_view_on_a_phone(http_client, db_path, cloud):
+    """Events on a 390 px phone: the empty-state message was centred across
+    the table's full scroll width and cut off mid-sentence."""
+    _seed(db_path, "cust-empty")
+    html = _dashboard(http_client, "cust-empty")
+    assert ".data-table td .empty-stage{position:sticky;left:0;width:calc(100vw - 60px)" in html

@@ -46409,7 +46409,7 @@ body{background:var(--workspace-bottom)}.shell{grid-template-columns:112px minma
 
 
 
-}.content{max-width:none;padding:24px 34px 48px}.eyebrow{color:var(--brand-soft)}.stat,.panel,.feature-card,.setting-link,.camera-card,.clip{background:rgba(24,33,50,.94);border-color:rgba(170,196,207,.18);box-shadow:0 7px 20px rgba(7,12,20,.12)}.camera-card{border-radius:7px}.camera-tools{background:#121a28}.filter.active,.layout-button.active{background:var(--brand-action);border-color:var(--brand-action);color:white}.download{color:#8df0ea}.pill{background:#315c5d;color:#9ff7f1}.workspace-tabs{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:24px;padding:7px;border-radius:9px;background:#182234}.workspace-tab{padding:12px;border:0;border-radius:7px;background:transparent;color:#f5f7fb;text-align:center;font:inherit;font-weight:700}.workspace-tab.active{background:var(--brand-soft);color:#15343d}.live-workspace,.playback-workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:22px}.camera-picker{align-self:start;min-height:420px;padding:14px;border-radius:12px;background:#172134;box-shadow:0 7px 20px rgba(7,12,20,.2)}.picker-head{padding:12px 15px;border-radius:999px;background:var(--brand-action);font-weight:750}.picker-search{width:100%;margin:18px 0 12px;padding:10px 13px;border:1px solid #b8c2cc;border-radius:999px;background:transparent;color:white}.picker-camera{display:flex;align-items:center;gap:10px;padding:12px 8px;color:#eef2f6}.picker-camera input{accent-color:var(--brand)}.work-area{min-width:0}.action-button{padding:10px 17px;border:0;border-radius:999px;background:var(--brand-action);color:white;font:inherit;font-weight:700}.ghost-button{padding:10px 17px;border:1px solid #c0cad3;border-radius:999px;background:transparent;color:white;font:inherit}.data-table{width:100%;border-collapse:collapse;background:rgba(25,34,51,.92)}.data-table th{padding:15px;text-align:left;background:#161827}.data-table td{padding:15px;border-top:1px solid #596473;color:#eef2f4}.empty-stage{min-height:420px;display:grid;place-items:center;text-align:center;color:#cbd5dc;font-size:22px;font-weight:700}.timeline-shell{margin-top:18px;padding:18px;border-radius:12px;background:#171a2a}.timeline-controls{display:flex;justify-content:center;gap:20px;font-size:24px;color:#9ea7b5}.timeline-track{height:54px;margin-top:14px;border-top:2px solid #b5bec7;background:repeating-linear-gradient(90deg,transparent 0 24px,rgba(255,255,255,.35) 25px 26px)}@media(max-width:900px){.live-workspace,.playback-workspace{grid-template-columns:1fr}.camera-picker{min-height:auto}.shell{grid-template-columns:86px minmax(0,1fr)}.sidebar{width:86px}.content{padding:20px}.nav a{min-height:68px;font-size:11px}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:18px 14px 92px}.mobile-nav{grid-template-columns:repeat(4,1fr)}}
+}.content{max-width:none;padding:24px 34px 48px}.eyebrow{color:var(--brand-soft)}.stat,.panel,.feature-card,.setting-link,.camera-card,.clip{background:rgba(24,33,50,.94);border-color:rgba(170,196,207,.18);box-shadow:0 7px 20px rgba(7,12,20,.12)}.camera-card{border-radius:7px}.camera-tools{background:#121a28}.filter.active,.layout-button.active{background:var(--brand-action);border-color:var(--brand-action);color:white}.download{color:#8df0ea}.pill{background:#315c5d;color:#9ff7f1}.workspace-tabs{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:24px;padding:7px;border-radius:9px;background:#182234}.workspace-tab{padding:12px;border:0;border-radius:7px;background:transparent;color:#f5f7fb;text-align:center;font:inherit;font-weight:700}.workspace-tab.active{background:var(--brand-soft);color:#15343d}.live-workspace,.playback-workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:22px}.camera-picker{align-self:start;min-height:420px;padding:14px;border-radius:12px;background:#172134;box-shadow:0 7px 20px rgba(7,12,20,.2)}.picker-head{padding:12px 15px;border-radius:999px;background:var(--brand-action);font-weight:750}.picker-search{width:100%;margin:18px 0 12px;padding:10px 13px;border:1px solid #b8c2cc;border-radius:999px;background:transparent;color:white}.picker-camera{display:flex;align-items:center;gap:10px;padding:12px 8px;color:#eef2f6}.picker-camera input{accent-color:var(--brand)}.work-area{min-width:0}.action-button{padding:10px 17px;border:0;border-radius:999px;background:var(--brand-action);color:white;font:inherit;font-weight:700}.ghost-button{padding:10px 17px;border:1px solid #c0cad3;border-radius:999px;background:transparent;color:white;font:inherit}.data-table{width:100%;border-collapse:collapse;background:rgba(25,34,51,.92)}.data-table th{padding:15px;text-align:left;background:#161827}.data-table td{padding:15px;border-top:1px solid #596473;color:#eef2f4}.empty-stage{min-height:420px;display:grid;place-items:center;text-align:center;color:#cbd5dc;font-size:22px;font-weight:700}.timeline-shell{margin-top:18px;padding:18px;border-radius:12px;background:#171a2a}.timeline-controls{display:flex;justify-content:center;gap:20px;font-size:24px;color:#9ea7b5}.timeline-track{height:54px;margin-top:14px;border-top:2px solid #b5bec7;background:repeating-linear-gradient(90deg,transparent 0 24px,rgba(255,255,255,.35) 25px 26px)}@media(max-width:900px){.live-workspace,.playback-workspace{grid-template-columns:1fr}.camera-picker{min-height:auto}.shell{grid-template-columns:86px minmax(0,1fr)}.sidebar{width:86px}.content{padding:20px}.nav a{min-height:68px;font-size:11px}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:18px 14px 92px}.mobile-nav{grid-template-columns:repeat(4,1fr)}.data-table td .empty-stage{position:sticky;left:0;width:calc(100vw - 60px);min-height:240px;padding:0 12px;font-size:18px}}
 
 
 
@@ -48487,7 +48487,13 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
     # Partner roles see no platform licensing (they cannot open /license-management).
-    if shell_role not in PARTNER_DB_ROLES:
+    # Nor does a customer on the cloud portal: the banner reads this HOST's
+    # own VMS license file (on staging, "License status is inactive" on
+    # every customer page) and links to a page customers cannot open; their
+    # real plan is on the Dashboard and My subscription (2026-10-01).
+    if shell_role not in PARTNER_DB_ROLES and not (
+        RUNTIME_ROLE == "cloud" and shell_role in {"customer_owner", "customer_viewer"}
+    ):
         content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
 
     # 2026-09-19: the persistent floating AACO assistant is injected
@@ -75060,10 +75066,15 @@ def _customer_appliance_health(customer_id: str) -> dict:
     from partner_db import connection
     with connection() as db:
         rows = [dict(row) for row in db.execute(
-            "SELECT state, cpu, memory, disk_capacity, disk FROM appliances WHERE customer_id=?",
+            "SELECT state, last_check_in, cpu, memory, disk_capacity, disk FROM appliances WHERE customer_id=?",
             (customer_id,),
         ).fetchall()]
-    online = [row for row in rows if row.get("state") == "online"]
+    # Connected = 'online' or 'degraded' with a heartbeat in the last 3
+    # minutes -- the same rule appliance_cloud's fleet sweep uses, which
+    # only runs when staff pages load, so state alone can be stale.
+    fresh_after = (datetime.now() - timedelta(minutes=3)).isoformat()
+    online = [row for row in rows if row.get("state") in ("online", "degraded")
+              and str(row.get("last_check_in") or "") >= fresh_after]
     reporting = [row for row in rows if float(row.get("disk_capacity") or 0) > 0]
     capacity = sum(float(row["disk_capacity"]) for row in reporting)
     used = sum(min(float(row.get("disk") or 0), float(row["disk_capacity"])) for row in reporting)
