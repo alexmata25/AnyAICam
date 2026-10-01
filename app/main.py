@@ -41967,6 +41967,21 @@ CLOUD_PARTNER_NAV_PATH_PREFIXES = (
 )
 
 
+# Appliance-local APIs (see authentication_middleware) that read this host's
+# own files/state with no tenant scope; refused to customer sessions on the
+# cloud. None is used by any cloud customer page.
+CLOUD_HOST_LOCAL_API_PATHS = frozenset({
+    "/api/alerts",
+    "/api/events",
+    "/api/sites/summary",
+    "/api/analytics/summary",
+    "/api/analytics/events",
+    "/api/dashboard/intelligence",
+    "/api/ai/status",
+    "/api/health/issues",
+    "/api/system/metrics",
+    "/api/media",
+})
 PUBLIC_PATH_PREFIXES = (
     "/login",
 
@@ -42269,6 +42284,14 @@ async def authentication_middleware(request: Request, call_next):
 
     if portal_identity:
         request.state.partner_identity = portal_identity
+        # The appliance's own local APIs read THIS host's files with no tenant
+        # scope (its alert log, motion events, site/camera summary, CPU/disk,
+        # AI config). On the cloud that host is the shared portal, so a
+        # customer session must never reach them (2026-10-01, staging: any
+        # customer could read them). The customer UI uses /api/customer/*.
+        if (RUNTIME_ROLE == "cloud" and path in CLOUD_HOST_LOCAL_API_PATHS
+                and portal_identity.get("role") in {"customer_owner", "customer_viewer"}):
+            return JSONResponse({"status": "error", "message": "Not available for customer accounts."}, status_code=403)
         # Partner portal pass (2026-09-26): an invited account signing in with
         # its temporary password (must_change_password) went straight into
         # the portal and could keep using the emailed/relayed password

@@ -119,3 +119,47 @@ def test_host_level_apis_unchanged_on_the_edge_appliance(http_client, db_path, m
     _seed(db_path, "cust-edge-api")
     cookie = {partner_portal.SESSION_COOKIE: partner_portal._token("owner@example.test", "customer_owner", None, "cust-edge-api", None)}
     assert http_client.get(path, cookies=cookie).status_code == 200
+
+
+@pytest.mark.parametrize("path", sorted(main.CLOUD_HOST_LOCAL_API_PATHS))
+def test_every_host_local_api_refuses_a_cloud_customer(http_client, db_path, cloud, path):
+    """Probed live on staging with a test customer: each of these answered
+    with the cloud host's own unscoped data (its alert log, site summary
+    with 19 cameras, motion events, CPU/disk, AI configuration)."""
+    _seed(db_path, "cust-mw")
+    for role in ("customer_owner", "customer_viewer"):
+        cookie = {partner_portal.SESSION_COOKIE: partner_portal._token("owner@example.test", role, None, "cust-mw", None)}
+        response = http_client.get(path, cookies=cookie)
+        assert response.status_code == 403, (path, role, response.text[:200])
+
+
+def test_the_customer_dashboard_still_loads_its_own_apis(http_client, db_path, cloud):
+    _seed(db_path, "cust-ok")
+    cookie = {partner_portal.SESSION_COOKIE: partner_portal._token("owner@example.test", "customer_owner", None, "cust-ok", None)}
+    import time
+    day_start = int(time.time() // 86400 * 86400 * 1000)
+    for path in ("/api/cameras/status", "/api/customer/events/recent",
+                 f"/api/customer/dashboard/intelligence?start_ms={day_start}&end_ms={day_start + 86400000}"):
+        assert http_client.get(path, cookies=cookie).status_code == 200, path
+
+
+def test_local_storage_serves_only_update_packages(tmp_path, monkeypatch):
+    """Face crops are stored as thumbnails/facial/<customer>/<event>.jpg in
+    the local storage backend; /storage served any category to any
+    signed-in account."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import cloud_features
+    import object_storage
+    import dataclasses
+    monkeypatch.setattr(cloud_features, "settings", dataclasses.replace(cloud_features.settings, storage_backend="local"))
+    object_storage.LocalStorage(str(tmp_path)).put("thumbnails", "facial/cust-2/evt.jpg", b"face")
+    object_storage.LocalStorage(str(tmp_path)).put("updates", "pkg.tar.gz", b"pkg")
+    monkeypatch.setattr(cloud_features, "LocalStorage", lambda root=None: object_storage.LocalStorage(str(tmp_path)))
+    app = FastAPI()
+    cloud_features.register_cloud_feature_routes(app, lambda *a, **k: "")
+    route = next(r for r in app.routes if getattr(r, "path", "") == "/storage/{category}/{object_key:path}")
+    with TestClient(app) as client:
+        assert client.get("/storage/thumbnails/facial/cust-2/evt.jpg").status_code == 404
+        assert client.get("/storage/updates/pkg.tar.gz").content == b"pkg"
+    assert route is not None
