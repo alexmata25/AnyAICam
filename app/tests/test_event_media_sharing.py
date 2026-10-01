@@ -37,10 +37,15 @@ def _clean_state(monkeypatch, tmp_path):
     monkeypatch.setattr(event_media_outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
     event_media_sharing.owners.reset()
     main.ai_event_clip_windows.clear()
+    main.ai_activities.reset()
+    # Single-scan tests: an activity ends at once (ai_activity.py); the
+    # continuous-activity contract has its own tests.
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
     previous_loop = main._ai_event_media_loop
     yield
     event_media_sharing.owners.reset()
     main.ai_event_clip_windows.clear()
+    main.ai_activities.reset()
     main._ai_event_media_loop = previous_loop
 
 
@@ -263,38 +268,50 @@ def test_facial_recognition_in_the_clip_building_scan_reuses_it(scan):
     assert [u["event_id"] for u in scan.calls.uploads] == [person["id"]]
 
 
-def test_facial_recognition_later_in_the_same_clip_window_reuses_it(scan):
-    scan.run(at=T0)                                  # person only: builds the clip
+def test_facial_recognition_later_in_the_activity_shares_its_clip(scan, monkeypatch):
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))
+    now = datetime.now()  # the activity finaliser runs on the real clock
+    person = _of(scan.run(at=now), "person")[0]        # opens the activity: its card, its clip
     scan.faces["on"] = True
-    events = scan.run(at=T0 + timedelta(seconds=4))  # merged scan (no clip), still inside T0's window
-    person, face = _of(events, "person")[0], _of(events, "facial_recognition")[0]
+    events = scan.run(at=now + timedelta(seconds=4))   # continues it
+    assert _of(events, "person") == [person]          # still one person card (run() returns every event so far)
+    face = _of(events, "facial_recognition")[0]
     assert face["media_parent_event_id"] == person["id"]
-    assert _wait_until(lambda: len(scan.calls.shared) == 1)
-    assert len(scan.calls.uploads) == 1
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    assert _wait_until(lambda: len(scan.calls.shared) == 1, timeout=10)
+    assert [u["event_id"] for u in scan.calls.uploads] == [person["id"]]
 
 
-def test_facial_recognition_outside_any_clip_gets_a_clip_of_its_own(scan):
-    scan.run(at=T0)
+def test_facial_recognition_past_the_first_scans_window_still_shares_the_activitys_one_clip(scan, monkeypatch):
+    """Before: a face 7 s after the first scan fell outside that scan's
+    10 s clip and built a second clip of its own. The activity's clip now
+    covers it, so there is one clip, through the face."""
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))
+    now = datetime.now()  # the activity finaliser runs on the real clock
+    person = _of(scan.run(at=now), "person")[0]
     scan.faces["on"] = True
-    events = scan.run(at=T0 + timedelta(seconds=7))  # merged (no new person clip) but past T0's clip
+    events = scan.run(at=now + timedelta(seconds=7))
     face = _of(events, "facial_recognition")[0]
-    assert "media_parent_event_id" not in face
-    assert _wait_until(lambda: len(scan.calls.uploads) == 2)
-    own = scan.calls.uploads[1]
-    assert own["event_id"] == face["id"] and own["event_start"] == T0 + timedelta(seconds=7)
-    assert own["thumbnail_url"] and own["already_classified"] is True
-    assert scan.calls.shared == []
+    assert face["media_parent_event_id"] == person["id"]
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    assert _wait_until(lambda: len(scan.calls.uploads) == 1, timeout=10)
+    upload = scan.calls.uploads[0]
+    assert upload["event_id"] == person["id"] and upload["event_end"] == now + timedelta(seconds=7)
 
 
-def test_facial_recognition_builds_nothing_when_the_camera_cannot_keep_media(scan):
-    scan.run(at=T0)
+def test_facial_recognition_builds_no_clip_of_its_own_during_an_activity(scan, monkeypatch):
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))
+    now = datetime.now()  # the activity finaliser runs on the real clock
+    person = _of(scan.run(at=now), "person")[0]
     scan.faces["on"] = True
-    scan.identity["cloud_recording_mode"] = "continuous"  # not Hybrid: the upload would be refused
-    events = scan.run(at=T0 + timedelta(seconds=7))  # merged scan, past T0's clip
+    scan.identity["cloud_recording_mode"] = "continuous"
+    events = scan.run(at=now + timedelta(seconds=7))
     face = _of(events, "facial_recognition")[0]
-    assert "media_parent_event_id" not in face
+    assert face["media_parent_event_id"] == person["id"]
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
+    assert _wait_until(lambda: len(scan.calls.uploads) == 1, timeout=10)
     time.sleep(0.3)
-    assert [u["event_id"] for u in scan.calls.uploads] == [_of(events, "person")[0]["id"]]
+    assert [u["event_id"] for u in scan.calls.uploads] == [person["id"]]
 
 
 def test_facial_recognition_on_another_camera_does_not_reuse_this_cameras_clip(scan):

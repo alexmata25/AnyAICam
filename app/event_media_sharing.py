@@ -79,6 +79,14 @@ class ClipOwners:
             self._by_camera[camera_number] = kept
             self._by_id[owner_id] = entry
 
+    def extend(self, owner_id: str, end: datetime) -> None:
+        """A continuing AI activity's clip window grows (ai_activity.py), so
+        results during it keep sharing its one clip."""
+        with self._lock:
+            entry = self._by_id.get(owner_id)
+            if entry is not None and end > entry["end"]:
+                entry["end"] = end
+
     def covering(self, camera_number: int, moment: datetime) -> str | None:
         with self._lock:
             for item in reversed(self._by_camera.get(camera_number, [])):
