@@ -412,3 +412,73 @@ def test_omitting_shared_media_out_is_completely_unaffected(monkeypatch, fake_s3
     _wire_happy_path(monkeypatch, identity, fake_s3)
 
     assert _call() is True
+
+
+# ------------------------------------------------------------- the environmental verdict is final (2026-10-01)
+
+@pytest.fixture()
+def outbox(tmp_path, monkeypatch):
+    import event_media_outbox
+    monkeypatch.setattr(event_media_outbox, "OUTBOX_FILE", tmp_path / "outbox.json")
+    return event_media_outbox
+
+
+def test_a_skipped_environmental_event_leaves_the_outbox(monkeypatch, fake_s3, outbox):
+    """Live on the Ryzen: every skipped event stayed in the outbox with no
+    next attempt, due on every retry tick forever."""
+    calls = _wire_happy_path(monkeypatch, _eligible_identity_with_smart_motion(), fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: None)
+
+    assert _call() is True
+    assert outbox.load() == [] and fake_s3.uploaded == [] and calls["ensure_session_calls"] == []
+
+
+def test_a_real_event_whose_upload_failed_is_retried_as_classified(monkeypatch, fake_s3, outbox):
+    """An outage during a real person's upload: the retry, later, must not
+    re-ask classify_motion() about whatever the camera sees then."""
+    _wire_happy_path(monkeypatch, _eligible_identity_with_smart_motion(), fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: "person")
+    monkeypatch.setattr(recording_upload, "_ensure_session", lambda cam, cam_id: None)  # the outage
+    assert _call() is False
+    [job] = outbox.load()
+    assert job["classified"] is True
+
+    # Back online; the scene is empty now.
+    _wire_happy_path(monkeypatch, _eligible_identity_with_smart_motion(), fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: None)
+    result = event_media_uploader.retry_pending_event_media()
+
+    assert result["completed"] == 1
+    assert {item["key"].rsplit(".", 1)[-1] for item in fake_s3.uploaded} == {"mp4", "jpg"}
+    assert outbox.load() == []
+
+
+def test_an_ai_detection_job_is_stored_as_classified(monkeypatch, fake_s3, outbox):
+    _wire_happy_path(monkeypatch, _eligible_identity_with_smart_motion(), fake_s3)
+    monkeypatch.setattr(recording_upload, "_ensure_session", lambda cam, cam_id: None)
+    assert event_media_uploader.upload_motion_event_media(
+        event_id="evt-1", camera_number=1, event_start=datetime(2026, 9, 10, 12, 0, 0),
+        event_end=datetime(2026, 9, 10, 12, 0, 10), clip_url="/recordings/clips/motion/motion_evt-1.mp4",
+        thumbnail_url=None, already_classified=True) is False
+    assert outbox.load()[0]["classified"] is True
+
+
+def test_stale_skipped_jobs_drain_and_no_longer_block_real_retries(monkeypatch, fake_s3, outbox):
+    """Twelve skip jobs written by the old code sit ahead of one real job;
+    the worker takes at most RETRY_MAX_JOBS per pass. They drain, and the
+    real job is then uploaded."""
+    for n in range(12):
+        outbox.put({"event_id": f"env-{n}", "camera_number": 1, "event_start": "2026-09-10T12:00:00",
+                    "event_end": "2026-09-10T12:00:10", "clip_url": f"/recordings/clips/motion/motion_env-{n}.mp4",
+                    "thumbnail_url": None})
+    outbox.put({"event_id": "evt-1", "camera_number": 1, "event_start": "2026-09-10T12:00:00",
+                "event_end": "2026-09-10T12:00:10", "clip_url": "/recordings/clips/motion/motion_evt-1.mp4",
+                "thumbnail_url": None, "classified": True})
+    _wire_happy_path(monkeypatch, _eligible_identity_with_smart_motion(), fake_s3)
+    monkeypatch.setattr(smart_motion, "classify_motion", lambda camera_number: None)
+
+    for _ in range(3):
+        event_media_uploader.retry_pending_event_media(max_jobs=10)
+
+    assert outbox.load() == []
+    assert [item["key"].rsplit(".", 1)[-1] for item in fake_s3.uploaded] == ["mp4"]

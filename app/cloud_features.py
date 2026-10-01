@@ -17,6 +17,8 @@ from object_storage import LocalStorage,get_storage,safe_key
 from partner_db import audit,authorize_customer_tenant,connection,require_permission,row,rows,tenant_owns_partner
 from partner_portal import partner_identity,require_partner_access
 
+# /storage/{category}/... serves only these local-storage categories.
+PUBLIC_LOCAL_STORAGE_CATEGORIES=frozenset({'updates'})
 
 # Anonymous recovery requests deliberately receive the same generic response
 # whether or not the account exists.  These limits bound email abuse while
@@ -104,6 +106,12 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     @app.get('/storage/{category}/{object_key:path}')
     def local_storage_file(category: str,object_key: str):
         if settings.storage_backend!='local': raise HTTPException(status_code=404,detail='Local storage backend is disabled.')
+        # Only update packages are ever linked here (LocalStorage.url()). Every
+        # other category holds tenant data with no owner check on this route --
+        # e.g. thumbnails/facial/<customer>/<event>.jpg face crops, which any
+        # signed-in account could fetch by key (2026-10-01); those are shown
+        # through their own tenant-scoped routes instead.
+        if category not in PUBLIC_LOCAL_STORAGE_CATEGORIES: raise HTTPException(status_code=404,detail='Stored object not found.')
         path=LocalStorage().path(category,object_key)
         if not path.exists(): raise HTTPException(status_code=404,detail='Stored object not found.')
         return FileResponse(path)

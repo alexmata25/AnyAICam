@@ -16577,6 +16577,81 @@ def delete_expired_recordings() -> None:
         except OSError:
             continue
 
+    delete_expired_event_media(cutoff)
+    prune_expired_in_app_alerts(cutoff)
+
+
+def prune_expired_in_app_alerts(cutoff: datetime) -> None:
+    """in_app_alerts.jsonl is append-only (every event plus repeated health
+    alerts: 133,000 lines in 19 days on the Ryzen); keep RETENTION_DAYS of
+    it like motion_events.jsonl. Rewritten only when something expired;
+    lines that cannot be dated are kept."""
+    if not IN_APP_ALERTS_FILE.exists():
+        return
+    try:
+        lines = IN_APP_ALERTS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    kept = []
+    for line in lines:
+        try:
+            if datetime.fromisoformat(json.loads(line)["timestamp"]) < cutoff:
+                continue
+        except (KeyError, TypeError, ValueError):
+            pass
+        kept.append(line)
+    if len(kept) == len(lines):
+        return
+    temporary = IN_APP_ALERTS_FILE.with_suffix(".tmp")
+    try:
+        temporary.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+        os.replace(temporary, IN_APP_ALERTS_FILE)
+    except OSError as error:
+        print(f"Could not prune in-app alerts: {error}")
+
+
+def delete_expired_event_media(cutoff: datetime) -> None:
+    """Event clips (clips/motion/) and AI snapshots (media/ai/<day>/) follow
+    the same RETENTION_DAYS as the recordings and motion thumbnails above
+    (2026-10-01). They were never pruned: on the Ryzen, 18 days of them
+    held 190 GB -- far more than the recordings -- and once the disk
+    reached its reserve the storage manager would have deleted recordings,
+    the primary footage, to make room for them. Exported clips at the top
+    of clips/ are the customer's own and are never touched here. Pending
+    uploads of a clip deleted here leave the outbox: nothing is left to
+    send."""
+    import event_media_outbox
+
+    # Resolved from RECORDINGS_FOLDER at call time (CLIPS_FOLDER / AI_
+    # THUMBNAILS_FOLDER are derived from it at import), so a redirected
+    # recordings root can never reach the real folders.
+    clips_folder = RECORDINGS_FOLDER / "clips" / "motion"
+    ai_folder = RECORDINGS_FOLDER / "media" / "ai"
+    deleted: set[str] = set()
+    for folder, pattern in ((clips_folder, "*.mp4"), (ai_folder, "*/*")):
+        if not folder.is_dir():
+            continue
+        for path in folder.glob(pattern):
+            try:
+                if path.is_file() and datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+                    path.unlink(missing_ok=True)
+                    deleted.add(path.name)
+            except OSError:
+                continue
+    for day_folder in ai_folder.glob("*") if ai_folder.is_dir() else []:
+        try:
+            if day_folder.is_dir() and not any(day_folder.iterdir()):
+                day_folder.rmdir()
+        except OSError:
+            continue
+    if not deleted:
+        return
+    print(f"Retention cleanup deleted {len(deleted)} expired event clip(s)/snapshot(s).")
+    for job in event_media_outbox.load():
+        clip_name = str(job.get("clip_url") or "").rsplit("/", 1)[-1]
+        if job.get("kind") != "shared" and clip_name in deleted:
+            event_media_outbox.remove(str(job.get("event_id")))
+
 
 
 
@@ -41892,6 +41967,21 @@ CLOUD_PARTNER_NAV_PATH_PREFIXES = (
 )
 
 
+# Appliance-local APIs (see authentication_middleware) that read this host's
+# own files/state with no tenant scope; refused to customer sessions on the
+# cloud. None is used by any cloud customer page.
+CLOUD_HOST_LOCAL_API_PATHS = frozenset({
+    "/api/alerts",
+    "/api/events",
+    "/api/sites/summary",
+    "/api/analytics/summary",
+    "/api/analytics/events",
+    "/api/dashboard/intelligence",
+    "/api/ai/status",
+    "/api/health/issues",
+    "/api/system/metrics",
+    "/api/media",
+})
 PUBLIC_PATH_PREFIXES = (
     "/login",
 
@@ -42194,6 +42284,14 @@ async def authentication_middleware(request: Request, call_next):
 
     if portal_identity:
         request.state.partner_identity = portal_identity
+        # The appliance's own local APIs read THIS host's files with no tenant
+        # scope (its alert log, motion events, site/camera summary, CPU/disk,
+        # AI config). On the cloud that host is the shared portal, so a
+        # customer session must never reach them (2026-10-01, staging: any
+        # customer could read them). The customer UI uses /api/customer/*.
+        if (RUNTIME_ROLE == "cloud" and path in CLOUD_HOST_LOCAL_API_PATHS
+                and portal_identity.get("role") in {"customer_owner", "customer_viewer"}):
+            return JSONResponse({"status": "error", "message": "Not available for customer accounts."}, status_code=403)
         # Partner portal pass (2026-09-26): an invited account signing in with
         # its temporary password (must_change_password) went straight into
         # the portal and could keep using the emailed/relayed password
@@ -46311,7 +46409,7 @@ body{background:var(--workspace-bottom)}.shell{grid-template-columns:112px minma
 
 
 
-}.content{max-width:none;padding:24px 34px 48px}.eyebrow{color:var(--brand-soft)}.stat,.panel,.feature-card,.setting-link,.camera-card,.clip{background:rgba(24,33,50,.94);border-color:rgba(170,196,207,.18);box-shadow:0 7px 20px rgba(7,12,20,.12)}.camera-card{border-radius:7px}.camera-tools{background:#121a28}.filter.active,.layout-button.active{background:var(--brand-action);border-color:var(--brand-action);color:white}.download{color:#8df0ea}.pill{background:#315c5d;color:#9ff7f1}.workspace-tabs{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:24px;padding:7px;border-radius:9px;background:#182234}.workspace-tab{padding:12px;border:0;border-radius:7px;background:transparent;color:#f5f7fb;text-align:center;font:inherit;font-weight:700}.workspace-tab.active{background:var(--brand-soft);color:#15343d}.live-workspace,.playback-workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:22px}.camera-picker{align-self:start;min-height:420px;padding:14px;border-radius:12px;background:#172134;box-shadow:0 7px 20px rgba(7,12,20,.2)}.picker-head{padding:12px 15px;border-radius:999px;background:var(--brand-action);font-weight:750}.picker-search{width:100%;margin:18px 0 12px;padding:10px 13px;border:1px solid #b8c2cc;border-radius:999px;background:transparent;color:white}.picker-camera{display:flex;align-items:center;gap:10px;padding:12px 8px;color:#eef2f6}.picker-camera input{accent-color:var(--brand)}.work-area{min-width:0}.action-button{padding:10px 17px;border:0;border-radius:999px;background:var(--brand-action);color:white;font:inherit;font-weight:700}.ghost-button{padding:10px 17px;border:1px solid #c0cad3;border-radius:999px;background:transparent;color:white;font:inherit}.data-table{width:100%;border-collapse:collapse;background:rgba(25,34,51,.92)}.data-table th{padding:15px;text-align:left;background:#161827}.data-table td{padding:15px;border-top:1px solid #596473;color:#eef2f4}.empty-stage{min-height:420px;display:grid;place-items:center;text-align:center;color:#cbd5dc;font-size:22px;font-weight:700}.timeline-shell{margin-top:18px;padding:18px;border-radius:12px;background:#171a2a}.timeline-controls{display:flex;justify-content:center;gap:20px;font-size:24px;color:#9ea7b5}.timeline-track{height:54px;margin-top:14px;border-top:2px solid #b5bec7;background:repeating-linear-gradient(90deg,transparent 0 24px,rgba(255,255,255,.35) 25px 26px)}@media(max-width:900px){.live-workspace,.playback-workspace{grid-template-columns:1fr}.camera-picker{min-height:auto}.shell{grid-template-columns:86px minmax(0,1fr)}.sidebar{width:86px}.content{padding:20px}.nav a{min-height:68px;font-size:11px}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:18px 14px 92px}.mobile-nav{grid-template-columns:repeat(4,1fr)}}
+}.content{max-width:none;padding:24px 34px 48px}.eyebrow{color:var(--brand-soft)}.stat,.panel,.feature-card,.setting-link,.camera-card,.clip{background:rgba(24,33,50,.94);border-color:rgba(170,196,207,.18);box-shadow:0 7px 20px rgba(7,12,20,.12)}.camera-card{border-radius:7px}.camera-tools{background:#121a28}.filter.active,.layout-button.active{background:var(--brand-action);border-color:var(--brand-action);color:white}.download{color:#8df0ea}.pill{background:#315c5d;color:#9ff7f1}.workspace-tabs{display:grid;grid-template-columns:repeat(3,1fr);margin-bottom:24px;padding:7px;border-radius:9px;background:#182234}.workspace-tab{padding:12px;border:0;border-radius:7px;background:transparent;color:#f5f7fb;text-align:center;font:inherit;font-weight:700}.workspace-tab.active{background:var(--brand-soft);color:#15343d}.live-workspace,.playback-workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:22px}.camera-picker{align-self:start;min-height:420px;padding:14px;border-radius:12px;background:#172134;box-shadow:0 7px 20px rgba(7,12,20,.2)}.picker-head{padding:12px 15px;border-radius:999px;background:var(--brand-action);font-weight:750}.picker-search{width:100%;margin:18px 0 12px;padding:10px 13px;border:1px solid #b8c2cc;border-radius:999px;background:transparent;color:white}.picker-camera{display:flex;align-items:center;gap:10px;padding:12px 8px;color:#eef2f6}.picker-camera input{accent-color:var(--brand)}.work-area{min-width:0}.action-button{padding:10px 17px;border:0;border-radius:999px;background:var(--brand-action);color:white;font:inherit;font-weight:700}.ghost-button{padding:10px 17px;border:1px solid #c0cad3;border-radius:999px;background:transparent;color:white;font:inherit}.data-table{width:100%;border-collapse:collapse;background:rgba(25,34,51,.92)}.data-table th{padding:15px;text-align:left;background:#161827}.data-table td{padding:15px;border-top:1px solid #596473;color:#eef2f4}.empty-stage{min-height:420px;display:grid;place-items:center;text-align:center;color:#cbd5dc;font-size:22px;font-weight:700}.timeline-shell{margin-top:18px;padding:18px;border-radius:12px;background:#171a2a}.timeline-controls{display:flex;justify-content:center;gap:20px;font-size:24px;color:#9ea7b5}.timeline-track{height:54px;margin-top:14px;border-top:2px solid #b5bec7;background:repeating-linear-gradient(90deg,transparent 0 24px,rgba(255,255,255,.35) 25px 26px)}@media(max-width:900px){.live-workspace,.playback-workspace{grid-template-columns:1fr}.camera-picker{min-height:auto}.shell{grid-template-columns:86px minmax(0,1fr)}.sidebar{width:86px}.content{padding:20px}.nav a{min-height:68px;font-size:11px}}@media(max-width:760px){.shell{display:block}.sidebar{display:none}.content{padding:18px 14px 92px}.mobile-nav{grid-template-columns:repeat(4,1fr)}.data-table td .empty-stage{position:sticky;left:0;width:calc(100vw - 60px);min-height:240px;padding:0 12px;font-size:18px}}
 
 
 
@@ -48389,7 +48487,13 @@ def page_shell(title: str, active: str, content: str, scripts: str = "") -> str:
 
 
     # Partner roles see no platform licensing (they cannot open /license-management).
-    if shell_role not in PARTNER_DB_ROLES:
+    # Nor does a customer on the cloud portal: the banner reads this HOST's
+    # own VMS license file (on staging, "License status is inactive" on
+    # every customer page) and links to a page customers cannot open; their
+    # real plan is on the Dashboard and My subscription (2026-10-01).
+    if shell_role not in PARTNER_DB_ROLES and not (
+        RUNTIME_ROLE == "cloud" and shell_role in {"customer_owner", "customer_viewer"}
+    ):
         content = license_warning_banner(customer_id=(shell_user or {}).get("customer_id")) + content
 
     # 2026-09-19: the persistent floating AACO assistant is injected
@@ -52842,24 +52946,20 @@ def system_metrics() -> dict:
 
 
 
+def _cloud_customer_session(request: Request) -> bool:
+    """A customer signed in to the cloud portal: this host's own CPU/disk and
+    alert log are the cloud's, not theirs (2026-10-01), so host-level APIs
+    refuse them; their appliance's health comes from its heartbeat."""
+    if RUNTIME_ROLE != "cloud":
+        return False
+    from partner_portal import partner_identity
+    return (partner_identity(request) or {}).get("role") in {"customer_owner", "customer_viewer"}
+
+
 @app.get("/api/system/metrics")
-
-
-
-
-
-
-
-
-def metrics_api() -> dict:
-
-
-
-
-
-
-
-
+def metrics_api(request: Request) -> dict:
+    if _cloud_customer_session(request):
+        raise HTTPException(status_code=403, detail="Not available for customer accounts.")
     return system_metrics()
 
 
@@ -53968,15 +54068,9 @@ def update_alert_rule(camera_number: int, rule: AlertRuleModel, http_request: Re
 
 
 @app.get("/api/alerts")
-
-
-
-
-
-
-
-
-def in_app_alerts(limit: int = 100) -> dict:
+def in_app_alerts(request: Request, limit: int = 100) -> dict:
+    if _cloud_customer_session(request):
+        raise HTTPException(status_code=403, detail="Not available for customer accounts.")
 
 
 
@@ -71950,7 +72044,20 @@ def go_live_page(request: Request) -> str:
 
 
 
-def home() -> str:
+def home(request: Request):
+    # The cloud portal has no local cameras: this page is the appliance's
+    # own live wall (camera1..N HLS on this host). A signed-in customer
+    # reaching it there (Phone access's "Open cameras", a bookmark) saw
+    # duplicated "Camera 1..8" tiles that can never connect (2026-10-01,
+    # staging, a tenant with no cameras). Send them to their real Live
+    # page; any other cloud identity to its portal. Signed-out visitors are
+    # already sent to the customer sign-in by authentication_middleware.
+    if RUNTIME_ROLE == "cloud":
+        from partner_portal import partner_identity
+        identity = partner_identity(request) or {}
+        if identity.get("role") in {"customer_owner", "customer_viewer"}:
+            return RedirectResponse("/customer-live", status_code=303)
+        return RedirectResponse("/partner", status_code=303)
 
 
 
@@ -74954,6 +75061,57 @@ def _render_dashboard_camera_card(camera_number, *, name, camera_id, can_live, f
         '</article>'
     )
 
+def _customer_appliance_health(customer_id: str) -> dict:
+    """The customer's own appliance(s), from their last heartbeat."""
+    from partner_db import connection
+    with connection() as db:
+        rows = [dict(row) for row in db.execute(
+            "SELECT state, last_check_in, cpu, memory, disk_capacity, disk FROM appliances WHERE customer_id=?",
+            (customer_id,),
+        ).fetchall()]
+    # Connected = 'online' or 'degraded' with a heartbeat in the last 3
+    # minutes -- the same rule appliance_cloud's fleet sweep uses, which
+    # only runs when staff pages load, so state alone can be stale.
+    fresh_after = (datetime.now() - timedelta(minutes=3)).isoformat()
+    online = [row for row in rows if row.get("state") in ("online", "degraded")
+              and str(row.get("last_check_in") or "") >= fresh_after]
+    reporting = [row for row in rows if float(row.get("disk_capacity") or 0) > 0]
+    capacity = sum(float(row["disk_capacity"]) for row in reporting)
+    used = sum(min(float(row.get("disk") or 0), float(row["disk_capacity"])) for row in reporting)
+    if not rows:
+        health, storage_text, detail = "No appliance connected", "No appliance connected", "Storage appears once your appliance is connected."
+    else:
+        health = (("Appliance online" if online else "Appliance offline") if len(rows) == 1
+                  else f"{len(online)} of {len(rows)} appliances online")
+        storage_text = f"{capacity - used:.1f} GB free" if reporting else "Not reported yet"
+        detail = (f"{round(used / capacity * 100)}% of appliance disk in use" if reporting
+                  else "Your appliance has not reported its storage yet.")
+    single = rows[0] if len(rows) == 1 and online else None
+    return {"health": health, "online": bool(online), "storage_text": storage_text, "storage_detail": detail,
+            "used_percent": round(used / capacity * 100) if capacity else 0,
+            "cpu": single.get("cpu") if single else None, "memory": single.get("memory") if single else None}
+
+
+def _dashboard_health_stats_html(fleet: dict | None, clips, plan_stat, recording_stat, storage_text) -> str:
+    plan = (f'<a class="stat" href="/subscription-portal" style="text-decoration:none;color:inherit"><span class="stat-label">Plan</span>'
+            f'<span class="stat-value">{plan_stat}</span></a>') if plan_stat is not None else ''
+    recording = f'<div class="stat"><span class="stat-label">Recording</span><span class="stat-value">{recording_stat}</span></div>'
+    storage = f'<div class="stat"><span class="stat-label">Storage available</span><span class="stat-value" id="storage-metric">{escape(storage_text)}</span></div>'
+    if fleet is None:  # this appliance's own dashboard, unchanged
+        return (f'<div class="stat"><span class="stat-label">System health</span><span class="stat-value"><span class="dot"></span>VMS running</span></div>'
+                f'{plan}{recording}<div class="stat"><span class="stat-label">Saved clips</span><span class="stat-value">{len(clips)}</span></div>'
+                '<div class="stat"><span class="stat-label">CPU</span><span class="stat-value" id="cpu-metric" data-live="1">Checking…</span></div>'
+                '<div class="stat"><span class="stat-label">Memory</span><span class="stat-value" id="memory-metric">Checking…</span></div>'
+                f'{storage}')
+    dot = '<span class="dot"></span>' if fleet["online"] else ''
+    load = ''
+    if fleet["cpu"] is not None and fleet["memory"] is not None:
+        load = (f'<div class="stat"><span class="stat-label">Appliance CPU</span><span class="stat-value" id="cpu-metric">{round(float(fleet["cpu"]))}%</span></div>'
+                f'<div class="stat"><span class="stat-label">Appliance memory</span><span class="stat-value" id="memory-metric">{round(float(fleet["memory"]))}%</span></div>')
+    return (f'<div class="stat"><span class="stat-label">System health</span><span class="stat-value">{dot}{escape(fleet["health"])}</span></div>'
+            f'{plan}{recording}{load}{storage}')
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 
 
@@ -75126,106 +75284,32 @@ def dashboard(request: Request) -> str:
 
 
 
-    clips = sorted(
-
-
-
-
-
-
-
-
-        RECORDINGS_FOLDER.rglob("*.mkv"),
-
-
-
-
-
-
-
-
-        key=lambda clip: clip.stat().st_mtime,
-
-
-
-
-
-
-
-
-        reverse=True,
-
-
-
-
-
-
-
-
+    # A customer on the cloud portal: health, CPU/memory and storage come
+    # from their own appliance(s)' last heartbeat (appliances table, GB as
+    # metrics.py reports them) -- never from this cloud host, whose disk,
+    # CPU and recordings folder are not theirs (2026-10-01: staging showed
+    # a camera-less customer "VMS running", the EC2's CPU/memory and
+    # "12.0 GB free · 74.6% of disk in use").
+    _dashboard_fleet = (
+        _customer_appliance_health(_dashboard_identity["customer_id"])
+        if RUNTIME_ROLE == "cloud" and _dashboard_identity and _dashboard_identity.get("customer_id") else None
     )
-
-
-
-
-
-
-
-
-    try:
-
-
-
-
-
-
-
-
-        disk = shutil.disk_usage(RECORDINGS_FOLDER)
-
-
-
-
-
-
-
-
-        used_percent = round((disk.used / disk.total) * 100) if disk.total else 0
-
-
-
-
-
-
-
-
-        free_gb = disk.free / (1024**3)
-
-
-
-
-
-
-
-
-        storage_text = f"{free_gb:.1f} GB free"
-
-
-
-
-
-
-
-
-    except OSError:
-
-
-
-
-
-
-
-
-        used_percent, storage_text = 0, "Storage unavailable"
+    if _dashboard_fleet is not None:
+        clips = None
+        used_percent, storage_text = _dashboard_fleet["used_percent"], _dashboard_fleet["storage_text"]
+    else:
+        clips = sorted(
+            RECORDINGS_FOLDER.rglob("*.mkv"),
+            key=lambda clip: clip.stat().st_mtime,
+            reverse=True,
+        )
+        try:
+            disk = shutil.disk_usage(RECORDINGS_FOLDER)
+            used_percent = round((disk.used / disk.total) * 100) if disk.total else 0
+            free_gb = disk.free / (1024**3)
+            storage_text = f"{free_gb:.1f} GB free"
+        except OSError:
+            used_percent, storage_text = 0, "Storage unavailable"
 
 
 
@@ -75831,53 +75915,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="stat"><span class="stat-label">System health</span><span class="stat-value"><span class="dot"></span>VMS running</span></div>
-
-
-
-
-
-
-
-
-        {f'<a class="stat" href="/subscription-portal" style="text-decoration:none;color:inherit"><span class="stat-label">Plan</span><span class="stat-value">{_dashboard_plan_stat}</span></a>' if _dashboard_plan_stat is not None else ''}
-        <div class="stat"><span class="stat-label">Recording</span><span class="stat-value">{_dashboard_recording_stat}</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">Saved clips</span><span class="stat-value">{len(clips)}</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">CPU</span><span class="stat-value" id="cpu-metric">Checking…</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">Memory</span><span class="stat-value" id="memory-metric">Checking…</span></div>
-
-
-
-
-
-
-
-
-        <div class="stat"><span class="stat-label">Storage available</span><span class="stat-value" id="storage-metric">{storage_text}</span></div>
+        {_dashboard_health_stats_html(_dashboard_fleet, clips, _dashboard_plan_stat, _dashboard_recording_stat, storage_text)}
 
 
 
@@ -76165,7 +76203,7 @@ def dashboard(request: Request) -> str:
 
 
 
-        <div class="panel"><div class="panel-head"><h2>Storage</h2><span class="health-detail">Local</span></div><div class="stat-value">{storage_text}</div><div class="storage-bar"><span id="storage-bar-value" style="width:{used_percent}%"></span></div><div class="health-detail" id="storage-detail">{used_percent}% of disk in use · {RETENTION_DAYS}-day retention</div></div>
+        <div class="panel"><div class="panel-head"><h2>Storage</h2><span class="health-detail">{"Your appliance" if _dashboard_fleet is not None else "Local"}</span></div><div class="stat-value">{storage_text}</div><div class="storage-bar"><span id="storage-bar-value" style="width:{used_percent}%"></span></div><div class="health-detail" id="storage-detail">{escape(_dashboard_fleet["storage_detail"]) if _dashboard_fleet is not None else f"{used_percent}% of disk in use · {RETENTION_DAYS}-day retention"}</div></div>
 
 
 
@@ -76282,6 +76320,7 @@ async function updateDashboard(){
 
 
 
+        const hostMetrics=document.getElementById('cpu-metric')?.dataset.live==='1';
         const [statusResponse,metricsResponse,intelligenceResponse]=await Promise.all([
 
 
@@ -76300,8 +76339,7 @@ async function updateDashboard(){
 
 
 
-            fetch('/api/system/metrics',{cache:'no-store'}),
-
+            hostMetrics?fetch('/api/system/metrics',{cache:'no-store'}):Promise.resolve(null),
 
 
 
@@ -76327,7 +76365,7 @@ async function updateDashboard(){
 
 
 
-        const statusData=await statusResponse.json();const metrics=await metricsResponse.json();const intelligence=await intelligenceResponse.json();
+        const statusData=await statusResponse.json();const metrics=metricsResponse?await metricsResponse.json():null;const intelligence=await intelligenceResponse.json();
 
 
 
@@ -76392,7 +76430,7 @@ async function updateDashboard(){
 
 
 
-        document.getElementById('cpu-metric').textContent=metrics.cpu_percent+'%';
+        if(metrics){document.getElementById('cpu-metric').textContent=metrics.cpu_percent+'%';
 
 
 
@@ -76400,8 +76438,7 @@ async function updateDashboard(){
 
 
 
-
-        document.getElementById('memory-metric').textContent=metrics.memory_percent+'%';
+        document.getElementById('memory-metric').textContent=metrics.memory_percent+'%';}
 
 
 

@@ -73,6 +73,8 @@ EVENT_MEDIA_CACHE_CONTROL = "public, max-age=31536000, immutable"
 RETRY_SECONDS = max(30, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_SECONDS", "120")))
 RETRY_MAX_SECONDS = max(RETRY_SECONDS, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_SECONDS", "3600")))
 RETRY_MAX_JOBS = max(1, int(os.environ.get("ANYAICAM_EVENT_MEDIA_RETRY_MAX_JOBS", "10")))
+# Cloud answers to .../media/shared that no quick retry can change.
+SHARED_REGISTRATION_REFUSED = frozenset({400, 403})
 event_media_retry_state = {"worker_status": "not_started", "last_summary": None, "last_error": None}
 
 
@@ -266,9 +268,12 @@ def upload_motion_event_media(
     # Persist only deterministic local references and timing metadata.  In
     # particular, no identity, bearer credential, STS material, bucket, or
     # cloud-derived key can enter the durable outbox.
-    event_media_outbox.put({"event_id": event_id, "camera_number": camera_number,
-                            "event_start": event_start.isoformat(), "event_end": event_end.isoformat(),
-                            "clip_url": safe_clip_url, "thumbnail_url": safe_thumbnail_url})
+    job = {"event_id": event_id, "camera_number": camera_number,
+           "event_start": event_start.isoformat(), "event_end": event_end.isoformat(),
+           "clip_url": safe_clip_url, "thumbnail_url": safe_thumbnail_url}
+    if already_classified:
+        job["classified"] = True
+    event_media_outbox.put(job)
 
     # This is the hard local-only boundary.  Nothing below it may run unless
     # the explicit transport flag is true.
@@ -341,13 +346,23 @@ def upload_motion_event_media(
     # filter on in the existing architecture, so this deliberately falls
     # back to current behavior (every Basic Motion clip uploads) rather
     # than inventing a raw-pixel heuristic.
-    if not already_classified and identity.get("smart_motion_enabled") and not smart_motion.classify_motion(camera_number):
-        logger.info(
-            "event_media.environmental_motion_skipped event_id=%s camera=%s",
-            event_id,
-            camera_number,
-        )
-        return True
+    #
+    # The verdict is taken once, at the event, and is final both ways
+    # (2026-10-01): a skipped event leaves the outbox (it used to stay,
+    # due on every retry tick forever, and ten of them blocked every real
+    # retry behind them), and a real one is remembered as classified so a
+    # retry after an outage uploads it instead of re-asking classify_
+    # motion() about whatever the camera sees at retry time.
+    if not already_classified and identity.get("smart_motion_enabled"):
+        if not smart_motion.classify_motion(camera_number):
+            logger.info(
+                "event_media.environmental_motion_skipped event_id=%s camera=%s",
+                event_id,
+                camera_number,
+            )
+            event_media_outbox.remove(event_id)
+            return True
+        event_media_outbox.replace(event_id, {**job, "classified": True})
 
     camera_id = identity["camera_id"]
     session = recording_upload._ensure_session(camera_number, camera_id)
@@ -586,6 +601,13 @@ def register_shared_event_media(
             event_media_outbox.remove(event_id)
             return True
 
+        # 404 (event not in the cloud yet) and 409 (parent media pending)
+        # resolve within seconds, so they are worth these quick retries; a
+        # 400/403 refusal is the same answer every time -- leave it to the
+        # outbox's backed-off retry instead of a minute of identical POSTs.
+        if recording_upload.last_control_plane_post_status() in SHARED_REGISTRATION_REFUSED:
+            break
+
         if attempt < 12:
             time.sleep(5)
 
@@ -629,6 +651,7 @@ def retry_pending_event_media(max_jobs: int = RETRY_MAX_JOBS) -> dict:
                     event_start=datetime.fromisoformat(str(job["event_start"])),
                     event_end=datetime.fromisoformat(str(job["event_end"])),
                     clip_url=str(job["clip_url"]), thumbnail_url=job.get("thumbnail_url"),
+                    already_classified=bool(job.get("classified")),
                 )
             if succeeded:
                 completed += 1
