@@ -43,6 +43,18 @@ def test_the_owner_page_offers_all_three_enrollment_methods_and_face_access(http
                    'id="a-enabled"', 'id="a-unit"', 'id="a-site"', 'id="a-starts"', 'id="a-expires"', 'id="a-save"'):
         assert marker in page, marker
     assert "getUserMedia" in page and "/api/aac/face-preview" in page and "/live/still.jpg" in page
+    # Enroll from Camera keeps the live stream watched while capturing (no frames otherwise).
+    assert page.index("/live/playlist.m3u8") < page.index("/live/still.jpg")
+
+
+def test_enroll_from_camera_lists_real_cameras_only(http_client, db_path):
+    _seed(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO cameras(id,customer_id,site_id,camera_number,name,status,created_at) VALUES('slot','cust-1','site-1',NULL,'Camera 6','pending_installation','2026-01-01')")
+    conn.commit(); conn.close()
+    page = http_client.get("/aac/people/enroll?person_id=person_1", cookies=_owner()).text
+    select = page[page.index('id="cam-select"'):page.index("</select>", page.index('id="cam-select"'))]
+    assert "Lobby Door" in select and "Camera 6" not in select
 
 
 def test_a_viewer_sees_but_cannot_change_anything(http_client, db_path):

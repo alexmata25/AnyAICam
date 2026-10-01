@@ -345,9 +345,12 @@ $('cam-start')?.addEventListener('click',async()=>{
   $('cam-start').disabled=true;$('cam-candidates').innerHTML='';cameraCandidates=[];
   say('cam-status','Starting the camera… ask the person to look at it.');
   try{await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}/live/start`,{method:'POST'});}catch(e){}
-  for(let i=0;i<10&&cameraCandidates.length<6;i++){
-    await new Promise(r=>setTimeout(r,i?900:2500));
+  for(let i=0;i<16&&cameraCandidates.length<6;i++){
+    await new Promise(r=>setTimeout(r,i?1200:2000));
     say('cam-status',`Capturing… ${i+1}`);
+    // The camera's cloud live stream only produces frames while it is being
+    // watched (2026-10-01, staging): keep its playlist active while capturing.
+    try{await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}/live/playlist.m3u8`,{cache:'no-store'});}catch(e){}
     const r=await fetch(`/api/customer/cameras/${encodeURIComponent(cameraId)}/live/still.jpg`,{cache:'no-store'});
     if(!r.ok)continue;
     const b=await r.blob();const data=await new Promise(res=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.readAsDataURL(b);});
@@ -806,7 +809,7 @@ if(FIXED_CUSTOMER_ID!==null)aacLoadPeople();
         if facial_ctx:
             with connection() as db:
                 cameras = [dict(row) for row in db.execute(
-                    "SELECT id,name FROM cameras WHERE customer_id=? AND (status IS NULL OR status<>'deleted') ORDER BY name", (facial_ctx["customer_id"],)
+                    "SELECT id,name FROM cameras WHERE customer_id=? AND camera_number IS NOT NULL AND (status IS NULL OR status<>'deleted') ORDER BY name", (facial_ctx["customer_id"],)
                 ).fetchall()]
         camera_options = "".join(f'<option value="{html.escape(c["id"], quote=True)}">{html.escape(c["name"] or "Camera")}</option>' for c in cameras)
         ro = "" if can_manage else " disabled"
