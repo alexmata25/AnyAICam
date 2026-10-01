@@ -94,3 +94,38 @@ webrtc_port_preflight() {
     echo "Stop or reconfigure the program using it, then re-run the installer. Nothing has been changed." >&2
     return 1
 }
+
+# VMS web port (2026-10-01): the VMS publishes TCP 8000. A clean install
+# on a machine where another program held it built the whole image (about
+# 50 minutes) and only then failed at `docker compose up` with "address
+# already in use". Refused here instead, before anything changes. The
+# bind test also catches listeners `ss` cannot see (e.g. a port mirrored
+# in from another OS). Our own publish is not a conflict.
+VMS_HTTP_PORT="${VMS_HTTP_PORT:-8000}"
+
+vms_http_port_published_by_vms() {
+    docker port anyaicam-vms "$VMS_HTTP_PORT/tcp" 2>/dev/null | grep -q ":$VMS_HTTP_PORT\$"
+}
+
+vms_http_port_bindable() {
+    python3 -c 'import socket,sys
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try: s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError: sys.exit(1)
+finally: s.close()' "$VMS_HTTP_PORT"
+}
+
+vms_http_port_preflight() {
+    if vms_http_port_published_by_vms; then
+        log "Preflight OK: TCP $VMS_HTTP_PORT is already published by this appliance's own VMS container"
+        return 0
+    fi
+    if vms_http_port_bindable; then
+        log "Preflight OK: TCP $VMS_HTTP_PORT (VMS web) is free"
+        return 0
+    fi
+    echo "[ERROR] TCP port $VMS_HTTP_PORT (the AnyAiCam VMS web interface) is already in use on this host:" >&2
+    ss -H -t -l -n -p "sport = :$VMS_HTTP_PORT" 2>/dev/null >&2 || true
+    echo "Stop or reconfigure the program using it, then re-run the installer. Nothing has been changed." >&2
+    return 1
+}

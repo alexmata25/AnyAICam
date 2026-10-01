@@ -1252,6 +1252,20 @@ assert_exit "validate: the VMS container does not publish 8189 -> FAIL" 1 webrtc
 SS_MOCK="$PROXY"$'\n'"$FOREIGN"; VMS_PUBLISHES_8189=yes
 assert_exit "validate: something besides the VMS holds 8189 -> FAIL" 1 webrtc_port_owned_by_vms
 unset -f ss docker
+
+echo "== TCP 8000 port-conflict preflight (01-preflight.sh) =="
+docker() { [[ "$1" == "port" && "$2" == "anyaicam-vms" && "${VMS_PUBLISHES_8000:-no}" == "yes" ]] && { echo "0.0.0.0:8000"; return 0; }; return 1; }
+vms_http_port_bindable() { [[ "${PORT_8000_FREE:-yes}" == "yes" ]]; }
+VMS_PUBLISHES_8000=no; PORT_8000_FREE=yes
+assert_exit "a free TCP 8000 passes (clean install)" 0 vms_http_port_preflight
+VMS_PUBLISHES_8000=no; PORT_8000_FREE=no
+assert_exit "another program holding TCP 8000 FAILS before anything changes" 1 vms_http_port_preflight
+assert_eq "the message names the port and says nothing changed" "1" "$( (vms_http_port_preflight 2>&1 >/dev/null) | grep -c 'TCP port 8000 .* already in use' )"
+VMS_PUBLISHES_8000=yes; PORT_8000_FREE=no
+assert_exit "the appliance's own VMS publish passes (repair/upgrade)" 0 vms_http_port_preflight
+unset -f docker vms_http_port_bindable
+source "$INSTALLER_DIR/01-preflight.sh"
+assert_exit "install.sh runs the TCP 8000 preflight right after the UDP one, before docker_setup" 0   bash -c "grep -A1 '^    webrtc_port_preflight\$' '$INSTALLER_DIR/install.sh' | grep -q '^    vms_http_port_preflight\$' && [ \$(grep -n '^    vms_http_port_preflight\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) -lt \$(grep -n '^    docker_setup\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) ]"
 assert_exit "install.sh runs the port preflight right after preflight_checks, before anything is changed" 0 \
   bash -c "grep -A1 '^    preflight_checks\$' '$INSTALLER_DIR/install.sh' | grep -q '^    webrtc_port_preflight\$' && [ \$(grep -n '^    webrtc_port_preflight\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) -lt \$(grep -n '^    docker_setup\$' '$INSTALLER_DIR/install.sh' | cut -d: -f1) ]"
 assert_exit "validate.sh runs the port-ownership check" 0 grep -q 'check "WebRTC media port (UDP 8189) is published by the VMS container and by nothing else" webrtc_port_owned_by_vms' "$INSTALLER_DIR/validate.sh"
