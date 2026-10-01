@@ -72025,7 +72025,20 @@ def go_live_page(request: Request) -> str:
 
 
 
-def home() -> str:
+def home(request: Request):
+    # The cloud portal has no local cameras: this page is the appliance's
+    # own live wall (camera1..N HLS on this host). A signed-in customer
+    # reaching it there (Phone access's "Open cameras", a bookmark) saw
+    # duplicated "Camera 1..8" tiles that can never connect (2026-10-01,
+    # staging, a tenant with no cameras). Send them to their real Live
+    # page; any other cloud identity to its portal. Signed-out visitors are
+    # already sent to the customer sign-in by authentication_middleware.
+    if RUNTIME_ROLE == "cloud":
+        from partner_portal import partner_identity
+        identity = partner_identity(request) or {}
+        if identity.get("role") in {"customer_owner", "customer_viewer"}:
+            return RedirectResponse("/customer-live", status_code=303)
+        return RedirectResponse("/partner", status_code=303)
 
 
 
