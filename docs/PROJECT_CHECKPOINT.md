@@ -5391,3 +5391,38 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
 
 **Open, handle separately after this release is stable (not investigated or changed now)**
 - Some primary recordings on the Ryzen are older than the 7-day retention: the oldest `camera*/` file was 9.5 days old on 2026-10-01. The existing recording retention seems to skip some files.
+
+## 2026-10-01 evening: Ryzen release `b46cb43` INSTALLED and validated; checkpoint COMPLETE
+
+- **Installed** by the owner with `sudo ./install.sh --repair` from `~/anyaicam-release-b46cb43` (23:10–23:15 UTC). Repair of an existing install: appliance identity preserved (sha256 `1b418261…`), product mode left unset (legacy), MediaMTX unchanged, WebRTC firewall reinstalled.
+- **Root validation** (`~/validate-b46cb43-root.log`, 23:58 UTC): **PASSED, 0 failures** (26 checks). An earlier non-root run showed 11 failures; every one was a root-only read (`/etc/anyaicam` is 0750, quarantine dir, firewall/port owner), not a defect.
+- **Independently verified:**
+  - `/health`, `/version` and the container env report `b46cb43e2414…`.
+  - All 569 running source files hash-match the payload, and the running `app/main.py` equals the git blob.
+  - The VMS archive sha256 `715dc89f…` reproduces from git.
+  - Rollback image `anyaicam-vms:rollback-2e1086246293` contains 2e10862's exact `main.py`, and the pre-upgrade DB backup exists.
+  - SQLite integrity ok. No table lost rows; 5 additive tables (`access_door_*`, `sms_test_sends`). Customer, appliance and 9 camera rows unchanged.
+  - 0 restarts, 0 tracebacks.
+  - 4/5 cameras recording; Bedroom has been offline since 2026-09-29 (no ARP reply), so this is not a regression.
+- **Behaviour verified:**
+  - 98+ analytics events after the install.
+  - **Line-crossing events receive a playable clip** (H.264 720p and AAC; cloud `accepted`; plays in the browser from S3).
+  - The Talk greeting played (ISAPI 200s) and the Talk relay is connected. MediaMTX and the WebRTC publisher are up.
+  - The agent re-entitled (8 slots). The sync flags are still on.
+  - Face Access unlock is fail-closed and simulated, because `relay_control.get_provider()` is always simulated in this build. Front Door is door-enabled on channel 1, and no relay hardware is attached.
+- **Browser (staging `b46cb43`, signed in, 1366px and 390px):**
+  - All 24 customer pages load with no console or API errors, no raw ISO timestamps, and no page-level horizontal scroll.
+  - Live video plays and event clips play.
+  - Friends & Family is unchanged (approved state; 50/25/0 rule as on golden).
+- Samsung untouched.
+
+## Launch remediation list (confirmed 2026-10-01, all pre-existing, none caused by `b46cb43`)
+
+1. **Offline cameras must clearly show "Camera offline".** The Dashboard currently says "Configured", the camera page shows "Starting live view…" forever, and the Live tile is plain black (Bedroom).
+2. **Facial-recognition events need a correctly associated, playable cloud clip.** Each FR moment is 3–8 s after its parent `person` clip ended (for example FR 23:10:11 against a clip ending 23:10:08), so the cloud's `.../media/shared` rightly answers 403 ("moment is outside the claimed parent's clip"). The parent-clip association and timing need to be fixed on the edge.
+3. **Dashboard "Live view" button overlaps the status line.** `.action-button` is `display:inline` with vertical padding inside `.feature-card`.
+4. **The clip duration shown to the customer must be the real duration**, not a hardcoded "10s". For example, a clip labelled 10s is 7.5 s, and the Ryzen log says "created clip (10.0s)" for a 6.9 s file.
+5. **Redact RTSP credentials from customer and appliance logs.** FFmpeg error lines print `rtsp://user:password@…`, and the credentials are also on the ffmpeg command line in the process list.
+- Low priority: the Cloudflare beacon is blocked by CSP, and `/favicon.ico` returns 404.
+- **Launch blocker (next phase):** My subscription says "The installer download will appear here when it is released." The customer installer download and release wiring is not live. Covered by the installer + licensed download + activation E2E phase.
+- Roadmap (owner-requested 2026-10-01): Face Access **Backup Mobile Access**, being implemented software-only on `feature/face-access-backup-mobile-access`. Physical relay, strike and maglock validation is deferred until hardware is available.
