@@ -375,6 +375,7 @@ def evaluate_access_rules(
                 "activated": result.activated,
                 "dry_run": result.dry_run,
                 "suppressed_reason": result.suppressed_reason,
+                "simulated": bool(getattr(result, "simulated", False)),
             }
         )
     return outcomes
@@ -541,7 +542,8 @@ def record_facial_events(
                     "UPDATE facial_events SET access_outcomes_json=? WHERE id=?",
                     (json.dumps(outcomes), event["id"]),
                 )
-            activated = any(outcome["activated"] for outcome in outcomes)
+            activated = any(outcome["activated"] and not outcome.get("simulated") for outcome in outcomes)
+            simulated = any(outcome.get("simulated") for outcome in outcomes)
             if activated:
                 # Mode 1: recognized + authorized for automatic entry.
                 # The relay already fired inside evaluate_access_rules()
@@ -565,7 +567,9 @@ def record_facial_events(
                 # fanout, see that module's own facial_recognition
                 # comment) turns into "<name> is at <door>."
                 suppressed = outcomes[0].get("suppressed_reason") if outcomes else None
-                relay_result = "suppressed" if suppressed else ("dry_run" if outcomes else "skipped")
+                # 'simulated': authorized, but no relay hardware exists, so
+                # nothing opened -- recorded as such, never as an unlock.
+                relay_result = "simulated" if simulated else ("suppressed" if suppressed else ("dry_run" if outcomes else "skipped"))
                 door_access.record_door_access_event(
                     db, customer_id=context["customer_id"], camera_id=context["id"], door_name=context["name"],
                     relay_channel=context.get("door_relay_channel"), trigger_type="automatic",

@@ -411,7 +411,8 @@ def _door_unlock_on_appliance(message: dict) -> dict:
         result = door_access.trigger_door(dict(camera), reason=f"remote_unlock:{camera_id}", actor=str(message.get("actor") or "portal"),
                                           trigger_type="manual", pulse_ms=pulse)
         return {"status": "ok", "channel": result.channel, "activated": bool(result.activated),
-                "dry_run": bool(result.dry_run), "suppressed_reason": result.suppressed_reason}
+                "dry_run": bool(result.dry_run), "suppressed_reason": result.suppressed_reason,
+                "simulated": bool(getattr(result, "simulated", False))}
     except Exception as error:
         logger.warning("talk_audio_relay_client.door_unlock_failed camera_id=%s error=%s", camera_id, type(error).__name__)
         return {"status": "error", "reason": "door_unreachable"}

@@ -181,7 +181,18 @@ def dispatch_manual_unlock(camera: dict, *, actor: str, pulse_ms: int | None) ->
     if answer.get("status") != "ok":
         raise DoorNotReachable({"not_a_door_here": "the appliance does not have this door set up yet"}.get(answer.get("reason"), "the door could not be reached"))
     return relay_control.RelayResult(channel=int(answer.get("channel") or 0), activated=bool(answer.get("activated")),
-                                     dry_run=bool(answer.get("dry_run")), suppressed_reason=answer.get("suppressed_reason"))
+                                     dry_run=bool(answer.get("dry_run")), suppressed_reason=answer.get("suppressed_reason"),
+                                     simulated=bool(answer.get("simulated")))
+
+
+SIMULATED_MESSAGE = "No door relay is connected to {name} yet, so nothing was unlocked."
+
+
+def audit_relay_result(result: relay_control.RelayResult) -> str:
+    """The door_access_events.relay_result for a finished trigger."""
+    if result.simulated:
+        return 'simulated'
+    return 'activated' if result.activated else ('suppressed' if result.suppressed_reason else 'failed')
 
 
 def door_camera(db, *, customer_id: str, camera_id: str) -> dict | None:
@@ -311,15 +322,18 @@ def register_door_access_routes(app: FastAPI) -> None:
                     error=str(error), now=now,
                 )
             raise HTTPException(status_code=502, detail='The door relay could not be reached.') from error
-        relay_result = 'activated' if result.activated else ('suppressed' if result.suppressed_reason else 'failed')
+        relay_result = audit_relay_result(result)
         with connection() as audit_db:
             record_door_access_event(
                 audit_db, customer_id=identity['customer_id'], camera_id=camera['id'], door_name=camera['name'],
                 relay_channel=camera['door_relay_channel'], trigger_type='manual',
                 actor_user_id=user_id, actor_email=identity['email'],
-                authorization_result='authorized', relay_result=relay_result, success=result.activated,
+                authorization_result='authorized', relay_result=relay_result,
+                success=result.activated and not result.simulated,
                 error=result.suppressed_reason, now=now,
             )
+        if result.simulated:
+            raise HTTPException(status_code=409, detail=SIMULATED_MESSAGE.format(name=camera['name']))
         if not result.activated:
             detail = 'This door was just unlocked -- please wait a moment before trying again.' if result.suppressed_reason == 'cooldown' else 'The door could not be unlocked.'
             raise HTTPException(status_code=409, detail=detail)

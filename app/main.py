@@ -155809,15 +155809,19 @@ class _ClassicAacoBoundary:
                 )
             raise PermissionError("The door could not be unlocked.") from error
 
-        relay_result = "activated" if result.activated else ("suppressed" if result.suppressed_reason else "failed")
+        relay_result = door_access.audit_relay_result(result)
         with connection() as audit_db:
             door_access.record_door_access_event(
                 audit_db, customer_id=identity["customer_id"], camera_id=camera["id"], door_name=camera["name"],
                 relay_channel=camera["door_relay_channel"], trigger_type="aaco",
                 actor_user_id=user_id, actor_email=identity["email"],
-                authorization_result="authorized", relay_result=relay_result, success=result.activated,
+                authorization_result="authorized", relay_result=relay_result,
+                success=result.activated and not result.simulated,
                 error=result.suppressed_reason, now=now,
             )
+        if result.simulated:
+            # No relay hardware behind this door yet: say so, never "unlocked".
+            return Clarification(door_access.SIMULATED_MESSAGE.format(name=camera["name"]))
         if not result.activated:
             raise PermissionError("The door could not be unlocked.")
 
