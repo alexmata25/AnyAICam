@@ -236,3 +236,33 @@ def test_a_moving_car_keeps_its_activity_open(monkeypatch):
     assert activity is not None and activity.last_seen == T + timedelta(seconds=24)
     assert len(saved) == 1                                    # the cooldown still paces saved detections
     main.ai_activities.reset()
+
+
+def test_a_finaliser_closed_without_finishing_runs_nothing(monkeypatch):
+    """Found in the suite: a finaliser abandoned when its loop shut down was
+    closed by the garbage collector inside ThreadPoolExecutor.submit() on a
+    thread that held the executor's lock; its finally-block's
+    asyncio.to_thread() re-entered submit() and deadlocked. Closed without
+    finishing, it must run nothing -- no thread, no await, no tracker lock."""
+    main.ai_activities.reset()
+    activity = main.ai_activities.open(43, "own", start=T, moment=T)
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (3600.0, 3600.0))   # still waiting
+
+    def forbidden(*a, **k):
+        raise AssertionError("closing an unfinished finaliser must not start threads")
+
+    monkeypatch.setattr(main.asyncio, "to_thread", forbidden)
+    monkeypatch.setattr(main.event_media_sharing, "owner_finished", forbidden)
+
+    class _Parked:
+        def __await__(self):
+            yield                                                # parked, like a real wait
+
+    async def never(seconds):
+        await _Parked()
+
+    coroutine = main._finalize_ai_activity(43, activity, None, sleep=never)
+    coroutine.send(None)                                         # runs up to its first wait
+    coroutine.close()                                            # what the garbage collector does
+    assert main.ai_activities.is_open(43)                        # untouched (no lock taken)
+    main.ai_activities.reset()

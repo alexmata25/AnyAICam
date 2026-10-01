@@ -102,11 +102,22 @@ def facial_recognition_fires_one_match(monkeypatch):
 def test_facial_recognition_event_id_is_included_in_the_backfill(
     monkeypatch, tmp_path, facial_recognition_fires_one_match, background_loop
 ):
+    """The Face event recorded during an AI activity gets the activity's
+    Event-mode recording as its linked recording, like the person event,
+    once that recording is cut (the activity ends -- ai_activity.py)."""
     monkeypatch.setattr(main, "_ai_event_media_loop", background_loop)
     monkeypatch.setattr(main, "_local_recording_settings", lambda camera_number: {"mode": "event"})
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))  # one scan: ends at once
+    main.ai_activities.reset()
     monkeypatch.setattr(main, "AI_THUMBNAILS_FOLDER", tmp_path)
-    monkeypatch.setattr(main, "linked_recording_for", lambda *a, **k: None)
-    monkeypatch.setattr(main, "persist_event_recording", lambda *a, **k: asyncio.sleep(0))
+    persisted = []
+
+    async def fake_persist(*a, **k):
+        persisted.append(a)
+
+    monkeypatch.setattr(main, "persist_event_recording", fake_persist)
+    monkeypatch.setattr(main, "linked_recording_for",
+                        lambda *a, **k: "/recordings/camera190/x.mkv#t=1,9" if persisted else None)
 
     async def fake_build_motion_event_clip(event_id, camera_number, start, end):
         return f"/recordings/clips/motion/motion_{event_id}.mp4"
@@ -115,23 +126,16 @@ def test_facial_recognition_event_id_is_included_in_the_backfill(
 
     recorded = []
     monkeypatch.setattr(main, "append_analytics_event", lambda event: recorded.append(event))
-
-    backfill_calls = []
-
-    async def fake_backfill(camera_number, event_ids, event_time):
-        backfill_calls.append((camera_number, event_ids, event_time))
-
-    monkeypatch.setattr(main, "_backfill_ai_event_linked_recording", fake_backfill)
+    patched = []
+    monkeypatch.setattr(main, "_patch_analytics_events_linked_recording", lambda ids, linked: patched.append((ids, linked)))
 
     main.save_yolo_events(190, _fake_result("person"))
 
-    assert any(event["id"] == "aac-evt-1" for event in recorded), \
-        "the facial_recognition event must still be appended via append_analytics_event()"
-    assert _wait_until(lambda: len(backfill_calls) == 1), \
-        "a backfill must be scheduled at all for a camera with a facial_recognition match"
-    camera_number, event_ids, _event_time = backfill_calls[0]
-    assert camera_number == 190
+    assert any(event["id"] == "aac-evt-1" for event in recorded),         "the facial_recognition event must still be appended via append_analytics_event()"
+    assert _wait_until(lambda: len(patched) == 1, timeout=10),         "the activity's events must get their linked recording once it is cut"
+    event_ids, linked = patched[0]
     assert "aac-evt-1" in event_ids, (
         "the facial_recognition event's id must be included in the backfill batch -- "
         f"got {event_ids!r}"
     )
+    main.ai_activities.reset()

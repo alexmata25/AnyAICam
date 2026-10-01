@@ -37840,25 +37840,6 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             event_media_sharing.owners.register(camera_number, event_group_id, window.start, window.end)
             event_clip_path = f"/recordings/clips/motion/motion_{event_group_id}.mp4"
             activity = ai_activities.open(camera_number, event_group_id, start=event_start, moment=event_moment)
-            if _ai_event_media_loop is not None:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        _finalize_ai_activity(camera_number, activity, thumbnail_url), _ai_event_media_loop,
-                    )
-                except RuntimeError as error:
-                    print(
-                        f"AI event {event_group_id}: could not schedule "
-                        f"clip build/upload: {type(error).__name__}: {error}"
-                    )
-                    ai_activities.close(activity)
-                    event_media_sharing.owners.finish(event_group_id, False)
-            else:
-                print(
-                    f"AI event {event_group_id}: could not schedule clip "
-                    f"build/upload: no main event loop captured yet."
-                )
-                ai_activities.close(activity)
-                event_media_sharing.owners.finish(event_group_id, False)
     for class_name, class_detections in grouped.items():
 
 
@@ -38158,6 +38139,29 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     # linked recordings are filled in then (_finalize_ai_activity()).
     if activity is not None and backfill_event_ids:
         ai_activities.add(activity, event_ids=backfill_event_ids)
+    # The finaliser starts only now, with this opening scan's cards and ids
+    # already on the activity (started at open(), it could close the
+    # activity before they were recorded).
+    if activity is not None and not continuing:
+        if _ai_event_media_loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _finalize_ai_activity(camera_number, activity, thumbnail_url), _ai_event_media_loop,
+                )
+            except RuntimeError as error:
+                print(
+                    f"AI event {event_group_id}: could not schedule "
+                    f"clip build/upload: {type(error).__name__}: {error}"
+                )
+                ai_activities.close(activity)
+                event_media_sharing.owners.finish(event_group_id, False)
+        else:
+            print(
+                f"AI event {event_group_id}: could not schedule clip "
+                f"build/upload: no main event loop captured yet."
+            )
+            ai_activities.close(activity)
+            event_media_sharing.owners.finish(event_group_id, False)
     elif _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and backfill_event_ids:
         try:
             asyncio.run_coroutine_threadsafe(
@@ -38202,6 +38206,12 @@ async def _finalize_ai_activity(camera_number: int, activity, thumbnail_url: str
         event_mode = _local_recording_settings(camera_number).get("mode") == "event"
         if event_mode:
             await persist_event_recording(camera_number, start, end, detector="ai_detection", trigger_id=owner_id)
+            # Local first: the events get their linked recording as soon as it
+            # exists, never held behind the clip encode or a slow upload.
+            if activity.event_ids:
+                linked = await asyncio.to_thread(linked_recording_for, camera_number, activity.first_moment, activity.first_moment)
+                if linked:
+                    await asyncio.to_thread(_patch_analytics_events_linked_recording, list(activity.event_ids), linked)
         try:
             clip_url = await build_motion_event_clip(owner_id, camera_number, start, end)
         except Exception as error:
@@ -38217,16 +38227,21 @@ async def _finalize_ai_activity(camera_number: int, activity, thumbnail_url: str
                 ))
             except Exception as error:
                 print(f"AI event {owner_id}: media upload failed: {type(error).__name__}: {error}")
-        if event_mode and activity.event_ids:
-            linked = await asyncio.to_thread(linked_recording_for, camera_number, activity.first_moment, activity.first_moment)
-            if linked:
-                await asyncio.to_thread(_patch_analytics_events_linked_recording, list(activity.event_ids), linked)
-    finally:
+    except GeneratorExit:
+        # Closed without ever finishing -- e.g. garbage-collected after its
+        # loop was shut down. Run NOTHING here: no lock, no thread, no
+        # await. (Calling asyncio.to_thread() from a coroutine being closed
+        # can re-enter ThreadPoolExecutor.submit() on a thread that already
+        # holds its lock -- a deadlock, found in the test suite.)
+        raise
+    except BaseException:
+        # Cancelled or failed while running: release the results queued on
+        # this activity's clip without a worker thread, then propagate.
         ai_activities.close(activity)
-        try:
-            await asyncio.to_thread(event_media_sharing.owner_finished, owner_id, camera_number, registered)
-        except RuntimeError:  # the loop is shutting down: still release the queued results
-            event_media_sharing.owner_finished(owner_id, camera_number, registered)
+        event_media_sharing.owner_finished(owner_id, camera_number, False)
+        raise
+    ai_activities.close(activity)
+    await asyncio.to_thread(event_media_sharing.owner_finished, owner_id, camera_number, registered)
 
 
 

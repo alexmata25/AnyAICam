@@ -66,6 +66,34 @@ def _reset_partner_application_limiter():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _ai_activities_end_within_their_test(request, monkeypatch):
+    """main.ai_activities (ai_activity.py) is process-wide, and each open
+    activity has a finaliser on a background loop that waits for it to go
+    quiet. In one shared pytest process a finaliser outliving its test ran
+    alongside later tests that monkeypatch asyncio/subprocess globally and
+    deadlocked the suite. Every test therefore ends its activities at once
+    (continuation gap 0) and starts/ends with an empty tracker; tests of
+    continuous activity set their own limits (main._ai_activity_limits).
+    Never imports main on its own."""
+    import sys
+
+    try:
+        import ai_activity
+    except ImportError:
+        yield
+        return
+    if request.node.name != "test_continuation_gap_is_the_merge_gap_but_never_less_than_two_scans":
+        monkeypatch.setattr(ai_activity, "continuation_gap", lambda merge_gap_seconds, scan_interval_seconds: 0.0)
+    module = sys.modules.get("main")
+    if module is not None and hasattr(module, "ai_activities"):
+        module.ai_activities.reset()
+    yield
+    module = sys.modules.get("main")
+    if module is not None and hasattr(module, "ai_activities"):
+        module.ai_activities.reset()
+
+
 @pytest.fixture()
 def fake_stripe_prices(monkeypatch):
     """Answers main.stripe_api_get('/v1/prices/<id>') with the catalog amount
