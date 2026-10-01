@@ -16577,6 +16577,51 @@ def delete_expired_recordings() -> None:
         except OSError:
             continue
 
+    delete_expired_event_media(cutoff)
+
+
+def delete_expired_event_media(cutoff: datetime) -> None:
+    """Event clips (clips/motion/) and AI snapshots (media/ai/<day>/) follow
+    the same RETENTION_DAYS as the recordings and motion thumbnails above
+    (2026-10-01). They were never pruned: on the Ryzen, 18 days of them
+    held 190 GB -- far more than the recordings -- and once the disk
+    reached its reserve the storage manager would have deleted recordings,
+    the primary footage, to make room for them. Exported clips at the top
+    of clips/ are the customer's own and are never touched here. Pending
+    uploads of a clip deleted here leave the outbox: nothing is left to
+    send."""
+    import event_media_outbox
+
+    # Resolved from RECORDINGS_FOLDER at call time (CLIPS_FOLDER / AI_
+    # THUMBNAILS_FOLDER are derived from it at import), so a redirected
+    # recordings root can never reach the real folders.
+    clips_folder = RECORDINGS_FOLDER / "clips" / "motion"
+    ai_folder = RECORDINGS_FOLDER / "media" / "ai"
+    deleted: set[str] = set()
+    for folder, pattern in ((clips_folder, "*.mp4"), (ai_folder, "*/*")):
+        if not folder.is_dir():
+            continue
+        for path in folder.glob(pattern):
+            try:
+                if path.is_file() and datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+                    path.unlink(missing_ok=True)
+                    deleted.add(path.name)
+            except OSError:
+                continue
+    for day_folder in ai_folder.glob("*") if ai_folder.is_dir() else []:
+        try:
+            if day_folder.is_dir() and not any(day_folder.iterdir()):
+                day_folder.rmdir()
+        except OSError:
+            continue
+    if not deleted:
+        return
+    print(f"Retention cleanup deleted {len(deleted)} expired event clip(s)/snapshot(s).")
+    for job in event_media_outbox.load():
+        clip_name = str(job.get("clip_url") or "").rsplit("/", 1)[-1]
+        if job.get("kind") != "shared" and clip_name in deleted:
+            event_media_outbox.remove(str(job.get("event_id")))
+
 
 
 
