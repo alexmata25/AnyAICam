@@ -5335,3 +5335,17 @@ The Ryzen runs `bd73eb6` (installed 2026-10-01 ~04:59 UTC). It was healthy all n
 - Camera RTSP credentials are visible in the appliance's process list (ffmpeg command line).
 - An AI activity open during a VMS restart gets no clip (cards are released without media).
 - The fix for the shared-clip 403 only takes effect once the cloud (staging) is deployed. Until then the Ryzen keeps retrying those cards hourly, which is harmless.
+
+## 2026-10-01 morning: launch-readiness regression complete, merged into golden (`bb5bc88`), NOT deployed
+
+The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` after the Dell restart. It covered all 374 test files in batches 0–9, and the worktree was clean at both start and end.
+
+- **Dell:** 5,297 passed, 3 failed, 147 skipped. All three failures are pre-existing and unrelated:
+  - `test_talk_audio_relay.py::test_no_appliance_channel_uses_local_isapi_fallback` is a teardown race in the test: `local_relay.stop` runs via `asyncio.to_thread` after the websocket closes. It also fails on golden `46296f1` (5 of 25 solo runs, against 1 of 25 on `d2616de`).
+  - `test_facial_engine_onnx.py::test_ensure_model_caches_and_does_not_redownload` and `::test_ensure_model_repairs_a_corrupted_cached_file` fail only when the model download fails. Both errors reproduce exactly with the network blocked, and all 30 tests pass on both commits.
+- **Staging release image** (`deploy-portal:3ecf46c`; FFmpeg 7.1, Tesseract, firebase-admin): the Dell-skipped tool tests plus every overnight and event-clip suite ran 383 passed, 4 skipped (Node not installed in the image).
+  - 4 apparent failures came from mounting only `app/`, so the repo-root Dockerfiles were missing. They pass with the full tree.
+  - 1 real failure is already on golden: `test_lpr_real_world.py::test_glyph_reader_handles_tilted_and_slanted_plates[-15--0.2]` reads `A8430` for `AFW8430` at -15°. It fails identically on `46296f1` and `d2616de` (3 of 3 each), and the branch has no LPR changes. This is a known LPR accuracy limit for strongly tilted plates and is open.
+- The merge's `app/` tree is byte-identical to the tested `d2616de`.
+
+**Deployment status:** cloud staging still runs `3ecf46c` and the Ryzen still runs `bd73eb6`. Nothing has been deployed. The proposed plan is in the session report: cloud first, then a Ryzen release only after owner approval.
