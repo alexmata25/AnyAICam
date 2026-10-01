@@ -5369,3 +5369,25 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
   - LPR misreads plates tilted -15° (already present).
   - The talk relay test is flaky.
 - **Ryzen release pending owner approval:** `8fc2e3b` (edge part), `317253e`, `c41b6ad` and `72daf09` on top of `bd73eb6`, built from `2e10862`.
+
+## 2026-10-01: Ryzen release `2e10862` built, verified and staged (NOT installed); Ryzen still on `bd73eb6`
+
+**Package**
+- `anyaicam-appliance-installer-1.1.0-vms-2e1086246293.tar.gz`, sha256 `87472268487b2be1df9e4592609334857385900a24743fe5f5978c39a7060eb5`.
+- Built twice, from a clean detached checkout at exactly `2e1086246293f188c6a93233f987f37348e011f6`, not from the docs-only golden head. The two builds are byte-identical.
+- The payload matches `2e10862` blob for blob: VMS 575, agent 40, installer scripts 16, with 0 mismatches. `main.py` is `5ce6a4dd…` with 0 CR bytes. MediaMTX is `9fac297a…`, unchanged.
+- Compared with the `bd73eb6` package, only 5 app modules, 7 tests and the release metadata differ.
+
+**Staging**
+- Staged at `~/anyaicam-release-2e10862` on the Ryzen. The sha256 was re-checked there, and `release.env` names `2e10862`.
+- `RETENTION_DAYS` stays at the default of 7, as the owner decided.
+- The first retention pass will delete about 109,800 event clips and AI snapshots older than 7 days (about 150 GB). Primary recordings and exports are excluded.
+
+**Pre-deployment baseline (read-only)**
+- `bd73eb6`: 0 restarts, healthy. `/health` 200, `/ready` 200 with `self_test.ok`. VMS and agent active.
+- 4/5 cameras writing; Bedroom has been down since 9/29. Event mode on all cameras.
+- In 30 min: 97 analytics events, 42 AI clips, 186 event-media sync lines, 0 tracebacks. The outbox has 0 jobs, and the Talk channel is connected.
+- SQLite `quick_check` ok. Disk 151 GB free (66%).
+
+**Open, handle separately after this release is stable (not investigated or changed now)**
+- Some primary recordings on the Ryzen are older than the 7-day retention: the oldest `camera*/` file was 9.5 days old on 2026-10-01. The existing recording retention seems to skip some files.
