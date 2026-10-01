@@ -5250,3 +5250,54 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
 
 **Pending**
 - No plate had been read since the install (night). LPR vehicle fields, the plate-image sync and the table rows await tomorrow's daylight drive-by.
+
+## 2026-10-01: physical-test results, the 8:32:09 PM person-clip failure, continuous activity as one event; Ryzen `bd73eb6` staged (NOT installed)
+
+**Physical tests on the Ryzen (`b3546bd`), owner-run, evening of 2026-09-30**
+- PASS: two-way audio (Talk).
+- PASS: email notification received on the phone.
+- PASS: PC/browser push.
+- PASS: vehicle event pre-roll (around 8:52 PM; the known-good comparison).
+- FAIL: phone push. No phone has ever enrolled; the only push devices are two `web` (PC browser) registrations. The phone must install the PWA (iPhone: Safari → Share → Add to Home Screen, then enable notifications from the installed app) or allow notifications in Chrome (Android).
+- NOT IMPLEMENTED / NOT CONFIGURED: SMS. The backend is the preview (log-only) backend. Production needs:
+  - a Twilio account with `ANYAICAM_SMS_BACKEND=twilio` plus SID, token and from-number;
+  - A2P 10DLC or toll-free verification;
+  - STOP/HELP opt-out handling;
+  - real code verification;
+  - delivery-status callbacks;
+  - per-visit grouping.
+- FAIL, fixed in `bd73eb6`: the person clip at 8:32:09 PM.
+
+**Root causes of the 8:32:09 PM failure (four clips, footage starting late)**
+1. Event-mode recordings were mislabelled. FFmpeg 7.1 ignores an input-side `-ss` on the concat demuxer under `-c copy`, so the cut started at the first buffer segment's keyframe, but the file was named and stored with the requested start. Every downstream time-to-position mapping (clip builder, linked recording, Playback) was therefore 6–8 s off. Proven on staging with frame-numbered test media.
+2. A person who stayed in view produced a new event, card, notification and clip every scan after the cooldown, so one presence became four clips.
+
+**Fix (golden `bd73eb6`, merge of `fix/event-recording-true-start-20261001`)**
+- `fcab0df`: the cut uses a per-file concat `inpoint` at the last keyframe at or before the request (keyframes from ffprobe). The recording is named and stored by its true start (rounded up to the whole second). A `duration_mismatch` warning fires if the length is off by more than 1.5 s. The pre-roll timing from `b3546bd` is unchanged.
+- `1b0ff97`, `e9c766c`, `db0c9aa`, `19ba3ae`: continuous AI activity is one event (`app/ai_activity.py`), per the owner's decision.
+  - The activity continues while non-stationary sightings keep arriving within max(merge gap, 2 × scan interval). Stationary repeats (for example a parked car) do not extend it. It is capped at 300 s.
+  - It produces one card, one notification, one clip, one Event-mode recording and one upload. A new object class seen during the activity gets its own card linked to the same media.
+  - PPE runs once per presence.
+  - The clip is built when the activity closes, so it arrives up to about 2 scans after the activity ends.
+  - The finalizer is deadlock-safe if the task is garbage-collected.
+
+**Tests**
+- New tests:
+  - `tests/test_event_recording_true_start.py`: real FFmpeg media.
+  - `tests/test_continuous_activity.py`: continuous people, moving versus parked vehicles (through the real detector loop), mixed and new classes, stop/restart, the 300 s cap, cooldown, and a finalizer deadlock regression that fails on the old code.
+- Full regression: 5,239 passed, 0 failed, 147 skipped.
+- FFmpeg-dependent tests in the staging container: 141 passed.
+
+**Release `bd73eb6`, staged on the Ryzen, not installed**
+- Package `anyaicam-appliance-installer-1.1.0-vms-bd73eb610ed5.tar.gz`, sha256 `d71a9d9e54e2851c096b614b94e7e4a75db905f7c320c131f33e73e21ec6f3fc`.
+- Two builds were byte-identical. The payload matches golden `bd73eb6` blob for blob: VMS 571, agent 40 and installer scripts 16 files, 0 mismatches.
+- `main.py` sha256 `d641a509…`, 0 CR bytes. MediaMTX `9fac297a…` (unchanged).
+- Staged at `~/anyaicam-release-bd73eb6`. The sha256 was re-checked on the Ryzen, and `release.env` names `bd73eb6`.
+- Install (owner): `cd ~/anyaicam-release-bd73eb6 && sudo ./install.sh --repair && sudo ./validate.sh`.
+- Rollback: the installer tags the current `b3546bd` image as `anyaicam-vms:rollback-b3546bd1fc1b` and backs up the DB. `sudo ./rollback.sh` reverts. The earlier rollback `anyaicam-vms:rollback-7290f7c017e5` is kept.
+- `main` is unchanged (`d08282f`). No changes were made to Samsung, networking, cameras, credentials, Talk, email or notification configuration.
+
+**Open**
+- Bedroom (camera 4) has been down since 9/29.
+- Dell OneDrive memory leak (restart it before long runs).
+- Phone push enrollment, SMS provider, and the daylight LPR drive-by.
