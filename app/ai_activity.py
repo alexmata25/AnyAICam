@@ -54,6 +54,10 @@ class Activity:
     classes: set = field(default_factory=set)
     event_ids: list = field(default_factory=list)
     closed: bool = False
+    # A finaliser will cut this activity's recording, so its buffer footage
+    # must be kept. Without one (no event loop yet) the activity still
+    # de-duplicates cards but never pins footage.
+    has_finalizer: bool = False
 
 
 class ActivityTracker:
@@ -63,6 +67,8 @@ class ActivityTracker:
 
     def reset(self) -> None:
         with self._lock:
+            for activity in self._open.values():
+                activity.closed = True  # a waiting finaliser exits at once
             self._open.clear()
 
     def continuing(self, camera: int, moment: datetime, *, gap_seconds: float, max_seconds: float) -> Optional[Activity]:
@@ -143,6 +149,6 @@ class ActivityTracker:
         it closes): from before its start, open-ended."""
         with self._lock:
             activity = self._open.get(camera)
-            if activity is None:
+            if activity is None or activity.closed or not activity.has_finalizer:
                 return []
             return [(activity.start - timedelta(seconds=lead_seconds), datetime.max)]

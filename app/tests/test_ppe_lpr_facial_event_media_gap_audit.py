@@ -48,7 +48,7 @@ import sys
 import threading
 import time
 import types
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
@@ -197,6 +197,8 @@ def test_ppe_event_is_suppressed_when_merged_into_the_immediately_prior_window(
     that already gives the primary AI-classified event's own Hybrid clip
     build "one per real continuous event" semantics -- a merged/duplicate
     scan now creates NO new PPE event at all, not just no media call."""
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))  # one continuous presence
+    main.ai_activities.reset()
     monkeypatch.setattr(main, "_ai_event_media_loop", None)
     _standard_mocks(monkeypatch, tmp_path)
 
@@ -217,12 +219,11 @@ def test_ppe_event_is_suppressed_when_merged_into_the_immediately_prior_window(
     monkeypatch.setattr(main.facial_recognition, "is_camera_enabled", lambda camera_number: False)
     monkeypatch.setattr(main.lpr, "is_camera_enabled", lambda camera_number: False)
 
-    # Pre-seed this camera's clip window so this scan's own detection is
-    # treated as a duplicate/merge of an already-covered window -- no new
-    # clip build/upload is scheduled for it at all.
-    from event_clips import compute_clip_window
+    # Pre-seed an open activity on this camera (ai_activity.py) so this
+    # scan continues it -- the same continuous presence: no new clip build
+    # or upload, and no second PPE event.
     now = datetime.now()
-    main.ai_event_clip_windows[171] = compute_clip_window(now, now)
+    main.ai_activities.open(171, "prior-scan", start=now - timedelta(seconds=5), moment=now)
 
     def worker():
         main.save_yolo_events(171, _fake_result("person"))
@@ -249,6 +250,8 @@ def test_two_real_consecutive_scans_of_the_same_person_produce_one_ppe_event(
     enough in wall-clock time to be should_merge()-classified as the same
     continuous presence -- must produce exactly one PPE analytics event,
     not two."""
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (30.0, 300.0))  # one continuous presence
+    main.ai_activities.reset()
     monkeypatch.setattr(main, "_ai_event_media_loop", None)
     _standard_mocks(monkeypatch, tmp_path)
 

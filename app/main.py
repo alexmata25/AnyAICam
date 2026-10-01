@@ -37829,6 +37829,9 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
             ai_activities.seen(camera_number, event_moment, gap_seconds=gap_seconds, max_seconds=max_seconds)
             media_owner_id = activity.owner_id
             event_media_sharing.owners.extend(media_owner_id, compute_clip_window(activity.start, event_moment).end)
+            # A continuing scan is a merged scan: one PPE result per
+            # continuous presence, as before activities existed.
+            is_duplicate = True
         else:
             primary_class_name = qualifying_detections[0]["class_name"]
             media_owner_id = event_group_id
@@ -38145,22 +38148,24 @@ def save_yolo_events(camera_number: int, result: dict) -> list[dict]:
     if activity is not None and not continuing:
         if _ai_event_media_loop is not None:
             try:
+                activity.has_finalizer = True
                 asyncio.run_coroutine_threadsafe(
                     _finalize_ai_activity(camera_number, activity, thumbnail_url), _ai_event_media_loop,
                 )
             except RuntimeError as error:
+                activity.has_finalizer = False
                 print(
                     f"AI event {event_group_id}: could not schedule "
                     f"clip build/upload: {type(error).__name__}: {error}"
                 )
-                ai_activities.close(activity)
                 event_media_sharing.owners.finish(event_group_id, False)
         else:
+            # No clip without a loop; the activity still de-duplicates
+            # cards (it ends by the continuation gap) but pins no footage.
             print(
                 f"AI event {event_group_id}: could not schedule clip "
                 f"build/upload: no main event loop captured yet."
             )
-            ai_activities.close(activity)
             event_media_sharing.owners.finish(event_group_id, False)
     elif _local_recording_settings(camera_number)["mode"] == "event" and _ai_event_media_loop is not None and backfill_event_ids:
         try:

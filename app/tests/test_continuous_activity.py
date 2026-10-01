@@ -65,9 +65,13 @@ def test_a_closed_activity_is_never_extended_and_cameras_are_independent():
 
 def test_an_open_activity_keeps_its_footage_from_before_its_start():
     tracker = ai_activity.ActivityTracker()
-    tracker.open(1, "a", start=T, moment=T)
+    activity = tracker.open(1, "a", start=T, moment=T)
+    assert tracker.in_flight_windows(1, lead_seconds=60) == []    # no finaliser (no loop): pins nothing
+    activity.has_finalizer = True
     assert tracker.in_flight_windows(1, lead_seconds=60) == [(T - timedelta(seconds=60), datetime.max)]
     assert tracker.in_flight_windows(2, lead_seconds=60) == []
+    tracker.reset()
+    assert activity.closed                                     # reset releases a waiting finaliser
 
 
 # ------------------------------------------------------------ save_yolo_events()
