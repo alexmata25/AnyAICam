@@ -5219,3 +5219,34 @@ The installer-style edge build (no `requirements-push.txt`, default args) passes
   - the plate-image route returns 404 for an unknown id and 401 signed out;
   - no page errors.
 - E2E sessions revoked.
+
+## 2026-10-01 ~00:48 UTC: Ryzen `b3546bd` installed and validated
+
+**Release and install**
+- Package `anyaicam-appliance-installer-1.1.0-vms-b3546bd1fc1b.tar.gz`, sha256 `9cafae546095f6e189b3cb33dbde315a5986ae2151f218d455adefdfc3d5d809`.
+- Two builds were byte-identical. The payload matches golden `b3546bd` exactly: VMS 568, agent 40 and installer scripts 16 files all equal to the git blobs; `main.py` has 0 CR bytes.
+- MediaMTX `9fac297a…` (unchanged).
+- Installed by the owner (`install.sh --repair`); `validate.sh` reported 0 failures.
+
+**Post-install (read-only) result: PASS**
+- `/version` = `b3546bd`; healthy, 0 restarts.
+- `main.py`, `detection_timing.py`, `lpr_vehicle.py` and `analytics_sync.py` match the commit. All feature flags are unchanged.
+- Appliance agent active, 0 restarts.
+- MediaMTX API 200 with WebRTC, RTSP and HLS on.
+- 4 of 5 cameras reachable and writing in Event mode. Bedroom (camera 4) is down, which predates this install (since 9/29).
+- 0 tracebacks; SQLite `quick_check` ok; disk 66%; network bindings identical to before the install.
+- Event media `analytics_synced status=accepted`; Talk channel connected 3 s after start.
+- LPR available: model present, enabled on cameras 1–5.
+- The Ryzen syncs to `portal-staging.anyaicam.com` (`3ecf46c`, which has the LPR table).
+
+**New timing confirmed live**
+- AI events are stamped at their frame time, 7–11 s before they are processed.
+- AI Event-mode recordings now span from the previous scan to the detection (`event_start` 7–8 s before `event_end`).
+
+**Rollback**
+- Image `anyaicam-vms:rollback-7290f7c017e5`.
+- DB backup `partner_portal-pre-b3546bd1fc1b-20261001T004645Z.db`.
+- `sudo ./rollback.sh` in `~/anyaicam-release-b3546bd`.
+
+**Pending**
+- No plate had been read since the install (night). LPR vehicle fields, the plate-image sync and the table rows await tomorrow's daylight drive-by.
