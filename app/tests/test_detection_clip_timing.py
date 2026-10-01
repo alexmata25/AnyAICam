@@ -131,6 +131,9 @@ def test_the_reported_bug_the_clip_now_includes_the_vehicle_entering():
 def wired(monkeypatch, tmp_path):
     import main
     main.ai_event_clip_windows.clear()
+    main.ai_activities.reset()
+    # One scan: its activity ends at once (continuous activity: test_continuous_activity.py).
+    monkeypatch.setattr(main, "_ai_activity_limits", lambda camera: (0.0, 300.0))
     builds, uploads = [], []
 
     async def fake_build(event_id, camera_number, start, end):
@@ -160,6 +163,7 @@ def wired(monkeypatch, tmp_path):
     thread.join(timeout=2)
     loop.close()
     main.ai_event_clip_windows.clear()
+    main.ai_activities.reset()
 
 
 def _car(frame_time, previous):
