@@ -221,8 +221,38 @@ def _open_or_resume_claim(client:PortalClient,config:AgentConfig,device_id:str) 
         print('Discarding a saved claim that was opened with a different portal; starting a new claim here.')
         clear_claim_state(config); state=None
     if state and state.get('device_id')==device_id and state.get('claim_session_id'):
-        print('Resuming a previously-opened claim session for this appliance.')
-        return state
+        if state.get('claim_proof'):
+            print('Resuming a claim the customer already confirmed.')
+            return state
+        # Still waiting for the customer: show a code again (2026-10-02).
+        # The first one may no longer be on any screen, and the cloud keeps
+        # only its hash -- resuming with this appliance's secret issues a
+        # fresh code for the same claim. An expired claim starts over.
+        try:
+            status=client.claim_status(state['claim_session_id'],state['device_secret']).get('status')
+        except PortalError as error:
+            print(f'WARNING: could not reach the portal to show the claim code again ({error}); continuing to wait.')
+            return state
+        if status=='expired':
+            print('The previous claim expired before it was confirmed; starting a new claim.')
+            clear_claim_state(config); state=None
+        elif status=='pending':
+            try: session=client.claim_begin(device_id,state['device_secret'])
+            except PortalError as error:
+                print(f'WARNING: could not get a new claim code ({error}); continuing to wait.')
+                return state
+            if session.get('claim_session_id')==state['claim_session_id']:
+                print('Resuming the claim already opened for this appliance.')
+                _show_claim_code(session)
+                return state
+            # The cloud opened a different claim (the old one ended in between).
+            state.update({'claim_session_id':session['claim_session_id'],'opened_at':datetime.now().isoformat()})
+            save_claim_state(config,state)
+            _show_claim_code(session)
+            return state
+        else:
+            print('Resuming a previously-opened claim session for this appliance.')
+            return state
     device_secret=secrets.token_urlsafe(32)
     try: session=client.claim_begin(device_id,device_secret)
     except PortalError as error:
@@ -235,11 +265,16 @@ def _open_or_resume_claim(client:PortalClient,config:AgentConfig,device_id:str) 
     save_claim_state(config,state)
     if session.get('resumed'):
         print('A claim session was already pending for this appliance on the cloud side; resuming it.')
-    elif session.get('claim_code'):
-        print(f"\n  Claim code:  {session['claim_code']}\n")
-        print(f"This code expires at {session['expires_at']}.")
-        print("On another device, sign in to the AnyAiCam customer portal, open 'Claim an appliance', enter this code, choose the site, and confirm.\n")
+    _show_claim_code(session)
     return state
+
+
+def _show_claim_code(session:dict) -> None:
+    if not session.get('claim_code'):
+        return
+    print(f"\n  Claim code:  {session['claim_code']}\n", flush=True)
+    print(f"This code expires at {session['expires_at']}.")
+    print("On another device, sign in to the AnyAiCam customer portal, open 'Claim an appliance', enter this code, choose the site, and confirm.\n", flush=True)
 
 
 def _wait_for_claim_proof(client:PortalClient,config:AgentConfig,state:dict,sleep_fn=time.sleep) -> str:

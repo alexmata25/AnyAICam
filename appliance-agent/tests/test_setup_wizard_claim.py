@@ -15,6 +15,8 @@ _finish_enrollment() itself is not re-tested here -- that machinery
 test_reenrollment.py already covers, unmodified by Phase 2A; this file
 patches it out to isolate the claim-flow orchestration being added.
 """
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -123,18 +125,45 @@ class OpenOrResumeClaimTests(unittest.TestCase):
         self.assertEqual(persisted['claim_session_id'], 'sess-1')
         self.assertEqual(persisted['device_id'], self.device_id)
 
-    def test_resumes_from_existing_state_without_calling_begin_again(self):
-        # Simulates "appliance restart while waiting": a prior process
-        # already ran _open_or_resume_claim and persisted state; this
-        # is a fresh process (fresh FakePortalClient with an EMPTY
-        # begin queue -- popping it would raise IndexError, proving
-        # claim_begin is never called on this path).
+    def _saved(self, **extra):
         from anyaicam_agent.config import save_claim_state
-        save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'sess-1', 'opened_at': '2026-01-01T00:00:00', 'device_secret': SECRET, 'portal_origin': setup_wizard.portal_origin(self.config.portal_url)})
-        client = FakePortalClient()
+        save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'sess-1', 'opened_at': '2026-01-01T00:00:00',
+                                       'device_secret': SECRET, 'portal_origin': setup_wizard.portal_origin(self.config.portal_url), **extra})
 
+    def test_a_restart_while_waiting_resumes_the_same_claim_and_shows_a_new_code(self):
+        # "Appliance restart while waiting": the code shown before is gone
+        # with the old screen; resuming (with this appliance's own secret)
+        # gets a fresh code for the SAME claim session.
+        self._saved()
+        client = FakePortalClient(status=[{'status': 'pending'}],
+                                  begin=[{'claim_session_id': 'sess-1', 'claim_code': 'NEWC0DE1', 'expires_at': '2099-01-01T00:00:00', 'resumed': True}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+        self.assertEqual(state['claim_session_id'], 'sess-1')
+        self.assertEqual(client.begin_calls, [self.device_id])
+        self.assertEqual(client.secrets_seen, [SECRET, SECRET])  # the same secret, never a new one
+        self.assertIn('Claim code:  NEWC0DE1', out.getvalue())
+
+    def test_a_confirmed_claim_resumes_without_asking_for_a_code(self):
+        self._saved(claim_proof='proof-1')
+        client = FakePortalClient()  # empty queues: any call would raise
         state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+        self.assertEqual(state['claim_proof'], 'proof-1')
+        self.assertEqual(client.begin_calls, [])
 
+    def test_an_expired_saved_claim_starts_a_new_one(self):
+        self._saved()
+        client = FakePortalClient(status=[{'status': 'expired'}],
+                                  begin=[{'claim_session_id': 'sess-2', 'claim_code': 'FRESH001', 'expires_at': '2099-01-01T00:00:00', 'resumed': False}])
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
+        self.assertEqual(state['claim_session_id'], 'sess-2')
+        self.assertNotEqual(state['device_secret'], SECRET)
+
+    def test_an_unreachable_portal_keeps_waiting_on_the_saved_claim(self):
+        self._saved()
+        client = FakePortalClient(status=[PortalError('offline')])
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
         self.assertEqual(state['claim_session_id'], 'sess-1')
         self.assertEqual(client.begin_calls, [])
 
@@ -457,8 +486,11 @@ class ClaimOriginBindingAndSecretTests(unittest.TestCase):
         save_claim_state(self.config, {'device_id': self.device_id, 'claim_session_id': 'sess-a', 'device_secret': SECRET,
                                        'portal_origin': 'https://portal-a.example.test'})
         self.config.portal_url = 'HTTPS://Portal-A.example.test/'
-        state = setup_wizard._open_or_resume_claim(FakePortalClient(), self.config, self.device_id)
+        client = FakePortalClient(status=[{'status': 'pending'}],
+                                  begin=[{'claim_session_id': 'sess-a', 'claim_code': 'ABCD1234', 'expires_at': '2099-01-01T00:00:00', 'resumed': True}])
+        state = setup_wizard._open_or_resume_claim(client, self.config, self.device_id)
         self.assertEqual(state['claim_session_id'], 'sess-a')
+        self.assertEqual(client.secrets_seen, [SECRET, SECRET])
 
     def test_interactive_portal_b_also_discards_portal_a_state(self):
         from anyaicam_agent.config import save_claim_state

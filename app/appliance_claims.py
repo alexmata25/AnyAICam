@@ -378,9 +378,19 @@ def register_appliance_claim_routes(app: FastAPI, shell: Callable | None = None)
             # UUID alone never returns the session.
             if not _possesses(resumable, device_secret):
                 raise HTTPException(status_code=409, detail='A claim is already in progress for this device.')
+            # Only a hash of the code is stored, so a resumed claim gets a
+            # fresh code (2026-10-02): once the screen that showed the first
+            # one was gone -- a closed terminal, a reboot -- the customer had
+            # nothing to enter and a new claim was refused until this one
+            # expired. The previous code stops working; same expiry.
+            claim_code = _generate_claim_code()
+            with connection() as db:
+                db.execute("UPDATE appliance_claims SET claim_code_hash=? WHERE id=? AND status='pending'",
+                           (password_hash(claim_code), resumable['id']))
+            logger.info('Claim session resumed with a new code claim_id=%s', resumable['id'])
             return {
                 'claim_session_id': resumable['claim_session_id'],
-                'claim_code': None,
+                'claim_code': claim_code,
                 'expires_at': resumable['expires_at'],
                 'poll_interval_seconds': 5,
                 'resumed': True,

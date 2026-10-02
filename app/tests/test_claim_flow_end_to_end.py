@@ -37,6 +37,9 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import contextlib
+import io
+import re
 
 ROOT = Path(__file__).resolve().parents[1]  # app/
 AGENT_ROOT = Path(__file__).resolve().parents[2] / 'appliance-agent'
@@ -250,6 +253,15 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         return _http_post('/api/portal/claims/confirm', {'claim_code': claim_code, 'site_id': site_id or self.site_id}, cookie=cookie or self.cookie)
 
 
+    def _resume_and_read_code(self, client, config):
+        """Runs the agent's open-or-resume and returns (state, the claim code
+        it printed). A resumed claim shows a NEW code (2026-10-02)."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            state = setup_wizard._open_or_resume_claim(client, config, self.device_id)
+        match = re.search(r"Claim code:\s+([0-9A-F]{8})", out.getvalue())
+        return state, (match.group(1) if match else None)
+
     def test_full_workflow_reaches_authenticate_appliance_success(self):
         session = self._begin()
         config = self._agent_config()
@@ -266,16 +278,20 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         # would if the SAME agent process had made both calls.)
         device_id = setup_wizard._installer_device_id(config)
         self.assertEqual(device_id, self.device_id)
-        state = setup_wizard._open_or_resume_claim(client, config, device_id)
+        state, shown_code = self._resume_and_read_code(client, config)
         self.assertEqual(state['claim_session_id'], session['claim_session_id'])
         persisted = load_claim_state(config)
         self.assertEqual(persisted['claim_session_id'], state['claim_session_id'])
+        # The resumed claim shows a fresh code; the earlier one no longer works.
+        self.assertTrue(shown_code and shown_code != session['claim_code'])
+        status, _ = _http_post('/api/portal/claims/lookup', {'claim_code': session['claim_code']}, cookie=self.cookie)
+        self.assertEqual(status, 404)
 
         # 2. customer authenticates, selects the authorized site, confirms
-        status, lookup_body = _http_post('/api/portal/claims/lookup', {'claim_code': session['claim_code']}, cookie=self.cookie)
+        status, lookup_body = _http_post('/api/portal/claims/lookup', {'claim_code': shown_code}, cookie=self.cookie)
         self.assertEqual(status, 200)
         self.assertEqual(lookup_body['device_id'], device_id)
-        status, confirm_body = self._confirm(session['claim_code'])
+        status, confirm_body = self._confirm(shown_code)
         self.assertEqual(status, 200, confirm_body)
         self.assertEqual(confirm_body, {'status': 'claimed', 'device_id': device_id})
 
@@ -366,9 +382,9 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         config_a = self._agent_config()
         self._same_device_state(config_a, session)
         client_a = PortalClient(config_a.portal_url)
-        state_a = setup_wizard._open_or_resume_claim(client_a, config_a, self.device_id)
+        state_a, shown_code = self._resume_and_read_code(client_a, config_a)
 
-        status, confirm_body = self._confirm(session['claim_code'])
+        status, confirm_body = self._confirm(shown_code)
         self.assertEqual(status, 200, confirm_body)
 
         # "Process B": a fresh config/client pointed at the SAME
@@ -385,6 +401,28 @@ class ClaimFlowEndToEndTests(unittest.TestCase):
         with connection() as db:
             count = db.execute("SELECT COUNT(*) AS n FROM appliances WHERE cloud_id=?", (self.device_id.upper(),)).fetchone()['n']
         self.assertEqual(count, 1)
+
+    def test_a_restarted_appliance_shows_a_working_code_again(self):
+        """The screen that showed the code is gone (closed terminal, reboot):
+        running the claim again shows a NEW code for the SAME claim, which
+        the customer can confirm; the first code no longer works."""
+        session = self._begin()
+        config = self._agent_config()
+        self._same_device_state(config, session)
+        state_1, code_1 = self._resume_and_read_code(PortalClient(config.portal_url), config)
+        state_2, code_2 = self._resume_and_read_code(PortalClient(self._agent_config().portal_url), self._agent_config())
+        self.assertEqual(state_1['claim_session_id'], state_2['claim_session_id'])
+        self.assertTrue(code_1 and code_2 and code_1 != code_2)
+        self.assertEqual(self._confirm(code_1)[0], 404)
+        self.assertEqual(self._confirm(code_2)[0], 200)
+
+    def test_only_the_appliance_holding_the_secret_gets_a_new_code(self):
+        session = self._begin()
+        status, body = _http_post('/api/appliance/claim/begin', {'device_id': self.device_id, 'device_secret': 'x' * 40})
+        self.assertEqual(status, 409, body)
+        self.assertNotIn('claim_code', body if isinstance(body, dict) else {})
+        # the original code still works: an attacker's attempt rotated nothing
+        self.assertEqual(self._confirm(session['claim_code'])[0], 200)
 
     def test_lost_completion_response_then_retry(self):
         session = self._begin()
