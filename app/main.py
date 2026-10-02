@@ -42052,6 +42052,11 @@ PUBLIC_PATH_PREFIXES = (
     "/api/customer/household/join",
     "/accept-invitation",
     "/api/invitations/accept",
+    # Direct self-service signup (direct_onboarding.py): a visitor has no
+    # account yet; the emailed single-use link proves the address.
+    "/customer-signup",
+    "/customer/verify-email",
+    "/api/customer/direct-signup",
 
     "/forgot-password",
 
@@ -48780,6 +48785,8 @@ from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
 from account_invitations import register_account_invitation_routes
 register_account_invitation_routes(app)
+from direct_onboarding import register_direct_onboarding_routes
+register_direct_onboarding_routes(app)
 from customer_registration import register_customer_registration_routes
 
 

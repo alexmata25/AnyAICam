@@ -1778,3 +1778,14 @@ def apply_migrations():
         if 'media_status' not in detection_event_columns_media: db.execute('ALTER TABLE detection_events ADD COLUMN media_status TEXT')
         if 'media_status_at' not in detection_event_columns_media: db.execute('ALTER TABLE detection_events ADD COLUMN media_status_at TEXT')
         if 'media_status_reason' not in detection_event_columns_media: db.execute('ALTER TABLE detection_events ADD COLUMN media_status_reason TEXT')
+
+        # Direct self-service onboarding (2026-10-02, direct_onboarding.py):
+        # unverified signups (hashed single-use email link, 24-hour expiry) and
+        # an explicit channel on customers -- 'direct' for house customers who
+        # signed up themselves; NULL for every existing and partner-assisted
+        # customer, which keep their behaviour. Additive.
+        db.execute('CREATE TABLE IF NOT EXISTS direct_signups(id TEXT PRIMARY KEY,email TEXT NOT NULL,name TEXT NOT NULL,'
+                   'password_hash TEXT NOT NULL,token_hash TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL,created_at TEXT NOT NULL,'
+                   'verified_at TEXT,customer_id TEXT,user_id TEXT)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_direct_signups_email ON direct_signups(email)')
+        if 'onboarding_channel' not in _columns('customers'): db.execute('ALTER TABLE customers ADD COLUMN onboarding_channel TEXT')
