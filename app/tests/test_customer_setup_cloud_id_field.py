@@ -92,6 +92,14 @@ def _fake_request(headers=None):
     return SimpleNamespace(headers=headers or {}, cookies={}, query_params=SimpleNamespace(get=lambda k, d=None: d))
 
 
+def _without_signed_in_identity(body: str) -> str:
+    """The page minus page_shell's signed-in identity display (sidebar chip
+    and the phone layout's account line), which shows the email by design."""
+    import re
+    body = re.sub(r'<div class="sidebar-identity".*?</div>', '', body, flags=re.S)
+    return re.sub(r'<form class="mobile-logout logout-form".*?</form>', '', body, flags=re.S)
+
+
 def _cloud_id_input_tag(body: str) -> str:
     start = body.index('id="customer-cloud-id"')
     tag_start = body.rindex('<input', 0, start)
@@ -108,7 +116,10 @@ def test_cloud_id_field_never_contains_the_customer_email_anywhere_on_the_page(h
     _seed_appliance(conn)
     response = http_client.get("/customer/setup", cookies={partner_portal.SESSION_COOKIE: _owner_cookie()})
     assert response.status_code == 200
-    assert CUSTOMER_EMAIL not in response.text
+    # 2026-10-02: the sidebar now shows who is signed in (their email, by
+    # design); nowhere else on the page -- above all not the setup form --
+    # may carry it.
+    assert CUSTOMER_EMAIL not in _without_signed_in_identity(response.text)
 
 
 def test_cloud_id_input_has_no_value_attribute_when_nothing_is_claimed_yet(http_client, db_path):
@@ -169,7 +180,7 @@ def test_no_appliance_at_all_means_no_cloud_id_is_fabricated(http_client, db_pat
     # customer's email standing in for one.
     tag = _cloud_id_input_tag(response.text)
     assert "value=" not in tag
-    assert CUSTOMER_EMAIL not in response.text
+    assert CUSTOMER_EMAIL not in _without_signed_in_identity(response.text)
 
 
 # --------------------------------------------- activation token independent of customer identity, tenant isolation

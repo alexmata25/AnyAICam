@@ -167,7 +167,7 @@ def test_returned_shape_matches_customer_detection_events_exactly(db_path):
         expected_keys = {
             "id", "camera", "camera_id", "camera_name", "site", "rule_name",
             "event_type", "direction", "timestamp", "confidence", "thumbnail",
-            "linked_recording", "has_event_clip", "media_state", "plate_number", "vehicle_color", "mock",
+            "linked_recording", "has_event_clip", "media_state", "media_status", "plate_number", "vehicle_color", "mock",
         }
         # 2026-09-25: plus four additive, customer-ready fields the Dashboard
         # uses (friendly label, epoch-ms time, real confidence, Playback link).

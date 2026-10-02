@@ -469,6 +469,19 @@ def test_customer_role_rechecked_at_enrollment(client):
 @pytest.mark.parametrize('kind',['person','lpr'])
 def test_push_tap_preserves_available_event_clip(client,fake_channels,kind):
     from urllib.parse import urlsplit,parse_qs
+    if kind=='lpr':
+        # Plate alerts are opt-in (2026-10-02, notification_engine.OPT_IN_EVENT_TYPES):
+        # this account member chose them, as a customer would in Notification settings.
+        import json as _json
+        with connection() as db:
+            for (user_id,) in db.execute("SELECT id FROM partner_users WHERE customer_id='cust-1'").fetchall():
+                saved=db.execute('SELECT event_types_json FROM customer_notification_channels WHERE user_id=?',(user_id,)).fetchone()
+                if saved:
+                    db.execute('UPDATE customer_notification_channels SET event_types_json=? WHERE user_id=?',(_json.dumps(sorted(set(_json.loads(saved[0] or '[]'))|{'lpr'})),user_id))
+                else:
+                    db.execute("INSERT INTO customer_notification_channels(user_id,customer_id,email_address,email_enabled,phone_number,sms_enabled,"
+                               "event_types_json,camera_scope,quiet_hours_enabled,quiet_start,quiet_end,delivery_mode,updated_at) "
+                               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(user_id,'cust-1','',0,'',0,_json.dumps(['lpr']),'all',0,'22:00','07:00','immediate','2026-09-29'))
     fanout(kind,eid='clip-event')
     with connection() as db:
         db.execute('INSERT INTO detection_events(id,customer_id,site_id,appliance_id,camera_id,local_event_id,event_type,event_timestamp,created_at) VALUES(?,?,?,?,?,?,?,?,?)',

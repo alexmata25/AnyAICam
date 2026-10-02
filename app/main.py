@@ -54973,8 +54973,8 @@ def _customer_detection_events(request: Request, *, limit: int | None = None) ->
                 if row["thumbnail_s3_key"] else None
             ),
             "linked_recording": None,
-            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": _row_media_status(row),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=_row_media_status(row)),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
@@ -55110,8 +55110,8 @@ def _customer_investigate_events(request: Request) -> list[dict] | None:
                 if row["thumbnail_s3_key"] else None
             ),
             "linked_recording": None,
-            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": _row_media_status(row),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=_row_media_status(row)),
             "plate_number": None,
             "vehicle_color": None,
             "mock": False,
@@ -55261,7 +55261,7 @@ def _customer_investigate_search(
                 f'/api/customer/events/{row["camera_id"]}/{row["id"]}/thumbnail'
                 if row["thumbnail_s3_key"] else None
             ),
-            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": _row_media_status(row),
             "plate_number": None,
             "vehicle_color": None,
         }
@@ -121614,6 +121614,15 @@ def _naive_utc_timestamp_to_epoch_ms(raw_timestamp) -> int | None:
         return None
 
 
+def _row_media_status(row):
+    """detection_events.media_status when the query selected it, else None
+    (older queries, older databases) -- never a KeyError (2026-10-02)."""
+    try:
+        return row["media_status"] if "media_status" in row.keys() else None
+    except (KeyError, IndexError, AttributeError, TypeError):
+        return None
+
+
 def _is_customer_event_pending(event: dict) -> bool:
     return customer_event_media_state(event.get('has_event_clip'),event.get('timestamp'),status=event.get('media_status')) == 'processing'
 
@@ -143999,8 +144008,8 @@ def _customer_camera_events(camera_id: str, date: str) -> list[dict]:
             "id": row["id"],
             "event_type": row["event_type"],
             "timestamp": row["event_timestamp"],
-            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": _row_media_status(row),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=_row_media_status(row)),
         }
         for row in rows
     ]
@@ -144096,8 +144105,8 @@ def _customer_recent_events_bounded(request: Request, limit: int, camera_id: str
                 if row["thumbnail_s3_key"] else None
             ),
             "linked_recording": None,
-            "has_event_clip": bool(row["has_event_clip"]), "media_status": row["media_status"],
-            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=row["media_status"]),
+            "has_event_clip": bool(row["has_event_clip"]), "media_status": _row_media_status(row),
+            "media_state": customer_event_media_state(bool(row["has_event_clip"]), row["event_timestamp"], status=_row_media_status(row)),
             # Additive, customer-ready fields (2026-09-25) for the Dashboard:
             # friendly type, epoch-ms time (the stored value is naive UTC,
             # which browsers parse as local time), a real confidence only,
