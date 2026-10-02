@@ -324,6 +324,11 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
                 # Every rule deleted or disabled, or the camera lost Smart
                 # Motion: nothing may carry over to a rule enabled later.
                 analytics_rules_engine.reset_camera(camera_number)
+                # Secure Edge too (2026-10-02, Codex): crossing state and the
+                # per-rule alarm cooldown must not survive into a restored rule.
+                import security_rules
+                security_rules.sync_rules(camera_number, [])
+                security_rules.note_arm_state(camera_number, None)
             else:
                 # Removed rules and rules whose configuration changed start clean.
                 analytics_rules_engine.sync_rules(camera_number, [r for r in rules if r["analytic_type"] != "security_line"])
