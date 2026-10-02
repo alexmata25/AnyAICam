@@ -127,6 +127,7 @@ def test_local_vs_hybrid_comparison_is_always_shown(http_client, db_path):
 
 def test_upgrade_panel_shown_for_a_local_customer_with_a_priced_hybrid_tier(http_client, db_path, monkeypatch):
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")  # upgrading is offered once the owner has chosen proration
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
@@ -156,8 +157,12 @@ def test_upgrade_panel_hidden_when_no_matching_hybrid_price_is_configured(http_c
     assert 'id="upgrade-to-hybrid"' not in response.text
 
 
-def test_upgrade_button_calls_the_existing_camera_slot_checkout_endpoint(http_client, db_path, monkeypatch):
+def test_upgrade_button_upgrades_the_existing_subscription(http_client, db_path, monkeypatch):
+    """Owner, 2026-10-02: Local -> Hybrid is an upgrade of the SAME
+    subscription (plan_changes.py), never a second Hybrid checkout that left
+    Local billing too."""
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
@@ -166,8 +171,8 @@ def test_upgrade_button_calls_the_existing_camera_slot_checkout_endpoint(http_cl
         from customer_entitlements import upsert_entitlement
         upsert_entitlement(customer_id="cust-1", product="camera_slots_local", camera_slot_quantity=8)
     response = http_client.get("/subscription-portal", cookies={partner_portal.SESSION_COOKIE: _owner_cookie("cust-1")})
-    assert "/api/customer/camera-slots/checkout" in response.text
-    assert "plan_type:'hybrid'" in response.text
+    assert "/api/customer/plan/upgrade-to-hybrid" in response.text
+    assert "plan_type:'hybrid'" not in response.text
 
 
 # ------------------------------------------------------------------ add-ons
@@ -293,6 +298,7 @@ def test_viewer_sees_the_new_page_with_real_data_but_no_purchase_actions(http_cl
 
 def test_owner_still_sees_purchase_actions_unaffected_by_the_viewer_fix(http_client, db_path, monkeypatch):
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()

@@ -357,4 +357,6 @@ def test_multiple_active_entitlements_sum_to_the_real_total(db_path, mock_backen
         _as_customer(monkeypatch, customer_id="cust-4", email="four@example.test")
 
         result = provision(_fake_request(), {})
-        assert result["camera_capacity"] == 16
+        # Local and Hybrid are alternative base plans (owner, 2026-10-02):
+        # the larger one counts, never their sum.
+        assert result["camera_capacity"] == 8

@@ -232,6 +232,13 @@ def product_mode_for_customer(customer_id: str) -> str:
     return ""
 
 
+# The two base plans (2026-10-02, owner: Local -> Hybrid is an upgrade, one
+# base plan at a time). They are alternatives, never additive: if both are
+# ever active at once (an older separate-subscription upgrade), camera
+# capacity is the larger of the two, not their sum.
+BASE_PLAN_PRODUCTS = ("camera_slots_local", "camera_slots_hybrid")
+
+
 def total_camera_slots(customer_id: str) -> int:
     """The one function anything (claim/refresh endpoints, the setup
     wizard, a future installer) must call to learn camera-slot capacity.
@@ -240,11 +247,10 @@ def total_camera_slots(customer_id: str) -> int:
     # The one-time VMS software license (product "vms_license", 2026-09-30)
     # is a licence of the software, not additional camera slots -- counting
     # it here would double a customer's capacity.
-    return sum(
-        (item["camera_slot_quantity"] or 0)
-        for item in get_entitlements_for_customer(customer_id)
-        if item["status"] == "active" and item["product"] != VMS_LICENSE_PRODUCT
-    )
+    active = [item for item in get_entitlements_for_customer(customer_id)
+              if item["status"] == "active" and item["product"] != VMS_LICENSE_PRODUCT]
+    base = max((int(item["camera_slot_quantity"] or 0) for item in active if item["product"] in BASE_PLAN_PRODUCTS), default=0)
+    return base + sum(int(item["camera_slot_quantity"] or 0) for item in active if item["product"] not in BASE_PLAN_PRODUCTS)
 
 
 def appliance_includes_vms_license(customer_id: str) -> bool:
@@ -614,6 +620,9 @@ def _sync_checkout_completed(event: dict) -> dict:
         stripe_subscription_id=subscription_id if current is not None else None,
         stripe_checkout_session_id=fields["stripe_checkout_session_id"], stripe_price_id=fields["price_id"],
     )
+    if current is not None:
+        record_billing_state(entitlement["id"], current)
+        supersede_other_base_plans(entitlement, current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"], "customer_id": customer["id"]}
 
 
@@ -692,4 +701,53 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
         stripe_price_id=price_id,
     )
+    if current is not None:
+        record_billing_state(entitlement["id"], current)
+        supersede_other_base_plans(entitlement, current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}
+
+
+def _period_end(subscription: dict) -> int | None:
+    """current_period_end lives on the subscription in older Stripe API
+    versions and on each item in newer ones."""
+    value = subscription.get("current_period_end")
+    if not value:
+        items = ((subscription.get("items") or {}).get("data") or [])
+        value = items[0].get("current_period_end") if items and isinstance(items[0], dict) else None
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def record_billing_state(entitlement_id: str, subscription: dict) -> None:
+    """Facts from Stripe's current subscription, shown on My subscription:
+    its status, when the period ends, and whether it is set to end then.
+    Display only -- which statuses keep access is unchanged."""
+    with connection() as db:
+        db.execute("UPDATE customer_entitlements SET stripe_status=?,current_period_end=?,cancel_at_period_end=? WHERE id=?",
+                   (str(subscription.get("status") or "") or None, _period_end(subscription),
+                    1 if subscription.get("cancel_at_period_end") else 0, entitlement_id))
+
+
+def supersede_other_base_plans(entitlement: dict, subscription: dict) -> list[str]:
+    """Local -> Hybrid is one subscription changing its price (owner,
+    2026-10-02): once Stripe says a subscription is on one base plan, the
+    other base plan held through that SAME subscription is no longer active
+    -- one base plan, never both, never double capacity. A separate
+    subscription is never touched here (that would hide double billing)."""
+    if entitlement.get("product") not in BASE_PLAN_PRODUCTS or entitlement.get("status") != "active":
+        return []
+    subscription_id = str(subscription.get("id") or "")
+    if not subscription_id:
+        return []
+    superseded = []
+    for other in rows("SELECT * FROM customer_entitlements WHERE customer_id=? AND product<>? AND status='active' "
+                      "AND stripe_subscription_id=?", (entitlement["customer_id"], entitlement["product"], subscription_id)):
+        if other["product"] not in BASE_PLAN_PRODUCTS:
+            continue
+        with connection() as db:
+            db.execute("UPDATE customer_entitlements SET status='superseded',camera_slot_quantity=0,updated_at=? WHERE id=? AND status='active'",
+                       (_now(), other["id"]))
+        superseded.append(other["id"])
+    return superseded

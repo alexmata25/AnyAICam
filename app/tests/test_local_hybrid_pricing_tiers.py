@@ -151,7 +151,9 @@ def test_buying_local_and_hybrid_creates_two_independent_entitlements(db_path, _
         entitlements = {e["product"]: e["camera_slot_quantity"] for e in ce.get_entitlements_for_customer("cust-1")}
         total = ce.total_camera_slots("cust-1")
     assert entitlements == {"camera_slots_local": 8, "camera_slots_hybrid": 8}
-    assert total == 16  # both count toward total camera-slot capacity
+    # Owner, 2026-10-02: Local and Hybrid are alternative base plans, never
+    # additive -- capacity is the larger one, not the sum.
+    assert total == 8
 
 
 def test_upgrading_local_never_touches_an_existing_hybrid_entitlement(db_path, _real_tier_map):

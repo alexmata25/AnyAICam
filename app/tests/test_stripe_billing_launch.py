@@ -72,6 +72,13 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
             posts.append((path, dict(fields)))
             if path == "/v1/billing_portal/sessions":
                 return {"id": "bps_1", "url": "https://billing.stripe.test/session"}
+            if path.startswith("/v1/subscriptions/"):  # Stripe applies an item price change in place
+                sub = stripe[path.rsplit("/", 1)[1]]
+                values = dict(fields)
+                item = next(i for i in sub["items"]["data"] if i.get("id") == values["items[0][id]"])
+                item["price"] = {"id": values["items[0][price]"]}
+                sub["metadata"].update({k[len("metadata["):-1]: v for k, v in values.items() if k.startswith("metadata[")})
+                return sub
             return {"id": f"cs_{len(posts)}", "url": f"https://checkout.stripe.test/{len(posts)}"}
         monkeypatch.setattr(main, "stripe_api_get", fake_get)
         monkeypatch.setattr(main, "stripe_api_post", fake_post)
@@ -87,9 +94,10 @@ def _deliver(env, event):
                               headers={"stripe-signature": f"t={stamp},v1={signature}", "content-type": "application/json"})
 
 
-def _subscription(sub_id, customer, status, price=LOCAL_8, metadata_customer="cust-A"):
+def _subscription(sub_id, customer, status, price=LOCAL_8, metadata_customer="cust-A", period_end=1_893_456_000, cancel_at_end=False):
     return {"id": sub_id, "object": "subscription", "customer": customer, "status": status,
-            "items": {"data": [{"price": {"id": price}, "quantity": 1}]},
+            "current_period_end": period_end, "cancel_at_period_end": cancel_at_end,
+            "items": {"data": [{"id": f"si_{sub_id}", "price": {"id": price}, "quantity": 1}]},
             "metadata": {"anyaicam_customer_id": metadata_customer, "anyaicam_stripe_price_id": price}}
 
 
@@ -321,3 +329,110 @@ def test_an_add_on_paid_by_account_as_stripe_customer_never_provisions_b(env, mo
     env["stripe"]["sub_ADB"] = _subscription("sub_ADB", "cus_A", "active", price="price_adv", metadata_customer="cust-B")
     _deliver(env, _checkout("evt_ad", customer_id="cust-B", stripe_customer="cus_A", sub_id="sub_ADB", price="price_adv"))
     assert _addon_status(env["path"], "cust-B") is None
+
+
+# ================================================================ one base plan; Local -> Hybrid is an upgrade
+
+def _local_customer(env):
+    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", "active")
+    assert _deliver(env, _checkout("evt_1")).status_code == 200
+
+
+def _capacity(env, customer_id="cust-A"):
+    import customer_entitlements as ce
+    with override_target(sqlite_path=str(env["path"])):
+        return ce.total_camera_slots(customer_id), ce.product_mode_for_customer(customer_id)
+
+
+def test_local_to_hybrid_upgrades_the_same_subscription_to_one_base_plan(env, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "create_prorations")
+    _local_customer(env)
+    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    assert response.status_code == 200, response.text
+    changes = [p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_A1"]
+    assert len(changes) == 1 and changes[0][1]["items[0][id]"] == "si_sub_A1" and changes[0][1]["items[0][price]"] == HYBRID_8
+    assert changes[0][1]["proration_behavior"] == "create_prorations"
+    assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]  # no second subscription
+    assert _plan(env["path"], product="camera_slots_hybrid")["status"] == "active"
+    assert _plan(env["path"], product="camera_slots_local")["status"] == "superseded"
+    assert _capacity(env) == (8, "hybrid")  # one base plan, never 16
+    # The webhook Stripe sends for the same change is harmless, and so is a second click.
+    _deliver(env, _sub_event("evt_up", "updated", env["stripe"]["sub_A1"], 9_000))
+    again = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    assert again.status_code == 200 and again.json()["status"] == "already_hybrid"
+    assert len([p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_A1"]) == 1
+    assert _capacity(env) == (8, "hybrid")
+
+
+def test_the_upgrade_waits_for_the_owners_proration_decision(env, monkeypatch):
+    monkeypatch.delenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", raising=False)
+    _local_customer(env)
+    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    assert response.status_code == 503 and not [p for p in env["posts"] if p[0].startswith("/v1/subscriptions/")]
+    page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
+    assert 'id="subscription-upgrade-button"' not in page  # never a button that would be refused
+
+
+def test_the_upgrade_button_appears_once_upgrading_is_available(env, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
+    _local_customer(env)
+    page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
+    assert 'id="subscription-upgrade-button"' in page and "/api/customer/plan/upgrade-to-hybrid" in page
+    assert "camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type:'hybrid'" not in page
+
+
+def test_hybrid_checkout_while_local_is_active_is_refused_and_points_to_the_upgrade(env):
+    _local_customer(env)
+    response = env["client"].post("/api/customer/camera-slots/checkout", json={"plan_type": "hybrid", "tier_label": "1-8"},
+                                  cookies=_cookie(*OWNER_A))
+    assert response.status_code == 409 and "Upgrade to Hybrid" in response.json()["detail"]
+    assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]
+
+
+@pytest.mark.parametrize("cookie", [("viewer@example.test", "customer_viewer", "cust-A"), ("b@example.test", "customer_owner", "cust-B")])
+def test_only_the_accounts_owner_can_upgrade_and_never_another_accounts_subscription(env, monkeypatch, cookie):
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
+    _local_customer(env)
+    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*cookie))
+    assert response.status_code in (403, 409)
+    assert not [p for p in env["posts"] if p[0].startswith("/v1/subscriptions/")]
+    assert _plan(env["path"])["status"] == "active"
+
+
+def test_an_upgrade_is_refused_if_stripe_no_longer_matches_the_account(env, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
+    _local_customer(env)
+    env["stripe"]["sub_A1"]["metadata"]["anyaicam_customer_id"] = "cust-B"  # tampered / reassigned in Stripe
+    response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    assert response.status_code == 409 and not [p for p in env["posts"] if p[0].startswith("/v1/subscriptions/")]
+
+
+def test_a_plan_switch_made_in_stripe_also_leaves_one_base_plan(env):
+    _local_customer(env)
+    env["stripe"]["sub_A1"]["items"]["data"][0]["price"] = {"id": HYBRID_8}  # e.g. changed in Stripe's portal
+    _deliver(env, _sub_event("evt_sw", "updated", env["stripe"]["sub_A1"], 5_000))
+    assert _plan(env["path"], product="camera_slots_local")["status"] == "superseded"
+    assert _capacity(env) == (8, "hybrid")
+
+
+def test_two_active_base_plans_never_double_camera_capacity(env):
+    import customer_entitlements as ce
+    with override_target(sqlite_path=str(env["path"])):  # e.g. an upgrade made before this fix: two subscriptions
+        ce.upsert_entitlement(customer_id="cust-A", product="camera_slots_local", camera_slot_quantity=8, stripe_subscription_id="sub_L")
+        ce.upsert_entitlement(customer_id="cust-A", product="camera_slots_hybrid", camera_slot_quantity=16, stripe_subscription_id="sub_H")
+    assert _capacity(env) == (16, "hybrid")
+
+
+# ================================================================ My subscription billing facts
+
+@pytest.mark.parametrize("status,cancel_at_end,expect", [
+    ("active", False, "Renews on"),
+    ("active", True, "will not renew"),
+    ("past_due", False, "could not collect the latest payment"),
+])
+def test_my_subscription_shows_what_stripe_says_about_the_plan(env, status, cancel_at_end, expect):
+    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", status, cancel_at_end=cancel_at_end)
+    _deliver(env, _checkout("evt_1"))
+    page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
+    assert 'id="plan-billing-note"' in page and expect in page
+    assert "sub_A1" not in page and "cus_A" not in page  # no Stripe ids or payment details on the page

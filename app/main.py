@@ -48785,6 +48785,8 @@ from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
 from customer_billing import register_customer_billing_routes
 register_customer_billing_routes(app)
+from plan_changes import register_plan_change_routes
+register_plan_change_routes(app)
 from account_invitations import register_account_invitation_routes
 register_account_invitation_routes(app)
 from direct_onboarding import register_direct_onboarding_routes
@@ -104371,6 +104373,20 @@ def _customer_subscription_portal_page(identity: dict) -> str:
                             f" &middot; ${_plan['monthly_cents'] / 100:.2f}/mo")
     else:
         plan_summary = "No camera-slot plan purchased yet"
+    # What Stripe says about this plan now (2026-10-02, record_billing_state):
+    # renewal date, a scheduled end, or a payment Stripe could not collect.
+    # Information only; which statuses keep access is unchanged.
+    billing_note = ""
+    if camera_entitlement and camera_entitlement.get("current_period_end"):
+        _end = datetime.fromtimestamp(int(camera_entitlement["current_period_end"]), tz=timezone.utc)
+        _when = f'<time datetime="{_end.isoformat()}" data-local-date>{_end.strftime("%b %d, %Y")}</time>'
+        if camera_entitlement.get("stripe_status") in ("past_due", "unpaid", "incomplete"):
+            billing_note = "Stripe could not collect the latest payment for this plan. Please update your payment method."
+        elif camera_entitlement.get("cancel_at_period_end"):
+            billing_note = f"This plan is set to end on {_when} and will not renew."
+        else:
+            billing_note = f"Renews on {_when}."
+        billing_note = f'<p class="health-detail" id="plan-billing-note">{billing_note}</p>'
 
     # Plan-badge text is deliberately derived from `mode` (product_mode_
     # for_customer(), Hybrid-wins-if-both-active) rather than
@@ -104396,7 +104412,8 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         for t in PLAN_TIERS if t[0] == "hybrid" and os.environ.get(t[6], "").strip()
     ]
     upgrade_tier = None
-    if mode == "local" and camera_entitlement and is_owner:
+    import plan_changes
+    if mode == "local" and camera_entitlement and is_owner and plan_changes.upgrade_available():
         upgrade_tier = next((t for t in hybrid_tier_options if t["camera_slot_maximum"] == camera_entitlement["camera_slot_quantity"]), None)
 
     active_analytics = set(get_active_analytics_for_customer(customer_id))
@@ -104551,6 +104568,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     content = f'''<header class="topbar"><div><p class="eyebrow">Customer self-service</p><h1>My subscription</h1></div></header>
     <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
     <p>{plan_summary}</p>
+    {billing_note}
     <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
@@ -104580,16 +104598,17 @@ def _customer_subscription_portal_page(identity: dict) -> str:
       if(!response.ok){choosePlanButton.disabled=false;choosePlanButton.textContent='Continue to payment';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
       location.href=r.checkout_url
     };
+    document.querySelectorAll('time[data-local-date]').forEach(t=>{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {dateStyle:'medium'})});
     const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
     if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
       const tier_label=subscriptionUpgradeButton.dataset.tierLabel;
-      subscriptionUpgradeButton.disabled=true;subscriptionUpgradeButton.textContent='Redirecting to Stripe…';
+      subscriptionUpgradeButton.disabled=true;subscriptionUpgradeButton.textContent='Upgrading…';
       const messageEl=document.getElementById('subscription-upgrade-message');messageEl.textContent='';
       let response,r;
-      try{response=await fetch('/api/customer/camera-slots/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({plan_type:'hybrid',tier_label})});r=await response.json()}
+      try{response=await fetch('/api/customer/plan/upgrade-to-hybrid',{method:'POST'});r=await response.json()}
       catch(error){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
-      if(!response.ok){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not start checkout (error ${response.status}).`;return}
-      location.href=r.checkout_url
+      if(!response.ok){subscriptionUpgradeButton.disabled=false;subscriptionUpgradeButton.textContent='Upgrade to Hybrid';messageEl.textContent=r.detail||`Could not upgrade (error ${response.status}).`;return}
+      messageEl.textContent=r.message||'Your plan is now Hybrid.';setTimeout(()=>location.reload(),1200)
     };
     const vmsLicenseButton=document.getElementById('vms-license-buy');
     if(vmsLicenseButton)vmsLicenseButton.onclick=async()=>{
@@ -113813,9 +113832,15 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
     # One subscription per plan (2026-10-02): a second checkout for a plan
     # this account already holds would start a second, parallel Stripe
     # subscription (double billing) and overwrite the first one's record.
-    from customer_entitlements import get_entitlements_for_customer as _held
-    if any(e["product"] == f"camera_slots_{plan_type}" and e["status"] == "active" for e in _held(customer_id)):
-        raise HTTPException(status_code=409, detail=f"Your account already has an active {plan_type.title()} plan.")
+    # One base plan per account (owner, 2026-10-02): Local -> Hybrid is an
+    # upgrade of the existing subscription (plan_changes.py), never a second
+    # base subscription; any other change of base plan is not self-service.
+    from customer_entitlements import BASE_PLAN_PRODUCTS as _BASE, get_entitlements_for_customer as _held
+    _active_base = [e["product"] for e in _held(customer_id) if e["product"] in _BASE and e["status"] == "active"]
+    if _active_base:
+        _current = "Hybrid" if "camera_slots_hybrid" in _active_base else "Local"
+        _how = " Use Upgrade to Hybrid on My subscription." if (_current == "Local" and plan_type == "hybrid") else ""
+        raise HTTPException(status_code=409, detail=f"Your account already has an active {_current} plan.{_how}")
     stripe_mode = "payment" if billing_type == "one_time" else "subscription"
     import pricing_catalog
     _catalog_plan = pricing_catalog.find_base_plan(plan_type, tier_label)

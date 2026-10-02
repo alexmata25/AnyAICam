@@ -1791,6 +1791,14 @@ def apply_migrations():
         if 'onboarding_channel' not in _columns('customers'): db.execute('ALTER TABLE customers ADD COLUMN onboarding_channel TEXT')
         # AACO door unlock confirmations (2026-10-02, aaco_door_confirm.py):
         # hashed one-use tokens, bound to customer + person + door. Additive.
+        # Billing state shown on My subscription (2026-10-02,
+        # customer_entitlements.record_billing_state): Stripe's current
+        # subscription status, period end (unix time) and scheduled end.
+        # Display only. Additive.
+        entitlement_columns=_columns('customer_entitlements')
+        if 'stripe_status' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN stripe_status TEXT')
+        if 'current_period_end' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN current_period_end INTEGER')
+        if 'cancel_at_period_end' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN cancel_at_period_end INTEGER')
         # Visitor Call lifecycle (2026-10-02, aac_voice_call_events.reconcile):
         # last heartbeat from an open call page, why a call closed, and the
         # call that replaced an expired/abandoned one. Additive.
