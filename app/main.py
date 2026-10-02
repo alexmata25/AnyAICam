@@ -104206,6 +104206,31 @@ def download_customer_invoice(invoice_id: str, request: Request) -> Response:
 
 
 
+def _installer_steps_html(mode: str | None) -> str:
+    """Install-and-activate steps under the installer download (2026-10-01).
+
+    The customer path is the claim flow: `anyaicam-setup --claim` prints a
+    code the owner enters on /customer/claim-appliance. Plain `anyaicam-setup`
+    is the administrator flow (Cloud ID + activation token) a customer never
+    receives, and its Portal URL default is the appliance's own local VMS, so
+    the command carries this portal's address. The installer's product mode
+    matches the plan the customer bought; with no plan on record the
+    installer asks."""
+    product_flag = f" --product-mode={mode}" if mode in ("local", "hybrid") else ""
+    portal = PUBLIC_BASE_URL if PUBLIC_BASE_URL.startswith(("https://", "http://")) and "localhost" not in PUBLIC_BASE_URL and "127.0.0.1" not in PUBLIC_BASE_URL else ""
+    portal_flag = f" --portal-url={portal}" if portal else ""
+    mode_note = "" if product_flag else " Choose <strong>local</strong> or <strong>hybrid</strong> when asked, matching your plan."
+    portal_note = "" if portal_flag else " When asked for the Portal URL, enter the address of this portal, and <strong>production</strong> for the mode."
+    return (
+        '<ol class="health-detail" id="vms-installer-steps" style="margin:10px 0 0;padding-left:20px;line-height:1.7">'
+        '<li>Extract the downloaded file and open a terminal in the extracted folder.</li>'
+        f'<li>Install: <code>sudo ./install.sh{escape(product_flag)}</code>, then check it with <code>sudo ./validate.sh</code>.{mode_note}</li>'
+        f'<li>Link it to this account: <code style="word-break:break-all">sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup --claim{escape(portal_flag)}</code>.{portal_note} It shows a claim code.</li>'
+        '<li>Enter that code on <a href="/customer/claim-appliance">Claim an appliance</a> and choose the site. The appliance finishes activating by itself.</li>'
+        '</ol>'
+    )
+
+
 def _customer_subscription_portal_page(identity: dict) -> str:
     """The real-customer branch of GET /subscription-portal -- see that
     route's own comment for why this exists as a separate function
@@ -104305,12 +104330,11 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         if _installer:
             _download_html = (
                 f'<div class="health-row" id="vms-installer-download"><span>AnyAiCam VMS installer {escape(str(_installer["version"]))}'
-                f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory) &middot; '
+                f'<br><span class="health-detail">For Ubuntu 24.04 (64-bit PC, 4+ CPU cores, 8 GB+ memory, 100 GB free disk) &middot; '
                 f'{customer_downloads.human_size(int(_installer["size_bytes"]))} &middot; build {escape(_installer["commit"][:7])}</span>'
                 f'<br><span class="health-detail">SHA-256 <code style="word-break:break-all">{escape(_installer["sha256"])}</code></span></span>'
                 f'<a class="ghost-button" href="/api/customer/downloads/vms-installer" download>Download installer</a></div>'
-                '<p class="health-detail">Install: extract the file, then run <code>sudo ./install.sh</code> and <code>sudo ./validate.sh</code> in the extracted folder. '
-                'Then link it to this account with <code>sudo -u anyaicam /opt/anyaicam-agent/venv/bin/anyaicam-setup</code>.</p>')
+                + _installer_steps_html(mode))
         else:
             _download_html = '<p class="health-detail" id="vms-installer-download">The installer download will appear here when it is released.</p>'
     _license_panel = (f'<section class="panel" style="margin-top:14px"><h3 style="margin-top:0">VMS software license</h3>'

@@ -5426,3 +5426,18 @@ The full regression ran fresh on `fix/launch-readiness-20261001` @ `d2616de` aft
 - Low priority: the Cloudflare beacon is blocked by CSP, and `/favicon.ico` returns 404.
 - **Launch blocker (next phase):** My subscription says "The installer download will appear here when it is released." The customer installer download and release wiring is not live. Covered by the installer + licensed download + activation E2E phase.
 - Roadmap (owner-requested 2026-10-01): Face Access **Backup Mobile Access**, being implemented software-only on `feature/face-access-backup-mobile-access`. Physical relay, strike and maglock validation is deferred until hardware is available.
+
+## Pre-launch checklist additions (owner, 2026-10-01)
+
+- **Face Access Backup Mobile Access** (software-only now): per-person backup PIN (hashed, set/change/reset, never shown), Unlock Door from People/Face Access, session + PIN, permission/schedule/date/revocation checks, rate limiting, short-lived replay-protected cloud→appliance command, honest "no door hardware configured" result, audit states, denial/success tones. Physical relay/strike/maglock validation is deferred. Branch `feature/face-access-backup-mobile-access`.
+- **Business Partner program**, after the installer phase:
+  - Referral Partner (existing 20% recurring commission and activation/hardware rules preserved).
+  - New Reseller Partner: wholesale floor, partner-set selling price, margin ledger with refund/cancel/dispute reversal, F&F never below the wholesale floor, partner-scoped pricing, global-admin control.
+  - Fix: 10% display default vs the 20% ledger; multi-line/add-on invoice commissions; the add-on-before-first-plan-invoice edge case.
+  - Uses the current pricing catalog. The Videoloft Partner Portal is unchanged.
+  - **Stop for owner approval of wholesale levels and limits before any customer-facing price.**
+
+## Installer + licensed download + activation E2E (in progress, branch `fix/launch-installer-e2e-20261001`)
+
+- **Why My subscription says "will appear here when it is released":** the download feature (`customer_downloads.py`, licensed-owner-only route, private `downloads` storage) is on golden, but no installer has ever been published (`latest_vms_installer()` is `None` on staging; staging storage is local, `/app/recordings/storage`). Publishing is the operator step `python -m customer_downloads publish <pkg> <commit> <version>`.
+- **Launch blocker fixed:** the page told customers to run `anyaicam-setup`, the administrator Cloud ID + activation-token flow a customer never receives. Its Portal URL default `http://127.0.0.1:8000` is the appliance's own VMS, not the cloud. The page now gives `install.sh --product-mode=<plan>`, `validate.sh`, `anyaicam-setup --claim --portal-url=<ANYAICAM_PUBLIC_URL>` and a link to Claim an appliance. The agent accepts `--portal-url` (production mode, no prompts) and keeps the old prompts without it.
