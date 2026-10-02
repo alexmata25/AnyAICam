@@ -57,6 +57,7 @@ without touching per-track state, so a camera with no rules behaves
 identically to before this module existed.
 """
 
+import json
 import uuid
 
 # ---------------------------------------------------------------- tracker
@@ -259,7 +260,10 @@ _dwell_entered_at: dict[tuple, float] = {}
 _line_last_side: dict[tuple, str] = {}
 _last_fired_at: dict[tuple, float] = {}
 _zone_last_seen_at: dict[tuple, float] = {}  # last time a dwelling track was actually observed inside the zone
+_dwell_observed: dict[tuple, float] = {}  # seconds of OBSERVED presence inside the zone (occlusions do not count)
 _last_cycle_at: dict[int, float] = {}  # camera_number -> last successful detection cycle (see start_cycle())
+_rule_last_evaluated_at: dict[tuple, float] = {}  # (camera_number, rule_id) -> time of its previous evaluation
+_rule_signature: dict[tuple, str] = {}  # (camera_number, rule_id) -> the configuration its state belongs to
 
 DEFAULT_DWELL_SECONDS = 5.0  # minimum continuous in-zone time before an intrusion rule fires -- roughly one confirmed cycle beyond entry, at this pipeline's existing ~5s detection cadence
 # Loitering (2026-10-01): a polygon rule that fires when a PERSON stays
@@ -275,9 +279,16 @@ ZONE_ANALYTIC_TYPES = ("intrusion", "loitering")
 # keeps the track through TRACK_MAX_MISSED_CYCLES -- so one occluded frame
 # restarted a loitering clock. Now:
 # - occlusion: a track still alive in the tracker keeps its dwell for up
-#   to ZONE_OCCLUSION_GRACE_SECONDS since it was last seen inside; the
-#   clock keeps running from the original entry (the person never left).
-#   Past the grace, or once the tracker drops the track, it is forgotten.
+#   to ZONE_OCCLUSION_GRACE_SECONDS since it was last seen inside, but the
+#   time it was not seen never counts: dwell is the sum of intervals
+#   between consecutive cycles that both observed it inside (2026-10-02,
+#   "missing detections do not count as confirmed dwell"). Past the grace,
+#   or once the tracker drops the track, it is forgotten.
+# - line crossings keep a track's last clear side through the same
+#   tracker-retained misses, so a person briefly hidden while crossing
+#   still produces the crossing; state goes when the tracker drops them.
+# - a rule whose configuration changes (geometry, direction, dwell...)
+#   starts clean: sync_rules() compares each rule's signature.
 # - outage: detection failures never reach update_tracker(), so nothing
 #   aged. start_cycle() notices a gap longer than OUTAGE_RESET_SECONDS
 #   since the last successful cycle and resets the camera: whoever is
@@ -292,7 +303,8 @@ LINE_SIDE_EPSILON = 0.01  # normalized-distance "dead zone" around a line: a cen
 MIN_REFIRE_SECONDS = 0.5  # defensive floor only -- see module docstring; the real dedup is the state-machine transition itself
 
 
-_RULE_STATE_DICTS = (_dwell_entered_at, _line_last_side, _last_fired_at, _zone_last_seen_at)
+_RULE_STATE_DICTS = (_dwell_entered_at, _line_last_side, _last_fired_at, _zone_last_seen_at, _dwell_observed)
+_RULE_LEVEL_DICTS = (_rule_last_evaluated_at, _rule_signature)
 
 
 def _clear_track_state(camera_number: int, rule_id: str, track_id: str) -> None:
@@ -308,7 +320,7 @@ def reset_camera(camera_number: int) -> None:
     entitlement) and after a detection outage."""
     _tracker_state.pop(camera_number, None)
     _last_cycle_at.pop(camera_number, None)
-    for state_dict in _RULE_STATE_DICTS:
+    for state_dict in _RULE_STATE_DICTS + _RULE_LEVEL_DICTS:
         for key in [key for key in state_dict if key[0] == camera_number]:
             del state_dict[key]
 
@@ -318,9 +330,39 @@ def forget_rules_except(camera_number: int, rule_ids) -> None:
     in `rule_ids` (deleted, disabled, or edited into a different rule), so
     re-enabling it later starts clean instead of firing on stale timers."""
     keep = set(rule_ids)
-    for state_dict in _RULE_STATE_DICTS:
+    for state_dict in _RULE_STATE_DICTS + _RULE_LEVEL_DICTS:
         for key in [key for key in state_dict if key[0] == camera_number and key[1] not in keep]:
             del state_dict[key]
+
+
+def rule_signature(rule: dict) -> str:
+    """What a rule's per-track state depends on. Its name does not count."""
+    return json.dumps({k: rule.get(k) for k in ("analytic_type", "geometry", "direction", "dwell_seconds", "confidence_threshold")},
+                      sort_keys=True, default=str)
+
+
+def forget_rule(camera_number: int, rule_id: str) -> None:
+    for state_dict in _RULE_STATE_DICTS + _RULE_LEVEL_DICTS:
+        for key in [key for key in state_dict if key[0] == camera_number and key[1] == rule_id]:
+            del state_dict[key]
+
+
+def sync_rules(camera_number: int, rules: list[dict]) -> list[str]:
+    """Call every cycle with the camera's current rules: state of removed
+    rules is dropped (forget_rules_except) and so is the state of any rule
+    whose configuration changed. Returns the ids that were reset."""
+    forget_rules_except(camera_number, [rule.get("id") for rule in rules if isinstance(rule, dict)])
+    reset = []
+    for rule in rules:
+        if not isinstance(rule, dict) or not rule.get("id"):
+            continue
+        key = (camera_number, rule["id"])
+        signature = rule_signature(rule)
+        if key in _rule_signature and _rule_signature[key] != signature:
+            forget_rule(camera_number, rule["id"])
+            reset.append(rule["id"])
+        _rule_signature[key] = signature
+    return reset
 
 
 def start_cycle(camera_number: int, now: float) -> bool:
@@ -337,13 +379,15 @@ def start_cycle(camera_number: int, now: float) -> bool:
 
 
 def _evict_unseen_tracks(camera_number: int, rule_id: str, seen_track_ids: set) -> None:
-    """Removes state for any track this rule saw before but did not see
-    at all this cycle -- prevents unbounded growth from objects that
-    left the frame entirely, and ensures a later different object
-    (even one that happens to reuse an evicted track_id) starts with
-    fresh state rather than inheriting another object's history."""
-    for state_dict in (_dwell_entered_at, _line_last_side, _last_fired_at):
-        stale_keys = [key for key in state_dict if key[0] == camera_number and key[1] == rule_id and key[2] not in seen_track_ids]
+    """Removes state for any track this rule did not see this cycle AND the
+    tracker no longer holds -- prevents unbounded growth from objects that
+    left the frame, and ensures a later different object starts fresh. A
+    track the tracker still retains through a short miss keeps its last
+    side (2026-10-02): before, one missed frame mid-crossing lost it."""
+    live_tracks = _tracker_state.get(camera_number, {})
+    for state_dict in (_line_last_side, _last_fired_at):
+        stale_keys = [key for key in state_dict if key[0] == camera_number and key[1] == rule_id
+                      and key[2] not in seen_track_ids and key[2] not in live_tracks]
         for key in stale_keys:
             del state_dict[key]
 
@@ -394,6 +438,7 @@ def _evaluate_zone(camera_number: int, rule: dict, tracked_detections: list[dict
     confidence_threshold = float(rule.get("confidence_threshold") or 0)
     fired: list[dict] = []
     observed_inside: set = set()
+    previous_evaluation = _rule_last_evaluated_at.get((camera_number, rule_id))
 
     for detection in tracked_detections:
         track_id = detection.get("track_id")
@@ -411,14 +456,22 @@ def _evaluate_zone(camera_number: int, rule: dict, tracked_detections: list[dict
             _clear_track_state(camera_number, rule_id, track_id)
             continue
         observed_inside.add(track_id)
+        previously_seen = _zone_last_seen_at.get(key)
         _zone_last_seen_at[key] = now
 
         entry_time = _dwell_entered_at.get(key)
         if entry_time is None:
             _dwell_entered_at[key] = now  # first observed inside -- dwell clock starts now, no event yet
+            _dwell_observed[key] = 0.0
             continue
 
-        if now - entry_time < dwell_seconds:
+        # Only time between two consecutive cycles that BOTH saw the track
+        # inside counts; a gap (occlusion, low-confidence readings) pauses
+        # the clock rather than advancing it.
+        if previously_seen is not None and previously_seen == previous_evaluation:
+            _dwell_observed[key] = _dwell_observed.get(key, 0.0) + (now - previously_seen)
+        observed = _dwell_observed.get(key, 0.0)
+        if observed < dwell_seconds:
             continue  # still dwelling, not long enough yet
 
         if key in _last_fired_at:
@@ -436,11 +489,12 @@ def _evaluate_zone(camera_number: int, rule: dict, tracked_detections: list[dict
             "box": _box_from_detection(detection),
         }
         if analytic_type == "loitering":
-            event["dwell_seconds"] = int(round(now - entry_time))
+            event["dwell_seconds"] = int(round(observed))
             event["dwell_threshold_seconds"] = int(dwell_seconds)
         fired.append(event)
 
     _evict_unobserved_zone_tracks(camera_number, rule_id, observed_inside, now)
+    _rule_last_evaluated_at[(camera_number, rule_id)] = now
     return fired
 
 

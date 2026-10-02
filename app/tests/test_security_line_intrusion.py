@@ -195,3 +195,16 @@ def test_the_dedup_window_is_bounded(monkeypatch):
     for i, x in enumerate([800, 750, 650, 400, 380], 50):
         alarms += sr.evaluate(1, dict(FENCE_B, geometry=[{"x": 0.7, "y": 0.0}, {"x": 0.7, "y": 1.0}]), [person(x)], W, H, now=float(i * 2))
     assert len(alarms) == 2
+
+
+def test_moving_or_deleting_a_security_line_drops_its_crossing_state():
+    sr.note_arm_state(1, "away")
+    sr.sync_rules(1, [RULE])
+    _feed([700, 650])                                    # seen outside
+    assert sr.sync_rules(1, [dict(RULE, name="Renamed")]) == []
+    assert any(key[1] == "r1" for key in sr._state)
+    assert sr.sync_rules(1, [dict(RULE, direction="outbound")]) == ["r1"]
+    assert not any(key[1] == "r1" for key in sr._state)
+    _feed([700, 650])
+    assert sr.sync_rules(1, []) == ["r1"] and sr._state == {}
+

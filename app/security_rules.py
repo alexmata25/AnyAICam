@@ -72,6 +72,7 @@ def reset_state() -> None:
         _last_alarm_at.clear()
         _arm_mode.clear()
         _track_alarm.clear()
+        _rule_signature.clear()
 
 
 def reset_camera(camera_number) -> None:
@@ -84,6 +85,33 @@ def _reset_camera_locked(camera_number) -> None:
     for store in (_state, _last_alarm_at, _track_alarm):
         for key in [key for key in store if key[0] == camera_number]:
             del store[key]
+
+
+_rule_signature: dict = {}  # (camera, rule_id) -> the line configuration its state belongs to
+
+
+def sync_rules(camera_number, rules: list) -> list:
+    """Drop crossing state of security lines that were removed or whose
+    geometry/protected side changed (2026-10-02). Returns reset rule ids."""
+    import json
+    current = {}
+    for rule in rules or []:
+        if isinstance(rule, dict) and rule.get("id"):
+            current[rule["id"]] = json.dumps({k: rule.get(k) for k in ("geometry", "direction")}, sort_keys=True, default=str)
+    reset = []
+    with _lock:
+        for (camera, rule_id) in [key for key in _rule_signature if key[0] == camera_number]:
+            if current.get(rule_id) != _rule_signature[(camera, rule_id)]:
+                for store in (_state, _last_alarm_at):
+                    for key in [key for key in store if key[0] == camera_number and key[1] == rule_id]:
+                        del store[key]
+                for key in [key for key, v in _track_alarm.items() if key[0] == camera_number and v["alarm"]["rule_id"] == rule_id]:
+                    del _track_alarm[key]
+                del _rule_signature[(camera, rule_id)]
+                reset.append(rule_id)
+        for rule_id, signature in current.items():
+            _rule_signature[(camera_number, rule_id)] = signature
+    return reset
 
 
 def note_arm_state(camera_number, mode: str | None) -> bool:

@@ -117,11 +117,57 @@ def test_dwell_is_bounded_and_defaults_safely(dwell, expected):
     assert engine.rule_dwell_seconds(_intrusion()) == engine.DEFAULT_DWELL_SECONDS
 
 
-def test_a_brief_occlusion_keeps_the_dwell_running():
-    """Previously one missed detection restarted the clock; the tracker
-    itself tolerates TRACK_MAX_MISSED_CYCLES."""
-    readings = [[_person()], [_person()], [], [], [_person()], [_person()], [_person()]]
-    assert _run([_loitering(dwell=30)], readings) == [(6, "loitering")]  # measured from the first sighting
+def test_a_brief_occlusion_pauses_the_dwell_without_resetting_it():
+    """2026-10-02: time the person was not seen never counts as dwell, but a
+    short occlusion the tracker retains does not throw away what was seen."""
+    readings = [[_person()], [_person()], [], [], [_person()], [_person()], [_person()], [_person()], [_person()], [_person()]]
+    # observed: 0-5 (5 s), gap (not counted), 20-25-30-35-40-45 (25 s) -> 30 s at index 9
+    assert _run([_loitering(dwell=30)], readings) == [(9, "loitering")]
+
+
+def test_missing_detections_never_count_as_confirmed_dwell():
+    rule = _loitering(dwell=10)
+    _cycle([rule], [_person()], 0.0)
+    for t in (5.0, 10.0, 15.0):                   # unseen (tracker still retains the track)
+        _cycle([rule], [], t)
+    assert _cycle([rule], [_person()], 16.0) == []  # 16 s since entry, but nothing observed in between
+    assert _cycle([rule], [_person()], 21.0) == []  # 5 s observed
+    assert len(_cycle([rule], [_person()], 26.0)) == 1  # 10 s observed
+
+
+def test_editing_a_rule_starts_its_state_over():
+    rule = _loitering(dwell=10)
+    engine.sync_rules(1, [rule])
+    _cycle([rule], [_person()], 0.0)
+    _cycle([rule], [_person()], 5.0)
+    assert engine.sync_rules(1, [dict(rule, name="Renamed porch")]) == []  # a name change keeps state
+    moved = dict(rule, geometry=HALF)
+    assert engine.sync_rules(1, [moved]) == ["loiter-1"]
+    assert all(key[1] != "loiter-1" for key in engine._dwell_entered_at)
+    assert engine.sync_rules(1, []) == [] and not any(key[1] == "loiter-1" for key in engine._rule_signature)
+
+
+LINE = {"id": "line-1", "analytic_type": "line_crossing", "name": "Gate", "enabled": True, "direction": "both",
+        "geometry": [{"x": 0.5, "y": 0.0}, {"x": 0.5, "y": 1.0}], "confidence_threshold": 0.0}
+
+
+def test_a_crossing_survives_a_short_occlusion_the_tracker_retains():
+    """The side a person was last clearly on is kept while the tracker still
+    holds them; before, one missed frame mid-crossing lost the crossing."""
+    fired = []
+    # 200 px frame, line at x=100 px, 40 px boxes moving in small steps so the
+    # tracker keeps one track: clearly left, hidden twice, reappears already across
+    for t, x in enumerate([40, 55, 70, None, None, 90]):
+        fired += _cycle([LINE], [_person(x=x)] if x is not None else [], float(t * 5))
+    assert len(fired) == 1 and fired[0]["analytic_type"] == "line_crossing"  # before: lost with the first missed frame
+
+
+def test_line_state_is_dropped_when_the_tracker_drops_the_track():
+    _cycle([LINE], [_person(x=60)], 0.0)
+    assert engine._line_last_side
+    for t in range(1, 6):
+        _cycle([LINE], [], float(t * 5))
+    assert engine._line_last_side == {}
 
 
 def test_an_occlusion_past_the_grace_starts_over():

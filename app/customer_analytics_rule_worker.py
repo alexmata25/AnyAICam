@@ -325,7 +325,10 @@ async def customer_analytics_rule_worker(camera_number: int) -> None:
                 # Motion: nothing may carry over to a rule enabled later.
                 analytics_rules_engine.reset_camera(camera_number)
             else:
-                analytics_rules_engine.forget_rules_except(camera_number, [rule["id"] for rule in rules])
+                # Removed rules and rules whose configuration changed start clean.
+                analytics_rules_engine.sync_rules(camera_number, [r for r in rules if r["analytic_type"] != "security_line"])
+                import security_rules
+                security_rules.sync_rules(camera_number, [r for r in rules if r["analytic_type"] == "security_line"])
                 async with ai_inference_semaphore:
                     result = await asyncio.to_thread(detect_objects_frame, camera_number)
                 if result.get("ok"):
