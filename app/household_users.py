@@ -177,6 +177,10 @@ def account_permission(identity: dict | None, key: str) -> bool:
         return True
     if role != "customer_viewer":
         return False
+    if not identity.get("email") or not identity.get("customer_id"):
+        # Not a signed-in household member (no account to look up): the
+        # unchanged customer_viewer role behaviour, People view only.
+        return key == "people"
     with connection() as db:
         user = db.execute("SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
                           (identity.get("email", ""), identity.get("customer_id"))).fetchone()
