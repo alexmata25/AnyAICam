@@ -198,6 +198,59 @@ def _customer_identity(request: Request) -> dict:
     return identity
 
 
+# Simulation routes (simulate-trigger, simulate-person-detected,
+# simulate-visitor-utterance) fabricate visitor events and transcripts.
+# They are development/test tools, never customer production controls
+# (2026-10-02, Codex review): off unless this environment opts in, and
+# then for the account owner only.
+SIMULATION_ENV = "ANYAICAM_AAC_VC_SIMULATION_ENABLED"
+
+
+def _require_simulation(identity: dict) -> None:
+    import os
+    if os.environ.get(SIMULATION_ENV, "").strip().lower() not in {"1", "true", "yes"} or identity.get("role") != "customer_owner":
+        raise HTTPException(status_code=404, detail="Not found.")
+
+
+def camera_permitted(identity: dict, camera_id: str) -> bool:
+    """Visitor Call per-camera authorization (2026-10-02, Codex review).
+
+    A Visitor Call is the entrance camera's live view plus its visitor's
+    words, so it needs exactly what Live needs: the account owner, or a
+    household member/viewer whose camera grant includes Live for this
+    camera (customer_camera_permissions.can_live, or camera_access_mode
+    'all'). Same decision as live_view_page._authorized_camera() via
+    camera_access.is_camera_authorized(); read fresh on every call, so a
+    revoked grant takes effect immediately. The caller has already scoped
+    the camera to identity['customer_id']."""
+    from camera_access import is_camera_authorized
+    role = identity.get("role")
+    if role == "customer_owner":
+        return True
+    if role != "customer_viewer" or not identity.get("email") or not identity.get("customer_id"):
+        return False
+    user = row("SELECT id,camera_access_mode,account_status FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?",
+               (identity["email"], identity["customer_id"]))
+    if not user or (user.get("account_status") or "active") != "active":  # suspended/removed: no access
+        return False
+    permitted = {r["camera_id"] for r in rows(
+        "SELECT p.camera_id FROM customer_camera_permissions p JOIN cameras c ON c.id=p.camera_id "
+        "WHERE p.user_id=? AND p.can_live=1 AND c.customer_id=?", (user["id"], identity["customer_id"]))}
+    return is_camera_authorized(camera_id, role="customer_viewer", access_mode=user.get("camera_access_mode") or "selected",
+                                permitted_camera_ids=permitted)
+
+
+def _authorized_event(identity: dict, event_id: str) -> dict:
+    """Every Visitor Call read or action goes through here: tenant scope
+    (customer_id in the WHERE clause) AND the signed-in person's camera
+    grant. Both failures answer the same 404, so an ID never reveals that
+    a call exists on a camera this person may not see."""
+    event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
+    if not event or not camera_permitted(identity, event["camera_id"]):
+        raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+    return event
+
+
 def _authorized_camera(customer_id: str, camera_id: str) -> dict:
     """Tenant-scoped camera lookup -- customer_id is part of the WHERE
     clause, matching aac_voice_call_events.get_voice_call_event()'s own
@@ -884,7 +937,8 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/customer/aac/voice-call/entrance-cameras")
     def list_entrance_cameras(request: Request) -> dict:
         identity = _customer_identity(request)
-        return {"cameras": store.list_entrance_cameras(identity["customer_id"])}
+        return {"cameras": [camera for camera in store.list_entrance_cameras(identity["customer_id"])
+                            if camera_permitted(identity, camera.get("camera_id") or camera.get("id"))]}
 
     @app.post("/api/customer/aac/voice-call/entrance-cameras/{camera_id}")
     def set_entrance_camera(request: Request, camera_id: str, enabled: bool = True) -> dict:
@@ -951,6 +1005,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         dispatch, notification fan-out, listening window) is real and
         identical either way."""
         identity = _customer_identity(request)
+        _require_simulation(identity)
         return handle_person_detected(
             customer_id=identity["customer_id"],
             camera_id=payload.camera_id,
@@ -974,6 +1029,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         real; only the upstream trigger source is not yet the real
         appliance analytics pipeline."""
         identity = _customer_identity(request)
+        _require_simulation(identity)
         return trigger_visitor_event(
             customer_id=identity["customer_id"],
             camera_id=payload.camera_id,
@@ -985,17 +1041,13 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
     @app.get("/api/customer/aac/voice-call/events/{event_id}")
     def get_event(request: Request, event_id: str) -> dict:
         identity = _customer_identity(request)
-        event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
-        if not event:
-            raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+        event = _authorized_event(identity, event_id)
         return event
 
     @app.post("/api/customer/aac/voice-call/events/{event_id}/answer")
     def answer_event(request: Request, event_id: str, payload: AnswerPayload = None) -> dict:
         identity = _customer_identity(request)
-        event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
-        if not event:
-            raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+        event = _authorized_event(identity, event_id)
         # partner_identity()'s signed session token carries email/role/
         # customer_id only -- never a partner_users.id -- so the real row
         # id (required: answered_by_user_id is a FOREIGN KEY into
@@ -1008,18 +1060,14 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
     @app.post("/api/customer/aac/voice-call/events/{event_id}/end")
     def end_event_route(request: Request, event_id: str) -> dict:
         identity = _customer_identity(request)
-        event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
-        if not event:
-            raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+        event = _authorized_event(identity, event_id)
         store.end_call(event_id=event_id, customer_id=identity["customer_id"], actor=identity)
         return {"message": "Call ended.", "event_id": event_id}
 
     @app.post("/api/customer/aac/voice-call/events/{event_id}/dismiss")
     def dismiss_event(request: Request, event_id: str) -> dict:
         identity = _customer_identity(request)
-        event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
-        if not event:
-            raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+        event = _authorized_event(identity, event_id)
         store.mark_dismissed(event_id=event_id, customer_id=identity["customer_id"], actor=identity)
         return {"message": "Dismissed.", "event_id": event_id}
 
@@ -1038,6 +1086,8 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         (a real visitor's spoken words, transcribed) is not yet wired
         to real hardware."""
         identity = _customer_identity(request)
+        _require_simulation(identity)
+        _authorized_event(identity, event_id)
         return record_visitor_utterance(
             customer_id=identity["customer_id"],
             event_id=event_id,
@@ -1052,6 +1102,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         design. Never dispatches anything; only validates and issues a
         short-lived confirmation token."""
         identity = _customer_identity(request)
+        _authorized_event(identity, event_id)
         return aac_voice_call_door.request_unlock(event_id=event_id, customer_id=identity["customer_id"], identity=identity)
 
     @app.post("/api/customer/aac/voice-call/events/{event_id}/door/unlock-confirm")
@@ -1062,6 +1113,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         live can_unlock permission. See aac_voice_call_door.py's
         confirm_unlock() for the complete authorization/audit trail."""
         identity = _customer_identity(request)
+        _authorized_event(identity, event_id)
         return aac_voice_call_door.confirm_unlock(
             event_id=event_id, customer_id=identity["customer_id"], identity=identity, confirm_token=payload.confirm_token,
         )
@@ -1104,9 +1156,7 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         which states the real flag state honestly rather than always
         claiming the mic works."""
         identity = _customer_identity(request)
-        event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
-        if not event:
-            raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
+        event = _authorized_event(identity, event_id)
         camera = row("SELECT id,name,talk_down_supported FROM cameras WHERE id=? AND customer_id=?", (event["camera_id"], identity["customer_id"]))
         camera_name = (camera or {}).get("name") or "Entrance camera"
         call_over = (event.get("state") or "") in ("ended", "dismissed", "missed")

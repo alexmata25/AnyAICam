@@ -50,6 +50,13 @@ def _shell(title, active, content, scripts=""):
 # ------------------------------------------------------------- fixtures
 
 
+@pytest.fixture(autouse=True)
+def _simulation_routes_enabled(monkeypatch):
+    # The simulate-* routes are development/test-only (2026-10-02): off
+    # unless the environment opts in. This file exercises them on purpose.
+    monkeypatch.setenv(aac_voice_call.SIMULATION_ENV, "1")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_aac_voice_call_foundation.db"
@@ -363,13 +370,16 @@ def test_viewer_can_use_but_not_configure_entrance_cameras(client, db_path):
     response = client.post(f"/api/customer/aac/voice-call/entrance-cameras/{camera_id}", cookies=owner_cookie)
     assert response.status_code == 200
 
-    # Viewer can still trigger/use the now-configured camera.
+    # The simulate-* routes are development/test tools for the account
+    # owner only (2026-10-02); a viewer never fabricates visitor events.
+    # Real viewer use of a call is covered by
+    # test_aac_voice_call_household_authorization.py.
     response = client.post(
         "/api/customer/aac/voice-call/simulate-trigger",
         json={"camera_id": camera_id, "transcript_text": "hello"},
         cookies=viewer_cookie,
     )
-    assert response.status_code == 200
+    assert response.status_code == 404
 
 
 # ------------------------------------------------- door unlock interface

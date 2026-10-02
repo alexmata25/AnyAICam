@@ -47,6 +47,13 @@ def _shell(title, active, content, scripts=""):
 # ------------------------------------------------------------- fixtures
 
 
+@pytest.fixture(autouse=True)
+def _simulation_routes_enabled(monkeypatch):
+    # The simulate-* routes are development/test-only (2026-10-02): off
+    # unless the environment opts in. This file exercises them on purpose.
+    monkeypatch.setenv(aac_voice_call.SIMULATION_ENV, "1")
+
+
 @pytest.fixture()
 def db_path(tmp_path):
     return tmp_path / "test_aac_voice_call_proactive_greeting.db"

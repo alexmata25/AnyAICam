@@ -111,10 +111,13 @@ def _seed_tenant_with_door(db_path, *, customer_id, camera_id, partner_id, owner
                     (this_camera_id, customer_id, site_id, f"app-{customer_id}", "Front Door" if is_door else f"Camera {n}", "configured", n,
                      1 if is_door else 0, door_channel if is_door else None, 3000 if is_door else None, now),
                 )
-            if viewer_email and viewer_can_unlock:
+            if viewer_email:
+                # The viewer can see the door camera (can_live defaults to 1):
+                # Visitor Call requires that grant (2026-10-02), so the
+                # can_unlock flag below is what these tests exercise.
                 db.execute(
-                    "INSERT INTO customer_camera_permissions(user_id,camera_id,can_alerts,can_settings,can_talk,can_unlock) VALUES(?,?,1,0,0,1)",
-                    (f"viewer-{customer_id}", camera_id),
+                    "INSERT INTO customer_camera_permissions(user_id,camera_id,can_alerts,can_settings,can_talk,can_unlock) VALUES(?,?,1,0,0,?)",
+                    (f"viewer-{customer_id}", camera_id, 1 if viewer_can_unlock else 0),
                 )
         # Called AFTER the with-connection block above has committed --
         # set_entrance_camera() opens its own connection, and SQLite

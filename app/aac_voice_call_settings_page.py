@@ -42,6 +42,9 @@ def render_settings(identity: dict) -> tuple[str, str]:
         "WHERE customer_id=? AND status NOT IN ('removed','pending_installation') ORDER BY camera_number",
         (customer_id,),
     )
+    if not is_owner:  # a household member sees only cameras their grant covers
+        from aac_voice_call import camera_permitted
+        cameras = [camera for camera in cameras if camera_permitted(identity, camera["id"])]
     entrance = {item["camera_id"]: item for item in store.list_entrance_cameras(customer_id)}
     disabled = "" if is_owner else " disabled"
     cards = []

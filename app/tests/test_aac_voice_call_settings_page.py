@@ -56,7 +56,10 @@ def test_viewer_sees_settings_read_only(client, db_path):
     html = _get(client, _viewer_cookie("cust-a", "viewer-cust-a@example.test")).text
     assert "Only the account owner can change these settings." in html
     assert "vc-save" not in html.split("<script>")[0]
-    assert 'class="vc-enabled" disabled' in html
+    assert 'class="vc-enabled" checked disabled' in html  # read-only
+    # Only cameras this household member's grant covers (2026-10-02): the
+    # door camera, not the Driveway camera they were never given.
+    assert "Front Door" in html and "Driveway" not in html
 
 
 def test_other_tenants_cameras_never_appear(client, db_path):
