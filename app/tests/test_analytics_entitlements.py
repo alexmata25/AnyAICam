@@ -169,11 +169,14 @@ def test_subscription_deleted_revokes_all_four_advanced_analytics_keys_together(
 
 
 def test_subscription_updated_to_an_inactive_status_also_revokes(db_path, _analytics_price_map):
+    """A subscription Stripe has ended revokes the add-on. ('unpaid' no longer
+    revokes at once: a failed payment gets the 7-day grace, owner policy
+    2026-10-02 -- see test_stripe_billing_policies.py.)"""
     _seed_customer(db_path)
     with override_target(sqlite_path=db_path):
         ae.sync_analytics_from_stripe_event(_checkout_event("evt_1", TALK_DOWN_TEST_PRICE))
         ae.sync_analytics_from_stripe_event(
-            _subscription_event("evt_2", "customer.subscription.updated", TALK_DOWN_TEST_PRICE, status="unpaid")
+            _subscription_event("evt_2", "customer.subscription.updated", TALK_DOWN_TEST_PRICE, status="canceled")
         )
         assert ae.get_active_analytics_for_customer("cust-1") == []
 

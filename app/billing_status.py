@@ -1,0 +1,330 @@
+"""Paid-service state of camera plans, VMS licenses and add-ons
+(2026-10-02, owner billing policies approved 2026-10-02).
+
+1. Failed payment -> 7-day grace. When a renewal payment fails (Stripe sends
+   invoice.payment_failed and/or the subscription becomes past_due/unpaid),
+   service continues for GRACE_PERIOD; the customer sees the problem on My
+   subscription and can update the card in the Customer Portal. A payment
+   that succeeds in that window restores normal state (no new entitlement,
+   nothing duplicated). Unpaid after the window: the entitlement is
+   'suspended' (reason payment_failed) -- not cancelled, so a later
+   successful payment restores exactly what was paid for. A subscription
+   Stripe ends (canceled / incomplete_expired) is cancelled as before.
+2. Refunds and disputes affect only the purchase they belong to: a FULL
+   refund or a dispute of the payment covering the CURRENT period of a
+   subscription (or of a one-time license) suspends that entitlement (reason
+   refunded / disputed). A refunded or disputed OLDER period does not stop
+   the currently paid period. A later successful payment restores refunded
+   service; a dispute closed in AnyAiCam's favour (Stripe 'won': the payment
+   stands) restores disputed service. Commission reversal is unchanged
+   (sales_commissions.py).
+Every transition is a state set keyed by Stripe ids, so replayed or
+duplicated events change nothing further. Camera plans keep their camera
+count while suspended (counted only when active), so restoring is exact.
+
+Not decided here (owner): partial refunds -- a partially refunded payment
+leaves service unchanged.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+
+from partner_db import connection, row, rows
+
+logger = logging.getLogger("anyaicam.billing_status")
+
+GRACE_PERIOD = timedelta(days=7)
+GRACE_STRIPE_STATUSES = {"past_due", "unpaid"}
+HEALTHY_STRIPE_STATUSES = {"active", "trialing"}
+RESTORED_BY_PAYMENT = ("payment_failed", "refunded")
+REVERSALS_DDL = ("CREATE TABLE IF NOT EXISTS billing_reversals(id INTEGER PRIMARY KEY AUTOINCREMENT,charge_id TEXT,payment_intent TEXT,"
+                 "invoice_id TEXT,reason TEXT NOT NULL,created_at TEXT NOT NULL)")
+
+
+def _now() -> datetime:
+    return datetime.now()
+
+
+def _stamp(value) -> str:
+    if isinstance(value, (int, float)) and value > 0:
+        return datetime.fromtimestamp(int(value)).isoformat()
+    return _now().isoformat()
+
+
+# ------------------------------------------------------------------ rows
+
+def _plan_rows(subscription_id: str) -> list[dict]:
+    return rows("SELECT * FROM customer_entitlements WHERE stripe_subscription_id=? AND status IN ('active','suspended')",
+                (subscription_id,))
+
+
+def _addon_rows(subscription_id: str) -> list[dict]:
+    try:
+        return rows("SELECT * FROM addon_subscriptions WHERE stripe_subscription_id=? AND status IN ('active','suspended')",
+                    (subscription_id,))
+    except Exception:
+        return []
+
+
+def _set_plan(entitlement_id: str, status: str, reason: str | None) -> None:
+    with connection() as db:
+        db.execute("UPDATE customer_entitlements SET status=?,suspended_reason=?,updated_at=? WHERE id=?",
+                   (status, reason, _now().isoformat(), entitlement_id))
+
+
+def _set_addon(addon: dict, status: str, reason: str | None) -> None:
+    import analytics_entitlements
+    analytics_entitlements.apply_addon_state(addon, status=status, suspended_reason=reason)
+
+
+def _suspend(subscription_id: str, reason: str) -> int:
+    changed = 0
+    for plan in _plan_rows(subscription_id):
+        if plan["status"] == "active":
+            _set_plan(plan["id"], "suspended", reason)
+            changed += 1
+    for addon in _addon_rows(subscription_id):
+        if addon["status"] == "active":
+            _set_addon(addon, "suspended", reason)
+            changed += 1
+    if changed:
+        logger.info("billing.suspended subscription=%s reason=%s rows=%s", subscription_id, reason, changed)
+    return changed
+
+
+def _restore(subscription_id: str, reasons: tuple[str, ...]) -> int:
+    changed = 0
+    for plan in _plan_rows(subscription_id):
+        if plan["status"] == "suspended" and plan.get("suspended_reason") in reasons:
+            _set_plan(plan["id"], "active", None)
+            changed += 1
+    for addon in _addon_rows(subscription_id):
+        if addon["status"] == "suspended" and addon.get("suspended_reason") in reasons:
+            _set_addon(addon, "active", None)
+            changed += 1
+    return changed
+
+
+# ------------------------------------------------------------------ 1. failed payment and grace
+
+def mark_payment_failed(subscription_id: str, *, at=None) -> None:
+    """The first failure starts the grace period; repeats do not move it."""
+    stamp = _stamp(at)
+    with connection() as db:
+        db.execute("UPDATE customer_entitlements SET payment_failed_at=? WHERE stripe_subscription_id=? AND payment_failed_at IS NULL "
+                   "AND status IN ('active','suspended')", (stamp, subscription_id))
+        try:
+            db.execute("UPDATE addon_subscriptions SET payment_failed_at=? WHERE stripe_subscription_id=? AND payment_failed_at IS NULL "
+                       "AND status IN ('active','suspended')", (stamp, subscription_id))
+        except Exception:
+            pass
+
+
+def payment_recovered(subscription_id: str) -> int:
+    with connection() as db:
+        db.execute("UPDATE customer_entitlements SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
+        try:
+            db.execute("UPDATE addon_subscriptions SET payment_failed_at=NULL WHERE stripe_subscription_id=?", (subscription_id,))
+        except Exception:
+            pass
+    return _restore(subscription_id, RESTORED_BY_PAYMENT)
+
+
+def sweep_grace(now: datetime | None = None, *, customer_id: str | None = None) -> int:
+    """Suspend whatever has been unpaid for longer than the grace period.
+    Run periodically and before entitlements are read, so access never
+    outlives the grace period just because no event arrived."""
+    cutoff = ((now or _now()) - GRACE_PERIOD).isoformat()
+    scope, args = ("", ()) if customer_id is None else (" AND customer_id=?", (customer_id,))
+    changed = 0
+    try:
+        for plan in rows("SELECT id FROM customer_entitlements WHERE status='active' AND payment_failed_at IS NOT NULL "
+                         f"AND payment_failed_at<=?{scope}", (cutoff, *args)):
+            _set_plan(plan["id"], "suspended", "payment_failed")
+            changed += 1
+        for addon in rows("SELECT * FROM addon_subscriptions WHERE status='active' AND payment_failed_at IS NOT NULL "
+                          f"AND payment_failed_at<=?{scope}", (cutoff, *args)):
+            _set_addon(addon, "suspended", "payment_failed")
+            changed += 1
+    except Exception as error:  # a database before these columns exist
+        logger.debug("billing.sweep_skipped error=%s", type(error).__name__)
+        return 0
+    if changed:
+        logger.info("billing.grace_expired rows=%s", changed)
+    return changed
+
+
+def grace_ends_at(payment_failed_at: str | None) -> datetime | None:
+    if not payment_failed_at:
+        return None
+    try:
+        return datetime.fromisoformat(payment_failed_at) + GRACE_PERIOD
+    except ValueError:
+        return None
+
+
+def apply_subscription_status(subscription: dict) -> None:
+    """Stripe's current status for a subscription (reconciliation)."""
+    subscription_id = str(subscription.get("id") or "")
+    status = str(subscription.get("status") or "")
+    if not subscription_id:
+        return
+    if status in GRACE_STRIPE_STATUSES:
+        mark_payment_failed(subscription_id)
+        sweep_grace()
+    elif status in HEALTHY_STRIPE_STATUSES:
+        payment_recovered(subscription_id)
+
+
+# ------------------------------------------------------------------ 2. refunds and disputes
+
+def _payment_for_charge(charge_id: str, intent: str, invoice_id: str) -> dict | None:
+    for column, value in (("id", invoice_id), ("stripe_charge_id", charge_id), ("stripe_payment_intent_id", intent)):
+        if value:
+            found = row(f"SELECT * FROM subscription_payments WHERE {column}=?", (value,))
+            if found:
+                return found
+    if intent:
+        import sales_commissions
+        looked_up = sales_commissions._invoice_for_payment_intent(intent)
+        if looked_up:
+            return row("SELECT * FROM subscription_payments WHERE id=?", (looked_up,))
+    return None
+
+
+def _covers_current_period(payment: dict) -> bool:
+    latest = row("SELECT id FROM subscription_payments WHERE stripe_subscription_id=? ORDER BY period_start DESC, paid_at DESC LIMIT 1",
+                 (payment["stripe_subscription_id"],))
+    return bool(latest) and latest["id"] == payment["id"]
+
+
+def _charge_parts(event: dict) -> tuple[str, str, str, bool]:
+    obj = (event.get("data") or {}).get("object") or {}
+    if obj.get("object") == "charge" or event.get("type") == "charge.refunded":
+        amount = int(obj.get("amount") or 0)
+        full = bool(obj.get("refunded")) or (amount > 0 and int(obj.get("amount_refunded") or 0) >= amount)
+        return str(obj.get("id") or ""), str(obj.get("payment_intent") or ""), str(obj.get("invoice") or ""), full
+    return str(obj.get("charge") or ""), str(obj.get("payment_intent") or ""), "", True  # a dispute covers the charge
+
+
+def _record_reversal(charge_id: str, intent: str, invoice_id: str, reason: str) -> None:
+    """Remembered so a paid-invoice event for this same payment, however late
+    it arrives, never restores refunded/disputed service."""
+    with connection() as db:
+        db.execute(REVERSALS_DDL)
+        if not db.execute("SELECT 1 FROM billing_reversals WHERE COALESCE(charge_id,'')=? AND COALESCE(payment_intent,'')=? AND reason=?",
+                          (charge_id, intent, reason)).fetchone():
+            db.execute("INSERT INTO billing_reversals(charge_id,payment_intent,invoice_id,reason,created_at) VALUES(?,?,?,?,?)",
+                       (charge_id or None, intent or None, invoice_id or None, reason, _now().isoformat()))
+
+
+def _is_reversed(charge_id: str, intent: str, invoice_id: str) -> bool:
+    with connection() as db:
+        db.execute(REVERSALS_DDL)
+        for column, value in (("charge_id", charge_id), ("payment_intent", intent), ("invoice_id", invoice_id)):
+            if value and db.execute(f"SELECT 1 FROM billing_reversals WHERE {column}=? AND reason IN ('refunded','disputed')",
+                                    (value,)).fetchone():
+                return True
+    return False
+
+
+def _stripe_invoice_subscription(intent: str) -> tuple[str, str] | None:
+    """A refund that arrives before AnyAiCam recorded its invoice: ask Stripe
+    which invoice and subscription the payment belongs to."""
+    if not intent:
+        return None
+    import sales_commissions
+    invoice_id = sales_commissions._invoice_for_payment_intent(intent)
+    if not invoice_id:
+        return None
+    try:
+        invoice = sales_commissions._stripe_get(f"/v1/invoices/{invoice_id}")
+    except Exception:
+        return None
+    subscription_id = _invoice_subscription(invoice or {})
+    return (invoice_id, subscription_id) if subscription_id else None
+
+
+def _reverse_purchase(event: dict, reason: str) -> dict:
+    charge_id, intent, invoice_id, full = _charge_parts(event)
+    if not full:
+        return {"status": "ignored", "reason": "partial refund: service unchanged (owner decision pending)"}
+    payment = _payment_for_charge(charge_id, intent, invoice_id)
+    _record_reversal(charge_id, intent, (payment or {}).get("id") or invoice_id, reason)
+    if payment is None:
+        found = _stripe_invoice_subscription(intent)
+        if found and (_plan_rows(found[1]) or _addon_rows(found[1])):
+            _record_reversal(charge_id, intent, found[0], reason)
+            return {"status": "suspended", "rows": _suspend(found[1], reason)}
+    if payment and payment.get("stripe_subscription_id"):
+        if not _covers_current_period(payment):
+            return {"status": "ignored", "reason": "an earlier period; the current period is paid"}
+        return {"status": "suspended", "rows": _suspend(payment["stripe_subscription_id"], reason)}
+    if intent:  # a one-time purchase (VMS license)
+        changed = 0
+        for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='active'", (intent,)):
+            _set_plan(license_row["id"], "suspended", reason)
+            changed += 1
+        if changed:
+            return {"status": "suspended", "rows": changed}
+    return {"status": "ignored", "reason": "no AnyAiCam purchase for this charge"}
+
+
+def _dispute_closed(event: dict) -> dict:
+    obj = (event.get("data") or {}).get("object") or {}
+    if str(obj.get("status") or "") != "won":
+        return {"status": "ignored", "reason": "dispute not won: service stays suspended"}
+    charge_id, intent = str(obj.get("charge") or ""), str(obj.get("payment_intent") or "")
+    payment = _payment_for_charge(charge_id, intent, "")
+    restored = 0
+    if payment and payment.get("stripe_subscription_id"):
+        restored = _restore(payment["stripe_subscription_id"], ("disputed",))
+    elif intent:
+        for license_row in rows("SELECT * FROM customer_entitlements WHERE stripe_payment_intent_id=? AND status='suspended' "
+                                "AND suspended_reason='disputed'", (intent,)):
+            _set_plan(license_row["id"], "active", None)
+            restored += 1
+    return {"status": "restored" if restored else "ignored", "rows": restored}
+
+
+# ------------------------------------------------------------------ webhook step
+
+def _invoice_subscription(invoice: dict) -> str:
+    direct = invoice.get("subscription")
+    if direct:
+        return str(direct.get("id") if isinstance(direct, dict) else direct)
+    parent = ((invoice.get("parent") or {}).get("subscription_details") or {}).get("subscription")
+    return str(parent or "")
+
+
+def sync_from_stripe_event(event: dict) -> dict:
+    event_type = str(event.get("type") or "")
+    obj = (event.get("data") or {}).get("object") or {}
+    if event_type == "invoice.payment_failed":
+        subscription_id = _invoice_subscription(obj)
+        if subscription_id:
+            mark_payment_failed(subscription_id, at=event.get("created"))
+            return {"status": "grace_started", "subscription": subscription_id}
+        return {"status": "ignored"}
+    if event_type in ("invoice.paid", "invoice.payment_succeeded"):
+        subscription_id = _invoice_subscription(obj)
+        if not subscription_id:
+            return {"status": "ignored"}
+        import sales_commissions
+        intent = sales_commissions._invoice_payment_intent(obj) or ""
+        if _is_reversed(str(obj.get("charge") or ""), intent, str(obj.get("id") or "")):
+            return {"status": "ignored", "reason": "this payment was refunded or disputed"}
+        return {"status": "recovered", "rows": payment_recovered(subscription_id)}
+    if event_type in ("customer.subscription.updated", "customer.subscription.created"):
+        from stripe_state import current_subscription
+        current = current_subscription(str(obj.get("id") or "") or None) or obj
+        apply_subscription_status(current)
+        return {"status": "reconciled"}
+    if event_type == "charge.refunded":
+        return _reverse_purchase(event, "refunded")
+    if event_type == "charge.dispute.created":
+        return _reverse_purchase(event, "disputed")
+    if event_type == "charge.dispute.closed":
+        return _dispute_closed(event)
+    return {"status": "ignored"}

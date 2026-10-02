@@ -40454,6 +40454,11 @@ async def lifespan(app: FastAPI):
         if RUNTIME_ROLE in {"cloud", "combined"}
         else None
     )
+    billing_grace_task = (  # 7-day failed-payment grace expiry (billing_status.py)
+        asyncio.create_task(_billing_grace_worker())
+        if RUNTIME_ROLE in {"cloud", "combined"}
+        else None
+    )
     # Orphaned live-HLS segments left by every FFmpeg restart (see
     # hls_segment_sweeper.py): wherever cameras stream locally.
     import hls_segment_sweeper
@@ -48725,8 +48730,9 @@ from customer_downloads import register_customer_download_routes
 register_customer_download_routes(app)
 from customer_billing import register_customer_billing_routes
 register_customer_billing_routes(app)
-from plan_changes import register_plan_change_routes
+from plan_changes import register_plan_change_routes, register_plan_management_routes
 register_plan_change_routes(app)
+register_plan_management_routes(app)
 from account_invitations import register_account_invitation_routes
 register_account_invitation_routes(app)
 from direct_onboarding import register_direct_onboarding_routes
@@ -104301,6 +104307,10 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     mode = product_mode_for_customer(customer_id)
     entitlements = get_entitlements_for_customer(customer_id)
     camera_entitlement = next((e for e in entitlements if e["product"] in ("camera_slots_local", "camera_slots_hybrid") and e["status"] == "active"), None)
+    # A plan suspended for an unpaid period, a refund or a dispute is still the
+    # account's plan (2026-10-02): shown with why, never offered as "no plan".
+    suspended_plan = None if camera_entitlement else next(
+        (e for e in entitlements if e["product"] in ("camera_slots_local", "camera_slots_hybrid") and e["status"] == "suspended"), None)
     licensed_slots = total_camera_slots(customer_id)
     if camera_entitlement:
         plan_type = "hybrid" if camera_entitlement["product"] == "camera_slots_hybrid" else "local"
@@ -104317,16 +104327,40 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     # renewal date, a scheduled end, or a payment Stripe could not collect.
     # Information only; which statuses keep access is unchanged.
     billing_note = ""
-    if camera_entitlement and camera_entitlement.get("current_period_end"):
-        _end = datetime.fromtimestamp(int(camera_entitlement["current_period_end"]), tz=timezone.utc)
-        _when = f'<time datetime="{_end.isoformat()}" data-local-date>{_end.strftime("%b %d, %Y")}</time>'
-        if camera_entitlement.get("stripe_status") in ("past_due", "unpaid", "incomplete"):
-            billing_note = "Stripe could not collect the latest payment for this plan. Please update your payment method."
-        elif camera_entitlement.get("cancel_at_period_end"):
-            billing_note = f"This plan is set to end on {_when} and will not renew."
+
+    def _local_date(value) -> str:
+        if isinstance(value, str):
+            moment = datetime.fromisoformat(value)
+            if moment.tzinfo is None:
+                moment = moment.astimezone()
         else:
-            billing_note = f"Renews on {_when}."
-        billing_note = f'<p class="health-detail" id="plan-billing-note">{billing_note}</p>'
+            moment = datetime.fromtimestamp(int(value), tz=timezone.utc)
+        return f'<time datetime="{moment.isoformat()}" data-local-date>{moment.strftime("%b %d, %Y")}</time>'
+
+    import billing_status as _billing
+    if suspended_plan:
+        _why = {"payment_failed": "the payment for it could not be collected. Update your payment method to restore it.",
+                "refunded": "its payment was refunded. Please contact AnyAiCam support.",
+                "disputed": "its payment is disputed. Please contact AnyAiCam support."}.get(
+            suspended_plan.get("suspended_reason") or "", "of a billing problem. Please contact AnyAiCam support.")
+        plan_summary = "Your plan is paused"
+        billing_note = f'<p class="health-detail" id="plan-billing-note">This plan is paused because {_why}</p>'
+    elif camera_entitlement:
+        _grace_end = _billing.grace_ends_at(camera_entitlement.get("payment_failed_at"))
+        _period_end = camera_entitlement.get("current_period_end")
+        if _grace_end:
+            billing_note = ("The latest payment for this plan failed. Your plan stays active until "
+                            f"{_local_date(_grace_end.isoformat())}; please update your payment method before then.")
+        elif camera_entitlement.get("cancel_at_period_end") and _period_end:
+            billing_note = f"This plan is set to end on {_local_date(_period_end)} and will not renew."
+        elif camera_entitlement.get("scheduled_change") == "downgrade_to_local" and camera_entitlement.get("scheduled_change_at"):
+            billing_note = (f"Hybrid stays active until {_local_date(camera_entitlement['scheduled_change_at'])}; "
+                            "then your plan becomes Local.")
+        elif _period_end:
+            billing_note = f"Renews on {_local_date(_period_end)}."
+        if billing_note:
+            billing_note = f'<p class="health-detail" id="plan-billing-note">{billing_note}</p>'
+
 
     # Plan-badge text is deliberately derived from `mode` (product_mode_
     # for_customer(), Hybrid-wins-if-both-active) rather than
@@ -104351,6 +104385,32 @@ def _customer_subscription_portal_page(identity: dict) -> str:
         {"tier_label": t[1], "camera_slot_maximum": t[4], "monthly_retail_usd": t[5]}
         for t in PLAN_TIERS if t[0] == "hybrid" and os.environ.get(t[6], "").strip()
     ]
+    # Self-service plan actions (owner policies 2026-10-02): cancel at period
+    # end / keep the plan, Hybrid -> Local at renewal / keep Hybrid, and the
+    # Customer Portal for card and plan management. Owners only; only actions
+    # that apply right now are shown.
+    plan_actions = ""
+    _actions = []
+    _held_plan = camera_entitlement or suspended_plan
+    if is_owner and _held_plan and _held_plan.get("stripe_subscription_id"):
+        if camera_entitlement and camera_entitlement.get("cancel_at_period_end"):
+            _actions.append('<button class="action-button plan-action" data-endpoint="/api/customer/plan/resume">Keep my plan</button>')
+        elif camera_entitlement:
+            if camera_entitlement["product"] == "camera_slots_hybrid":
+                if camera_entitlement.get("scheduled_change") == "downgrade_to_local":
+                    _actions.append('<button class="action-button plan-action" data-endpoint="/api/customer/plan/cancel-downgrade">Keep Hybrid</button>')
+                else:
+                    _actions.append('<button class="ghost-button plan-action" data-endpoint="/api/customer/plan/downgrade-to-local" '
+                                    'data-confirm="Switch to Local at your next renewal? Hybrid stays active until then.">Switch to Local at renewal</button>')
+            _actions.append('<button class="ghost-button plan-action" data-endpoint="/api/customer/plan/cancel" '
+                            'data-confirm="Cancel your plan? It stays active until the end of the period you have paid for, and you can keep it until then.">Cancel plan</button>')
+    import customer_billing as _customer_billing
+    if is_owner and _customer_billing.portal_enabled() and _customer_billing.stripe_customer_ids_for_customer(customer_id):
+        _actions.append('<button class="ghost-button" id="manage-billing-button">Manage billing</button>')
+    if _actions:
+        plan_actions = ('<div class="plan-actions" id="plan-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">'
+                        + "".join(_actions) + '</div><p id="plan-action-message" class="health-detail" role="status"></p>')
+
     upgrade_tier = None
     import plan_changes
     if mode == "local" and camera_entitlement and is_owner and plan_changes.upgrade_available():
@@ -104481,7 +104541,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     # "Upgrade to Hybrid" below (create_camera_slot_checkout); only tiers
     # with a configured Stripe Price ID are offered, owners only.
     choose_plan_panel = ""
-    if is_owner and not camera_entitlement:
+    if is_owner and not camera_entitlement and not suspended_plan:
         _plan_options = [t for t in PLAN_TIERS if os.environ.get(t[6], "").strip()]
         if _plan_options:
             _options_html = "".join(
@@ -104509,6 +104569,7 @@ def _customer_subscription_portal_page(identity: dict) -> str:
     <section class="panel"><h3 style="margin-top:0">Current plan &middot; <span class="pill">{escape(plan_badge)}</span></h3>
     <p>{plan_summary}</p>
     {billing_note}
+    {plan_actions}
     <p class="health-detail">Your plan as confirmed by our payment provider. Payments and invoices are handled securely by Stripe.</p>
     </section>
     <section class="panel" style="margin-top:14px"><h3 style="margin-top:0">Local vs Hybrid</h3>
@@ -104539,6 +104600,26 @@ def _customer_subscription_portal_page(identity: dict) -> str:
       location.href=r.checkout_url
     };
     document.querySelectorAll('time[data-local-date]').forEach(t=>{const d=new Date(t.getAttribute('datetime'));if(!isNaN(d))t.textContent=d.toLocaleDateString([], {dateStyle:'medium'})});
+    document.querySelectorAll('.plan-action').forEach(button=>{button.onclick=async()=>{
+      const messageEl=document.getElementById('plan-action-message');
+      if(button.dataset.confirm&&!confirm(button.dataset.confirm))return;
+      button.disabled=true;messageEl.textContent='';
+      let response,r;
+      try{response=await fetch(button.dataset.endpoint,{method:'POST'});r=await response.json()}
+      catch(error){button.disabled=false;messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+      messageEl.textContent=r.message||r.detail||'';
+      if(!response.ok){button.disabled=false;return}
+      setTimeout(()=>location.reload(),1200)
+    }});
+    const manageBilling=document.getElementById('manage-billing-button');
+    if(manageBilling)manageBilling.onclick=async()=>{
+      const messageEl=document.getElementById('plan-action-message');manageBilling.disabled=true;
+      let response,r;
+      try{response=await fetch('/api/customer/billing-portal',{method:'POST'});r=await response.json()}
+      catch(error){manageBilling.disabled=false;messageEl.textContent='Could not reach the server. Check the connection and try again.';return}
+      if(!response.ok){manageBilling.disabled=false;messageEl.textContent=r.detail||'Billing management could not be opened.';return}
+      location.href=r.url
+    };
     const subscriptionUpgradeButton=document.getElementById('subscription-upgrade-button');
     if(subscriptionUpgradeButton)subscriptionUpgradeButton.onclick=async()=>{
       const tier_label=subscriptionUpgradeButton.dataset.tierLabel;
@@ -113776,7 +113857,7 @@ def create_camera_slot_checkout(payload: CameraSlotCheckoutModel, request: Reque
     # upgrade of the existing subscription (plan_changes.py), never a second
     # base subscription; any other change of base plan is not self-service.
     from customer_entitlements import BASE_PLAN_PRODUCTS as _BASE, get_entitlements_for_customer as _held
-    _active_base = [e["product"] for e in _held(customer_id) if e["product"] in _BASE and e["status"] == "active"]
+    _active_base = [e["product"] for e in _held(customer_id) if e["product"] in _BASE and e["status"] in ("active", "suspended")]
     if _active_base:
         _current = "Hybrid" if "camera_slots_hybrid" in _active_base else "Local"
         _how = " Use Upgrade to Hybrid on My subscription." if (_current == "Local" and plan_type == "hybrid") else ""
@@ -114828,6 +114909,19 @@ async def stripe_webhook(request: Request) -> dict:
 # A step left 'running' longer than this (its worker crashed or was
 # restarted mid-step) may be claimed again by a redelivery.
 STRIPE_WEBHOOK_STEP_STALE_SECONDS = 300
+BILLING_GRACE_SWEEP_SECONDS = 900
+
+
+async def _billing_grace_worker() -> None:
+    while True:
+        try:
+            import billing_status
+            await asyncio.to_thread(billing_status.sweep_grace)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            structured_log("billing.grace_sweep_failed", level="warning", error=type(error).__name__)
+        await asyncio.sleep(BILLING_GRACE_SWEEP_SECONDS)
 
 
 def _stripe_webhook_steps() -> list:
@@ -114849,6 +114943,10 @@ def _stripe_webhook_steps() -> list:
         # Last, so the hardware order / entitlements it reads already exist.
         from sales_commissions import sync_commissions_from_stripe_event
         sync_commissions_from_stripe_event(event)
+    def billing(event):
+        # Grace after failed payments, refunds and disputes (2026-10-02).
+        from billing_status import sync_from_stripe_event
+        sync_from_stripe_event(event)
 
     return [
         ("legacy_billing", process_stripe_webhook_event),
@@ -114856,6 +114954,7 @@ def _stripe_webhook_steps() -> list:
         ("hardware_orders", hardware),
         ("analytics_entitlements", analytics),
         ("sales_commissions", commissions),
+        ("billing_status", billing),
     ]
 
 

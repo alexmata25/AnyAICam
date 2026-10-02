@@ -145,7 +145,8 @@ def _load_price_map() -> dict:
 
 ANALYTICS_PRICE_MAP = _load_price_map()
 
-SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
+# Ended in Stripe; past_due/unpaid get the 7-day grace (billing_status.py).
+SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "incomplete_expired"}
 
 
 def resolve_addon(price_id: str) -> Optional[dict]:
@@ -389,7 +390,31 @@ def resolve_pending_links_for_customer(customer_id: str, email: str) -> list[str
     return resolved_ids
 
 
+def apply_addon_state(addon: dict, *, status: str, suspended_reason: str | None) -> None:
+    """billing_status: suspend or restore one add-on and its features
+    (features another active add-on grants stay on)."""
+    resolved = resolve_addon(str(addon.get("stripe_price_id") or ""))
+    keys = list(resolved["analytic_keys"]) if resolved else []
+    now = datetime.now().isoformat()
+    with connection() as db:
+        db.execute("UPDATE addon_subscriptions SET status=?,suspended_reason=?,updated_at=? WHERE id=?",
+                   (status, suspended_reason, now, addon["id"]))
+    for analytic_key in keys:
+        feature_status = "active" if status == "active" else "cancelled"
+        if feature_status == "cancelled" and feature_granted_by_other_addon(addon["customer_id"], analytic_key, excluding=addon["addon_key"]):
+            feature_status = "active"
+        upsert_analytics_subscription(customer_id=addon["customer_id"], analytic_key=analytic_key, status=feature_status,
+                                      stripe_customer_id=addon.get("stripe_customer_id"),
+                                      stripe_subscription_id=addon.get("stripe_subscription_id"),
+                                      stripe_price_id=addon.get("stripe_price_id"))
+
+
 def get_active_analytics_for_customer(customer_id: str) -> list[str]:
+    try:
+        import billing_status
+        billing_status.sweep_grace(customer_id=customer_id)
+    except Exception:
+        pass
     """Every analytic_key currently licensed for this customer. 'active'
     here means status != 'cancelled', the exact convention
     customer_analytics_panel.py and customer_platform.py already use
@@ -531,6 +556,10 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     if not owners and (not metadata_customer_id or not row("SELECT id FROM customers WHERE id=?", (metadata_customer_id,))):
         return unresolved("add_on", str(subscription_obj.get("id") or "") or None, stripe_customer_id)
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
+    held = row("SELECT status FROM addon_subscriptions WHERE stripe_subscription_id=? AND addon_key=?",
+               (str(subscription_obj.get("id") or ""), addon["addon_key"]))
+    if held and held["status"] == "suspended" and new_status == "active":
+        new_status = "suspended"  # only billing_status lifts a suspension
     items = ((subscription_obj.get("items") or {}).get("data") or [])
     quantity = _positive_int(items[0].get("quantity")) if items and isinstance(items[0], dict) else None
     subscription_ids = []
@@ -565,8 +594,10 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
             )
         # Overlapping packages: a feature another active package still
         # grants stays active when this package is cancelled.
-        feature_status = new_status
-        if new_status == "cancelled" and feature_granted_by_other_addon(customer_id, analytic_key, excluding=addon["addon_key"]):
+        # A suspended add-on's features are off (the add-on row keeps
+        # 'suspended' and why); another active add-on can still grant them.
+        feature_status = "active" if new_status == "active" else "cancelled"
+        if feature_status == "cancelled" and feature_granted_by_other_addon(customer_id, analytic_key, excluding=addon["addon_key"]):
             feature_status = "active"
         subscription = upsert_analytics_subscription(
             customer_id=customer_id, analytic_key=analytic_key, status=feature_status,

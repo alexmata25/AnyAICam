@@ -1799,6 +1799,17 @@ def apply_migrations():
         if 'stripe_status' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN stripe_status TEXT')
         if 'current_period_end' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN current_period_end INTEGER')
         if 'cancel_at_period_end' not in entitlement_columns: db.execute('ALTER TABLE customer_entitlements ADD COLUMN cancel_at_period_end INTEGER')
+        # Billing policies (2026-10-02, billing_status.py / plan_changes.py):
+        # grace start after a failed payment, why service is suspended
+        # (payment_failed / refunded / disputed), the payment of a one-time
+        # license (refund/dispute association), and a scheduled plan change
+        # (Hybrid -> Local at renewal). Additive.
+        for column, kind in (('payment_failed_at', 'TEXT'), ('suspended_reason', 'TEXT'), ('stripe_payment_intent_id', 'TEXT'),
+                             ('scheduled_change', 'TEXT'), ('scheduled_change_at', 'INTEGER'), ('stripe_schedule_id', 'TEXT')):
+            if column not in entitlement_columns: db.execute(f'ALTER TABLE customer_entitlements ADD COLUMN {column} {kind}')
+        addon_columns=_columns('addon_subscriptions')
+        for column in ('payment_failed_at', 'suspended_reason'):
+            if column not in addon_columns: db.execute(f'ALTER TABLE addon_subscriptions ADD COLUMN {column} TEXT')
         # Visitor Call lifecycle (2026-10-02, aac_voice_call_events.reconcile):
         # last heartbeat from an open call page, why a call closed, and the
         # call that replaced an expired/abandoned one. Additive.

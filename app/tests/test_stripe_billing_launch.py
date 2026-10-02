@@ -59,9 +59,22 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         declines: set = set()  # subscriptions whose next payment Stripe declines
         price_lookup = main.stripe_api_get  # conftest's fake_stripe_prices: published catalog amounts
 
+        portal_config = {"id": "bpc_policy", "features": {
+            "payment_method_update": {"enabled": True},
+            "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+            "subscription_update": {"enabled": True, "proration_behavior": "always_invoice",
+                                    "schedule_at_period_end": {"conditions": [{"type": "decreasing_item_amount"}]}}}}
+        schedules: dict = {}
+
         def fake_get(path):
             if path.startswith("/v1/prices/"):
                 return price_lookup(path)
+            if path.startswith("/v1/billing_portal/configurations"):
+                return {"data": [portal_config]} if "?" in path else portal_config
+            if path.startswith("/v1/subscription_schedules/"):
+                return schedules[path.rsplit("/", 1)[1]]
+            if path.startswith("/v1/invoice_payments") or path.startswith("/v1/invoices/"):
+                return {"data": []}
             if path.startswith("/v1/subscriptions/"):
                 found = stripe.get(path.rsplit("/", 1)[1])
                 if found is None:
@@ -75,6 +88,36 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
             keys.append(idempotency_key)
             if path == "/v1/billing_portal/sessions":
                 return {"id": "bps_1", "url": "https://billing.stripe.test/session"}
+            if path == "/v1/subscription_schedules":  # a schedule taken over from a subscription
+                sub = stripe[dict(fields)["from_subscription"]]
+                schedule_id = f"sub_sched_{sub['id']}"
+                schedules[schedule_id] = {"id": schedule_id, "subscription": sub["id"], "phases": [
+                    {"start_date": sub.get("current_period_start") or 0, "end_date": sub["current_period_end"],
+                     "items": [{"price": sub["items"]["data"][0]["price"]["id"]}]}]}
+                sub["schedule"] = schedule_id
+                return schedules[schedule_id]
+            if path.startswith("/v1/subscription_schedules/") and path.endswith("/release"):
+                schedule_id = path.split("/")[3]
+                found = schedules.pop(schedule_id, None)
+                if found:
+                    stripe[found["subscription"]]["schedule"] = None
+                return {"id": schedule_id, "status": "released"}
+            if path.startswith("/v1/subscription_schedules/"):
+                schedule = schedules[path.rsplit("/", 1)[1]]
+                values = dict(fields)
+                phases = []
+                for n in (0, 1):
+                    if f"phases[{n}][items][0][price]" in values:
+                        start = values.get(f"phases[{n}][start_date]") or (phases[-1]["end_date"] if phases else 0)
+                        phases.append({"start_date": int(start), "end_date": int(values.get(f"phases[{n}][end_date]") or 0),
+                                       "items": [{"price": values[f"phases[{n}][items][0][price]"]}]})
+                schedule["phases"] = phases
+                schedule["fields"] = values
+                return schedule
+            if path.startswith("/v1/subscriptions/") and "cancel_at_period_end" in dict(fields):
+                sub = stripe[path.rsplit("/", 1)[1]]
+                sub["cancel_at_period_end"] = dict(fields)["cancel_at_period_end"] == "true"
+                return sub
             if path.startswith("/v1/subscriptions/"):  # Stripe applies an item price change in place
                 sub = stripe[path.rsplit("/", 1)[1]]
                 values = dict(fields)
@@ -89,7 +132,7 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         monkeypatch.setattr(main, "stripe_api_post", fake_post)
         with TestClient(main.app, follow_redirects=False) as client:
             yield {"client": client, "stripe": stripe, "posts": posts, "path": path, "tmp": tmp_path, "main": main,
-                   "keys": keys, "declines": declines}
+                   "keys": keys, "declines": declines, "portal_config": portal_config, "schedules": schedules}
 
 
 def _deliver(env, event):
@@ -294,8 +337,8 @@ def test_direct_customers_earn_nobody_a_commission_and_partner_customers_still_d
     assert len([e for e in entries if e["kind"] == "activation"]) == 1  # replay never doubles
 
 
-def test_the_owner_portal_is_off_until_the_owner_turns_it_on(env, monkeypatch):
-    monkeypatch.delenv("ANYAICAM_STRIPE_BILLING_PORTAL_ENABLED")
+def test_the_owner_portal_can_be_turned_off(env, monkeypatch):
+    monkeypatch.setenv("ANYAICAM_STRIPE_BILLING_PORTAL_ENABLED", "false")
     env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", "active")
     _deliver(env, _checkout("evt_1"))
     assert env["client"].post("/api/customer/billing-portal", cookies=_cookie(*OWNER_A)).status_code == 404
@@ -447,11 +490,13 @@ def test_two_active_base_plans_never_double_camera_capacity(env):
 @pytest.mark.parametrize("status,cancel_at_end,expect", [
     ("active", False, "Renews on"),
     ("active", True, "will not renew"),
-    ("past_due", False, "could not collect the latest payment"),
+    ("past_due", False, "latest payment for this plan failed"),
 ])
 def test_my_subscription_shows_what_stripe_says_about_the_plan(env, status, cancel_at_end, expect):
-    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", status, cancel_at_end=cancel_at_end)
+    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", "active")
     _deliver(env, _checkout("evt_1"))
+    env["stripe"]["sub_A1"] = _subscription("sub_A1", "cus_A", status, cancel_at_end=cancel_at_end)
+    _deliver(env, _sub_event("evt_2", "updated", env["stripe"]["sub_A1"], 2_000))
     page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
     assert 'id="plan-billing-note"' in page and expect in page
     assert "sub_A1" not in page and "cus_A" not in page  # no Stripe ids or payment details on the page

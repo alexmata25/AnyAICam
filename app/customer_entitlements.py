@@ -189,6 +189,17 @@ def upsert_entitlement(
 
 
 def get_entitlements_for_customer(customer_id: str) -> list:
+    # Access never outlives the failed-payment grace period just because no
+    # event arrived (billing_status.sweep_grace; also run periodically).
+    try:
+        import billing_status
+        billing_status.sweep_grace(customer_id=customer_id)
+    except Exception:
+        pass
+    return _entitlement_rows(customer_id)
+
+
+def _entitlement_rows(customer_id: str) -> list:
     return rows("SELECT * FROM customer_entitlements WHERE customer_id=? ORDER BY created_at", (customer_id,))
 
 
@@ -474,7 +485,10 @@ def resolve_vms_license(price_id: str) -> Optional[dict]:
     entry = PRICE_ID_VMS_LICENSE_MAP.get(price_id or "")
     return dict(entry) if isinstance(entry, dict) else None
 
-SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "unpaid", "incomplete_expired"}
+# A subscription Stripe has ENDED. 'past_due' and 'unpaid' are not here: a
+# failed payment gets the 7-day grace period (owner policy 2026-10-02,
+# billing_status.py), after which the plan is suspended, not cancelled.
+SUBSCRIPTION_INACTIVE_STATUSES = {"canceled", "incomplete_expired"}
 
 
 def resolve_tier(price_id: str) -> Optional[dict]:
@@ -548,6 +562,9 @@ def _extract_checkout_fields(session_obj: dict) -> dict:
         "authoritative_customer_id": str(metadata.get("anyaicam_customer_id") or "") or None,
         "stripe_customer_id": str(session_obj.get("customer") or "") or None,
         "stripe_checkout_session_id": str(session_obj.get("id") or "") or None,
+        # One-time purchases (VMS license): the payment a refund or dispute
+        # names (billing_status.py).
+        "stripe_payment_intent_id": str(session_obj.get("payment_intent") or "") or None,
     }
 
 
@@ -623,6 +640,10 @@ def _sync_checkout_completed(event: dict) -> dict:
     if current is not None:
         record_billing_state(entitlement["id"], current)
         supersede_other_base_plans(entitlement, current)
+    if fields.get("stripe_payment_intent_id") and session_obj.get("mode") == "payment":
+        with connection() as db:
+            db.execute("UPDATE customer_entitlements SET stripe_payment_intent_id=? WHERE id=?",
+                       (fields["stripe_payment_intent_id"], entitlement["id"]))
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"], "customer_id": customer["id"]}
 
 
@@ -681,6 +702,11 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         # giving up.
         existing = row("SELECT * FROM customer_entitlements WHERE customer_id=? AND product=?", (metadata_customer_id, tier["product"]))
     new_status = "cancelled" if (cancelled or subscription_obj.get("status") in SUBSCRIPTION_INACTIVE_STATUSES) else "active"
+    if existing and existing.get("status") == "suspended" and new_status == "active":
+        # Suspended for an unpaid period, a refund or a dispute: only
+        # billing_status lifts that (a payment, a won dispute), never a
+        # subscription update that merely says the subscription exists.
+        new_status = "suspended"
     if not existing:
         known = metadata_customer_id and row("SELECT id FROM customers WHERE id=?", (metadata_customer_id,))
         if not known:
@@ -695,7 +721,7 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
         # SAME product) would arrive with a different tier -- always take
         # the current event's own verified maximum, never carry forward
         # the prior row's value, except on cancellation (0).
-        camera_slot_quantity=0 if new_status == "cancelled" else tier["camera_slot_maximum"],
+        camera_slot_quantity=0 if new_status == "cancelled" else tier["camera_slot_maximum"],  # suspended keeps its size
         status=new_status,
         stripe_customer_id=stripe_customer_id,
         stripe_subscription_id=str(subscription_obj.get("id") or "") or None,
@@ -704,6 +730,8 @@ def _sync_subscription_change(event: dict, *, cancelled: bool) -> dict:
     if current is not None:
         record_billing_state(entitlement["id"], current)
         supersede_other_base_plans(entitlement, current)
+        import plan_changes
+        plan_changes.sync_scheduled_change(entitlement, current)
     return {"status": "entitlement_updated", "entitlement_id": entitlement["id"]}
 
 
@@ -747,7 +775,8 @@ def supersede_other_base_plans(entitlement: dict, subscription: dict) -> list[st
         if other["product"] not in BASE_PLAN_PRODUCTS:
             continue
         with connection() as db:
-            db.execute("UPDATE customer_entitlements SET status='superseded',camera_slot_quantity=0,updated_at=? WHERE id=? AND status='active'",
+            db.execute("UPDATE customer_entitlements SET status='superseded',camera_slot_quantity=0,scheduled_change=NULL,"
+                       "scheduled_change_at=NULL,stripe_schedule_id=NULL,updated_at=? WHERE id=? AND status IN ('active','suspended')",
                        (_now(), other["id"]))
         superseded.append(other["id"])
     return superseded
