@@ -116,6 +116,12 @@ def _require(request: Request, permission: str) -> dict:
         raise HTTPException(status_code=401, detail="Sign in is required.")
     if not allowed(identity, permission):
         raise HTTPException(status_code=403, detail="You do not have permission for this action.")
+    # Users & household (2026-10-01): a household member reaches People only
+    # with the People or Face Access grant, and manages Face Access only with
+    # the Face Access grant the account owner gave them.
+    import household_users
+    if not household_users.facial_permission_allowed(identity, permission):
+        raise HTTPException(status_code=403, detail="You do not have permission for this action.")
     return identity
 
 
@@ -520,6 +526,14 @@ def register_facial_recognition_routes(app: FastAPI, shell: Callable) -> None:
         import face_access_people
         try:
             with connection() as db:
+                if identity.get("role") == "customer_viewer":
+                    # Users & household: a delegated Face Access manager only
+                    # changes grants on doors they may unlock themselves.
+                    import household_users
+                    before = face_access_people.get_access(db, customer_id=resolved, person_id=person_id)
+                    if before is None:
+                        raise LookupError(person_id)
+                    payload = household_users.restrict_face_access_payload(before, payload, household_users.unlockable_door_ids(identity))
                 outcome = face_access_people.save_access(db, customer_id=resolved, person_id=person_id, payload=payload,
                                                           actor=identity.get("email", ""), now=datetime.now().isoformat())
         except LookupError as error:

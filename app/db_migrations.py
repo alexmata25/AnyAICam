@@ -1702,3 +1702,22 @@ def apply_migrations():
         # 'cloud' = a door grant made in the customer portal and mirrored to
         # the appliance by facial_embedding_sync; 'local' = made on the appliance.
         if 'origin' not in facial_rules_columns: db.execute("ALTER TABLE facial_rules ADD COLUMN origin TEXT NOT NULL DEFAULT 'local'")
+
+        # Users & household (2026-10-01, household_users.py): a customer owner
+        # invites household members with a single-use, expiring link instead
+        # of an emailed temporary password. The existing invitations table
+        # gains the link's SHA-256 (never the link itself), the invitee's
+        # name, the permissions to apply on acceptance and the send history;
+        # account-level grants with no per-camera home (People, Face Access,
+        # Backup Mobile Access) get one row per household member. All
+        # nullable/defaulted and additive, so an older build is unaffected.
+        invitation_columns=_columns('invitations')
+        for column,ddl in (('name','TEXT'),('token_hash','TEXT'),('permissions_json','TEXT'),('accepted_at','TEXT'),
+                           ('cancelled_at','TEXT'),('accepted_user_id','TEXT'),('last_sent_at','TEXT'),('send_count','INTEGER')):
+            if column not in invitation_columns: db.execute(f'ALTER TABLE invitations ADD COLUMN {column} {ddl}')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_invitations_token_hash ON invitations(token_hash)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_invitations_customer_status ON invitations(customer_id,status)')
+        db.execute('CREATE TABLE IF NOT EXISTS customer_user_permissions(user_id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,'
+                   'can_people INTEGER NOT NULL DEFAULT 0,can_face_access INTEGER NOT NULL DEFAULT 0,can_backup_access INTEGER NOT NULL DEFAULT 0,'
+                   'updated_at TEXT NOT NULL,updated_by TEXT)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_customer_user_permissions_customer ON customer_user_permissions(customer_id)')
