@@ -302,7 +302,11 @@ def sync_provisioned_cameras() -> dict:
     if not identity:
         return {"status": "not_activated"}
 
-    response = _control_plane_get("/api/appliance/configuration", identity["appliance_id"], identity["credential"])
+    # running_mode (2026-10-02): the mode this VMS process is actually
+    # running -- the cloud's acknowledgment that a Local/Hybrid transition
+    # took effect, and its signal to retry the restart when it has not.
+    response = _control_plane_get("/api/appliance/configuration?running_mode=" + (product_mode.running_mode() or ""),
+                                  identity["appliance_id"], identity["credential"])
     if not isinstance(response, dict):
         return {"status": "unreachable"}
     cloud_cameras = response.get("cameras")

@@ -99,6 +99,26 @@ def current_mode() -> str:
     return bootstrap if bootstrap in VALID_MODES else persisted
 
 
+# The mode this process STARTED in (2026-10-02). Governed flags are read at
+# import, so this -- not the persisted file -- is what the running workers
+# actually follow; edge_camera_sync reports it to the cloud as the
+# acknowledgment of a Local/Hybrid transition.
+RUNNING_MODE = None  # set at import, just below
+
+
+def running_mode() -> str:
+    global RUNNING_MODE
+    if RUNNING_MODE is None:
+        RUNNING_MODE = current_mode() or ""
+    return RUNNING_MODE
+
+
+try:
+    RUNNING_MODE = current_mode() or ""
+except Exception:  # never break import over a missing/unreadable state file
+    RUNNING_MODE = None
+
+
 def is_local() -> bool:
     return current_mode() == "local"
 

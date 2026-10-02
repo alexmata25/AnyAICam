@@ -347,6 +347,45 @@ def _queue_product_mode_restart(db,appliance: dict,new_mode: str) -> dict | None
     }
 
 
+PRODUCT_MODE_RESTART_RETRY_SECONDS=600
+
+
+def _reconcile_running_mode(db,appliance: dict,desired_mode: str,running_mode: str) -> dict | None:
+    """Acknowledgment and retry for a Local/Hybrid transition (2026-10-02).
+    The VMS reports the mode its process is actually running. That is
+    stored as product_mode_applied (the acknowledgment). While it differs
+    from the desired mode in a way that changes behaviour, a restart_vms is
+    queued again -- unless one is already pending/delivered or the last one
+    for a transition was queued within PRODUCT_MODE_RESTART_RETRY_SECONDS.
+    Covers the restart that ran before the VMS had persisted the new mode,
+    and a restart command that expired or failed. The Compose configuration
+    is unchanged: the mode comes from the persisted file at process start."""
+    now=datetime.now()
+    db.execute('UPDATE appliances SET product_mode_applied=?,product_mode_applied_at=? WHERE id=?',(running_mode,now.isoformat(),appliance['id']))
+    if not desired_mode or desired_mode==running_mode or not product_mode.describe_transition(running_mode,desired_mode):
+        return None
+    pending=db.execute("SELECT id FROM appliance_commands WHERE appliance_id=? AND command='restart_vms' AND status IN ('pending','delivered') LIMIT 1",
+                       (appliance['id'],)).fetchone()
+    if pending:
+        return None
+    last=db.execute("SELECT created_at FROM appliance_commands WHERE appliance_id=? AND command='restart_vms' AND created_by='product-mode-transition' "
+                    "ORDER BY created_at DESC LIMIT 1",(appliance['id'],)).fetchone()
+    if last:
+        try:
+            if (now-datetime.fromisoformat(str(last['created_at']))).total_seconds()<PRODUCT_MODE_RESTART_RETRY_SECONDS:
+                return None
+        except ValueError:
+            pass
+    command_id=secrets.token_hex(7)
+    db.execute('INSERT INTO appliance_commands(id,appliance_id,command,payload_json,status,created_at,expires_at,created_by) VALUES(?,?,?,?,?,?,?,?)',
+               (command_id,appliance['id'],'restart_vms',json.dumps({'confirmed':True,'reason':f'product_mode running {running_mode} -> {desired_mode} (retry)'}),
+                'pending',now.isoformat(),(now+timedelta(minutes=60)).isoformat(),'product-mode-transition'))
+    logger.warning('product_mode.restart_retry appliance_id=%s running=%s desired=%s command_id=%s',appliance['id'],running_mode,desired_mode,command_id)
+    return {'actor':{'email':appliance['cloud_id'],'role':'appliance'},'action':'appliance.product_mode_restart_retried',
+            'entity_type':'appliance','entity_id':appliance['id'],
+            'details':{'running_mode':running_mode,'desired_mode':desired_mode,'restart_command_id':command_id}}
+
+
 def _resolve_parent_motion_event(db,camera_id: str,appliance_id: str,parent_local_event_id: str) -> str | None:
     """Resolves a submitted LOCAL parent id (an appliance's own
     local_event_id, never a cloud id) to this exact appliance's own
@@ -785,6 +824,9 @@ def register_appliance_cloud_routes(app: FastAPI,shell: Callable,current_user: C
             # full host reboot. See _queue_product_mode_restart()'s own
             # docstring for the loop-prevention and dedup discipline.
             product_mode_audit=_queue_product_mode_restart(db,appliance,product_mode_value)
+            running_mode=str(request.query_params.get('running_mode') or '').strip().lower()
+            if running_mode in product_mode.VALID_MODES:
+                product_mode_audit=_reconcile_running_mode(db,appliance,product_mode_value,running_mode) or product_mode_audit
         # audit() opens its own connection() -- called only after the
         # `with connection() as db:` block above has closed/committed,
         # never from inside it (see _queue_product_mode_restart()'s own

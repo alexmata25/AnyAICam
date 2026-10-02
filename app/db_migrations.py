@@ -1759,6 +1759,13 @@ def apply_migrations():
         if 'pending_secret_base32' not in mfa_columns: db.execute('ALTER TABLE platform_owner_mfa ADD COLUMN pending_secret_base32 TEXT')
         if 'pending_created_at' not in mfa_columns: db.execute('ALTER TABLE platform_owner_mfa ADD COLUMN pending_created_at TEXT')
 
+        # Product mode acknowledgment (2026-10-02, appliance_cloud.
+        # _reconcile_running_mode): the mode the appliance's VMS reports it
+        # is actually running, and when. Additive.
+        appliance_mode_columns=_columns('appliances')
+        if 'product_mode_applied' not in appliance_mode_columns: db.execute('ALTER TABLE appliances ADD COLUMN product_mode_applied TEXT')
+        if 'product_mode_applied_at' not in appliance_mode_columns: db.execute('ALTER TABLE appliances ADD COLUMN product_mode_applied_at TEXT')
+
         # Loitering (2026-10-01, customer_analytics_rules.py): how long a
         # person must stay inside a zone before it counts (NULL = the rule
         # type's default), and whether the rule notifies anyone -- the event
