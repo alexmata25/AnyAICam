@@ -77,6 +77,9 @@ _PORTAL_AUTH_STYLE = ':root{--navy:#10162d;--blue:#5360df;--pink:#bd2b90}*{box-s
 _PORTAL_AUTH_HELPERS_JS = 'const csrf=()=>{const m=document.cookie.split(\'; \').find(x=>x.startsWith(\'anyaicam_csrf=\'));if(!m)return \'\';let v=decodeURIComponent(m.split(\'=\').slice(1).join(\'=\'));return v.length>=2&&v[0]===\'"\'&&v[v.length-1]===\'"\'?v.slice(1,-1):v};const say=(text,ok)=>{const box=document.getElementById(\'message\');box.textContent=text;box.className=\'message \'+(ok?\'ok\':\'error\');box.style.display=\'block\'};'
 
 
+# Customer-branded sign-in card style, shared with household_users.py's join page.
+CUSTOMER_AUTH_STYLE = ':root{--navy:#10162d;--blue:#5360df;--pink:#bd2b90}*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial;background:#eef3f9;color:#17233e}.head{display:flex;align-items:center;padding:14px clamp(16px,5vw,64px);background:#fff}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--navy);font-weight:900}.brand img{width:50px}.auth-wrap{min-height:calc(100vh - 130px);display:grid;place-items:center;padding:32px 16px}.card{width:100%;max-width:420px;background:#fff;color:#17233e;padding:28px;border-radius:20px;box-shadow:0 20px 60px #05091a25}.card form{display:grid;gap:14px;margin-top:6px}.card label{display:grid;gap:5px;font-weight:700}.card input{padding:12px;border:1px solid #aab7ca;border-radius:9px;font:inherit}.submit{border:0;border-radius:999px;padding:12px;background:linear-gradient(135deg,var(--pink),var(--blue));color:#fff;font-weight:900;cursor:pointer}.message{display:none;padding:10px;background:#ffe8ec;color:#8b1730;border-radius:8px}.back-link{display:block;margin-top:16px;text-align:center;font-weight:700;color:var(--blue);text-decoration:none}'
+
 def _portal_auth_page(title: str, body_html: str, script: str) -> str:
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{escape(title)} | ANY AI CAM</title><style>{_PORTAL_AUTH_STYLE}</style></head><body>'
@@ -363,7 +366,7 @@ def register_cloud_feature_routes(app: FastAPI,shell: Callable):
     # /api/password-reset/complete endpoints above -- no new backend
     # behavior, only a customer-facing frontend for it that stays
     # customer-branded and redirects back to /customer-login.html.
-    _CUSTOMER_AUTH_STYLE = ':root{--navy:#10162d;--blue:#5360df;--pink:#bd2b90}*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial;background:#eef3f9;color:#17233e}.head{display:flex;align-items:center;padding:14px clamp(16px,5vw,64px);background:#fff}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--navy);font-weight:900}.brand img{width:50px}.auth-wrap{min-height:calc(100vh - 130px);display:grid;place-items:center;padding:32px 16px}.card{width:100%;max-width:420px;background:#fff;color:#17233e;padding:28px;border-radius:20px;box-shadow:0 20px 60px #05091a25}.card form{display:grid;gap:14px;margin-top:6px}.card label{display:grid;gap:5px;font-weight:700}.card input{padding:12px;border:1px solid #aab7ca;border-radius:9px;font:inherit}.submit{border:0;border-radius:999px;padding:12px;background:linear-gradient(135deg,var(--pink),var(--blue));color:#fff;font-weight:900;cursor:pointer}.message{display:none;padding:10px;background:#ffe8ec;color:#8b1730;border-radius:8px}.back-link{display:block;margin-top:16px;text-align:center;font-weight:700;color:var(--blue);text-decoration:none}'
+    _CUSTOMER_AUTH_STYLE = CUSTOMER_AUTH_STYLE
 
     @app.get('/customer-forgot-password',response_class=HTMLResponse)
     def customer_forgot_password_page():
