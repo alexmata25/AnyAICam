@@ -135,8 +135,10 @@ def play_for_camera(camera_id: str, outcome: str | None) -> dict:
     if not outcome:
         return {"played": False, "reason": "no_outcome"}
     try:
-        from partner_db import connection
-        with connection() as db:
+        # The plain connection: read only, and never the first thing to
+        # initialize a database target (see household_users._lookup).
+        from database_backend import connect
+        with connect() as db:
             row = db.execute("SELECT * FROM cameras WHERE id=?", (camera_id,)).fetchone()
         return play(dict(row), outcome) if row else {"played": False, "reason": "camera_not_found"}
     except Exception as error:
