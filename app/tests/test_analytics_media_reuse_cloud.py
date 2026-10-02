@@ -267,9 +267,14 @@ def test_disallowed_parent_types_never_resolve(cloud):
                                               ("cam-2", "c3", "people_counting_in", "ppe-1")):
         assert _sync(cloud, camera, child, child_type, parent=parent).status_code == 200
         assert _share(cloud, camera, child, parent).status_code == 409, child
-    # Other event types (not a YOLO class) still can't use the shared route at all.
+    # A plate may share clips since 2026-10-02 (test_lpr_media_reuse.py), but
+    # never a Motion clip: refused like every other disallowed parent.
     assert _sync(cloud, "cam-1", "plate-1", "plate", parent="motion-1").status_code == 200
-    assert _share(cloud, "cam-1", "plate-1", "motion-1").status_code == 403
+    assert _share(cloud, "cam-1", "plate-1", "motion-1").status_code == 409
+    assert _media("plate-1") is None
+    # Event types that never share (not in ANALYTICS_MEDIA_PARENT_TYPES) still can't use the route at all.
+    assert _sync(cloud, "cam-1", "health-1", "camera_offline", parent="motion-1").status_code == 200
+    assert _share(cloud, "cam-1", "health-1", "motion-1").status_code == 403
 
 
 def test_a_shared_row_is_never_shared_again(cloud):

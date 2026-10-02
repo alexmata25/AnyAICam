@@ -390,7 +390,17 @@ ANALYTICS_MEDIA_PARENT_TYPES={
     # (2026-10-01): the clip covering the crossing -- the person's own AI
     # activity, or another rule event that had to build one.
     **{event_type:AI_CLIP_PARENT_TYPES|RULE_EVENT_TYPES for event_type in ('line_crossing','intrusion','intrusion_alarm','loitering')},
+    # License plates (2026-10-02): a plate read shows the clip already
+    # covering it (the vehicle's own AI activity, a rule event's, or another
+    # plate's), and builds its own when none does. Before, 'plate' was in
+    # neither direction of this table, so a plate's shared clip was refused
+    # and retried forever, and so was any event whose covering clip happened
+    # to be a plate's. Same camera/appliance/tenant, moment-inside-the-clip
+    # and one-level (an original upload only) checks as every other type.
+    'plate':AI_CLIP_PARENT_TYPES|RULE_EVENT_TYPES|{'plate'},
 }
+for _child_type in list(ANALYTICS_MEDIA_PARENT_TYPES):
+    ANALYTICS_MEDIA_PARENT_TYPES[_child_type]=frozenset(ANALYTICS_MEDIA_PARENT_TYPES[_child_type])|{'plate'}
 
 
 def _resolve_parent_event(db,camera_id: str,appliance_id: str,parent_local_event_id: str,child_event_type: str) -> str | None:
