@@ -75,6 +75,9 @@ def _grant_slots(db_path, customer_id, quantity, *, product="camera_slots_local"
     with override_target(sqlite_path=str(db_path)):
         import customer_entitlements as ce
         ce.upsert_entitlement(customer_id=customer_id, product=product, camera_slot_quantity=quantity, status="active")
+        # These tests are about camera-plan slots; give the account a matching
+        # VMS software license so usable capacity equals the plan (2026-10-01).
+        ce.upsert_entitlement(customer_id=customer_id, product=ce.VMS_LICENSE_PRODUCT, camera_slot_quantity=quantity, status="active")
 
 
 def _owner_cookie(customer_id="cust-1", email="slot-test@example.test"):
@@ -169,7 +172,8 @@ def test_zero_active_slots_blocks_the_first_camera(client, db_path):
 
     response = _provision_request(client, appliance_id="appl-1", device_key="dev-1")
     assert response.status_code == 403
-    assert "licensed for 0 camera" in response.json()["detail"]
+    # No plan and no VMS license: the refusal names the missing license.
+    assert "VMS software license is required" in response.json()["detail"]
 
 
 def test_reconnecting_an_existing_camera_is_never_blocked_by_the_slot_limit(client, db_path):
