@@ -282,6 +282,14 @@ def register_partner_routes(app: FastAPI, shell: Callable) -> None:
 
     @app.post('/partner-logout')
     def partner_logout(request: Request):
+        # One sign-out (2026-10-01): inside the full app this is exactly
+        # /logout -- both sessions revoked, both cookies cleared, role-based
+        # landing (main.perform_logout). Only a bare test app without main
+        # keeps the partner-only fallback below.
+        import sys
+        main_module=sys.modules.get('main')
+        if main_module is not None and hasattr(main_module,'perform_logout'):
+            return main_module.perform_logout(request)
         identity=_identity(request)
         if identity and identity.get('session_id'):
             with connection() as db: db.execute('UPDATE user_sessions SET revoked_at=? WHERE id=?',(datetime.now().isoformat(),identity['session_id']))
