@@ -16,10 +16,19 @@ Hybrid price of the same camera tier, and applies Stripe's answer (Hybrid
 active, Local superseded on that subscription). The webhook that follows is
 idempotent with this.
 
-What happens to the money for the rest of the current period is the owner's
-proration decision, not decided here: ANYAICAM_STRIPE_UPGRADE_PRORATION must
-be set to a Stripe proration_behavior (create_prorations, always_invoice or
-none). Until it is, the upgrade is refused and its button is not shown.
+Owner decision (2026-10-02): the upgrade takes effect immediately, Stripe
+prorates the price difference for the rest of the current period and
+invoices it now (proration_behavior=always_invoice), and the renewal date is
+unchanged (billing_cycle_anchor=unchanged).
+
+payment_behavior=pending_if_incomplete: Stripe applies the new price only if
+that immediate proration payment succeeds. If it does not, nothing changes --
+the customer stays on Local and is told the payment did not go through. (Not
+a grace policy: Hybrid is simply never granted on an unpaid upgrade.)
+
+Repeated or concurrent requests reach Stripe with the same Idempotency-Key
+(per subscription and price change), and a request that finds the
+subscription already on Hybrid sends nothing: one change, one charge.
 """
 from __future__ import annotations
 
@@ -30,17 +39,15 @@ from fastapi import FastAPI, HTTPException, Request
 
 from partner_db import audit
 
-PRORATION_ENV = "ANYAICAM_STRIPE_UPGRADE_PRORATION"
-PRORATION_CHOICES = ("create_prorations", "always_invoice", "none")
-
-
-def upgrade_proration() -> str | None:
-    value = os.environ.get(PRORATION_ENV, "").strip().lower()
-    return value if value in PRORATION_CHOICES else None
+UPGRADE_PRORATION_BEHAVIOR = "always_invoice"  # owner, 2026-10-02: prorate and invoice now
+UPGRADE_BILLING_CYCLE_ANCHOR = "unchanged"     # owner, 2026-10-02: renewal date unchanged
+UPGRADE_PAYMENT_BEHAVIOR = "pending_if_incomplete"
 
 
 def upgrade_available() -> bool:
-    return upgrade_proration() is not None
+    """The upgrade is offered (button shown) whenever a Hybrid price exists
+    for the customer's tier -- checked by the page; the policy is decided."""
+    return True
 
 
 def _hybrid_tier_for(camera_slots: int):
@@ -53,9 +60,6 @@ def upgrade_to_hybrid(identity: dict) -> dict:
     import stripe_state
     main = sys.modules.get("main")
     customer_id = identity["customer_id"]
-    proration = upgrade_proration()
-    if proration is None:
-        raise HTTPException(status_code=503, detail="Upgrading to Hybrid online is not available yet. Please contact AnyAiCam support.")
     held = {e["product"]: e for e in ce.get_entitlements_for_customer(customer_id) if e["status"] == "active"}
     if "camera_slots_hybrid" in held:
         return {"status": "already_hybrid", "message": "Your account is already on Hybrid."}
@@ -96,18 +100,29 @@ def upgrade_to_hybrid(identity: dict) -> dict:
         current = main.stripe_api_post(f"/v1/subscriptions/{subscription_id}", [
             ("items[0][id]", str(item["id"])),
             ("items[0][price]", hybrid_price),
-            ("proration_behavior", proration),
+            ("proration_behavior", UPGRADE_PRORATION_BEHAVIOR),
+            ("billing_cycle_anchor", UPGRADE_BILLING_CYCLE_ANCHOR),
+            ("payment_behavior", UPGRADE_PAYMENT_BEHAVIOR),
             ("metadata[anyaicam_customer_id]", customer_id),
             ("metadata[anyaicam_stripe_price_id]", hybrid_price),
             ("metadata[anyaicam_camera_slot_plan_type]", "hybrid"),
             ("metadata[anyaicam_camera_slot_maximum]", str(camera_slot_maximum)),
-        ])
+        ], idempotency_key=f"anyaicam-upgrade-{subscription_id}-{item['id']}-{hybrid_price}")
+        moved = [i for i in ((current.get("items") or {}).get("data") or [])
+                 if isinstance(i, dict) and str((i.get("price") or {}).get("id") or "") == hybrid_price]
+        if not moved or current.get("pending_update"):
+            # pending_if_incomplete: the proration payment did not go
+            # through, so Stripe kept the subscription on Local.
+            audit(identity, "customer.plan_upgrade_payment_incomplete", "customer", customer_id, {"to": "hybrid"})
+            raise HTTPException(status_code=402, detail="The payment for the upgrade didn't go through, so your plan is still Local. "
+                                                        "Please check your payment method and try again.")
     # Apply what Stripe now says (Hybrid active, Local superseded); the
     # webhook for the same change is idempotent with this.
     ce._sync_subscription_change({"id": f"upgrade:{subscription_id}", "type": "customer.subscription.updated",
                                   "data": {"object": current}}, cancelled=False)
     audit(identity, "customer.plan_upgraded", "customer", customer_id,
-          {"from": "local", "to": "hybrid", "camera_slots": camera_slot_maximum, "proration_behavior": proration})
+          {"from": "local", "to": "hybrid", "camera_slots": camera_slot_maximum,
+           "proration_behavior": UPGRADE_PRORATION_BEHAVIOR, "billing_cycle_anchor": UPGRADE_BILLING_CYCLE_ANCHOR})
     return {"status": "upgraded", "message": f"Your plan is now Hybrid ({tier_label} cameras)."}
 
 

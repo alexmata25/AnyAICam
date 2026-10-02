@@ -127,7 +127,6 @@ def test_local_vs_hybrid_comparison_is_always_shown(http_client, db_path):
 
 def test_upgrade_panel_shown_for_a_local_customer_with_a_priced_hybrid_tier(http_client, db_path, monkeypatch):
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")  # upgrading is offered once the owner has chosen proration
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
@@ -162,7 +161,6 @@ def test_upgrade_button_upgrades_the_existing_subscription(http_client, db_path,
     subscription (plan_changes.py), never a second Hybrid checkout that left
     Local billing too."""
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()
@@ -298,7 +296,6 @@ def test_viewer_sees_the_new_page_with_real_data_but_no_purchase_actions(http_cl
 
 def test_owner_still_sees_purchase_actions_unaffected_by_the_viewer_fix(http_client, db_path, monkeypatch):
     monkeypatch.setenv("ANYAICAM_STRIPE_PRICE_HYBRID_1_8", "price_test_hybrid_1_8")
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
     conn = sqlite3.connect(db_path)
     _seed_tenant(conn, "cust-1")
     conn.commit()

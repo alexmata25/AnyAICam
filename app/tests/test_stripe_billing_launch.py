@@ -55,6 +55,8 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         monkeypatch.setattr(ce, "PRICE_ID_CAMERA_SLOT_MAP", ce._load_price_tier_map())
         stripe: dict = {}
         posts: list = []
+        keys: list = []  # Idempotency-Key per Stripe write
+        declines: set = set()  # subscriptions whose next payment Stripe declines
         price_lookup = main.stripe_api_get  # conftest's fake_stripe_prices: published catalog amounts
 
         def fake_get(path):
@@ -68,13 +70,16 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
                 return found
             raise AssertionError(f"unexpected Stripe GET {path}")
 
-        def fake_post(path, fields):
+        def fake_post(path, fields, idempotency_key=None):
             posts.append((path, dict(fields)))
+            keys.append(idempotency_key)
             if path == "/v1/billing_portal/sessions":
                 return {"id": "bps_1", "url": "https://billing.stripe.test/session"}
             if path.startswith("/v1/subscriptions/"):  # Stripe applies an item price change in place
                 sub = stripe[path.rsplit("/", 1)[1]]
                 values = dict(fields)
+                if sub["id"] in declines and values.get("payment_behavior") == "pending_if_incomplete":
+                    return dict(sub, pending_update={"subscription_items": [{"price": values["items[0][price]"]}]})
                 item = next(i for i in sub["items"]["data"] if i.get("id") == values["items[0][id]"])
                 item["price"] = {"id": values["items[0][price]"]}
                 sub["metadata"].update({k[len("metadata["):-1]: v for k, v in values.items() if k.startswith("metadata[")})
@@ -83,7 +88,8 @@ def env(tmp_path, monkeypatch, fake_stripe_prices):
         monkeypatch.setattr(main, "stripe_api_get", fake_get)
         monkeypatch.setattr(main, "stripe_api_post", fake_post)
         with TestClient(main.app, follow_redirects=False) as client:
-            yield {"client": client, "stripe": stripe, "posts": posts, "path": path, "tmp": tmp_path, "main": main}
+            yield {"client": client, "stripe": stripe, "posts": posts, "path": path, "tmp": tmp_path, "main": main,
+                   "keys": keys, "declines": declines}
 
 
 def _deliver(env, event):
@@ -344,14 +350,18 @@ def _capacity(env, customer_id="cust-A"):
         return ce.total_camera_slots(customer_id), ce.product_mode_for_customer(customer_id)
 
 
-def test_local_to_hybrid_upgrades_the_same_subscription_to_one_base_plan(env, monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "create_prorations")
+def test_local_to_hybrid_upgrades_the_same_subscription_to_one_base_plan(env):
     _local_customer(env)
     response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
     assert response.status_code == 200, response.text
     changes = [p for p in env["posts"] if p[0] == "/v1/subscriptions/sub_A1"]
     assert len(changes) == 1 and changes[0][1]["items[0][id]"] == "si_sub_A1" and changes[0][1]["items[0][price]"] == HYBRID_8
-    assert changes[0][1]["proration_behavior"] == "create_prorations"
+    # Owner, 2026-10-02: immediate, prorated and invoiced now, renewal date unchanged,
+    # applied only if that payment succeeds.
+    assert changes[0][1]["proration_behavior"] == "always_invoice"
+    assert changes[0][1]["billing_cycle_anchor"] == "unchanged"
+    assert changes[0][1]["payment_behavior"] == "pending_if_incomplete"
+    assert env["keys"][env["posts"].index(changes[0])] == f"anyaicam-upgrade-sub_A1-si_sub_A1-{HYBRID_8}"
     assert not [p for p in env["posts"] if p[0] == "/v1/checkout/sessions"]  # no second subscription
     assert _plan(env["path"], product="camera_slots_hybrid")["status"] == "active"
     assert _plan(env["path"], product="camera_slots_local")["status"] == "superseded"
@@ -364,17 +374,28 @@ def test_local_to_hybrid_upgrades_the_same_subscription_to_one_base_plan(env, mo
     assert _capacity(env) == (8, "hybrid")
 
 
-def test_the_upgrade_waits_for_the_owners_proration_decision(env, monkeypatch):
-    monkeypatch.delenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", raising=False)
+def test_a_declined_upgrade_payment_leaves_the_customer_on_local(env):
     _local_customer(env)
+    env["declines"].add("sub_A1")
     response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
-    assert response.status_code == 503 and not [p for p in env["posts"] if p[0].startswith("/v1/subscriptions/")]
-    page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
-    assert 'id="subscription-upgrade-button"' not in page  # never a button that would be refused
+    assert response.status_code == 402 and "still Local" in response.json()["detail"]
+    assert _plan(env["path"])["status"] == "active" and _plan(env["path"], product="camera_slots_hybrid") is None
+    assert _capacity(env) == (8, "local")
 
 
-def test_the_upgrade_button_appears_once_upgrading_is_available(env, monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
+def test_repeated_upgrade_requests_reach_stripe_as_one_operation(env):
+    """Two requests that both find the subscription still on Local (a double
+    click, a retry after a lost response, two workers) send the same
+    Idempotency-Key, so Stripe performs and charges the change once."""
+    _local_customer(env)
+    env["declines"].add("sub_A1")  # the first attempt is not applied...
+    env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))
+    upgrade_keys = [k for (path, _), k in zip(env["posts"], env["keys"]) if path == "/v1/subscriptions/sub_A1"]
+    assert len(upgrade_keys) == 2 and len(set(upgrade_keys)) == 1  # ...and a repeat is the same Stripe operation
+
+
+def test_the_upgrade_button_uses_the_in_place_upgrade(env):
     _local_customer(env)
     page = env["client"].get("/subscription-portal", cookies=_cookie(*OWNER_A)).text
     assert 'id="subscription-upgrade-button"' in page and "/api/customer/plan/upgrade-to-hybrid" in page
@@ -390,8 +411,7 @@ def test_hybrid_checkout_while_local_is_active_is_refused_and_points_to_the_upgr
 
 
 @pytest.mark.parametrize("cookie", [("viewer@example.test", "customer_viewer", "cust-A"), ("b@example.test", "customer_owner", "cust-B")])
-def test_only_the_accounts_owner_can_upgrade_and_never_another_accounts_subscription(env, monkeypatch, cookie):
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
+def test_only_the_accounts_owner_can_upgrade_and_never_another_accounts_subscription(env, cookie):
     _local_customer(env)
     response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*cookie))
     assert response.status_code in (403, 409)
@@ -399,8 +419,7 @@ def test_only_the_accounts_owner_can_upgrade_and_never_another_accounts_subscrip
     assert _plan(env["path"])["status"] == "active"
 
 
-def test_an_upgrade_is_refused_if_stripe_no_longer_matches_the_account(env, monkeypatch):
-    monkeypatch.setenv("ANYAICAM_STRIPE_UPGRADE_PRORATION", "none")
+def test_an_upgrade_is_refused_if_stripe_no_longer_matches_the_account(env):
     _local_customer(env)
     env["stripe"]["sub_A1"]["metadata"]["anyaicam_customer_id"] = "cust-B"  # tampered / reassigned in Stripe
     response = env["client"].post("/api/customer/plan/upgrade-to-hybrid", cookies=_cookie(*OWNER_A))

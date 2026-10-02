@@ -19447,15 +19447,7 @@ def require_stripe_price_matches_catalog(price_id: str, expected_cents: int, int
     _VERIFIED_STRIPE_PRICES[key] = True
 
 
-def stripe_api_post(path: str, fields: list[tuple[str, str]]) -> dict:
-
-
-
-
-
-
-
-
+def stripe_api_post(path: str, fields: list[tuple[str, str]], *, idempotency_key: str | None = None) -> dict:
     if not STRIPE_SECRET_KEY:
 
 
@@ -19574,68 +19566,16 @@ def stripe_api_post(path: str, fields: list[tuple[str, str]]) -> dict:
 
 
             "Content-Type": "application/x-www-form-urlencoded",
-
-
-
-
-
-
-
-
             "User-Agent": f"AnyAiCam-VMS/{APP_VERSION}",
-
-
-
-
-
-
-
-
         },
-
-
-
-
-
-
-
-
     )
-
-
-
-
-
-
-
-
+    if idempotency_key:
+        # Stripe returns the first result for a repeated key instead of
+        # performing the operation again (2026-10-02: plan upgrades).
+        request.add_header("Idempotency-Key", idempotency_key)
     try:
-
-
-
-
-
-
-
-
         with urlopen(request, timeout=20) as response:
-
-
-
-
-
-
-
-
             return json.loads(response.read().decode("utf-8"))
-
-
-
-
-
-
-
-
     except HTTPError as exc:
 
 
