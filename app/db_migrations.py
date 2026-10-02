@@ -1791,6 +1791,13 @@ def apply_migrations():
         if 'onboarding_channel' not in _columns('customers'): db.execute('ALTER TABLE customers ADD COLUMN onboarding_channel TEXT')
         # AACO door unlock confirmations (2026-10-02, aaco_door_confirm.py):
         # hashed one-use tokens, bound to customer + person + door. Additive.
+        # Visitor Call lifecycle (2026-10-02, aac_voice_call_events.reconcile):
+        # last heartbeat from an open call page, why a call closed, and the
+        # call that replaced an expired/abandoned one. Additive.
+        call_columns=_columns('aac_voice_call_events')
+        if 'last_heartbeat_at' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN last_heartbeat_at TEXT')
+        if 'end_reason' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN end_reason TEXT')
+        if 'superseded_by' not in call_columns: db.execute('ALTER TABLE aac_voice_call_events ADD COLUMN superseded_by TEXT')
         db.execute('CREATE TABLE IF NOT EXISTS aaco_door_unlock_confirmations(token_hash TEXT PRIMARY KEY,customer_id TEXT NOT NULL,'
                    'user_email TEXT NOT NULL,door_camera_id TEXT NOT NULL,door_name TEXT,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,'
                    'consumed_at TEXT)')

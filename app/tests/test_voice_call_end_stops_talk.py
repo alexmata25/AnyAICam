@@ -55,7 +55,8 @@ def test_page_script_uses_the_shared_controls():
     # Rendered disabled, with "Call ended." visible, for a call that is already over.
     assert "{' disabled' if call_over else ''}>Answer</button>" in source
     assert "{' disabled' if call_over else ''}>End call</button>" in source
-    assert "{'' if call_over else ' hidden'}><strong>Call ended.</strong>" in source
+    # The closed note says why (2026-10-02): ended, missed, or connection lost.
+    assert "{'' if call_over else ' hidden'}><strong>{esc(_closed_label(event))}</strong>" in source
     assert 'call_over = (event.get("state") or "") in ("ended", "dismissed", "missed")' in source
 
 

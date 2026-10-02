@@ -172,6 +172,10 @@ def ingest_edge_visitor_utterance(*, customer_id: str, camera_id: str, trigger_d
     if not trigger_detection_event_id:
         return {"status": "skipped", "skipped_reason": "session_not_found"}
     session = store.get_event_by_trigger_detection(customer_id=customer_id, detection_event_id=trigger_detection_event_id)
+    if not session:
+        # This trigger joined the camera's live call (one call per visit):
+        # its words belong to that call.
+        session = store.active_call_for_camera(customer_id=customer_id, camera_id=camera_id)
     if not session or session.get("camera_id") != camera_id:
         return {"status": "skipped", "skipped_reason": "session_not_found"}
     try:
@@ -245,10 +249,80 @@ def _authorized_event(identity: dict, event_id: str) -> dict:
     (customer_id in the WHERE clause) AND the signed-in person's camera
     grant. Both failures answer the same 404, so an ID never reveals that
     a call exists on a camera this person may not see."""
+    store.reconcile(customer_id=identity["customer_id"])  # expired/abandoned calls first (lifecycle)
     event = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"])
     if not event or not camera_permitted(identity, event["camera_id"]):
         raise HTTPException(status_code=404, detail="AAC Voice Call event not found.")
     return event
+
+
+# Camera-side "Call ended" (2026-10-02): when the owner ends a Visitor Call
+# the visitor hears it, through the camera speaker path the greeting
+# already uses (espeak-ng TTS -> ISAPI two-way audio,
+# aac_voice_call_greeting). The text is fixed here: a cloud message only
+# ever names the camera, never what to say.
+CALL_ENDED_TEXT = "Call ended."
+
+# The selected Visitor Call chime (AAC_Visitor_Call_Chime.wav, the
+# original file, never re-encoded): played by the call page while the call
+# rings.
+CHIME_FILENAME = "AAC_Visitor_Call_Chime.wav"
+
+
+def _closed_label(event: dict) -> str:
+    if event.get("state") == "missed":
+        return "Missed call." if event.get("end_reason") != "unanswered_timeout" else "Missed call: nobody answered in time."
+    if event.get("end_reason") == "connection_lost":
+        return "Call ended: the connection was lost."
+    return "Call ended."
+
+
+def speak_call_ended(*, camera_id: str, event_id: str = "", customer_id: str | None = None, provider=None) -> dict:
+    """Plays CALL_ENDED_TEXT on a camera this process reaches directly (the
+    edge, or a combined process). Never raises."""
+    try:
+        camera = row("SELECT id,customer_id FROM cameras WHERE id=?", (camera_id,))
+        if not camera or (customer_id and camera["customer_id"] != customer_id):
+            return {"delivered": False, "reason": "camera_not_found"}
+        volume = store.resolve_greeting_volume(customer_id=camera["customer_id"], camera_id=camera_id)
+        result = (provider or aac_voice_call_greeting.get_provider()).speak(aac_voice_call_greeting.GreetingRequest(
+            camera_id=camera_id, customer_id=camera["customer_id"], event_id=event_id or "", text=CALL_ENDED_TEXT,
+            reason="aac_voice_call_ended", volume=volume,
+        ))
+        return {"delivered": bool(getattr(result, "delivered", False)), "reason": getattr(result, "suppressed_reason", None)}
+    except Exception as error:  # feedback must never break ending the call
+        logger.warning("aac_voice_call.call_ended_feedback_failed camera_id=%s error=%s", camera_id, type(error).__name__)
+        return {"delivered": False, "reason": "error"}
+
+
+def _runtime_role() -> str:
+    from cloud_config import settings as _settings
+    return _settings.runtime_role
+
+
+def _call_ended_feedback(event: dict, identity: dict) -> str:
+    """After the owner ends a call: tell the camera's appliance over its
+    open control channel (appliance_control, the same real-time path the
+    portal's door unlock uses) or, when this process reaches the camera
+    itself, speak it here. Never blocks or fails the End request."""
+    try:
+        camera = row("SELECT id,appliance_id,talk_down_supported FROM cameras WHERE id=? AND customer_id=?",
+                     (event["camera_id"], identity["customer_id"]))
+        if not camera or camera.get("talk_down_supported") != 1:
+            return "camera_has_no_speaker"
+        if _runtime_role() == "cloud":
+            import appliance_control
+            sent = appliance_control.send(camera["appliance_id"], {"type": "voice_call_ended", "camera_id": camera["id"],
+                                                                   "event_id": event["id"]})
+            return "sent_to_appliance" if sent else "appliance_not_connected"
+        import threading
+        threading.Thread(target=speak_call_ended, kwargs={"camera_id": camera["id"], "event_id": event["id"],
+                                                          "customer_id": identity["customer_id"]},
+                         name=f"aac-call-ended-{camera['id']}", daemon=True).start()
+        return "spoken_locally"
+    except Exception as error:
+        logger.warning("aac_voice_call.call_ended_feedback_failed event_id=%s error=%s", event.get("id"), type(error).__name__)
+        return "error"
 
 
 def _authorized_camera(customer_id: str, camera_id: str) -> dict:
@@ -341,6 +415,14 @@ def trigger_visitor_event(
     classifier = classifier or DeterministicVisitorIntentClassifier()
     intent_result = classifier.classify(transcript_text)
 
+    # One live call per camera (2026-10-02): a visitor still ringing or
+    # talking on this camera is the same visit -- never a second ring.
+    active = store.active_call_for_camera(customer_id=customer_id, camera_id=camera_id)
+    if active:
+        return {"event_id": active["id"], "joined_active_call": True, "intent": active.get("intent"),
+                "intent_confidence": active.get("intent_confidence"), "notifications_created": 0,
+                "notification_id": active.get("notification_id")}
+
     event_id = store.create_voice_call_event(
         customer_id=customer_id,
         site_id=camera["site_id"],
@@ -352,6 +434,7 @@ def trigger_visitor_event(
         thumbnail_s3_key=thumbnail_s3_key,
         actor=actor,
     )
+    store.mark_superseded(customer_id=customer_id, camera_id=camera_id, new_event_id=event_id)
 
     appliance = {"customer_id": customer_id, "site_id": camera["site_id"]}
     event = {
@@ -427,6 +510,10 @@ def handle_person_detected(
 
     camera = _authorized_camera(customer_id, camera_id)
 
+    active = store.active_call_for_camera(customer_id=customer_id, camera_id=camera_id)
+    if active:  # the same visit is still ringing/talking: no second call
+        return {"triggered": False, "skipped_reason": "call_in_progress", "event_id": active["id"]}
+
     event_id = store.create_voice_call_event(
         customer_id=customer_id,
         site_id=camera["site_id"],
@@ -436,6 +523,7 @@ def handle_person_detected(
         trigger_source="detection",
         actor=actor,
     )
+    store.mark_superseded(customer_id=customer_id, camera_id=camera_id, new_event_id=event_id)
 
     greeting_text = store.resolve_greeting_text(customer_id=customer_id, camera_id=camera_id, site_id=camera["site_id"])
     greeting_result = None
@@ -644,6 +732,10 @@ def ingest_edge_visitor_event(
         return {"status": "skipped", "skipped_reason": "camera_not_found"}
 
     stale = _edge_trigger_is_stale(event_timestamp, now or datetime.now())
+    if not stale:
+        active = store.active_call_for_camera(customer_id=customer_id, camera_id=camera_id)
+        if active:  # same visit already ringing/talking: its transcripts join it
+            return {"status": "joined_active_call", "event_id": active["id"]}
     try:
         event_id = store.create_voice_call_event(
             customer_id=customer_id,
@@ -661,6 +753,7 @@ def ingest_edge_visitor_event(
         if existing:
             return {"status": "duplicate", "event_id": existing["id"]}
         raise
+    store.mark_superseded(customer_id=customer_id, camera_id=camera_id, new_event_id=event_id)
 
     if greeting_delivered and greeting_text_used:
         store.stamp_greeted(event_id=event_id, customer_id=customer_id, greeting_text_used=greeting_text_used)
@@ -867,8 +960,86 @@ function releaseCallMicrophone() {
 function stopCallTalk() {
   (window.anyaicamTalkStops || []).forEach(stopTalk => { try { stopTalk(); } catch (e) {} });
 }
+// Visitor chime (2026-10-02): loops while the call rings, stops on answer,
+// end or any close. Browsers may block sound until the person interacts
+// with the page; then a note asks for a tap -- the call itself keeps working.
+// The call page defines callInitialState/callHeartbeatSeconds/callChimeUrl;
+// an embedding without them (e.g. a test harness) gets the original
+// controls only -- no chime, no timers.
+const callLifecycle = typeof callInitialState === 'string';
+const callChime = (callLifecycle && typeof Audio === 'function') ? new Audio(callChimeUrl) : null;
+if (callChime) { callChime.loop = true; callChime.preload = 'auto'; }
+let chimeWanted = false;
+function startChime() {
+  if (!callChime || callEnded) return;
+  chimeWanted = true;
+  let attempt;
+  try { attempt = callChime.play(); } catch (e) { attempt = Promise.reject(e); }
+  Promise.resolve(attempt).then(() => {
+    const note = document.getElementById('voice-call-sound-note'); if (note) note.hidden = true;
+  }).catch(() => {
+    const note = document.getElementById('voice-call-sound-note'); if (note && chimeWanted) note.hidden = false;
+  });
+}
+function stopChime() {
+  chimeWanted = false;
+  if (callChime) { try { callChime.pause(); callChime.currentTime = 0; } catch (e) {} }
+  const note = document.getElementById('voice-call-sound-note'); if (note) note.hidden = true;
+}
+if (typeof document.addEventListener === 'function') {
+  document.addEventListener('pointerdown', () => { if (chimeWanted && callChime && callChime.paused) startChime(); });
+}
+let heartbeatTimer = null, ringPollTimer = null;
+function stopCallTimers() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  if (ringPollTimer) { clearInterval(ringPollTimer); ringPollTimer = null; }
+}
+function closedMessage(state) {
+  return state === 'missed' ? 'Missed call.' : 'Call ended.';
+}
+function applyServerState(state) {
+  if (!state || callEnded) return;
+  const label = document.getElementById('voice-call-state');
+  if (label) label.textContent = state;
+  if (state === 'answered') { stopChime(); startHeartbeat(); return; }
+  if (state === 'triggered' || state === 'notified') return;
+  const note = document.getElementById('voice-call-ended');
+  if (note) note.innerHTML = '<strong>' + closedMessage(state) + '</strong>';
+  finishCallLocally(state);
+}
+async function sendHeartbeat() {
+  try {
+    const response = await fetch(`/api/customer/aac/voice-call/events/${eventId}/heartbeat`, {method: 'POST'});
+    if (response.status === 404) { applyServerState('ended'); return; }
+    if (!response.ok) return;  // transient: try again on the next beat
+    const data = await response.json();
+    if (data.state !== 'answered') applyServerState(data.state);
+  } catch (e) { /* offline for a moment: the next beat reconnects */ }
+}
+function startHeartbeat() {
+  if (ringPollTimer) { clearInterval(ringPollTimer); ringPollTimer = null; }
+  if (!callLifecycle || heartbeatTimer || callEnded) return;
+  sendHeartbeat();
+  heartbeatTimer = setInterval(sendHeartbeat, Math.max(5, callHeartbeatSeconds) * 1000);
+}
+async function pollRinging() {
+  try {
+    const response = await fetch(`/api/customer/aac/voice-call/events/${eventId}`);
+    if (response.status === 404) { applyServerState('ended'); return; }
+    if (!response.ok) return;
+    applyServerState((await response.json()).state);
+  } catch (e) {}
+}
+if (typeof document.addEventListener === 'function') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || callEnded) return;
+    if (heartbeatTimer) sendHeartbeat(); else pollRinging();  // back from the background: reconnect now
+  });
+}
 function finishCallLocally() {
   callEnded = true;
+  stopChime();
+  stopCallTimers();
   stopCallTalk();
   releaseCallMicrophone();
   if (answerButton) answerButton.disabled = true;
@@ -880,6 +1051,8 @@ function finishCallLocally() {
   if (note) note.hidden = false;
 }
 if (callEnded) finishCallLocally();
+else if (callLifecycle && callInitialState === 'answered') startHeartbeat();  // refreshed during a call: resume it
+else if (callLifecycle) { startChime(); ringPollTimer = setInterval(pollRinging, 5000); }
 // Answer (2026-09-28): turn the live audio on inside this tap (a phone
 // only plays sound after a user gesture), record the answer, then ask for
 // the microphone once so Talk works without a second prompt.
@@ -892,11 +1065,15 @@ answerButton.addEventListener('click', async () => {
     const muteButton = document.getElementById('live-view-mute');
     if (muteButton) muteButton.textContent = '♫';
   }
+  stopChime();
   const response = await fetch(`/api/customer/aac/voice-call/events/${eventId}/answer`, {method: 'POST'});
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
+  if (response.status === 404) { showToast(data.detail || 'This call has ended.'); applyServerState('ended'); return; }
   if (!response.ok) { showToast(data.detail || 'Could not answer this call.'); return; }
+  if (data.state && data.state !== 'answered') { showToast(data.message || 'This call has ended.'); applyServerState(data.state); return; }
   if (callEnded) return;
   document.getElementById('voice-call-state').textContent = 'answered';
+  startHeartbeat();
   let micMessage = '';
   if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
     try {
@@ -1054,15 +1231,34 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         # partner_users) is resolved the same way main.py's own customer
         # notification-read routes already do.
         user = row("SELECT id FROM partner_users WHERE lower(email)=lower(?) AND customer_id=?", (identity["email"], identity["customer_id"]))
-        store.mark_answered(event_id=event_id, customer_id=identity["customer_id"], answered_by_user_id=user["id"] if user else None, actor=identity)
-        return {"message": "Call answered.", "event_id": event_id}
+        if store.mark_answered(event_id=event_id, customer_id=identity["customer_id"], answered_by_user_id=user["id"] if user else None, actor=identity):
+            return {"message": "Call answered.", "event_id": event_id, "state": "answered"}
+        # Duplicate tap, second device, or a call that already closed:
+        # harmless, and the answer says what is true.
+        current = store.get_voice_call_event(event_id=event_id, customer_id=identity["customer_id"]) or {}
+        if current.get("state") == "answered":
+            return {"message": "This call is already answered.", "event_id": event_id, "state": "answered"}
+        # Already closed: nothing changes, nothing reopens (harmless).
+        return {"message": "This call has ended.", "event_id": event_id, "state": current.get("state") or "ended"}
 
     @app.post("/api/customer/aac/voice-call/events/{event_id}/end")
     def end_event_route(request: Request, event_id: str) -> dict:
         identity = _customer_identity(request)
         event = _authorized_event(identity, event_id)
-        store.end_call(event_id=event_id, customer_id=identity["customer_id"], actor=identity)
-        return {"message": "Call ended.", "event_id": event_id}
+        if store.end_call(event_id=event_id, customer_id=identity["customer_id"], actor=identity):
+            _call_ended_feedback(event, identity)
+            return {"message": "Call ended.", "event_id": event_id, "state": "ended"}
+        return {"message": "This call had already ended.", "event_id": event_id, "state": "ended"}  # idempotent
+
+    @app.post("/api/customer/aac/voice-call/events/{event_id}/heartbeat")
+    def heartbeat_event(request: Request, event_id: str) -> dict:
+        """The open call page, every store.HEARTBEAT_SECONDS. Keeps an
+        answered call alive across refresh/reconnect; tells the page when
+        the call has closed (missed, ended elsewhere, or abandoned)."""
+        identity = _customer_identity(request)
+        _authorized_event(identity, event_id)
+        return {"event_id": event_id, "state": store.heartbeat(event_id=event_id, customer_id=identity["customer_id"]),
+                "heartbeat_seconds": store.HEARTBEAT_SECONDS}
 
     @app.post("/api/customer/aac/voice-call/events/{event_id}/dismiss")
     def dismiss_event(request: Request, event_id: str) -> dict:
@@ -1215,7 +1411,8 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
 </section>
 <style>.dialog-actions button:disabled{{opacity:.4;cursor:not-allowed;filter:grayscale(1)}}.call-ended-note{{margin:0 auto 0 0}}</style>
 <section class="panel dialog-actions">
-  <p id="voice-call-ended" class="call-ended-note" role="status"{'' if call_over else ' hidden'}><strong>Call ended.</strong></p>
+  <p id="voice-call-ended" class="call-ended-note" role="status"{'' if call_over else ' hidden'}><strong>{esc(_closed_label(event))}</strong></p>
+  <p id="voice-call-sound-note" class="health-detail" hidden>Tap anywhere on this page to hear the visitor chime.</p>
   <button class="action-button" id="voice-call-answer" type="button"{' disabled' if call_over else ''}>Answer</button>
   <button class="ghost-button" id="voice-call-end" type="button"{' disabled' if call_over else ''}>End call</button>
   {'<button class="ghost-button" id="voice-call-unlock" type="button">Unlock Door</button>' if show_unlock_button else ''}
@@ -1225,6 +1422,9 @@ def register_aac_voice_call_routes(app: FastAPI, shell: Callable) -> None:
         scripts = live_panel_scripts + f'''<script>
 const eventId={event_id!r};
 const callInitiallyOver={'true' if call_over else 'false'};
+const callInitialState={esc(event.get("state") or "triggered")!r};
+const callHeartbeatSeconds={store.HEARTBEAT_SECONDS};
+const callChimeUrl='/static/sounds/{CHIME_FILENAME}';
 ''' + _CALL_CONTROLS_JS + f'''
 {'''const unlockButton=document.getElementById('voice-call-unlock');
 const unlockStatus=document.getElementById('voice-call-unlock-status');

@@ -182,6 +182,10 @@ def test_a_new_visitor_after_the_cooldown_window_is_greeted_again(db_path, _isol
     _seed_tenant(db_path, "cust-1")
     with override_target(sqlite_path=str(db_path)):
         first = aac_voice_call.handle_person_detected(customer_id="cust-1", camera_id="cam-1", cooldown_seconds=0.0)
+        # The first visit is over (one live call per camera since 2026-10-02;
+        # a detection during a live call joins it -- see
+        # test_aac_voice_call_lifecycle.py).
+        store.end_call(event_id=first["event_id"], customer_id="cust-1")
         second = aac_voice_call.handle_person_detected(customer_id="cust-1", camera_id="cam-1", cooldown_seconds=0.0)
     assert first["triggered"] is True
     assert second["triggered"] is True

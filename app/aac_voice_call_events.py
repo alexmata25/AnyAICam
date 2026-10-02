@@ -28,6 +28,82 @@ from datetime import datetime
 
 from partner_db import audit, connection, row, rows
 
+# Call lifecycle (2026-10-02, Codex review). A ringing call nobody answers
+# becomes 'missed' after RING_TIMEOUT_SECONDS; an answered call whose call
+# page has stopped sending heartbeats (closed tab, lost connection, phone
+# asleep) for STALE_ANSWERED_SECONDS becomes 'ended'. The page beats every
+# HEARTBEAT_SECONDS, so a refresh or a brief reconnect resumes the same
+# call. reconcile() applies both rules; every read/action and every new
+# trigger runs it first, so no background worker is needed.
+RING_TIMEOUT_SECONDS = 60
+HEARTBEAT_SECONDS = 15
+STALE_ANSWERED_SECONDS = 45
+LIVE_STATES = ("triggered", "notified", "answered")
+
+
+def _now() -> datetime:
+    """The one clock this module reads (tests move it)."""
+    return datetime.now()
+
+
+def reconcile(*, customer_id: str, camera_id: str | None = None) -> list[str]:
+    """Expire unanswered calls and end abandoned answered calls for this
+    customer (optionally one camera). Each transition is a guarded UPDATE
+    on the row's current state, so a call answered/ended concurrently is
+    never overwritten. Returns the ids it changed."""
+    from datetime import timedelta
+    now = _now()
+    ring_cutoff = (now - timedelta(seconds=RING_TIMEOUT_SECONDS)).isoformat()
+    stale_cutoff = (now - timedelta(seconds=STALE_ANSWERED_SECONDS)).isoformat()
+    scope, args = ("customer_id=?", [customer_id]) if camera_id is None else ("customer_id=? AND camera_id=?", [customer_id, camera_id])
+    changed = []
+    with connection() as db:
+        for item in db.execute(f"SELECT id FROM aac_voice_call_events WHERE {scope} AND state IN ('triggered','notified') AND created_at<?",
+                               (*args, ring_cutoff)).fetchall():
+            if db.execute("UPDATE aac_voice_call_events SET state='missed',end_reason='unanswered_timeout',updated_at=? "
+                          "WHERE id=? AND state IN ('triggered','notified')", (now.isoformat(), item["id"])).rowcount:
+                changed.append(("missed", item["id"]))
+        for item in db.execute(f"SELECT id FROM aac_voice_call_events WHERE {scope} AND state='answered' "
+                               "AND COALESCE(last_heartbeat_at,call_started_at,answered_at,created_at)<?",
+                               (*args, stale_cutoff)).fetchall():
+            if db.execute("UPDATE aac_voice_call_events SET state='ended',call_ended_at=?,end_reason='connection_lost',updated_at=? "
+                          "WHERE id=? AND state='answered'", (now.isoformat(), now.isoformat(), item["id"])).rowcount:
+                changed.append(("ended", item["id"]))
+    for state, event_id in changed:
+        audit({"email": "system", "role": "system"}, f"aac_voice_call.{'missed' if state == 'missed' else 'ended'}",
+              "aac_voice_call_event", event_id, {"reason": "unanswered_timeout" if state == "missed" else "connection_lost"})
+    return [event_id for _, event_id in changed]
+
+
+def active_call_for_camera(*, customer_id: str, camera_id: str) -> dict | None:
+    """The live call on this camera after reconciliation, if any -- the
+    one a new trigger joins instead of ringing a second time."""
+    reconcile(customer_id=customer_id, camera_id=camera_id)
+    return row(f"SELECT * FROM aac_voice_call_events WHERE customer_id=? AND camera_id=? AND state IN {LIVE_STATES} "
+               "ORDER BY created_at DESC LIMIT 1", (customer_id, camera_id))
+
+
+def mark_superseded(*, customer_id: str, camera_id: str, new_event_id: str) -> None:
+    """Point calls this camera's reconciliation just closed at the call
+    that replaced them, so the history reads deterministically."""
+    with connection() as db:
+        db.execute("UPDATE aac_voice_call_events SET superseded_by=? WHERE customer_id=? AND camera_id=? AND id<>? "
+                   "AND superseded_by IS NULL AND end_reason IN ('unanswered_timeout','connection_lost')",
+                   (new_event_id, customer_id, camera_id, new_event_id))
+
+
+def heartbeat(*, event_id: str, customer_id: str) -> str | None:
+    """The call page is still open on an answered call. Returns the
+    call's state after reconciliation (the page shows 'ended' when it
+    was closed meanwhile)."""
+    reconcile(customer_id=customer_id)
+    now = _now().isoformat()
+    with connection() as db:
+        db.execute("UPDATE aac_voice_call_events SET last_heartbeat_at=? WHERE id=? AND customer_id=? AND state='answered'",
+                   (now, event_id, customer_id))
+        found = db.execute("SELECT state FROM aac_voice_call_events WHERE id=? AND customer_id=?", (event_id, customer_id)).fetchone()
+    return found["state"] if found else None
+
 
 def is_entrance_camera(customer_id: str, camera_id: str) -> bool:
     """The one gate every trigger must pass: only a camera explicitly
@@ -41,7 +117,7 @@ def is_entrance_camera(customer_id: str, camera_id: str) -> bool:
 
 
 def set_entrance_camera(*, customer_id: str, camera_id: str, enabled: bool, configured_by: str | None = None) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "INSERT INTO aac_voice_call_entrance_cameras(camera_id,customer_id,enabled,configured_at,configured_by) "
@@ -73,7 +149,7 @@ def set_camera_greeting_text(*, customer_id: str, camera_id: str, greeting_text:
     camera already enrolled via set_entrance_camera() -- the WHERE
     clause naturally no-ops for an unenrolled/unowned camera_id rather
     than creating a stray row."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_entrance_cameras SET greeting_text=?,configured_at=?,configured_by=? WHERE camera_id=? AND customer_id=?",
@@ -98,7 +174,7 @@ def set_camera_greeting_volume(*, customer_id: str, camera_id: str, volume: str,
     level = normalize_greeting_volume(volume)
     if level is None:
         raise ValueError("greeting volume must be low, medium or high")
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_entrance_cameras SET greeting_volume=?,configured_at=?,configured_by=? WHERE camera_id=? AND customer_id=?",
@@ -119,7 +195,7 @@ def resolve_greeting_volume(*, customer_id: str, camera_id: str) -> str:
 
 
 def set_site_default_greeting(*, customer_id: str, site_id: str, greeting_text: str, configured_by: str | None = None) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "INSERT INTO aac_voice_call_site_greetings(customer_id,site_id,greeting_text,updated_at,updated_by) VALUES(?,?,?,?,?) "
@@ -157,7 +233,7 @@ def check_and_stamp_cooldown(*, customer_id: str, camera_id: str, cooldown_secon
     door.py's confirm_unlock() already established for its own
     single-use token claim, so two near-simultaneous detections for the
     same camera can never both greet/notify."""
-    now = now or datetime.now()
+    now = now or _now()
     now_text = now.isoformat()
     with connection() as db:
         db.execute(
@@ -180,7 +256,7 @@ def stamp_greeted(*, event_id: str, customer_id: str, greeting_text_used: str, a
     timestamp column rather than the shared `state` field (deliberately
     layered ON TOP of the existing triggered/notified/... state machine,
     not a new state -- see this module's own migration comment)."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET greeted_at=?,greeting_text_used=?,updated_at=? WHERE id=? AND customer_id=? AND greeted_at IS NULL",
@@ -190,7 +266,7 @@ def stamp_greeted(*, event_id: str, customer_id: str, greeting_text_used: str, a
 
 
 def open_listening_window(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET listening_opened_at=?,updated_at=? WHERE id=? AND customer_id=? AND listening_opened_at IS NULL",
@@ -200,7 +276,7 @@ def open_listening_window(*, event_id: str, customer_id: str, actor: dict | None
 
 
 def close_listening_window(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET listening_closed_at=?,updated_at=? "
@@ -222,7 +298,7 @@ def record_visitor_utterance(
     vs-escalate decision. Returns the new utterance_count (0 if the
     event does not exist/belong to this customer, so the caller can
     tell "not found" from "first utterance recorded")."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         existing = db.execute(
             "SELECT transcript_text,utterance_count FROM aac_voice_call_events WHERE id=? AND customer_id=?",
@@ -253,7 +329,7 @@ def mark_escalated(*, event_id: str, customer_id: str, actor: dict | None = None
     but at most one of them ever gets True back here -- the caller
     gates the second, real homeowner notification on this return value
     specifically so a race can never send it twice."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         claim = db.execute(
             "UPDATE aac_voice_call_events SET escalated_at=?,updated_at=? WHERE id=? AND customer_id=? AND escalated_at IS NULL",
@@ -292,7 +368,7 @@ def create_voice_call_event(
     only source) -- never inferred after the fact, and never defaulted
     to 'detection' just because a caller forgot to pass it."""
     event_id = uuid.uuid4().hex
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "INSERT INTO aac_voice_call_events("
@@ -313,7 +389,7 @@ def create_voice_call_event(
 def record_transcript_and_intent(
     *, event_id: str, customer_id: str, transcript_text: str, intent: str, intent_confidence: float, actor: dict | None = None
 ) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET transcript_text=?,intent=?,intent_confidence=?,updated_at=? "
@@ -324,7 +400,7 @@ def record_transcript_and_intent(
 
 
 def mark_notified(*, event_id: str, customer_id: str, notification_id: str, actor: dict | None = None) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET state='notified',notification_id=?,updated_at=? WHERE id=? AND customer_id=?",
@@ -333,7 +409,7 @@ def mark_notified(*, event_id: str, customer_id: str, notification_id: str, acto
     audit(actor or {}, "aac_voice_call.notified", "aac_voice_call_event", event_id, {"notification_id": notification_id})
 
 
-def mark_answered(*, event_id: str, customer_id: str, answered_by_user_id: str, actor: dict | None = None) -> None:
+def mark_answered(*, event_id: str, customer_id: str, answered_by_user_id: str, actor: dict | None = None) -> bool:
     """2026-09-23 fix: the UPDATE below is now guarded to only fire from
     'triggered'/'notified' -- without this, answering an already-ended
     or already-dismissed call silently re-stamped answered_at/
@@ -348,18 +424,20 @@ def mark_answered(*, event_id: str, customer_id: str, answered_by_user_id: str, 
     has no other error path wired for "wrong state" yet -- a stale
     button press on an already-finished call is a normal, harmless race
     (e.g. two devices open on the same account), not a caller bug."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
-        db.execute(
-            "UPDATE aac_voice_call_events SET state='answered',answered=1,answered_at=?,answered_by_user_id=?,call_started_at=?,updated_at=? "
-            "WHERE id=? AND customer_id=? AND state IN ('triggered','notified')",
-            (now, answered_by_user_id, now, now, event_id, customer_id),
-        )
-    audit(actor or {}, "aac_voice_call.answered", "aac_voice_call_event", event_id, {"answered_by_user_id": answered_by_user_id})
+        answered = db.execute(
+            "UPDATE aac_voice_call_events SET state='answered',answered=1,answered_at=?,answered_by_user_id=?,call_started_at=?,"
+            "last_heartbeat_at=?,updated_at=? WHERE id=? AND customer_id=? AND state IN ('triggered','notified')",
+            (now, answered_by_user_id, now, now, now, event_id, customer_id),
+        ).rowcount
+    if answered:
+        audit(actor or {}, "aac_voice_call.answered", "aac_voice_call_event", event_id, {"answered_by_user_id": answered_by_user_id})
+    return bool(answered)
 
 
 def mark_dismissed(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET state='dismissed',updated_at=? WHERE id=? AND customer_id=? AND state IN ('triggered','notified')",
@@ -368,7 +446,7 @@ def mark_dismissed(*, event_id: str, customer_id: str, actor: dict | None = None
     audit(actor or {}, "aac_voice_call.dismissed", "aac_voice_call_event", event_id, {})
 
 
-def end_call(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
+def end_call(*, event_id: str, customer_id: str, actor: dict | None = None) -> bool:
     """2026-09-23 fix: guarded against re-ending an already-terminal
     call (same defect class as mark_answered() just above -- an
     unguarded UPDATE let a stale/duplicate "End call" press re-stamp
@@ -380,14 +458,16 @@ def end_call(*, event_id: str, customer_id: str, actor: dict | None = None) -> N
     closed the screen" -- is a real, intended flow, not a bug; only
     re-processing an already-dismissed/already-ended call is guarded
     against here."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
-        db.execute(
-            "UPDATE aac_voice_call_events SET state='ended',call_ended_at=?,updated_at=? "
-            "WHERE id=? AND customer_id=? AND state NOT IN ('dismissed','ended')",
+        ended = db.execute(
+            "UPDATE aac_voice_call_events SET state='ended',call_ended_at=?,end_reason=COALESCE(end_reason,'ended_by_user'),updated_at=? "
+            "WHERE id=? AND customer_id=? AND state NOT IN ('dismissed','ended','missed')",
             (now, now, event_id, customer_id),
-        )
-    audit(actor or {}, "aac_voice_call.ended", "aac_voice_call_event", event_id, {})
+        ).rowcount
+    if ended:
+        audit(actor or {}, "aac_voice_call.ended", "aac_voice_call_event", event_id, {})
+    return bool(ended)
 
 
 def mark_missed(*, event_id: str, customer_id: str, actor: dict | None = None) -> None:
@@ -395,7 +475,7 @@ def mark_missed(*, event_id: str, customer_id: str, actor: dict | None = None) -
     answer (the edge was offline and queued it -- see aac_voice_call.
     ingest_edge_visitor_event()). Same state guard as mark_dismissed():
     only ever moves a call that nobody has acted on yet."""
-    now = datetime.now().isoformat()
+    now = _now().isoformat()
     with connection() as db:
         db.execute(
             "UPDATE aac_voice_call_events SET state='missed',updated_at=? WHERE id=? AND customer_id=? AND state IN ('triggered','notified')",

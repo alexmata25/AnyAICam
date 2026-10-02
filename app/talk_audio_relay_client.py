@@ -435,6 +435,17 @@ def _door_unlock_on_appliance(message: dict) -> dict:
         return {"status": "error", "reason": "door_unreachable"}
 
 
+def _speak_call_ended_on_appliance(camera_id: str, event_id: str) -> dict:
+    # A moment for the owner's own Talk session (stopped by the same End
+    # tap) to release the camera's speaker before the announcement.
+    time.sleep(CALL_ENDED_DELAY_SECONDS)
+    import aac_voice_call
+    return aac_voice_call.speak_call_ended(camera_id=camera_id, event_id=event_id)
+
+
+CALL_ENDED_DELAY_SECONDS = 0.8
+
+
 async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=None) -> None:
     try:
         message = json.loads(raw_message)
@@ -450,6 +461,14 @@ async def _handle_message(raw_message: str, camera_map: dict[int, dict], send=No
     if message_type == "door_unlock":
         result = await asyncio.to_thread(_door_unlock_on_appliance, message)
         await _reply(send, {"type": "door_unlock_result", "request_id": message.get("request_id"), **result})
+        return
+    if message_type == "voice_call_ended":
+        # The owner ended a Visitor Call (2026-10-02): the visitor hears
+        # "Call ended." through the greeting's speaker path. Only the
+        # camera id comes from the cloud; the words are fixed on this side.
+        camera_id = message.get("camera_id")
+        if isinstance(camera_id, str) and camera_id:
+            asyncio.create_task(asyncio.to_thread(_speak_call_ended_on_appliance, camera_id, str(message.get("event_id") or "")))
         return
     session_id = message.get("session_id")
     if not isinstance(session_id, str) or not session_id:
