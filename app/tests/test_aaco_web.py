@@ -38,15 +38,25 @@ class ControlledVms:
         self.calls.append(("status", identity["customer_id"]))
         return {"kind": "status", "message": "One camera", "cameras": [{"label": "Camera 4", "state": "online"}]}
 
-    def unlock_door(self, identity, door_id):
-        self.calls.append(("unlock_door", identity["customer_id"], door_id))
+    def _door(self, identity, door_id):
         if identity["customer_id"] != "tenant-a":
             raise PermissionError("Door is unavailable.")
         if door_id == "camera-name:ambiguous door":
             from aaco import Clarification
             return Clarification("More than one authorized door matches that name -- try a camera number instead.")
-        if door_id != "camera-name:front door":
+        if door_id not in ("camera-name:front door", "camera-id:cam-front"):
             raise PermissionError("Door is unavailable.")
+        return {"door_camera_id": "cam-front", "door_name": "Front Door"}
+
+    def prepare_door_unlock(self, identity, door_id, *, allowed_ids=None):
+        self.calls.append(("prepare_door_unlock", identity["customer_id"], door_id))
+        return self._door(identity, door_id)
+
+    def unlock_door(self, identity, door_id, *, allowed_ids=None):
+        self.calls.append(("unlock_door", identity["customer_id"], door_id))
+        door = self._door(identity, door_id)
+        if not isinstance(door, dict):
+            return door
         return {"kind": "door_unlock", "message": "Front Door unlocked.", "context": {"camera_id": door_id}}
 
 
@@ -130,8 +140,14 @@ def test_unlock_door_reaches_the_boundary_and_never_the_generic_camera_gate(monk
     _door_actions_on(monkeypatch)  # off by default since 2026-09-30 (AACO settings)
     client, vms = _client()
     response = client.post("/api/aaco/command", json={"command": "Open Front Door"})
-    assert response.status_code == 200 and response.json()["kind"] == "door_unlock"
-    assert ("unlock_door", "tenant-a", "camera-name:front door") in vms.calls
+    # Since 2026-10-02 the command asks first (aaco_door_confirm.py) ...
+    assert response.status_code == 200 and response.json()["kind"] == "confirm_door_unlock"
+    assert ("prepare_door_unlock", "tenant-a", "camera-name:front door") in vms.calls
+    assert not [call for call in vms.calls if call[0] == "unlock_door"]
+    # ... and the confirmation unlocks exactly the door it named.
+    confirmed = client.post("/api/aaco/door-unlock/confirm", json={"confirm_token": response.json()["confirm_token"]})
+    assert confirmed.status_code == 200 and confirmed.json()["kind"] == "door_unlock"
+    assert ("unlock_door", "tenant-a", "camera-id:cam-front") in vms.calls
     assert not [call for call in vms.calls if call[0] == "authorized_camera" and call[2] == "camera-name:front door"]
 
 
@@ -150,7 +166,7 @@ def test_unlock_door_unauthorized_or_nonexistent_fails_closed(monkeypatch):
     foreign, vms = _client({"role": "customer_owner", "customer_id": "tenant-b"})
     denied = foreign.post("/api/aaco/command", json={"command": "Open Front Door"})
     assert denied.status_code == 403
-    assert not [call for call in vms.calls if call[0] == "door_unlock"]
+    assert not [call for call in vms.calls if call[0] == "unlock_door"]
 
 
 

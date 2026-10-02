@@ -220,6 +220,23 @@ class RestrictedBoundary:
         return self._inner.unlock_door(identity, door_id)
 
 
+def _prepare_door_unlock_scoped(self, identity, door_id):
+    """Same scope rule as unlock_door() above, for the confirmation step."""
+    import inspect
+    from aaco import Clarification
+    prepare = getattr(self._inner, "prepare_door_unlock", None)
+    try:
+        scoped = callable(prepare) and "allowed_ids" in inspect.signature(prepare).parameters
+    except (TypeError, ValueError):
+        scoped = False
+    if not scoped:
+        return Clarification(CAMERA_NOT_ALLOWED_MESSAGE)
+    return prepare(identity, door_id, allowed_ids=set(self._allowed_ids))
+
+
+RestrictedBoundary.prepare_door_unlock = _prepare_door_unlock_scoped
+
+
 def restrict(vms, settings: dict, customer_id: str):
     allowed = allowed_camera_ids(settings)
     if allowed is None:

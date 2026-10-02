@@ -53,7 +53,18 @@ _AACO_CLIENT_CORE_JS = """
 window.aacoSubmitCommand=function(commandText,context,onSuccess,onError){
 return fetch('/api/aaco/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:commandText,context:context||null,tz:(function(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||null}catch(e){return null}})()})})
 .then(function(response){return response.json().then(function(body){return {ok:response.ok,status:response.status,body:body}}).catch(function(){return {ok:false,status:response.status,body:{detail:'AACO returned an unreadable response.'}}})})
-.then(function(result){if(result.ok){onSuccess(result.body)}else{onError(result.body||{detail:'AACO could not complete that command.'})}})
+.then(function(result){if(!result.ok){onError(result.body||{detail:'AACO could not complete that command.'});return}
+if(result.body&&result.body.kind==='confirm_door_unlock'){window.aacoConfirmDoorUnlock(result.body,onSuccess,onError);return}
+onSuccess(result.body)})
+.catch(function(){onError({detail:'AACO could not reach the authorized VMS service.'})})
+};
+// Door unlock is a physical action (2026-10-02): AACO asks first, and the
+// server only acts on the one-use token it issued for that question.
+window.aacoConfirmDoorUnlock=function(body,onSuccess,onError){
+if(!window.confirm(body.message||'Unlock this door?')){onSuccess({kind:'clarification',message:'Door unlock cancelled.'});return}
+fetch('/api/aaco/door-unlock/confirm',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm_token:body.confirm_token})})
+.then(function(response){return response.json().then(function(b){return {ok:response.ok,body:b}}).catch(function(){return {ok:false,body:{detail:'The door could not be unlocked.'}}})})
+.then(function(r){if(r.ok){onSuccess(r.body)}else{onError(r.body||{detail:'The door could not be unlocked.'})}})
 .catch(function(){onError({detail:'AACO could not reach the authorized VMS service.'})})
 };
 // Voice input, shared by every AACO box (the floating panel and the /aaco
@@ -386,7 +397,7 @@ def _workspace() -> str:
 .aaco-mic-listening{background:#c0392b !important;color:#fff !important;animation:aaco-mic-pulse 1.1s ease-in-out infinite}@keyframes aaco-mic-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 </style>
 <main class="aaco-layout" aria-label="AACO operator workspace">
- <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO opens only the cameras, recordings and events your account can see, and never changes or deletes anything.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
+ <aside class="aaco-panel"><p class="eyebrow">On demand</p><h2>Ask AACO</h2><p class="aaco-muted">Ask in your own words, typed or spoken. AACO opens only the cameras, recordings and events your account can see, and never changes or deletes recordings or settings. Door unlock is the one physical action: it is off unless the account owner turns it on, needs your own door permission, and always asks you to confirm first.</p><div class="aaco-examples" aria-label="Example commands"><button class="aaco-example" type="button">Show Camera 1</button><button class="aaco-example" type="button">Show the front entrance</button><button class="aaco-example" type="button">Show Camera 2 from 3:15 yesterday</button><button class="aaco-example" type="button">Show person events from the last 2 hours</button><button class="aaco-example" type="button">Which cameras are offline?</button><button class="aaco-example" type="button">Go back 20 minutes</button><button class="aaco-example" type="button">Show previous event</button><button class="aaco-example" type="button">Return to live</button><button class="aaco-example" type="button">Did anyone come to the front entrance today?</button><button class="aaco-example" type="button">What happened on Camera 1 at 3:15 PM?</button><button class="aaco-example" type="button">Show me the latest event</button></div></aside>
  <section class="aaco-panel"><form id="aaco-command-form"><label class="eyebrow" for="aaco-command">Command</label><div class="aaco-command-row"><input id="aaco-command" name="command" maxlength="500" autocomplete="off" required placeholder="What would you like to see?"><button type="button" class="camera-tool aaco-mic-button" id="aaco-mic" title="Voice commands are not supported in this browser" aria-label="Voice commands are not supported in this browser" aria-pressed="false" disabled>🎤</button><button class="action-button">Run command</button></div></form><p id="aaco-status" class="aaco-muted" role="status" aria-live="polite">Ready. No historical media is loaded until you ask.</p><div id="aaco-conversation" class="aaco-conversation" aria-live="polite"><div class="aaco-turn operator"><p class="eyebrow">AACO</p>What would you like to see?</div></div><div id="aaco-context" class="aaco-context" hidden></div></section>
 </main>
 <script>%%AACO_CORE_JS%%
@@ -469,6 +480,59 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
         log.info("aaco.workspace_opened mode=on_demand historical_autoload=false")
         return page_shell("AACO", "aaco", _workspace())
 
+    def _prepare_unlock(vms, identity: dict, door_token: str | None) -> dict[str, Any]:
+        """A physical action never runs from the command itself
+        (2026-10-02): resolve and authorize the door exactly as the unlock
+        would, then hand back a one-use confirmation (aaco_door_confirm)."""
+        import aaco_door_confirm
+        if not door_token:
+            raise HTTPException(status_code=400, detail="Unsupported AACO command.")
+        prepare = getattr(vms, "prepare_door_unlock", None)
+        if not callable(prepare):
+            return {"kind": "clarification", "message": "Door actions aren't available here."}
+        try:
+            prepared = prepare(identity, door_token)
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail="Camera is unavailable.") from error
+        if isinstance(prepared, Clarification):
+            return {"kind": "clarification", "message": prepared.message}
+        token = aaco_door_confirm.issue(identity, door_camera_id=prepared["door_camera_id"], door_name=prepared["door_name"],
+                                        now=now())
+        log.info("aaco.door_unlock_confirmation_issued")
+        return {"kind": "confirm_door_unlock", "door_name": prepared["door_name"], "confirm_token": token,
+                "expires_in_seconds": aaco_door_confirm.TTL_SECONDS,
+                "message": f"Unlock {prepared['door_name']}? This physically unlocks the door for a few seconds."}
+
+    @app.post("/api/aaco/door-unlock/confirm")
+    async def aaco_door_unlock_confirm(request: Request) -> dict[str, Any]:
+        import aaco_door_confirm
+        import aaco_settings
+        identity = _require_customer(identity_provider(request))
+        try:
+            payload = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Confirmation must be valid JSON.") from error
+        if not isinstance(payload, dict) or set(payload) - {"confirm_token"}:
+            raise HTTPException(status_code=400, detail="Malformed confirmation.")
+        settings = aaco_settings.load(identity.get("customer_id"))
+        denial = (aaco_settings.DISABLED_MESSAGE if not settings.get("enabled", True)
+                  else aaco_settings.operation_denial(settings, "unlock_door"))
+        if denial:  # settings changed after the question was asked
+            return {"kind": "clarification", "message": denial}
+        claim = aaco_door_confirm.consume(identity, payload.get("confirm_token"), now=now())
+        if not claim:
+            log.info("aaco.door_unlock_confirmation_refused")
+            raise HTTPException(status_code=409, detail="This confirmation has expired or was already used. Ask AACO again.")
+        vms = aaco_settings.restrict(vms_factory(request), settings, identity.get("customer_id"))
+        try:
+            result = vms.unlock_door(identity, f"camera-id:{claim['door_camera_id']}")
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail="Camera is unavailable.") from error
+        if isinstance(result, Clarification):
+            return {"kind": "clarification", "message": result.message}
+        log.info("aaco.command operation=unlock_door confirmed=1")
+        return _result_payload(result)
+
     @app.post("/api/aaco/command")
     async def aaco_command(request: Request) -> dict[str, Any]:
         identity = _require_customer(identity_provider(request))
@@ -511,6 +575,8 @@ def register_aaco_routes(app: FastAPI, page_shell: Callable[..., str], *, identi
         if denial:
             log.info("aaco.command_blocked operation=%s", parsed.operation)
             return {"kind": "clarification", "message": denial}
+        if parsed.operation == "unlock_door":
+            return _prepare_unlock(vms, identity, parsed.camera_id)
         try:
             result = execute(parsed, identity=identity, vms=vms)
         except PermissionError as error:

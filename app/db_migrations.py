@@ -1789,3 +1789,8 @@ def apply_migrations():
                    'verified_at TEXT,customer_id TEXT,user_id TEXT)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_direct_signups_email ON direct_signups(email)')
         if 'onboarding_channel' not in _columns('customers'): db.execute('ALTER TABLE customers ADD COLUMN onboarding_channel TEXT')
+        # AACO door unlock confirmations (2026-10-02, aaco_door_confirm.py):
+        # hashed one-use tokens, bound to customer + person + door. Additive.
+        db.execute('CREATE TABLE IF NOT EXISTS aaco_door_unlock_confirmations(token_hash TEXT PRIMARY KEY,customer_id TEXT NOT NULL,'
+                   'user_email TEXT NOT NULL,door_camera_id TEXT NOT NULL,door_name TEXT,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,'
+                   'consumed_at TEXT)')
