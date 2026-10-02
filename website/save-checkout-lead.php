@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/private-storage.php';
+
 date_default_timezone_set('America/Chicago');
 header('Content-Type: application/json');
 
@@ -223,10 +225,8 @@ $recordingLabel = $recordingType === 'continuous' ? '24/7 Continuous' : ($record
 $durationLabel = $duration ? "$duration days" : 'N/A';
 $billingLabel = $billingCycle === 'annual' ? 'Annual (10% Off)' : 'Monthly';
 
-// Save to log file
-$logFile = __DIR__ . '/checkout-leads.txt';
 $logEntry = date('Y-m-d H:i:s') . " | $customerName | $email | $adapterLabel | $cameraDetails | $totalCameras cam | ${recordingLabel} | ${durationLabel} | ${billingLabel}\n";
-file_put_contents($logFile, $logEntry, FILE_APPEND | LOCK_EX);
+anyaicam_append_private_log('checkout-leads.txt', $logEntry);
 
 // === BUILD ADMIN EMAIL ===
 $adminTo = $config['to_email'] ?? 'amata@anyaicam.com';
@@ -370,9 +370,8 @@ if (!empty($config['smtp_enabled']) && !empty($config['smtp_host'])) {
 }
 
 // Log
-$emailLog = __DIR__ . '/email-log.txt';
 $logResult = "Admin:" . ($adminSent ? 'OK' : 'FAIL') . " Customer:" . ($customerSent ? 'OK' : 'FAIL');
-file_put_contents($emailLog, date('Y-m-d H:i:s') . " - save-checkout-lead - $logResult\n", FILE_APPEND | LOCK_EX);
+anyaicam_append_private_log('email-log.txt', date('Y-m-d H:i:s') . " - save-checkout-lead - $logResult\n");
 
 echo json_encode([
     'success' => $adminSent || $customerSent,

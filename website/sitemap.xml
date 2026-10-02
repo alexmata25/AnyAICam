@@ -2,7 +2,7 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://anyaicam.com/</loc>
-    <lastmod>2026-07-17</lastmod>
+    <lastmod>2026-10-02</lastmod>
     <changefreq>monthly</changefreq>
     <priority>1.0</priority>
   </url>
@@ -13,13 +13,7 @@
     <priority>0.9</priority>
   </url>
   <url>
-    <loc>https://anyaicam.com/cloud-storage-pricing.html</loc>
-    <lastmod>2026-07-17</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.9</priority>
-  </url>
-  <url>
-    <loc>https://anyaicam.com/compatibility.html</loc>
+    <loc>https://anyaicam.com/pricing.html</loc>
     <lastmod>2026-07-17</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.9</priority>
@@ -29,12 +23,6 @@
     <lastmod>2026-07-17</lastmod>
     <changefreq>monthly</changefreq>
     <priority>0.9</priority>
-  </url>
-  <url>
-    <loc>https://anyaicam.com/billing.html</loc>
-    <lastmod>2026-07-17</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.8</priority>
   </url>
   <url>
     <loc>https://anyaicam.com/support.html</loc>
@@ -72,20 +60,20 @@
     <changefreq>monthly</changefreq>
     <priority>0.6</priority>
   </url>
-  <url>
-    <loc>https://anyaicam.com/adapter-enterprise.html</loc>
-    <lastmod>2026-07-17</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.5</priority>
-  </url>
-  <url>
-    <loc>https://anyaicam.com/Smart-Motion-Add-On.html</loc>
-    <lastmod>2026-07-17</lastmod>
-    <changefreq>monthly</changefreq>
-    <priority>0.5</priority>
-  </url>
   <url><loc>https://anyaicam.com/aac-features.html</loc><changefreq>monthly</changefreq></url>
   <url><loc>https://anyaicam.com/aaco.html</loc><changefreq>monthly</changefreq></url>
   <url><loc>https://anyaicam.com/visitor-call.html</loc><changefreq>monthly</changefreq></url>
   <url><loc>https://anyaicam.com/secure-edge.html</loc><changefreq>monthly</changefreq></url>
+  <url>
+    <loc>https://anyaicam.com/plans.html</loc>
+    <lastmod>2026-10-02</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://anyaicam.com/vms.html</loc>
+    <lastmod>2026-10-02</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
 </urlset>

@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/private-storage.php';
+
 ini_set('display_errors', '0');
 header('X-Content-Type-Options: nosniff');
 
@@ -136,7 +138,7 @@ $logLine = sprintf(
     $adminSent ? 'sent' : 'failed',
     $customerSent ? 'sent' : 'failed'
 );
-@file_put_contents(__DIR__ . '/software-trial-email-log.txt', $logLine, FILE_APPEND | LOCK_EX);
+anyaicam_append_private_log('software-trial-email-log.txt', $logLine);
 
 header('Location: software-trial-wizard-thank-you.html', true, 303);
 exit;

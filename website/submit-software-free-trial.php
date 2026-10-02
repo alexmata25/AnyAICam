@@ -1,8 +1,9 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/private-storage.php';
+
 $videoloftUrl = 'https://videoloft.com/product/virtual-cloud-adapter/';
-$logFile = __DIR__ . '/software-trial-requests.log';
 
 
 function smtpRead($socket, array $codes): bool {
@@ -140,10 +141,9 @@ $body = implode("\n", [
     'Notes: ' . ($request['notes'] !== '' ? $request['notes'] : 'None'),
 ]);
 
-@file_put_contents(
-    $logFile,
-    $timestamp . "\t" . $reference . "\t" . $request['email'] . "\t" . json_encode($request, JSON_UNESCAPED_SLASHES) . "\n",
-    FILE_APPEND | LOCK_EX
+anyaicam_append_private_log(
+    'software-trial-requests.log',
+    $timestamp . "\t" . $reference . "\t" . $request['email'] . "\t" . json_encode($request, JSON_UNESCAPED_SLASHES) . "\n"
 );
 
 $mailConfigFile = __DIR__ . '/mail_config.php';

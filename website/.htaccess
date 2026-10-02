@@ -2,11 +2,25 @@
 
 # Set default index file
 DirectoryIndex index.html index.php
+Options -Indexes
 
 # Block .htaccess files from web access
 <FilesMatch "^\.ht">
   Require all denied
 </FilesMatch>
+
+# Submission and mail logs are written by legacy/public PHP handlers. Keep
+# both current and historical log files inaccessible even if a deployment
+# still has older copies in the document root.
+<FilesMatch "^(submissions-support\.txt|checkout-leads\.txt|software-trial-requests\.log|software-trial-email-log\.txt|email-log\.txt)$">
+  Require all denied
+</FilesMatch>
+
+# Private support/claim-marker directories must never be served directly.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteRule ^(?:support-private|\.anyaicam-mail-sent)(?:/|$) - [F,L,NC]
+</IfModule>
 
 # MIME types
 AddType image/webp .webp

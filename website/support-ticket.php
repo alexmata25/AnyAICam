@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/private-storage.php';
+
 header('Content-Type: application/json; charset=utf-8');
 header('Cache-Control: no-store');
 
@@ -67,28 +69,11 @@ $record = [
     'summary' => $summary
 ];
 
-$storageDir = __DIR__ . '/support-private';
-if (!is_dir($storageDir) && !mkdir($storageDir, 0750, true) && !is_dir($storageDir)) {
+$logName = 'diagnostics-' . gmdate('Y-m') . '.jsonl';
+$logEntry = json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL;
+if (!anyaicam_append_private_log($logName, $logEntry)) {
     http_response_code(500);
-    echo json_encode(['ok' => false, 'error' => 'Could not create storage']);
-    exit;
-}
-
-$denyFile = $storageDir . '/.htaccess';
-if (!file_exists($denyFile)) {
-    file_put_contents($denyFile, "Require all denied\nDeny from all\n");
-}
-
-$logFile = $storageDir . '/diagnostics-' . gmdate('Y-m') . '.jsonl';
-$written = file_put_contents(
-    $logFile,
-    json_encode($record, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . PHP_EOL,
-    FILE_APPEND | LOCK_EX
-);
-
-if ($written === false) {
-    http_response_code(500);
-    echo json_encode(['ok' => false, 'error' => 'Could not save ticket']);
+    echo json_encode(['ok' => false, 'error' => 'Could not securely save ticket']);
     exit;
 }
 

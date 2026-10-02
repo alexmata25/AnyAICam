@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/private-storage.php';
+
 function redirectTo(string $path): never {
     header('Location: ' . $path, true, 303);
     exit;
@@ -133,16 +135,15 @@ $customerBody = implode("\n", [
     'amata@anyaicam.com'
 ]);
 
-@file_put_contents(
-    __DIR__ . '/software-trial-requests.log',
+anyaicam_append_private_log(
+    'software-trial-requests.log',
     $timestamp . "\t" . $reference . "\t" . $email . "\t" . json_encode([
         'name' => $name,
         'email' => $email,
         'phone' => $phone,
         'site_name' => $siteName,
         'notes' => $notes
-    ], JSON_UNESCAPED_SLASHES) . "\n",
-    FILE_APPEND | LOCK_EX
+    ], JSON_UNESCAPED_SLASHES) . "\n"
 );
 
 $mailConfigFile = __DIR__ . '/mail_config.php';

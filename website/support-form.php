@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/private-storage.php';
+
 date_default_timezone_set('America/Chicago');
 
 function support_field(string $name): string
@@ -93,7 +95,7 @@ $bodyLines[] = 'Security reminder: Do not request camera passwords, payment card
 $body = implode("\n", $bodyLines);
 
 $savedSubmission = "=== " . date('Y-m-d H:i:s') . " ===\n" . $body . "\n" . str_repeat('-', 40) . "\n";
-@file_put_contents(__DIR__ . '/submissions-support.txt', $savedSubmission, FILE_APPEND | LOCK_EX);
+$submissionSaved = anyaicam_append_private_log('submissions-support.txt', $savedSubmission);
 
 $to = 'amata@anyaicam.com';
 $subject = 'ANYAICAM Live Tech Support Request ' . $requestId;
@@ -110,11 +112,15 @@ $headers = [
 ];
 
 $sent = @mail($to, $subject, $body, implode("\r\n", $headers), '-f ' . $fromEmail);
-$logLine = date('Y-m-d H:i:s') . ' - support - ' . ($sent ? 'SUCCESS' : 'SAVED_ONLY') . ' - ' . $requestId . "\n";
-@file_put_contents(__DIR__ . '/email-log.txt', $logLine, FILE_APPEND | LOCK_EX);
+$logLine = date('Y-m-d H:i:s') . ' - support - ' . ($sent ? 'SUCCESS' : 'FAILED') . ' - ' . $requestId . "\n";
+anyaicam_append_private_log('email-log.txt', $logLine);
 
 if ($sent) {
     support_respond(true, 'Thanks. We received your live tech support request and will follow up shortly.');
 }
 
-support_respond(true, 'Thanks. Your support request was saved. If you do not hear back shortly, please email amata@anyaicam.com directly.');
+if ($submissionSaved) {
+    support_respond(true, 'Thanks. Your support request was saved. If you do not hear back shortly, please email amata@anyaicam.com directly.');
+}
+
+support_respond(false, 'We could not send or securely save your request. Please email amata@anyaicam.com directly.', 503);
