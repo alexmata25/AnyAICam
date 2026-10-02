@@ -462,3 +462,12 @@ def test_the_face_access_grant_lets_a_member_manage_people_and_shows_edit_contro
         assert fr.facial_allowed({"role": "salesperson"}, "facial.manage") is False
     created = client.post("/api/aac/people", json={"customer_id": "cust-1", "display_name": "Cleaner"}, cookies=_cookie(*viewer))
     assert created.status_code != 403, created.text
+
+
+def test_delivery_messages_say_what_actually_happened():
+    import household_users as hu
+    assert hu._delivery_message("sent", "a@x.test", first=True) == "Invitation sent to a@x.test."
+    assert hu._delivery_message("sent", "a@x.test", first=False) == "Invitation sent again to a@x.test."
+    assert "created" in hu._delivery_message("preview", "a@x.test", first=True)
+    assert hu._delivery_message("preview", "a@x.test", first=False).startswith("New invitation link created")
+    assert "could not be sent" in hu._delivery_message("failed", "a@x.test", first=True)

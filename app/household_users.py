@@ -492,7 +492,8 @@ def _delivery_message(status: str, email: str, *, first: bool) -> str:
     if status == "sent":
         return f"Invitation sent to {email}." if first else f"Invitation sent again to {email}."
     if status == "preview":  # email preview mode (development/staging without SMTP): nothing left the server
-        return f"Invitation created for {email} (email preview mode: nothing was emailed)."
+        return (f"Invitation created for {email} (email preview mode: nothing was emailed)." if first
+                else f"New invitation link created for {email} (email preview mode: nothing was emailed).")
     return (f"Invitation created for {email}, but the email could not be sent. Use Resend to try again." if first
             else "The email could not be sent. Please try again.")
 
